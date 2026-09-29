@@ -47,6 +47,7 @@ pub(crate) mod surreal_automation;
 pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_capability_evidence;
 pub(crate) mod surreal_experience;
+pub(crate) mod surreal_instrument_registry;
 pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
@@ -1055,6 +1056,7 @@ struct AttemptLegWrites {
     automation: surreal_automation::AutomationWrites,
     experience: surreal_experience::ExperienceWrites,
     learning: surreal_learning::LearningWrites,
+    instrument_registry: surreal_instrument_registry::InstrumentRegistryWrites,
 }
 
 /// Same-operation reuse check for one apply attempt (issue #63).
@@ -1194,12 +1196,20 @@ async fn prepare_attempt_leg_writes(
         surreal_experience::prepare_experience_writes(db, &adapter.config, transition).await?;
     let learning_writes =
         surreal_learning::prepare_learning_writes(db, &adapter.config, transition).await?;
+    let instrument_registry_writes =
+        surreal_instrument_registry::prepare_instrument_registry_writes(
+            db,
+            &adapter.config,
+            transition,
+        )
+        .await?;
     Ok(AttemptLegWrites {
         notification: notification_writes,
         reactive: reactive_writes,
         automation: automation_writes,
         experience: experience_writes,
         learning: learning_writes,
+        instrument_registry: instrument_registry_writes,
     })
 }
 
@@ -1355,6 +1365,7 @@ async fn apply_with_retry(
             &legs.automation,
             &legs.experience,
             &legs.learning,
+            &legs.instrument_registry,
         )
         .await
         {

@@ -312,9 +312,10 @@ pub use operation_catalogue::{
 
 pub use operation_parameters::{
     ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
-    named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
-    named_read_operation_name, parameter_schema_digest, project_parameter_schema,
-    validate_typed_read_parameters, verify_declaration_holds_no_payload_encoding,
+    decode_instrument_registry_mutation, named_mutation_operation_by_name,
+    named_mutation_operation_name, named_read_operation_by_name, named_read_operation_name,
+    parameter_schema_digest, project_parameter_schema, validate_typed_read_parameters,
+    verify_declaration_holds_no_payload_encoding,
 };
 
 pub use revocation_history::{

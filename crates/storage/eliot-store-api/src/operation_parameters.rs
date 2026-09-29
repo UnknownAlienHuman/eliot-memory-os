@@ -1706,6 +1706,31 @@ fn check_declared_shape(
     }
 }
 
+/// Decodes one validated `ApplyInstrumentRegistryState` parameter map.
+///
+/// Runs the shared snapshot acceptance boundary first (JSON string with
+/// the supported schema/version), then returns the verbatim snapshot
+/// bytes. Both store contours share this decoder so neither backend
+/// interprets instrument admission on its own.
+pub fn decode_instrument_registry_mutation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<String, StoreError> {
+    let value = parameters
+        .get("snapshot_json")
+        .ok_or(StoreError::InvalidField {
+            field: "instrument_registry.snapshot_json",
+            reason: "instrument registry mutation requires snapshot_json",
+        })?;
+    validate_instrument_registry_snapshot(value)?;
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or(StoreError::InvalidField {
+            field: "instrument_registry.snapshot_json",
+            reason: "instrument registry snapshot must be a JSON string",
+        })
+}
+
 fn validate_instrument_registry_snapshot(value: &Value) -> Result<(), StoreError> {
     let snapshot_json = value.as_str().ok_or(StoreError::InvalidField {
         field: "operation.parameter",

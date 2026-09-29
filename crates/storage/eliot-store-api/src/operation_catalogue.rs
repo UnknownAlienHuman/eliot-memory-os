@@ -281,7 +281,7 @@ struct ActivatedReadDescriptor {
 /// typed `scope_id` request field (issue #1868: proven by both adapter
 /// handlers) and filters through the declared optional closed
 /// `record_kind` selector plus the `max_records` bound.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -392,11 +392,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetInstrumentRegistryState,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -420,6 +425,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
         ACTIVATED_READS[19].operation,
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
+        ACTIVATED_READS[22].operation,
     ]
 }
 
@@ -470,7 +476,7 @@ struct ActivatedMutationDescriptor {
 /// eighteen address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -577,6 +583,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
         operation: NamedMutationOperation::RecordCapabilityEvidenceRecord,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyInstrumentRegistryState,
+        transition_classes: &[TransitionClass::InstrumentRegistry],
+        maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
