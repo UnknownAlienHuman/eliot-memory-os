@@ -47,8 +47,8 @@ pub use inquiry_governance::{
     InquiryError, InquiryGovernance, InquiryHorizon, InquiryLane, InquiryObservation,
     InquiryOutputContract, InquiryProtocol, InquiryProtocolProfile, InquiryRisk,
     InquirySelectionFeatures, InquiryStopRule, InquiryTerminalRecord, InquiryUncertainty,
-    LaneDisciplineOutcome, MissingSourceClass, PreservedNextProbe, PreservedUnknown, ReopenCondition,
-    ResearchDebt, ResearchDebtKind, ResearchDebtRestriction, SourcePortfolio,
+    LaneDisciplineOutcome, MissingSourceClass, PreservedNextProbe, PreservedUnknown,
+    ReopenCondition, ResearchDebt, ResearchDebtKind, ResearchDebtRestriction, SourcePortfolio,
     SpecialistDiscoverability, StopRuleKind, StreamEvidence, UnadmittedReference,
     UnadmittedReferenceKind, VerifierStrength,
 };
