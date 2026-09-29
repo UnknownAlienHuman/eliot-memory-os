@@ -180,7 +180,7 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
                 operation: operation.clone(),
                 request_commitment_sha256: request_commitment_sha256.clone(),
             })
-            .map_err(map_cancellation_query_error)?;
+            .map_err(|error| map_cancellation_query_error(&error))?;
         let record = observation.record();
         if record.operation != operation
             || record.request_commitment_sha256.as_deref()
@@ -539,7 +539,7 @@ fn map_journal_error(error: JournalError) -> UserAutomationRuntimeError {
 }
 
 fn map_cancellation_query_error(
-    error: WakeCancellationBatchQueryError,
+    error: &WakeCancellationBatchQueryError,
 ) -> UserAutomationRuntimeError {
     match error {
         WakeCancellationBatchQueryError::NotFound

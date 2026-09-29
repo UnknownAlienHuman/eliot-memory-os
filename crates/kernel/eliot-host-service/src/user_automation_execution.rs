@@ -88,11 +88,6 @@ where
                     execution,
                 })
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { .. } => {
-                // Cancellation receipts bind a server-authenticated channel,
-                // so this convenience path cannot authorize the effect.
-                Err(UserAutomationRuntimeError::IdentityConflict)
-            }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 let readback = self.wake.read_pending_wake(request).await?;
                 Ok(UserAutomationHostExecutionResponse::WakeRead {
@@ -101,15 +96,12 @@ where
                     readback,
                 })
             }
-            // Batch enumeration receipts bind the authenticated Host channel.
-            // This convenience dispatch has no server-authored session, so it
-            // must not issue a receipt from caller-carried channel fields.
-            UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. } => {
-                Err(UserAutomationRuntimeError::IdentityConflict)
-            }
-            // The exact cancellation readback is a restart reconciliation
-            // proof and must use a server-authenticated session.
-            UserAutomationHostExecutionOperation::ReadCancellationBatch { .. } => {
+            // Cancellation, enumeration, and exact batch readback bind a
+            // server-authenticated channel. This convenience dispatch has no
+            // server-authored session and cannot authorize any of them.
+            UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
+            | UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
         }
