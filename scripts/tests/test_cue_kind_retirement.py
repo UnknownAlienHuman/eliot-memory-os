@@ -68,6 +68,59 @@ def bound_case(number: int):
     return _gate_bound[number]
 
 
+def assert_string_switch_discriminators(case: unittest.TestCase) -> None:
+    """Exercise the actual pure scanner; not a substitute for bound case 18."""
+    for spelling in a.V1_SPELLINGS:
+        for literal in (json.dumps(spelling), 'r##"' + spelling + '"##'):
+            text = f'match spelling {{ {literal} /* separator */ => Owner::Value, _ => () }}'
+            case.assertTrue(a.string_switch_offsets(text)[2], text)
+    for text in (
+        'match kind { "symbol" | "other" => push(s), _ => () }',
+        'match kind { "symbol" if permitted => push(s), _ => () }',
+        r'match kind { "sym\x62ol" => push(s), _ => () }',
+        r'match kind { "sym\u{62}ol" => push(s), _ => () }',
+    ):
+        case.assertTrue(a.string_switch_offsets(text)[2], text)
+    for text in (
+        '// match kind { "symbol" => Owner::Symbol }',
+        '/* match kind { "symbol" => Owner::Symbol } */',
+        'const SAMPLE: &str = r##"match kind { "symbol" => Owner::Symbol }"##;',
+        r'fn f() { let sample = "match kind { \"symbol\" => Owner::Symbol }"; }',
+        'fn f() { let symbol = "symbol"; match other { _ => () } }',
+        'fn f() { matches!(key, "symbol" | "owner"); match other { _ => () } }',
+        'fn f() { if value == "concept" || value == "procedure" {} match other { _ => () } }',
+    ):
+        case.assertEqual(a.string_switch_offsets(text)[2], [], text)
+    # Byte offsets stay correct with UTF-8 and CRLF before a real literal.
+    unicode_source = '// Ω🙂\r\nmatch kind { "symbol" => push(s), _ => () }'
+    offset = a.string_switch_offsets(unicode_source)[2][0]
+    case.assertEqual(offset, unicode_source.encode('utf-8').index(b'"symbol"'))
+    for malformed in ('match kind { "symbol', 'match kind { r##"symbol"#'):
+        with case.assertRaises(ValueError, msg=malformed):
+            a.string_switch_offsets(malformed)
+
+    path = 'crates/research/eliot-researcher/src/evidence_portfolio.rs'
+    source = (ROOT / path).read_text(encoding='utf-8')
+    owner = (ROOT / 'crates/research/eliot-research-exchange-api/src/lib.rs').read_text(encoding='utf-8')
+    case.assertTrue(a.string_switch_offsets(source)[2])
+    case.assertEqual(a.unclassified_string_switch_offsets(path, source, owner), [])
+    # This is a source-site adjudication, never permission for the whole file.
+    extra = '\nfn accidental_owner(kind: &str) { match kind { "symbol" => push(s), _ => () } }\n'
+    case.assertEqual(len(a.unclassified_string_switch_offsets(path, source + extra, owner)), 1)
+    case.assertTrue(a.unclassified_string_switch_offsets('other.rs', source, owner))
+    case.assertTrue(a.unclassified_string_switch_offsets(path, source, ''))
+    changed_rank = source.replace('"symbol" => Some(6)', '"symbol" => Some(5)')
+    case.assertNotEqual(changed_rank, source)
+    case.assertTrue(a.unclassified_string_switch_offsets(path, changed_rank, owner))
+    changed_owner = owner.replace('rename_all = "snake_case"', 'rename_all = "kebab-case"')
+    case.assertTrue(a.unclassified_string_switch_offsets(path, source, changed_owner))
+    # Nonsemantic comments at the owner boundary do not require digest repins.
+    commented_owner = owner.replace('pub enum AnchorPrecision', '/* owner comment */ pub enum AnchorPrecision')
+    case.assertEqual(a.unclassified_string_switch_offsets(path, source, commented_owner), [])
+    legacy = (ROOT / 'crates/smart/eliot-cues/src/legacy_adapter.rs').read_text(encoding='utf-8')
+    case.assertEqual(len(a.string_switch_offsets(legacy)[2]), len(a.V1_SPELLINGS))
+
+
 class RetirementCoordinator(unittest.TestCase):
     def assertBoundCase(self, number: int) -> None:
         """Assert the reconciled accepted execution for this coordinator case.
@@ -304,11 +357,10 @@ class RetirementCoordinator(unittest.TestCase):
     def test_18_oracle_detects_string_switch_owner(self):
         self.assertBoundCase(18)
         adversarial = fixture("adversarial_kinds.json")["string_switch_owner"]
-        arm = re.compile(r'"(?:%s)"\s*=>' % "|".join(a.V1_SPELLINGS))
         for snippet in adversarial:
-            self.assertIsNotNone(
-                arm.search(a.strip_comments_only(snippet)), snippet
-            )
+            self.assertTrue(a.string_switch_offsets(snippet)[2], snippet)
+        assert_string_switch_discriminators(self)
+        self.assertEqual(a.string_switch_unresolved_files(), [])
         # Exactly one live owner branches on historical spellings: the named
         # #833 decoder, whose arms construct the A-10 owner (verified above).
         self.assertEqual(
