@@ -7928,7 +7928,7 @@ impl HostComposition {
     /// (Re)binds the pending activation record's held supervision-lease
     /// reference from the published Kernel-signed supervision-lease mirror.
     ///
-    /// I1.5 W4 (SupervisionLease issuance/renewal, Host leg): a transition
+    /// I1.5 W4 (`SupervisionLease` issuance/renewal, Host leg): a transition
     /// into a live state holds exactly the supervision lease the mirror
     /// proves live for this activation generation right now — no synthesised
     /// identity, no carried predecessor. When the mirror proves no live
