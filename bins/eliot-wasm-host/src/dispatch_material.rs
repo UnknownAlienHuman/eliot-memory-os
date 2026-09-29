@@ -26,8 +26,50 @@
 
 use eliot_contracts::{EpochId, StateFence, sha256_hex};
 use eliot_wasm_runtime::Sha256Digest;
+use std::io::Write as _;
 
 use crate::cli_contract::Profile;
+
+#[cfg(windows)]
+type InstallationDeliveryGuard = eliot_windows_ipc::InstallationDeliveryFileLock;
+
+#[cfg(not(windows))]
+struct InstallationDeliveryGuard;
+
+fn acquire_installation_delivery_guard(
+    install_dir: &std::path::Path,
+) -> std::io::Result<InstallationDeliveryGuard> {
+    #[cfg(windows)]
+    {
+        InstallationDeliveryGuard::acquire(install_dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = install_dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "installation delivery OS lock is only available on Windows",
+        ))
+    }
+}
+
+fn validate_installation_delivery_guard(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        guard.validate_root(install_dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (guard, install_dir);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "installation delivery OS lock is only available on Windows",
+        ))
+    }
+}
 
 /// Dispatch material file name the child reader derives from its executable
 /// directory (`current_exe`, never argv/stdin/env). Duplicated here because
@@ -51,35 +93,28 @@ pub const WASM_HOST_GUEST_INPUT_FILE_NAME: &str = "eliot-wasm-host.guest-input.b
 /// exact-name byte-verified delete. Anything it cannot join stays in place
 /// for its owner.
 pub const WASM_HOST_CONTROL_FILE_NAME: &str = "eliot-wasm-host.control-request.json";
-/// Durable served marker (#2786 step 7): written atomically after a terminal
-/// outcome publishes, removed only when its own identity fully reclaims. A
-/// crash between publish and reclaim leaves staged bytes plus this marker,
-/// so restart classifies terminal-unacknowledged as replay instead of
-/// re-executing. Single fixed name, overwritten by every serve: no
-/// accumulation is possible, and a stale marker (naming a replaced set)
-/// never matches the staged identity.
-pub const WASM_HOST_SERVED_FILE_NAME: &str = "eliot-wasm-host.served.json";
-/// Durable pre-execution `InFlight` marker (#2786 step 7): written atomically
-/// after claim and before any guest effect, cleared only once the served
-/// marker above is durable. A crash or failed served write after the effect
-/// settled still leaves this claim, so restart classifies `InFlight` or
-/// terminal-unacknowledged as replay instead of re-executing. Single fixed
-/// name, overwritten by every claim: no accumulation is possible, and a
-/// stale marker (naming a replaced set) never matches the staged identity.
-pub const WASM_HOST_INFLIGHT_FILE_NAME: &str = "eliot-wasm-host.inflight.json";
-/// Durable terminal-result record (#2786 step 7): written atomically after the
-/// served marker above is durable and before physical reclaim, retired only
-/// with its own fully gone set. A crash between publish and reclaim leaves the
-/// exact terminal frame beside the staged bytes, so restart reconciles
-/// terminal-unacknowledged state by returning the original retained result
-/// instead of an identity-only error. Single fixed name, overwritten by every
-/// serve: no accumulation is possible, and a stale record (naming a replaced
-/// set) never matches the staged identity.
-pub const WASM_HOST_SERVED_RESULT_FILE_NAME: &str = "eliot-wasm-host.served-result.json";
-/// Served-result record allocation guard: the retained terminal frame already
-/// fits the governed result budget, and the identity wrapper adds a few
-/// hundred bytes; anything larger is refused before parsing, never truncated.
+/// Per-delivery served marker file inside its owner generation slot. It is
+/// never a mutable installation-wide marker or reclamation authority.
+pub const WASM_HOST_SERVED_FILE_NAME: &str = "SERVED.json";
+/// Per-delivery pre-execution claim file inside its owner generation slot.
+pub const WASM_HOST_INFLIGHT_FILE_NAME: &str = "INFLIGHT.json";
+/// Per-delivery exact result stream inside its owner generation slot.
+pub const WASM_HOST_SERVED_RESULT_FILE_NAME: &str = "RESULTS.json";
+/// Reserved per-delivery receiver-ACK sidecar path. A digest-only child-side
+/// record at this path is not receiver-owned proof and cannot authorize
+/// EFFECT_SETTLED retirement.
+pub const WASM_HOST_ACK_FILE_NAME: &str = "ACK.json";
+/// Process/material settlement evidence required before reclamation.
+pub const WASM_HOST_SETTLED_FILE_NAME: &str = "SETTLED.json";
+/// Served-result record allocation guard. This includes identity and the
+/// complete bounded event stream and is enforced before replacement.
 pub const SERVED_RESULT_MAX_BYTES: usize = 128 * 1024;
+/// Identity-bearing per-delivery marker bound.
+pub const DELIVERY_IDENTITY_MARKER_MAX_BYTES: usize = 64 * 1024;
+/// Maximum event sequence count shared with the request-loop result contract.
+pub const SERVED_RESULT_MAX_EVENTS: u64 = 8;
+/// Maximum serialized size of one retained event frame.
+pub const SERVED_RESULT_MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Material envelope wire identity, matched exactly with the publisher.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
 /// Material envelope wire version, matched exactly with the publisher.
@@ -95,6 +130,10 @@ pub const DISPATCH_MATERIAL_MAX_BYTES: u64 = 64 * 1024;
 /// owns the read path; the owner publisher stays the authority for the
 /// value.
 pub const WASM_DELIVERY_SLOT_DIR_NAME: &str = "eliot-wasm-host.generations";
+/// Owner publication-head record name, mirrored exactly with the publisher.
+pub const WASM_DELIVERY_HEAD_FILE_NAME: &str = "HEAD.json";
+/// Owner publication-head version, mirrored exactly with the publisher.
+pub const WASM_DELIVERY_HEAD_VERSION: u16 = 1;
 /// Owner pending-publication marker, mirrored exactly with the publisher.
 pub const WASM_DELIVERY_PENDING_FILE_NAME: &str = "PENDING.json";
 /// Owner ready-publication marker, mirrored exactly with the publisher. The
@@ -103,6 +142,8 @@ pub const WASM_DELIVERY_PENDING_FILE_NAME: &str = "PENDING.json";
 pub const WASM_DELIVERY_READY_FILE_NAME: &str = "READY.json";
 /// Owner failed-publication marker, mirrored exactly with the publisher.
 pub const WASM_DELIVERY_FAILED_FILE_NAME: &str = "FAILED.json";
+/// Owner retired-publication marker, mirrored exactly with the publisher.
+pub const WASM_DELIVERY_RETIRED_FILE_NAME: &str = "RETIRED.json";
 /// Owner-issued delivery-identity wire version, mirrored exactly with the
 /// publisher. A slot record carrying any other version is refused rather than
 /// reinterpreted.
@@ -618,6 +659,9 @@ pub enum MaterialError {
         /// Stable field name.
         field: &'static str,
     },
+    /// Installation-scoped OS exclusion or owner-state discovery was
+    /// unavailable; callers must retain the delivery and refuse execution.
+    Unavailable,
 }
 
 impl MaterialError {
@@ -631,6 +675,7 @@ impl MaterialError {
             Self::Malformed => "DISPATCH_MATERIAL_MALFORMED",
             Self::DigestMismatch => "DISPATCH_MATERIAL_DIGEST_MISMATCH",
             Self::InvalidRecord { .. } => "DISPATCH_MATERIAL_INVALID_RECORD",
+            Self::Unavailable => "DISPATCH_MATERIAL_UNAVAILABLE",
         }
     }
 }
@@ -1228,7 +1273,8 @@ pub fn consume_staged(path: &std::path::Path) -> ReclaimOutcome {
 /// typed field values is a different delivery, never a match. The owner's
 /// publication incarnation/revision stay in the owner slot record
 /// ([`OwnerDeliveryIdentity`]) and are cross-checked there.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagedDeliveryIdentity {
     /// Admitted claim identity.
     pub claim_id: String,
@@ -1252,12 +1298,73 @@ pub struct StagedDeliveryIdentity {
     pub expires_at: u64,
     /// Canonical live-authority-epoch JSON bound at admission.
     pub authority_epoch_json: String,
+    /// Version of the owner-issued delivery identity.
+    pub delivery_version: u16,
     /// Measured digest of the exact staged envelope bytes this identity was
     /// parsed from (hex).
     pub envelope_digest: Sha256Digest,
     /// Owner-measured installed child image digest (hex): the installation
     /// binding the owner recorded for this delivery.
     pub host_artifact_digest: Sha256Digest,
+    /// Owner publication incarnation and revision bound by the slot marker.
+    pub publication_incarnation: u64,
+    /// Monotonic revision assigned by the owner slot transition.
+    pub publication_revision: u64,
+    /// Exact claimant incarnation after first-writer claim, absent before it.
+    pub claimant_incarnation: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for StagedDeliveryIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireIdentity {
+            claim_id: String,
+            operation_id: String,
+            generation: u64,
+            launch_nonce: String,
+            grant_digest: String,
+            fence_generation: u64,
+            artifact_digest: String,
+            input_digest: String,
+            admitted_at_unix_ms: u64,
+            expires_at: u64,
+            authority_epoch_json: String,
+            delivery_version: u16,
+            envelope_digest: String,
+            host_artifact_digest: String,
+            publication_incarnation: u64,
+            publication_revision: u64,
+            claimant_incarnation: Option<String>,
+        }
+
+        let wire = WireIdentity::deserialize(deserializer)?;
+        let digest = |value: String| {
+            Sha256Digest::new(value).map_err(serde::de::Error::custom)
+        };
+        Ok(Self {
+            claim_id: wire.claim_id,
+            operation_id: wire.operation_id,
+            generation: wire.generation,
+            launch_nonce: wire.launch_nonce,
+            grant_digest: wire.grant_digest,
+            fence_generation: wire.fence_generation,
+            artifact_digest: wire.artifact_digest,
+            input_digest: wire.input_digest,
+            admitted_at_unix_ms: wire.admitted_at_unix_ms,
+            expires_at: wire.expires_at,
+            authority_epoch_json: wire.authority_epoch_json,
+            delivery_version: wire.delivery_version,
+            envelope_digest: digest(wire.envelope_digest)?,
+            host_artifact_digest: digest(wire.host_artifact_digest)?,
+            publication_incarnation: wire.publication_incarnation,
+            publication_revision: wire.publication_revision,
+            claimant_incarnation: wire.claimant_incarnation,
+        })
+    }
 }
 
 impl StagedDeliveryIdentity {
@@ -1269,8 +1376,9 @@ impl StagedDeliveryIdentity {
     pub fn from_material(
         material: &ValidatedDispatchMaterial,
         envelope_digest: Sha256Digest,
-    ) -> Self {
-        Self {
+        owner: &OwnerDeliveryIdentity,
+    ) -> Result<Self, MaterialError> {
+        let identity = Self {
             claim_id: material.claim_id.clone(),
             operation_id: material.operation_id.clone(),
             generation: material.generation,
@@ -1282,9 +1390,54 @@ impl StagedDeliveryIdentity {
             admitted_at_unix_ms: material.admitted_at_unix_ms,
             expires_at: material.grant.expires_at,
             authority_epoch_json: material.authority_epoch_json.clone(),
+            delivery_version: owner.delivery_version,
             envelope_digest,
             host_artifact_digest: material.host_artifact_digest.clone(),
+            publication_incarnation: owner.publication_incarnation,
+            publication_revision: owner.publication_revision,
+            claimant_incarnation: None,
+        };
+        if owner.names_material(&identity) {
+            Ok(identity)
+        } else {
+            Err(invalid("owner-delivery-identity"))
         }
+    }
+
+    /// Whether two identities name the same owner-issued delivery. The
+    /// claimant incarnation is intentionally separate because it names the
+    /// exclusive execution attempt, not the published material.
+    #[must_use]
+    pub fn same_delivery(&self, other: &Self) -> bool {
+        self.claim_id == other.claim_id
+            && self.operation_id == other.operation_id
+            && self.generation == other.generation
+            && self.launch_nonce == other.launch_nonce
+            && self.grant_digest == other.grant_digest
+            && self.fence_generation == other.fence_generation
+            && self.artifact_digest == other.artifact_digest
+            && self.input_digest == other.input_digest
+            && self.admitted_at_unix_ms == other.admitted_at_unix_ms
+            && self.expires_at == other.expires_at
+            && self.authority_epoch_json == other.authority_epoch_json
+            && self.delivery_version == other.delivery_version
+            && self.envelope_digest == other.envelope_digest
+            && self.host_artifact_digest == other.host_artifact_digest
+            && self.publication_incarnation == other.publication_incarnation
+            && self.publication_revision == other.publication_revision
+    }
+
+    /// Whether this identity carries the same delivery and exact claimant
+    /// incarnation as another identity.
+    #[must_use]
+    pub fn same_claim(&self, other: &Self) -> bool {
+        self.same_delivery(other) && self.claimant_incarnation == other.claimant_incarnation
+    }
+
+    fn with_claimant(&self, claimant_incarnation: &str) -> Self {
+        let mut identity = self.clone();
+        identity.claimant_incarnation = Some(claimant_incarnation.to_owned());
+        identity
     }
 }
 
@@ -1309,10 +1462,11 @@ impl DeliveryClaim {
     pub fn from_material(
         material: &ValidatedDispatchMaterial,
         envelope_digest: Sha256Digest,
-    ) -> Self {
-        Self {
-            identity: StagedDeliveryIdentity::from_material(material, envelope_digest),
-        }
+        owner: &OwnerDeliveryIdentity,
+    ) -> Result<Self, MaterialError> {
+        Ok(Self {
+            identity: StagedDeliveryIdentity::from_material(material, envelope_digest, owner)?,
+        })
     }
 
     /// Borrows the claimed identity.
@@ -1379,8 +1533,8 @@ const RECLAIM_ASIDE_SUFFIX: &str = ".reclaiming";
 
 /// Aside path for one fixed staging name under the claimed identity: the
 /// fixed name is only a locator, and this claimed-identity name is the
-/// only path ever deleted. The claim fragment is filename-sanitized and
-/// truncated; the process id scopes forensics, never authority.
+/// only path ever deleted. The claim and digest fragments are filename-
+/// sanitized and bounded; the full identity and bytes remain authority.
 fn reclaim_aside_path(
     install_dir: &std::path::Path,
     file_name: &str,
@@ -1401,82 +1555,128 @@ fn reclaim_aside_path(
     install_dir.join(format!(
         ".{file_name}.g{:020}.{fragment}.{}{RECLAIM_ASIDE_SUFFIX}",
         claim.generation,
-        std::process::id()
+        claim.envelope_digest.as_str(),
     ))
 }
 
-/// Removes orphaned aside files for one fixed staging name. Every aside
-/// predates this call, so under the single-driver rule (one child driver
-/// per install directory; the publisher never writes aside names) each
-/// one is a crash-window orphan whose fixed set already moved on. Bounded
-/// scan; failures are ignored because a leftover aside is inert evidence,
-/// never a live name. Callers run this only while the fixed name exists.
-fn remove_stale_reclaim_asides(install_dir: &std::path::Path, file_name: &str) {
-    let prefix = format!(".{file_name}.");
-    let Ok(entries) = std::fs::read_dir(install_dir) else {
-        return;
-    };
-    for entry in entries.flatten().take(64) {
-        let name = entry.file_name();
-        let Some(text) = name.to_str() else {
-            continue;
-        };
-        if text.starts_with(&prefix) && text.ends_with(RECLAIM_ASIDE_SUFFIX) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Restores aside bytes to their fixed name only when no successor owns
-/// it. The hard-link attempt is the atomic restore-if-absent path: it
-/// fails when the publisher already staged a successor, so a replacement
-/// is never clobbered. When the fixed name holds a successor, the aside
-/// bytes are already superseded (the owner slot retains them immutably)
-/// and the aside is removed so incidents cannot accumulate. When the
-/// fixed name is absent and the filesystem lacks hard links, a plain
-/// rename restores: safe on Windows (rename fails over an existing
-/// destination), with a narrow clobber window against a concurrent
-/// publisher on Unix. That window is the honest residual of filesystems
-/// without atomic restore-if-absent.
+/// Restores aside bytes only when the fixed name is absent. It never
+/// deletes the aside: callers without proof of the exact owner-slot copy
+/// and retirement disposition must preserve that recovery evidence.
 fn restore_aside_if_absent(aside: &std::path::Path, fixed: &std::path::Path) {
     if std::fs::hard_link(aside, fixed).is_ok() {
-        let _ = std::fs::remove_file(aside);
         return;
     }
     if std::fs::symlink_metadata(fixed).is_ok() {
-        let _ = std::fs::remove_file(aside);
         return;
     }
     let _ = std::fs::rename(aside, fixed);
 }
 
-/// Reclaims one fixed staging name by claim: renames the fixed name aside
-/// under the claimed-identity name, re-verifies the aside bytes against
-/// the claim, and deletes only the verified aside. A fixed name that went
-/// missing answers `NotFound`; aside bytes that fail verification are
-/// restored when no successor owns the name and answer `Preserved` — a
-/// replacement landing between the set pre-check and this removal is
-/// never deleted. Deletion targets the claimed aside path only, never a
-/// generic current pathname.
-#[must_use]
-pub fn reclaim_claimed_file(
+fn delivery_file_owner_copy_matches_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    file_name: &str,
+    identity: &StagedDeliveryIdentity,
+    bytes: &[u8],
+) -> bool {
+    if validate_installation_delivery_guard(guard, install_dir).is_err()
+        || !settled_delivery_is_reclaimable_locked(guard, install_dir, identity)
+    {
+        return false;
+    }
+    let (maximum, expected_digest) = match file_name {
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME => (
+            eliot_protocol::MAX_FRAME_BYTES,
+            identity.artifact_digest.as_str(),
+        ),
+        WASM_HOST_GUEST_INPUT_FILE_NAME => (
+            eliot_protocol::MAX_FRAME_BYTES,
+            identity.input_digest.as_str(),
+        ),
+        WASM_HOST_MATERIAL_FILE_NAME => (
+            DISPATCH_MATERIAL_MAX_BYTES as usize,
+            identity.envelope_digest.as_str(),
+        ),
+        _ => return false,
+    };
+    if Sha256Digest::of_bytes(bytes).as_str() != expected_digest {
+        return false;
+    }
+    let owner_path = delivery_slot_dir(install_dir, identity).join(file_name);
+    read_bounded_delivery_record(&owner_path, maximum).is_ok_and(|owner_bytes| {
+        owner_bytes.len() == bytes.len()
+            && Sha256Digest::of_bytes(&owner_bytes).as_str() == expected_digest
+    })
+}
+
+/// Reclaims one fixed staging name by claim while holding the installation
+/// lock. An existing aside is retained unless its exact identity, immutable
+/// owner-slot copy and settlement/ack disposition all verify. Deletion
+/// targets only this claim's aside path; uncertain bytes stay recoverable.
+fn reclaim_claimed_file(
+    guard: &InstallationDeliveryGuard,
     install_dir: &std::path::Path,
     file_name: &str,
     claim: &StagedDeliveryIdentity,
-    verify: impl FnOnce(&[u8]) -> bool,
+    verify: impl Fn(&[u8]) -> bool,
 ) -> ReclaimOutcome {
-    let fixed = install_dir.join(file_name);
-    match std::fs::symlink_metadata(&fixed) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ReclaimOutcome::NotFound;
-        }
-        Err(_) => {}
-        Ok(_) => remove_stale_reclaim_asides(install_dir, file_name),
+    if validate_installation_delivery_guard(guard, install_dir).is_err() {
+        return ReclaimOutcome::Other("delivery-lock-root-mismatch".to_owned());
     }
     let aside = reclaim_aside_path(install_dir, file_name, claim);
+    let fixed = install_dir.join(file_name);
+    let mut reclaimed_existing_aside = false;
+    match std::fs::symlink_metadata(&aside) {
+        Ok(_) => {
+            let bytes = match read_bounded_delivery_record(
+                &aside,
+                if file_name == WASM_HOST_MATERIAL_FILE_NAME {
+                    DISPATCH_MATERIAL_MAX_BYTES as usize
+                } else {
+                    eliot_protocol::MAX_FRAME_BYTES
+                },
+            ) {
+                Ok(bytes) => bytes,
+                Err(_) => return ReclaimOutcome::Other("aside-unreadable".to_owned()),
+            };
+            if !verify(&bytes)
+                || !delivery_file_owner_copy_matches_locked(
+                    guard,
+                    install_dir,
+                    file_name,
+                    claim,
+                    &bytes,
+                )
+            {
+                restore_aside_if_absent(&aside, &fixed);
+                return ReclaimOutcome::Preserved;
+            }
+            match consume_staged(&aside) {
+                outcome if outcome.reclaimed() => reclaimed_existing_aside = true,
+                outcome => return outcome,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return ReclaimOutcome::Other(error.kind().to_string()),
+    }
+    match std::fs::symlink_metadata(&fixed) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if reclaimed_existing_aside {
+                ReclaimOutcome::Reclaimed
+            } else {
+                ReclaimOutcome::NotFound
+            };
+        }
+        Err(error) => return ReclaimOutcome::Other(error.kind().to_string()),
+        Ok(_) => {}
+    }
     match std::fs::rename(&fixed, &aside) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ReclaimOutcome::NotFound;
+            return if reclaimed_existing_aside {
+                ReclaimOutcome::Reclaimed
+            } else {
+                ReclaimOutcome::NotFound
+            };
         }
         Err(error) if error.raw_os_error() == Some(32) => {
             return ReclaimOutcome::SharingViolation;
@@ -1487,11 +1687,18 @@ pub fn reclaim_claimed_file(
         Err(error) => return ReclaimOutcome::Other(error.kind().to_string()),
         Ok(()) => {}
     }
-    let Ok(bytes) = read_staged_bytes(&aside) else {
+    let maximum = if file_name == WASM_HOST_MATERIAL_FILE_NAME {
+        DISPATCH_MATERIAL_MAX_BYTES as usize
+    } else {
+        eliot_protocol::MAX_FRAME_BYTES
+    };
+    let Ok(bytes) = read_bounded_delivery_record(&aside, maximum) else {
         restore_aside_if_absent(&aside, &fixed);
         return ReclaimOutcome::Other("aside-unreadable".to_owned());
     };
-    if !verify(&bytes) {
+    if !verify(&bytes)
+        || !delivery_file_owner_copy_matches_locked(guard, install_dir, file_name, claim, &bytes)
+    {
         restore_aside_if_absent(&aside, &fixed);
         return ReclaimOutcome::Preserved;
     }
@@ -1504,77 +1711,77 @@ pub fn reclaim_claimed_file(
 /// loader and compares the full identity (claim, operation, generation,
 /// nonce, grant/fence, digests, window, epoch, material-set digest,
 /// installation binding); anything else is a replacement left untouched.
-/// Each removal then re-verifies on its own: the fixed name is renamed
-/// aside under the claimed-identity name and only aside bytes that still
-/// verify against the claim are deleted, so a replacement B landing after
-/// the pre-check is restored, never deleted. The envelope check re-hashes
-/// the claimed aside bytes against the material-set digest recorded when
-/// this claim was taken, so a replacement envelope that merely carries the
-/// same typed field values is never deleted either. A matching readable
-/// served marker is required before reclaim: absent or uncertain served
-/// state leaves the claimed bytes for recovery. No single-owner condition
-/// is asserted — the owner publisher stages replacements and retires
-/// expired sets concurrently by design — which is exactly why every
-/// deletion re-verifies after the move. Residual windows: the Unix restore
-/// path without hard-link support (see `restore_aside_if_absent`), and a
-/// crash between rename-aside and restore/delete orphaning one aside
-/// (removed on the next reclaim; the fixed set heals on the owner's next
-/// publication). The sibling kernel half fixes the analogous
-/// publisher-side race; coordination is by protocol (aside names never
-/// collide with publisher partials).
+/// Each removal re-verifies under the shared installation OS lock. The
+/// exact aside bytes must match the claim and the immutable owner-slot copy,
+/// and owner settlement plus receiver acknowledgement must still authorize
+/// reclamation. Any uncertainty preserves the aside and the original
+/// identity for recovery.
 #[must_use]
 pub fn reclaim_claimed_delivery(
     claim: &DeliveryClaim,
     install_dir: &std::path::Path,
 ) -> ClaimedReclamation {
-    let staged = match read_claimed_dispatch_material_from(install_dir) {
+    let Ok(guard) = acquire_installation_delivery_guard(install_dir) else {
+        return ClaimedReclamation::RetainedForRecovery {
+            claimed: claim.identity().clone(),
+        };
+    };
+    let identity = claim.identity();
+    let staged = match read_claimed_dispatch_material_from_locked(&guard, install_dir) {
         Ok(Some(current)) => current,
         Ok(None) => {
-            return ClaimedReclamation::AlreadyGone {
-                claimed: claim.identity().clone(),
+            return if settled_delivery_is_reclaimable_locked(&guard, install_dir, identity) {
+                ClaimedReclamation::AlreadyGone {
+                    claimed: identity.clone(),
+                }
+            } else {
+                ClaimedReclamation::RetainedForRecovery {
+                    claimed: identity.clone(),
+                }
             };
         }
         Err(_) => {
             return ClaimedReclamation::RetainedForRecovery {
-                claimed: claim.identity().clone(),
-            };
-        }
-    };
-    if staged.0.identity() != claim.identity() {
-        return ClaimedReclamation::ReplacementPreserved {
-            claimed: claim.identity().clone(),
-        };
-    }
-    let identity = claim.identity();
-    match read_served_marker(install_dir) {
-        Ok(Some(mark)) if mark.names(identity) => {}
-        Ok(_) | Err(_) => {
-            return ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
             };
         }
+    };
+    if staged.0.identity() != identity {
+        return ClaimedReclamation::ReplacementPreserved {
+            claimed: identity.clone(),
+        };
+    }
+    if !matches!(
+        read_delivery_publication_locked(&guard, install_dir, identity),
+        Ok(OwnerPublicationLookup::Published(ref state))
+            if state.is_ready() && state.names(identity)
+    ) || !settled_delivery_is_reclaimable_locked(&guard, install_dir, identity)
+    {
+        return ClaimedReclamation::RetainedForRecovery {
+            claimed: identity.clone(),
+        };
     }
     let artifact = reclaim_claimed_file(
+        &guard,
         install_dir,
         WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
         identity,
         |bytes| Sha256Digest::of_bytes(bytes).as_str() == identity.artifact_digest.as_str(),
     );
     let input = reclaim_claimed_file(
+        &guard,
         install_dir,
         WASM_HOST_GUEST_INPUT_FILE_NAME,
         identity,
         |bytes| Sha256Digest::of_bytes(bytes).as_str() == identity.input_digest.as_str(),
     );
     let material = reclaim_claimed_file(
+        &guard,
         install_dir,
         WASM_HOST_MATERIAL_FILE_NAME,
         identity,
         |bytes| Sha256Digest::of_bytes(bytes) == identity.envelope_digest,
     );
-    // Any preserved file means a replacement owns the fixed names now:
-    // already-removed files were exactly-claimed verified bytes, and the
-    // current names are left untouched for the next drive.
     if matches!(artifact, ReclaimOutcome::Preserved)
         || matches!(input, ReclaimOutcome::Preserved)
         || matches!(material, ReclaimOutcome::Preserved)
@@ -1583,36 +1790,38 @@ pub fn reclaim_claimed_delivery(
             claimed: identity.clone(),
         };
     }
-    // The served marker retires only with its own fully gone set: while any
-    // staged file resists removal, the marker stays so the next drive
-    // replays instead of re-executing a partially reclaimed set. A marker
-    // naming another identity is never touched here.
-    if reclamation_gone(&artifact)
-        && reclamation_gone(&input)
-        && reclamation_gone(&material)
-        && let Ok(Some(mark)) = read_served_marker(install_dir)
-        && mark.names(claim.identity())
-    {
-        let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_FILE_NAME));
-    }
-    // The served-result record retires under the same rule: only with its
-    // own fully gone set, and only when it names exactly this identity. A
-    // partial reclamation keeps the exact retained frame for recovery, and
-    // a record naming another identity is never touched here.
-    if reclamation_gone(&artifact)
-        && reclamation_gone(&input)
-        && reclamation_gone(&material)
-        && let Ok(Some(record)) = read_served_result(install_dir)
-        && record.names(claim.identity())
-    {
-        let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME));
-    }
+    // Per-delivery markers, stream, acknowledgement and settlement evidence
+    // remain in the owner generation slot for the Kernel retirement gate.
     ClaimedReclamation::Reclaimed(DeliveryReclamation {
-        identity: claim.identity().clone(),
+        identity: identity.clone(),
         artifact,
         input,
         material,
     })
+}
+
+fn settled_delivery_is_reclaimable_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> bool {
+    if !matches!(
+        read_delivery_publication_locked(guard, install_dir, identity),
+        Ok(OwnerPublicationLookup::Published(ref state))
+            if state.is_ready() && state.names(identity)
+    ) {
+        return false;
+    }
+    let _unattested_settlement = match read_delivery_process_settlement_locked(guard, install_dir, identity) {
+        Ok(Some(settlement)) => settlement,
+        _ => return false,
+    };
+    // The on-disk settlement is child-serializable JSON with a caller-chosen
+    // digest. It is a compatibility observation only, not #2785 process-owner
+    // evidence. Keep both NO_EFFECT and EFFECT_SETTLED fail-closed until a
+    // typed process-owner proof is integrated; EFFECT_SETTLED additionally
+    // needs #2787's receiver-owned acknowledgement/readback.
+    false
 }
 
 /// Requires one owner-recorded field to be a well-formed lowercase digest.
@@ -1672,6 +1881,16 @@ impl OwnerDeliveryIdentity {
     /// pathname or a well-formed token is not a match.
     #[must_use]
     pub fn names(&self, claim: &StagedDeliveryIdentity) -> bool {
+        self.names_material(claim)
+            && self.delivery_version == claim.delivery_version
+            && self.publication_incarnation == claim.publication_incarnation
+            && self.publication_revision == claim.publication_revision
+    }
+
+    /// Whether the published owner identity binds this material envelope,
+    /// before the publication-only fields are copied into the child claim.
+    #[must_use]
+    fn names_material(&self, claim: &StagedDeliveryIdentity) -> bool {
         self.claim_id == claim.claim_id
             && self.operation_id == claim.operation_id
             && self.generation == claim.generation
@@ -1752,6 +1971,19 @@ pub enum OwnerPublicationState {
         #[serde(rename = "reason")]
         _reason: String,
     },
+    /// Owner-proven retired delivery. Its spent identity remains durable
+    /// evidence even after the fixed installation names are reused.
+    Retired {
+        /// Retired delivery identity.
+        identity: OwnerDeliveryIdentity,
+        /// Closed owner disposition used to authorize retirement.
+        disposition: String,
+        /// Digest of the exact settlement evidence that authorized retirement.
+        settlement_digest: String,
+        /// Reserved receiver ACK digest; current host/kernel code does not
+        /// admit `EFFECT_SETTLED` retirement without receipt readback.
+        acknowledgement_digest: Option<String>,
+    },
 }
 
 impl OwnerPublicationState {
@@ -1761,7 +1993,8 @@ impl OwnerPublicationState {
         match self {
             Self::Pending { identity }
             | Self::Ready { identity }
-            | Self::Failed { identity, .. } => identity,
+            | Self::Failed { identity, .. }
+            | Self::Retired { identity, .. } => identity,
         }
     }
 
@@ -1772,6 +2005,7 @@ impl OwnerPublicationState {
             Self::Pending { .. } => "DELIVERY_PENDING",
             Self::Ready { .. } => "DELIVERY_READY",
             Self::Failed { .. } => "DELIVERY_FAILED",
+            Self::Retired { .. } => "DELIVERY_RETIRED",
         }
     }
 
@@ -1794,8 +2028,38 @@ impl OwnerPublicationState {
     /// Returns [`MaterialError`] when the recorded identity is malformed
     /// or carries an unsupported version.
     fn validate(&self) -> Result<(), MaterialError> {
-        self.identity().validate()
+        self.identity().validate()?;
+        if let Self::Retired {
+            disposition,
+            settlement_digest,
+            acknowledgement_digest,
+            ..
+        } = self
+        {
+            if !matches!(disposition.as_str(), "NO_EFFECT" | "EFFECT_SETTLED") {
+                return Err(MaterialError::Malformed);
+            }
+            hex_digest(settlement_digest, "owner-retirement-settlement-digest")?;
+            match (disposition.as_str(), acknowledgement_digest.as_deref()) {
+                ("NO_EFFECT", None) => {}
+                _ => return Err(MaterialError::Malformed),
+            }
+        }
+        Ok(())
     }
+}
+
+/// Explicit owner publication lookup result. Missing new-format publication
+/// and legacy fixed-name evidence are distinct states; neither is Ready, and
+/// this reader currently never certifies the legacy variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnerPublicationLookup {
+    /// A typed new-format owner state was found and validated.
+    Published(OwnerPublicationState),
+    /// No owner slot marker exists for this exact identity.
+    MissingNewFormat,
+    /// Explicit legacy classification for a separately proven migration.
+    LegacyV1FixedName,
 }
 
 /// Immutable slot locator for one claimed delivery, derived exactly as the
@@ -1807,11 +2071,65 @@ fn delivery_slot_dir(
     install_dir: &std::path::Path,
     claim: &StagedDeliveryIdentity,
 ) -> std::path::PathBuf {
-    let digest = claim.envelope_digest.as_str();
+    delivery_slot_dir_for_envelope(
+        install_dir,
+        claim.generation,
+        claim.envelope_digest.as_str(),
+    )
+}
+
+fn delivery_slot_dir_for_envelope(
+    install_dir: &std::path::Path,
+    generation: u64,
+    envelope_digest: &str,
+) -> std::path::PathBuf {
+    let digest = envelope_digest;
     let prefix = digest.get(..16).unwrap_or(digest);
     install_dir
         .join(WASM_DELIVERY_SLOT_DIR_NAME)
-        .join(format!("{:020}-{prefix}", claim.generation))
+        .join(format!("{generation:020}-{prefix}"))
+}
+
+static DELIVERY_PARTIAL_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn claimant_incarnation() -> String {
+    let sequence = DELIVERY_PARTIAL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{}-{timestamp:032x}-{sequence:020}", std::process::id())
+}
+
+fn write_delivery_file_atomic_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    destination: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    validate_installation_delivery_guard(guard, install_dir)?;
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "delivery record has no parent")
+    })?;
+    let sequence = DELIVERY_PARTIAL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let partial = parent.join(format!(
+        ".delivery-{}-{sequence:020}.partial",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    eliot_windows_ipc::atomic_replace_file(&partial, destination)?;
+    #[cfg(not(windows))]
+    std::fs::rename(&partial, destination)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Reads the owner publication state for the claimed generation's slot.
@@ -1825,9 +2143,9 @@ fn delivery_slot_dir(
 /// A slot with no parsable marker is not a state at all, never a complete
 /// set.
 ///
-/// `Ok(None)` means the owner recorded no publication for this delivery:
-/// the legacy v1 fixed-name compatibility state, which the caller admits
-/// only under full admission with the staged identity verbatim.
+/// `Ok(None)` means this delivery has no owner publication record. Callers
+/// must fail closed; a missing new-format record is never permission to
+/// admit the fixed-name files as a fresh legacy delivery.
 ///
 /// # Errors
 ///
@@ -1837,14 +2155,54 @@ fn delivery_slot_dir(
 pub fn read_delivery_publication(
     install_dir: &std::path::Path,
     claim: &StagedDeliveryIdentity,
-) -> Result<Option<OwnerPublicationState>, MaterialError> {
-    let slot = delivery_slot_dir(install_dir, claim);
+) -> Result<OwnerPublicationLookup, MaterialError> {
+    let guard = acquire_installation_delivery_guard(install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    read_delivery_publication_locked(&guard, install_dir, claim)
+}
+
+fn read_delivery_publication_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+) -> Result<OwnerPublicationLookup, MaterialError> {
+    let state = read_delivery_publication_at_slot_locked(
+        guard,
+        install_dir,
+        claim.generation,
+        claim.envelope_digest.as_str(),
+    )?;
+    match &state {
+        OwnerPublicationLookup::Published(state) if !state.names(claim) => {
+            return Err(invalid("owner-delivery-identity"));
+        }
+        OwnerPublicationLookup::Published(_) | OwnerPublicationLookup::MissingNewFormat => {}
+        OwnerPublicationLookup::LegacyV1FixedName => {
+            return Err(MaterialError::Unavailable);
+        }
+    }
+    Ok(state)
+}
+
+fn read_delivery_publication_at_slot_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    generation: u64,
+    envelope_digest: &str,
+) -> Result<OwnerPublicationLookup, MaterialError> {
+    validate_installation_delivery_guard(guard, install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    let slot = delivery_slot_dir_for_envelope(install_dir, generation, envelope_digest);
     for file_name in [
+        WASM_DELIVERY_RETIRED_FILE_NAME,
         WASM_DELIVERY_READY_FILE_NAME,
         WASM_DELIVERY_FAILED_FILE_NAME,
         WASM_DELIVERY_PENDING_FILE_NAME,
     ] {
-        let bytes = match read_staged_bytes(&slot.join(file_name)) {
+        let bytes = match read_bounded_delivery_record(
+            &slot.join(file_name),
+            DELIVERY_IDENTITY_MARKER_MAX_BYTES,
+        ) {
             Err(MaterialError::Missing) => continue,
             Err(error) => return Err(error),
             Ok(bytes) => bytes,
@@ -1856,6 +2214,10 @@ pub fn read_delivery_publication(
         // state per marker name.
         let expected = matches!(
             (&state, file_name),
+            (
+                OwnerPublicationState::Retired { .. },
+                WASM_DELIVERY_RETIRED_FILE_NAME
+            ) |
             (
                 OwnerPublicationState::Ready { .. },
                 WASM_DELIVERY_READY_FILE_NAME
@@ -1871,33 +2233,60 @@ pub fn read_delivery_publication(
             return Err(MaterialError::Malformed);
         }
         state.validate()?;
-        return Ok(Some(state));
+        return Ok(OwnerPublicationLookup::Published(state));
     }
-    Ok(None)
+    Ok(OwnerPublicationLookup::MissingNewFormat)
+}
+
+fn delivery_is_current_and_ready_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> bool {
+    let ready = matches!(
+        read_delivery_publication_locked(guard, install_dir, identity),
+        Ok(OwnerPublicationLookup::Published(ref state))
+            if state.is_ready() && state.names(identity)
+    );
+    if !ready {
+        return false;
+    }
+    matches!(
+        read_claimed_dispatch_material_from_locked(guard, install_dir),
+        Ok(Some((ref claim, _))) if claim.identity().same_delivery(identity)
+    )
+}
+
+fn material_error_to_io(error: MaterialError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
 }
 
 /// Restart/discovery classification (#2786 step 7): restart discovers owner
 /// publication/claim state through the owner's own generation-slot marker
 /// ([`read_delivery_publication`]) plus durable retention, not arbitrary
-/// files alone. Legacy v1 fixed-name sets are an explicit compatibility
-/// state — a staged set with no owner slot record, consumed only under full
-/// admission with the staged identity verbatim, never reinterpreted as a
-/// fresh generation with new identity. `InFlight` sets reconcile through the
-/// durable pre-execution claim marker and terminal-unacknowledged sets
+/// files alone. A staged set without an owner slot record is unavailable
+/// evidence, never permission to execute as legacy. `InFlight` sets reconcile
+/// through the durable pre-execution claim marker and terminal-unacknowledged sets
 /// through the durable served marker; cross-operation owner
 /// ack/retirement stays with the kernel publisher half.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StagedDeliveryState {
+    /// Exact owner delivery has no durable claim or result and may attempt
+    /// the first-writer claim transition.
+    Fresh { identity: StagedDeliveryIdentity },
     /// Staged set matches served state: replay, no second guest effect.
     Replay { identity: StagedDeliveryIdentity },
-    /// Legacy v1 fixed-name set: explicit compat, full admission only.
+    /// The grant or claimant is already bound to a different full owner
+    /// identity; refuse without executing or treating it as a replay.
+    Conflict { identity: StagedDeliveryIdentity },
+    /// Legacy fixed-name state. Retained for wire compatibility, never emitted
+    /// unless an explicit migration proof is added.
     LegacyV1FixedName { identity: StagedDeliveryIdentity },
 }
 
-/// Classifies the claimed staged delivery against served retention. Same
-/// identity — or the same grant digest under any differing
-/// generation/operation/digests — is a replay of spent one-shot authority,
-/// never a fresh execution. The served set carries every identity this drive
+/// Classifies the claimed staged delivery against served retention. An exact
+/// owner identity is a replay; reuse of a grant or claimant under a different
+/// owner identity is a conflict. The served set carries every identity this drive
 /// served, so an older grant re-staged after a newer serve still replays
 /// instead of re-executing. The durable markers extend the same rule across
 /// restart: a staged set the served marker names is terminal-unacknowledged
@@ -1911,34 +2300,61 @@ pub enum StagedDeliveryState {
 #[must_use]
 pub fn classify_staged_delivery(
     identity: &StagedDeliveryIdentity,
+    publication: &OwnerPublicationLookup,
     served: &[StagedDeliveryIdentity],
     marker: Option<&ServedDeliveryMarker>,
     inflight: Option<&InFlightDeliveryMarker>,
 ) -> StagedDeliveryState {
-    if served.contains(identity)
-        || served
-            .iter()
-            .any(|prior| prior.grant_digest == identity.grant_digest)
-    {
+    match publication {
+        OwnerPublicationLookup::Published(state)
+            if state.is_ready() && state.validate().is_ok() && state.names(identity) => {}
+        OwnerPublicationLookup::LegacyV1FixedName => {
+            return StagedDeliveryState::LegacyV1FixedName {
+                identity: identity.clone(),
+            };
+        }
+        OwnerPublicationLookup::Published(_)
+        | OwnerPublicationLookup::MissingNewFormat => {
+            return StagedDeliveryState::Conflict {
+                identity: identity.clone(),
+            };
+        }
+    }
+    if served.iter().any(|prior| prior.same_delivery(identity)) {
         return StagedDeliveryState::Replay {
             identity: identity.clone(),
         };
     }
-    if let Some(mark) = inflight
-        && (mark.names(identity) || mark.grant_digest == identity.grant_digest)
+    if served
+        .iter()
+        .any(|prior| prior.grant_digest == identity.grant_digest)
     {
-        return StagedDeliveryState::Replay {
+        return StagedDeliveryState::Conflict {
             identity: identity.clone(),
         };
+    }
+    if let Some(mark) = inflight {
+        if mark.names(identity) {
+            return StagedDeliveryState::Replay {
+                identity: identity.clone(),
+            };
+        }
+        if mark.grant_digest == identity.grant_digest {
+            return StagedDeliveryState::Conflict {
+                identity: identity.clone(),
+            };
+        }
     }
     match marker {
         Some(mark) if mark.names(identity) => StagedDeliveryState::Replay {
             identity: identity.clone(),
         },
-        Some(mark) if mark.grant_digest == identity.grant_digest => StagedDeliveryState::Replay {
-            identity: identity.clone(),
-        },
-        _ => StagedDeliveryState::LegacyV1FixedName {
+        Some(mark) if mark.grant_digest == identity.grant_digest => {
+            StagedDeliveryState::Conflict {
+                identity: identity.clone(),
+            }
+        }
+        _ => StagedDeliveryState::Fresh {
             identity: identity.clone(),
         },
     }
@@ -1950,6 +2366,10 @@ pub fn classify_staged_delivery(
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServedDeliveryMarker {
+    /// Complete served identity, including launch, fence, material and host
+    /// bindings. The smaller fields below are checked mirrors for existing
+    /// request-loop classification only.
+    pub delivery_identity: StagedDeliveryIdentity,
     /// Served operation identity.
     pub operation_id: String,
     /// Served generation.
@@ -1967,6 +2387,7 @@ impl ServedDeliveryMarker {
     #[must_use]
     pub fn from_identity(identity: &StagedDeliveryIdentity, served_at_unix_ms: u64) -> Self {
         Self {
+            delivery_identity: identity.clone(),
             operation_id: identity.operation_id.clone(),
             generation: identity.generation,
             claim_id: identity.claim_id.clone(),
@@ -1978,7 +2399,12 @@ impl ServedDeliveryMarker {
     /// Whether this marker names exactly the staged identity.
     #[must_use]
     pub fn names(&self, identity: &StagedDeliveryIdentity) -> bool {
-        self.operation_id == identity.operation_id
+        self.delivery_identity.same_delivery(identity)
+            && identity
+                .claimant_incarnation
+                .as_ref()
+                .is_none_or(|claimant| self.delivery_identity.claimant_incarnation.as_ref() == Some(claimant))
+            && self.operation_id == identity.operation_id
             && self.generation == identity.generation
             && self.claim_id == identity.claim_id
             && self.grant_digest == identity.grant_digest
@@ -1991,37 +2417,28 @@ impl ServedDeliveryMarker {
 /// The bounded read accepts a few hundred bytes for a legitimate marker.
 pub fn read_served_marker(
     install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
 ) -> Result<Option<ServedDeliveryMarker>, MaterialError> {
-    const MAX_BYTES: usize = 4096;
+    let guard = acquire_installation_delivery_guard(install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    read_served_marker_locked(&guard, install_dir, identity)
+}
 
-    let path = install_dir.join(WASM_HOST_SERVED_FILE_NAME);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.len() > MAX_BYTES as u64 => {
-            return Err(MaterialError::TooLarge);
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
-    }
+fn read_served_marker_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> Result<Option<ServedDeliveryMarker>, MaterialError> {
+    validate_installation_delivery_guard(guard, install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    const MAX_BYTES: usize = DELIVERY_IDENTITY_MARKER_MAX_BYTES;
 
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return match std::fs::symlink_metadata(&path) {
-                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(other) => Err(MaterialError::Unreadable(other.kind().to_string())),
-                Ok(_) => Err(MaterialError::Unreadable(error.kind().to_string())),
-            };
-        }
-        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_SERVED_FILE_NAME);
+    let bytes = match read_bounded_delivery_record(&path, MAX_BYTES) {
+        Err(MaterialError::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(bytes) => bytes,
     };
-    let mut bounded = std::io::Read::take(file, (MAX_BYTES + 1) as u64);
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut bounded, &mut bytes)
-        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
-    if bytes.len() > MAX_BYTES {
-        return Err(MaterialError::TooLarge);
-    }
     let marker: ServedDeliveryMarker =
         serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
     if marker.operation_id.trim().is_empty()
@@ -2031,30 +2448,64 @@ pub fn read_served_marker(
         return Err(MaterialError::Malformed);
     }
     hex_digest(&marker.grant_digest, "served-marker-grant-digest")?;
+    validate_staged_delivery_identity(&marker.delivery_identity)?;
+    if !marker.names(identity) {
+        return Err(MaterialError::InvalidRecord {
+            field: "served-marker-identity",
+        });
+    }
     Ok(Some(marker))
 }
 
-/// Writes the served marker atomically (process-scoped partial, flushed,
-/// then renamed): the reader never observes partial JSON. Callers must
-/// propagate a write failure and retain the claimed set for recovery.
+/// Writes the identity-scoped served marker atomically while holding the
+/// installation lock. It requires a durable terminal result stream first;
+/// callers must propagate a write failure and retain the claimed set.
 pub fn write_served_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
     served_at_unix_ms: u64,
 ) -> std::io::Result<()> {
-    let marker = ServedDeliveryMarker::from_identity(identity, served_at_unix_ms);
+    let guard = acquire_installation_delivery_guard(install_dir)?;
+    validate_installation_delivery_guard(&guard, install_dir)?;
+    if !delivery_is_current_and_ready_locked(&guard, install_dir, identity) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "served-marker-owner-state-conflict",
+        ));
+    }
+    let inflight = read_inflight_marker_locked(&guard, install_dir, identity)
+        .map_err(material_error_to_io)?
+        .ok_or_else(|| std::io::Error::other("served-marker-claim-missing"))?;
+    let claimed_identity = identity.with_claimant(&inflight.claimant_incarnation);
+    if identity
+        .claimant_incarnation
+        .as_ref()
+        .is_some_and(|value| value != &inflight.claimant_incarnation)
+        || !matches!(
+            read_served_result_locked(&guard, install_dir, &claimed_identity),
+            Ok(Some(ref record)) if record.names(&claimed_identity) && record.terminal_sequence.is_some()
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "served-marker-terminal-result-not-retained",
+        ));
+    }
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_SERVED_FILE_NAME);
+    if let Some(existing) = read_served_marker_locked(&guard, install_dir, &claimed_identity)
+        .map_err(material_error_to_io)?
+    {
+        if existing.names(&claimed_identity) {
+            return Ok(());
+        }
+    }
+    let marker = ServedDeliveryMarker::from_identity(&claimed_identity, served_at_unix_ms);
     let bytes =
         serde_json::to_vec(&marker).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let partial = install_dir.join(format!(
-        ".{}.{}.partial",
-        WASM_HOST_SERVED_FILE_NAME,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&partial);
-    std::fs::write(&partial, &bytes)?;
-    std::fs::File::open(&partial)?.sync_all()?;
-    std::fs::rename(&partial, install_dir.join(WASM_HOST_SERVED_FILE_NAME))?;
-    Ok(())
+    if bytes.len() > DELIVERY_IDENTITY_MARKER_MAX_BYTES {
+        return Err(std::io::Error::other("served-marker-too-large"));
+    }
+    write_delivery_file_atomic_locked(&guard, install_dir, &path, &bytes)
 }
 
 /// Durable pre-execution claim record: the identity this drive is about to
@@ -2063,6 +2514,10 @@ pub fn write_served_marker(
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InFlightDeliveryMarker {
+    /// Complete claimed identity, including launch, fence, material and host
+    /// bindings. The smaller fields below are checked mirrors for existing
+    /// request-loop classification only.
+    pub delivery_identity: StagedDeliveryIdentity,
     /// Claimed operation identity.
     pub operation_id: String,
     /// Claimed generation.
@@ -2071,6 +2526,8 @@ pub struct InFlightDeliveryMarker {
     pub claim_id: String,
     /// Claimed grant digest (hex).
     pub grant_digest: String,
+    /// Unique claimant incarnation persisted before any guest effect.
+    pub claimant_incarnation: String,
     /// Wall-clock milliseconds when the marker was written.
     pub claimed_at_unix_ms: u64,
 }
@@ -2079,11 +2536,14 @@ impl InFlightDeliveryMarker {
     /// Captures the claim record for one delivery identity.
     #[must_use]
     pub fn from_identity(identity: &StagedDeliveryIdentity, claimed_at_unix_ms: u64) -> Self {
+        let claimant_incarnation = claimant_incarnation();
         Self {
+            delivery_identity: identity.with_claimant(&claimant_incarnation),
             operation_id: identity.operation_id.clone(),
             generation: identity.generation,
             claim_id: identity.claim_id.clone(),
             grant_digest: identity.grant_digest.clone(),
+            claimant_incarnation,
             claimed_at_unix_ms,
         }
     }
@@ -2091,7 +2551,14 @@ impl InFlightDeliveryMarker {
     /// Whether this marker names exactly the staged identity.
     #[must_use]
     pub fn names(&self, identity: &StagedDeliveryIdentity) -> bool {
-        self.operation_id == identity.operation_id
+        self.delivery_identity.same_delivery(identity)
+            && self.delivery_identity.claimant_incarnation.as_deref()
+                == Some(self.claimant_incarnation.as_str())
+            && identity
+                .claimant_incarnation
+                .as_ref()
+                .is_none_or(|claimant| claimant == &self.claimant_incarnation)
+            && self.operation_id == identity.operation_id
             && self.generation == identity.generation
             && self.claim_id == identity.claim_id
             && self.grant_digest == identity.grant_digest
@@ -2104,230 +2571,644 @@ impl InFlightDeliveryMarker {
 /// The bounded read accepts a few hundred bytes for a legitimate marker.
 pub fn read_inflight_marker(
     install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
 ) -> Result<Option<InFlightDeliveryMarker>, MaterialError> {
-    const MAX_BYTES: usize = 4096;
+    let guard = acquire_installation_delivery_guard(install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    read_inflight_marker_locked(&guard, install_dir, identity)
+}
 
-    let path = install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.len() > MAX_BYTES as u64 => {
-            return Err(MaterialError::TooLarge);
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
-    }
+fn read_inflight_marker_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> Result<Option<InFlightDeliveryMarker>, MaterialError> {
+    validate_installation_delivery_guard(guard, install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    const MAX_BYTES: usize = DELIVERY_IDENTITY_MARKER_MAX_BYTES;
 
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return match std::fs::symlink_metadata(&path) {
-                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(other) => Err(MaterialError::Unreadable(other.kind().to_string())),
-                Ok(_) => Err(MaterialError::Unreadable(error.kind().to_string())),
-            };
-        }
-        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_INFLIGHT_FILE_NAME);
+    let bytes = match read_bounded_delivery_record(&path, MAX_BYTES) {
+        Err(MaterialError::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(bytes) => bytes,
     };
-    let mut bounded = std::io::Read::take(file, (MAX_BYTES + 1) as u64);
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut bounded, &mut bytes)
-        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
-    if bytes.len() > MAX_BYTES {
-        return Err(MaterialError::TooLarge);
-    }
     let marker: InFlightDeliveryMarker =
         serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
     if marker.operation_id.trim().is_empty()
         || marker.claim_id.trim().is_empty()
         || marker.generation == 0
+        || marker.claimant_incarnation.trim().is_empty()
     {
         return Err(MaterialError::Malformed);
     }
     hex_digest(&marker.grant_digest, "inflight-marker-grant-digest")?;
+    validate_staged_delivery_identity(&marker.delivery_identity)?;
+    if !marker.names(identity) {
+        return Err(MaterialError::InvalidRecord {
+            field: "inflight-marker-identity",
+        });
+    }
     Ok(Some(marker))
 }
 
-/// Writes the `InFlight` marker atomically (process-scoped partial, flushed,
-/// then renamed): the reader never observes partial JSON. Callers must
-/// propagate a write failure and refuse execution without durable claim
-/// evidence.
+/// First-writer-wins result of the cross-process delivery claim transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryClaimOutcome {
+    /// This caller durably claimed the exact ready generation and may execute.
+    Acquired,
+    /// An exact in-flight marker already owns this delivery.
+    ExistingInFlight,
+    /// An exact retained result already owns this delivery; replay without effects.
+    RetainedResult,
+    /// The current material, owner state, or retained identity conflicts.
+    Conflict,
+    /// The installation lock or owner-state discovery was unavailable.
+    Unavailable,
+}
+
+/// Persists the exact `InFlight` claim atomically under the shared lock.
+/// Only `Acquired` grants permission to execute; callers must refuse execution
+/// for every other outcome.
 pub fn write_inflight_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
     claimed_at_unix_ms: u64,
-) -> std::io::Result<()> {
+) -> DeliveryClaimOutcome {
+    let Ok(guard) = acquire_installation_delivery_guard(install_dir) else {
+        return DeliveryClaimOutcome::Unavailable;
+    };
+    if validate_installation_delivery_guard(&guard, install_dir).is_err() {
+        return DeliveryClaimOutcome::Unavailable;
+    }
+    if !delivery_is_current_and_ready_locked(&guard, install_dir, identity) {
+        return DeliveryClaimOutcome::Conflict;
+    }
+    match read_served_result_locked(&guard, install_dir, identity) {
+        Ok(Some(record)) if record.names(identity) => return DeliveryClaimOutcome::RetainedResult,
+        Ok(None) => {}
+        Ok(Some(_)) => return DeliveryClaimOutcome::Conflict,
+        Err(MaterialError::InvalidRecord { .. }) => return DeliveryClaimOutcome::Conflict,
+        Err(_) => return DeliveryClaimOutcome::Unavailable,
+    }
+    match read_served_marker_locked(&guard, install_dir, identity) {
+        Ok(Some(marker)) if marker.names(identity) => return DeliveryClaimOutcome::RetainedResult,
+        Ok(None) => {}
+        Ok(Some(_)) => return DeliveryClaimOutcome::Conflict,
+        Err(MaterialError::InvalidRecord { .. }) => return DeliveryClaimOutcome::Conflict,
+        Err(_) => return DeliveryClaimOutcome::Unavailable,
+    }
+    match read_inflight_marker_locked(&guard, install_dir, identity) {
+        Ok(Some(marker)) if marker.names(identity) => return DeliveryClaimOutcome::ExistingInFlight,
+        Ok(None) if identity.claimant_incarnation.is_none() => {}
+        Ok(None) => return DeliveryClaimOutcome::Conflict,
+        Ok(Some(_)) => return DeliveryClaimOutcome::Conflict,
+        Err(MaterialError::InvalidRecord { .. }) => return DeliveryClaimOutcome::Conflict,
+        Err(_) => return DeliveryClaimOutcome::Unavailable,
+    }
     let marker = InFlightDeliveryMarker::from_identity(identity, claimed_at_unix_ms);
     let bytes =
-        serde_json::to_vec(&marker).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let partial = install_dir.join(format!(
-        ".{}.{}.partial",
-        WASM_HOST_INFLIGHT_FILE_NAME,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&partial);
-    std::fs::write(&partial, &bytes)?;
-    std::fs::File::open(&partial)?.sync_all()?;
-    std::fs::rename(&partial, install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME))?;
-    Ok(())
+        match serde_json::to_vec(&marker) {
+            Ok(bytes) => bytes,
+            Err(_) => return DeliveryClaimOutcome::Unavailable,
+        };
+    if bytes.len() > DELIVERY_IDENTITY_MARKER_MAX_BYTES {
+        return DeliveryClaimOutcome::Unavailable;
+    }
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_INFLIGHT_FILE_NAME);
+    match write_delivery_file_atomic_locked(&guard, install_dir, &path, &bytes) {
+        Ok(()) => DeliveryClaimOutcome::Acquired,
+        Err(_) => DeliveryClaimOutcome::Unavailable,
+    }
 }
 
-/// Clears the `InFlight` marker once the served marker is durable: only a
-/// marker naming exactly this identity is removed, so a successor claim is
-/// never touched. Best-effort by contract — the served marker remains the
-/// primary replay guard, so a leftover only replays, never re-executes.
-/// Returns whether no marker for this identity remains.
+/// Confirms the exact in-flight claim has a durable terminal result and
+/// served marker. The claim record is intentionally retained so the process
+/// settlement owner can bind its evidence to the claimant incarnation.
+/// A missing claim is successful only when the exact retained terminal
+/// transition still binds the served marker and result to one claimant.
 #[must_use]
 pub fn clear_inflight_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
 ) -> bool {
-    match read_inflight_marker(install_dir) {
-        Ok(Some(mark)) if mark.names(identity) => {
-            std::fs::remove_file(install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).is_ok()
-        }
-        Ok(Some(_) | None) => true,
-        Err(_) => false,
+    let Ok(guard) = acquire_installation_delivery_guard(install_dir) else {
+        return false;
+    };
+    if validate_installation_delivery_guard(&guard, install_dir).is_err() {
+        return false;
     }
+    if !delivery_is_current_and_ready_locked(&guard, install_dir, identity) {
+        return false;
+    }
+    let marker = match read_inflight_marker_locked(&guard, install_dir, identity) {
+        Ok(Some(marker)) if marker.names(identity) => Some(marker),
+        Ok(Some(_)) => return false,
+        Ok(None) => None,
+        Err(_) => return false,
+    };
+    let served = match read_served_marker_locked(&guard, install_dir, identity) {
+        Ok(Some(served)) if served.names(identity) => served,
+        _ => return false,
+    };
+    let result = match read_served_result_locked(&guard, install_dir, identity) {
+        Ok(Some(result))
+            if result.names(identity) && result.terminal_sequence.is_some() => result,
+        _ => return false,
+    };
+    let Some(claimant) = served.delivery_identity.claimant_incarnation.as_deref() else {
+        return false;
+    };
+    if claimant.trim().is_empty()
+        || !served.names(&served.delivery_identity)
+        || !result.names(&served.delivery_identity)
+        || result.identity.claimant_incarnation.as_deref() != Some(claimant)
+        || marker.as_ref().is_some_and(|marker| {
+            marker.claimant_incarnation != claimant
+                || !marker.names(&served.delivery_identity)
+        })
+    {
+        return false;
+    }
+    // The marker remains durable until the owner retires this delivery slot;
+    // dropping it here would erase the claimant incarnation needed by the
+    // process-settlement receipt and by restart recovery.
+    true
 }
 
-/// Durable terminal-result record: the exact terminal frame this drive served,
-/// bound to its served identity. Decisions match on identity only (see
-/// [`names`](ServedResultRecord::names)); `retained_at_unix_ms` is
-/// informational (wall-clock at write, never a derivation input). The frame
-/// stays an opaque JSON value here: typed interpretation belongs to the
-/// request-loop driver that owns the frame contract, so this module never
-/// depends on driver types.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Durable per-delivery stream retained in the immutable owner generation
+/// slot. `frame` remains opaque JSON for the request-loop's typed boundary;
+/// the stream digest is checked over the exact raw event-array bytes before
+/// those events are converted to `Value`s and before a caller converts them
+/// to request-loop frame types.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServedResultRecord {
-    /// Served operation identity.
+    /// Complete exact delivery identity.
+    pub identity: StagedDeliveryIdentity,
+    /// Compatibility mirrors retained for existing request-loop readers.
     pub operation_id: String,
-    /// Served generation.
+    /// Compatibility mirrors retained for existing request-loop readers.
     pub generation: u64,
-    /// Served claim identity.
+    /// Compatibility mirrors retained for existing request-loop readers.
     pub claim_id: String,
-    /// Served grant digest (hex).
+    /// Compatibility mirrors retained for existing request-loop readers.
     pub grant_digest: String,
-    /// Wall-clock milliseconds when the record was written.
+    /// Wall-clock milliseconds of the first retained event.
     pub retained_at_unix_ms: u64,
-    /// Exact retained terminal frame JSON.
+    /// Exact last event JSON, kept opaque for the request-loop decoder.
     pub frame: serde_json::Value,
+    /// Exact bounded event stream, kept opaque for the request-loop decoder.
+    pub events: Vec<serde_json::Value>,
+    /// Sequence of the terminal event, or `None` while the stream is open.
+    pub terminal_sequence: Option<u64>,
+    /// SHA-256 of the exact serialized JSON array stored as `events`.
+    pub stream_digest: String,
+    events_json: Vec<u8>,
 }
 
 impl ServedResultRecord {
-    /// Captures the served-result record for one claimed identity and frame.
-    #[must_use]
-    pub fn from_identity(
-        identity: &StagedDeliveryIdentity,
-        frame: &serde_json::Value,
-        retained_at_unix_ms: u64,
-    ) -> Self {
-        Self {
-            operation_id: identity.operation_id.clone(),
-            generation: identity.generation,
-            claim_id: identity.claim_id.clone(),
-            grant_digest: identity.grant_digest.clone(),
-            retained_at_unix_ms,
-            frame: frame.clone(),
-        }
-    }
-
     /// Whether this record names exactly the staged identity.
     #[must_use]
     pub fn names(&self, identity: &StagedDeliveryIdentity) -> bool {
-        self.operation_id == identity.operation_id
+        self.identity.same_delivery(identity)
+            && identity
+                .claimant_incarnation
+                .as_ref()
+                .is_none_or(|claimant| self.identity.claimant_incarnation.as_ref() == Some(claimant))
+            && self.operation_id == identity.operation_id
             && self.generation == identity.generation
             && self.claim_id == identity.claim_id
             && self.grant_digest == identity.grant_digest
     }
 }
 
-/// Reads the durable served-result record, if any. Only an absent record
-/// answers `Ok(None)`; read failures, oversize files, and malformed records
-/// fail closed so callers cannot treat uncertain retained state as a fresh
-/// delivery or as another identity's result.
-pub fn read_served_result(
-    install_dir: &std::path::Path,
-) -> Result<Option<ServedResultRecord>, MaterialError> {
-    let path = install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.len() > SERVED_RESULT_MAX_BYTES as u64 => {
-            return Err(MaterialError::TooLarge);
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
-    }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServedResultRecordWire {
+    identity: StagedDeliveryIdentity,
+    operation_id: String,
+    generation: u64,
+    claim_id: String,
+    grant_digest: String,
+    retained_at_unix_ms: u64,
+    frame: serde_json::Value,
+    events: Box<serde_json::value::RawValue>,
+    terminal_sequence: Option<u64>,
+    stream_digest: String,
+}
 
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return match std::fs::symlink_metadata(&path) {
-                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(other) => Err(MaterialError::Unreadable(other.kind().to_string())),
-                Ok(_) => Err(MaterialError::Unreadable(error.kind().to_string())),
-            };
-        }
-        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
-    };
-    let mut bounded = std::io::Read::take(file, (SERVED_RESULT_MAX_BYTES + 1) as u64);
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut bounded, &mut bytes)
-        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
-    if bytes.len() > SERVED_RESULT_MAX_BYTES {
-        return Err(MaterialError::TooLarge);
-    }
-    let record: ServedResultRecord =
-        serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
-    if record.operation_id.trim().is_empty()
-        || record.claim_id.trim().is_empty()
-        || record.generation == 0
+fn validate_staged_delivery_identity(identity: &StagedDeliveryIdentity) -> Result<(), MaterialError> {
+    require_nonblank(&identity.claim_id, "delivery-identity-claim-id")?;
+    require_nonblank(&identity.operation_id, "delivery-identity-operation-id")?;
+    require_nonblank(&identity.launch_nonce, "delivery-identity-launch-nonce")?;
+    require_nonblank(
+        &identity.authority_epoch_json,
+        "delivery-identity-authority-epoch",
+    )?;
+    if identity.generation == 0
+        || identity.admitted_at_unix_ms == 0
+        || identity.expires_at <= identity.admitted_at_unix_ms
+        || identity.delivery_version != WASM_DELIVERY_IDENTITY_VERSION
+        || identity.publication_incarnation == 0
+        || identity.publication_revision == 0
+        || identity
+            .claimant_incarnation
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
     {
         return Err(MaterialError::Malformed);
     }
-    hex_digest(&record.grant_digest, "served-result-grant-digest")?;
-    Ok(Some(record))
+    require_owner_digest(&identity.grant_digest, "delivery-identity-grant-digest")?;
+    require_owner_digest(&identity.artifact_digest, "delivery-identity-artifact-digest")?;
+    require_owner_digest(&identity.input_digest, "delivery-identity-input-digest")?;
+    require_owner_digest(
+        identity.envelope_digest.as_str(),
+        "delivery-identity-envelope-digest",
+    )?;
+    require_owner_digest(
+        identity.host_artifact_digest.as_str(),
+        "delivery-identity-host-artifact-digest",
+    )?;
+    Ok(())
 }
 
-/// Writes the served-result record atomically (process-scoped partial,
-/// flushed, then renamed): the reader never observes partial JSON. The
-/// record must fit [`SERVED_RESULT_MAX_BYTES`]; an oversize frame fails here
-/// rather than truncating. Callers must propagate a write failure and retain
-/// the claimed set for recovery.
+fn result_frame_header(frame: &serde_json::Value) -> Result<(u64, bool), MaterialError> {
+    let sequence = frame
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(MaterialError::InvalidRecord {
+            field: "result-frame-sequence",
+        })?;
+    let terminal = frame
+        .get("terminal")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(MaterialError::InvalidRecord {
+            field: "result-frame-terminal",
+        })?;
+    Ok((sequence, terminal))
+}
+
+fn validate_result_stream(
+    events: &[serde_json::Value],
+    terminal_sequence: Option<u64>,
+) -> Result<(), MaterialError> {
+    if events.is_empty() || events.len() > SERVED_RESULT_MAX_EVENTS as usize {
+        return Err(MaterialError::InvalidRecord {
+            field: "result-stream-count",
+        });
+    }
+    let last = events.len() - 1;
+    for (index, frame) in events.iter().enumerate() {
+        let (sequence, terminal) = result_frame_header(frame)?;
+        if sequence != index as u64 || sequence >= SERVED_RESULT_MAX_EVENTS {
+            return Err(MaterialError::InvalidRecord {
+                field: "result-stream-sequence",
+            });
+        }
+        if serde_json::to_vec(frame)
+            .map_err(|_| MaterialError::Malformed)?
+            .len()
+            > SERVED_RESULT_MAX_FRAME_BYTES
+        {
+            return Err(MaterialError::TooLarge);
+        }
+        if terminal != (index == last && terminal_sequence == Some(sequence)) {
+            return Err(MaterialError::InvalidRecord {
+                field: "result-stream-terminal",
+            });
+        }
+    }
+    if terminal_sequence.is_some_and(|sequence| sequence != last as u64) {
+        return Err(MaterialError::InvalidRecord {
+            field: "result-stream-terminal-sequence",
+        });
+    }
+    Ok(())
+}
+
+fn read_bounded_delivery_record(
+    path: &std::path::Path,
+    maximum: usize,
+) -> Result<Vec<u8>, MaterialError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            MaterialError::Missing
+        } else {
+            MaterialError::Unreadable(error.kind().to_string())
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(MaterialError::Malformed);
+    }
+    if metadata.len() > maximum as u64 {
+        return Err(MaterialError::TooLarge);
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    let mut bounded = std::io::Read::take(file, maximum.saturating_add(1) as u64);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    if bytes.len() > maximum {
+        return Err(MaterialError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+fn read_served_result_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> Result<Option<ServedResultRecord>, MaterialError> {
+    validate_installation_delivery_guard(guard, install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_SERVED_RESULT_FILE_NAME);
+    let bytes = match read_bounded_delivery_record(&path, SERVED_RESULT_MAX_BYTES) {
+        Err(MaterialError::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(bytes) => bytes,
+    };
+    let wire: ServedResultRecordWire =
+        serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
+    validate_staged_delivery_identity(&wire.identity)?;
+    let inflight = read_inflight_marker_locked(guard, install_dir, identity)?
+        .ok_or(MaterialError::Unavailable)?;
+    let exact_claim = identity.with_claimant(&inflight.claimant_incarnation);
+    if wire.identity != exact_claim {
+        return Err(MaterialError::InvalidRecord {
+            field: "served-result-claim-identity",
+        });
+    }
+    if !wire.identity.same_delivery(identity)
+        || wire.operation_id != identity.operation_id
+        || wire.generation != identity.generation
+        || wire.claim_id != identity.claim_id
+        || wire.grant_digest != identity.grant_digest
+    {
+        return Err(MaterialError::InvalidRecord {
+            field: "served-result-identity",
+        });
+    }
+    hex_digest(&wire.stream_digest, "served-result-stream-digest")?;
+    let events_json = wire.events.get().as_bytes().to_vec();
+    if sha256_hex(&events_json) != wire.stream_digest {
+        return Err(MaterialError::DigestMismatch);
+    }
+    if events_json.len() > SERVED_RESULT_MAX_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    let events: Vec<serde_json::Value> =
+        serde_json::from_slice(&events_json).map_err(|_| MaterialError::Malformed)?;
+    validate_result_stream(&events, wire.terminal_sequence)?;
+    if events.last() != Some(&wire.frame) {
+        return Err(MaterialError::InvalidRecord {
+            field: "served-result-frame-tail",
+        });
+    }
+    Ok(Some(ServedResultRecord {
+        identity: wire.identity,
+        operation_id: wire.operation_id,
+        generation: wire.generation,
+        claim_id: wire.claim_id,
+        grant_digest: wire.grant_digest,
+        retained_at_unix_ms: wire.retained_at_unix_ms,
+        frame: wire.frame,
+        events,
+        terminal_sequence: wire.terminal_sequence,
+        stream_digest: wire.stream_digest,
+        events_json,
+    }))
+}
+
+/// Reads one exact delivery's durable stream. The fixed-name compatibility
+/// record is never consulted; only this identity's generation slot can answer.
+pub fn read_served_result(
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> Result<Option<ServedResultRecord>, MaterialError> {
+    let guard = acquire_installation_delivery_guard(install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    if !matches!(
+        read_delivery_publication_locked(&guard, install_dir, identity),
+        Ok(OwnerPublicationLookup::Published(ref state))
+            if state.is_ready() && state.names(identity)
+    ) {
+        return Err(MaterialError::Unavailable);
+    }
+    read_served_result_locked(&guard, install_dir, identity)
+}
+
+/// Checks only whether the reserved ACK pathname is absent. Presence is a
+/// conflict for `NO_EFFECT`; this child-side directory has no verified
+/// receiver receipt reader and the file's digest is never accepted here.
+fn delivery_result_ack_record_absent_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> Result<bool, MaterialError> {
+    validate_installation_delivery_guard(guard, install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_ACK_FILE_NAME);
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err(MaterialError::Unavailable),
+        Ok(_) => Ok(false),
+    }
+}
+
+/// Compatibility wire shape for a process/material settlement observation.
+/// The fields alone are not owner proof: #2785 has not exposed a typed
+/// process-owner receipt to this API, so records of this shape cannot authorize
+/// retirement.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryProcessSettlement {
+    /// Full delivery identity whose process settled.
+    pub identity: StagedDeliveryIdentity,
+    /// Exact pre-effect claimant incarnation being settled, absent only for
+    /// an owner-proven never-issued `NO_EFFECT` disposition.
+    pub claimant_incarnation: Option<String>,
+    /// Stable owner-proven disposition (`NO_EFFECT` or `EFFECT_SETTLED`).
+    pub disposition: String,
+    /// Digest of the process owner's exact settlement evidence.
+    pub settlement_digest: String,
+    /// Informational process settlement time.
+    pub settled_at_unix_ms: u64,
+}
+
+fn read_delivery_process_settlement_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> Result<Option<DeliveryProcessSettlement>, MaterialError> {
+    validate_installation_delivery_guard(guard, install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_SETTLED_FILE_NAME);
+    let bytes = match read_bounded_delivery_record(&path, DELIVERY_IDENTITY_MARKER_MAX_BYTES) {
+        Err(MaterialError::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(bytes) => bytes,
+    };
+    let settlement: DeliveryProcessSettlement =
+        serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
+    validate_staged_delivery_identity(&settlement.identity)?;
+    if !settlement.identity.same_delivery(identity)
+        || !matches!(settlement.disposition.as_str(), "NO_EFFECT" | "EFFECT_SETTLED")
+    {
+        return Err(invalid("delivery-settlement-identity"));
+    }
+    match (settlement.claimant_incarnation.as_deref(), settlement.disposition.as_str()) {
+        (Some(claimant), _) if !claimant.trim().is_empty() => {
+            let inflight = read_inflight_marker_locked(guard, install_dir, identity)?
+                .ok_or(MaterialError::Unavailable)?;
+            let expected_claim = identity.with_claimant(&inflight.claimant_incarnation);
+            if !inflight.names(identity)
+                || claimant != inflight.claimant_incarnation
+                || !settlement.identity.same_claim(&expected_claim)
+            {
+                return Err(invalid("delivery-settlement-claimant"));
+            }
+        }
+        (None, "NO_EFFECT") => {
+            if settlement.identity.claimant_incarnation.is_some()
+                || read_inflight_marker_locked(guard, install_dir, identity)?.is_some()
+                || read_served_result_locked(guard, install_dir, identity)?.is_some()
+                || read_served_marker_locked(guard, install_dir, identity)?.is_some()
+                || !delivery_result_ack_record_absent_locked(guard, install_dir, identity)?
+            {
+                return Err(invalid("delivery-settlement-claimant"));
+            }
+        }
+        _ => return Err(invalid("delivery-settlement-claimant")),
+    }
+    hex_digest(&settlement.settlement_digest, "delivery-settlement-digest")?;
+    Ok(Some(settlement))
+}
+
+/// Compatibility entry point for the pending #2785 process-owner receipt.
+/// Caller-supplied disposition and digest shape are not process evidence and
+/// must never be persisted as retirement authority. Until the process owner
+/// supplies a typed receipt that this module can validate, settlement remains
+/// unavailable and reclamation stays fail-closed.
+pub fn write_delivery_process_settlement(
+    _install_dir: &std::path::Path,
+    _identity: &StagedDeliveryIdentity,
+    _claimant_incarnation: Option<&str>,
+    _disposition: &str,
+    _settlement_digest: &str,
+    _settled_at_unix_ms: u64,
+) -> Result<(), MaterialError> {
+    Err(MaterialError::Unavailable)
+}
+
+fn write_served_result_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+    frame: &serde_json::Value,
+    retained_at_unix_ms: u64,
+) -> std::io::Result<()> {
+    validate_installation_delivery_guard(guard, install_dir)?;
+    if !delivery_is_current_and_ready_locked(guard, install_dir, identity) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "served-result-owner-state-conflict",
+        ));
+    }
+    let inflight = read_inflight_marker_locked(guard, install_dir, identity)
+        .map_err(material_error_to_io)?
+        .ok_or_else(|| std::io::Error::other("served-result-claim-not-owned"))?;
+    if !inflight.names(identity) {
+        return Err(std::io::Error::other("served-result-claim-not-owned"));
+    }
+    let claimed_identity = identity.with_claimant(&inflight.claimant_incarnation);
+    let frame_bytes = serde_json::to_vec(frame)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if frame_bytes.len() > SERVED_RESULT_MAX_FRAME_BYTES {
+        return Err(std::io::Error::other("served-result-frame-too-large"));
+    }
+    let (sequence, terminal) = result_frame_header(frame).map_err(material_error_to_io)?;
+    let path = delivery_slot_dir(install_dir, identity).join(WASM_HOST_SERVED_RESULT_FILE_NAME);
+    let prior = read_served_result_locked(guard, install_dir, &claimed_identity)
+        .map_err(material_error_to_io)?;
+    let (mut events, previous_json, retained_at, previous_terminal) = match prior {
+        Some(record) if record.names(&claimed_identity) => (
+            record.events,
+            record.events_json,
+            record.retained_at_unix_ms,
+            record.terminal_sequence,
+        ),
+        Some(_) => return Err(std::io::Error::other("served-result-identity-conflict")),
+        None => (Vec::new(), b"[]".to_vec(), retained_at_unix_ms, None),
+    };
+    if previous_terminal.is_some() {
+        return Err(std::io::Error::other("served-result-after-terminal"));
+    }
+    let expected_sequence = events.len() as u64;
+    if sequence != expected_sequence || sequence >= SERVED_RESULT_MAX_EVENTS {
+        return Err(std::io::Error::other("served-result-sequence-conflict"));
+    }
+    // Reserve for frame, delimiters, full identity and record fields before
+    // cloning/appending the aggregate event vector or serializing it.
+    let identity_bytes = serde_json::to_vec(&claimed_identity)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let projected_events = if events.is_empty() {
+        frame_bytes.len().saturating_add(2)
+    } else {
+        previous_json
+            .len()
+            .saturating_add(frame_bytes.len())
+            .saturating_add(1)
+    };
+    if projected_events
+        .saturating_add(identity_bytes.len())
+        .saturating_add(512)
+        > SERVED_RESULT_MAX_BYTES
+    {
+        return Err(std::io::Error::other("served-result-stream-too-large"));
+    }
+    events.push(frame.clone());
+    let event_json = serde_json::to_vec(&events)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let stream_digest = sha256_hex(&event_json);
+    let terminal_sequence = terminal.then_some(sequence);
+    validate_result_stream(&events, terminal_sequence).map_err(material_error_to_io)?;
+    let wire = ServedResultRecordWire {
+        identity: claimed_identity,
+        operation_id: identity.operation_id.clone(),
+        generation: identity.generation,
+        claim_id: identity.claim_id.clone(),
+        grant_digest: identity.grant_digest.clone(),
+        retained_at_unix_ms: retained_at,
+        frame: frame.clone(),
+        events: serde_json::value::RawValue::from_string(
+            String::from_utf8(event_json)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?,
+        terminal_sequence,
+        stream_digest,
+    };
+    let bytes = serde_json::to_vec(&wire)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if bytes.len() > SERVED_RESULT_MAX_BYTES {
+        return Err(std::io::Error::other("served-result-too-large"));
+    }
+    write_delivery_file_atomic_locked(guard, install_dir, &path, &bytes)
+}
+
+/// Appends one opaque JSON event to the exact retained delivery stream.
+/// Existing stream digest and identity are verified while holding the shared
+/// installation lock before any event is converted or appended. Every write
+/// atomically replaces that delivery's slot record.
 pub fn write_served_result(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
     frame: &serde_json::Value,
     retained_at_unix_ms: u64,
 ) -> std::io::Result<()> {
-    let record = ServedResultRecord::from_identity(identity, frame, retained_at_unix_ms);
-    let bytes =
-        serde_json::to_vec(&record).map_err(|error| std::io::Error::other(error.to_string()))?;
-    if bytes.len() > SERVED_RESULT_MAX_BYTES {
-        return Err(std::io::Error::other("served-result-too-large"));
-    }
-    let partial = install_dir.join(format!(
-        ".{}.{}.partial",
-        WASM_HOST_SERVED_RESULT_FILE_NAME,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&partial);
-    std::fs::write(&partial, &bytes)?;
-    std::fs::File::open(&partial)?.sync_all()?;
-    std::fs::rename(
-        &partial,
-        install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME),
-    )?;
-    Ok(())
-}
-
-/// Whether one staged file is gone: removed by this reclaim, or already
-/// absent. Any other outcome keeps the set identifiable for recovery.
-fn reclamation_gone(outcome: &ReclaimOutcome) -> bool {
-    matches!(
-        outcome,
-        ReclaimOutcome::Reclaimed | ReclaimOutcome::NotFound
-    )
+    let guard = acquire_installation_delivery_guard(install_dir)?;
+    write_served_result_locked(&guard, install_dir, identity, frame, retained_at_unix_ms)
 }
 
 /// Wire mirror of the owner-published grant record, field-for-field with
@@ -2629,15 +3510,13 @@ fn parse_envelope(bytes: &[u8]) -> Result<DispatchMaterialInput, MaterialError> 
 /// without the claim.
 ///
 /// Honest residual — cases this ordering cannot exclude, by protocol, not
-/// by omission: no cross-process reservation or lease exists on the child
-/// side, so (a) a replacement staged entirely BEFORE the snapshot reads
-/// as one consistent set (it is the live set at read time), and (b) a
-/// replacement staged entirely AFTER the bind executes from pinned
-/// in-memory bytes while the fixed names advance (the
-/// execution-bytes-pinned invariant; reclamation re-checks before
-/// deleting). Publication serialization stays with the owner publisher
-/// half (retire-or-backpressure); the claim orders the read, not the
-/// publisher.
+/// by omission: the shared filesystem lock is released before guest work,
+/// so (a) a replacement staged entirely BEFORE the snapshot reads as one
+/// consistent set (it is the live set at read time), and (b) a replacement
+/// staged after the bind still executes from pinned in-memory bytes. The
+/// separate first-writer claim is persisted before effects, while owner
+/// publication and child reclamation transitions serialize under the same
+/// installation lock; no lock is held across guest execution.
 ///
 /// # Errors
 ///
@@ -2682,6 +3561,17 @@ pub fn read_dispatch_material() -> Result<Option<ValidatedDispatchMaterial>, Mat
 pub fn read_claimed_dispatch_material_from(
     install_dir: &std::path::Path,
 ) -> Result<Option<(DeliveryClaim, ValidatedDispatchMaterial)>, MaterialError> {
+    let guard = acquire_installation_delivery_guard(install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
+    read_claimed_dispatch_material_from_locked(&guard, install_dir)
+}
+
+fn read_claimed_dispatch_material_from_locked(
+    guard: &InstallationDeliveryGuard,
+    install_dir: &std::path::Path,
+) -> Result<Option<(DeliveryClaim, ValidatedDispatchMaterial)>, MaterialError> {
+    validate_installation_delivery_guard(guard, install_dir)
+        .map_err(|_| MaterialError::Unavailable)?;
     let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
     let envelope_bytes = match read_staged_bytes(&material_path) {
         Err(MaterialError::Missing) => return Ok(None),
@@ -2702,8 +3592,20 @@ pub fn read_claimed_dispatch_material_from(
         _ => return Err(MaterialError::DigestMismatch),
     }
     let material = bind_dispatch_material(input)?;
+    let publication = read_delivery_publication_at_slot_locked(
+        guard,
+        install_dir,
+        material.generation,
+        envelope_digest.as_str(),
+    )?;
+    let publication = match publication {
+        OwnerPublicationLookup::Published(state) if state.is_ready() => state,
+        OwnerPublicationLookup::Published(_)
+        | OwnerPublicationLookup::MissingNewFormat
+        | OwnerPublicationLookup::LegacyV1FixedName => return Err(MaterialError::Unavailable),
+    };
     Ok(Some((
-        DeliveryClaim::from_material(&material, envelope_digest),
+        DeliveryClaim::from_material(&material, envelope_digest, publication.identity())?,
         material,
     )))
 }

@@ -2355,6 +2355,168 @@ fn emit_frame_bounded(framed: Vec<u8>) -> Result<BoundedEmission, LoopError> {
     }
 }
 
+/// The durable result stream bound to one claimed owner delivery. Nonterminal
+/// events are appended before stdout; the terminal event is held until the
+/// request loop has observed exact P-03 child-termination evidence and the
+/// exact served transition has been confirmed. Neither grants retirement.
+struct DeliveryResultRetention {
+    directory: PathBuf,
+    identity: crate::dispatch_material::StagedDeliveryIdentity,
+    events: Vec<WasmHostResultFrame>,
+    pending_terminal: Option<WasmHostResultFrame>,
+    terminal_output_authorized: bool,
+}
+
+impl DeliveryResultRetention {
+    fn new(
+        directory: &Path,
+        identity: &crate::dispatch_material::StagedDeliveryIdentity,
+    ) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            identity: identity.clone(),
+            events: Vec::new(),
+            pending_terminal: None,
+            terminal_output_authorized: false,
+        }
+    }
+
+    /// Persists each nonterminal event before output. The terminal frame is
+    /// held until the outer path has observed exact child termination and the
+    /// exact result/marker transition; repeating an already retained event
+    /// is allowed only after a complete owner readback matches this stream.
+    fn retain_before_stdout(
+        &mut self,
+        frame: &WasmHostResultFrame,
+        retained_at_unix_ms: u64,
+    ) -> Result<bool, LoopError> {
+        if frame.operation_id != self.identity.operation_id
+            || frame.claim_id != self.identity.claim_id
+            || frame.grant_digest != self.identity.grant_digest
+            || frame.artifact_digest != self.identity.artifact_digest
+            || frame.input_digest != self.identity.input_digest
+        {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        if let Some(pending) = &self.pending_terminal {
+            if !frame.terminal || pending != frame {
+                return Err(LoopError::ChannelUnavailable);
+            }
+            if !self.terminal_output_authorized {
+                return Ok(false);
+            }
+            self.verify_record()?;
+            return Ok(true);
+        }
+
+        if frame.terminal {
+            let sequence = u64::try_from(self.events.len())
+                .map_err(|_| LoopError::ChannelUnavailable)?;
+            if frame.sequence != sequence {
+                return Err(LoopError::ChannelUnavailable);
+            }
+            self.pending_terminal = Some(frame.clone());
+            return Ok(false);
+        }
+
+        let sequence = usize::try_from(frame.sequence)
+            .map_err(|_| LoopError::ChannelUnavailable)?;
+        if sequence < self.events.len() {
+            if self.events.get(sequence) != Some(frame) {
+                return Err(LoopError::ChannelUnavailable);
+            }
+            self.verify_record()?;
+            return Ok(true);
+        }
+        if sequence != self.events.len() || self.events.len() >= MAX_RESULT_SEQUENCE as usize {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        self.append_event(frame, retained_at_unix_ms)?;
+        self.verify_record()?;
+        Ok(true)
+    }
+
+    /// Appends the held terminal event only after the bounded loop returned
+    /// success. That return includes the P-03 owner's observation of the
+    /// exact child tree; it is not #2785 delivery-settlement evidence and does
+    /// not authorize reclamation.
+    fn persist_terminal_after_success(
+        &mut self,
+        frame: &WasmHostResultFrame,
+        retained_at_unix_ms: u64,
+    ) -> Result<(), LoopError> {
+        if !frame.terminal || self.pending_terminal.as_ref() != Some(frame) {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        let sequence = u64::try_from(self.events.len())
+            .map_err(|_| LoopError::ChannelUnavailable)?;
+        if frame.sequence != sequence || self.events.len() >= MAX_RESULT_SEQUENCE as usize {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        self.append_event(frame, retained_at_unix_ms)?;
+        self.verify_record()
+    }
+
+    fn authorize_terminal_output(
+        &mut self,
+        frame: &WasmHostResultFrame,
+    ) -> Result<(), LoopError> {
+        if !frame.terminal
+            || self.pending_terminal.as_ref() != Some(frame)
+            || self.events.last() != Some(frame)
+        {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        self.verify_record()?;
+        self.terminal_output_authorized = true;
+        Ok(())
+    }
+
+    fn append_event(
+        &mut self,
+        frame: &WasmHostResultFrame,
+        retained_at_unix_ms: u64,
+    ) -> Result<(), LoopError> {
+        let value = serde_json::to_value(frame).map_err(|_| LoopError::ResultTooLarge)?;
+        crate::dispatch_material::write_served_result(
+            &self.directory,
+            &self.identity,
+            &value,
+            retained_at_unix_ms,
+        )
+        .map_err(|_| LoopError::ChannelUnavailable)?;
+        self.events.push(frame.clone());
+        Ok(())
+    }
+
+    fn verify_record(&self) -> Result<(), LoopError> {
+        let record = crate::dispatch_material::read_served_result(&self.directory, &self.identity)
+            .map_err(|_| LoopError::ChannelUnavailable)?
+            .ok_or(LoopError::ChannelUnavailable)?;
+        if !record.names(&self.identity) || record.events.len() != self.events.len() {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        let expected = self
+            .events
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| LoopError::ResultTooLarge)?;
+        let terminal_sequence = self
+            .events
+            .last()
+            .filter(|event| event.terminal)
+            .map(|event| event.sequence);
+        if record.events != expected
+            || record.frame != expected.last().cloned().ok_or(LoopError::ChannelUnavailable)?
+            || record.terminal_sequence != terminal_sequence
+        {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        Ok(())
+    }
+}
+
 /// Production channel over the owner delivery set and the canonical receipt
 /// stream. One delivery set carries exactly one admitted operation, so the
 /// channel issues that request once and then reports exhaustion, which is
@@ -2373,6 +2535,7 @@ pub struct DeliverySetChannel {
     /// contended stream is never reused, so at most one frame is ever
     /// outstanding and wire order is preserved.
     pending_helper: Option<std::thread::JoinHandle<()>>,
+    result_retention: Option<DeliveryResultRetention>,
 }
 
 impl DeliverySetChannel {
@@ -2386,7 +2549,24 @@ impl DeliverySetChannel {
             control: None,
             emission_broken: false,
             pending_helper: None,
+            result_retention: None,
         }
+    }
+
+    fn for_retained_output() -> Self {
+        Self {
+            admitted: None,
+            delivered: true,
+            control: None,
+            emission_broken: false,
+            pending_helper: None,
+            result_retention: None,
+        }
+    }
+
+    fn with_result_retention(mut self, retention: DeliveryResultRetention) -> Self {
+        self.result_retention = Some(retention);
+        self
     }
 
     /// Installs the Kernel control reader feeding external
@@ -2496,6 +2676,11 @@ impl WasmHostRequestChannel for DeliverySetChannel {
         // local stream write, not proof the owner durably accepted the
         // result.
         validate_frame(frame)?;
+        if let Some(retention) = self.result_retention.as_mut()
+            && !retention.retain_before_stdout(frame, edge_now_ms())?
+        {
+            return Ok(());
+        }
         if self.emission_broken {
             // A previous emission confirmed its write failed; the stream
             // state is unusable, so every later frame fails closed here.
@@ -3412,9 +3597,28 @@ pub fn run_request_loop(
     runtime: AdmittedRuntime,
     material: &ValidatedDispatchMaterial,
 ) -> Result<WasmHostResultFrame, LoopError> {
+    run_request_loop_inner(runtime, material, None).map(|(frame, _channel)| frame)
+}
+
+fn run_request_loop_with_retention(
+    runtime: AdmittedRuntime,
+    material: &ValidatedDispatchMaterial,
+    retention: DeliveryResultRetention,
+) -> Result<(WasmHostResultFrame, DeliverySetChannel), LoopError> {
+    run_request_loop_inner(runtime, material, Some(retention))
+}
+
+fn run_request_loop_inner(
+    runtime: AdmittedRuntime,
+    material: &ValidatedDispatchMaterial,
+    retention: Option<DeliveryResultRetention>,
+) -> Result<(WasmHostResultFrame, DeliverySetChannel), LoopError> {
     let binding = AdmittedBinding::from_material(material, &runtime.invocation);
     let request_frame = WasmHostRequestFrame::admitted_invoke(&binding);
     let mut channel = DeliverySetChannel::new(request_frame);
+    if let Some(retention) = retention {
+        channel = channel.with_result_retention(retention);
+    }
     if let Some(directory) = kernel_control_dir() {
         channel = channel.with_kernel_control(KernelControlReader::new(&binding, directory));
     }
@@ -3438,7 +3642,14 @@ pub fn run_request_loop(
         &worker.outcomes,
         &worker.handle,
     );
-    drain_and_shutdown_request_worker(&mut state, &mut channel, &termination, worker, drive)
+    let frame = drain_and_shutdown_request_worker(
+        &mut state,
+        &mut channel,
+        &termination,
+        worker,
+        drive,
+    )?;
+    Ok((frame, channel))
 }
 
 /// Drains accepted work, shuts down and joins the worker, then returns the
@@ -4319,31 +4530,46 @@ fn seal_inflight_claim(
     claim: &crate::dispatch_material::DeliveryClaim,
     now_ms: u64,
 ) -> Result<(), OrdinaryDriveError> {
-    crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms).map_err(
-        |_| {
+    match crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms) {
+        crate::dispatch_material::DeliveryClaimOutcome::Acquired => Ok(()),
+        crate::dispatch_material::DeliveryClaimOutcome::ExistingInFlight
+        | crate::dispatch_material::DeliveryClaimOutcome::RetainedResult
+        | crate::dispatch_material::DeliveryClaimOutcome::Conflict
+        | crate::dispatch_material::DeliveryClaimOutcome::Unavailable => {
             let identity = claim.identity();
-            OrdinaryDriveError::DeliveryInProgress {
+            Err(OrdinaryDriveError::DeliveryInProgress {
                 operation_id: identity.operation_id.clone(),
                 generation: identity.generation,
                 claim_id: identity.claim_id.clone(),
-            }
-        },
-    )
+            })
+        }
+    }
 }
 
-/// Seals the durable served evidence for one terminal outcome (#2786 step
-/// 7): the served marker first, then the exact terminal frame, both before
-/// physical reclaim. The pre-execution `InFlight` marker is already durable,
-/// so a failed seal still replays on restart instead of re-executing. Any
-/// failure preserves the claimed set and reports its original identity as
-/// unresolved instead of claiming success.
+/// Persists the terminal event only after the request loop returns with the
+/// exact P-03 child-termination observation, then verifies the full event
+/// stream, writes the served marker, and confirms the exact retained
+/// transition. This is not delivery-settlement evidence or retirement
+/// authority. No terminal stdout is authorized before these checks succeed.
 fn seal_served_outcome(
     directory: &std::path::Path,
     claim: &crate::dispatch_material::DeliveryClaim,
     frame: &OrdinaryOutcome,
     now_ms: u64,
+    channel: &mut DeliverySetChannel,
 ) -> Result<(), OrdinaryDriveError> {
-    if crate::dispatch_material::write_served_marker(directory, claim.identity(), now_ms).is_err() {
+    let identity = claim.identity();
+    let Some(retention) = channel.result_retention.as_mut() else {
+        return Err(OrdinaryDriveError::DeliveryInProgress {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+        });
+    };
+    if retention.persist_terminal_after_success(frame, now_ms).is_err()
+        || read_back_served_result(directory, identity)
+            .is_none_or(|events| events.last() != Some(frame))
+    {
         let identity = claim.identity();
         return Err(OrdinaryDriveError::DeliveryInProgress {
             operation_id: identity.operation_id.clone(),
@@ -4351,18 +4577,23 @@ fn seal_served_outcome(
             claim_id: identity.claim_id.clone(),
         });
     }
-    let retained = serde_json::to_value(frame).map_err(|_| {
+    if crate::dispatch_material::write_served_marker(directory, identity, now_ms).is_err() {
         let identity = claim.identity();
-        OrdinaryDriveError::DeliveryInProgress {
+        return Err(OrdinaryDriveError::DeliveryInProgress {
             operation_id: identity.operation_id.clone(),
             generation: identity.generation,
             claim_id: identity.claim_id.clone(),
-        }
-    })?;
-    if crate::dispatch_material::write_served_result(directory, claim.identity(), &retained, now_ms)
-        .is_err()
-    {
+        });
+    }
+    if !crate::dispatch_material::clear_inflight_marker(directory, identity) {
         let identity = claim.identity();
+        return Err(OrdinaryDriveError::DeliveryInProgress {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+        });
+    }
+    if retention.authorize_terminal_output(frame).is_err() {
         return Err(OrdinaryDriveError::DeliveryInProgress {
             operation_id: identity.operation_id.clone(),
             generation: identity.generation,
@@ -4372,38 +4603,66 @@ fn seal_served_outcome(
     Ok(())
 }
 
-/// Reads back the durably retained terminal result for exactly the staged
-/// replay identity (#2786 step 7). Returns the original frame only when the
-/// retained record names this identity verbatim, the frame parses under the
-/// closed result contract, and the frame's own operation/claim/grant and
-/// proven digests bind back to the same identity; anything else — absent,
-/// unreadable, oversize, malformed, foreign-identity, non-terminal, or
-/// wire-mismatched — answers `None` so the caller reports identity-only
-/// in-progress with all evidence preserved. Never executes, never deletes.
+/// Reads back the complete durably retained terminal stream for exactly the
+/// staged replay identity (#2786/#2787). Every event must parse, the stream
+/// must be gapless with one terminal event, and every available identity
+/// field must bind to the owner claim. Anything absent, incomplete,
+/// unreadable, malformed, foreign, nonterminal, or wire-mismatched answers
+/// `None`; replay then remains in progress and performs no effects.
 fn read_back_served_result(
     directory: &std::path::Path,
     identity: &crate::dispatch_material::StagedDeliveryIdentity,
-) -> Option<OrdinaryOutcome> {
-    let record = crate::dispatch_material::read_served_result(directory).ok()??;
-    if !record.names(identity) {
-        return None;
-    }
-    let frame: OrdinaryOutcome = serde_json::from_value(record.frame).ok()?;
-    if frame.wire_id != WASM_HOST_RESULT_WIRE_ID
-        || frame.wire_version != WASM_HOST_RESULT_WIRE_VERSION
-        || !frame.terminal
+) -> Option<Vec<OrdinaryOutcome>> {
+    let record =
+        crate::dispatch_material::read_served_result(directory, identity).ok()??;
+    if !record.names(identity)
+        || record.events.is_empty()
+        || record.frame != record.events.last()?.clone()
+        || record.terminal_sequence.is_none()
     {
         return None;
     }
-    if frame.operation_id != identity.operation_id
-        || frame.claim_id != identity.claim_id
-        || frame.grant_digest != identity.grant_digest
-        || frame.artifact_digest != identity.artifact_digest
-        || frame.input_digest != identity.input_digest
+    let events = record
+        .events
+        .into_iter()
+        .map(serde_json::from_value::<OrdinaryOutcome>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    validate_result_stream(&events).ok()?;
+    let terminal = events.last()?;
+    if record.terminal_sequence != Some(terminal.sequence)
+        || terminal.operation_id != identity.operation_id
+        || terminal.claim_id != identity.claim_id
+        || terminal.grant_digest != identity.grant_digest
+        || terminal.artifact_digest != identity.artifact_digest
+        || terminal.input_digest != identity.input_digest
     {
         return None;
     }
-    Some(frame)
+    if events.iter().any(|frame| {
+        frame.operation_id != identity.operation_id
+            || frame.claim_id != identity.claim_id
+            || frame.grant_digest != identity.grant_digest
+            || frame.artifact_digest != identity.artifact_digest
+            || frame.input_digest != identity.input_digest
+    }) {
+        return None;
+    }
+    Some(events)
+}
+
+/// Republishes an exact retained stream through the same bounded stdout
+/// supervisor used by a live loop. The caller must first validate the stream
+/// and confirm its exact terminal owner transition.
+fn publish_retained_result_stream(events: &[OrdinaryOutcome]) -> Result<(), LoopError> {
+    let mut channel = DeliverySetChannel::for_retained_output();
+    for frame in events {
+        if let Err(error) = channel.publish(frame) {
+            let _ = channel.cleanup_output_helper();
+            return Err(error);
+        }
+    }
+    channel.cleanup_output_helper()
 }
 
 /// Runs the ordinary governed path for this process: binds the owner
@@ -4419,7 +4678,8 @@ fn read_back_served_result(
 /// authority cell are dropped, never reused. A re-staged copy of the grant
 /// this process already served ends the chain without a second execution:
 /// spent one-shot authority is never revived, and the completed outcome —
-/// whose terminal frame was already published — stands.
+/// whose event stream is retained and whose terminal transition was checked
+/// before stdout — stands.
 ///
 /// # Errors
 ///
@@ -4442,60 +4702,58 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // the pre-read envelope identity selected this operation before
         // the payload files were trusted, so the claim below is that
         // selection — never a copy derived after the fact. Durable
-        // retention extends in-memory state across restart: a staged set
-        // the served marker names is terminal-unacknowledged (a crash
-        // between publish and reclaim), and a staged set the InFlight
-        // marker names was claimed for execution (a crash between claim
-        // and served durability), so both replay below instead of
-        // re-executing.
+        // Retained owner state extends in-memory state across restart: a
+        // complete served transition is replayed, while an incomplete
+        // InFlight result remains in progress. Neither is re-executed.
         let directory = crate::dispatch_material::admitted_material_path()
             .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
             .ok_or(OrdinaryDriveError::Drive(DriveError::NoMaterial))?;
-        let served_marker = crate::dispatch_material::read_served_marker(&directory)
-            .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
-        let inflight_marker = crate::dispatch_material::read_inflight_marker(&directory)
-            .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
+        let publication = crate::dispatch_material::read_delivery_publication(
+            &directory,
+            claim.identity(),
+        )
+        .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
+        let served_marker =
+            crate::dispatch_material::read_served_marker(&directory, claim.identity())
+                .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
+        let inflight_marker =
+            crate::dispatch_material::read_inflight_marker(&directory, claim.identity())
+                .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
         match crate::dispatch_material::classify_staged_delivery(
             claim.identity(),
+            &publication,
             served.as_slice(),
             served_marker.as_ref(),
             inflight_marker.as_ref(),
         ) {
             crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
-                // Terminal-unacknowledged read-back: a fresh drive (no
-                // in-process outcome) returns the original retained
-                // terminal result for exactly this identity when one is
-                // durably retained, before any evidence is touched — the
-                // replay path deletes nothing. Absent, unreadable, or
-                // foreign records fall through to the identity-only
-                // in-progress report below; same-drive replays keep the
-                // in-process projection, never a file read-back.
-                if outcome.is_none()
-                    && let Some(frame) = read_back_served_result(&directory, &identity)
-                {
-                    return Ok(frame);
+                // A restart replays only a complete terminal stream. The
+                // exact retained transition is rechecked before stdout; a
+                // partial stream or missing/unrelated marker stays blocked.
+                if outcome.is_none() {
+                    if let Some(events) = read_back_served_result(&directory, &identity)
+                        && crate::dispatch_material::clear_inflight_marker(
+                            &directory,
+                            &identity,
+                        )
+                    {
+                        publish_retained_result_stream(&events)
+                            .map_err(OrdinaryDriveError::Loop)?;
+                        if let Some(frame) = events.last() {
+                            return Ok(frame.clone());
+                        }
+                    }
                 }
-                // The classifier also treats a differing identity under the
-                // same spent grant as Replay, and an InFlight-named set as
-                // Replay whether or not its effect settled. Preserve the
-                // staged identity; the final projection may reuse an outcome
-                // only when this identity exactly matches the latest one
-                // served in this process. A replay without a retained
-                // result has no acknowledgement to authorize reclamation.
-                // Keep the claimed set and durable markers as local
-                // identity evidence; the projection below reports
-                // DeliveryInProgress with this exact identity until an
-                // owner can reconcile it.
+                // Only an exact served/in-flight identity is Replay; a
+                // conflicting identity is refused above. Preserve the staged
+                // identity; the final projection may reuse an outcome only
+                // when this identity exactly matches the latest one served in
+                // this process. An incomplete result remains in progress and
+                // cannot authorize retirement.
                 replayed = Some(identity);
                 break;
             }
-            crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { identity } => {
-                // Explicit v1 compatibility: full admission under the staged
-                // identity verbatim, never reinterpreted as a fresh
-                // generation with new identity. Bounded served retention:
-                // past the bound a fresh identity fails closed as
-                // in-progress — the staged set stays for the owner — rather
-                // than evicting a spent grant the classifier must remember.
+            crate::dispatch_material::StagedDeliveryState::Fresh { identity } => {
                 if served.len() >= MAX_SERVED_DELIVERIES_PER_DRIVE {
                     return Err(OrdinaryDriveError::DeliveryInProgress {
                         operation_id: identity.operation_id,
@@ -4503,63 +4761,54 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                         claim_id: identity.claim_id,
                     });
                 }
-                let _admitted_operation = identity.operation_id.len();
+            }
+            crate::dispatch_material::StagedDeliveryState::Conflict { identity } => {
+                return Err(OrdinaryDriveError::DeliveryInProgress {
+                    operation_id: identity.operation_id,
+                    generation: identity.generation,
+                    claim_id: identity.claim_id,
+                });
+            }
+            crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { .. } => {
+                return Err(OrdinaryDriveError::Publication {
+                    code: "DELIVERY_LEGACY_UNSUPPORTED",
+                });
             }
         }
         // Owner publication state gate (#2786 steps 3/7/8): the claim may
-        // execute only against the generation the owner itself published
-        // as ready. A staged set with no owner record at all is the
-        // explicit legacy v1 compatibility state the classifier above
-        // admitted; anything the owner did record must name this claim.
+        // execute only against the exact generation the owner published as
+        // ready. Missing and legacy publication states are unsupported.
         require_ready_publication(&directory, &claim)?;
         let runtime =
             build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
         seal_inflight_claim(&directory, &claim, edge_now_ms())?;
-        let frame = run_request_loop(runtime, &material);
-        // The delivery set is one-shot: a published terminal outcome reclaims
-        // exactly the claimed generation, so a leftover is a fresh-drive
-        // signal rather than a silent reuse. Unknown execution, failed
-        // publication, lost response, or failed drain retains the exact
-        // operation/generation evidence for recovery and never reclaims. The
-        // in-memory retention of the terminal frame below is the readback
-        // path, not a second execution.
+        let retention = DeliveryResultRetention::new(&directory, claim.identity());
+        let frame = run_request_loop_with_retention(runtime, &material, retention);
+        // The delivery set is one-shot. Unknown execution, failed publication,
+        // lost response, or failed drain retains the exact operation and
+        // generation evidence for recovery and never re-executes it. Durable
+        // replay is separate from the still-blocked physical retirement path.
         match frame {
-            Ok(ok_frame) => {
-                // Containment evidence is the loop's own terminal condition:
-                // it only returns a frame once the operation's effect is
-                // attested as settled, so reclaiming here never races an
-                // unresolved guest child.
-                //
-                // The served marker and the exact terminal frame seal
-                // durably before physical reclaim, so restart reconciles
-                // terminal-unacknowledged state by returning the original
-                // result instead of re-executing.
-                seal_served_outcome(&directory, &claim, &ok_frame, edge_now_ms())?;
-                let reclamation = consume_delivery_set(&claim);
-                // The served marker is now durable, so the pre-execution
-                // InFlight evidence is redundant: drop it best-effort. A
-                // leftover only replays, never re-executes.
-                let _ =
-                    crate::dispatch_material::clear_inflight_marker(&directory, claim.identity());
-                // Bounded residual only: a partial reclamation never
-                // overwrites the primary result; retained files stay for
-                // maintenance under the exact claimed identity.
-                let _residual_complete = match &reclamation {
-                    crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
-                        let _reclaimed_operation = detail.identity.operation_id.len();
-                        detail.fully_reclaimed()
-                    }
-                    crate::dispatch_material::ClaimedReclamation::ReplacementPreserved {
-                        claimed,
-                    }
-                    | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
-                    | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
-                        claimed,
-                    } => {
-                        let _preserved_operation = claimed.operation_id.len();
-                        false
-                    }
-                };
+            Ok((ok_frame, mut channel)) => {
+                seal_served_outcome(
+                    &directory,
+                    &claim,
+                    &ok_frame,
+                    edge_now_ms(),
+                    &mut channel,
+                )?;
+                if let Err(error) = channel.publish(&ok_frame) {
+                    let _ = channel.cleanup_output_helper();
+                    return Err(OrdinaryDriveError::Loop(error));
+                }
+                channel
+                    .cleanup_output_helper()
+                    .map_err(OrdinaryDriveError::Loop)?;
+                // Physical reclamation remains owner-gated. This consumer
+                // neither treats child completion as settlement nor claims
+                // that the owner retired any files; #2785 settlement and
+                // #2787 receiver ACK evidence are still required.
+                let _reclamation = consume_delivery_set(&claim);
                 served.push(claim.into_identity());
                 outcome = Some(ok_frame);
             }
@@ -4574,9 +4823,9 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
     // in-progress with its exact identity instead of borrowing the newer
     // result or re-executing under its spent grant. A same-grant replay for
     // another identity cannot borrow that result. Cross-restart
-    // terminal-unacknowledged state with a durably retained result already
-    // returned that original frame from the replay arm above; only a replay
-    // without a retained result reports in-progress with its exact identity.
+    // terminal-unacknowledged state with a durably retained result republishes
+    // the verified stream from the replay arm above; only a replay without a
+    // complete retained result reports in-progress with its exact identity.
     // Only a drive that observed nothing staged reports absence.
     match (outcome, replayed) {
         (Some(frame), None) => Ok(frame),
@@ -4590,8 +4839,8 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
     }
 }
 
-/// Consumes the staged delivery set beside this installation — but only
-/// while it still names the exact claimed generation this loop served.
+/// Requests owner-gated reclamation of the staged delivery set beside this
+/// installation — but only while it still names the exact claimed generation.
 ///
 /// The publisher stages replacements under the same fixed filenames, so a
 /// replacement published while this loop ran now owns those paths: the
@@ -4623,13 +4872,10 @@ fn consume_delivery_set(
 ///
 /// The owner slot is located by the claim's own generation and
 /// material-set digest, and every owner-recorded field is compared against
-/// the claim: a matching pathname, a well-formed token, or a matching
-/// grant digest is not a match. A pending or failed owner publication, and
-/// a ready record naming another delivery, both fail closed here — nothing
-/// executes and nothing is deleted, so the staged set stays for the owner
-/// under its exact identity. No owner record at all is the legacy v1
-/// fixed-name compatibility state, which stays admissible under full
-/// admission with the staged identity verbatim.
+/// the claim: a matching pathname, a well-formed token, or a matching grant
+/// digest is not a match. A missing, pending, failed, legacy, or mismatched
+/// owner publication fails closed — nothing executes and nothing is deleted,
+/// so the staged set stays for the owner under its exact identity.
 ///
 /// # Errors
 ///
@@ -4645,14 +4891,28 @@ fn require_ready_publication(
     match crate::dispatch_material::read_delivery_publication(directory, identity)
         .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?
     {
-        Some(state) if state.is_ready() && state.names(identity) => Ok(()),
-        Some(state) if !state.is_ready() => {
+        crate::dispatch_material::OwnerPublicationLookup::Published(state)
+            if state.is_ready() && state.names(identity) => Ok(()),
+        crate::dispatch_material::OwnerPublicationLookup::Published(state)
+            if !state.is_ready() =>
+        {
             Err(OrdinaryDriveError::Publication { code: state.code() })
         }
-        Some(_) => Err(OrdinaryDriveError::Publication {
-            code: "DELIVERY_IDENTITY_MISMATCH",
-        }),
-        None => Ok(()),
+        crate::dispatch_material::OwnerPublicationLookup::Published(_) => {
+            Err(OrdinaryDriveError::Publication {
+                code: "DELIVERY_IDENTITY_MISMATCH",
+            })
+        }
+        crate::dispatch_material::OwnerPublicationLookup::MissingNewFormat => {
+            Err(OrdinaryDriveError::Publication {
+                code: "DELIVERY_PUBLICATION_MISSING",
+            })
+        }
+        crate::dispatch_material::OwnerPublicationLookup::LegacyV1FixedName => {
+            Err(OrdinaryDriveError::Publication {
+                code: "DELIVERY_LEGACY_UNSUPPORTED",
+            })
+        }
     }
 }
 
