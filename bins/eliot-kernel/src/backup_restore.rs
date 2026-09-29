@@ -736,8 +736,11 @@ impl KernelBackupRestore {
         kernel_fence: &StateFence,
         identity: &OrsRestoreBinding,
     ) -> Result<RestoreJournalAdmission, KernelRestoreError> {
-        let owner =
-            OrsRestoreJournalOwner::production(std::sync::Arc::clone(ors), identity.clone(), kernel_fence)?;
+        let owner = OrsRestoreJournalOwner::production(
+            std::sync::Arc::clone(ors),
+            identity.clone(),
+            kernel_fence,
+        )?;
         let mut journal = OrsRestoreJournal::production(
             std::sync::Arc::clone(ors),
             kernel_fence,
@@ -788,8 +791,7 @@ impl KernelBackupRestore {
         // needs the plan here because the admission is bound to the plan's own
         // operation and the plan is never a parameter of the issuer.
         let plan = Self::compile_plan(bundle, target.clone())?;
-        let admission =
-            self.admit_restore_journal(ors, &plan, ports.kernel_fence, identity)?;
+        let admission = self.admit_restore_journal(ors, &plan, ports.kernel_fence, identity)?;
         let admitted = admitted_restore_ports(ports, &admission);
         check_ors_journal_binding(bundle, &target, &admitted, identity)?;
         let mut journal = OrsRestoreJournal::production(

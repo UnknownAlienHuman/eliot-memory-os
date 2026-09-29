@@ -867,14 +867,14 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
                 reason: "the journal identity must be non-blank".to_owned(),
             });
         }
+        // The ORS owner reports a missing binding as absent, and absence is a
+        // refusal here: an owner that held no durable record must not report an
+        // empty one, or a well-formed admission could be issued for a stream
+        // nothing was ever committed to.
         let bound = self
             .store
             .load_restore_journal_binding(journal_key)
             .map_err(ors_to_backup)?
-            // The ORS owner reports a missing binding as absent. Absence is a
-            // refusal here: an owner that held no durable record must not report
-            // an empty one, or a well-formed admission could be issued for a
-            // stream nothing was ever committed to.
             .ok_or(BackupError::RestoreJournalRequired)?;
         // The ORIGINAL recorded row is validated with the ORS owner's own
         // validator. Nothing is re-derived over the values held here.
