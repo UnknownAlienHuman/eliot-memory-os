@@ -2445,12 +2445,15 @@ impl KernelComposition {
     /// archive provenance. A namespace key alone is therefore not a succession
     /// claim.
     ///
-    /// (3) The presented archive IS that predecessor's archive: the freshly
-    /// decoded `report.archive_sha256` must equal the stored
-    /// `identity.archive_sha256`. Without this the caller could present a valid
-    /// but different archive and be answered with the predecessor's identity,
-    /// class, counts and fence relation, which would be a projection about bytes
-    /// the caller did not present.
+    /// (3) The owner re-decides THAT operation for the bytes just presented: see
+    /// [`owner_reproves_predecessor_operation`], which is the whole archive content
+    /// — identity, declared source and owner contract, export and archived fence
+    /// digests, class, evidence level and ceiling, receipt and member denominators
+    /// — and not one correlation value. The archive digest is a necessary part of
+    /// it, not the whole of it: without the full comparison a caller could present
+    /// a valid but different archive and be answered with the predecessor's
+    /// identity, class, counts and fence relation, which would be a projection
+    /// about bytes the caller did not present.
     ///
     /// The answer then keeps BOTH facts the transport needs. The envelope
     /// correlation is always the reconciling caller's own `idempotency_key`,
