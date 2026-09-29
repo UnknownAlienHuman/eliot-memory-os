@@ -8,12 +8,13 @@
 //!
 //! The mapper never retrieves canonical state and never invents missing role
 //! prose: a missing or incompatible projection stays an explicit omission,
-//! never filler. All projections in one set must share a compatible fence via
-//! [`StateFence::is_compatible_with`]; any drift fails closed.
+//! never filler. All projections in one set must share one exact fence via
+//! [`eliot_contracts::fences_match_exact`]; any drift, and any absent optional
+//! revision on only one side, fails closed.
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, fences_match_exact};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -193,11 +194,14 @@ pub struct CanonicalProjectionSet {
 impl CanonicalProjectionSet {
     /// Returns whether one fence can share this set's decision scope.
     ///
-    /// This is the `is_compatible_with` gate: a projection built under a
-    /// different epoch, generation, or revision is not silently absorbed.
+    /// This is the exact fence gate: a projection built under a different
+    /// epoch, generation, or revision is not silently absorbed, and an absent
+    /// optional revision on one side is not a wildcard for the other. It
+    /// applies the same shared [`eliot_contracts::fences_match_exact`] rule
+    /// [`Self::validate`] does for every member binding.
     #[must_use]
     pub fn is_compatible_with(&self, fence: &StateFence) -> bool {
-        self.binding.state_fence.is_compatible_with(fence)
+        fences_match_exact(&self.binding.state_fence, fence)
     }
 
     /// Validates the full set: every member, the shared binding, one fence,
@@ -217,14 +221,7 @@ impl CanonicalProjectionSet {
             if projection_binding != &self.binding {
                 return Err(ContextError::InvalidFence);
             }
-            if !projection_binding
-                .state_fence
-                .is_compatible_with(&self.binding.state_fence)
-                || !self
-                    .binding
-                    .state_fence
-                    .is_compatible_with(&projection_binding.state_fence)
-            {
+            if !fences_match_exact(&projection_binding.state_fence, &self.binding.state_fence) {
                 return Err(ContextError::InvalidFence);
             }
         }
