@@ -82,7 +82,7 @@ impl KernelDurableJobPort for DaemonKernelClient {
             "load_durable_job",
             serde_json::json!({ "job_id": job_id, "state_fence": state_fence }),
         )?;
-        decode_durable_job(value)
+        decode_durable_job(&value)
     }
 
     fn save_durable_job(&self, job: &MaintenanceJob) -> Result<(), KernelPortError> {
@@ -116,7 +116,7 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(kernel_port_error)?;
-        decode_durable_job(value)
+        decode_durable_job(&value)
     }
 }
 
@@ -125,6 +125,9 @@ impl DaemonKernelClient {
 /// Shared by the sync port read and the async #1694 W4 read-back so the two
 /// paths can never drift into different decoders: a malformed payload stays
 /// a typed contract refusal, and absence stays `Ok(None)`.
-fn decode_durable_job(value: serde_json::Value) -> Result<Option<MaintenanceJob>, KernelPortError> {
-    let value = kind_value(&value, "durable_job")?;
+fn decode_durable_job(
+    value: &serde_json::Value,
+) -> Result<Option<MaintenanceJob>, KernelPortError> {
+    let value = kind_value(value, "durable_job")?;
     serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
+}
