@@ -1356,6 +1356,186 @@ fn require_complete_effect_coverage(
     Ok(())
 }
 
+/// Quiesces the canary's own owner effects before any dependent stop/delete.
+///
+/// `I14.23` orders a governed drain as "revoke/finish expiring action
+/// authority; request jobs/modules checkpoint/cancel; drain canonical writes and
+/// reconcile pending receipts; flush audit/outbox/ORS", and `I14.24` states the
+/// matching recovery obligations as "revoke session/leases; checkpoint task/work
+/// graph" and "revoke broker/session launch leases". This function is the
+/// installation owner's half of that drain, and it is deliberately built out of
+/// the owners that already exist rather than a second revocation scheme: there
+/// is no second lease table, no parallel session registry, no new token format
+/// and no port method added for it.
+///
+/// Every identity below is derived from the install transaction's own durable
+/// record, and the plan contributes the second, independent set. A checkpoint
+/// over a guessed job list, or a caller-supplied set reconciled against itself,
+/// proves nothing and is refused here because the two sets are compared rather
+/// than self-compared.
+///
+/// The three clauses of the drain are:
+///
+/// * **Exact jobs.** `require_all_effects_applied` is the existing owner
+///   validator for "every installer effect this transaction durably created is
+///   authoritatively settled", and `require_complete_effect_coverage` is what
+///   makes that exact by naming each of them in the frozen graph. Their removal
+///   is then driven row by row through the existing `InstallationEffectPort`
+///   with the existing `Rollback` action, so each row's postcondition is read
+///   back from the resource's own owner rather than assumed.
+/// * **Pending writes, ORS, outbox and possible external effects.** The
+///   transaction's own `pending_external_changes` is the only accepted source of
+///   that set, and it must both be empty and equal the count the frozen plan
+///   recorded. A caller that presents a narrower set than the transaction owns
+///   is an identity conflict, not a clean drain.
+/// * **Canary leases, sessions and routes.** The authority that can admit this
+///   canary's leases, sessions and routes is the transaction's own supervision
+///   authority. Its stable lease scope identity is validated in either strict
+///   binding state, and when the authority is provisioned the existing owner's
+///   own `validate()` is run against the ORIGINAL recorded receipt - the owner
+///   compares its recorded `watchdog_admission_template_digest` and
+///   `provision_receipt_digest` itself. Nothing here recomputes a fresh digest
+///   to stand in for that check, and nothing re-mints a lease, session or route
+///   token. The only claim this owner makes is the one it can prove from its own
+///   record: the authority that would admit those authorities is bound to this
+///   exact generation of this exact installation, so retiring the generation
+///   retires them with it. A transaction still holding a live activation
+///   projection intent - the canary's own activation session boundary in this
+///   owner - is refused outright.
+///
+/// The owner-derived rows are re-derived here and compared identity for
+/// identity against the frozen plan. That is what stops a plan from naming a
+/// substituted canary evidence root or a substituted Store/Blob object set and
+/// still presenting itself as a complete owner-effect inventory, and it is what
+/// keeps the shared and foreign rows `Retain` instead of letting a plan claim
+/// to delete another generation's durable state.
+///
+/// Every failure is a refusal that leaves the durable incomplete recovery and
+/// its blocking effect exactly as observed. A canary whose lease authority is
+/// foreign, whose provision receipt does not validate, or whose owner-effect
+/// identities do not re-derive is never removed by this owner.
+fn require_quiesced_owner_effects(
+    install: &InstallationTransaction,
+    plan: &CanaryRemovalPlan,
+) -> Result<(), InstallationError> {
+    // Exact jobs: the existing owner validator, not a list assembled here.
+    install.require_all_effects_applied()?;
+    // Pending writes, ORS, outbox and possible external effects: resolved, and
+    // the resolved set is the transaction's own rather than the request's.
+    if !install.pending_external_changes.is_empty() {
+        return Err(InstallationError::IncompleteObservation(
+            "the installed transaction still carries unacknowledged external changes"
+                .to_owned(),
+        ));
+    }
+    if pending_external_change_count(install)? != plan.quiesce.pending_external_changes
+        || open_install_effect_count(install)? != plan.quiesce.open_install_effects
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    // The canary's live activation session boundary: a held intent means the
+    // activation owner can still project this generation, so its leases,
+    // sessions and routes are not yet this removal's to retire.
+    if install.has_activation_projection_intent() {
+        return Err(InstallationError::IncompleteObservation(
+            "the activation owner still holds this transaction's pending activation intent"
+                .to_owned(),
+        ));
+    }
+    let launch = &install.candidate_manifest.runtime_launch;
+    // The lease/session/route admission authority of this exact generation. The
+    // stable scope identity is validated in either strict binding state, so a
+    // Phase-A candidate that never received a live overlay is still covered.
+    let lease_scope = handle_ref(launch.supervision_lease_scope_id())?;
+    if launch.generation != install.candidate_manifest.generation {
+        return Err(InstallationError::IdentityConflict);
+    }
+    if let super::SupervisionAuthorityBinding::Provisioned { authority } =
+        &launch.supervision_authority
+    {
+        // The existing lease owner's own validator, run against the originally
+        // recorded receipt rather than against a digest recomputed here.
+        authority
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "canary_removal.owner_effects.supervision_authority".to_owned(),
+                reason: error.to_string(),
+            })?;
+        // The existing owner's own Watchdog admission template, validated by the
+        // owner. This is the lease admission template that carries the canary's
+        // lease scope, generation and trust anchor.
+        let template = authority
+            .watchdog_admission_template()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "canary_removal.owner_effects.watchdog_admission_template".to_owned(),
+                reason: error.to_string(),
+            })?;
+        template
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "canary_removal.owner_effects.watchdog_admission_template".to_owned(),
+                reason: error.to_string(),
+            })?;
+        // The authority must be this canary's own, in this installation. A
+        // neighbour's or a foreign installation's authority is refused here
+        // instead of being revoked under the wrong identity.
+        if authority.supervision_lease_scope_id != lease_scope.as_str()
+            || authority.candidate_generation != plan.generation.as_str()
+            || authority.trust_anchor.installation_id != plan.installation_epoch.installation.as_str()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    // The owner-derived rows, re-derived from the transaction and compared to
+    // the frozen plan. Each category must appear exactly once, its identity
+    // must be the one this transaction's own manifest derives, and the shared
+    // or foreign rows must still be `Retain` so no plan can claim to delete
+    // another generation's durable state.
+    let expected_owners = [
+        (
+            CanaryRemovalResource::CanaryEvidenceRoot,
+            install
+                .candidate_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .canary_evidence_root()?,
+            CanaryRemovalAction::Retain,
+        ),
+        (
+            CanaryRemovalResource::StoreObjects,
+            install.candidate_manifest.generation.clone(),
+            CanaryRemovalAction::Retain,
+        ),
+        (
+            CanaryRemovalResource::GenerationRegistryRecord,
+            install.candidate_manifest.generation.clone(),
+            CanaryRemovalAction::Remove,
+        ),
+    ];
+    for (category, identity, action) in expected_owners {
+        let mut rows = plan
+            .effects
+            .iter()
+            .filter(|row| row.category == category);
+        let Some(row) = rows.next() else {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "the frozen plan does not account for the canary's own {:?} owner effect",
+                category
+            )));
+        };
+        if rows.next().is_some() {
+            return Err(InstallationError::Duplicate {
+                kind: "canary removal owner-derived effect".to_owned(),
+                identity: format!("{:?}", category),
+            });
+        }
+        if row.resource_identity != identity || row.action != action {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    Ok(())
+}
+
 /// Re-observes the admission fence and the retirement barrier against the
 /// owner's current durable projection.
 ///
@@ -1931,23 +2111,16 @@ where
     // green-light a destructive call. An incomplete drain stays a refusal and
     // preserves the durable incomplete recovery; it never forces a green
     // cleanup.
-    install.require_all_effects_applied()?;
-    if !install.pending_external_changes.is_empty() {
-        return Err(InstallationError::IncompleteObservation(
-            "the installed transaction still carries unacknowledged external changes".to_owned(),
-        ));
-    }
-    // The plan's recorded quiesce counts are re-derived here and compared
-    // against the transaction's own roster. The plan carries the counts it
-    // observed; this comparison proves the durable transaction still presents
-    // exactly that set, so a plan can never be read as covering a narrower set
-    // of open effects or pending writes/ORS/outbox rows than the transaction
-    // actually owns.
-    if open_install_effect_count(&install)? != plan.quiesce.open_install_effects
-        || pending_external_change_count(&install)? != plan.quiesce.pending_external_changes
-    {
-        return Err(InstallationError::IdentityConflict);
-    }
+    //
+    // `require_quiesced_owner_effects` is that whole observation in one place:
+    // the exact jobs, the pending writes/ORS/outbox entries and the canary's own
+    // lease/session/route authority, each compared against the transaction's own
+    // durable record rather than against a list supplied with the request. The
+    // plan's recorded quiesce counts are re-derived from the transaction's roster
+    // inside it, so a plan can never be read as covering a narrower set of open
+    // effects or pending writes/ORS/outbox rows than the transaction actually
+    // owns.
+    require_quiesced_owner_effects(&install, plan)?;
     // The frozen effect graph is checked against the install transaction's own
     // effect roster, which is the independent expected set: every installer
     // effect of the transaction must have exactly one plan row naming that
@@ -1955,12 +2128,6 @@ where
     // must name one that exists. Comparing the graph against itself would
     // prove nothing and could not detect a dropped or substituted member.
     require_complete_effect_coverage(&install, plan)?;
-    if install.has_activation_projection_intent() {
-        return Err(InstallationError::IncompleteObservation(
-            "the activation owner still holds this transaction's pending activation intent"
-                .to_owned(),
-        ));
-    }
     let projection = registry.load()?;
     projection.validate()?;
     // The target generation record is the one registry member a completed
