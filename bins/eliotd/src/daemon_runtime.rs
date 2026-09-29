@@ -1747,7 +1747,12 @@ async fn run_loop(
                 // owner flight. It never shares the notification completion
                 // branch, so a blocked durable commit cannot delay the
                 // maintenance notification.
+                //
+                // #1867 W3: the step also reads the deduplication registry back
+                // from the durable candidate records over the retained Kernel
+                // transport, which is why the client travels into the future.
                 maybe_start_improvement_intake(
+                    &kernel,
                     &composition,
                     &flight,
                     &mut improvement_intake_flight,
@@ -4289,32 +4294,37 @@ enum ImprovementIntakeFlight {
     InFlight(ImprovementIntakeFlightState),
 }
 
-/// Evaluates one real maintenance observation, assembles the
-/// owner-actionable improvement artifact over it, and admits it into the
-/// bounded backlog through the GOVERNED path, under the composition guard.
+/// Evaluates one real maintenance observation and assembles the
+/// owner-actionable improvement artifact over it, under the composition guard.
 ///
-/// Three reads and one pure assembly plus one governed admission, all under
-/// the lock:
+/// Three reads and one pure assembly, all under the lock:
 ///
 /// - the maintenance trigger decision, from the live observation;
-/// - the admitted Kernel fence for this pass;
+/// - the admitted Kernel fence for this pass, which is also the fence the
+///   deduplication registry is read back at;
 /// - the maintenance (`G-19`) improvement admission policy record, read from
 ///   the live `GovernorOwners::maintenance` owner — this is where the
 ///   per-surface bound numbers and the owning authority come from
 ///   (`eliotd::improvement_intake_dispatch::maintenance_bound`), so the
-///   daemon spells none of them;
-/// - the live `Governor` handle, which mints and re-verifies the learning
-///   admission permit the bound is checked against.
+///   daemon spells none of them.
 ///
-/// The guarded phase performs no exchange: assembling, reading the policy and
-/// issuing a permit are all pure with respect to the Kernel.
+/// The admission is deliberately NOT performed here. It needs the restored
+/// deduplication registry first, and that registry is read over the
+/// authenticated Kernel named-read route, which is an exchange and must not
+/// run while the composition guard is held. The admission is therefore the
+/// second guarded phase, [`admit_over_restored_registry`], after the guard has
+/// been released for the read — the same contour the Skill and ControlBoard
+/// reads already use.
+///
+/// The guarded phase performs no exchange: evaluating, assembling and reading
+/// the policy are all pure with respect to the Kernel.
 fn improvement_intake_artifact(
     composition: &DaemonComposition,
     observation: MaintenanceObservation,
 ) -> Result<
     (
         eliotd::improvement_intake_dispatch::ImprovementArtifact,
-        eliotd::improvement_intake_dispatch::GovernedImprovementAdmission,
+        eliot_maintenance::ImprovementAdmissionPolicy,
         eliot_contracts::StateFence,
     ),
     String,
@@ -4337,40 +4347,96 @@ fn improvement_intake_artifact(
             &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(&decision),
         )
         .map_err(|error| error.to_string())?;
-    // The dedup registry. Its bound comes from the owner record above, and it
-    // is deliberately per-pass: the durable artifact is the committed learning
-    // record, and nothing here claims the registry itself is durable.
-    let mut backlog = BoundedBacklog::new(vec![
-        eliotd::improvement_intake_dispatch::maintenance_bound(&policy)
-            .map_err(|error| error.to_string())?,
-    ])
-    .map_err(|error| error.to_string())?;
-    let admitted = eliotd::improvement_intake_dispatch::admit_improvement_artifact(
-        composition.improvement_governor(),
-        &policy,
-        &mut backlog,
-        &artifact,
-        &fence,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok((artifact, admitted, fence))
+    Ok((artifact, policy, fence))
 }
 
-/// Runs one improvement-intake step: evaluate, assemble, and admit the
-/// artifact over a real observation under the composition guard, then commit
-/// it — and every archive receipt the admission produced — durably through
-/// the Governor `RecordLearningRecord` seam with the guard released.
+/// Admits the assembled artifact into the deduplication registry restored from
+/// the durable candidate records, through the GOVERNED path.
 ///
-/// No kernel handle is carried: this step's durable write is owned entirely by
+/// The registry is REBUILT from the records this daemon previously committed,
+/// read back through the existing authenticated `GetLearningRecordRange`
+/// route (`eliotd::improvement_dedup_read::read_candidate_scope`). It is not
+/// constructed empty: a backlog built empty at every pass can never take its
+/// evidence-lineage merge branch, which is the whole of I12.24:297's
+/// "Duplicates merge by evidence lineage" on this path.
+///
+/// The fence is re-read under this fresh borrow and compared with the fence
+/// the registry was read at. The read and the admission are separated by an
+/// await with no lock held, so the fence can move in between; admitting
+/// against a registry read at a superseded fence would bound the admission
+/// with a set that is no longer the current one, so a moved fence refuses the
+/// pass instead. This is the same re-check `run_local_read_poll` already
+/// applies to its ControlBoard snapshot.
+///
+/// `rows` must be the EXHAUSTIVE candidate scope. A refused or unexhausted
+/// read never reaches here: it is a typed error the caller turns into a
+/// diagnostic, and the admission is not attempted against a partial set.
+fn admit_over_restored_registry(
+    composition: &DaemonComposition,
+    policy: &eliot_maintenance::ImprovementAdmissionPolicy,
+    rows: &[serde_json::Value],
+    artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
+    fence: &eliot_contracts::StateFence,
+) -> Result<eliotd::improvement_intake_dispatch::GovernedImprovementAdmission, String> {
+    let current = composition
+        .notification_state_admission_fence()
+        .map_err(|error| error.to_string())?;
+    if current != *fence {
+        return Err(
+            "the admitted state fence moved between the dedup registry read and the admission"
+                .to_owned(),
+        );
+    }
+    // The bound still comes from the G-19 owner record, never from a literal
+    // and never from the restored records.
+    let bound = eliotd::improvement_intake_dispatch::maintenance_bound(policy)
+        .map_err(|error| error.to_string())?;
+    let mut backlog: BoundedBacklog =
+        eliotd::improvement_dedup_read::restored_registry(rows, bound)
+            .map_err(|error| error.to_string())?;
+    eliotd::improvement_intake_dispatch::admit_improvement_artifact(
+        composition.improvement_governor(),
+        policy,
+        &mut backlog,
+        artifact,
+        fence,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Runs one improvement-intake step: evaluate and assemble the artifact over a
+/// real observation, read the deduplication registry back from the durable
+/// candidate records, admit into it through the governed path, and commit the
+/// artifact — and every archive receipt the admission produced — durably
+/// through the Governor `RecordLearningRecord` seam.
+///
+/// Four phases, and the lock is held for three of them:
+///
+/// 1. guarded: evaluate the observation, capture the admitted fence, assemble
+///    the artifact, read the `G-19` admission policy;
+/// 2. UNGUARDED: read the whole candidate scope back through the existing
+///    authenticated `GetLearningRecordRange` route at the fence captured in
+///    phase 1. No mutex is held across this await, exactly as the Skill
+///    acceptance and evidence reads are run;
+/// 3. guarded: re-check the fence, rebuild the bounded backlog from those
+///    records, and run the governed admission against it;
+/// 4. guarded: commit.
+///
+/// A refused or unexhausted phase-2 read is a typed error and the pass STOPS.
+/// It is never treated as an empty registry: admitting against "nothing was
+/// there" is precisely the failure this read exists to prevent, because it
+/// makes a repeat of the same evidence lineage look like a first observation.
+///
+/// The durable write is owned entirely by
 /// [`eliotd::DaemonComposition::commit_learning_record`], the one
-/// Governor-owned caller of the closed `RecordLearningRecord` mutation, so a
-/// parameter it never consumes would be a stand-in rather than a transport.
-/// The commit is a retained run-loop flight rather than detached work, the
-/// composition lock is never held across the durable exchange, and a refusal
-/// is a typed diagnostic rather than a loop failure — exactly the discipline
+/// Governor-owned caller of the closed `RecordLearningRecord` mutation. The
+/// commit is a retained run-loop flight rather than detached work, the
+/// composition lock is never held across a durable exchange, and a refusal is
+/// a typed diagnostic rather than a loop failure — exactly the discipline
 /// [`evaluate_and_emit_maintenance_notification`] already uses for the
 /// notification leg.
 async fn run_improvement_intake(
+    kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     observation: MaintenanceObservation,
 ) -> Result<(), String> {
@@ -4378,12 +4444,36 @@ async fn run_improvement_intake(
         let guard = composition.lock().await;
         improvement_intake_artifact(&guard, observation)
     };
-    let (artifact, admitted, fence) = match prepared {
+    let (artifact, policy, fence) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = eliotd::diagnostics::ErrorRecord::of(
                 eliotd::diagnostics::OwningComponent::DaemonRuntime,
                 "improvement-intake",
+                &error,
+            )
+            .emit();
+            return Ok(());
+        }
+    };
+    // The deduplication registry, read back from the records this daemon
+    // committed, at the fence this pass admitted under. Unguarded: the read is
+    // an authenticated Kernel exchange and the composition guard is not held
+    // across it.
+    let rows = eliotd::improvement_dedup_read::read_candidate_scope(kernel, &fence)
+        .await
+        .map_err(|error| error.to_string())?;
+    let restored = rows.len();
+    let admitted = {
+        let guard = composition.lock().await;
+        admit_over_restored_registry(&guard, &policy, &rows, &artifact, &fence)
+    };
+    let admitted = match admitted {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-admission",
                 &error,
             )
             .emit();
@@ -4413,6 +4503,13 @@ async fn run_improvement_intake(
                 bound_min_value = admitted.bound.min_value,
                 governor_authority_ref = %admitted.bound.governor_authority_ref,
                 governed_admission_digest = %admitted.admission_digest,
+                // How many durable candidate records the deduplication
+                // registry was rebuilt from, and what the admission decided
+                // against it. A merge here is a real lineage merge into an
+                // entry this daemon committed on an earlier pass, not into a
+                // registry that was empty again.
+                restored_candidate_records = restored,
+                admission = ?admitted.report.outcome,
             );
             for archived in &admitted.report.archived {
                 // Every archive receipt is a recorded disposition, and the
@@ -4446,7 +4543,13 @@ async fn run_improvement_intake(
 /// observation is captured from the activation state before the future is
 /// created, so the decision and its evidence are the same observation; a busy
 /// flight is left untouched.
+///
+/// The retained Kernel client is cloned into the future because the step now
+/// performs an authenticated named read — the deduplication-registry read-back
+/// — as well as the durable write. It is the same retained transport every
+/// other read in this loop uses, not a second client.
 fn maybe_start_improvement_intake(
+    kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     activation_flight: &ActivationFlight,
     flight: &mut ImprovementIntakeFlight,
@@ -4455,10 +4558,11 @@ fn maybe_start_improvement_intake(
         return;
     }
     let observation = idle_maintenance_observation(activation_flight);
+    let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
     *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {
         future: Box::pin(async move {
-            let result = run_improvement_intake(&composition, observation).await;
+            let result = run_improvement_intake(&kernel, &composition, observation).await;
             ImprovementIntakeCompletion::Settled(result)
         }),
     });
