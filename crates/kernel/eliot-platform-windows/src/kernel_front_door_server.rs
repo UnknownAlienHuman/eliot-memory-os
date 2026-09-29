@@ -271,6 +271,7 @@ pub fn authenticate_kernel_front_door_server(
                 .map(|binding| binding.job_name().to_owned()),
             builtin_administrators: false,
             interactive_session: false,
+            interactive_group_enabled: false,
         };
         let process = OwnedProcessHandle::new(process)?;
         Ok(KernelFrontDoorServerProof {

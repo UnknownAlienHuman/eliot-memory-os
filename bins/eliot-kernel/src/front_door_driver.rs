@@ -260,6 +260,13 @@ async fn serve_connection(
 ) -> Result<(), TransportError> {
     let limits = kernel.ipc_limits();
     let peer = front_door.peer_identity().clone();
+    if selection.kind() == NamedPipePeerKind::UserBroker {
+        // The transport role is pinned to the installed image and live
+        // interactive token, but the Kernel has no owner-issued Broker launch
+        // nonce/session record yet. Close before reading any frame so a
+        // Broker cannot enter the generic control or client-hello route.
+        return Ok(());
+    }
     if selection.kind() == NamedPipePeerKind::AgentBridge {
         return Box::pin(serve_agent_bridge_connection(
             kernel, front_door, shutdown, selection, peer,

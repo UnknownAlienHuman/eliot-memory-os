@@ -2,7 +2,8 @@
 //!
 //! Binary-private parsing, validation, and bounded lease reads for the
 //! `eliot-kernel` entry: host-injected `KernelStartupBinding`, the exact
-//! 24-value launch contour, neutral store-bootstrap and `eliotd` descriptor
+//! 28-value launch contour, neutral store-bootstrap, User Broker executable,
+//! and `eliotd` descriptor
 //! preparation, and the authority-contour projection. Zero composition
 //! contact: this module never constructs, reads, or drives
 //! `KernelComposition`; `main` calls the `pub(crate)` parsers and passes the
@@ -208,6 +209,8 @@ pub(crate) struct KernelLaunchOptions {
     pub(crate) doctor_executable_path: Option<PathBuf>,
     pub(crate) testd_artifact_sha256: Option<String>,
     pub(crate) native_worker_artifact_sha256: Option<String>,
+    pub(crate) user_broker_executable_path: Option<PathBuf>,
+    pub(crate) user_broker_artifact_sha256: Option<String>,
 }
 
 pub(crate) struct PreparedStoreBootstrap {
@@ -246,6 +249,10 @@ where
             testd_artifact_digest,
             native_worker_artifact_flag,
             native_worker_artifact_digest,
+            user_broker_executable_flag,
+            user_broker_executable_path,
+            user_broker_artifact_flag,
+            user_broker_artifact_digest,
             daemon_flag,
             daemon_path,
             daemon_digest_flag,
@@ -260,6 +267,8 @@ where
             && doctor_executable_flag == "--doctor-executable-path"
             && testd_artifact_flag == "--testd-artifact-sha256"
             && native_worker_artifact_flag == "--native-worker-artifact-sha256"
+            && user_broker_executable_flag == "--user-broker-executable"
+            && user_broker_artifact_flag == "--user-broker-artifact-sha256"
             && daemon_flag == "--eliotd-descriptor"
             && daemon_digest_flag == "--eliotd-descriptor-sha256" =>
         {
@@ -269,6 +278,7 @@ where
             let doctor_artifact_digest = doctor_artifact_digest.to_string_lossy();
             let testd_artifact_digest = testd_artifact_digest.to_string_lossy();
             let native_worker_artifact_digest = native_worker_artifact_digest.to_string_lossy();
+            let user_broker_artifact_digest = user_broker_artifact_digest.to_string_lossy();
             let daemon_digest = daemon_digest.to_string_lossy();
             if !is_lower_sha256(&store_digest)
                 || !is_lower_sha256(&authority_digest)
@@ -276,10 +286,23 @@ where
                 || !is_lower_sha256(&doctor_artifact_digest)
                 || !is_lower_sha256(&testd_artifact_digest)
                 || !is_lower_sha256(&native_worker_artifact_digest)
+                || !is_lower_sha256(&user_broker_artifact_digest)
                 || !is_lower_sha256(&daemon_digest)
             {
                 return Err(invalid_input(
                     "descriptor digests must be lowercase SHA-256",
+                ));
+            }
+            let user_broker_executable_path = PathBuf::from(user_broker_executable_path);
+            if !user_broker_executable_path.is_absolute()
+                || user_broker_executable_path.as_os_str().is_empty()
+                || user_broker_executable_path
+                    .to_string_lossy()
+                    .chars()
+                    .any(char::is_control)
+            {
+                return Err(invalid_input(
+                    "Host launch must inject the exact User Broker executable path bound to the digested User Broker role",
                 ));
             }
             let doctor_executable_path = PathBuf::from(doctor_executable_path);
@@ -309,7 +332,51 @@ where
                 doctor_executable_path: Some(doctor_executable_path),
                 testd_artifact_sha256: Some(testd_artifact_digest.into_owned()),
                 native_worker_artifact_sha256: Some(native_worker_artifact_digest.into_owned()),
+                user_broker_executable_path: Some(user_broker_executable_path),
+                user_broker_artifact_sha256: Some(user_broker_artifact_digest.into_owned()),
             })
+        }
+        [
+            work_flag,
+            _work_root,
+            store_flag,
+            _descriptor,
+            store_digest_flag,
+            _store_digest,
+            authority_flag,
+            _authority_path,
+            authority_digest_flag,
+            _authority_digest,
+            kernel_artifact_flag,
+            _kernel_artifact_digest,
+            doctor_artifact_flag,
+            _doctor_artifact_digest,
+            doctor_executable_flag,
+            _doctor_executable_path,
+            testd_artifact_flag,
+            _testd_artifact_digest,
+            native_worker_artifact_flag,
+            _native_worker_artifact_digest,
+            daemon_flag,
+            _daemon_path,
+            daemon_digest_flag,
+            _daemon_digest,
+        ] if work_flag == "--work-root"
+            && store_flag == "--store-bootstrap"
+            && store_digest_flag == "--store-bootstrap-sha256"
+            && authority_flag == "--authority-descriptor"
+            && authority_digest_flag == "--authority-descriptor-sha256"
+            && kernel_artifact_flag == "--kernel-artifact-sha256"
+            && doctor_artifact_flag == "--doctor-artifact-sha256"
+            && doctor_executable_flag == "--doctor-executable-path"
+            && testd_artifact_flag == "--testd-artifact-sha256"
+            && native_worker_artifact_flag == "--native-worker-artifact-sha256"
+            && daemon_flag == "--eliotd-descriptor"
+            && daemon_digest_flag == "--eliotd-descriptor-sha256" =>
+        {
+            Err(invalid_input(
+                "Host launch must inject the exact User Broker executable path and digest",
+            ))
         }
         [
             work_flag,
@@ -351,7 +418,7 @@ where
             ))
         }
         _ => Err(invalid_input(
-            "expected the exact mandatory 24-value Host launch contour",
+            "expected the exact mandatory 28-value Host launch contour",
         )),
     }
 }
@@ -551,6 +618,7 @@ mod tests {
         let root = TempRoot::new();
         let digest = "a".repeat(64);
         let doctor_path = root.0.join("eliot-doctor.exe");
+        let user_broker_path = root.0.join("eliot-user-broker.exe");
         let options = parse_launch_options([
             "--work-root".into(),
             root.0.join("work").into_os_string(),
@@ -572,6 +640,10 @@ mod tests {
             digest.clone().into(),
             "--native-worker-artifact-sha256".into(),
             digest.clone().into(),
+            "--user-broker-executable".into(),
+            user_broker_path.clone().into_os_string(),
+            "--user-broker-artifact-sha256".into(),
+            digest.clone().into(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
@@ -587,6 +659,12 @@ mod tests {
         );
         assert_eq!(options.testd_artifact_sha256, Some(digest.clone()));
         assert_eq!(options.native_worker_artifact_sha256, Some(digest.clone()));
+        assert_eq!(
+            options.user_broker_executable_path,
+            Some(user_broker_path),
+            "the installer-pinned User Broker path must be retained exactly"
+        );
+        assert_eq!(options.user_broker_artifact_sha256, Some(digest.clone()));
         assert_eq!(options.daemon_descriptor, Some(root.0.join("eliotd.json")));
     }
 
@@ -650,6 +728,10 @@ mod tests {
             digest.clone().into(),
             "--native-worker-artifact-sha256".into(),
             digest.clone().into(),
+            "--user-broker-executable".into(),
+            root.0.join("eliot-user-broker.exe").into_os_string(),
+            "--user-broker-artifact-sha256".into(),
+            digest.clone().into(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
@@ -681,6 +763,10 @@ mod tests {
             "--testd-artifact-sha256".into(),
             digest.clone().into(),
             "--native-worker-artifact-sha256".into(),
+            digest.clone().into(),
+            "--user-broker-executable".into(),
+            root.0.join("eliot-user-broker.exe").into_os_string(),
+            "--user-broker-artifact-sha256".into(),
             digest.clone().into(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
@@ -782,6 +868,10 @@ mod tests {
             "f".repeat(64).into(),
             "--native-worker-artifact-sha256".into(),
             "a".repeat(64).into(),
+            "--user-broker-executable".into(),
+            root.0.join("eliot-user-broker.exe").into_os_string(),
+            "--user-broker-artifact-sha256".into(),
+            "b".repeat(64).into(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
