@@ -1631,7 +1631,13 @@ fn dispatch_apply_experience_state(
                 record_json,
                 record_digest,
                 ..
-            } => (handle, revision, record_json, record_digest, ExperienceFamily::Bank),
+            } => (
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ExperienceFamily::Bank,
+            ),
             eliot_store_api::DecodedExperienceMutation::Feedback {
                 handle,
                 revision,

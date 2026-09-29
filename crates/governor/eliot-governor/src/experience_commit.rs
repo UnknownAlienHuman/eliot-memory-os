@@ -78,8 +78,8 @@
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::OperationId;
 use eliot_observation::bank_admission::{
-    ExperienceRevisionLedger, SessionEpisodeAdmission, admit_session_episode,
-    produce_bank_commit, produce_feedback_commit, produce_session_episode_commit,
+    ExperienceRevisionLedger, SessionEpisodeAdmission, admit_session_episode, produce_bank_commit,
+    produce_feedback_commit, produce_session_episode_commit,
 };
 use eliot_observation_contracts::{
     AgentFeedbackRecord, ExperienceBankRecord, SessionEpisodeRecord,
@@ -159,16 +159,15 @@ fn session_episode_commit_leg(
         .map_err(|error| CompositionError::Owner(format!("episode commit payload: {error}")))?;
     let record_json = serde_json::to_string(record)
         .map_err(|error| CompositionError::Owner(format!("episode record encode: {error}")))?;
-    let mutation = experience_session_episode_mutation_request(
-        experience_session_episode_commit_params(
+    let mutation =
+        experience_session_episode_mutation_request(experience_session_episode_commit_params(
             record_json,
             commit.record_digest,
             commit.record_revision,
             commit.scope_digest,
             commit.fence_digest,
             commit.idempotency_key.clone(),
-        ),
-    );
+        ));
     Ok(CommitLeg {
         mutation,
         idempotency_key: commit.idempotency_key,

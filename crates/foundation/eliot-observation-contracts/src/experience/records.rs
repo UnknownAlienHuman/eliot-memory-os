@@ -627,7 +627,11 @@ pub enum SessionEpisodeSourceAvailability {
 /// requires the explicit policy reference the promoted variants carry
 /// (I12.37).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "portability", deny_unknown_fields)]
+#[serde(
+    rename_all = "SCREAMING_SNAKE_CASE",
+    tag = "portability",
+    deny_unknown_fields
+)]
 pub enum SessionEpisodePortability {
     /// Local-private episode; no sharing was inferred.
     LocalPrivate,
@@ -655,12 +659,13 @@ impl SessionEpisodePortability {
     fn validate(&self) -> Result<(), ObservationError> {
         match self {
             Self::LocalPrivate => Ok(()),
-            Self::ProjectShareable { policy_ref }
-            | Self::ExportableRedacted { policy_ref } => bounded_text(
-                policy_ref,
-                "session_episode.portability.policy_ref",
-                MAX_CONSENT_REF_CHARS,
-            ),
+            Self::ProjectShareable { policy_ref } | Self::ExportableRedacted { policy_ref } => {
+                bounded_text(
+                    policy_ref,
+                    "session_episode.portability.policy_ref",
+                    MAX_CONSENT_REF_CHARS,
+                )
+            }
         }
     }
 }
@@ -1564,9 +1569,7 @@ impl ExperienceCommitParameters {
 
     /// Build commit parameters for one admitted session-episode record. Same
     /// recompute rule as [`for_bank`](Self::for_bank).
-    pub fn for_session_episode(
-        record: &SessionEpisodeRecord,
-    ) -> Result<Self, ObservationError> {
+    pub fn for_session_episode(record: &SessionEpisodeRecord) -> Result<Self, ObservationError> {
         record.validate()?;
         Ok(Self {
             operation: SESSION_EPISODE_COMMIT_OPERATION.to_owned(),

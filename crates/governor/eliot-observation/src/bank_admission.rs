@@ -178,21 +178,6 @@ impl ExperienceRevisionLedger {
         }
     }
 
-    /// Rebuild session-episode sequencing from admitted records (greatest
-    /// revision wins per handle). Idempotent: rebuilding twice changes
-    /// nothing. Issue #1778, I12.37.
-    pub fn rebuild_session_episodes(&mut self, records: &[SessionEpisodeRecord]) {
-        for record in records {
-            let entry = self
-                .session_episode
-                .entry(record.handle.as_str().to_owned())
-                .or_insert(0);
-            if record.episode_revision > *entry {
-                *entry = record.episode_revision;
-            }
-        }
-    }
-
     /// Check a bank revision against the tracked greatest and track it.
     /// Genesis (untracked handle) accepts any revision; afterwards only a
     /// strictly greater revision passes.
