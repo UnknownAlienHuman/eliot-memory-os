@@ -531,11 +531,11 @@ fn process_token_is_interactive_member(
     process: windows_sys::Win32::Foundation::HANDLE,
 ) -> Result<bool, WindowsAdapterError> {
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
     use windows_sys::Win32::Security::{
         CreateWellKnownSid, EqualSid, GetTokenInformation, SECURITY_MAX_SID_SIZE,
         SID_AND_ATTRIBUTES, TOKEN_GROUPS, TokenGroups, WinInteractiveSid,
     };
-    use windows_sys::Win32::Security::TOKEN_QUERY;
     use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
     use windows_sys::Win32::System::Threading::OpenProcessToken;
 

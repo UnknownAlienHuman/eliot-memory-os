@@ -79,8 +79,10 @@ impl NamedPipePeerProfile {
             || (kind == NamedPipePeerKind::UserBroker
                 && (!expectation.is_dynamic_process()
                     || !expectation.requires_interactive_group_membership()))
-            || (!matches!(kind, NamedPipePeerKind::AgentBridge | NamedPipePeerKind::UserBroker)
-                && expectation.is_dynamic_process())
+            || (!matches!(
+                kind,
+                NamedPipePeerKind::AgentBridge | NamedPipePeerKind::UserBroker
+            ) && expectation.is_dynamic_process())
         {
             return Err(WindowsAdapterError::InvalidInput);
         }
@@ -139,16 +141,10 @@ impl NamedPipePeerSet {
             let dynamic_process = entry.expectation.is_dynamic_process();
             let valid = match entry.kind {
                 NamedPipePeerKind::AgentBridge => {
-                    dynamic_process
-                        && !entry
-                            .expectation
-                            .requires_interactive_group_membership()
+                    dynamic_process && !entry.expectation.requires_interactive_group_membership()
                 }
                 NamedPipePeerKind::UserBroker => {
-                    dynamic_process
-                        && entry
-                            .expectation
-                            .requires_interactive_group_membership()
+                    dynamic_process && entry.expectation.requires_interactive_group_membership()
                 }
                 _ => !dynamic_process && static_process.is_some(),
             };
@@ -199,11 +195,9 @@ impl NamedPipePeerSet {
     /// group membership from the peer process primary token.
     #[must_use]
     pub fn requires_interactive_group_membership(&self) -> bool {
-        self.entries.iter().any(|entry| {
-            entry
-                .expectation
-                .requires_interactive_group_membership()
-        })
+        self.entries
+            .iter()
+            .any(|entry| entry.expectation.requires_interactive_group_membership())
     }
 
     /// Returns the approved SID principals used to build and verify a set DACL.
