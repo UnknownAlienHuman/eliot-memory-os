@@ -2983,18 +2983,45 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
         })
 
     $hashes = Get-ReleaseFileInventory $Bundle -ExcludeChecksumManifest -ExcludePaths @($script:StagingOwnerMarker)
-    Set-JsonFile (Join-Path $Bundle 'SHA256SUMS.json') ([ordered]@{
-            component = 'eliot_windows_x64_release_manifest'
-            version = [string]$release.version
-            source_commit = [string]$release.source_commit
-            architecture = [string]$release.architecture
-            signed = $true
-            signature_policy = $script:AuthenticodeSigningPolicy
-            signed_scope = $script:AuthenticodeSigningScope
-            signature_evidence = $signatureEvidence
-            governor_approval = $governorApproval
-            files = @($hashes)
-        })
+    # Issue #1811 (item A4): signing rewrites the release manifest, so the exact
+    # excluded-disposition gate receipt reference the build bound - including the
+    # admitted separate-package evidence - is carried into the signed manifest
+    # instead of being dropped. It is re-validated against the signed
+    # RELEASE.json below and in Test-FinalizedReleaseBundle, so a signed bundle
+    # cannot publish without the receipt that admitted its inputs.
+    $stagedChecksums = Get-Content -LiteralPath (Join-Path $Bundle 'SHA256SUMS.json') -Raw | ConvertFrom-Json
+    $excludedDispositionReceipt = $stagedChecksums.PSObject.Properties['excluded_disposition_receipt']
+    if ($null -eq $excludedDispositionReceipt -or $null -eq $excludedDispositionReceipt.Value) {
+        throw 'the unsigned release manifest carries no excluded-disposition gate receipt reference; signing would drop the admitted separate-package evidence'
+    }
+    $releaseDisposition = $release.PSObject.Properties['excluded_dispositions']
+    if ($null -eq $releaseDisposition -or $null -eq $releaseDisposition.Value) {
+        throw 'RELEASE.json carries no excluded-disposition binding to carry into the signed release manifest'
+    }
+    if ([string]$excludedDispositionReceipt.Value.receipt_sha256 -cne [string]$releaseDisposition.Value.receipt_sha256) {
+        throw 'RELEASE.json and SHA256SUMS.json disagree about the excluded-disposition gate receipt before signing'
+    }
+    $signedManifest = [ordered]@{
+        component = 'eliot_windows_x64_release_manifest'
+        version = [string]$release.version
+        source_commit = [string]$release.source_commit
+        architecture = [string]$release.architecture
+        signed = $true
+        signature_policy = $script:AuthenticodeSigningPolicy
+        signed_scope = $script:AuthenticodeSigningScope
+        signature_evidence = $signatureEvidence
+        governor_approval = $governorApproval
+        excluded_disposition_receipt = $excludedDispositionReceipt.Value
+        files = @($hashes)
+    }
+    Set-JsonFile (Join-Path $Bundle 'SHA256SUMS.json') $signedManifest
+    # Issue #1811: the admitted evidence must survive signing byte-identically.
+    $writtenChecksums = Get-Content -LiteralPath (Join-Path $Bundle 'SHA256SUMS.json') -Raw | ConvertFrom-Json
+    $writtenAdmitted = $writtenChecksums.excluded_disposition_receipt.admitted_separate_evidence | ConvertTo-Json -Depth 12 -Compress
+    $expectedAdmitted = $releaseDisposition.Value.admitted_separate_evidence | ConvertTo-Json -Depth 12 -Compress
+    if ($writtenAdmitted -cne $expectedAdmitted) {
+        throw 'the signed release manifest does not carry the admitted separate-package evidence bound by RELEASE.json'
+    }
     return $signatureEvidence
 }
 
@@ -3089,6 +3116,26 @@ function Test-FinalizedReleaseBundle(
     if ([string]$verified.schema -cne 'eliot-authenticode-signing-verification-v1' -or
         [string]$verified.signature_evidence.status -cne 'VERIFIED') {
         throw 'SIGNING_VERIFIED.json is not an exact verification receipt'
+    }
+    # Issue #1811 (item A4): the finalized, signed release manifest must still
+    # reference the exact excluded-disposition gate receipt, and the admitted
+    # separate-package evidence in it must be the evidence RELEASE.json bound -
+    # not a rewritten, dropped or substituted set.
+    $finalReceiptProperty = $checksum.PSObject.Properties['excluded_disposition_receipt']
+    if ($null -eq $finalReceiptProperty -or $null -eq $finalReceiptProperty.Value) {
+        throw 'finalized release manifest does not reference the excluded-disposition gate receipt'
+    }
+    $finalReleaseDisposition = $release.PSObject.Properties['excluded_dispositions']
+    if ($null -eq $finalReleaseDisposition -or $null -eq $finalReleaseDisposition.Value) {
+        throw 'finalized RELEASE.json does not carry the excluded-disposition binding'
+    }
+    if ([string]$finalReceiptProperty.Value.receipt_sha256 -cne [string]$finalReleaseDisposition.Value.receipt_sha256) {
+        throw 'finalized RELEASE.json and SHA256SUMS.json disagree about the excluded-disposition gate receipt'
+    }
+    $finalAdmittedJson = $finalReceiptProperty.Value.admitted_separate_evidence | ConvertTo-Json -Depth 12 -Compress
+    $finalExpectedAdmittedJson = $finalReleaseDisposition.Value.admitted_separate_evidence | ConvertTo-Json -Depth 12 -Compress
+    if ($finalAdmittedJson -cne $finalExpectedAdmittedJson) {
+        throw 'finalized release manifest does not carry the admitted separate-package evidence bound by RELEASE.json'
     }
     $releaseEvidence = $release.signature_evidence | ConvertTo-Json -Depth 12 -Compress
     $runtimeEvidence = $runtime.signature_evidence | ConvertTo-Json -Depth 12 -Compress
