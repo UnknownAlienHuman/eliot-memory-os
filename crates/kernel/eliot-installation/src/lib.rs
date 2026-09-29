@@ -378,7 +378,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// shape. Version 26 adds the original `UserMode` authority key receipt and
 /// terminal no-effect-abort progress. Version 27 retains the original profile
 /// selection receipt; v28 adds exact current-user Task registration intent,
-/// receipt and unresolved progress. Version 29 adds exact Task RunEx intent
+/// receipt and unresolved progress. Version 29 adds exact Task `RunEx` intent
 /// and receipt plus the source-publication profile-anchor object identity.
 /// Wires before v29 require explicit migration/recovery and are never
 /// synthesized from current paths or objects.
@@ -2891,7 +2891,7 @@ impl UserModeAuthorityAbsentSnapshot {
     }
 }
 
-/// Repository-object and relative-key absence observed before one PortableDev authority write.
+/// Repository-object and relative-key absence observed before one `PortableDev` authority write.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortableDevAuthorityAbsentSnapshot {
@@ -4336,7 +4336,7 @@ pub(crate) trait InstallationEffectPort: Send {
     ) {
     }
 
-    /// Generates one PortableDev key seed and returns its secret-free root
+    /// Generates one `PortableDev` key seed and returns its secret-free root
     /// identity receipt before any file write is permitted.
     fn prepare_portable_dev_authority(
         &mut self,
@@ -4345,7 +4345,7 @@ pub(crate) trait InstallationEffectPort: Send {
         PortOutcome::Unknown(UnknownReason::Unsupported)
     }
 
-    /// Reports whether this live port still holds the prepared PortableDev
+    /// Reports whether this live port still holds the prepared `PortableDev`
     /// seed for the exact persisted receipt.
     fn has_prepared_portable_dev_authority(
         &self,
@@ -4354,7 +4354,7 @@ pub(crate) trait InstallationEffectPort: Send {
         false
     }
 
-    /// Drops an uncommitted PortableDev seed after the transaction CAS fails.
+    /// Drops an uncommitted `PortableDev` seed after the transaction CAS fails.
     fn discard_prepared_portable_dev_authority(
         &mut self,
         _receipt: &PortableDevSupervisionAuthorityKeyReceipt,
@@ -4380,7 +4380,7 @@ pub(crate) trait InstallationEffectPort: Send {
         eliot_platform_windows::profile_supervision::inspect_current_user_task(request, expected)
     }
 
-    /// Issues the one-shot Task Scheduler RunEx call for an exact registration.
+    /// Issues the one-shot Task Scheduler `RunEx` call for an exact registration.
     fn run_current_user_task(
         &mut self,
         receipt: &CurrentUserTaskReceipt,
@@ -9757,7 +9757,7 @@ where
         self.store.reconcile_active_verified(receipt, evidence)
     }
 
-    /// Reconciles or creates the one immutable UserMode Task Scheduler task.
+    /// Reconciles or creates the one immutable `UserMode` Task Scheduler task.
     ///
     /// The exact request is persisted before inspection and mutation. An
     /// unsettled or unknown effect is inspected against that request and its
@@ -9965,7 +9965,7 @@ where
         }
     }
 
-    /// Issues one current-user RunEx call after committing its live-session
+    /// Issues one current-user `RunEx` call after committing its live-session
     /// intent. A retained intent without a receipt is never replayed.
     pub(crate) fn run_current_user_task_once(
         &mut self,
@@ -12661,6 +12661,70 @@ pub struct WindowsInstallationCoordinator<S> {
     inner: InstallationCoordinator<WindowsInstallationEffectPort, S>,
 }
 
+/// Re-reads the original profile root and immutable package effects before the
+/// first current-user root selection is retained. The caller holds the live
+/// no-follow profile leases across this readback and the transaction CAS, so a
+/// replacement at the same path cannot become the original selection.
+pub fn verify_profile_effect_identities_before_selection(
+    transaction: &InstallationTransaction,
+) -> Result<(), InstallationError> {
+    transaction.validate()?;
+    if transaction.profile == InstallationProfile::SystemService
+        || transaction.profile_selection_receipt().is_some()
+    {
+        return Err(InstallationError::ProfileViolation(
+            "first profile effect readback requires an unselected current-user transaction"
+                .to_owned(),
+        ));
+    }
+    transaction.require_profile_root_creation_complete()?;
+    let mut port = WindowsInstallationEffectPort::new();
+    for (index, effect) in transaction.installer_effects.iter().enumerate() {
+        if !matches!(
+            effect,
+            InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::StagePackage { .. }
+        ) {
+            continue;
+        }
+        let InstallationEffectProgressState::Applied {
+            disposition,
+            external_identity,
+            postcondition_digest,
+            ..
+        } = &transaction.effect_progress[index].state
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "profile root or immutable package effect has no retained Applied identity"
+                    .to_owned(),
+            ));
+        };
+        let request = effect_request(
+            transaction,
+            index,
+            1,
+            InstallationEffectAction::Apply,
+            None,
+        )?;
+        match port.reconcile(&request) {
+            PortOutcome::Known(InstallationEffectObservation::Matching {
+                disposition: observed_disposition,
+                external_identity: observed_identity,
+                postcondition_digest: observed_postcondition,
+                ..
+            }) if observed_disposition == *disposition
+                && observed_identity == *external_identity
+                && observed_postcondition == *postcondition_digest => {}
+            _ => {
+                return Err(InstallationError::IncompleteObservation(
+                    "profile root or immutable package no longer matches its original effect readback"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<S> WindowsInstallationCoordinator<S>
 where
     S: InstallationTransactionStore,
@@ -12719,12 +12783,12 @@ where
             .register_or_reconcile_current_user_task(transaction_id, request)
     }
 
-    /// Issues RunEx once for a durable registration, retaining the current live
+    /// Issues `RunEx` once for a durable registration, retaining the current live
     /// interactive session before crossing the Task Scheduler boundary.
     ///
     /// If the call has already been attempted but its exact receipt was not
     /// durably recorded, this method returns an unresolved observation and
-    /// never issues RunEx again.
+    /// never issues `RunEx` again.
     pub fn run_current_user_task_once(
         &mut self,
         transaction_id: &PlatformHandle,
@@ -12846,7 +12910,7 @@ where
     /// Callers invoke this only after the pending activation projection is
     /// committed and the pending profile Host has been launched. The method
     /// drives the current-user credential effect and Phase-B effect in order,
-    /// then stops before UserMode Task Scheduler registration. The
+    /// then stops before `UserMode` Task Scheduler registration. The
     /// authenticated profile Host pipe proves the serving principal and live
     /// Host identity; this method never infers Host liveness from its caller.
     pub fn drive_until_profile_phase_b(

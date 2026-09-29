@@ -1014,7 +1014,7 @@ impl InstallationTransaction {
         self.validate()
     }
 
-    fn require_profile_root_creation_complete(&self) -> Result<(), InstallationError> {
+    pub(crate) fn require_profile_root_creation_complete(&self) -> Result<(), InstallationError> {
         let package_indices = self
             .installer_effects
             .iter()

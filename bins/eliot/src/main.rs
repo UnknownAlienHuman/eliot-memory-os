@@ -3344,6 +3344,10 @@ fn record_or_validate_profile_selection_receipt(
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         return Ok(transaction.clone());
     }
+    eliot_installation::verify_profile_effect_identities_before_selection(transaction)?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
     let recorded = RedbInstallationTransactionStore::record_profile_selection_receipt_at_exact_path(
         store_path,
         &transaction.transaction_id,
