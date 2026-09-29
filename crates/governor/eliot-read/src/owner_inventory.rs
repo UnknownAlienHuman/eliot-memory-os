@@ -1555,6 +1555,16 @@ fn resolve_schema_identity(
 }
 
 /// Returns the catalogue manifest of one canonical read operation name.
+///
+/// A missing row here is [`ReadOutcome::Missing`], not
+/// [`ReadOutcome::NotRunning`], and the two are different facts. This owner
+/// admitting the operation is proven by the caller's own activation gate, which
+/// has already passed by the time this runs; what failed is the Store
+/// catalogue's own declaration. `NotRunning` would assert that no handler is
+/// activated, which is exactly what the activation gate decides — asserting it
+/// here from a lookup miss would let a catalogue gap be read as a lifecycle
+/// fact, and a caller could not tell a source that was never started from a
+/// source whose declaration is simply absent.
 fn read_manifest<'a>(
     entries: &'a [NamedOperationManifest],
     operation_name: &str,
@@ -1562,7 +1572,7 @@ fn read_manifest<'a>(
     entries
         .iter()
         .find(|entry| entry.name == operation_name)
-        .ok_or(ReadError::Outcome(ReadOutcome::NotRunning))
+        .ok_or(ReadError::Outcome(ReadOutcome::Missing))
 }
 
 /// Returns the generated Store operation catalogue.
