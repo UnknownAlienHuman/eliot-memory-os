@@ -2543,22 +2543,21 @@ impl KernelComposition {
             .map_err(|_| TransportError::Backpressure)
     }
 
-    fn enqueue_local_read_pair_charged(
-        &self,
+    /// Classifies a charged enqueue against the pair the live index already
+    /// holds, so a repeat admission is idempotent instead of stacking a second
+    /// charge on one queue slot.
+    ///
+    /// The comparison is by content, never by name: the same operation id and
+    /// the same envelope digest staged on a *different* connection is an
+    /// identity conflict rather than a replay, and only an identical pair
+    /// already staged on this connection is the idempotent case. The caller
+    /// already holds the index guard, so this reads the live index and never
+    /// takes a second one.
+    fn classify_charged_local_read_replay(
+        index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
         envelope: &HostRequestEnvelope,
-        tool: &serde_json::Value,
-        charge: HotPathCharge,
+        operation_id: &str,
     ) -> Result<LocalReadEnqueueDisposition, TransportError> {
-        let _admission_owner = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        self.host_request_connection_gate_under_transition(envelope)?;
-        let mut index = self
-            .host_request_connection_index
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let operation_id = host_request_operation_id(envelope);
         let existing_connection = index.iter().find_map(|(connection_id, refs)| {
             refs.iter()
                 .find(|candidate| {
@@ -2567,62 +2566,46 @@ impl KernelComposition {
                 })
                 .map(|_| connection_id.clone())
         });
-        if let Some(existing_connection) = existing_connection.as_deref() {
-            if existing_connection != envelope.connection_id {
-                return Err(TransportError::IdentityConflict);
-            }
-            if index
-                .get(existing_connection)
-                .into_iter()
-                .flatten()
-                .any(|candidate| {
-                    candidate.operation_id == operation_id
-                        && candidate.request_digest == envelope.envelope_sha256
-                        && candidate.local_read_envelope.is_some()
-                })
-            {
-                return Ok(LocalReadEnqueueDisposition::AlreadyRetained);
-            }
+        let Some(existing_connection) = existing_connection.as_deref() else {
+            return Ok(LocalReadEnqueueDisposition::ChargeAdopted);
+        };
+        if existing_connection != envelope.connection_id {
+            return Err(TransportError::IdentityConflict);
         }
-        let queued = index
-            .values()
+        let already_retained = index
+            .get(existing_connection)
+            .into_iter()
             .flatten()
-            .filter(|candidate| candidate.local_read_envelope.is_some())
-            .count();
-        if queued >= MAX_QUEUED_LOCAL_READS {
-            let mut evicted = None;
-            for refs in index.values_mut() {
-                if let Some(position) = refs.iter().position(|candidate| {
-                    candidate.local_read_envelope.is_some()
-                        && !candidate.local_read_attempt.is_live()
-                }) {
-                    // An evicted pair held the charge minted at its own
-                    // admission. Dropping the pair without returning it would
-                    // ratchet the bound to permanent refusal, so its exact
-                    // recorded charge is carried out and released once the
-                    // index guard is dropped — the spine ledger is never
-                    // acquired while the index lock is held.
-                    evicted = refs.remove(position).local_read_charge;
-                    break;
-                }
-            }
-            let Some(evicted_charge) = evicted else {
-                return Err(TransportError::Backpressure);
-            };
-            drop(index);
-            self.release_local_read_charge(evicted_charge);
-            index = self
-                .host_request_connection_index
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
+            .any(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == envelope.envelope_sha256
+                    && candidate.local_read_envelope.is_some()
+            });
+        if already_retained {
+            return Ok(LocalReadEnqueueDisposition::AlreadyRetained);
         }
-        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        Ok(LocalReadEnqueueDisposition::ChargeAdopted)
+    }
+
+    /// Retains one charged local-read pair on this connection, re-staging an
+    /// existing record for the same operation rather than pushing a second.
+    ///
+    /// Re-staging overwrites the record's charge with the one this admission
+    /// minted, so the ledger holds exactly one charge per retained pair; the
+    /// caller has already released nothing here, which is why it passes a
+    /// freshly minted charge rather than one carried over. The durable claim
+    /// record is written at enqueue, before any poll: unclaimed
+    /// (`generation == 0`) until the first claim mints fencing generation 1.
+    /// The salt makes this lifecycle's identities unique even if the pair is
+    /// re-enqueued later. No time lease is involved.
+    fn retain_charged_local_read_pair(
+        refs: &mut Vec<HostRequestOperationRef>,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        operation_id: String,
+        charge: HotPathCharge,
+    ) {
         let local_read_attempt = LocalReadAttemptState {
-            // The durable claim record is written at enqueue, before any
-            // poll: unclaimed (`generation == 0`) until the first claim
-            // mints fencing generation 1. The salt makes this lifecycle's
-            // identities unique even if the pair is re-enqueued later. No
-            // time lease is involved.
             enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             ..LocalReadAttemptState::default()
         };
@@ -2657,6 +2640,75 @@ impl KernelComposition {
                 finish_attempt: LocalReadAttemptState::default(),
             });
         }
+    }
+
+    /// Enqueues one charged local-read pair, keeping the charge exactly once.
+    ///
+    /// The charge is minted by the caller before this runs, so the bound is
+    /// enforced before the pair is retained and before any read work is
+    /// claimed. Whatever this returns, the caller releases the charge the
+    /// disposition did not adopt.
+    fn enqueue_local_read_pair_charged(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        charge: HotPathCharge,
+    ) -> Result<LocalReadEnqueueDisposition, TransportError> {
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = host_request_operation_id(envelope);
+        let disposition =
+            Self::classify_charged_local_read_replay(&index, envelope, &operation_id)?;
+        if disposition == LocalReadEnqueueDisposition::AlreadyRetained {
+            return Ok(disposition);
+        }
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|candidate| candidate.local_read_envelope.is_some())
+            .count();
+        if queued >= MAX_QUEUED_LOCAL_READS {
+            let mut evicted = None;
+            for refs in index.values_mut() {
+                if let Some(position) = refs.iter().position(|candidate| {
+                    candidate.local_read_envelope.is_some()
+                        && !candidate.local_read_attempt.is_live()
+                }) {
+                    // An evicted pair held the charge minted at its own
+                    // admission. Dropping the pair without returning it would
+                    // ratchet the bound to permanent refusal, so its exact
+                    // recorded charge is carried out and released once the
+                    // index guard is dropped — the spine ledger is never
+                    // acquired while the index lock is held.
+                    evicted = refs.remove(position).local_read_charge;
+                    break;
+                }
+            }
+            let Some(evicted_charge) = evicted else {
+                return Err(TransportError::Backpressure);
+            };
+            drop(index);
+            self.release_local_read_charge(evicted_charge);
+            index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        Self::retain_charged_local_read_pair(
+            refs,
+            envelope,
+            tool,
+            operation_id,
+            charge,
+        );
         // Issue #1837: durable audit evidence for queue admission.
         self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
         // I16.5 (issue #1841): the queue gauges are read from the owner's own

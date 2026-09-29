@@ -453,10 +453,19 @@ impl KernelComposition {
     #[cfg(windows)]
     pub fn hot_path_binding_projection(&self) -> serde_json::Value {
         let binding = self.bound_hot_path_binding();
-        let status = binding
+        // The owner projects `status` from a closed vocabulary, so the observed
+        // outcome is one of its own literals and never borrowed text out of the
+        // projection. Matching settles the borrow of `binding` before the
+        // projection itself is moved out, so the view returns the owner's value
+        // as-is — no clone, and no second binding to re-derive the status.
+        let status = match binding
             .get("status")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
+        {
+            Some("bound") => "bound",
+            Some("unbound") => "unbound",
+            _ => "unknown",
+        };
         observe_health("kernel.health.hot_path_binding_projected", status);
         binding
     }

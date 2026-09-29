@@ -231,16 +231,22 @@ impl HotPathCapacityLedger {
     }
 
     /// Charges one admission, or refuses it leaving the ledger untouched.
-    fn acquire(&mut self, queue: HotPathQueueId, bytes: u64) -> Result<(), RuntimeContractError> {
-        self.queues
-            .get_mut(&queue)
-            .ok_or_else(|| {
-                RuntimeContractError::InvalidField {
-                    field: "queues_and_capacity",
-                    reason: format!("no declared queue '{}' is bound", queue.as_str()),
-                }
-            })?
-            .acquire(bytes)
+    ///
+    /// The refusal names the exact unbound queue, so the reason is owned text
+    /// rather than a fixed literal: the queue is the caller's own admission
+    /// point, and a refusal that cannot name which declared queue it lost would
+    /// report the same condition for all three legs. [`HotPathError`] is the
+    /// owner-side refusal this module already funnels every other bind failure
+    /// through, so an unbound queue refuses on the same path as a bound one
+    /// that cannot admit the requested bytes — never more weakly.
+    fn acquire(&mut self, queue: HotPathQueueId, bytes: u64) -> Result<(), HotPathError> {
+        let capacity = self.queues.get_mut(&queue).ok_or_else(|| {
+            HotPathError::UnboundDeclaration {
+                reason: format!("no declared queue '{}' is bound", queue.as_str()),
+            }
+        })?;
+        capacity.acquire(bytes)?;
+        Ok(())
     }
 
     /// Returns one admission's recorded bytes at its owner-safe release point.
