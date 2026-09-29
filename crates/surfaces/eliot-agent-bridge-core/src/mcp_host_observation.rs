@@ -20,12 +20,12 @@
 //! prove that the caller agrees with itself. Correlation attribution rides the
 //! owner's journal session binding: the owner nominates the candidate event
 //! from its live journal and the join verifies it there verbatim (see
-//! `super::bridge_join`). UI-only screenshots and free text are not machine
+//! `crate::mcp_bridge_join`). UI-only screenshots and free text are not machine
 //! authority and never enter the observation.
 
-use eliot_agent_bridge_core::{HostEventEnvelope, HostEventKind, ProviderObservationLineage};
+use crate::{HostEventEnvelope, HostEventKind, ProviderObservationLineage};
 
-use super::correlation::{
+use crate::mcp_correlation::{
     HostObservationEvidence, HostTerminalObservation, HostTerminalState, sha256_hex,
 };
 
@@ -41,18 +41,14 @@ use super::correlation::{
 /// holds is not a recorded value. Both of those are read from the event owner
 /// itself ([`HostOwnerBinding`]), and the observed side is derived from the
 /// candidate's own owner-validated lineage.
-#[allow(
-    dead_code,
-    reason = "owner seam: attested only by the bridge-owning join caller (#2899)"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct HostEventJoinKeys {
+pub struct HostEventJoinKeys {
     /// Host integration identity that produced the observation.
-    pub(crate) integration_id: String,
+    pub integration_id: String,
     /// Owner-attested correlation digest the event is joined to.
-    pub(crate) correlation_digest: String,
+    pub correlation_digest: String,
     /// Applicable observation deadline admitted by the owner, when one exists.
-    pub(crate) deadline_unix_ms: Option<u64>,
+    pub deadline_unix_ms: Option<u64>,
 }
 
 /// Live generation the event owner itself states for the joined route.
@@ -64,29 +60,21 @@ pub(crate) struct HostEventJoinKeys {
 /// own session is not the owner's live session is stale and closes nothing; a
 /// lineage that attributes no session is unattributable, which is a different
 /// outcome and is never relabeled as a host fault.
-#[allow(
-    dead_code,
-    reason = "owner seam: read by the bridge join from the live owner attach binding (#2899)"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct HostOwnerBinding {
+pub struct HostOwnerBinding {
     /// Installation identity the owner's live attach binding names.
-    pub(crate) installation_id: String,
+    pub installation_id: String,
     /// Session the owner's live attach binding names.
-    pub(crate) session_id: String,
+    pub session_id: String,
     /// Authority generation the owner's live attach binding names.
-    pub(crate) activation_generation: String,
+    pub activation_generation: String,
     /// Digest of the route fingerprint the owner itself observed.
-    pub(crate) route_digest: String,
+    pub route_digest: String,
 }
 
 /// Why a candidate host event was rejected for correlation.
-#[allow(
-    dead_code,
-    reason = "owner seam: raised only by the bridge join's normalization path (#2899)"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HostObservationReject {
+pub enum HostObservationReject {
     /// The envelope failed structural validation.
     InvalidEnvelope(String),
     /// The event kind attests no terminal invocation state.
@@ -154,11 +142,7 @@ impl std::error::Error for HostObservationReject {}
 /// asserted. Non-terminal kinds, foreign routes, unattributable lineage, and
 /// stale generations are rejected: missing or mismatched telemetry is never
 /// relabeled as a host fault.
-#[allow(
-    dead_code,
-    reason = "owner seam: invoked by the bridge-owning process with live journal events; the facade observes no host events itself (#2899)"
-)]
-pub(crate) fn normalize_terminal_observation(
+pub fn normalize_terminal_observation(
     event: &HostEventEnvelope,
     keys: &HostEventJoinKeys,
     owner: &HostOwnerBinding,
@@ -232,12 +216,8 @@ pub(crate) fn normalize_terminal_observation(
 }
 
 /// Replay disposition of a candidate host event against prior evidence.
-#[allow(
-    dead_code,
-    reason = "owner seam: returned only by the bridge join's replay check (#2899)"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HostEventReplay {
+pub enum HostEventReplay {
     /// Same event identity with identical content: idempotent, safe to accept.
     ExactDuplicate,
     /// Different event identity: a new observation, not a replay.
@@ -245,18 +225,14 @@ pub(crate) enum HostEventReplay {
 }
 
 /// Same event identity observed with changed content: a hard conflict.
-#[allow(
-    dead_code,
-    reason = "owner seam: raised only by the bridge join's replay check (#2899)"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReplayConflict {
+pub struct ReplayConflict {
     /// Conflicting event identity.
-    pub(crate) event_id: String,
+    pub event_id: String,
     /// Digest of the previously accepted content.
-    pub(crate) prior_digest: String,
+    pub prior_digest: String,
     /// Digest of the candidate content.
-    pub(crate) candidate_digest: String,
+    pub candidate_digest: String,
 }
 
 impl std::fmt::Display for ReplayConflict {
@@ -275,11 +251,7 @@ impl std::error::Error for ReplayConflict {}
 ///
 /// Exact replay is idempotent; same event identity with changed content
 /// conflicts and must never silently supersede the prior observation.
-#[allow(
-    dead_code,
-    reason = "owner seam: invoked by the bridge join when reconciling nominated host events (#2899)"
-)]
-pub(crate) fn check_event_replay(
+pub fn check_event_replay(
     prior: &HostObservationEvidence,
     candidate: &HostObservationEvidence,
 ) -> Result<HostEventReplay, ReplayConflict> {

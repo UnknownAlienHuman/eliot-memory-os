@@ -71,6 +71,36 @@ pub use terminal_inputs::{
     AttemptTransition, CanonicalWriteRefs, CoverageFlags, RecoveryDirective, RecoveryDirectiveKind,
     TERMINAL_JOURNAL_CAPACITY, TerminalReductionInputs, TransportEdge, TransportEdgeKind,
 };
+// Issue #2899: MCP stdio correlation vocabulary, the competent host-observation
+// producer adapter, and the join that reconciles a later host event against an
+// earlier emission. These live with the event owner because the join verifies
+// against the owner's own live journal, attach binding and observed route; a
+// stdio facade holds none of those and cannot mint a second journal to obtain
+// them.
+mod mcp_bridge_join;
+mod mcp_correlation;
+mod mcp_host_observation;
+pub use mcp_bridge_join::{
+    BridgeHostCoverage, DeadlineSweepRequest, FaultEdgeSubmission, ReconcileError,
+    TerminalReconcileRequest, read_host_coverage, reconcile_deadline_sweep, reconcile_terminal_event,
+    submit_derived_fault, submit_host_event,
+};
+pub use mcp_correlation::{
+    Assessment, AssessmentEvidence, AssessmentInputs, AssessmentLog, AssessmentLogError,
+    AssessmentRevision, AssessmentSummary, CanonicalDisposition, CommitEvidence,
+    CorrelationAssessmentState, CorrelationIdentity, CorrelationIdentityParts, CorrelationStage,
+    CoverageGap, CoverageIndeterminacy, CoverageProof, CORRELATION_IDENTITY_VERSION,
+    CORRELATION_SCHEMA_ID, EmissionCause, EliotEmissionObservation, HandlerOutcome,
+    HostObservationEvidence, HostTerminalObservation, HostTerminalState, MAX_ASSESSMENT_REVISIONS,
+    MAX_SUMMARY_EVIDENCE, ObservationWindow, OperationEffectClass, OperationIdentity,
+    OwnerBindingError, OwnerValidatedOperationBinding, PartialObservation, RecoveryAction,
+    RecoveryDirective, RouteDegradation, RouteDegradationCode, StdioEmissionReceipt,
+    assess_correlation, derive_recovery, sha256_hex,
+};
+pub use mcp_host_observation::{
+    HostEventJoinKeys, HostEventReplay, HostObservationReject, HostOwnerBinding, ReplayConflict,
+    check_event_replay, normalize_terminal_observation,
+};
 
 /// Stable A-16 source contract identity.
 pub const CONTRACT_ID: &str = "eliot.surfaces.agent-bridge-core/v1";

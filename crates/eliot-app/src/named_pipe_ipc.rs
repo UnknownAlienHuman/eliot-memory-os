@@ -1,5 +1,5 @@
 use crate::mcp_stdio::correlation::{
-    McpInvocationCorrelation, check_response_correlation, emit_stdout_frame,
+    McpInvocationCorrelation, check_response_correlation, emit_stdout_frame, emission_into_result,
 };
 use crate::mcp_stdio::{AuthenticatedRoleAuthority, CognitiveCapabilityFile, McpDaemon};
 use crate::runtime_instance::{
@@ -344,7 +344,7 @@ pub(crate) async fn run_stdio_client(
             let receipt = emit_stdout_frame(framed.as_bytes());
             correlation.observe_emission(&receipt);
             correlation.emit();
-            receipt.into_result(&correlation.mcp_request_id)?;
+            emission_into_result(receipt, &correlation.mcp_request_id)?;
         }
     }
     Ok(())
