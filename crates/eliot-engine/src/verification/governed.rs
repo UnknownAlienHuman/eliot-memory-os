@@ -14,8 +14,11 @@
 //! [`GovernedProfileService::describe_execution`] assembles over zero
 //! observed runs and every stage becomes an explicit missing proof instead
 //! of a launch; [`GovernedProfileService::describe_execution_with_runs`]
-//! assembles over caller-observed runs once the W4 execution lane produces
-//! them. The resolution is not decoration: the resolved revision, stage DAG,
+//! assembles over caller-observed runs, and
+//! [`GovernedProfileService::execute_admitted`] is the executable path that
+//! obtains those runs from the existing `TestExecutionPlane` owner before
+//! assembling through the same resolution identity. The resolution is not
+//! decoration: the resolved revision, stage DAG,
 //! and resolution digest are the only source of the planned stages and the
 //! persisted per-stage and aggregate records. One run record per stage plus
 //! the aggregate record persist to the configured
@@ -46,9 +49,10 @@ use eliot_instrument_runner::profile_run::{
 };
 use eliot_instrument_runner::registry::{InvalidationSet, ProviderRegistry};
 use eliot_instrument_runner::{
-    AvailabilityInputs, DEV_FAST_PROFILE, ProviderDispatch, ProviderDisposition,
-    compose_provider_dispatch, dev_fast_registry, host_platform,
+    AvailabilityInputs, DEV_FAST_PROFILE, InstrumentRunner, ProviderDispatch, ProviderDisposition,
+    StageLauncher, compose_provider_dispatch, dev_fast_registry, host_platform,
 };
+use eliot_process::ProcessExecutor;
 use eliot_store::BlobStore;
 use eliot_types::BlobRef;
 use serde::Serialize;
@@ -480,12 +484,12 @@ impl GovernedProfileService {
     /// without a run stay explicit missing proofs. Planning and execution
     /// stay separate entry paths: planning calls
     /// [`GovernedProfileService::describe_execution`], while the executable
-    /// path obtains admitted stage operations from the existing
-    /// TestExecutionPlane and feeds their observed runs here. The profile
-    /// revision resolves once per call and its registry, profile, DAG, and
-    /// resolution digests bind every per-stage record, pending handle,
-    /// result, and the aggregate, so a registry update cannot silently change
-    /// later stages of the same run.
+    /// path ([`GovernedProfileService::execute_admitted`]) obtains admitted
+    /// stage operations from the existing `TestExecutionPlane` owner and
+    /// feeds their observed runs here. The profile revision resolves once
+    /// per call and its registry, profile, DAG, and resolution digests bind
+    /// every per-stage record, pending handle, result, and the aggregate, so
+    /// a registry update cannot silently change later stages of the same run.
     ///
     /// # Errors
     ///
@@ -499,6 +503,90 @@ impl GovernedProfileService {
         runs: Vec<InstrumentRun>,
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
+        let (resolved, admitted, plan) = Self::resolve_once(name, bindings)?;
+        render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
+    }
+
+    /// Executes one governed profile through the `TestExecutionPlane` owner
+    /// and reports over the observed runs (issue #1813 W4/A1, audit
+    /// 5882318903).
+    ///
+    /// This is the executable sibling of
+    /// [`GovernedProfileService::describe_execution`]: planning there stays
+    /// non-executed, while this path resolves once through the same
+    /// [`ProfileCompiler::resolve_admitted`] identity, binds the
+    /// caller-admitted candidate commitment onto the stage plan without
+    /// rebinding it, submits every external stage through the composition
+    /// root's admitted [`InstrumentRunner`](eliot_instrument_runner::InstrumentRunner)
+    /// behind the `TestExecutionPlane`, and assembles the observed
+    /// [`InstrumentRun`](eliot_instrument_runner::InstrumentRun) records
+    /// through the same render path, so a nonempty governed run reaches the
+    /// admitted executor and returns matching stage and result evidence.
+    ///
+    /// The bindings revalidate at dispatch: a changed layout, scope fence, or
+    /// environment refuses instead of rebinding silently. The exact revision
+    /// pins before launch, so a registry update cannot silently change later
+    /// stages of the same run. A malformed or replaced candidate identity
+    /// refuses through
+    /// [`StagePlan::bind_candidate_identity`](eliot_instrument_runner::StagePlan::bind_candidate_identity).
+    /// Each launched run retains its durable stage identity with the bound
+    /// executor operation, so on cancellation, timeout, or reconnect the
+    /// supervising lane requeries that same stage instead of starting a
+    /// replacement. Pure stages carry no registered in-process lane and
+    /// record an explicit missing proof instead of escaping through a generic
+    /// local command. Declared stages without an observed run stay missing,
+    /// and per-stage plus aggregate records persist before the report is
+    /// returned; a non-successful aggregate still fails closed through
+    /// [`GovernedProfileService::enforce_success`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the builtin registry is unavailable, the
+    /// name quarantines instead of governing, a resolution binding or the
+    /// candidate identity is refused, or blob persistence fails. Launch,
+    /// admission, and invocation failures never surface here: they become
+    /// explicit missing runs inside the returned report.
+    pub async fn execute_admitted<E: ProcessExecutor + 'static>(
+        &self,
+        name: &str,
+        bindings: &ProfileResolutionBindings,
+        candidate_identity: Option<&str>,
+        runner: &InstrumentRunner<E>,
+        launcher: &dyn StageLauncher,
+        blob_store: Option<&BlobStore>,
+    ) -> Result<GovernedProfileReport, EngineError> {
+        let (resolved, admitted, mut plan) = Self::resolve_once(name, bindings)?;
+        if let Some(candidate) = candidate_identity {
+            plan.bind_candidate_identity(candidate).map_err(|error| {
+                rejected(
+                    "governed-profile",
+                    &format!("candidate identity refused for profile '{name}': {error}"),
+                )
+            })?;
+        }
+        let runs = StageOrchestrator::launch_plan(runner, &plan, launcher).await;
+        render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
+    }
+
+    /// Resolves one profile name to its pinned plan through the single
+    /// profile compiler.
+    ///
+    /// The caller-admitted bindings revalidate at dispatch, the name
+    /// resolves once through [`ProfileCompiler::resolve_admitted`], the
+    /// exact revision pins through the same compiler, and the plan must
+    /// expand the resolved stage DAG exactly. A changed fence, layout,
+    /// environment, or registry revision refuses here instead of rebinding
+    /// silently, so planning and execution share one resolution identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the builtin registry is unavailable, a
+    /// binding no longer validates, the name quarantines instead of
+    /// governing, or the pinned plan drifts from the resolved DAG.
+    fn resolve_once(
+        name: &str,
+        bindings: &ProfileResolutionBindings,
+    ) -> Result<(ResolvedProfile, AdmittedProfile, StagePlan), EngineError> {
         let bindings = ProfileResolutionBindings::admitted(
             bindings.layout.clone(),
             bindings.scope.clone(),
@@ -531,72 +619,7 @@ impl GovernedProfileService {
                 &format!("resolved profile '{name}' did not plan: {reason}"),
             )
         })?;
-        let aggregate = ProfileAggregate::assemble(&plan, runs);
-        let fingerprints = unattested_fingerprints();
-        let normative_pair_digest = String::new();
-        let providers = ProviderRegistry::ready(
-            BUILTIN_REGISTRY_GENERATION,
-            normative_pair_digest.clone(),
-            &fingerprints,
-        )
-        .map_err(|error| {
-            rejected(
-                "governed-profile",
-                &format!("ready provider registry is unavailable: {error}"),
-            )
-        })?;
-        let dispatch_inputs = AvailabilityInputs {
-            generation: BUILTIN_REGISTRY_GENERATION,
-            normative_pair_digest: &normative_pair_digest,
-            fingerprints: &fingerprints,
-            platform: host_platform(),
-        };
-        let mut stages = Vec::with_capacity(plan.stages.len());
-        for (planned, run) in plan.stages.iter().zip(aggregate.runs.iter()) {
-            let admission = admit_stage(&providers, planned, &dispatch_inputs);
-            stages.push(persist_stage_report(
-                blob_store, &resolved, &plan, planned, run, &admission,
-            )?);
-        }
-        let observed_runs = aggregate
-            .runs
-            .iter()
-            .filter(|run| !run.evidence.is_missing())
-            .count();
-        let missing_proof = if observed_runs == 0 {
-            NO_LAUNCH_PROVISIONS
-        } else {
-            OBSERVED_RUNS_PRESENT
-        };
-        let aggregate_blob = persist_aggregate_record(
-            blob_store,
-            &resolved,
-            &plan,
-            &aggregate,
-            &stages,
-            missing_proof,
-        )?;
-        Ok(GovernedProfileReport {
-            schema_version: GOVERNED_PROFILE_REPORT_SCHEMA.to_owned(),
-            profile: plan.profile.clone(),
-            revision: plan.revision,
-            profile_digest: plan.profile_digest.clone(),
-            dag_digest: plan.dag_digest.clone(),
-            kinds: admitted
-                .kinds
-                .iter()
-                .map(|kind| format!("{kind:?}"))
-                .collect(),
-            registry_generation: registry.generation(),
-            resolution: resolved_binding(&resolved),
-            stages,
-            aggregate_digest: aggregate.aggregate_digest.clone(),
-            aggregate_status: format!("{:?}", aggregate.status),
-            success: aggregate.is_success(),
-            observed_runs,
-            aggregate_blob,
-            missing_proof: missing_proof.to_owned(),
-        })
+        Ok((resolved, admitted, plan))
     }
 
     /// Refuses a non-successful governed aggregate as an error.
@@ -623,6 +646,97 @@ impl GovernedProfileService {
             ),
         ))
     }
+}
+
+/// Assembles one governed report over a pinned resolution, plan, and runs.
+///
+/// This is the single render path behind both
+/// [`GovernedProfileService::describe_execution_with_runs`] and
+/// [`GovernedProfileService::execute_admitted`]: the aggregate assembles over
+/// the supplied runs matched by durable stage identity, every declared stage
+/// classifies through the composed provider dispatch without execution
+/// provisions, one run record per stage plus the aggregate record persist
+/// before the report returns, and identical input always yields identical
+/// persisted bytes on every entry point. Missing runs stay missing, so an
+/// unavailable or failed required stage can never read as success.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] when the ready provider registry is unavailable
+/// or blob persistence fails.
+fn render_resolved_report(
+    resolved: &ResolvedProfile,
+    admitted: &AdmittedProfile,
+    plan: &StagePlan,
+    runs: Vec<InstrumentRun>,
+    blob_store: Option<&BlobStore>,
+) -> Result<GovernedProfileReport, EngineError> {
+    let aggregate = ProfileAggregate::assemble(plan, runs);
+    let fingerprints = unattested_fingerprints();
+    let normative_pair_digest = String::new();
+    let providers = ProviderRegistry::ready(
+        BUILTIN_REGISTRY_GENERATION,
+        normative_pair_digest.clone(),
+        &fingerprints,
+    )
+    .map_err(|error| {
+        rejected(
+            "governed-profile",
+            &format!("ready provider registry is unavailable: {error}"),
+        )
+    })?;
+    let dispatch_inputs = AvailabilityInputs {
+        generation: BUILTIN_REGISTRY_GENERATION,
+        normative_pair_digest: &normative_pair_digest,
+        fingerprints: &fingerprints,
+        platform: host_platform(),
+    };
+    let mut stages = Vec::with_capacity(plan.stages.len());
+    for (planned, run) in plan.stages.iter().zip(aggregate.runs.iter()) {
+        let admission = admit_stage(&providers, planned, &dispatch_inputs);
+        stages.push(persist_stage_report(
+            blob_store, resolved, plan, planned, run, &admission,
+        )?);
+    }
+    let observed_runs = aggregate
+        .runs
+        .iter()
+        .filter(|run| !run.evidence.is_missing())
+        .count();
+    let missing_proof = if observed_runs == 0 {
+        NO_LAUNCH_PROVISIONS
+    } else {
+        OBSERVED_RUNS_PRESENT
+    };
+    let aggregate_blob = persist_aggregate_record(
+        blob_store,
+        resolved,
+        plan,
+        &aggregate,
+        &stages,
+        missing_proof,
+    )?;
+    Ok(GovernedProfileReport {
+        schema_version: GOVERNED_PROFILE_REPORT_SCHEMA.to_owned(),
+        profile: plan.profile.clone(),
+        revision: plan.revision,
+        profile_digest: plan.profile_digest.clone(),
+        dag_digest: plan.dag_digest.clone(),
+        kinds: admitted
+            .kinds
+            .iter()
+            .map(|kind| format!("{kind:?}"))
+            .collect(),
+        registry_generation: resolved.registry_generation,
+        resolution: resolved_binding(resolved),
+        stages,
+        aggregate_digest: aggregate.aggregate_digest.clone(),
+        aggregate_status: format!("{:?}", aggregate.status),
+        success: aggregate.is_success(),
+        observed_runs,
+        aggregate_blob,
+        missing_proof: missing_proof.to_owned(),
+    })
 }
 
 /// Loads the registry that admits one governed profile name (issue #1802
