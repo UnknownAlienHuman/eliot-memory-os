@@ -137,7 +137,9 @@ pub enum TestdDispatchError {
         profile: &'static str,
     },
     /// A profile Testd dispatches is bound to no instrument contract.
-    #[error("testd dispatches profile '{profile}' but the dispatch table binds no instrument contract")]
+    #[error(
+        "testd dispatches profile '{profile}' but the dispatch table binds no instrument contract"
+    )]
     UnboundDispatchProfile {
         /// The unbound Testd profile name.
         profile: &'static str,
