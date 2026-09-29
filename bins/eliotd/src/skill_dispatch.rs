@@ -259,7 +259,9 @@ pub struct ActivationCandidate {
     /// What the evidence-owner activation-receipt rows said about the
     /// presented subject identity: owner-bound, contradicted, or unresolved.
     /// The commit leg rechecks the lifecycle-owner view before publishing, so
-    /// a subject the rows contradict can never become a qualified claim.
+    /// a subject the rows contradict can never become a qualified claim — and
+    /// a subject no row names is refused as unqualified rather than published
+    /// from the receipt's own shape.
     subject: ActivationSubject,
 }
 
@@ -293,6 +295,12 @@ pub struct ExecutionCandidate {
     lifecycle_source_revision: Option<eliot_skill::SourceRevision>,
     /// This ingest's own authenticated attempt id, from the Kernel route.
     ingest_attempt_id: String,
+    /// Retained-history binding for the presented package digest, resolved by
+    /// the plan from committed lifecycle-policy rows (issue #2663, AC2). `Some`
+    /// exactly when a committed accept-row holds the presented digest — current
+    /// or superseded. The commit files a superseded observation as history
+    /// through this binding; without it a non-current revision stays refused.
+    historical_binding: Option<super::skill_evidence_read::HistoricalPackageBinding>,
 }
 
 /// Result of one read-only owner-position probe on the Skill lifecycle owner.
@@ -389,6 +397,44 @@ pub fn execution_owner_read(
     ))
 }
 
+/// Resolves the retained-history binding for one presented execution-evidence
+/// digest, without the composition lock (issue #2663, AC2).
+///
+/// The read is the SAME closed acceptance read the activation leg uses
+/// (`GetCapabilityEvidenceState`, exact `skill_id`, `ExactFence`); only the
+/// question differs. Intake asks currency ("does the LATEST row bind this
+/// digest?"); history asks admission ("does ANY committed accept-row hold this
+/// digest?"). A superseded-but-committed row is exactly the explicit permitted
+/// historical binding a current collector reports an older attempt through —
+/// resolved from retained rows, never reconstructed from payload fields.
+/// `None` means no retained row holds the digest (substituted package), the
+/// payload failed its shape (reported by the plan), or the read itself
+/// failed: the current path is unaffected either way, and the historical path
+/// stays refused at the seam. The plan never decides from this binding; it
+/// only carries it for the commit.
+async fn plan_execution_historical_binding(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+    arguments: &Value,
+) -> Option<super::skill_evidence_read::HistoricalPackageBinding> {
+    let payload = canonical_json_bytes(arguments)
+        .ok()
+        .and_then(|bytes| eliot_agent_bridge_core::SkillExecutionPayload::decode(&bytes).ok())?;
+    let resolution = super::skill_acceptance_read::resolve_intake_acceptance(
+        kernel,
+        admitted_fence,
+        &payload.skill_id,
+        &payload.package_digest,
+    )
+    .await
+    .ok()?;
+    super::skill_evidence_read::historical_binding_from_acceptance(
+        &resolution,
+        &payload.skill_id,
+        &payload.package_digest,
+    )
+}
+
 /// Plans one execution-evidence ingest into a bounded assessment over the
 /// owner-retained attempt-wide set (issue #2664).
 ///
@@ -397,11 +443,14 @@ pub fn execution_owner_read(
 /// passed in — never the page — so a bounded window without an `Uncertain` row
 /// is no longer read as proof that nothing is unresolved. The owner read
 /// happens under the caller's short composition borrow; nothing here holds
-/// composition state or accumulates the attempt.
+/// composition state or accumulates the attempt. The retained-history binding
+/// travels untouched for the commit: a superseded observation is filed as
+/// history only through that binding, never by revision-string comparison.
 fn plan_execution(
     owner_read: Option<OwnerPositionRead>,
     arguments: &Value,
     ingest_attempt_id: String,
+    historical_binding: Option<super::skill_evidence_read::HistoricalPackageBinding>,
 ) -> Result<ExecutionCandidate, Box<eliot_skill::SkillError>> {
     let payload = match canonical_json_bytes(&arguments)
         .map_err(|error| error.to_string())
@@ -428,6 +477,7 @@ fn plan_execution(
         read_position,
         lifecycle_source_revision,
         ingest_attempt_id,
+        historical_binding,
     })
 }
 
@@ -454,7 +504,11 @@ fn commit_execution_candidate(
     // The Skill revision/package read position must agree with what the
     // lifecycle owner actually holds, or the page is filed under a substituted
     // identity. `record_execution_evidence` enforces the same binding on the
-    // write path; this rejects it before the read.
+    // write path; this rejects malformed identities before the read. A
+    // superseded-but-committed observation is NOT rejected here: it travels
+    // with the plan-resolved retained-history binding and the seam files it
+    // as a linked historical revision that can never reactivate the Skill
+    // (issue #2663, AC2).
     if payload.skill_id.trim().is_empty()
         || payload.skill_revision.trim().is_empty()
         || payload.package_digest.len() != 64
@@ -464,7 +518,9 @@ fn commit_execution_candidate(
             reason: "execution evidence must name the exact Skill revision and package digest",
         });
     }
-    match composition.skill_publish_execution_evidence(payload) {
+    match composition
+        .skill_publish_execution_evidence(payload, candidate.historical_binding.as_ref())
+    {
         // The owner accepted the evidence: the assessment is only reported
         // after the owner took it, so a claim never outruns persistence. The
         // returned view IS the owner's result — the commit must observe it,
@@ -623,8 +679,19 @@ pub async fn plan_skill_pair(
         SkillToolKind::Execute => {
             // The execute plan consumes the owner read the caller already took
             // under a short composition borrow, so no composition state is
-            // borrowed here and the whole attempt is not accumulated.
-            match plan_execution(execution_owner_read, &arguments, attempt.attempt_id.clone()) {
+            // borrowed here and the whole attempt is not accumulated. The
+            // retained-history binding resolves on the same terms: outside the
+            // lock, from retained committed rows, so a superseded observation
+            // can stay historical instead of being refused for not matching
+            // the current revision (issue #2663, AC2).
+            let historical =
+                plan_execution_historical_binding(kernel, &admitted_fence, &arguments).await;
+            match plan_execution(
+                execution_owner_read,
+                &arguments,
+                attempt.attempt_id.clone(),
+                historical,
+            ) {
                 Ok(candidate) => plan(PlannedSkillPair::Execution(Box::new(candidate))),
                 Err(error) => plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
                     error.as_ref(),
@@ -806,13 +873,14 @@ async fn read_capability_evidence_records(
 /// read contradict a foreign or substituted subject outright, and the
 /// lifecycle owner's stored view binds the fence and the route. A candidate
 /// whose backing reads never settled, whose subject the owner rows
-/// contradict, or whose retained receipt contradicts the presented bytes
-/// never publishes a settled claim: loss of a required read, or a
-/// contradicted subject, refuses instead of yielding a positive summary. A
-/// subject no owner row names stays unresolved — never a negative fact — and
-/// still faces every remaining owner leg below. The admission re-validates
-/// the receipt against its ORIGINAL recorded value and binds it to the stored
-/// view's exact revision and package.
+/// contradict, whose subject NO owner row names, or whose retained receipt
+/// contradicts the presented bytes never publishes a settled claim: loss of a
+/// required read, a contradicted subject, or an unbound subject refuses
+/// instead of yielding a positive summary. A subject no owner row names stays
+/// unresolved — never a negative fact — and is refused as unqualified rather
+/// than published from the receipt's self-declared stages. The admission
+/// re-validates the receipt against its ORIGINAL recorded value and binds it
+/// to the stored view's exact revision and package.
 ///
 /// A candidate that cannot name the ingest it arrived on, or that carries a
 /// broken owner revision binding, is refused outright.
@@ -854,6 +922,19 @@ fn commit_activation_candidate(
         // under a real identity can never become a qualified claim.
         Some(SkillResultEnvelope::refused(
             &eliot_skill::SkillError::RevisionConflict,
+        ))
+    } else if candidate.subject == ActivationSubject::Unresolved {
+        // No owner row binds this subject attempt, route, packet or fence:
+        // the receipt's self-declared stages cannot become a qualified
+        // positive claim. This is absence of backing, never a negative fact
+        // about the Skill — a foreign attempt and a merely-unrecorded one
+        // refuse identically until a durable owner record names the subject
+        // (issue #2663, AC1/AUD1; audit 5856960648 repair 3).
+        Some(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::Surface(
+                "no owner row binds this activation subject attempt, route, packet or fence; the candidate remains unqualified"
+                    .to_owned(),
+            ),
         ))
     } else {
         None

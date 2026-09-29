@@ -1089,18 +1089,21 @@ impl SkillRegistry {
     /// exact Skill revision and package digest the caller presented:
     ///
     /// * when the presented identity equals the stored view's identity, the
-    ///   view is re-derived for that identity as before;
-    /// * when it differs, the caller-supplied entry must still name the
-    ///   presented identity — the live catalogue entry, never a reconstruction
-    ///   from payload fields — so this fires only while the catalogue still
-    ///   stands on the presented identity and the stored view has moved on. A
-    ///   current collector reports an older attempt only through this explicit
-    ///   binding (issue #2663 item 1). The observation is then filed as a
-    ///   linked revision: the new records are appended, the lifecycle revision
-    ///   advances, and the stored view keeps its current Skill
-    ///   revision/package, scope, fence, dependencies and status, so ingesting
-    ///   historical evidence now can never reactivate a superseded Skill nor
-    ///   re-stamp it with today's fence.
+    ///   view is re-derived for that identity as before, and the supplied
+    ///   entry must name that identity;
+    /// * when it differs, the observation is filed as a linked revision only
+    ///   when the supplied entry names the STORED identity: the caller proves
+    ///   it holds the current catalogue position (issue #2663 item 1: a
+    ///   current collector reports an older attempt only through an explicit
+    ///   permitted historical binding), while the historical package authority
+    ///   — a committed accept-row for the presented digest — is enforced from
+    ///   retained lifecycle-policy rows by the daemon seam, the sole
+    ///   production caller. An entry naming neither identity is a substituted
+    ///   binding and is refused. The linked observation appends the new
+    ///   records, advances the lifecycle revision, and keeps the stored view's
+    ///   current Skill revision/package, scope, fence, dependencies and
+    ///   status, so ingesting historical evidence now can never reactivate a
+    ///   superseded Skill nor re-stamp it with today's fence.
     ///
     /// A presented identity matching neither the stored view nor the supplied
     /// entry is refused with [`SkillError::IdentityMismatch`]: a
@@ -1126,13 +1129,13 @@ impl SkillRegistry {
         for evidence in executions {
             evidence.validate()?;
         }
-        // The supplied entry is the caller's explicit binding for the
-        // presented identity: it must name the presented Skill revision under
-        // the presented Skill id. On the current path this is the live entry;
-        // on the historical path it is the retained entry for the presented
-        // (older) revision. A caller-supplied entry naming any other identity
-        // cannot file evidence here.
-        if entry.index.skill_id != skill_id || entry.body.body_version != skill_revision {
+        // The supplied entry is the caller's CURRENT catalogue position for
+        // this Skill — the live entry, never a reconstruction from payload
+        // fields. It must name the Skill; which identity it must name depends
+        // on the path below: the presented identity on the current path, the
+        // stored identity on the historical path. An entry naming neither is
+        // a substituted binding and cannot file evidence here.
+        if entry.index.skill_id != skill_id {
             return Err(SkillError::IdentityMismatch);
         }
         let key = skill_id.to_owned();
@@ -1140,10 +1143,17 @@ impl SkillRegistry {
         // The evidence is bound to the exact Skill identity it was observed
         // under. A presented identity equal to the stored view is the current
         // path; a differing presented identity is accepted only as a
-        // historical linked observation against the caller-supplied retained
-        // entry above — never merged as current, never a reactivation.
+        // historical linked observation — never merged as current, never a
+        // reactivation.
         let historical = previous.skill_ref.registration.revision != skill_revision
             || previous.skill_ref.package_digest != package_digest;
+        if historical {
+            if entry.body.body_version != previous.skill_ref.registration.revision {
+                return Err(SkillError::IdentityMismatch);
+            }
+        } else if entry.body.body_version != skill_revision {
+            return Err(SkillError::IdentityMismatch);
+        }
         let mut retained = previous.execution_evidence.clone();
         let mut changed = false;
         for evidence in executions {

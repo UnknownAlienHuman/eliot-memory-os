@@ -410,3 +410,129 @@ pub fn activation_receipt_revision() -> SourceRevision {
         revision: None,
     }
 }
+
+/// Accept-family lifecycle actions: the closed vocabulary the canonical
+/// acceptance read decides intake currency by. Restated here — not
+/// re-derived — because `skill_acceptance_read` owns that decision and is not
+/// reopened: the question here differs (was THIS digest ever admitted, not is
+/// it current?), so the same vocabulary is consulted for history, never as a
+/// second currency scheme.
+const HISTORICAL_ACCEPT_ACTIONS: [&str; 6] =
+    ["keep", "patch", "split", "merge", "restore", "rollback"];
+
+/// One presented package digest held by retained committed history
+/// (issue #2663, AC2).
+///
+/// This is the explicit permitted historical binding a current collector
+/// reports an older attempt through: the latest committed
+/// `ApplyLifecyclePolicy` row holding the PRESENTED digest with an
+/// accept-family action, resolved from the retained lifecycle-policy rows —
+/// never reconstructed from payload fields. Currency is deliberately NOT
+/// required: a superseded-but-committed row is exactly what makes the ingest
+/// historical rather than current. Only constructed by
+/// [`historical_binding_from_acceptance`]; the daemon seam re-checks
+/// [`holds`](Self::holds) before filing, so a binding is never trusted on
+/// shape alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalPackageBinding {
+    /// Skill the committed row names.
+    pub skill_id: String,
+    /// Package digest the committed row holds.
+    pub package_digest: String,
+    /// Commit order (`capture_index`) of the latest row holding the digest.
+    pub row_revision: u64,
+    /// Accept-family action holding the digest.
+    pub action: String,
+    /// Competent verifier bound by that row.
+    pub verifier_ref: String,
+    /// Candidate digest bound by that row.
+    pub candidate_digest: String,
+}
+
+impl HistoricalPackageBinding {
+    /// Whether this binding still holds its digest: the latest committed row
+    /// for the digest carries an accept-family action. A digest whose latest
+    /// row revokes it — or that no row holds — never constructs, so this is
+    /// the seam's re-verification, not a second decision.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        HISTORICAL_ACCEPT_ACTIONS.contains(&self.action.as_str())
+    }
+}
+
+/// Scans an already-resolved acceptance read for the retained-history binding
+/// of one presented package digest.
+///
+/// The response binding was verified by `resolve_acceptance` before this scan
+/// runs (operation, fence, scope, shape, payload version, planned skill, no
+/// truncation), so only committed rows for the planned skill remain; this
+/// function only selects among them by commit order (`capture_index`, served
+/// order breaking ties, exactly as the acceptance read orders). The latest
+/// row binding the presented digest with an accept-family action yields the
+/// binding; a revoked digest, an unknown action, or no row at all yields
+/// `None` — absence of a row, never a negative fact. No new read, no new
+/// port, no free-text lookup: the page is exactly what the one bounded
+/// acceptance read returned.
+#[must_use]
+pub fn historical_binding_from_acceptance(
+    resolution: &AcceptanceResolution,
+    skill_id: &str,
+    package_digest: &str,
+) -> Option<HistoricalPackageBinding> {
+    let records = resolution.response.payload.get("records")?.as_array()?;
+    // Latest committed row holding the presented digest, by commit order.
+    let mut best: Option<(u64, String, String, String)> = None;
+    for record in records {
+        if record.get("operation").and_then(serde_json::Value::as_str)
+            != Some("ApplyLifecyclePolicy")
+        {
+            continue;
+        }
+        let parameters = record.get("parameters")?.as_object()?;
+        let text = |name: &str| parameters.get(name).and_then(serde_json::Value::as_str);
+        if text("skill_id") != Some(skill_id) {
+            continue;
+        }
+        // A row missing its base view cannot prove the admission it claims —
+        // the same completeness the acceptance read requires.
+        if text("base_view_digest").is_none() {
+            continue;
+        }
+        if text("candidate_package_digest") != Some(package_digest) {
+            continue;
+        }
+        let (Some(action), Some(verifier_ref), Some(candidate_digest)) = (
+            text("action"),
+            text("verifier_ref"),
+            text("candidate_digest"),
+        ) else {
+            continue;
+        };
+        let Some(revision) = record
+            .get("capture_index")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|current| revision > current.0) {
+            best = Some((
+                revision,
+                action.to_owned(),
+                verifier_ref.to_owned(),
+                candidate_digest.to_owned(),
+            ));
+        }
+    }
+    let (row_revision, action, verifier_ref, candidate_digest) = best?;
+    if !HISTORICAL_ACCEPT_ACTIONS.contains(&action.as_str()) {
+        return None;
+    }
+    Some(HistoricalPackageBinding {
+        skill_id: skill_id.to_owned(),
+        package_digest: package_digest.to_owned(),
+        row_revision,
+        action,
+        verifier_ref,
+        candidate_digest,
+    })
+}
