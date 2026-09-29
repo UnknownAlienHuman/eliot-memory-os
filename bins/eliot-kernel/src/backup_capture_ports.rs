@@ -17,7 +17,9 @@
 //! the adapters onto accepted owner-neutral APIs only
 //! (`owner_residency_key_digest`, `owner_suspended_recovery_refs`,
 //! `owner_fence_dispositions`), the exactly-once publication port
-//! (`PublicationPort`), and the fail-closed `KernelCaptureError` vocabulary
+//! (`PublicationPort`) together with the production retained-archive owner that
+//! implements it (`KernelArchiveOwner`), and the fail-closed
+//! `KernelCaptureError` vocabulary
 //! with lossless mapping onto the accepted `BackupError` seam
 //! (`KernelCaptureError::to_backup`).
 //!
@@ -401,7 +403,58 @@ pub struct CapturePorts<'a> {
     pub host_audit: Option<&'a HostStateAuditFence>,
 }
 
-impl CapturePorts<'_> {
+impl<'a> CapturePorts<'a> {
+    /// Assembles the production evidence bundle from owner-issued values and
+    /// validates every one of them before the bundle is usable.
+    ///
+    /// This is the only production construction site of [`CapturePorts`], and it
+    /// adds nothing to what the caller passes: each argument is a value an owner
+    /// already produced, validated here through that value's own `validate` and
+    /// nothing else. It performs no defaulting, no empty-vector substitution and
+    /// no optimistic admission — a caller that cannot supply a member the frozen
+    /// class requires gets a typed refusal from [`Self::validate_shapes`] or
+    /// from the coordinator's class gate, never a bundle that looks complete.
+    ///
+    /// The parameter list is one value per capture member domain. A builder
+    /// would only move the same values from one place to another.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one owner-issued value per capture member domain; a builder would only move them"
+    )]
+    pub fn from_owner_evidence(
+        caller: &'a CaptureCallerAuth,
+        kernel_fence: &'a StateFence,
+        export_fence: &'a ExportFence,
+        canonical_events: &'a [CanonicalRecord],
+        projections: &'a [CanonicalRecord],
+        receipts: &'a [WriteReceipt],
+        blobs: &'a [BackupBlob],
+        purge_ledger: &'a [PurgeLedgerEntry],
+        artifacts: &'a [BackupArtifact],
+        ors_snapshot: Option<&'a OrsSnapshotFence>,
+        suspended_count: u64,
+        watchdog_spool: Option<&'a WatchdogSpoolFence>,
+        host_audit: Option<&'a HostStateAuditFence>,
+    ) -> Result<Self, KernelCaptureError> {
+        let ports = Self {
+            caller,
+            kernel_fence,
+            export_fence,
+            canonical_events,
+            projections,
+            receipts,
+            blobs,
+            purge_ledger,
+            artifacts,
+            ors_snapshot,
+            suspended_count,
+            watchdog_spool,
+            host_audit,
+        };
+        ports.validate_shapes()?;
+        Ok(ports)
+    }
+
     /// Validates the structural shape of every carried evidence value by
     /// calling each element's own `validate`. Admission is decided by the
     /// coordinator through `require_capture_admitted`, not here.
@@ -694,6 +747,274 @@ pub trait PublicationPort {
     /// the owner's durable receipt for the same operation without a second
     /// publish.
     fn reconcile(&mut self, operation_id: &str) -> Result<PublicationReceipt, KernelCaptureError>;
+}
+
+/// Retained-archive area below `<work_root>/.eliot`.
+pub const CAPTURE_ARCHIVE_AREA: &str = "backup-archives";
+/// File name of the encoded archive body inside one publication operation's
+/// directory.
+pub const CAPTURE_PUBLISHED_ARCHIVE_FILE: &str = "archive.ecxf";
+/// File name of the owner-issued publication receipt inside one publication
+/// operation's directory.
+pub const CAPTURE_PUBLICATION_RECEIPT_FILE: &str = "publication-receipt.json";
+/// Maximum accepted length of a publication operation identity or idempotency
+/// key (bounded identities, I14.3).
+pub const MAX_PUBLICATION_ID_LEN: usize = 128;
+
+/// Kernel-owned retained-archive publication owner (issue #2569).
+///
+/// This is the missing production `PublicationPort` implementor. Before it
+/// existed the only implementation in the tree was `MemPublisher` inside
+/// `bins/eliot-kernel/tests/backup_capture.rs`, so no archive could reach
+/// durable storage and `KernelBackupCapture::capture` had no non-test caller.
+///
+/// It uses the SAME ownership boundary this crate's isolated restore
+/// destination already uses (`KernelIsolatedDestination` over
+/// `<work_root>/.eliot/<area>`): the area is CONSTRUCTED below the canonical
+/// work root, never accepted as an arbitrary path, and a publication operation
+/// owns its directory by EXCLUSIVE CREATION of its two files rather than by a
+/// predictable name. The directory component is the digest of the operation
+/// identity, so a caller-chosen backup id can never name a path and a
+/// reconciliation that knows only the operation identity still reaches exactly
+/// one directory.
+///
+/// What it is NOT: a second archive format, a coordinator-side self-attestation,
+/// or an in-memory stand-in. `durable` is set only after the archive body and
+/// the receipt are both flushed to stable storage, and nothing here claims
+/// recovery, activation, cutover, or readiness.
+#[derive(Clone, Debug)]
+pub struct KernelArchiveOwner {
+    area: PathBuf,
+}
+
+impl KernelArchiveOwner {
+    /// Binds the retained-archive owner to the Kernel work root. Fails closed
+    /// on a relative or non-existent work root: there is no default root and no
+    /// ambient-directory fallback.
+    pub fn bind(work_root: &Path) -> Result<Self, KernelCaptureError> {
+        if !work_root.is_absolute() {
+            return Err(KernelCaptureError::InvalidInput {
+                field: "publish.work_root",
+                reason: "the work root must be absolute",
+            });
+        }
+        if !work_root.is_dir() {
+            return Err(KernelCaptureError::InvalidInput {
+                field: "publish.work_root",
+                reason: "the work root must be an existing directory",
+            });
+        }
+        let area = work_root.join(".eliot").join(CAPTURE_ARCHIVE_AREA);
+        std::fs::create_dir_all(&area).map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "retained-archive area could not be created: {error}"
+            ))
+        })?;
+        Ok(Self { area })
+    }
+
+    /// Retained-archive area root.
+    #[must_use]
+    pub fn area(&self) -> &Path {
+        &self.area
+    }
+
+    /// The one directory this publication operation owns.
+    fn operation_dir(&self, operation_id: &str) -> Result<PathBuf, KernelCaptureError> {
+        let dir = self.area.join(sha256_hex(operation_id.as_bytes()));
+        if !dir.starts_with(&self.area) {
+            return Err(KernelCaptureError::OwnerEvidenceInvalid(
+                "publication directory escapes the retained-archive area".to_owned(),
+            ));
+        }
+        Ok(dir)
+    }
+}
+
+impl PublicationPort for KernelArchiveOwner {
+    /// Publishes the verified archive bytes exactly once, then issues the
+    /// owner's own durable receipt for that operation.
+    ///
+    /// Order: validate the bounded identities, construct the operation's own
+    /// directory, EXCLUSIVELY create the archive body, flush it, then
+    /// EXCLUSIVELY create the receipt and flush it. Durability is claimed only
+    /// after both writes are flushed. An operation whose directory already holds
+    /// a body or a receipt is never written twice: exclusive creation refuses
+    /// and the coordinator reconciles by identity instead, so this is
+    /// exactly-once even across a lost response.
+    fn publish_once(
+        &mut self,
+        operation_id: &str,
+        idempotency_key: &str,
+        bytes: &[u8],
+    ) -> Result<PublicationReceipt, KernelCaptureError> {
+        check_publication_id(operation_id, "publish.operation_id")?;
+        check_publication_id(idempotency_key, "publish.idempotency_key")?;
+        if bytes.is_empty() {
+            return Err(KernelCaptureError::InvalidInput {
+                field: "publish.bytes",
+                reason: "an empty archive is not a publishable artifact",
+            });
+        }
+        let dir = self.operation_dir(operation_id)?;
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "publication directory could not be created: {error}"
+            ))
+        })?;
+        // This digest MINTES the content address of the exact bytes this call is
+        // publishing. It never stands in for checking a recorded one: the
+        // coordinator independently compares this value against the digest of
+        // the bundle it built and validated, and that comparison is what binds
+        // the receipt to this operation.
+        let receipt = PublicationReceipt {
+            operation_id: operation_id.to_owned(),
+            archive_sha256: sha256_hex(bytes),
+            durable: true,
+        };
+        write_owned(&dir.join(CAPTURE_PUBLISHED_ARCHIVE_FILE), bytes, operation_id)?;
+        let encoded = serde_json::to_vec(&receipt).map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "publication receipt could not be encoded: {error}"
+            ))
+        })?;
+        write_owned(
+            &dir.join(CAPTURE_PUBLICATION_RECEIPT_FILE),
+            &encoded,
+            operation_id,
+        )?;
+        sync_directory(&dir)?;
+        Ok(receipt)
+    }
+
+    /// Adopts this owner's OWN durable receipt for `operation_id` without a
+    /// second publish.
+    ///
+    /// The recorded receipt is read back and validated through
+    /// [`PublicationReceipt::validate`] — the original recorded value, not a
+    /// fresh checksum over whatever bytes are in hand — and it must name THIS
+    /// operation identity exactly. The body that exclusive creation committed
+    /// for this operation must still be present, otherwise the receipt no longer
+    /// describes a retained archive. Anything else is an unknown publication
+    /// outcome, which crosses as `RestoreRollbackRequired` so the coordinator
+    /// reconciles rather than blind-retries (I14.21).
+    fn reconcile(&mut self, operation_id: &str) -> Result<PublicationReceipt, KernelCaptureError> {
+        check_publication_id(operation_id, "publish.operation_id")?;
+        let dir = self.operation_dir(operation_id)?;
+        let unknown = || KernelCaptureError::PublicationUnknown(operation_id.to_owned());
+        let raw =
+            std::fs::read(dir.join(CAPTURE_PUBLICATION_RECEIPT_FILE)).map_err(|_| unknown())?;
+        let receipt: PublicationReceipt = serde_json::from_slice(&raw).map_err(|_| unknown())?;
+        receipt.validate()?;
+        if receipt.operation_id != operation_id {
+            return Err(unknown());
+        }
+        let body =
+            std::fs::metadata(dir.join(CAPTURE_PUBLISHED_ARCHIVE_FILE)).map_err(|_| unknown())?;
+        if !body.is_file() || body.len() == 0 {
+            return Err(unknown());
+        }
+        Ok(receipt)
+    }
+}
+
+/// Refuses an unbounded or malformed publication identity.
+fn check_publication_id(
+    value: &str,
+    field: &'static str,
+) -> Result<(), KernelCaptureError> {
+    non_blank(value, field)?;
+    if value.len() > MAX_PUBLICATION_ID_LEN {
+        return Err(KernelCaptureError::InvalidInput {
+            field,
+            reason: "publication identities must be bounded",
+        });
+    }
+    Ok(())
+}
+
+/// Creates one file this publication operation owns, refusing an existing one.
+///
+/// `create_new` IS the ownership claim: a predictable name is not ownership,
+/// so this refuses rather than overwriting or appending. An existing file means
+/// this operation already published, which is an unknown publication outcome for
+/// the caller to reconcile by identity — never a second write. A body that was
+/// created but whose receipt was not is deliberately left in place and reported
+/// the same way, because a partially written publication is precisely the state
+/// a blind retry would corrupt.
+fn write_owned(
+    path: &Path,
+    bytes: &[u8],
+    operation_id: &str,
+) -> Result<(), KernelCaptureError> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                KernelCaptureError::PublicationUnknown(operation_id.to_owned())
+            }
+            _ => KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "publication body could not be created: {error}"
+            )),
+        })?;
+    file.write_all(bytes).map_err(|error| {
+        KernelCaptureError::OwnerEvidenceInvalid(format!("publication write failed: {error}"))
+    })?;
+    file.sync_all().map_err(|error| {
+        KernelCaptureError::OwnerEvidenceInvalid(format!("publication flush failed: {error}"))
+    })?;
+    Ok(())
+}
+
+/// Flushes the directory entry that names this operation's two created files.
+///
+/// Windows cannot flush a directory through an ordinary open, so the handle is
+/// opened with `FILE_FLAG_BACKUP_SEMANTICS`, and the three errors Windows may
+/// legitimately raise for a directory flush are absorbed for the same reason
+/// this crate's restore journal adapter absorbs them: the entry cannot be
+/// flushed rather than a write having been lost, and both file bodies were
+/// already flushed unconditionally by [`write_owned`] before this call.
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> Result<(), KernelCaptureError> {
+    std::fs::File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "publication directory flush failed: {error}"
+            ))
+        })
+}
+
+#[cfg(windows)]
+fn sync_directory(directory: &Path) -> Result<(), KernelCaptureError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)
+        .and_then(|handle| handle.sync_all())
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported => Ok(()),
+            _ => Err(error),
+        })
+        .map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "publication directory flush failed: {error}"
+            ))
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(_directory: &Path) -> Result<(), KernelCaptureError> {
+    Ok(())
 }
 
 /// Typed fail-closed errors for the Kernel capture owner.
