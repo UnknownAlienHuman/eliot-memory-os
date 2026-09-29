@@ -1,11 +1,12 @@
 //! Authenticated Kernel owner route for installation-bound scan disclosure.
 //!
 //! The daemon reaches this route only through the authenticated daemon gateway.
-//! Every request is joined to the live application session, retained accepted
-//! activation, exact durable activation rows, and the current P-07 owner
-//! projection before the durable ORS port can be touched. Owner inputs that
-//! have no current producer remain typed plan gaps; the route never turns a
-//! request field into authority.
+//! Every request is joined to the retained accepted activation, exact durable
+//! activation rows, and current P-07 owner projection. The initial contour and
+//! binding requests can run after AcceptedTerminal and before application
+//! Session projection; record operations require the later active session
+//! before the durable ORS port can be touched. Owner inputs without current
+//! producers remain typed plan gaps; request fields never become authority.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,8 +49,8 @@ pub(crate) struct ScanDisclosureOwnerRequest {
 pub(crate) enum ScanDisclosureOwnerAction {
     /// Return the Kernel-owned installation/ORS contour.
     IssueContour,
-    /// Admit one scanner binding against the currently retained activation.
-    IssueBinding { binding: ScanDisclosureOwnerBinding },
+    /// Issue one scanner binding from the current retained activation owners.
+    IssueBinding,
     /// Stage one canonical receipt row.
     Stage { binding: ScanDisclosureOwnerBinding, record: ScanDisclosureOrsRecord },
     /// Commit one staged receipt row.
@@ -134,10 +135,15 @@ pub(crate) enum ScanDisclosureOwnerValue {
 
 #[cfg(windows)]
 #[derive(Clone)]
-struct CurrentApplicationBinding {
-    retained: super::ActivatedApplicationBinding,
+struct CurrentScanDisclosureActivation {
+    binding: eliot_protocol::AgentActivationResolvedBinding,
     ticket: eliot_protocol::AgentActivationResolutionTicket,
+    result: eliot_protocol::AgentActivationResolutionResult,
     installation_id: String,
+    kernel_owner_revision: u64,
+    kernel_owner_bundle_sha256: String,
+    active_session_epoch: Option<u64>,
+    activated_binding: Option<super::ActivatedApplicationBinding>,
 }
 
 impl KernelComposition {
@@ -169,17 +175,28 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let current = self.current_application_binding(
+        let current = self.current_scan_disclosure_activation(
             &request.application_connection_id,
             &request.activation_ticket_id,
         )?;
+        if !matches!(
+            &request.action,
+            ScanDisclosureOwnerAction::IssueContour | ScanDisclosureOwnerAction::IssueBinding
+        ) {
+            self.require_active_scan_disclosure_session(
+                &current,
+                &request.application_connection_id,
+            )?;
+        } else if super::unix_ms() > current.ticket.kernel_deadline_unix_ms {
+            return Err(TransportError::Timeout);
+        }
         let value = match request.action {
             ScanDisclosureOwnerAction::IssueContour => {
                 let contour = self.issue_scan_disclosure_contour(&current)?;
                 ScanDisclosureOwnerValue::Contour { contour }
             }
-            ScanDisclosureOwnerAction::IssueBinding { binding } => {
-                self.validate_scan_disclosure_binding(&current, &binding)?;
+            ScanDisclosureOwnerAction::IssueBinding => {
+                let binding = self.issue_scan_disclosure_binding(&current)?;
                 ScanDisclosureOwnerValue::Binding { binding }
             }
             ScanDisclosureOwnerAction::Stage { binding, record } => {
@@ -304,67 +321,16 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn current_application_binding(
+    fn current_scan_disclosure_activation(
         &self,
         connection_id: &str,
         ticket_id: &str,
-    ) -> Result<CurrentApplicationBinding, TransportError> {
-        let (retained, application_session_epoch) = {
-            let connections = self
-                .agent_bridge_connections
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let connection = connections
-                .get(connection_id)
-                .ok_or(TransportError::SessionFenced)?;
-            if !connection.activation_completed || connection.session.is_none() {
-                return Err(TransportError::SessionFenced);
-            }
-            let retained = connection
-                .activated_binding
-                .as_ref()
-                .ok_or(TransportError::SessionFenced)?;
-            if retained.activation_ticket_id != ticket_id {
-                return Err(TransportError::IdentityConflict);
-            }
-            let session_epoch = connection
-                .session
-                .as_ref()
-                .map(|session| session.session_epoch)
-                .ok_or(TransportError::SessionFenced)?;
-            (retained.clone(), session_epoch)
-        };
+    ) -> Result<CurrentScanDisclosureActivation, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
 
-        {
-            let sessions = self
-                .agent_application_sessions
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let application = sessions
-                .get(&retained.session_id)
-                .ok_or(TransportError::SessionFenced)?;
-            if application.session_id() != retained.session_id
-                || application.state() != ApplicationSessionState::Active
-                || !application
-                    .authority_epoch()
-                    .is_same_authority(&retained.authority_epoch)
-                || !application.transport_bindings().last().is_some_and(|binding| {
-                    binding.binding_id == connection_id
-                        && binding.session_epoch == application_session_epoch
-                })
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-
-        let (owner_bound, owner_revision, owner_digest) = self.p07_owner_readback();
-        if !owner_bound
-            || owner_revision != Some(retained.kernel_owner_revision)
-            || owner_digest.as_deref() != Some(retained.kernel_owner_bundle_sha256.as_str())
-        {
-            return Err(TransportError::SessionFenced);
-        }
-
+        // Keep the activation-result owner first in the lock order. The bridge
+        // may already have projected a Session after the daemon received its
+        // Accepted ACK, so the result and ORS rows remain the root evidence.
         let pending = self
             .agent_activation_pending
             .lock()
@@ -375,18 +341,13 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         if local.phase != AgentActivationResultPhase::AcceptedTerminal
             || local.result.validate().is_err()
-            || local.result.ticket_id != retained.activation_ticket_id
-            || local.result.ticket_sha256 != retained.activation_ticket_sha256
-            || local.result.result_sha256 != retained.resolution_result_sha256
-            || local.result.resolved_binding() != Some(&retained.resolved_binding)
-            || retained.resolved_binding.principal_id != retained.principal_id
-            || retained.resolved_binding.session_id != retained.session_id
-            || retained.resolved_binding.task_id != retained.task_id
-            || retained.resolved_binding.work_scope_id != retained.work_scope_id
-            || retained.resolved_binding.task_revision != retained.task_revision.value().to_string()
+            || local.result.ticket_id != ticket_id
+            || local.result.resolved_binding().is_none()
         {
             return Err(TransportError::SessionFenced);
         }
+        let local_result = local.result.clone();
+        let pending_entry = pending.entries.get(ticket_id).cloned();
         drop(pending);
 
         let lifecycle = self
@@ -398,20 +359,19 @@ impl KernelComposition {
         let retained_result = self
             .generation_gateway
             .ors
-            .load_activation_result(ticket_id, &retained.resolution_result_sha256)
+            .load_activation_result(ticket_id, &local_result.result_sha256)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::SessionFenced)?;
         if lifecycle.state != eliot_ors::ActivationLifecycleState::ResultAccepted
-            || lifecycle.ticket_id != retained.activation_ticket_id
-            || lifecycle.ticket_sha256 != retained.activation_ticket_sha256
+            || lifecycle.ticket_id != ticket_id
             || lifecycle.connection_id != connection_id
-            || lifecycle.result_sha256.as_deref()
-                != Some(retained.resolution_result_sha256.as_str())
+            || lifecycle.result_sha256.as_deref() != Some(local_result.result_sha256.as_str())
+            || lifecycle.kernel_deadline_unix_ms == 0
             || retained_result.phase != eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
             || retained_result.ticket_id != lifecycle.ticket_id
             || retained_result.ticket_sha256 != lifecycle.ticket_sha256
             || retained_result.ticket_payload != lifecycle.ticket_payload
-            || retained_result.result_sha256 != retained.resolution_result_sha256
+            || retained_result.result_sha256 != local_result.result_sha256
             || retained_result.connection_id != connection_id
             || retained_result.state_fence != lifecycle.state_fence
         {
@@ -425,21 +385,138 @@ impl KernelComposition {
             &retained_result.result_payload,
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        if result != local_result || result.validate_against(&ticket).is_err() {
+            return Err(TransportError::IdentityConflict);
+        }
         let state_fence_digest = sha256_json(&ticket.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if ticket.validate().is_err()
-            || result.validate().is_err()
-            || ticket.ticket_id != retained.activation_ticket_id
-            || ticket.ticket_sha256 != retained.activation_ticket_sha256
+            || ticket.ticket_id != ticket_id
             || ticket.connection_id != connection_id
+            || lifecycle.ticket_sha256 != ticket.ticket_sha256
+            || retained_result.ticket_sha256 != ticket.ticket_sha256
             || ticket.workspace_selector.is_none()
-            || ticket.state_fence.authority_epoch != retained.authority_epoch
-            || ticket.state_fence.resource_generation != retained.activation_generation
+            || lifecycle.activation_request_id != ticket.activation_request_id.as_str()
+            || lifecycle.activation_request_sha256 != ticket.activation_request_sha256
+            || lifecycle.kernel_deadline_unix_ms != ticket.kernel_deadline_unix_ms
             || lifecycle.state_fence != state_fence_digest
-            || result.ticket_id != retained.activation_ticket_id
-            || result.ticket_sha256 != retained.activation_ticket_sha256
-            || result.result_sha256 != retained.resolution_result_sha256
-            || result.resolved_binding() != Some(&retained.resolved_binding)
+            || result.ticket_id != ticket.ticket_id
+            || result.ticket_sha256 != ticket.ticket_sha256
+            || result.ticket_state_fence != ticket.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let binding = (*result
+            .resolved_binding()
+            .ok_or(TransportError::SessionFenced)?)
+        .clone();
+        let (accepted, session_epoch, activated_binding) = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let connection = connections
+                .get(connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            let accepted = connection
+                .accepted_transport
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?
+                .clone();
+            if accepted.connection_id() != connection_id
+                || accepted.peer() != &connection.peer
+                || accepted.declaration() != &connection.declaration
+                || (connection.activation_completed && connection.session.is_none())
+                || (connection.session.is_some() && !connection.activation_completed)
+                || (connection.activation_completed && connection.activated_binding.is_none())
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            (
+                accepted,
+                connection.session.as_ref().map(|session| session.session_epoch),
+                connection.activated_binding.clone(),
+            )
+        };
+        let receipt = accepted.admission_receipt();
+        receipt
+            .validate_challenge(accepted.challenge())
+            .map_err(|_| TransportError::SessionFenced)?;
+        receipt
+            .validate_client_hello(accepted.declaration(), accepted.client_hello())
+            .map_err(|_| TransportError::SessionFenced)?;
+        if receipt.connection_id != connection_id
+            || receipt.receipt_sha256 != ticket.peer_admission_receipt_sha256
+            || receipt.state_fence != ticket.state_fence
+            || receipt.activation_deadline_unix_ms != ticket.kernel_deadline_unix_ms
+            || ticket.connection_id != connection_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        if let Some(entry) = pending_entry.as_ref()
+            && (entry.ticket != ticket
+                || entry.ticket.validate_against(&entry.request, receipt).is_err())
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let owner_readback = pending_entry
+            .as_ref()
+            .and_then(|entry| entry.owner_readback.as_ref());
+        if let Some(readback) = owner_readback {
+            let evidence = result
+                .owner_evidence
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            readback
+                .validate_against_binding(&binding, &ticket.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if readback.evidence.owner_id != evidence.owner_id
+                || readback.evidence.owner_revision < evidence.owner_revision
+                || readback.evidence.state_fence != evidence.state_fence
+                || readback.evidence.binding != evidence.binding
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+
+        let (kernel_owner_revision, kernel_owner_bundle_sha256) = if let Some(readback) = owner_readback
+        {
+            let kernel_owner = readback
+                .kernel_owner
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            kernel_owner.validate().map_err(|_| TransportError::SessionFenced)?;
+            (kernel_owner.revision, kernel_owner.bundle_sha256.clone())
+        } else if let Some(active) = activated_binding.as_ref() {
+            if active.activation_ticket_id != ticket.ticket_id
+                || active.activation_ticket_sha256 != ticket.ticket_sha256
+                || active.resolution_result_sha256 != result.result_sha256
+                || active.resolved_binding != binding
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            (
+                active.kernel_owner_revision,
+                active.kernel_owner_bundle_sha256.clone(),
+            )
+        } else {
+            return Err(TransportError::PlanGap {
+                dependency: "kernel.activation_owner_readback_retention",
+                reason: "the accepted connection no longer retains the exact P-07 revision and digest",
+            });
+        };
+        if let Some(active) = activated_binding.as_ref()
+            && (active.kernel_owner_revision != kernel_owner_revision
+                || active.kernel_owner_bundle_sha256 != kernel_owner_bundle_sha256)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let (owner_bound, current_owner_revision, current_owner_digest) = self.p07_owner_readback();
+        if !owner_bound
+            || current_owner_revision != Some(kernel_owner_revision)
+            || current_owner_digest.as_deref() != Some(kernel_owner_bundle_sha256.as_str())
         {
             return Err(TransportError::SessionFenced);
         }
@@ -448,17 +525,77 @@ impl KernelComposition {
             .map(|contour| contour.installation_id().to_owned())
             .filter(|identity| !identity.trim().is_empty())
             .ok_or(TransportError::SessionFenced)?;
-        Ok(CurrentApplicationBinding {
-            retained,
+        Ok(CurrentScanDisclosureActivation {
+            binding,
             ticket,
+            result,
             installation_id,
+            kernel_owner_revision,
+            kernel_owner_bundle_sha256,
+            active_session_epoch: session_epoch,
+            activated_binding,
         })
+    }
+
+    #[cfg(windows)]
+    fn require_active_scan_disclosure_session(
+        &self,
+        current: &CurrentScanDisclosureActivation,
+        connection_id: &str,
+    ) -> Result<(), TransportError> {
+        let retained = current
+            .activated_binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let application_session_epoch = current
+            .active_session_epoch
+            .ok_or(TransportError::SessionFenced)?;
+        if retained.activation_ticket_id != current.ticket.ticket_id
+            || retained.activation_ticket_sha256 != current.ticket.ticket_sha256
+            || retained.activation_request_id != current.ticket.activation_request_id.as_str()
+            || retained.activation_request_sha256 != current.ticket.activation_request_sha256
+            || retained.peer_admission_receipt_sha256
+                != current.ticket.peer_admission_receipt_sha256
+            || retained.resolution_result_sha256 != current.result.result_sha256
+            || retained.resolved_binding != current.binding
+            || retained.principal_id != current.binding.principal_id
+            || retained.session_id != current.binding.session_id
+            || retained.task_id != current.binding.task_id
+            || retained.work_scope_id != current.binding.work_scope_id
+            || retained.task_revision.value().to_string() != current.binding.task_revision
+            || retained.authority_epoch != current.ticket.state_fence.authority_epoch
+            || retained.activation_generation != current.ticket.state_fence.resource_generation
+            || retained.kernel_owner_revision != current.kernel_owner_revision
+            || retained.kernel_owner_bundle_sha256 != current.kernel_owner_bundle_sha256
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let application = sessions
+            .get(&current.binding.session_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if application.session_id() != current.binding.session_id
+            || application.state() != ApplicationSessionState::Active
+            || !application
+                .authority_epoch()
+                .is_same_authority(&current.ticket.state_fence.authority_epoch)
+            || !application.transport_bindings().last().is_some_and(|binding| {
+                binding.binding_id == connection_id
+                    && binding.session_epoch == application_session_epoch
+            })
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
     fn issue_scan_disclosure_contour(
         &self,
-        current: &CurrentApplicationBinding,
+        current: &CurrentScanDisclosureActivation,
     ) -> Result<InstallationScanContour, TransportError> {
         let object_path = self.work_root.join(".eliot").join("kernel-ors.redb");
         let object_path = std::fs::canonicalize(&object_path).map_err(|_| {
@@ -483,9 +620,25 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn issue_scan_disclosure_binding(
+        &self,
+        _current: &CurrentScanDisclosureActivation,
+    ) -> Result<ScanDisclosureOwnerBinding, TransportError> {
+        // The accepted activation and Host observation do not carry an
+        // admitted privacy boundary, policy revision, or durable
+        // DiscoveryReadLease owner, and the accepted result carries no
+        // TaskSelectionEvidence. Kernel cannot turn request data or the
+        // activation ticket into those missing authorities.
+        Err(TransportError::PlanGap {
+            dependency: "governor.current_scan_privacy_policy_and_lease_owner",
+            reason: "no admitted privacy-boundary/policy, DiscoveryReadLease owner, or TaskSelectionEvidence is available for this activation",
+        })
+    }
+
+    #[cfg(windows)]
     fn validate_scan_disclosure_binding(
         &self,
-        current: &CurrentApplicationBinding,
+        current: &CurrentScanDisclosureActivation,
         binding: &ScanDisclosureOwnerBinding,
     ) -> Result<(), TransportError> {
         let state_fence_ref = sha256_json(&current.ticket.state_fence)
@@ -497,9 +650,10 @@ impl KernelComposition {
         .as_str()
         .to_owned();
         if binding.installation_id != current.installation_id
-            || binding.principal_ref != current.retained.principal_id
-            || binding.session_ref != current.retained.session_id
-            || binding.host_generation_ref != current.retained.activation_generation.value().to_string()
+            || binding.principal_ref != current.binding.principal_id
+            || binding.session_ref != current.binding.session_id
+            || binding.host_generation_ref
+                != current.ticket.state_fence.resource_generation.value().to_string()
             || binding.candidate_root_ref
                 != current.ticket.workspace_selector.as_deref().unwrap_or_default()
             || binding.state_fence_ref.as_deref() != Some(state_fence_ref.as_str())
@@ -508,7 +662,6 @@ impl KernelComposition {
             || binding.privacy_boundary_ref.trim().is_empty()
             || binding.operation_id.trim().is_empty()
             || binding.idempotency_key.trim().is_empty()
-            || binding.lease_consumed == 0
             || binding.policy_revision == 0
             || binding.deadline == 0
             || binding.deadline > current.ticket.kernel_deadline_unix_ms
@@ -516,18 +669,19 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         // The current Kernel/application state has no admitted privacy-policy
-        // boundary or retained discovery-lease owner to compare these fields
-        // against. Shape and activation equality alone are not authority.
+        // boundary, retained discovery-lease owner, or TaskSelectionEvidence
+        // to compare these fields against. Shape and activation equality alone
+        // are not authority.
         Err(TransportError::PlanGap {
             dependency: "governor.current_scan_privacy_policy_and_lease_owner",
-            reason: "no admitted live privacy-boundary/policy and DiscoveryReadLease owner is available for this activation",
+            reason: "no admitted live privacy-boundary/policy, DiscoveryReadLease owner, or TaskSelectionEvidence is available for this activation",
         })
     }
 
     #[cfg(windows)]
     fn validate_record_binding(
         &self,
-        current: &CurrentApplicationBinding,
+        current: &CurrentScanDisclosureActivation,
         binding: &ScanDisclosureOwnerBinding,
         record: &ScanDisclosureOrsRecord,
     ) -> Result<(), TransportError> {

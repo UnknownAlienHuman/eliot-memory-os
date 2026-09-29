@@ -224,6 +224,10 @@ enum ActivationCompletion {
 struct ActivationResolvedTicket {
     ticket: AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
+    /// The exact Host-observed bounded discovery lease/key/evidence created
+    /// while resolving this ticket. The accepted-result trigger consumes this
+    /// value; it never re-observes the workspace or recreates the lease.
+    cold_start_discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
     /// Issue #1115: the semantic Governor binding combined with the P-07
     /// revision/digest, both captured before this flight was published. The
     /// submit path reuses this pair verbatim and never performs a second
@@ -2607,6 +2611,37 @@ fn resolve_valid_ticket(
                 ticket.ticket_id
             )
         })?;
+    let mut cold_start_discovery = if result.resolved_binding().is_some()
+        && ticket.workspace_selector.is_some()
+    {
+        Some(
+            eliotd::task_binding_admission::observe_cold_start_discovery(
+                &ticket,
+                &ticket.state_fence,
+                now.max(1),
+            )
+            .map_err(|error| {
+                format!(
+                    "daemon activation discovery ticket {}: {error}",
+                    ticket.ticket_id
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let result = if let Some(observed) = cold_start_discovery.as_mut() {
+        DaemonComposition::attach_cold_start_question(result, observed).map_err(
+            |error| {
+                format!(
+                    "daemon activation cold-start question ticket {}: {error}",
+                    ticket.ticket_id
+                )
+            },
+        )?
+    } else {
+        result
+    };
     let semantic_owner = if matches!(
         &result.disposition,
         AgentActivationResolutionDisposition::Resolved { .. }
@@ -2664,6 +2699,7 @@ fn resolve_valid_ticket(
     Ok(Some(Box::new(ActivationResolvedTicket {
         ticket,
         result,
+        cold_start_discovery,
         owner_readback,
     })))
 }
@@ -2686,10 +2722,11 @@ fn start_activation_dispatch(
     let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
         Box::pin(async move {
             let outcome = dispatch_agent_activation_result(
-                &kernel_clone,
+                kernel_clone,
                 &resolved.ticket,
                 resolved.result,
                 resolved.owner_readback,
+                resolved.cold_start_discovery,
             )
             .await;
             ActivationCompletion::Dispatch(outcome)
@@ -4791,10 +4828,11 @@ async fn testd_owner_drain_admitted(composition: &SharedComposition) -> bool {
 /// creates no Session, authority, or Finish; only bounded ticket identity is
 /// carried in diagnostics.
 async fn dispatch_agent_activation_result(
-    kernel: &DaemonKernelClient,
+    kernel: Arc<DaemonKernelClient>,
     ticket: &AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
     owner_readback: Option<eliot_protocol::AgentActivationOwnerReadback>,
+    cold_start_discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
 ) -> Result<(), ActivationDispatchError> {
     // #740: dispatch span over the submit-then-reconcile path. The retained
     // result is reused verbatim; only bounded ticket identity is carried.
@@ -4811,7 +4849,11 @@ async fn dispatch_agent_activation_result(
         .submit_agent_activation_result(&result, owner_readback)
         .await
     {
-        Ok(ack) => classify_submit_ack(ticket, &result, &ack),
+        Ok(ack) => {
+            classify_submit_ack(ticket, &result, &ack)?;
+            trigger_accepted_cold_start(&kernel, ticket, cold_start_discovery).await;
+            Ok(())
+        }
         // #839 (W14/A3): the submit failure's own provenance now decides the
         // path. A failure that provably never reached the transport, and a
         // definitive non-acceptance, hold nothing for Kernel to reconcile and
@@ -4843,9 +4885,168 @@ async fn dispatch_agent_activation_result(
                         ticket.ticket_id
                     ))
                 })?;
-            classify_reconcile_ack(ticket, &result, &ack, &submit_detail)
+            classify_reconcile_ack(ticket, &result, &ack, &submit_detail)?;
+            trigger_accepted_cold_start(&kernel, ticket, cold_start_discovery).await;
+            Ok(())
         }
     }
+}
+
+/// Runs the I4.4.1 trigger after either direct acceptance or an accepted
+/// reconciliation of a possibly-lost result acknowledgement. The exact Host
+/// lease/key/evidence stays attached to this resolved dispatch across both
+/// paths.
+async fn trigger_accepted_cold_start(
+    kernel: &Arc<DaemonKernelClient>,
+    ticket: &AgentActivationResolutionTicket,
+    discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
+) {
+    if let Some(discovery) = discovery {
+        let kernel = Arc::clone(kernel);
+        let ticket_id = ticket.ticket_id.clone();
+        let worker_ticket = ticket.clone();
+        tokio::task::spawn_blocking(move || {
+            trigger_cold_start_controller(&kernel, &worker_ticket, discovery)
+        })
+        .await
+        .map_or_else(
+            |error| {
+                tracing::warn!(
+                    ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                    error = %error,
+                    "accepted activation's I4.4.1 scanner trigger worker failed closed"
+                );
+            },
+            |trigger_result| {
+                if let Err(refusal) = trigger_result {
+                    tracing::warn!(
+                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                        refusal = %refusal,
+                        "accepted activation's I4.4.1 scanner trigger refused"
+                    );
+                }
+            },
+        );
+    }
+}
+
+/// Fires the I4.4.1 `AttachOrLaunch` trigger only after Kernel accepted the
+/// exact typed activation result. The same retained Host lease/evidence is
+/// passed to `ColdStartController`; no second filesystem observation or new
+/// lease is created. The authenticated owner route and scanner adapter are
+/// reachable here. Completion remains fail-closed while the durable ORS
+/// generation, admitted privacy policy, and Kernel-visible lease owner have
+/// no current producers.
+fn trigger_cold_start_controller(
+    kernel: &DaemonKernelClient,
+    ticket: &AgentActivationResolutionTicket,
+    mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
+) -> Result<(), String> {
+    let now = unix_ms(SystemTime::now())?;
+    let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
+    let controller_result = eliot_workscope::ColdStartController::check_discovery_with_scan(
+        trigger,
+        &discovery.lease,
+        &discovery.discovery.evidence,
+        now,
+    );
+    // Every accepted explicit attach reaches the authenticated installation
+    // owner routes. The contour and binding are derived there; this caller
+    // supplies no authority-bearing storage or binding fields.
+    let contour_result = eliotd::task_binding_admission::request_scan_disclosure_contour(
+        kernel,
+        &ticket.connection_id,
+        &ticket.ticket_id,
+    );
+    let binding_result = eliotd::task_binding_admission::request_scan_disclosure_binding(
+        kernel,
+        &ticket.connection_id,
+        &ticket.ticket_id,
+    );
+
+    if let Err(controller) = controller_result {
+        let missing_reads = trigger
+            .required_discovery_reads()
+            .iter()
+            .filter(|read| {
+                !discovery.lease.allowed_reads.contains(read)
+                    || !discovery.discovery.evidence.attested_reads.contains(read)
+            })
+            .map(|read| format!("{read:?}"))
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {}; Kernel binding owner: {}",
+            contour_result.err().unwrap_or_else(|| "available".to_owned()),
+            binding_result.err().unwrap_or_else(|| "available".to_owned()),
+        ));
+    }
+
+    let (Some(candidate_privacy), Some(privacy_boundary), Some(policy)) = (
+        discovery.discovery.candidate_privacy,
+        discovery.discovery.privacy_boundary.as_ref(),
+        discovery.discovery.policy.as_ref(),
+    ) else {
+        // The privacy-bounded scanner's question path validates this exact
+        // retained lease/key/evidence and performs no charge or persistence.
+        let question = eliot_workscope::run_bootstrap_discovery(
+            None,
+            None,
+            &mut discovery.lease,
+            &discovery.key,
+            &discovery.discovery,
+        )
+        .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"))?;
+        let question = match question {
+            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
+                code,
+                ..
+            } => code,
+            eliot_workscope::BootstrapScanOutcome::Completed { .. } => {
+                "scanner returned completion without an installation owner".to_owned()
+            }
+        };
+        return Err(format!(
+            "I4.4.1 AttachOrLaunch reached privacy-bounded scanner question path: {question}; Kernel contour owner: {}; Kernel binding owner: {}; privacy class, admitted boundary and policy remain absent",
+            contour_result.err().unwrap_or_else(|| "available".to_owned()),
+            binding_result.err().unwrap_or_else(|| "available".to_owned()),
+        ));
+    };
+
+    let contour = contour_result?;
+    let binding = binding_result?;
+    let owner = Arc::new(
+        eliotd::task_binding_admission::KernelScanDisclosureRecordOwner::new(
+            Arc::clone(kernel),
+            ticket.connection_id.clone(),
+            ticket.ticket_id.clone(),
+            binding.clone(),
+        ),
+    );
+    let mut store = eliot_governor::GovernorComposition::bind_installation_scan_store(
+        contour.installation_id(),
+        contour.ors_object_ref(),
+        contour.ors_generation(),
+        owner,
+    )
+    .map_err(|error| format!("installation scan owner bind refused: {error}"))?;
+    eliot_governor::GovernorComposition::run_cold_start_trigger_scan(
+        trigger,
+        &mut discovery.lease,
+        &discovery.key,
+        &mut store,
+        &binding,
+        candidate_privacy,
+        Some(privacy_boundary),
+        &discovery.discovery.evidence,
+        discovery.discovery.proposed_kind,
+        &discovery.discovery.identity_fingerprint,
+        &policy.verifier_refs,
+        discovery.discovery.governing_source_refs.clone(),
+        now,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("I4.4.1 AttachOrLaunch scanner failed closed: {error}"))
+}
 }
 
 /// Builds the lost-acknowledgement reconcile query from the single retained

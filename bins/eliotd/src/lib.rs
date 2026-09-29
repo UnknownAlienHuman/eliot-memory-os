@@ -1872,22 +1872,13 @@ impl DaemonComposition {
             ));
         }
         let outcome = self.map_activation_outcome(ticket, now, successor_observation.as_ref());
-        let outcome = match outcome {
-            Ok(result)
-                if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() =>
-            {
-                Self::attach_cold_start_question(ticket, now, result)
-            }
-            other => other,
-        };
         emit_activation_admission_diagnostics(ticket, &outcome);
         outcome
     }
 
-    /// Runs the reachable, non-ready attach discovery leg for an explicit
-    /// workspace selector. The Host observer supplies filesystem/VCS facts;
-    /// the scanner may return only its smallest privacy-boundary question
-    /// until an installation-backed disclosure owner is supplied.
+    /// Attaches the bounded pre-owner question using the exact Host observation
+    /// retained by the activation dispatch. The lease/key/evidence are carried
+    /// forward unchanged for the post-acceptance trigger owner route.
     ///
     /// Issue #2900 W12: this is the live attach/cold-start ingress that
     /// reaches the scan port. The pre-owner question leg runs without a
@@ -1898,22 +1889,16 @@ impl DaemonComposition {
     /// `BootstrapScanner::scan`, and the live terminal readiness receipt
     /// must reference that durable handle through
     /// `GovernorComposition::compile_cold_start_at_trigger`'s `scan_receipt`.
-    /// Caller: live `bins/eliotd/src/lib.rs:1872` for the question leg;
-    /// STITCH for the owner leg — the canonical
-    /// `Arc<dyn eliot_governor::ScanDisclosureRecordOwner>` (Kernel
-    /// `RedbRecoveryStore::open`) has no live `eliotd` thread yet, so
-    /// completion fails closed with no in-memory or loose-file fallback.
-    fn attach_cold_start_question(
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
+    /// Caller: `daemon_runtime::resolve_valid_ticket` attaches this question
+    /// before submitting the exact result. After Kernel accepts that result,
+    /// `dispatch_agent_activation_result` passes the same retained Host
+    /// observation to `trigger_cold_start_controller`, whose authenticated
+    /// Kernel owner route fails closed while ORS generation, privacy policy,
+    /// and lease-owner producers remain unavailable.
+    pub(crate) fn attach_cold_start_question(
         result: AgentActivationResolutionResult,
+        observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
     ) -> Result<AgentActivationResolutionResult, DaemonError> {
-        let mut observed = crate::task_binding_admission::observe_cold_start_discovery(
-            ticket,
-            &ticket.state_fence,
-            now.max(1),
-        )
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         let scan = eliot_workscope::run_bootstrap_discovery(
             None,
             None,
