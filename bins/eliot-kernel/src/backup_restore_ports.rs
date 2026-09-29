@@ -19,7 +19,8 @@
 //! refusals with exact reason, never silence or fabricated success).
 //!
 //! What this file owns: the journal-admission gate
-//! ([`require_production_admitted`]), the per-execution port bundle
+//! ([`require_production_admitted`]), the production durable owner that issues
+//! an admission ([`OrsRestoreJournalOwner`]), the per-execution port bundle
 //! ([`RestorePorts`]), the constructed (never accepted)
 //! [`KernelIsolatedDestination`], the pinned destination admission record,
 //! the [`check_kernel_effect_fence`] gate, and the fail-closed
