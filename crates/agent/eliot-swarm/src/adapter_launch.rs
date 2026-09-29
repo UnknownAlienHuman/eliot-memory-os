@@ -271,14 +271,10 @@ pub fn launch_sealed_child(
     {
         return Err(SwarmError::StaleLineage);
     }
-    let launch = launch_admitted_child(
-        store, executor, attachment, item, request, registry, prior,
-    )?;
+    let launch =
+        launch_admitted_child(store, executor, attachment, item, request, registry, prior)?;
     let identities = verify_sealed_dispatch(plan, attachment, &launch.launch)?;
-    Ok(SealedChildLaunch {
-        launch,
-        identities,
-    })
+    Ok(SealedChildLaunch { launch, identities })
 }
 
 /// In-crate composition of one swarm execution contour: one Governor

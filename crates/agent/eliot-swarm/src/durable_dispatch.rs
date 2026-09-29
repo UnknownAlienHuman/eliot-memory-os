@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AdmittedSwarmPlan, ProviderBinding, ProviderRequest, ReceiptEnvelope, ReceiptVerificationPort,
-    SwarmError, derive_child_attempt_id, derive_child_cancellation_id,
-    derive_child_operation_id, digest,
+    SwarmError, derive_child_attempt_id, derive_child_cancellation_id, derive_child_operation_id,
+    digest,
     durable_work::{ChildDisposition, LaunchIntent, RouteGrant, TerminalKind, WorkUnitId},
     validate_receipt, validate_text,
 };
