@@ -288,9 +288,9 @@ pub fn prove_no_service_profile_authority_dependency(
     // against a retained object for that profile.
     let retained_anchor = match governed.profile {
         InstallationProfile::SystemService => unreachable!("service profile rejected above"),
-        InstallationProfile::PortableDev => Some(
-            anchor_provider.retain_root(&runtime_state_roots.profile_anchor_root)?,
-        ),
+        InstallationProfile::PortableDev => {
+            Some(anchor_provider.retain_root(&runtime_state_roots.profile_anchor_root)?)
+        }
         InstallationProfile::UserMode => None,
     };
     let declared_anchor = runtime_state_roots.profile_anchor_root.as_str();
@@ -308,7 +308,10 @@ pub fn prove_no_service_profile_authority_dependency(
                     .to_owned(),
             ));
         }
-        text(lease.file_identity(), "profile_supervision.anchor_lease.file_identity")?;
+        text(
+            lease.file_identity(),
+            "profile_supervision.anchor_lease.file_identity",
+        )?;
     }
 
     // The layout is derived from the retained lease's OS-resolved canonical
