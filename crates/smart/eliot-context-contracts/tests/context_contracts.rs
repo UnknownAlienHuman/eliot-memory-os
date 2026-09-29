@@ -140,6 +140,24 @@ fn resolved_applicability() -> QualityApplicability {
     }
 }
 
+/// Intrinsically well-formed output binding for a card that is only checked for
+/// structural integrity. A card bound to a real packet's exact output is built
+/// by its owner; these fixtures only need the field to be well formed.
+fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "fixture-route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
+    }
+}
+
 fn quality(context: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -156,7 +174,9 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
         QualityDimension::TelemetryMeasurementCostCoverage,
     ];
     QualityScorecard {
+        schema_version: QUALITY_SCORECARD_SCHEMA_VERSION,
         binding: context.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()

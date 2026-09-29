@@ -259,6 +259,19 @@ impl ActiveUnderstandingView {
         if self.recipe_digest != admitted.economy.recipe_digest {
             return Err(ContextError::IdentityConflict);
         }
+        // The admitted half of the scorecard's output binding, compared against
+        // the admitted set's own canonical payload digest and its own displaced
+        // list. Both sides are independent records: the digest is recomputed by
+        // the existing admitted-set owner over the admitted records, and the
+        // expected omissions are the admitted set's, not the scorecard's copy.
+        // A card graded against a different admitted set therefore cannot
+        // validate against this one even when the two share a task, attempt,
+        // scope, decision and fence.
+        if self.quality.output.admitted_digest != admitted.canonical_payload_digest()?
+            || self.quality.output.omission_handles != admitted.economy.displaced
+        {
+            return Err(ContextError::SelectionIntegrityMismatch);
+        }
         let expected_omissions: BTreeSet<_> = admitted.economy.displaced.iter().cloned().collect();
         let actual_omissions: BTreeSet<_> =
             self.selection.omission_evidence.iter().cloned().collect();
@@ -359,6 +372,21 @@ impl ActiveUnderstandingView {
         }
         self.quality.validate()?;
         self.measurement.validate()?;
+        // The rendered half of the scorecard's output binding, compared against
+        // the rendered half of this view. `derived_output_digest` is the one
+        // existing canonical digest of the ordered rendered payload and it
+        // reads only `{schema_version, binding, recipe_digest, fence_digest,
+        // rendered}` — the scorecard is not an input to it, so binding the
+        // grade to the final representation is not circular. Because the recipe
+        // digest and the rendered bytes are both in that input, a card graded on
+        // a different recipe or a different membership yields a different
+        // recorded value and is rejected here even when the fence matches.
+        if self.quality.output.recipe_digest != self.recipe_digest
+            || self.quality.output.fence_digest != self.fence_digest
+            || self.quality.output.rendered_digest != derived_output_digest
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
         if self.selection.binding != self.binding
             || self.quality.binding != self.binding
             || self.measurement.context != self.binding

@@ -1474,6 +1474,12 @@ fn count_view_references(
         counters.add_references(usize::from(result.failed_invariant.is_some()))?;
         counters.add_references(usize::from(result.invalidation.is_some()))?;
     }
+    // The scorecard's output binding retains two caller-supplied reference
+    // lists of its own, so it is charged against the same finite planning
+    // denominator as every other retained reference. An oversized value is
+    // refused; no reference is dropped to make a plan fit.
+    counters.add_references(view.view.quality.output.evidence_revisions.len())?;
+    counters.add_references(view.view.quality.output.omission_handles.len())?;
     for omission in &view.admitted.economy.omissions {
         counters.add_references(2)?; // source_id and decision
         counters.add_references(usize::from(omission.expires.is_some()))?;
