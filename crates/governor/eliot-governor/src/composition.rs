@@ -7165,10 +7165,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 phase: CanonicalRevocationPhase::ClosureReadback,
                 error: CompositionError::Owner(error.to_string()),
             })?;
-        closure.validate().map_err(|error| PendingCanonicalHandoff {
-            phase: CanonicalRevocationPhase::ClosureReadback,
-            error: CompositionError::Owner(error.to_string()),
-        })?;
+        closure
+            .validate()
+            .map_err(|error| PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::ClosureReadback,
+                error: CompositionError::Owner(error.to_string()),
+            })?;
         if closure.state != eliot_receipts::GrantClosureState::Revoked
             || closure.declaration.target_grant_id != request.grant_id.as_str()
             || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
@@ -7211,16 +7213,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 error: CompositionError::Owner(error.to_string()),
             })?;
         self.owners.authority.invalidate_owner_hydrations();
-        let envelope =
-            authority_revocation_envelope_from_closure(
-                canonical_request_identity,
-                canonical_operation_id,
-                &closure,
-            )
-            .map_err(|error| PendingCanonicalHandoff {
-                phase: CanonicalRevocationPhase::CanonicalCommit,
-                error,
-            })?;
+        let envelope = authority_revocation_envelope_from_closure(
+            canonical_request_identity,
+            canonical_operation_id,
+            &closure,
+        )
+        .map_err(|error| PendingCanonicalHandoff {
+            phase: CanonicalRevocationPhase::CanonicalCommit,
+            error,
+        })?;
         let canonical_receipt = self
             .commit_canonical(canonical_request_identity, envelope)
             .await
