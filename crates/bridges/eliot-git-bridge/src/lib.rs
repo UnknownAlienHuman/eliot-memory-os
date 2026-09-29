@@ -824,12 +824,14 @@ pub struct GitReadbackDiff {
 /// Read-only Git evidence for confirming a host or filesystem hint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitReadbackReceipt {
-    /// Exact repository HEAD observed by Git.
-    pub head: GitReadbackHead,
+    /// Repository HEAD observed before status and diff collection.
+    pub head_before: GitReadbackHead,
     /// Typed porcelain status, including the raw-output digest and invocation.
     pub status: StatusReceipt,
-    /// Full tracked-file diff output handle relative to `head.revision`.
+    /// Full tracked-file diff output handle relative to `head_before.revision`.
     pub diff: GitReadbackDiff,
+    /// Repository HEAD observed after status and diff collection.
+    pub head_after: GitReadbackHead,
     /// Stable content-addressed identity for the complete readback evidence.
     /// It binds every invocation, exit observation, and full output digest.
     pub evidence_ref: String,
@@ -1435,8 +1437,9 @@ impl<R: ProcessRunner> GitBridge<R> {
     /// The aggregate evidence identity binds those observations to the SID,
     /// repository root, lease, and exact argv. A readback is evidence of Git's
     /// observed state only: it does not establish who caused a change or
-    /// provide an atomic filesystem snapshot. Untracked paths appear in status
-    /// but have no patch bytes in Git's `diff` output.
+    /// provide an atomic filesystem snapshot. The two HEAD observations must
+    /// agree, but this does not prevent concurrent worktree edits. Untracked
+    /// paths appear in status but have no patch bytes in Git's `diff` output.
     ///
     /// # Errors
     /// Identity/root/lease failures, runner or Git failures, or malformed
@@ -1466,64 +1469,80 @@ impl<R: ProcessRunner> GitBridge<R> {
             "core.fsmonitor=false".to_owned(),
             "status".to_owned(),
             "--porcelain=v1".to_owned(),
-            "-b".to_owned(),
+            "--branch".to_owned(),
+            "-z".to_owned(),
             "--no-renames".to_owned(),
             "--untracked-files=all".to_owned(),
         ];
         let (status_outcome, status_invocation, status_exit) =
             self.exec(status_args, &resolved)?;
         Self::check_success(&status_outcome, &status_invocation)?;
-        let status_text = std::str::from_utf8(&status_outcome.stdout).map_err(|_| {
-            BridgeError::InvalidReadbackOutput {
+        let header_end = status_outcome
+            .stdout
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(BridgeError::InvalidReadbackOutput {
                 operation: "status",
-                reason: "porcelain output is not UTF-8",
-            }
-        })?;
-        let mut branch_line = None;
-        let mut entries = Vec::new();
-        for (index, line) in status_text.lines().enumerate() {
-            if index == 0 && line.starts_with("## ") {
-                branch_line = Some(line.to_owned());
-                continue;
-            }
-            let bytes = line.as_bytes();
-            if bytes.len() < 3 || bytes[2] != b' ' {
-                if line.is_empty() {
-                    continue;
-                }
-                return Err(BridgeError::InvalidReadbackOutput {
-                    operation: "status",
-                    reason: "porcelain entry is missing its status/path separator",
-                });
-            }
-            if branch_line.is_none() {
-                return Err(BridgeError::InvalidReadbackOutput {
-                    operation: "status",
-                    reason: "porcelain output is missing its branch header",
-                });
-            }
-            if !bytes[..2].iter().all(u8::is_ascii) {
-                return Err(BridgeError::InvalidReadbackOutput {
-                    operation: "status",
-                    reason: "porcelain status code is not ASCII",
-                });
-            }
-            if bytes.len() == 3 {
-                return Err(BridgeError::InvalidReadbackOutput {
-                    operation: "status",
-                    reason: "porcelain entry has an empty path",
-                });
-            }
-            entries.push(StatusEntry {
-                xy: line[..2].to_owned(),
-                path: line[3..].to_owned(),
-            });
-        }
-        if branch_line.is_none() {
+                reason: "porcelain output is missing its NUL-delimited branch header",
+            })?;
+        let branch_header = &status_outcome.stdout[..header_end];
+        if !branch_header.starts_with(b"## ") {
             return Err(BridgeError::InvalidReadbackOutput {
                 operation: "status",
                 reason: "porcelain output is missing its branch header",
             });
+        }
+        let branch_text = std::str::from_utf8(branch_header).map_err(|_| {
+            BridgeError::InvalidReadbackOutput {
+                operation: "status",
+                reason: "porcelain branch header is not UTF-8",
+            }
+        })?;
+        let branch_line = Some(branch_text.to_owned());
+        let records = &status_outcome.stdout[header_end + 1..];
+        if !records.is_empty() && records.last() != Some(&0) {
+            return Err(BridgeError::InvalidReadbackOutput {
+                operation: "status",
+                reason: "porcelain entry stream is missing its NUL terminator",
+            });
+        }
+        let mut entries = Vec::new();
+        if !records.is_empty() {
+            for record in records[..records.len() - 1].split(|byte| *byte == 0) {
+                if record.len() < 3 || record[2] != b' ' {
+                    return Err(BridgeError::InvalidReadbackOutput {
+                        operation: "status",
+                        reason: "porcelain entry is missing its status/path separator",
+                    });
+                }
+                if !record[..2].iter().all(u8::is_ascii) {
+                    return Err(BridgeError::InvalidReadbackOutput {
+                        operation: "status",
+                        reason: "porcelain status code is not ASCII",
+                    });
+                }
+                if record.len() == 3 {
+                    return Err(BridgeError::InvalidReadbackOutput {
+                        operation: "status",
+                        reason: "porcelain entry has an empty path",
+                    });
+                }
+                let path = std::str::from_utf8(&record[3..]).map_err(|_| {
+                    BridgeError::InvalidReadbackOutput {
+                        operation: "status",
+                        reason: "porcelain path is not UTF-8",
+                    }
+                })?;
+                entries.push(StatusEntry {
+                    xy: std::str::from_utf8(&record[..2])
+                        .map_err(|_| BridgeError::InvalidReadbackOutput {
+                            operation: "status",
+                            reason: "porcelain status code is not UTF-8",
+                        })?
+                        .to_owned(),
+                    path: path.to_owned(),
+                });
+            }
         }
         let dirty = !entries.is_empty();
         let status_common = Self::common(
@@ -1558,7 +1577,23 @@ impl<R: ProcessRunner> GitBridge<R> {
         let (diff_outcome, diff_invocation, diff_exit) = self.exec(diff_args, &resolved)?;
         Self::check_success(&diff_outcome, &diff_invocation)?;
 
-        let head_common = Self::common(
+        let head_after_args = vec![
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "HEAD^{commit}".to_owned(),
+        ];
+        let (head_after_outcome, head_after_invocation, head_after_exit) =
+            self.exec(head_after_args, &resolved)?;
+        Self::check_success(&head_after_outcome, &head_after_invocation)?;
+        let head_after_revision = parse_git_readback_revision(&head_after_outcome.stdout)?;
+        if head_after_revision != head_revision {
+            return Err(BridgeError::InvalidReadbackOutput {
+                operation: "rev-parse",
+                reason: "HEAD changed during readback",
+            });
+        }
+
+        let head_before_common = Self::common(
             identity,
             resolved.clone(),
             None,
@@ -1568,9 +1603,23 @@ impl<R: ProcessRunner> GitBridge<R> {
             &head_outcome,
             dirty,
         );
-        let head = GitReadbackHead {
-            common: head_common,
+        let head_before = GitReadbackHead {
+            common: head_before_common,
             revision: head_revision,
+        };
+        let head_after_common = Self::common(
+            identity,
+            resolved.clone(),
+            None,
+            lease.clone(),
+            head_after_invocation,
+            head_after_exit,
+            &head_after_outcome,
+            dirty,
+        );
+        let head_after = GitReadbackHead {
+            common: head_after_common,
+            revision: head_after_revision,
         };
         let diff_common = Self::common(
             identity,
@@ -1586,13 +1635,19 @@ impl<R: ProcessRunner> GitBridge<R> {
             diff_ref: format!("git-diff:sha256:{}", diff_common.stdout.sha256),
             common: diff_common,
         };
-        let evidence_sha256 = git_readback_digest(&head.common, &status.common, &diff.common);
+        let evidence_sha256 = git_readback_digest(
+            &head_before.common,
+            &status.common,
+            &diff.common,
+            &head_after.common,
+        );
         let evidence_ref = format!("git-readback:sha256:{evidence_sha256}");
 
         Ok(GitReadbackReceipt {
-            head,
+            head_before,
             status,
             diff,
+            head_after,
             evidence_ref,
             evidence_sha256,
         })
@@ -2156,14 +2211,16 @@ fn parse_git_readback_revision(stdout: &[u8]) -> Result<String, BridgeError> {
 }
 
 fn git_readback_digest(
-    head: &CommonReceipt,
+    head_before: &CommonReceipt,
     status: &CommonReceipt,
     diff: &CommonReceipt,
+    head_after: &CommonReceipt,
 ) -> String {
     let mut material = b"eliot-git-readback-v1\0".to_vec();
-    append_readback_common(&mut material, head);
+    append_readback_common(&mut material, head_before);
     append_readback_common(&mut material, status);
     append_readback_common(&mut material, diff);
+    append_readback_common(&mut material, head_after);
     sha256_hex(&material)
 }
 
