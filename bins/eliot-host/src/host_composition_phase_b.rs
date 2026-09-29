@@ -318,7 +318,12 @@ impl HostComposition {
             InstallationProfile::SystemService => None,
         };
 
-        super::validate_phase_b_credential_receipt(receipt, manifest, intent, selected_owner_sid)
+        super::phase_b_projection::validate_phase_b_credential_receipt(
+            receipt,
+            manifest,
+            intent,
+            selected_owner_sid,
+        )
     }
 
     /// Materializes the Host-owned Phase-B authority, Store bootstrap, and
