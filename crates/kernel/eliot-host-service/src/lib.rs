@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod foreign_occupant_recovery;
 pub mod reactive_context_delivery;
 pub mod runtime_control;
 pub mod user_automation_durable_job;
@@ -20,6 +21,14 @@ pub mod user_automation_execution;
 pub mod user_automation_wake;
 
 mod service;
+
+pub use foreign_occupant_recovery::{
+    AdmittedCollisionOperation, BlockedRecoveryOperation, CollisionOperationDisposition,
+    CollisionOriginClass, CollisionRefusal, ForeignOccupantRecoveryDirective,
+    ForeignOccupantRecoveryError, ManagedTreeObservation, OwnershipEvidenceClass,
+    PermittedRecoveryOperation, RecoveryReferenceRole, RequestedProcessOperation,
+    RoleFilteredReference, SafeNextAction,
+};
 
 pub use service::{
     BoundedRestartOutcome, HostChildExecutor, HostDependencyPlan, HostFailure,
