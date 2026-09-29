@@ -45,9 +45,10 @@ pub use atom::{
 };
 pub use boundary::{
     BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
-    BoundaryDenominator, BoundaryGap, BoundaryGapReason, BoundaryMember, BoundaryMemberCoverage,
-    BoundaryMemberOrigin, BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole,
-    BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryTransformRelation,
+    BoundaryDenominator, BoundaryDisposition, BoundaryDispositionRecord, BoundaryGap,
+    BoundaryGapReason, BoundaryMember, BoundaryMemberCoverage, BoundaryMemberOrigin,
+    BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole, BoundaryMetadataEnvelope,
+    BoundaryMetadataSet, BoundaryPrecision, BoundaryRecovery, BoundaryTransformRelation,
     BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ExactSourceRange,
 };
 

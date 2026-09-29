@@ -11,14 +11,19 @@ use eliot_contracts::{ArtifactId, ContractVersion, canonical_json_bytes, sha256_
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextBinding, ContextError, SourceSnapshot, validate_digest, validate_text};
+use crate::{
+    ContextBinding, ContextError, NonRecoverableReason, SourceSnapshot, validate_digest,
+    validate_text,
+};
 
 /// Only this schema revision is interpreted by this validator.
 ///
-/// `1.1.0` adds the required `BoundaryMetadataSet::transforms` member relation. A
-/// `1.0.0` payload is rejected by name in `validate()` instead of being read as a
-/// set that declares no transform.
-pub const BOUNDARY_METADATA_SCHEMA_REVISION: ContractVersion = ContractVersion::new(1, 1, 0);
+/// `1.2.0` adds the required `BoundaryMetadataEnvelope::disposition` member, so a
+/// payload that names a disposition it never recorded is rejected by name.
+/// `1.1.0` added the required `BoundaryMetadataSet::transforms` member relation.
+/// Both older revisions are rejected in `validate()` instead of being read as a
+/// set that declares no transform or no disposition.
+pub const BOUNDARY_METADATA_SCHEMA_REVISION: ContractVersion = ContractVersion::new(1, 2, 0);
 
 /// Semantic form of a logical unit represented by one boundary envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -188,6 +193,67 @@ pub struct BoundaryGap {
     pub reason: BoundaryGapReason,
 }
 
+/// The five permitted dispositions when a unit cannot be preserved exactly.
+///
+/// I12.13 allows exactly these degradations, each whole-unit and
+/// operation-specific. A representation that needs none of them carries no
+/// disposition record at all; one that needs one must say which, and why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BoundaryDisposition {
+    /// Only an exact expansion handle stands in for the original.
+    ExactHandleOnly,
+    /// A narrower extractive view; omitted members are named as gaps.
+    NarrowerExtractiveView,
+    /// The whole unit is incomplete or unsupported by this operation.
+    WholeUnitIncompleteUnsupported,
+    /// A proposal to route to a compatible contour.
+    RouteToCompatibleContour,
+    /// Only the dependent decision or effect is blocked.
+    BlockDependentDecisionOrEffect,
+}
+
+/// How material this operation did not retain may be reopened.
+///
+/// The absence of a handle is never inferred: it is stated as an explicit
+/// non-recoverable reason or as an unknown observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", content = "handles", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BoundaryRecovery {
+    /// Exact expansion handles this operation retained.
+    ExpansionHandles(Vec<ArtifactId>),
+    /// The original is unavailable or forbidden and cannot be reopened.
+    NonRecoverable(NonRecoverableReason),
+    /// No reopen path was observed; this is not a claim of non-recoverability.
+    Unknown,
+}
+
+/// One explicit degradation disposition with its reason and source binding.
+///
+/// `None` on the envelope means no permitted degradation applied. `Some` is the
+/// only way to represent a narrowed, blocked or unsupported unit, so a partial
+/// representation can never be read as a complete original.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryDispositionRecord {
+    /// Which permitted disposition this operation applied.
+    pub disposition: BoundaryDisposition,
+    /// Non-empty reason this disposition applied to this unit.
+    pub reason: String,
+    /// Rule/evidence identity that authorized the disposition.
+    pub rule_evidence: ArtifactId,
+    /// Boundary precision actually delivered by this representation.
+    pub delivered_precision: BoundaryPrecision,
+    /// How the material this operation did not retain may be reopened.
+    pub recovery: BoundaryRecovery,
+    /// Whether this disposition authorizes the dependent effect.
+    ///
+    /// A route proposal and a blocking disposition both leave this `false`: the
+    /// first names a contour, the second names a stop, and neither is authority
+    /// to launch anything.
+    pub grants_launch_authority: bool,
+}
+
 /// Exact denominator, retained sequence, and explicit member gaps.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -260,6 +326,13 @@ pub struct BoundaryMetadataEnvelope {
     pub completeness: BoundaryCompleteness,
     /// Precision established for its source/member boundaries.
     pub precision: BoundaryPrecision,
+    /// The permitted degradation applied to this unit, absent when none applied.
+    ///
+    /// A unit that carries no disposition is represented exactly. A unit that
+    /// carries one names which of the five permitted degradations it took, why,
+    /// and how the omitted material may be reopened, so a narrowed representation
+    /// cannot be read as a complete original.
+    pub disposition: Option<BoundaryDispositionRecord>,
     /// Schema revision of this wire contract.
     pub schema_revision: ContractVersion,
     /// Exact transformer revision and configuration, absent only for legacy data.
@@ -359,6 +432,7 @@ impl BoundaryMetadataEnvelope {
         }
 
         self.validate_lineage_refs(limits, &mut metadata_bytes)?;
+        self.validate_disposition(limits, &mut metadata_bytes)?;
 
         if metadata_bytes > limits.max_metadata_bytes {
             return Err(ContextError::Bounds {
@@ -493,6 +567,132 @@ impl BoundaryMetadataEnvelope {
             )?;
         }
         Ok(bytes)
+    }
+
+    /// Validate the permitted degradation this unit declares, against the rest of
+    /// the envelope rather than against itself.
+    ///
+    /// Each rule compares the disposition with an independent field of the same
+    /// envelope — coverage, precision, completeness, or the retained handle list —
+    /// and the handle comparison checks length as well as membership, because set
+    /// equality alone cannot see a dropped or duplicated member. A rule that only
+    /// checked the disposition for internal shape would be satisfied by a
+    /// producer that wrote a disposition and nothing else.
+    fn validate_disposition(
+        &self,
+        limits: &BoundaryValidationLimits,
+        metadata_bytes: &mut usize,
+    ) -> Result<(), ContextError> {
+        let gaps = self.coverage.known_gaps.len();
+        let legacy = self.completeness == BoundaryCompleteness::UnknownLegacy;
+        let Some(disposition) = &self.disposition else {
+            // No permitted degradation: the unit must actually be exact. A
+            // Complete/Exact envelope with no disposition is the only combination
+            // that claims nothing was lost. Explicit legacy handling is exempt:
+            // it already declares that nothing about it is established.
+            if !legacy
+                && (self.completeness != BoundaryCompleteness::Complete
+                    || self.precision != BoundaryPrecision::Exact)
+            {
+                return Err(ContextError::MissingField("boundary.disposition"));
+            }
+            return Ok(());
+        };
+        if legacy {
+            return Err(ContextError::InvalidField("boundary.disposition.legacy"));
+        }
+        account_text(
+            metadata_bytes,
+            limits,
+            &disposition.reason,
+            "boundary.disposition.reason",
+        )?;
+        account_text(
+            metadata_bytes,
+            limits,
+            disposition.rule_evidence.as_str(),
+            "boundary.disposition.rule_evidence",
+        )?;
+
+        match disposition.disposition {
+            BoundaryDisposition::NarrowerExtractiveView => {
+                // An extract states its losses: it must actually be degraded, and
+                // it must name the members it left out. A mixed exact/degraded
+                // record that calls itself Complete is exactly what this rejects.
+                if self.precision == BoundaryPrecision::Exact
+                    || self.completeness != BoundaryCompleteness::Incomplete
+                    || gaps == 0
+                    || disposition.delivered_precision != self.precision
+                {
+                    return Err(ContextError::InvalidField("boundary.disposition.extract"));
+                }
+            }
+            BoundaryDisposition::WholeUnitIncompleteUnsupported => {
+                if self.completeness == BoundaryCompleteness::Complete
+                    || disposition.grants_launch_authority
+                {
+                    return Err(ContextError::WholeUnitRequired);
+                }
+            }
+            BoundaryDisposition::RouteToCompatibleContour => {
+                // Nothing was delivered here, so the unit cannot also claim to be
+                // complete, and naming a contour is never authority to launch.
+                if self.completeness == BoundaryCompleteness::Complete
+                    || disposition.grants_launch_authority
+                {
+                    return Err(ContextError::InvalidField(
+                        "boundary.disposition.route_authority",
+                    ));
+                }
+            }
+            BoundaryDisposition::BlockDependentDecisionOrEffect => {
+                if disposition.grants_launch_authority {
+                    return Err(ContextError::InvalidField(
+                        "boundary.disposition.block_authority",
+                    ));
+                }
+            }
+            BoundaryDisposition::ExactHandleOnly => {
+                self.validate_handle_only(disposition)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a handle-only disposition against the retained handle list.
+    ///
+    /// The claimed handles and the retained expansion references are compared by
+    /// length as well as membership, because two copies of one identity collapse
+    /// in a set and a duplicate would otherwise pass unnoticed.
+    fn validate_handle_only(
+        &self,
+        disposition: &BoundaryDispositionRecord,
+    ) -> Result<(), ContextError> {
+        let claimed = match &disposition.recovery {
+            BoundaryRecovery::ExpansionHandles(handles) => handles.as_slice(),
+            BoundaryRecovery::NonRecoverable(_) | BoundaryRecovery::Unknown => &[],
+        };
+        if claimed.len() != self.expansion_refs.len()
+            || !claimed
+                .iter()
+                .all(|handle| self.expansion_refs.contains(handle))
+        {
+            return Err(ContextError::OmissionHandleInvalid);
+        }
+        if disposition.delivered_precision != BoundaryPrecision::Exact {
+            return Err(ContextError::InvalidField(
+                "boundary.disposition.handle_precision",
+            ));
+        }
+        if claimed.is_empty()
+            && self.completeness == BoundaryCompleteness::Complete
+            && !matches!(disposition.recovery, BoundaryRecovery::Unknown)
+        {
+            // No handle, yet nothing is missing and nothing is marked unknown: the
+            // record would promise a reopen path it does not carry.
+            return Err(ContextError::OmissionHandleInvalid);
+        }
+        Ok(())
     }
 
     fn validate_lineage_refs(
@@ -881,6 +1081,31 @@ impl BoundaryMetadataSet {
         let bytes = canonical_json_bytes(&self.canonical_payload())
             .map_err(|_| ContextError::InvalidField("boundary.canonical_payload"))?;
         Ok(sha256_hex(&bytes))
+    }
+
+    /// Canonical wire bytes for this set, used when a container packs it.
+    ///
+    /// These bytes carry the envelopes and the ordered member relations and
+    /// nothing else, so byte transport chunking stays separate from logical
+    /// segmentation: reassembling the exact bytes restores the exact units.
+    pub fn pack(&self) -> Result<Vec<u8>, ContextError> {
+        canonical_json_bytes(self).map_err(|_| ContextError::InvalidField("boundary.pack_payload"))
+    }
+
+    /// Reassemble a packed set from canonical wire bytes and validate it.
+    ///
+    /// This restores the exact units a container packed and proves nothing was
+    /// lost in transport. It deliberately does NOT certify identity on its own:
+    /// a `boundary_digest` travelling inside the same bytes is a second copy of
+    /// the same producer's claim, so a consumer checks the reassembled payload
+    /// against the separately recorded binding value, which incorporates the
+    /// upstream admission receipt digest.
+    pub fn unpack(bytes: &[u8], limits: &BoundaryValidationLimits) -> Result<Self, ContextError> {
+        limits.validate()?;
+        let reconstructed: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ContextError::InvalidField("boundary.unpack_payload"))?;
+        reconstructed.validate(limits)?;
+        Ok(reconstructed)
     }
 
     /// Exact UTF-8 byte length of the canonical boundary payload.
