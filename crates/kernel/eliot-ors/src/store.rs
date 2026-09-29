@@ -10213,6 +10213,11 @@ impl RedbRecoveryStore {
                 ],
                 BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE.to_owned(),
             ),
+            None if scan_hit => (
+                true,
+                scan_classes,
+                BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
+            ),
             // No usable owner verdict for these exact bytes is not permission.
             None => (
                 true,
