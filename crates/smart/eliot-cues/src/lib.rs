@@ -58,6 +58,14 @@
 //! stable `field` in [`FacadeError::EnvelopeInvalid`], so no refusal path
 //! changed. This removed no public item and added none.
 //!
+//! The retained-bytes/row identity binding was then written out twice more —
+//! once in [`reject_v1_row_conversion`] and once in
+//! [`legacy_adapter::convert_v1_row`], each validating the supplied row, parsing
+//! the retained bytes under the supplied identity, and requiring the payload to
+//! be that row. #1143 work item 4 collapsed those into the single crate-private
+//! owner [`bind_v1_row_payload`]. The per-path checks that follow the binding
+//! stay at their call sites, because their `field` names differ on purpose.
+//!
 //! Removed duplicates (compile-proof; see `tests/legacy_facade.rs`):
 //! local `CueKind`/`MatchMode`/`CueStrength`, all `normalize_value*`
 //! copies, `CueKey` constructors/comparison, `CueRecord` construction and
@@ -317,6 +325,35 @@ fn validate_legacy_identity(value: &str) -> Result<(), FacadeError> {
     Ok(())
 }
 
+/// The single owner of the retained-bytes/row identity binding rule.
+///
+/// [`reject_v1_row_conversion`] and [`legacy_adapter::convert_v1_row`] each
+/// opened with the same three statements: validate the supplied row's replay
+/// shape, parse the retained bytes under the supplied identity, and require the
+/// parsed payload to BE that row. One rule written out twice is a second
+/// validation owner, and this one is load-bearing: if the two copies drift,
+/// one path can admit a retained envelope whose payload is not the row the
+/// caller passed, or refuse a byte-closed envelope for a reason the other path
+/// would have accepted. Both now read the rule from here in the same order, so
+/// the first refusal a caller sees is unchanged, and the `what` each path
+/// reports is one stable pointer rather than two that can diverge. The checks
+/// that follow the binding stay at their call sites, because their `field`
+/// names differ by design and are part of the differential fixture.
+fn bind_v1_row_payload(
+    legacy_row_id: &str,
+    row: &LegacyEliotCuesV1Row,
+    legacy_bytes: &[u8],
+) -> Result<(), FacadeError> {
+    row.validate_for_conversion()?;
+    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
+    if &parsed != row {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_payload",
+        });
+    }
+    Ok(())
+}
+
 /// One exact legacy row input for a byte-preserving snapshot conversion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -538,13 +575,7 @@ pub fn reject_v1_row_conversion(
     legacy_bytes: &[u8],
     reason: V1MigrationRejection,
 ) -> Result<V1RowMigration, FacadeError> {
-    row.validate_for_conversion()?;
-    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
-    if &parsed != row {
-        return Err(FacadeError::ResponseIdentityMismatch {
-            what: "migration.row_payload",
-        });
-    }
+    bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
     validate_legacy_identity(legacy_row_id)?;
     if legacy_bytes.is_empty() {
         return Err(FacadeError::EnvelopeInvalid {

@@ -24,7 +24,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    FacadeError, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration, is_blank_or_control,
+    FacadeError, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration, bind_v1_row_payload,
+    is_blank_or_control,
 };
 
 #[derive(Deserialize)]
@@ -562,13 +563,7 @@ pub fn convert_v1_row(
     observed: Option<&OwnerObservedCue>,
     normalized: Option<&NormalizedCue>,
 ) -> Result<V1RowMigration, FacadeError> {
-    row.validate_for_conversion()?;
-    let parsed = crate::legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
-    if &parsed != row {
-        return Err(FacadeError::ResponseIdentityMismatch {
-            what: "migration.row_payload",
-        });
-    }
+    bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
     if is_blank_or_control(legacy_row_id) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",

@@ -221,17 +221,15 @@ impl AdviceGate {
         &mut self,
         proposal: &AdviceProposal,
     ) -> Result<AdviceCandidate, AdviceRejected> {
-        if proposal.statement.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("statement"));
-        }
-        if proposal.expected_benefit.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("expected_benefit"));
-        }
-        if proposal.cost_counter_metrics.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("cost_counter_metrics"));
-        }
-        if proposal.owner.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("owner"));
+        for (field, value) in [
+            ("statement", &proposal.statement),
+            ("expected_benefit", &proposal.expected_benefit),
+            ("cost_counter_metrics", &proposal.cost_counter_metrics),
+            ("owner", &proposal.owner),
+        ] {
+            if value.trim().is_empty() {
+                return Err(AdviceRejected::BlankField(field));
+            }
         }
         let evidence: Vec<String> = proposal
             .discriminating_evidence
@@ -246,12 +244,12 @@ impl AdviceGate {
         self.check_negative_block(&hypothesis_key, &evidence)?;
         let candidate = AdviceCandidate {
             hypothesis_key,
-            statement: proposal.statement.trim().to_owned(),
+            statement: trim_to_owned(&proposal.statement),
             advice_class: proposal.advice_class,
             discriminating_evidence: evidence,
-            expected_benefit: proposal.expected_benefit.trim().to_owned(),
-            cost_counter_metrics: proposal.cost_counter_metrics.trim().to_owned(),
-            owner: proposal.owner.trim().to_owned(),
+            expected_benefit: trim_to_owned(&proposal.expected_benefit),
+            cost_counter_metrics: trim_to_owned(&proposal.cost_counter_metrics),
+            owner: trim_to_owned(&proposal.owner),
             verifier: None,
             rollback_plan: None,
             state: AdviceState::Proposed,
@@ -285,8 +283,8 @@ impl AdviceGate {
                 if rollback.trim().is_empty() {
                     return Err(AdviceRejected::MissingRollback);
                 }
-                candidate.verifier = Some(verifier.trim().to_owned());
-                candidate.rollback_plan = Some(rollback.trim().to_owned());
+                candidate.verifier = Some(trim_to_owned(verifier));
+                candidate.rollback_plan = Some(trim_to_owned(rollback));
                 candidate.state = AdviceState::OwnerApproved;
                 self.commit(&candidate);
                 Ok(candidate)
@@ -307,10 +305,11 @@ impl AdviceGate {
         candidate: &AdviceCandidate,
         reason: &str,
     ) -> NegativeMemoryEntry {
-        let reason = if reason.trim().is_empty() {
-            "unspecified failure"
+        let reason = trim_to_owned(reason);
+        let reason = if reason.is_empty() {
+            "unspecified failure".to_owned()
         } else {
-            reason.trim()
+            reason
         };
         let entry = self
             .negative_memory
@@ -318,12 +317,12 @@ impl AdviceGate {
             .or_insert(NegativeMemoryEntry {
                 hypothesis_key: candidate.hypothesis_key.clone(),
                 advice_class: candidate.advice_class,
-                failure_reason: reason.to_owned(),
+                failure_reason: reason.clone(),
                 failures: 0,
                 known_discriminators: BTreeSet::new(),
             });
         entry.failures = entry.failures.saturating_add(1);
-        entry.failure_reason = reason.to_string();
+        entry.failure_reason = reason;
         entry
             .known_discriminators
             .extend(candidate.discriminating_evidence.iter().cloned());
@@ -374,6 +373,23 @@ impl AdviceGate {
 /// [`AdviceGate::record_failure`] accumulates it verbatim.
 fn fold_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The single owner of the committed-text trim used by every transition that
+/// writes caller text into a committed record.
+///
+/// `propose` wrote `proposal.<field>.trim().to_owned()` for four fields and
+/// `record_owner_decision` wrote it for `verifier` and `rollback` — six copies
+/// of one rule, each of which a later edit could trim, fold, or forget
+/// differently and thereby write two different bytes for the same committed
+/// record depending on which path produced it. Every committed text value now
+/// reads the rule from here. This is deliberately NOT the same owner as
+/// [`fold_whitespace`]: the hypothesis key folds internal runs of whitespace to
+/// a single space and lowercases, while a committed record keeps the author's
+/// internal spacing and only loses its edges. Collapsing the two would silently
+/// rewrite committed text, so they stay separate owners on purpose.
+fn trim_to_owned(value: &str) -> String {
+    value.trim().to_owned()
 }
 
 fn normalise_statement(statement: &str) -> String {
