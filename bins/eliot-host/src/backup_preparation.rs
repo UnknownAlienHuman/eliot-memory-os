@@ -3029,8 +3029,12 @@ impl OwnerEvidence {
     /// Phase-B supervision authority, and the retained config identity is read
     /// the same way rather than from the older committed fence alone.
     pub fn approved_binding(&self) -> Result<ApprovedBuildBinding, PreparationError> {
-        bind_approved_build(&self.approved, &self.fence, self.registry.active_phase_b_rebind())
-            .map_err(projection_to_preparation)
+        bind_approved_build(
+            &self.approved,
+            &self.fence,
+            self.registry.active_phase_b_rebind(),
+        )
+        .map_err(projection_to_preparation)
     }
 
     /// Returns the **owner-issued** lease reference for this source, re-proving
