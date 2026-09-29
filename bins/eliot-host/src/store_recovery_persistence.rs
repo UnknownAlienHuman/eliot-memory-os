@@ -1607,6 +1607,55 @@ pub(super) fn persist_store_recovery_receipt(
 }
 
 #[cfg(windows)]
+fn cleanup_store_recovery_evidence_for_receipt(
+    host_state_root: &Path,
+    mutation_digest: &str,
+) -> Result<HostStoreRecoveryReceipt, HostError> {
+    // One receipt-backed cleanup implementation for both call sites.
+    // Existence alone never authorizes deletion: the exact terminal receipt
+    // is read back and validated, and its directory entry is confirmed
+    // durable with the existing checked sync before the first supporting
+    // file is touched. The readback is cleanup authority only and never
+    // becomes live Store authority. Deletion follows the dependency graph
+    // (inner -> termination -> pending) and each boundary is committed with
+    // the existing sync_store_recovery_dir before its prerequisite is
+    // removed, so every interruption leaves a loader-accepted state with the
+    // durable receipt still authorizing resume. Unknown, corrupt, or
+    // conflicting receipts fail closed without touching evidence.
+    let receipt = read_store_recovery_receipt(host_state_root, mutation_digest)?.ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Store recovery cleanup requires the exact durable terminal receipt".to_owned(),
+        )
+    })?;
+    let dir = store_recovery_store_dir(host_state_root);
+    sync_store_recovery_dir(&dir)?;
+    #[cfg(all(test, windows))]
+    ordering::record("cleanup_for_evidence_remove_attempt");
+    for path in [
+        store_recovery_inner_binding_path(host_state_root, mutation_digest),
+        store_recovery_termination_path(host_state_root, mutation_digest),
+        store_recovery_pending_path(host_state_root, mutation_digest),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Store recovery resolution cleanup failed for {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+        sync_store_recovery_dir(&dir)?;
+        #[cfg(all(test, windows))]
+        ordering::record("cleanup_for_dir_sync_success");
+    }
+    #[cfg(all(test, windows))]
+    ordering::record("cleanup_for_evidence_remove_done");
+    Ok(receipt)
+}
+
+#[cfg(windows)]
 pub(super) fn cleanup_store_recovery_supporting_evidence_for(
     host_state_root: &Path,
     mutation_digest: &str,
@@ -1623,44 +1672,7 @@ pub(super) fn cleanup_store_recovery_supporting_evidence_for(
             "Store recovery resolution mutation is not a lowercase sha256".to_owned(),
         ));
     }
-    let receipt_path = store_recovery_receipt_path(host_state_root, mutation_digest);
-    let receipt_bytes = read_bounded_runtime_restart_file(
-        &receipt_path,
-        16 * 1024,
-        "Store recovery resolution receipt",
-    )?;
-    let receipt = serde_json::from_slice::<HostStoreRecoveryReceipt>(&receipt_bytes)
-        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-    receipt.validate().map_err(HostError::RecoveryRequired)?;
-    if receipt.external_control_mutation_digest.as_str() != mutation_digest {
-        return Err(HostError::RecoveryRequired(
-            "Store recovery resolution receipt is bound to another mutation".to_owned(),
-        ));
-    }
-    let dir = store_recovery_store_dir(host_state_root);
-    #[cfg(all(test, windows))]
-    ordering::record("cleanup_for_evidence_remove_attempt");
-    for path in [
-        store_recovery_pending_path(host_state_root, mutation_digest),
-        store_recovery_termination_path(host_state_root, mutation_digest),
-        store_recovery_inner_binding_path(host_state_root, mutation_digest),
-    ] {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(HostError::RecoveryRequired(format!(
-                    "Store recovery resolution cleanup failed for {}: {error}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    #[cfg(all(test, windows))]
-    ordering::record("cleanup_for_evidence_remove_done");
-    sync_store_recovery_dir(&dir)?;
-    #[cfg(all(test, windows))]
-    ordering::record("cleanup_for_dir_sync_success");
+    let receipt = cleanup_store_recovery_evidence_for_receipt(host_state_root, mutation_digest)?;
     // F-LOG-HOST-2 (#893): supporting evidence removed with the receipt left
     // durable; absence of this record means cleanup did not complete.
     store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_receipt(
@@ -1674,34 +1686,84 @@ pub(super) fn cleanup_store_recovery_supporting_evidence_for(
 pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
     host_state_root: &Path,
 ) -> Result<(), HostError> {
-    // F-LOG-HOST-2 (#893): completed-evidence sweep boundary; only fenced
-    // intents with a durable receipt lose their supporting evidence. The
+    // F-LOG-HOST-2 (#893): completed-evidence sweep boundary; only intents
+    // with a durable receipt lose their supporting evidence. The
     // requested mark stays frozen: a sweep names no single record identity.
     store_recovery_persist_observe("host.store-recovery cleanup-completed requested");
-    let fences = load_durable_store_recoveries(host_state_root)?;
+    // Receipt-backed resume: terminal receipts are enumerated directly
+    // instead of through the pending-bound recovery loader, so an operation
+    // stranded mid-cleanup (orphaned termination or inner binding without
+    // pending) still resumes against its durable receipt instead of being
+    // rejected as its own retained state. Each receipt reuses the single
+    // committed-boundary implementation above.
     let dir = store_recovery_store_dir(host_state_root);
-    for fence in &fences {
-        if !store_recovery_receipt_path(host_state_root, &fence.mutation_digest).exists() {
-            continue;
-        }
-        #[cfg(all(test, windows))]
-        ordering::record("cleanup_completed_for_fence");
-        for path in [
-            store_recovery_pending_path(host_state_root, &fence.mutation_digest),
-            store_recovery_termination_path(host_state_root, &fence.mutation_digest),
-            store_recovery_inner_binding_path(host_state_root, &fence.mutation_digest),
-        ] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
+    let mut receipt_digests: Vec<String> = Vec::new();
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    HostError::RecoveryRequired(format!(
+                        "store recovery store entry cannot be inspected: {error}"
+                    ))
+                })?;
+                let path = entry.path();
+                let metadata = entry.metadata().map_err(|error| {
+                    HostError::RecoveryRequired(format!(
+                        "store recovery store entry metadata cannot be read: {error}"
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    return Err(HostError::RecoveryRequired(
+                        "store recovery store contains a non-file entry".to_owned(),
+                    ));
+                }
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "store recovery store contains a non-text filename".to_owned(),
+                        )
+                    })?;
+                if let Some(digest) = file_name
+                    .strip_suffix(".receipt.json")
+                    .filter(|digest| valid_sha256_text(digest))
+                {
+                    receipt_digests.push(digest.to_owned());
+                    continue;
+                }
+                let is_supporting = file_name
+                    .strip_suffix(".pending.json")
+                    .filter(|digest| valid_sha256_text(digest))
+                    .is_some()
+                    || file_name
+                        .strip_suffix(".termination.json")
+                        .filter(|digest| valid_sha256_text(digest))
+                        .is_some()
+                    || file_name
+                        .strip_suffix(".inner.json")
+                        .filter(|digest| valid_sha256_text(digest))
+                        .is_some()
+                    || (file_name.starts_with('.') && file_name.ends_with(".tmp"));
+                if !is_supporting {
                     return Err(HostError::RecoveryRequired(format!(
-                        "completed Store recovery evidence cleanup failed for {}: {error}",
-                        path.display()
+                        "store recovery store contains an unknown or wrongly named record: {file_name}"
                     )));
                 }
             }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "store recovery store cannot be enumerated: {error}"
+            )));
+        }
+    }
+    receipt_digests.sort();
+    for digest in &receipt_digests {
+        #[cfg(all(test, windows))]
+        ordering::record("cleanup_completed_for_fence");
+        cleanup_store_recovery_evidence_for_receipt(host_state_root, digest)?;
     }
     #[cfg(all(test, windows))]
     ordering::record("cleanup_completed_remove_done");
@@ -1710,10 +1772,7 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
     ordering::record("cleanup_completed_dir_sync_success");
     // F-LOG-HOST-2 (#893): completed sweep committed; absence of this record
     // means the sweep did not complete.
-    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_fences(
-        "host.store-recovery cleanup-completed removed",
-        &fences,
-    ));
+    store_recovery_persist_observe("host.store-recovery cleanup-completed removed");
     Ok(())
 }
 
