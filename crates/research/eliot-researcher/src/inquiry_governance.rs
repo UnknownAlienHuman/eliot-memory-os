@@ -2899,7 +2899,7 @@ fn vetted_records(records: &[SourceAdmissibilityRecord]) -> BTreeMap<String, Sou
 /// Filling this seam needs a
 /// [`NoMatchEvaluationIssuer`](crate::evidence_portfolio::NoMatchEvaluationIssuer),
 /// and the issuer holds
-/// twenty commitments. Eleven of them have a live owner value on this path. Nine
+/// twenty commitments. Twelve of them have a live owner value on this path. Eight
 /// do not, and they are not derivable from anything this crate or this plane
 /// holds:
 ///
@@ -2909,14 +2909,14 @@ fn vetted_records(records: &[SourceAdmissibilityRecord]) -> BTreeMap<String, Sou
 /// | `manifest_digest`, `manifest_revision` | the manifest `audit_binding` freezes |
 /// | `fence` | `profile.state_fence` |
 /// | `work_scope` | `observation.scope` |
-/// | `scope_digest` | **absent** — see below |
+/// | `scope_digest` | `profile.admitted_denominator_digest` — available, not yet threaded; see below |
 /// | `predicate_id`, `predicate_revision`, `predicate_form` | **absent** |
 /// | `issuer_id`, `evaluator_id`, `evaluator_revision` | **absent** |
 /// | `admission_receipt_id` | **absent** |
 /// | `index_revision`, `source_revision` | **absent** |
 /// | `scope_revision` | **absent** |
 ///
-/// The nine absent values are one fact seen from nine sides: this plane carries
+/// The eight absent values are one fact seen from eight sides: this plane carries
 /// per-source *acquisition custody* and never per-member *predicate execution*.
 /// [`CandidateEvidence`] is the whole of what the R6 plane observes about a
 /// candidate — handle, class, operation identity, content digest, receipt handle,
@@ -2926,29 +2926,39 @@ fn vetted_records(records: &[SourceAdmissibilityRecord]) -> BTreeMap<String, Sou
 /// scope-snapshot revision. There is no field on [`InquiryObservation`] that
 /// carries one either, and no value anywhere in this repository that produces
 /// them: `git grep` over `crates/research` and `bins` finds `predicate_id`,
-/// `predicate_revision`, `admission_receipt_id`, `scope_revision` and
-/// `MemberNoMatchResult` only in this crate's own type declarations.
+/// `predicate_revision`, `admission_receipt_id` and `MemberNoMatchResult`
+/// only in this crate's own type declarations, and the same holds on the live
+/// route for `index_revision`, `source_revision` and `evaluator_revision`.
+/// `scope_revision` has a handful of unrelated same-named fields in other
+/// crates; none of them is a producer for this commitment.
 ///
-/// The scope-snapshot commitment deserves its own note, because it is the one
-/// that looks closest to being reachable. The live route supplies
+/// The scope-snapshot commitment is the one that is closest to reachable, and it
+/// is worth being exact about why it is not yet threaded. `scope_digest` is the
+/// "digest of the frozen scope/denominator snapshot" (see
+/// [`NoMatchEvaluation`](crate::evidence_portfolio::NoMatchEvaluation)), and
+/// `check_scope_binding` requires the presented digest to equal the issuer's
+/// held `scope_digest` exactly. The live route currently supplies
 /// `frozen_scope_digest: &observation.reference_manifest.digest` (see the
-/// construction site in [`InquiryGovernance::record`]), and
-/// `NoMatchEvaluationIssuer::check_scope_binding` requires the presented digest
-/// to equal the issuer's held `scope_digest` exactly. Those are two different
-/// commitments under two different owners: the reference manifest digest
-/// commits a *run-bound reference allowlist*, while `scope_digest` commits the
-/// *frozen scope/denominator snapshot* the evaluation was bounded to. Binding
-/// the issuer to the allowlist digest would make `check_scope_binding` compare
-/// the issuer against a value from a different owner and a different concept,
-/// and the check would then attest nothing. The issuer is therefore expected to
-/// carry the snapshot digest it owns, and no such digest is issued to it: the
-/// closest candidate, `profile.admitted_denominator_digest`, is the denominator
-/// commitment and is already held and checked separately as
-/// `denominator_digest`, which is why reusing it here would be inventing a
-/// digest rather than threading one.
+/// construction site in [`InquiryGovernance::record`]), and *that* value is
+/// wrong for the slot: it is the digest of a run-bound reference allowlist, a
+/// different commitment from a different owner.
 ///
-/// Constructing the issuer in this crate would therefore mean writing the nine
-/// values above as literals and asserting, through `issue_for`, that a predicate
+/// The correct value is not missing. It is `profile.admitted_denominator_digest`
+/// — the Kernel-admitted denominator digest, already read on this very path and
+/// already compared against `frozen_scope_digest` by the receipt's own
+/// `scope_snapshot_matches_admission` check. This crate therefore already
+/// states, in code, that the frozen scope digest is *expected* to equal the
+/// admitted denominator digest; the reference-allowlist digest currently passed
+/// at that site does not, and the receipt's comparison is what exposes it.
+/// Threading `admitted_denominator_digest` into the issuer's `scope_digest` is
+/// therefore a one-value change, not a new digest and not a new owner. It is
+/// deferred with the other eight commitments above rather than half-applied:
+/// correcting the scope value alone would still leave the seam fail-closed on
+/// the eight genuinely absent query/evaluator commitments, and changing a
+/// receipt input the issuer cannot yet join is not this increment's work.
+///
+/// Constructing the issuer in this crate would therefore mean writing the eight
+/// absent values above as literals and asserting, through `issue_for`, that a predicate
 /// ran against members this process never searched. That is the exact fabrication
 /// the issue forbids and the exact residual trust boundary documented on
 /// [`NoMatchEvaluation`]: an issuer holder that invents evaluator attestations
@@ -5695,19 +5705,22 @@ impl InquiryGovernance {
         // will fill it is BLOCKED-BY #1762/#1767.
         //
         // #2893 item 12 is the seam this is, and the exact owner values it still
-        // needs are enumerated field by field on `AbsenceEvidence` above. Nine of
+        // needs are enumerated field by field on `AbsenceEvidence` above. Eight of
         // the twenty commitments a `NoMatchEvaluationIssuer` holds have no
         // producer on this path at all — predicate identity and bytes, issuer,
-        // evaluator and admission-receipt identity, index and source revisions,
-        // and the frozen scope-snapshot digest — so an issuer constructed here
-        // would be nine fabricated attestations that `issue_for` then joins and
-        // reports as owner-issued. The scope digest is the sharpest case: the
-        // value presented below is the run-bound *reference allowlist* digest, not
-        // a scope-snapshot digest, and binding the issuer to it would satisfy
-        // `check_scope_binding` with a commitment from a different owner while
-        // attesting nothing. The seam therefore stays `None` until the live
-        // evaluator composition holds a real issuer; the closure gate above it
-        // already refuses to publish anything without this record.
+        // evaluator and admission-receipt identity, index, source and scope
+        // revisions — so an issuer constructed here would be eight fabricated
+        // attestations that `issue_for` then joins and reports as owner-issued.
+        // The ninth, the frozen scope digest, is a separate and smaller matter:
+        // the value presented below is the run-bound *reference allowlist* digest
+        // rather than a scope-snapshot digest, while
+        // `profile.admitted_denominator_digest` is the value this crate's own
+        // `scope_snapshot_matches_admission` check expects here. Threading it is
+        // a one-value change and is deferred with the other eight rather than
+        // half-applied, because on its own it would not make the seam fillable.
+        // The seam therefore stays `None` until the live evaluator composition
+        // holds a real issuer; the closure gate above it already refuses to
+        // publish anything without this record.
         let absence_evidence: Option<AbsenceEvidence> = None;
         let coverage_receipt = CoverageReceipt::compute(CoverageReceiptParams {
             profile: &profile,
