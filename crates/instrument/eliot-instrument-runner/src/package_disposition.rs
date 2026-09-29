@@ -17,6 +17,28 @@
 //! expiry is compared against [`DISPOSITION_REVIEWED_ON`], so a fixture that
 //! has passed its recorded review date fails closed.
 //!
+//! # Two closed vocabularies, recorded separately
+//!
+//! A row records *two* different names, and conflating them was the defect this
+//! module's companion
+//! [`testd_profile_dispatch`](crate::testd_profile_dispatch) module exists to
+//! prevent:
+//!
+//! - `testd_profile` is the **instrument contract identity** the package owns,
+//!   from [`TESTD_PROFILE_UNIVERSE`]. It is what the provider registry keys on.
+//! - `testd_dispatch_profile` is the **Testd worker profile** the Testd binary
+//!   actually launches, from [`TESTD_DISPATCH_UNIVERSE`] (read from
+//!   `eliot-testd-core`, the admission owner). It is empty for every package
+//!   Testd does not dispatch.
+//!
+//! Only `eliot-instrument-nextest` is dispatched by the Testd worker today, so
+//! only it carries a non-empty `testd_dispatch_profile`. Recording the other
+//! live packages honestly as *not* Testd-dispatched is the point: a contract
+//! identity is not a dispatch profile, and a ledger that restated one as the
+//! other could never fail. The recorded dispatch profiles are then resolved
+//! against `eliot-testd-core` by
+//! [`verify_testd_dispatch`](crate::testd_profile_dispatch::verify_testd_dispatch).
+//!
 //! [`ProviderRegistry::ready`](crate::registry::ProviderRegistry::ready) runs
 //! [`verify_disposition_coverage`], so no provider registry can be assembled
 //! while a family member is unrecorded, a recorded live profile is missing
@@ -53,6 +75,21 @@ pub const INSTRUMENT_PACKAGE_FAMILY: [&str; 17] = [
     "eliot-reports",
     "eliot-test-selection",
     "eliot-verifier",
+];
+
+/// The closed set of Testd *dispatch* profile identities a live package may
+/// bind, read from the `eliot-testd-core` admission owner (issue #20).
+///
+/// This is deliberately distinct from [`TESTD_PROFILE_UNIVERSE`], which is the
+/// closed set of *instrument contract* identities. A live row records both: the
+/// contract it owns and the dispatch profile Testd launches it under, and
+/// [`verify_testd_dispatch`](crate::testd_profile_dispatch::verify_testd_dispatch)
+/// requires the second to resolve to the first.
+pub const TESTD_DISPATCH_UNIVERSE: [&str; 4] = [
+    eliot_testd_core::TESTD_ADMITTED_PROFILE,
+    eliot_testd_core::TESTD_LIST_PROFILE,
+    eliot_testd_core::TESTD_PRODUCTIVE_PROFILE,
+    eliot_testd_core::TESTD_SCOPED_PROFILE,
 ];
 
 /// The closed set of Testd profile identities a retained package may bind.
@@ -159,6 +196,8 @@ pub enum DispositionField {
     Contract,
     /// The Testd profile identity the package binds.
     TestdProfile,
+    /// The Testd dispatch profile the worker launches the package under.
+    TestdDispatchProfile,
     /// The workspace crate holding the live consumer.
     LiveConsumer,
     /// The `FunctionalCapabilityCell` owner.
@@ -180,6 +219,7 @@ impl fmt::Display for DispositionField {
         f.write_str(match self {
             Self::Contract => "contract",
             Self::TestdProfile => "testd profile",
+            Self::TestdDispatchProfile => "testd dispatch profile",
             Self::LiveConsumer => "live consumer",
             Self::CapabilityOwner => "capability owner",
             Self::StateOwner => "state owner",
@@ -202,6 +242,17 @@ pub struct PackageDispositionRecord {
     pub execution_contour: ExecutionContour,
     /// The Testd profile identity; empty for a non-dispatchable package.
     pub testd_profile: &'static str,
+    /// The Testd *dispatch* profile the Testd worker launches this package
+    /// under, read from the `eliot-testd-core` admission owner.
+    ///
+    /// Empty when the Testd worker does not dispatch this package. A registry
+    /// executable entry is not a Testd dispatch: `eliot-testd-core` admits only
+    /// the closed profile set in [`TESTD_DISPATCH_UNIVERSE`], so an entry the
+    /// registry resolves for the governed build lane may still name no Testd
+    /// dispatch at all. Recording that honestly, rather than restating the
+    /// contract identity, is what makes the "one live Testd profile per
+    /// package" claim falsifiable.
+    pub testd_dispatch_profile: &'static str,
     /// The workspace crate holding the live consumer; empty when none exists.
     pub live_consumer: &'static str,
     /// The `FunctionalCapabilityCell` owner.
@@ -233,6 +284,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveLibrarySurface,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "eliot.instrument.build-test-graph",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-testd-core",
         capability_owner: "eliot-instrument-runner::cache_lane",
         state_owner: "eliot-build-test-graph::DerivedCacheStore",
@@ -247,6 +299,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveLibrarySurface,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "eliot.instrument.diagnostic",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-governor",
         capability_owner: "eliot-governor::composition",
         state_owner: "stateless",
@@ -261,6 +314,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveTestdProfile,
         execution_contour: ExecutionContour::GovernedProcessExecutor,
         testd_profile: "eliot.instrument.cargo",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-instrument-runner",
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
@@ -275,6 +329,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveTestdProfile,
         execution_contour: ExecutionContour::GovernedProcessExecutor,
         testd_profile: "eliot.instrument.dotnet.msbuild",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-instrument-runner",
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
@@ -290,6 +345,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         execution_contour: ExecutionContour::GovernedProcessExecutor,
         testd_profile: "eliot.instrument.nextest",
         live_consumer: "eliot-instrument-runner",
+        testd_dispatch_profile: "cargo-nextest",
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
         contract: "eliot.instrument.nextest",
@@ -303,6 +359,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveTestdProfile,
         execution_contour: ExecutionContour::GovernedProcessExecutor,
         testd_profile: "eliot.instrument.rustc",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-instrument-runner",
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
@@ -317,6 +374,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveTestdProfile,
         execution_contour: ExecutionContour::GovernedProcessExecutor,
         testd_profile: "eliot.instrument.rustfmt",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-instrument-runner",
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
@@ -331,6 +389,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveTestdProfile,
         execution_contour: ExecutionContour::DecoderOnly,
         testd_profile: "eliot.instrument.scip",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-instrument-runner",
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
@@ -345,6 +404,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveLibrarySurface,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "eliot.instrument.observability",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-engine",
         capability_owner: "eliot-engine::cached_derivation",
         state_owner: "stateless",
@@ -359,6 +419,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveLibrarySurface,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "eliot.instrument.product-evaluation",
+        testd_dispatch_profile: "",
         live_consumer: "eliotd",
         capability_owner: "eliotd::maintenance",
         state_owner: "stateless",
@@ -373,6 +434,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveLibrarySurface,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "eliot.instrument.test-selection",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-instrument-runner",
         capability_owner: "eliot-instrument-runner::dev_fast",
         state_owner: "eliot-testd-core::claim",
@@ -387,6 +449,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::LiveLibrarySurface,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "eliot.instrument.verifier",
+        testd_dispatch_profile: "",
         live_consumer: "eliot-instrument-runner",
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
@@ -401,6 +464,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::BoundedFixture,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "",
+        testd_dispatch_profile: "",
         live_consumer: "",
         capability_owner: "eliot-instrument-runner::cache_lane",
         state_owner: "stateless",
@@ -415,6 +479,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::BoundedFixture,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "",
+        testd_dispatch_profile: "",
         live_consumer: "",
         capability_owner: "eliot-instrument-runner::dev_fast",
         state_owner: "stateless",
@@ -429,6 +494,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::BoundedFixture,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "",
+        testd_dispatch_profile: "",
         live_consumer: "",
         capability_owner: "eliot-instrument-runner::dev_fast",
         state_owner: "stateless",
@@ -443,6 +509,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::BoundedFixture,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "",
+        testd_dispatch_profile: "",
         live_consumer: "",
         capability_owner: "eliot-instrument-runner::dev_fast",
         state_owner: "stateless",
@@ -457,6 +524,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         route: PackageRoute::BoundedFixture,
         execution_contour: ExecutionContour::NoExecution,
         testd_profile: "",
+        testd_dispatch_profile: "",
         live_consumer: "",
         capability_owner: "eliot-instrument-runner::cache_lane",
         state_owner: "stateless",
@@ -676,6 +744,7 @@ fn verify_live_record(record: PackageDispositionRecord) -> Result<(), Dispositio
         record.package,
         DispositionField::TestdProfile,
     )?;
+    verify_dispatch_profile(record)?;
     require_member(
         record.live_consumer,
         &CONSUMER_CRATE_UNIVERSE,
@@ -712,6 +781,25 @@ fn verify_live_record(record: PackageDispositionRecord) -> Result<(), Dispositio
     )
 }
 
+/// Requires a recorded dispatch profile to be one the Testd worker admits.
+///
+/// A blank dispatch profile is allowed: a live registry entry is not
+/// automatically a Testd dispatch, and forcing one would be the same defect as
+/// restating a contract identity as a profile. A non-blank value must be a
+/// member of the closed dispatch universe, so a package cannot claim to be
+/// launched under a profile Testd refuses at its own admission gate.
+fn verify_dispatch_profile(record: PackageDispositionRecord) -> Result<(), DispositionError> {
+    if record.testd_dispatch_profile.trim().is_empty() {
+        return Ok(());
+    }
+    require_member(
+        record.testd_dispatch_profile,
+        &TESTD_DISPATCH_UNIVERSE,
+        record.package,
+        DispositionField::TestdDispatchProfile,
+    )
+}
+
 /// Fields a bounded fixture must satisfy, including the expiry comparison.
 fn verify_bounded_fixture(record: PackageDispositionRecord) -> Result<(), DispositionError> {
     if !record.live_consumer.trim().is_empty() {
@@ -724,6 +812,12 @@ fn verify_bounded_fixture(record: PackageDispositionRecord) -> Result<(), Dispos
         return Err(DispositionError::NonDispatchableProfile {
             package: record.package,
             profile: record.testd_profile,
+        });
+    }
+    if TESTD_DISPATCH_UNIVERSE.contains(&record.testd_dispatch_profile) {
+        return Err(DispositionError::NonDispatchableProfile {
+            package: record.package,
+            profile: record.testd_dispatch_profile,
         });
     }
     require_member(
@@ -772,6 +866,12 @@ fn verify_deleted(record: PackageDispositionRecord) -> Result<(), DispositionErr
         return Err(DispositionError::NonDispatchableProfile {
             package: record.package,
             profile: record.testd_profile,
+        });
+    }
+    if TESTD_DISPATCH_UNIVERSE.contains(&record.testd_dispatch_profile) {
+        return Err(DispositionError::NonDispatchableProfile {
+            package: record.package,
+            profile: record.testd_dispatch_profile,
         });
     }
     require_text(

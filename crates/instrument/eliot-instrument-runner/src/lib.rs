@@ -29,6 +29,7 @@ pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
 pub mod testd_port;
+pub mod testd_profile_dispatch;
 pub mod verification_profile;
 
 pub use build_projection::{
@@ -63,7 +64,7 @@ pub use package_disposition::{
     CAPABILITY_OWNER_UNIVERSE, CONSUMER_CRATE_UNIVERSE, DISPOSITION_REVIEWED_ON, DispositionError,
     DispositionField, ExecutionContour, INSTRUMENT_PACKAGE_FAMILY, PACKAGE_DISPOSITIONS,
     PROOF_CEILING_UNIVERSE, PackageDispositionRecord, PackageRoute, STATE_OWNER_UNIVERSE,
-    TESTD_PROFILE_UNIVERSE, verify_disposition_coverage,
+    TESTD_DISPATCH_UNIVERSE, TESTD_PROFILE_UNIVERSE, verify_disposition_coverage,
 };
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
@@ -98,6 +99,10 @@ pub use registry::{
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
+};
+pub use testd_profile_dispatch::{
+    TESTD_DISPATCH_BINDINGS, TestdDispatchBinding, TestdDispatchError, dispatched_testd_profiles,
+    instrument_contract_for_testd_profile, verify_testd_dispatch,
 };
 pub use verification_profile::{
     AggregateOutcome, DeclaredEnvironmentDependency, ExternalToolProvenance, PROFILE_PROOF_CEILING,

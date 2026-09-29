@@ -718,6 +718,9 @@ pub fn disposition_for_parts(
         crate::registry::RegistryError::Disposition(inner) => ProviderDisposition::Unavailable {
             rule: format!("registry disposition: {inner}"),
         },
+        crate::registry::RegistryError::TestdDispatch(inner) => ProviderDisposition::Unavailable {
+            rule: format!("testd dispatch: {inner}"),
+        },
         crate::registry::RegistryError::IdentitySlotBlank { instrument, .. }
         | crate::registry::RegistryError::IdentitySlotDrift { instrument, .. } => {
             ProviderDisposition::Unavailable {
