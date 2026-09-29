@@ -4297,7 +4297,7 @@ enum ImprovementIntakeFlight {
 /// Evaluates one real maintenance observation and assembles the
 /// owner-actionable improvement artifact over it, under the composition guard.
 ///
-/// Three reads and one pure assembly, all under the lock:
+/// Four reads and one pure assembly, all under the lock:
 ///
 /// - the maintenance trigger decision, from the live observation;
 /// - the admitted Kernel fence for this pass, which is also the fence the
@@ -4306,7 +4306,16 @@ enum ImprovementIntakeFlight {
 ///   the live `GovernorOwners::maintenance` owner — this is where the
 ///   per-surface bound numbers and the owning authority come from
 ///   (`eliotd::improvement_intake_dispatch::maintenance_bound`), so the
-///   daemon spells none of them.
+///   daemon spells none of them;
+/// - the Governor learning-closure image, read through
+///   `DaemonComposition::learning_closure().store()` so the brief's safe
+///   boundary is the newest boundary an owner actually closed
+///   (`SafeBoundary::from_observed_closure`). This is a read of already
+///   committed in-process state — the store's own mutex, no transport — and it
+///   is done HERE, inside the composition guard, because it must not race the
+///   guard release that precedes the authenticated dedup read below. An empty
+///   image is a typed refusal, so the pass commits nothing until a
+///   consequential closure has been observed.
 ///
 /// The admission is deliberately NOT performed here. It needs the restored
 /// deduplication registry first, and that registry is read over the
@@ -4335,9 +4344,17 @@ fn improvement_intake_artifact(
     let fence = composition
         .notification_state_admission_fence()
         .map_err(|error| error.to_string())?;
-    let artifact =
-        eliotd::improvement_intake_dispatch::assemble_improvement_artifact(&decision, &fence)
-            .map_err(|error| error.to_string())?;
+    // The brief's safe boundary is observed here, under the composition guard
+    // the caller already holds: `learning_closure()` is the daemon's single
+    // Governor-owned closure image, and `store()` hands back the canonical
+    // learning-delta store whose newest committed record IS an
+    // owner-observed consequential boundary.
+    let artifact = eliotd::improvement_intake_dispatch::assemble_improvement_artifact(
+        &decision,
+        &fence,
+        composition.learning_closure().store(),
+    )
+    .map_err(|error| error.to_string())?;
     // The G-19 decision record, read through the EXISTING maintenance owner.
     // The operation and idempotency key bind this exact observation, so the
     // policy a candidate is admitted under names the observation it belongs to.

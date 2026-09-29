@@ -167,7 +167,8 @@ use eliot_governor::{
     issue_learning_admission, verify_learning_admission,
 };
 use eliot_improvement::candidate_bounds::{
-    AdmitReport, ArchivedCandidate, BoundedBacklog, CandidateBoundPolicy, CrossTaskCarryover,
+    AdmitOutcome, AdmitReport, ArchivedCandidate, BoundedBacklog, CandidateBoundPolicy,
+    CrossTaskCarryover, TrackedCandidate,
 };
 use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
@@ -345,37 +346,33 @@ pub struct ImprovementArtifact {
 /// This performs no durability, no promotion and no activation: it returns the
 /// artifact, and the caller commits it through
 /// [`crate::DaemonComposition::commit_learning_record`].
+///
+/// `observed_closures` is the single Governor-owned learning-closure image
+/// ([`eliot_governor::CanonicalLearningDeltaStore`]) this daemon already holds,
+/// reached as `DaemonComposition::learning_closure().store()`. It is read here,
+/// under whatever guard the caller holds, so the brief's safe boundary is an
+/// owner-observed consequential boundary rather than a formatted literal (see
+/// the `SafeBoundary::from_observed_closure` call below).
 pub fn assemble_improvement_artifact(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     state_fence: &StateFence,
+    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
 ) -> Result<ImprovementArtifact, ImprovementDispatchError> {
     // Evidence lineage: the decision's own stable identity, never a fresh
     // per-observation value, so a repeat deduplicates.
-    let evidence_refs = vec![
-        format!("maintenance-trigger:{}", decision.trigger_id),
-        format!("maintenance-scope:{}", decision.scope_ref),
-    ];
+    let evidence_refs = maintenance_evidence_refs(decision);
     let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
     // `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
     // spelling); `AutomationDecision` and `DecisionReason` are `Debug`-only
     // closed owner enums and gain no `Display` here, so they are named by
     // their derived variant spelling instead.
-    let trigger = format!(
-        "maintenance automation {} evaluated {:?} for reason {:?}",
-        decision.family, decision.decision, decision.reason
-    );
+    let trigger = maintenance_trigger_text(decision);
     // The replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
     // holdout and transfer legs are the decision's own canonical refs, and the
     // counter metrics name what must not regress. Promotion is separately
     // refused by the intake's budget gate, which this advisory path does not
     // attempt to satisfy.
-    let replay_plan = ReplayPlan {
-        fixed_replay_refs: evidence_refs.clone(),
-        holdout_refs: vec![format!("maintenance-holdout:{}", decision.trigger_id)],
-        transfer_refs: vec![format!("maintenance-transfer:{}", decision.scope_ref)],
-        counter_metric_names: vec!["blocked_maintenance_runs".to_owned()],
-        verifier_refs: vec![format!("maintenance-evaluator:{}", decision.family)],
-    };
+    let replay_plan = maintenance_replay_plan(decision, &evidence_refs);
     let admitted_scope = admitted_fence_ref(state_fence)?;
     // The evidence bundle is selected by the DERIVED source, not asserted
     // (issue #1867 W2). Every source but one is the maintenance occurrence
@@ -446,27 +443,106 @@ pub fn assemble_improvement_artifact(
     // including the two classes this path cannot represent at all.
     enforce_advisory_class_gate(&candidate)?;
 
-    // The safe boundary is the daemon's own admitted generation plus the
-    // daemon's decision owner, both real values this daemon holds.
-    let boundary = SafeBoundary {
-        active_main_agent_or_human_ref: format!("owner:{IMPROVEMENT_OWNER}"),
-        boundary_ref: format!("boundary:{}", decision.scope_ref),
+    // The safe boundary is READ, not spelled. It used to be two formatted
+    // strings (`owner:{IMPROVEMENT_OWNER}` and `boundary:{scope_ref}`), which
+    // satisfied `SafeBoundary::validate` while observing nothing at all: the
+    // owner was a constant and the boundary was the scope this very pass is
+    // about to write, so the check proved nothing about the operation it claims
+    // to gate. `SafeBoundary` now has private fields and one constructor,
+    // `SafeBoundary::from_observed_closure`, which takes both values from a
+    // record the Governor's learning-closure owner actually committed from
+    // owner-recorded lifecycle activities
+    // (`crates/governor/eliot-governor/src/learning_closure.rs:483`). That
+    // boundary is derived by `derive_boundaries`, which refuses an ordinary
+    // read and an empty activity set before anything is committed, per
+    // I12.24:181.
+    //
+    // STATED PLAINLY, because it changes what this pass does: `store` is read
+    // from already-committed in-process state and performs no exchange, but an
+    // EMPTY closure image is `ImprovementError::UnsafeBoundary`, so this pass
+    // now commits nothing until a consequential attempt has actually been
+    // closed in this process. That is the fail-closed direction I12.24:64
+    // requires — a brief must not reach an owner as though a boundary had been
+    // observed when none was — and the refusal is reported as a typed
+    // `ImprovementDispatchError::Improvement` by the caller, not swallowed.
+    let boundary = SafeBoundary::from_observed_closure(observed_closures)?;
+
+    // The brief's decision information is a PROJECTION OF THAT SAME OBSERVED
+    // RECORD, not the raw maintenance trigger text. I12.24:74 requires the
+    // named decision owner to read the problem, evidence, likely benefit, risk,
+    // cost, next reversible step and unknowns without searching raw metrics;
+    // repeating the trigger text satisfied the letter of that and none of its
+    // purpose, because it said nothing about what the closure actually
+    // recorded.
+    //
+    // `load` is the same mutex-guarded read `from_observed_closure` just
+    // performed on the same image, under the composition guard the caller
+    // already holds (`daemon_runtime::improvement_intake_artifact`), and this
+    // guarded phase commits nothing, so the newest record here is the record
+    // whose `actor_id` and `consequential_boundary` the boundary above names.
+    // It is read a second time because the two-string `SafeBoundary` cannot
+    // carry the record itself: `eliot-improvement` has no `eliot-learning-delta`
+    // edge, so widening `SafeBoundary` to hold one would be a new dependency
+    // for a value the brief only needs to quote. The record TYPE is not named
+    // here either — `eliotd` has no `eliot-learning-delta` dependency — so it is
+    // read by inference and through the record's own accessors. An unreadable
+    // or empty image is the same typed `UnsafeBoundary` refusal the boundary
+    // constructor returns for the same condition, never a substituted value.
+    let observed = newest_observed_closure(observed_closures)?;
+    // The durable lineage handle and canonical digest the record itself
+    // committed, so the owner can read exactly this closure without searching.
+    let (observed_artifact, observed_digest) = (
+        observed.lineage_artifact.clone(),
+        observed.lineage_digest.clone(),
+    );
+    // What the observed closure actually concluded about behaviour, read
+    // through the record's own predicates rather than re-spelled here.
+    let observed_effect = if observed.carries_behavioural_proposal {
+        "and proposes a next-behaviour change for the next attempt"
+    } else {
+        "and closed with no next-behaviour change proposed"
     };
+    // The two values below are the boundary's OWN observed strings, so the
+    // boundary this brief describes and the boundary it is gated on are
+    // literally the same value.
+    let principal = boundary.observed_principal_ref();
+    let boundary_ref = boundary.observed_boundary_ref();
+    let unknowns = observed_unknowns(&observed, decision.family);
+
+    // Why the brief names the OBSERVED principal, and which brief fields the
+    // closure record cannot supply, is stated in the module documentation
+    // above under "One principal, two roles".
     let brief = brief_at_safe_boundary(
         &candidate,
-        &trigger,
         &format!(
-            "the blocked family {} is evaluated on every cadence and cannot start",
+            "{trigger}; the learning closure this brief is gated on committed durable delta \
+             {observed_artifact} (digest {observed_digest}) for attempt {} of campaign {} on \
+             route {}, at consequential boundary {boundary_ref} by principal {principal}, over {} \
+             observed evidence ref(s)",
+            observed.attempt_id,
+            observed.campaign_id,
+            observed.route_id,
+            observed.evidence_ref_count,
+        ),
+        &format!(
+            "the blocked family {} is evaluated on every cadence and cannot start, and the \
+             closure this brief is gated on {observed_effect}; giving that family a start route \
+             removes a blocked evaluation per cadence",
             decision.family
         ),
-        "advisory only; no authority, privacy, finish or durability effect is taken",
-        IMPROVEMENT_OWNER,
-        "one owner triage pass over the stored brief",
-        &format!("triage maintenance trigger {}", decision.trigger_id),
-        vec![format!(
-            "unknown whether maintenance family {} has a start route",
-            decision.family
-        )],
+        &format!(
+            "advisory only; no authority, privacy, finish or durability effect is taken, and the \
+             observed boundary {boundary_ref} is not modified by it"
+        ),
+        principal,
+        "one owner triage pass over the stored brief; the observed closure record carries no \
+         cost, compute or Human-attention field, so the cost of the decision itself is the only \
+         cost this brief can state",
+        &format!(
+            "triage maintenance trigger {} against the observed boundary {boundary_ref}",
+            decision.trigger_id
+        ),
+        unknowns,
         &boundary,
     )?;
 
@@ -474,6 +550,15 @@ pub fn assemble_improvement_artifact(
     // artifact is real and actionable, and recording it changes nothing. This
     // is the production caller of the bridge's
     // `record_brief_decision`, which previously had none.
+    //
+    // The `owner` here is the maintenance (`G-19`) admission authority and is
+    // deliberately NOT the brief's `proposed_owner`: this field names the
+    // principal that RECORDED this disposition, which the maintenance owner is
+    // (it issued the permit this candidate was assembled under), whereas the
+    // brief's `proposed_owner` names the principal proposed to decide. Naming
+    // the same constant in both would be the incoherence this region exists to
+    // remove; naming them differently, with the difference stated here, is what
+    // makes each field mean one thing.
     let decision_record = crate::improvement_intake::record_brief_decision(
         &brief,
         IMPROVEMENT_OWNER,
@@ -492,6 +577,132 @@ pub fn assemble_improvement_artifact(
         brief,
         decision: decision_record,
     })
+}
+
+/// The evidence lineage this observation raises, over the decision's own
+/// stable identity.
+///
+/// Never a fresh per-observation value: the refs are the decision's own
+/// `trigger_id` and `scope_ref`, so two evaluations of the same occurrence
+/// under the same admitted fence carry the same lineage and deduplicate.
+fn maintenance_evidence_refs(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> Vec<String> {
+    vec![
+        format!("maintenance-trigger:{}", decision.trigger_id),
+        format!("maintenance-scope:{}", decision.scope_ref),
+    ]
+}
+
+/// The trigger statement the decision's own closed fields make.
+///
+/// `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
+/// spelling); `AutomationDecision` and `DecisionReason` are `Debug`-only
+/// closed owner enums and gain no `Display` here, so they are named by their
+/// derived variant spelling instead.
+fn maintenance_trigger_text(decision: &eliot_maintenance::AutomationTriggerDecision) -> String {
+    format!(
+        "maintenance automation {} evaluated {:?} for reason {:?}",
+        decision.family, decision.decision, decision.reason
+    )
+}
+
+/// The diagnostic-only replay plan for this observation (I12.24:76-77).
+///
+/// The fixed replay, holdout and transfer legs are the decision's own canonical
+/// refs, and the counter metric names what must not regress. Promotion is
+/// separately refused by the budget gate, which this advisory path does not
+/// attempt to satisfy.
+fn maintenance_replay_plan(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    evidence_refs: &[String],
+) -> ReplayPlan {
+    ReplayPlan {
+        fixed_replay_refs: evidence_refs.to_vec(),
+        holdout_refs: vec![format!("maintenance-holdout:{}", decision.trigger_id)],
+        transfer_refs: vec![format!("maintenance-transfer:{}", decision.scope_ref)],
+        counter_metric_names: vec!["blocked_maintenance_runs".to_owned()],
+        verifier_refs: vec![format!("maintenance-evaluator:{}", decision.family)],
+    }
+}
+
+/// The material one observed closure contributes to the brief.
+///
+/// Owned, not borrowed: the record TYPE cannot be named here — neither `eliotd`
+/// nor `eliot-improvement` has an `eliot-learning-delta` edge, and adding one for
+/// a value the brief only quotes would be a new dependency. The closure's
+/// accessors are read through inference and their results carried by value, so
+/// nothing in this module depends on the record's concrete type.
+struct ObservedClosure {
+    /// Durable lineage handle and canonical digest the record committed.
+    lineage_artifact: String,
+    lineage_digest: String,
+    /// The closed attempt this observation belongs to.
+    attempt_id: String,
+    /// The campaign that attempt belonged to.
+    campaign_id: String,
+    /// The route the closed attempt ran.
+    route_id: String,
+    /// How many evidence refs the record itself observed.
+    evidence_ref_count: usize,
+    /// The record's own predicate on whether it proposed a behaviour change.
+    carries_behavioural_proposal: bool,
+    /// Whether the record names a prior-attempt lineage to retry against.
+    has_retry_lineage: bool,
+}
+
+/// Reads the newest committed closure record, refusing when there is none.
+///
+/// The same mutex-guarded read [`SafeBoundary::from_observed_closure`] performs
+/// on the same image, under the composition guard the caller already holds, so
+/// both see the same newest record. An unreadable or empty image is the same
+/// typed [`ImprovementError::UnsafeBoundary`] refusal, never a substituted
+/// value.
+fn newest_observed_closure(
+    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
+) -> Result<ObservedClosure, ImprovementError> {
+    let (observed_records, _observed_version) = observed_closures
+        .load()
+        .map_err(|_| ImprovementError::UnsafeBoundary)?;
+    let observed = observed_records
+        .last()
+        .ok_or(ImprovementError::UnsafeBoundary)?;
+    let (lineage_artifact, lineage_digest) = observed.lineage_ref();
+    Ok(ObservedClosure {
+        lineage_artifact: lineage_artifact.to_string(),
+        lineage_digest: lineage_digest.to_owned(),
+        attempt_id: observed.attempt_id.as_str().to_owned(),
+        campaign_id: observed.campaign_id.as_str().to_owned(),
+        route_id: observed.route_id.clone(),
+        evidence_ref_count: observed.evidence_refs.len(),
+        carries_behavioural_proposal: observed.carries_behavioural_proposal(),
+        has_retry_lineage: observed.lineage_for_retry().is_some(),
+    })
+}
+
+/// The unknowns the observed closure could not resolve, plus the one it cannot
+/// speak to at all.
+///
+/// Unknowns are the states the record could NOT resolve. The maintenance
+/// start-route question is kept because it is real and no closure record answers
+/// it. `require_refs` in [`eliot_improvement::ImprovementBrief::validate`]
+/// still hard-requires a non-empty list.
+fn observed_unknowns(
+    observed: &ObservedClosure,
+    family: eliot_maintenance::MaintenanceFamily,
+) -> Vec<String> {
+    let mut unknowns = vec![format!(
+        "unknown whether maintenance family {} has a start route",
+        family
+    )];
+    if !observed.has_retry_lineage {
+        unknowns.push(format!(
+            "the observed closure of campaign {} records no prior-attempt lineage, so it \
+             establishes no repeated-strategy comparison",
+            observed.campaign_id
+        ));
+    }
+    unknowns
 }
 
 /// Enforces the I12.24 application-class boundary over a real candidate
@@ -874,6 +1085,27 @@ pub struct GovernedImprovementAdmission {
     /// durable record, so the persisted artifact names the admission it was
     /// admitted under rather than only that some admission happened.
     pub admission_digest: String,
+    /// The surviving backlog entry exactly as
+    /// [`BoundedBacklog::admit_reporting_pressure`] left it, when this
+    /// admission deduplicated by evidence lineage; `None` when the candidate
+    /// was admitted as a new active entry.
+    ///
+    /// This is the merge RESULT, not the merge event. `report.outcome` already
+    /// states that a merge happened and names both candidates; this carries
+    /// what the merge produced — the unioned evidence and source lineage, the
+    /// `merged_from` absorbed-id list, the retained assessed value and owner,
+    /// the retained admission authority, and the advanced candidate revision.
+    /// Without it the commit path holds only the INCOMING candidate and the
+    /// accumulated lineage a merge built is lost when the pass ends
+    /// (I12.24:297: "Duplicates merge by evidence lineage").
+    ///
+    /// It is captured HERE, inside the only place that still holds the
+    /// backlog: `BoundedBacklog` owns its entries privately and the commit
+    /// function receives no backlog, so this is the one seam from which the
+    /// post-merge entry is reachable. `None` is never reachable for a
+    /// [`AdmitOutcome::Merged`] outcome — a merge whose surviving entry could
+    /// not be read back is refused, not reported as an admission without one.
+    pub merged_survivor: Option<TrackedCandidate>,
 }
 
 /// Admit one assembled improvement artifact into the bounded backlog through
@@ -904,6 +1136,11 @@ pub struct GovernedImprovementAdmission {
 ///    constant), and then enforces the bound, merging by evidence lineage or
 ///    relieving a full bound through the explicit summarized archive
 ///    transition (W3).
+/// 5. [`merged_survivor_entry`] reads the surviving entry back out of the
+///    backlog on the merge branch. This is the only seam that still holds the
+///    backlog, so the post-merge state is carried out on
+///    [`GovernedImprovementAdmission::merged_survivor`] rather than recomputed
+///    later from a value the commit path does not hold.
 ///
 /// The `ArchivedCandidate` receipts travel back in the returned
 /// [`AdmitReport`] for the caller to make durable; nothing is dropped here.
@@ -927,11 +1164,53 @@ pub fn admit_improvement_artifact(
             &verified,
         )
         .map_err(|error| ImprovementDispatchError::Backlog(error.to_string()))?;
+    let merged_survivor = merged_survivor_entry(&report, backlog)?;
     Ok(GovernedImprovementAdmission {
         report,
         bound,
         admission_digest: permit.digest().to_owned(),
+        merged_survivor,
     })
+}
+
+/// Reads the SURVIVING backlog entry out of the registry on the merge branch
+/// (W3, I12.24:297).
+///
+/// [`AdmitOutcome::Merged`] states that an incoming candidate deduplicated into
+/// an existing one and names both ids, but the state the merge BUILT — the
+/// unioned `evidence_refs`/`source_trace_refs`, the `merged_from` absorbed-id
+/// list, the retained assessed value and owner, the retained admission
+/// authority and the advanced candidate revision, all written by
+/// [`BoundedBacklog`]'s own merge transition — lives on the entry, and the
+/// entry is the only place it exists. So it is read here, while the backlog is
+/// still in hand, and travels back on
+/// [`GovernedImprovementAdmission::merged_survivor`] for the commit path to
+/// make durable.
+///
+/// `None` means the outcome was [`AdmitOutcome::Admitted`]: nothing merged, so
+/// there is no surviving entry to record. The opposite disagreement — a merge
+/// whose surviving entry is not retrievable from the registry that just
+/// performed it — is a REFUSAL, not a `None`. Returning `None` there would
+/// drop the merge result silently and commit only the event, which is exactly
+/// the loss this read closes.
+fn merged_survivor_entry(
+    report: &AdmitReport,
+    backlog: &BoundedBacklog,
+) -> Result<Option<TrackedCandidate>, ImprovementDispatchError> {
+    let AdmitOutcome::Merged {
+        surviving_candidate_id,
+        absorbed_candidate_id,
+    } = &report.outcome
+    else {
+        return Ok(None);
+    };
+    let survivor = backlog.entry_for(surviving_candidate_id).ok_or_else(|| {
+        ImprovementDispatchError::Backlog(format!(
+            "candidate {absorbed_candidate_id} was merged into {surviving_candidate_id}, \
+             but the merged entry is not an active entry of the registry that performed the merge"
+        ))
+    })?;
+    Ok(Some(survivor.clone()))
 }
 
 /// The closed learning-admission claim this daemon admits its own improvement
@@ -1236,6 +1515,16 @@ fn improvement_commit_identity(
 /// a process-local receipt that disappears with the backlog (W3; I12.24:291
 /// "Silence is not a disposition, because it hides lost learning").
 ///
+/// `admitted.merged_survivor` is committed, between the candidate's own commit
+/// and the archive receipts, as ONE additional `Candidate` record whenever the
+/// admission deduplicated by evidence lineage. Without it the daemon durably
+/// records THAT a merge happened but never WHAT was merged: the record above
+/// carries the INCOMING candidate, while the surviving entry — enriched by the
+/// merge with the unioned lineage and the absorbed-id list — exists only in the
+/// registry, so the next pass rebuilds from the incoming candidate and the
+/// unioned lineage is gone. [`commit_lineage_merge_receipt`] states the shape;
+/// `improvement_dedup_read::restored_registry` reads it back.
+///
 /// Receipt commits are sequenced after the candidate commit and are
 /// individually idempotent under their own key, so a receipt committed on one
 /// pass converges on a later pass instead of duplicating. A refused receipt
@@ -1292,10 +1581,156 @@ pub async fn commit_improvement_artifact(
         )
         .await
         .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
+    // The merge result, before the archive receipts: the surviving entry is
+    // what the NEXT pass rebuilds its registry from, so it is made durable
+    // before any relief disposition is.
+    match (&admitted.report.outcome, admitted.merged_survivor.as_ref()) {
+        (AdmitOutcome::Admitted { .. }, None) => {}
+        (
+            AdmitOutcome::Merged {
+                absorbed_candidate_id,
+                ..
+            },
+            Some(survivor),
+        ) => {
+            commit_lineage_merge_receipt(
+                composition,
+                survivor,
+                absorbed_candidate_id,
+                &scope,
+                state_fence,
+            )
+            .await?;
+        }
+        (outcome, _) => {
+            // `admit_improvement_artifact` refuses to produce this pair, so it
+            // is unreachable in practice; committing the candidate and silently
+            // skipping a merge result it cannot describe is not an option, so
+            // the disagreement is a typed refusal.
+            return Err(ImprovementDispatchError::Backlog(format!(
+                "the admission outcome {outcome:?} does not agree with the merge state this commit must record"
+            )));
+        }
+    }
     for archived in &admitted.report.archived {
         commit_archive_receipt(composition, archived, &scope, state_fence).await?;
     }
     Ok((receipt, effective))
+}
+
+/// Commits the SURVIVING entry of one evidence-lineage merge as a durable
+/// learning record (W3, I12.24:297).
+///
+/// # What this record is for, and what a record without it would be
+///
+/// The candidate's own record commits the INCOMING candidate. When the
+/// admission deduplicated by evidence lineage, the state that makes the
+/// deduplication durable is the SURVIVOR: the entry the merge unioned the
+/// incoming lineage into, with its absorbed-id bookkeeping, its retained
+/// assessed value, owner and admission authority, and its advanced candidate
+/// revision. Committing only the event would leave the daemon asserting that a
+/// merge happened while the next pass rebuilt its registry from the pre-merge
+/// candidate row — so the unioned lineage a merge produced is lost, and the
+/// merge is indistinguishable from two independent candidates that merely
+/// co-exist. I12.24:297 says "Duplicates merge by evidence lineage", so the
+/// lineage a merge accumulated is the merge's own result and it is committed
+/// here.
+///
+/// # The committed document
+///
+/// `{merged_survivor, absorbed_candidate_id}` where `merged_survivor` is the
+/// surviving [`TrackedCandidate`] verbatim. It is committed verbatim rather
+/// than projected onto a narrower shape because it IS the registry entry:
+/// `ImprovementCandidate`, the unioned `evidence_refs` and
+/// `source_trace_refs`, the `merged_from` absorbed-id list, the retained
+/// `value`/`owner`/`admitted_under_authority`, the `lineage_digest` the merge
+/// recomputed over the union, and the advanced `revision`. A projection would
+/// have to restate which of those the merge produced, and every field omitted
+/// would be a field a merge could accumulate and lose.
+///
+/// No extra digest is added: the record's own `lineage_digest` is the digest of
+/// the union, and `admitted_under_authority` is the Governor authority the
+/// merge was admitted under. The owner-issued admission digest for the same
+/// admission is already durable on the candidate's own record.
+///
+/// `Candidate` is the same closed kind the candidate and the archive receipts
+/// use and no new kind is added. The handle and idempotency key are derived
+/// from the surviving entry's OWN identity — its candidate id plus the revision
+/// the merge advanced it to — so re-observing the same merge converges on one
+/// record instead of appending a duplicate, and a later merge of the same
+/// surviving candidate is a distinct, additional record rather than an
+/// overwrite of the earlier accumulated state.
+///
+/// A refused commit is a typed `Commit` error naming the surviving candidate
+/// and the one it absorbed, and the candidate's own commit stays committed:
+/// this is the same partial-commit behaviour the archive receipts already
+/// document, not a rollback.
+async fn commit_lineage_merge_receipt(
+    composition: &mut DaemonComposition,
+    survivor: &TrackedCandidate,
+    absorbed_candidate_id: &str,
+    scope: &ScopeId,
+    state_fence: &StateFence,
+) -> Result<eliot_store_api::WriteReceipt, ImprovementDispatchError> {
+    let record = serde_json::json!({
+        "merged_survivor": survivor,
+        "absorbed_candidate_id": absorbed_candidate_id,
+    });
+    let record_bytes = canonical_json_bytes(&record)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let record_json = String::from_utf8(record_bytes)
+        .map_err(|_| ImprovementDispatchError::Contract("record is not utf-8".to_owned()))?;
+    let record_digest = eliot_contracts::sha256_hex(record_json.as_bytes());
+    let scope_digest = eliot_contracts::sha256_hex(IMPROVEMENT_SCOPE.as_bytes());
+    let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
+    let record_key = lineage_merge_record_key(survivor);
+    let request = learning_record_mutation_request(learning_record_commit_params(
+        LearningRecordKind::Candidate,
+        record_key.clone(),
+        record_json,
+        record_digest,
+        scope_digest,
+        fence_digest,
+        record_key.clone(),
+    ));
+    let identity = improvement_commit_identity(&record_key, state_fence)?;
+    // Proof refs: the SURVIVING entry's own evidence refs, which are the union
+    // the merge produced, so the receipt cites the accumulated lineage rather
+    // than the incoming candidate's.
+    let (receipt, _effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope.clone(),
+            survivor.candidate.evidence_refs.clone(),
+            None,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| {
+            ImprovementDispatchError::Commit(format!(
+                "the merge of {} into surviving candidate {} at revision {} could not be made durable: {error}",
+                absorbed_candidate_id, survivor.candidate.candidate_id, survivor.candidate.revision
+            ))
+        })?;
+    Ok(receipt)
+}
+
+/// The closed store handle and idempotency key of one lineage-merge receipt.
+///
+/// Derived from the surviving entry's own `candidate_id` and the
+/// `candidate.revision` the merge advanced it to, both of which the merge
+/// transition produced, so the key is a function of the merge rather than of
+/// the pass that observed it. An identical replay of the same merge converges
+/// on one record instead of appending a duplicate accumulated state.
+fn lineage_merge_record_key(survivor: &TrackedCandidate) -> String {
+    format!(
+        "improvement-merge:{}@{}",
+        survivor.candidate.candidate_id, survivor.candidate.revision
+    )
 }
 
 /// Commits one [`ArchivedCandidate`] receipt as a durable learning record.
