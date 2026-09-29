@@ -13,8 +13,8 @@
 //! entries refuse with the stable machine-readable code
 //! [`LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER`] plus a redirect receipt naming
 //! [`LEGACY_ENTRYPOINT_CANONICAL_ROUTE`]. The refusal is fail-closed and,
-//! for every arm except `mcp stdio` (which has an exact-Claude delegation
-//! branch and otherwise retains its host-specific MCP route), happens in the
+//! for every arm except `mcp stdio` (which has a delegated-host branch and
+//! otherwise retains its host-specific MCP route), happens in the
 //! single entry gate at the top of `dispatch_command` — before
 //! any arm handler runs, before `ensure_daemon_ready` could auto-launch the
 //! daemon, before any `DbClientSet`/`CanonicalStore` start, and before any
@@ -26,7 +26,8 @@
 //!
 //! Absent, `legacy`, or any unknown flag value preserves today's behavior.
 //! The exact flag selects cutover for legacy entries; MCP stdio delegation
-//! additionally requires the exact Claude host value.
+//! additionally requires a delegated host value at the default profile
+//! (`BRIDGE_DELEGATED_MCP_HOSTS` in `main.rs`).
 //!
 //! Explicit per-entrypoint disposition (issue Work parent-bullet census,
 //! tracked against the entry gate and the Claude MCP branch in
@@ -44,13 +45,15 @@
 //!   identity/route evidence in the detail. Refusing read-only surfaces too
 //!   keeps the behavior one explicit rule with no silent legacy invocation.
 //! - `mcp stdio --host <host>` is the single arm that falls through the entry
-//!   gate to its own branch. Only the exact `--host claude` invocation with
-//!   the selected flag emits the stable code plus canonical-route receipt and
-//!   delegates to the approved Bridge
-//!   (`delegate_claude_mcp_to_agent_bridge`). Claude Desktop and all other
-//!   host values retain their existing MCP route. Selected Claude delegation
-//!   failures keep the refusal receipt and return fail-closed with no legacy
-//!   fallback.
+//!   gate to its own branch. Only a delegated host at the default profile
+//!   (`claude`, `claude-desktop`, `opencode`; see `BRIDGE_DELEGATED_MCP_HOSTS`)
+//!   with the selected flag emits the stable code plus canonical-route
+//!   receipt and delegates to the approved Bridge
+//!   (`delegate_host_mcp_to_agent_bridge`). All other host/profile values,
+//!   including the Codex `codex_controller` profile whose behavior home is
+//!   the `eliot-mcp` track, retain their existing MCP route. Selected
+//!   delegation failures keep the refusal receipt and return fail-closed
+//!   with no legacy fallback.
 //! - `hook <event>` arms, including generated plugin hooks invoking
 //!   `bin/eliot-governor.exe` (`integrations/claude/eliot/hooks/hooks.json`):
 //!   refused at the entry gate before `dispatch_hook_command`; once the flag
