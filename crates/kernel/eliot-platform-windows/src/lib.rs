@@ -1750,10 +1750,16 @@ impl std::fmt::Display for KernelOwnerLeaseError {
                 formatter.write_str("Kernel owner object already exists; refusing ownership")
             }
             Self::OwnershipUncertain { win32_error } => {
-                write!(formatter, "Kernel owner state is uncertain (Win32 error {win32_error})")
+                write!(
+                    formatter,
+                    "Kernel owner state is uncertain (Win32 error {win32_error})"
+                )
             }
             Self::CreationFailed { win32_error } => {
-                write!(formatter, "Kernel owner creation failed (Win32 error {win32_error})")
+                write!(
+                    formatter,
+                    "Kernel owner creation failed (Win32 error {win32_error})"
+                )
             }
             Self::UnsupportedPlatform => {
                 formatter.write_str("exclusive Kernel ownership requires Windows")
@@ -1780,10 +1786,16 @@ impl std::fmt::Display for KernelOwnerLeaseReleaseError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReleaseMutex { win32_error } => {
-                write!(formatter, "Kernel owner ReleaseMutex failed (Win32 error {win32_error})")
+                write!(
+                    formatter,
+                    "Kernel owner ReleaseMutex failed (Win32 error {win32_error})"
+                )
             }
             Self::CloseHandle { win32_error } => {
-                write!(formatter, "Kernel owner CloseHandle failed (Win32 error {win32_error})")
+                write!(
+                    formatter,
+                    "Kernel owner CloseHandle failed (Win32 error {win32_error})"
+                )
             }
             Self::UnsupportedPlatform => {
                 formatter.write_str("exclusive Kernel owner release requires Windows")
@@ -1900,7 +1912,7 @@ impl KernelOwnerLease {
     ) -> Result<Self, KernelOwnerLeaseError> {
         Self::create(
             kernel_owner_mutex_name(installation, activation),
-            Some((installation.clone(), activation.clone())),
+            Some(&(installation.clone(), activation.clone())),
         )
     }
 
@@ -1921,7 +1933,7 @@ impl KernelOwnerLease {
 
     fn create(
         name: String,
-        identity: Option<(PlatformHandle, PlatformHandle)>,
+        identity: Option<&(PlatformHandle, PlatformHandle)>,
     ) -> Result<Self, KernelOwnerLeaseError> {
         #[cfg(windows)]
         {
@@ -1971,7 +1983,9 @@ impl KernelOwnerLease {
                 owns: true,
                 name,
                 authority: Arc::new(KernelOwnerAuthority {
-                    installation: identity.as_ref().map(|(installation, _)| installation.clone()),
+                    installation: identity
+                        .as_ref()
+                        .map(|(installation, _)| installation.clone()),
                     activation: identity.as_ref().map(|(_, activation)| activation.clone()),
                     ..KernelOwnerAuthority::default()
                 }),
