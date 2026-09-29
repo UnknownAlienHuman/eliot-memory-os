@@ -4614,12 +4614,30 @@ impl BridgeRunner {
         // the compiled owner surface carried, already validated by
         // `from_compiled_surface` above.
         if let Some(snapshot) = self.bootstrap_snapshot.as_mut() {
-            snapshot.context.serializer_id = surface.serializer_id.clone();
-            snapshot.context.serializer_version = surface.serializer_version.clone();
-            snapshot.context.serializer_options_digest = surface.serializer_options_digest.clone();
-            snapshot.context.tokenizer_id = surface.tokenizer_id.clone();
-            snapshot.context.tokenizer_version = surface.tokenizer_version.clone();
-            snapshot.context.tokenizer_hash = surface.tokenizer_hash.clone();
+            snapshot
+                .context
+                .serializer_id
+                .clone_from(&surface.serializer_id);
+            snapshot
+                .context
+                .serializer_version
+                .clone_from(&surface.serializer_version);
+            snapshot
+                .context
+                .serializer_options_digest
+                .clone_from(&surface.serializer_options_digest);
+            snapshot
+                .context
+                .tokenizer_id
+                .clone_from(&surface.tokenizer_id);
+            snapshot
+                .context
+                .tokenizer_version
+                .clone_from(&surface.tokenizer_version);
+            snapshot
+                .context
+                .tokenizer_hash
+                .clone_from(&surface.tokenizer_hash);
         }
         Ok(())
     }

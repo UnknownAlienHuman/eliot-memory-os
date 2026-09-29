@@ -671,12 +671,18 @@ impl BootstrapContext {
             // Governor receipt validation requires every one of them
             // non-blank, so a surface that states none fails closed here
             // instead of projecting an unidentified rendering.
-            context.serializer_id = surface.serializer_id.clone();
-            context.serializer_version = surface.serializer_version.clone();
-            context.serializer_options_digest = surface.serializer_options_digest.clone();
-            context.tokenizer_id = surface.tokenizer_id.clone();
-            context.tokenizer_version = surface.tokenizer_version.clone();
-            context.tokenizer_hash = surface.tokenizer_hash.clone();
+            context.serializer_id.clone_from(&surface.serializer_id);
+            context
+                .serializer_version
+                .clone_from(&surface.serializer_version);
+            context
+                .serializer_options_digest
+                .clone_from(&surface.serializer_options_digest);
+            context.tokenizer_id.clone_from(&surface.tokenizer_id);
+            context
+                .tokenizer_version
+                .clone_from(&surface.tokenizer_version);
+            context.tokenizer_hash.clone_from(&surface.tokenizer_hash);
             non_blank(&context.serializer_id, "SERIALIZER_ID_MISSING")?;
             non_blank(&context.serializer_version, "SERIALIZER_VERSION_MISSING")?;
             non_blank(
