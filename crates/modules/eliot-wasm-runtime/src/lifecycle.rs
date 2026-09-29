@@ -30,7 +30,9 @@
 
 use std::collections::BTreeMap;
 
-use eliot_runtime_contracts::{GenerationCutoverState, ModuleGenerationState};
+use eliot_runtime_contracts::{
+    GenerationCutoverRecord, GenerationCutoverState, ModuleGenerationState,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
