@@ -6956,12 +6956,12 @@ impl HostComposition {
     }
 
     /// Creates the credential control only from this live Host composition's
-    /// owner lease.  Callers receive an opaque authenticated server handle;
-    /// the raw `LocalService` Credential Manager provider is not public.
+    /// owner lease and selected launch. Callers receive an opaque authenticated
+    /// server handle; the raw Credential Manager provider is not public.
     ///
     /// # Errors
     ///
-    /// Returns an error if the live Host owner capability or protected state
+    /// Returns an error if the live Host owner capability or selected state
     /// root cannot be admitted.
     #[cfg(windows)]
     pub fn credential_control(&self) -> Result<HostCredentialControl, HostError> {
@@ -6969,13 +6969,42 @@ impl HostComposition {
         // values/env/payloads. Single terminal via guard.
         host_lifecycle_observe_scm(BOUNDARY_CREDENTIAL_CONTROL_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_CREDENTIAL_CONTROL_TERMINAL);
-        let capability = self
-            .owner_lease
-            .credential_mutation_capability()
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        let control = HostCredentialControl::new(
+        let launch = self
+            .registry
+            .pending_activation()
+            .map(|pending| &pending.manifest.runtime_launch)
+            .or_else(|| {
+                self.registry
+                    .active()
+                    .map(|active| &active.manifest.runtime_launch)
+            })
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "credential control has no selected approved generation".to_owned(),
+                )
+            })?
+            .clone();
+        let capability = match launch.profile {
+            InstallationProfile::SystemService => Some(
+                self.owner_lease
+                    .credential_mutation_capability()
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+            ),
+            InstallationProfile::UserMode => None,
+            InstallationProfile::PortableDev => {
+                return Err(HostError::ProcessContour(
+                    "PortableDev does not use the Host credential-control endpoint".to_owned(),
+                ));
+            }
+        };
+        let selected_roots = self
+            .profile_root_leases
+            .as_ref()
+            .map(|roots| roots.selection().clone());
+        let control = HostCredentialControl::new_for_profile(
             self.host.clone(),
-            self.launch_options.host_state_root().to_path_buf(),
+            launch,
+            selected_roots,
             capability,
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         )
