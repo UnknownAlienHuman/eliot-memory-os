@@ -41,19 +41,17 @@ use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
     ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
-    HumanActionRequirement, I14BackpressureCause, I14BackpressureResponseV1,
-    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
-    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
-    I14_BACKPRESSURE_RESPONSE_VERSION, NormalWorkClass, RecoveryCommitStatus,
-    StatePreservationStatus,
+    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
+    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
+    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
 };
 use thiserror::Error;
 
 use crate::model::validate_text;
 
 /// The exact transaction-slot bottleneck enforced by [`OrsReserve`].
-pub const ORS_TRANSACTION_BOTTLENECK: CapacityBottleneck =
-    CapacityBottleneck::OrsTransactionSlots;
+pub const ORS_TRANSACTION_BOTTLENECK: CapacityBottleneck = CapacityBottleneck::OrsTransactionSlots;
 
 /// The exact durable-queue-bytes bottleneck enforced by [`OrsReserve`].
 pub const ORS_DURABLE_BYTES_BOTTLENECK: CapacityBottleneck =
@@ -75,7 +73,9 @@ pub enum OrsReserveError {
     Contract(String),
     /// The normal partition cannot satisfy the request; the protected
     /// partition is untouched.
-    #[error("ORS normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner}")]
+    #[error(
+        "ORS normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner}"
+    )]
     NormalCapacityExhausted {
         /// Bottleneck whose normal partition is saturated.
         bottleneck: CapacityBottleneck,
@@ -87,7 +87,9 @@ pub enum OrsReserveError {
         owner: String,
     },
     /// The protected partition cannot satisfy the request.
-    #[error("ORS protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner}")]
+    #[error(
+        "ORS protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner}"
+    )]
     ProtectedReserveExhausted {
         /// Bottleneck whose protected partition is saturated.
         bottleneck: CapacityBottleneck,
@@ -241,9 +243,7 @@ impl Drop for OrsPermit {
             (OrsDimension::DurableQueueBytes, CapacityClass::NormalWorkload) => {
                 &self.inner.durable_normal_in_flight_bytes
             }
-            (OrsDimension::DurableQueueBytes, _) => {
-                &self.inner.durable_protected_in_flight_bytes
-            }
+            (OrsDimension::DurableQueueBytes, _) => &self.inner.durable_protected_in_flight_bytes,
         };
         debug_assert!(
             slot.load(Ordering::Acquire) >= self.amount,
@@ -342,45 +342,41 @@ impl OrsReserve {
     /// Returns the currently available normal transaction slots.
     #[must_use]
     pub fn available_normal_transactions(&self) -> u64 {
-        self.inner
-            .transaction_normal_capacity
-            .saturating_sub(self.inner.transaction_normal_in_flight.load(Ordering::Acquire))
+        self.inner.transaction_normal_capacity.saturating_sub(
+            self.inner
+                .transaction_normal_in_flight
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Returns the currently available protected transaction slots.
     #[must_use]
     pub fn available_protected_transactions(&self) -> u64 {
-        self.inner
-            .transaction_protected_capacity
-            .saturating_sub(
-                self.inner
-                    .transaction_protected_in_flight
-                    .load(Ordering::Acquire),
-            )
+        self.inner.transaction_protected_capacity.saturating_sub(
+            self.inner
+                .transaction_protected_in_flight
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Returns the currently available normal durable bytes.
     #[must_use]
     pub fn available_normal_durable_bytes(&self) -> u64 {
-        self.inner
-            .durable_normal_capacity_bytes
-            .saturating_sub(
-                self.inner
-                    .durable_normal_in_flight_bytes
-                    .load(Ordering::Acquire),
-            )
+        self.inner.durable_normal_capacity_bytes.saturating_sub(
+            self.inner
+                .durable_normal_in_flight_bytes
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Returns the currently available protected durable bytes.
     #[must_use]
     pub fn available_protected_durable_bytes(&self) -> u64 {
-        self.inner
-            .durable_protected_capacity_bytes
-            .saturating_sub(
-                self.inner
-                    .durable_protected_in_flight_bytes
-                    .load(Ordering::Acquire),
-            )
+        self.inner.durable_protected_capacity_bytes.saturating_sub(
+            self.inner
+                .durable_protected_in_flight_bytes
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Attempts to acquire one normal transaction slot without blocking.
@@ -404,12 +400,12 @@ impl OrsReserve {
             field: "ors_permit.owner",
             reason: "must be non-blank",
         })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(
-            |_| OrsReserveError::InvalidField {
+        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
+            OrsReserveError::InvalidField {
                 field: "ors_permit.operation_id",
                 reason: "must be non-blank",
-            },
-        )?;
+            }
+        })?;
         if !cas_add(
             &self.inner.transaction_normal_in_flight,
             self.inner.transaction_normal_capacity,
@@ -456,12 +452,12 @@ impl OrsReserve {
             field: "ors_permit.owner",
             reason: "must be non-blank",
         })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(
-            |_| OrsReserveError::InvalidField {
+        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
+            OrsReserveError::InvalidField {
                 field: "ors_permit.operation_id",
                 reason: "must be non-blank",
-            },
-        )?;
+            }
+        })?;
         if !cas_add(
             &self.inner.durable_normal_in_flight_bytes,
             self.inner.durable_normal_capacity_bytes,
@@ -509,12 +505,12 @@ impl OrsReserve {
             field: "ors_permit.owner",
             reason: "must be non-blank",
         })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(
-            |_| OrsReserveError::InvalidField {
+        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
+            OrsReserveError::InvalidField {
                 field: "ors_permit.operation_id",
                 reason: "must be non-blank",
-            },
-        )?;
+            }
+        })?;
         if !cas_add(
             &self.inner.transaction_protected_in_flight,
             self.inner.transaction_protected_capacity,
@@ -561,12 +557,12 @@ impl OrsReserve {
             field: "ors_permit.owner",
             reason: "must be non-blank",
         })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(
-            |_| OrsReserveError::InvalidField {
+        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
+            OrsReserveError::InvalidField {
                 field: "ors_permit.operation_id",
                 reason: "must be non-blank",
-            },
-        )?;
+            }
+        })?;
         if !cas_add(
             &self.inner.durable_protected_in_flight_bytes,
             self.inner.durable_protected_capacity_bytes,
@@ -682,7 +678,9 @@ impl OrsReserve {
                 bottleneck: ORS_TRANSACTION_BOTTLENECK,
                 unit: ORS_TRANSACTION_BOTTLENECK.unit(),
                 requested_amount: 1,
-                availability: BottleneckAvailability::Exhausted { available_amount: 0 },
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: 0,
+                },
                 coverage_state: BottleneckCoverageState::Claimed,
             },
             operation_id: Some(operation),
