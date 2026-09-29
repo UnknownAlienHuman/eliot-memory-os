@@ -32,6 +32,7 @@
 
 use eliot_contracts::{EpochId, sha256_hex};
 use eliot_process::Generation;
+use std::io::Write as _;
 
 /// Deterministic dispatch derivation domain for the WASM child contour.
 /// Byte-identical on both sides; a distinct domain per contour keeps
@@ -1918,15 +1919,6 @@ fn fixed_names_present(
     Ok(present)
 }
 
-/// Flushes one staged file so its bytes are durable before any rename
-/// names them (the repository's sealed-body contour: durable body
-/// before the row that names it).
-fn sync_file(path: &std::path::Path) -> Result<(), WasmDispatchError> {
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| invalid("delivery-io"))
-}
-
 /// Flushes a freshly renamed directory entry on platforms with
 /// directory `fsync`.
 #[cfg(unix)]
@@ -2006,7 +1998,6 @@ fn stage_file_atomic(
             }
         })
         .ok_or_else(|| invalid("delivery-io"))??;
-    use std::io::Write as _;
     if file.write_all(bytes).is_err() || file.sync_all().is_err() {
         let _ = std::fs::remove_file(&partial);
         return Err(invalid("delivery-io"));
@@ -2132,7 +2123,6 @@ fn validate_disposition_record(
         return Err(WasmDispatchError::DeliveryUnavailable);
     }
     match &record.disposition {
-        WasmDeliveryDisposition::Ready { .. } => {}
         WasmDeliveryDisposition::LaunchReserved {
             launch_incarnation: actual,
             ..
@@ -2151,7 +2141,7 @@ fn validate_disposition_record(
         } if actual != &launch_incarnation(identity) => {
             return Err(WasmDispatchError::DeliveryUnavailable);
         }
-        WasmDeliveryDisposition::LaunchReserved { .. } => {}
+        WasmDeliveryDisposition::Ready { .. } | WasmDeliveryDisposition::LaunchReserved { .. } => {}
         WasmDeliveryDisposition::InFlight {
             claimant_incarnation,
             runtime_request_digest,
@@ -2172,7 +2162,7 @@ fn validate_disposition_record(
             match &record.disposition {
                 WasmDeliveryDisposition::TerminalUnacknowledged { result_digest, .. }
                 | WasmDeliveryDisposition::Acknowledged { result_digest, .. } => {
-                    require_disposition_digest(result_digest)?
+                    require_disposition_digest(result_digest)?;
                 }
                 _ => {}
             }
@@ -2352,9 +2342,8 @@ fn validate_slot_material(
             }
             Err(_) => return Err(WasmDispatchError::DeliveryUnavailable),
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => return Err(WasmDispatchError::DeliveryUnavailable),
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Err(WasmDispatchError::DeliveryUnavailable);
         };
         if metadata.len() != bytes.len() as u64
             || bytes.is_empty()
@@ -2449,9 +2438,8 @@ fn scan_publication_snapshots(
     if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
         return Err(WasmDispatchError::DeliveryUnavailable);
     }
-    let entries = match std::fs::read_dir(slots) {
-        Ok(entries) => entries,
-        Err(_) => return Err(WasmDispatchError::DeliveryUnavailable),
+    let Ok(entries) = std::fs::read_dir(slots) else {
+        return Err(WasmDispatchError::DeliveryUnavailable);
     };
     let mut rows = Vec::new();
     let mut retained_bytes = 0_u64;
@@ -2607,7 +2595,7 @@ fn read_live_material(
 /// before removing any fixed name. It does not use hash-before-delete as
 /// an ownership test.
 fn reclaim_fixed_delivery(
-    owner_lock: &DeliveryOwnerLock,
+    _owner_lock: &DeliveryOwnerLock,
     install_dir: &std::path::Path,
     slot: &std::path::Path,
     presented: &WasmDeliveryIdentity,
@@ -2841,9 +2829,9 @@ fn reconcile_reclaimable_delivery(
     reclaim_slot_payloads(owner_lock, slot, &current)
 }
 
-/// Consumes the current fixed-name owner state, never expiry alone. A Ready
+/// Consumes the current fixed-name owner state, never expiry alone. A `Ready`
 /// slot proves no launch reservation exists and may be explicitly retired;
-/// LaunchReserved, InFlight, terminal-unacknowledged, or incomplete state
+/// `LaunchReserved`, `InFlight`, terminal-unacknowledged, or incomplete state
 /// backpressures with its exact recovery locator.
 fn retire_or_backpressure_live(
     owner_lock: &DeliveryOwnerLock,
@@ -2868,7 +2856,7 @@ fn retire_or_backpressure_live(
 }
 
 /// Reserves launch exactly once under the installation-root lock. The
-/// durable LaunchReserved transition closes execution before the caller
+/// durable `LaunchReserved` transition closes execution before the caller
 /// starts the child; expiry closes new launch but never changes unresolved
 /// custody into a reclaimable state.
 pub fn claim_wasm_dispatch_launch(
@@ -2946,6 +2934,10 @@ pub fn claim_wasm_dispatch_launch(
 /// publication error inside slot staging never touches the fixed names,
 /// so it cannot delete another generation; readers never see a torn
 /// generation. Returns the staged envelope path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "staging keeps the exact install lock, immutable slot identity, join binding, and source material explicit"
+)]
 fn stage_and_expose_delivery(
     owner_lock: &DeliveryOwnerLock,
     install_dir: &std::path::Path,
@@ -3338,6 +3330,10 @@ fn find_delivery_row<'a>(
 /// byte bindings, lock acquisition, or file staging fails closed, or
 /// [`WasmDispatchError::Backpressure`] when protected deliveries or bounded
 /// retained capacity prevent publication.
+#[allow(
+    clippy::too_many_lines,
+    reason = "bundle publication keeps identity derivation, durable locking, capacity reservation, and replay reconciliation in one ordered transaction"
+)]
 pub fn publish_wasm_dispatch_bundle(
     host_executable_path: &str,
     host_artifact_digest: &str,
