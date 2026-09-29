@@ -18804,25 +18804,10 @@ impl RedbRecoveryStore {
                 &mut read_budget,
             )?
             .ok_or(OrsError::RecoveryOwnerMismatch)?;
-            let compacted_through_required = if cut.retention_floor == 0 {
-                false
-            } else {
-                let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
-                match cursors.get(owner.namespace.as_str()).map_err(storage)? {
-                    Some(value) => {
-                        read_budget.charge(owner.namespace.as_bytes(), value.value().as_bytes())?;
-                        let cursor: BridgeEventCursorRow = decode(value.value())?;
-                        cursor.validate()?;
-                        cursor.last_compacted_sequence >= cut.retention_floor
-                    }
-                    None => false,
-                }
-            };
             let legacy_revision_moved = cut.version == 1
                 && Self::bridge_recovery_revision_for(&read, &owner.namespace, &mut read_budget)?
                     != cut.expected_revision;
             if cut.required_interval_moved
-                || compacted_through_required
                 || legacy_revision_moved
                 || cut.owner_revision != owner.revision
                 || cut.owner_incarnation != owner.incarnation
@@ -18909,6 +18894,9 @@ impl RedbRecoveryStore {
             // The rows and accounting are validated facts even when the
             // suffix itself cannot be proven; preserve them beside the
             // unresolved frontier in a typed Moved answer.
+            // This is a live namespace-wide backpressure observation from
+            // this page's read snapshot, not a fact in the finite event cut;
+            // it may change across pages without moving the cut.
             page["capacity"] =
                 Self::bridge_capacity_accounting_for(&read, &owner, &mut read_budget)?;
             page["stream_proof"] = json!(stream_proof);
@@ -19507,13 +19495,16 @@ impl RedbRecoveryStore {
         }))
     }
 
-    /// Accounts one namespace's stable bridge-event capacity under its owner
+    /// Accounts one namespace's current bridge-event capacity under its owner
     /// (issue #2731, item 4): pending live events, normalized projections,
     /// handoffs, retained replay commitments, the #2730 ordered position
     /// index, stable stream/cursor metadata, and scoped gaps with their
     /// encoded bytes. The mutable handoff scan fields are excluded from this
-    /// recovery-window snapshot and are reported as `handoff_scan_bytes` in
-    /// the post-key maintenance result. Each count sums key bytes plus the
+    /// per-page observation and are reported as `handoff_scan_bytes` in the
+    /// post-key maintenance result. The account is read from the same ORS
+    /// snapshot as its page, but is namespace-wide and intentionally not part
+    /// of the finite retained event/gap cut; later pages may report newer
+    /// backpressure facts. Each count sums key bytes plus the
     /// exact encoded value bytes for the stable projection, never source
     /// payload length or engine/heap overhead. This is a report only; it
     /// makes no aggregate-byte admission claim. The #2730 position index is owned,
