@@ -31,9 +31,10 @@ use eliot_research_exchange_api::{
 // itself stays public because a consumer reads the record off
 // `AbsencePreconditions`; it can no longer be constructed from outside.
 pub use evidence_portfolio::{
-    AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, ManifestSource,
-    MemberNoMatchResult, NoMatchApplicability, NoMatchDimension, NoMatchEvaluation,
-    ObservedOutsideScope, UnsupportedPrecisionItem,
+    AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding,
+    CLAIM_REQUIREMENTS, ClaimRequirement, DimensionEvaluation, ManifestSource, MemberNoMatchResult,
+    NoMatchApplicability, NoMatchDimension, NoMatchEvaluation, ObservedOutsideScope,
+    RequirementOutcome, UnsupportedPrecisionItem,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
@@ -41,15 +42,15 @@ pub use evidence_portfolio::{
 pub use inquiry_governance::{
     AcquisitionOutcome, BlindedField, CandidateEvidence, ClaimAuditRecord, CounterSearchStatus,
     CoverageGoal, CoverageReceipt, DenominatorKind, EnumerationState, EvidenceFreeze,
-    EvidenceGrade, EvidenceSetPrecision, GovernorInquiryAdmissionRequest, HypothesisPolicy,
-    IndependenceBlindingPolicy, IndependenceDimension, IndependenceDimensionMeasurement,
-    IndependenceProfile, InquiryError, InquiryGovernance, InquiryHorizon, InquiryLane,
-    InquiryObservation, InquiryOutputContract, InquiryProtocol, InquiryProtocolProfile,
-    InquiryRisk, InquirySelectionFeatures, InquiryStopRule, InquiryTerminalRecord,
-    InquiryUncertainty, LaneDisciplineOutcome, MissingSourceClass, PreservedNextProbe,
-    PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind, ResearchDebtRestriction,
-    SourcePortfolio, SpecialistDiscoverability, StopRuleKind, StreamEvidence, UnadmittedReference,
-    UnadmittedReferenceKind, VerifierStrength,
+    EvidenceFreezeParams, EvidenceGrade, EvidenceSetPrecision, GovernorInquiryAdmissionRequest,
+    HypothesisPolicy, IndependenceBlindingPolicy, IndependenceDimension,
+    IndependenceDimensionMeasurement, IndependenceProfile, InquiryError, InquiryGovernance,
+    InquiryHorizon, InquiryLane, InquiryObservation, InquiryOutputContract, InquiryProtocol,
+    InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures, InquiryStopRule,
+    InquiryTerminalRecord, InquiryUncertainty, LaneDisciplineOutcome, MissingSourceClass,
+    PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind,
+    ResearchDebtRestriction, SourcePortfolio, SpecialistDiscoverability, StopRuleKind,
+    StreamEvidence, UnadmittedReference, UnadmittedReferenceKind, VerifierStrength,
 };
 pub use inquiry_lanes::{
     AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,

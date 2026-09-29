@@ -403,9 +403,21 @@ fn report_admitted_inquiry(
 ) {
     match project_admitted_inquiry(request, admission, receipt, failure) {
         Ok(inquiry) => {
+            // The release gate is asked here, on the real run, and its answer is
+            // published beside the governance view. Before this the run rendered
+            // the record and stopped: `public_class()`, `dimensions_complete()`
+            // and `is_complete()` existed with no caller, so the audit existed and
+            // nothing on any production path ever read it. `report_admitted_inquiry`
+            // is a renderer, not an authority — it does not refuse the run and does
+            // not change this process's exit code — but the gate answer it prints is
+            // the one a release consumer has to see before it promotes anything.
+            let gate = match inquiry.release_gate() {
+                Ok(()) => eliot_mod_research::RELEASE_GATE_ADMITTED.to_owned(),
+                Err(error) => format!("{}:{error}", eliot_mod_research::RELEASE_GATE_BLOCKED),
+            };
             let _ = writeln!(
                 io::stderr(),
-                "{}: {inquiry}",
+                "{}: {inquiry} release_gate={gate}",
                 eliot_mod_research::INQUIRY_GOVERNANCE_VIEW
             );
         }
