@@ -12,8 +12,13 @@
 //! priority or class: only [`ControlOperationClass`] operations typecheck on
 //! the protected acquisition paths, and no acquisition path takes a priority,
 //! class label or free-form string that could smuggle one class into another.
-//! There is no emergency partition here; recording reserve loss stays with
-//! the front-door last-resort slot, exactly as in the ORS slice.
+//! The single preallocated emergency record cell (issue #1679, W9) lives
+//! outside normal/protected accounting: its three closed constructors record
+//! a reserve-exhaustion gap, record `CONTROL_GUARANTEE_LOST` or enter
+//! manual/platform recovery. They touch no partition counter, grant no
+//! capacity and refuse ordinary work with a typed denial; a second claim
+//! while the cell is held surfaces explicit `CONTROL_GUARANTEE_LOST`, never
+//! ordinary pressure.
 //!
 //! Every [`StorePermit`] is owner-issued non-clone evidence bound to permit
 //! and operation identities, capacity/operation class, issuing bridge
@@ -99,14 +104,15 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
     CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit,
-    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
-    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute,
+    ControlOperationClass, EarliestRecoveryCondition, EmergencyOperationClass,
+    EvidenceCoverageState, HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION,
+    I14AlternativeRoute,
     I14BackpressureCause, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome, NormalWorkClass,
     RecoveryCommitStatus, StatePreservationStatus, frozen_bottleneck_owner_map,
@@ -169,6 +175,46 @@ pub enum StoreReserveError {
         owner: String,
         /// Issuing bridge generation that refused the request.
         owner_generation: Uuid,
+    },
+    /// An emergency record was requested under the wrong closed operation:
+    /// each W9 constructor admits exactly its own [`EmergencyOperationClass`]
+    /// variant, and ordinary work has no emergency constructor at all.
+    #[error(
+        "Store emergency record refuses {presented:?}: this constructor admits only {expected:?}"
+    )]
+    EmergencyOperationMismatch {
+        /// The closed emergency operation this constructor admits.
+        expected: EmergencyOperationClass,
+        /// The closed emergency operation that was presented.
+        presented: EmergencyOperationClass,
+    },
+    /// The emergency-only path refused ordinary work: it records
+    /// reserve-exhaustion loss and enters manual/platform recovery only. It
+    /// never executes ordinary work and never replaces exhausted protected
+    /// capacity.
+    #[error(
+        "Store emergency path refuses ordinary {operation:?} operation {operation_id} owned by {owner}: {detail}"
+    )]
+    EmergencyRefusesOrdinaryWork {
+        /// Ordinary operation that was denied the emergency path.
+        operation: StorePermitOperation,
+        /// Operation that was denied.
+        operation_id: String,
+        /// Owner that requested admission.
+        owner: String,
+        /// Why the emergency path cannot serve ordinary work.
+        detail: &'static str,
+    },
+    /// Loss of the emergency path itself: the single preallocated Store
+    /// record cell is already held, so reserve loss cannot be recorded
+    /// through any remaining Store path. Explicit `CONTROL_GUARANTEE_LOST`,
+    /// never ordinary pressure.
+    #[error("Store control guarantee lost at {bottleneck:?}: {detail}")]
+    ControlGuaranteeLost {
+        /// Exhausted Store bottleneck whose loss cannot be recorded.
+        bottleneck: CapacityBottleneck,
+        /// Exact lost guarantee for post-recovery recording.
+        detail: String,
     },
     /// A release was requested twice for the same permit identity.
     #[error("Store permit {permit_id} is already released; release happens at most once")]
@@ -1270,6 +1316,11 @@ struct StoreReserveInner {
     transaction_protected_in_flight: AtomicU64,
     pending_normal_in_flight_bytes: AtomicU64,
     pending_protected_in_flight_bytes: AtomicU64,
+    /// The single preallocated W9 emergency record cell. Outside
+    /// normal/protected accounting: it is never added to a partition
+    /// capacity, never published in a claimed row and never granted as
+    /// capacity. `false` means free; `true` means one loss record is held.
+    emergency_record_held: AtomicBool,
 }
 
 /// The Store control reserve: disjoint normal/protected partitions for the
@@ -1520,6 +1571,102 @@ impl Drop for StorePermit {
     }
 }
 
+/// One held Store emergency loss record (issue #1679, W9).
+///
+/// Loss evidence only: the record holds the single preallocated record cell
+/// while alive and carries no amount, no partition counter and no capacity.
+/// Claiming it never observes or moves a normal or protected counter, and
+/// releasing it only frees the cell. Records are deliberately not [`Clone`]:
+/// duplicating a record handle must never duplicate the cell.
+#[derive(Debug)]
+pub struct StoreEmergencyRecord {
+    slot: Option<Arc<StoreReserveInner>>,
+    operation: EmergencyOperationClass,
+    bottleneck: CapacityBottleneck,
+    operation_id: String,
+    owner: String,
+    owner_generation: Uuid,
+    requester_generation: Uuid,
+    profile_revision: String,
+    evidence: String,
+}
+
+impl StoreEmergencyRecord {
+    /// Returns the closed emergency operation this record was claimed for.
+    #[must_use]
+    pub const fn operation(&self) -> EmergencyOperationClass {
+        self.operation
+    }
+
+    /// Returns the exhausted Store bottleneck whose loss this record holds.
+    #[must_use]
+    pub const fn bottleneck(&self) -> CapacityBottleneck {
+        self.bottleneck
+    }
+
+    /// Returns the partition this record belongs to: always the emergency
+    /// last resort, never a capacity partition.
+    #[must_use]
+    pub const fn capacity_class(&self) -> CapacityClass {
+        CapacityClass::EmergencyLastResort
+    }
+
+    /// Returns the operation identity this record was claimed for.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Returns the owner this record was claimed for.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Returns the issuing Store bridge generation recorded at claim time.
+    #[must_use]
+    pub const fn owner_generation(&self) -> Uuid {
+        self.owner_generation
+    }
+
+    /// Returns the requesting owner's generation recorded at claim time.
+    #[must_use]
+    pub const fn requester_generation(&self) -> Uuid {
+        self.requester_generation
+    }
+
+    /// Returns the profile revision recorded at claim time.
+    #[must_use]
+    pub fn profile_revision(&self) -> &str {
+        &self.profile_revision
+    }
+
+    /// Returns the owner-derived evidence reference recorded at claim time.
+    #[must_use]
+    pub fn evidence(&self) -> &str {
+        &self.evidence
+    }
+
+    /// Releases the record cell exactly once.
+    ///
+    /// Consuming `self` makes a second release a compile-time impossibility
+    /// through this path. No partition counter moves because none was ever
+    /// claimed; only the preallocated cell is freed.
+    pub fn release(mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.emergency_record_held.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for StoreEmergencyRecord {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.emergency_record_held.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Resolves the live normal-partition counter and its capacity for one
 /// dimension. The [`NormalWorkClass`] value is evidence-only: its type is the
 /// partition key, so a normal-only path cannot name, and therefore cannot
@@ -1552,7 +1699,8 @@ fn select_normal_slot(
 /// the normal authority bindings first (every protected acquisition opens
 /// with the same checked request validation as normal work, before any
 /// protected counter is touched). One dimension resolves exactly its own
-/// counter; there is no shared pool and no emergency cell in this slice.
+/// counter; there is no shared pool, and the W9 emergency record cell is not
+/// a counter and is never resolved here.
 fn select_protected_slot(
     inner: &StoreReserveInner,
     dimension: StoreDimension,
@@ -1725,8 +1873,9 @@ impl StoreReserve {
     ///
     /// Normal work draws only from the normal cells; admitted
     /// cancellation/recovery/fencing draws only from the protected cells.
-    /// Neither class can borrow from the other, and no emergency cell exists
-    /// in this slice.
+    /// Neither class can borrow from the other, and no emergency capacity
+    /// exists in any partition: the single W9 record cell starts free outside
+    /// partition accounting.
     ///
     /// # Errors
     ///
@@ -1779,6 +1928,7 @@ impl StoreReserve {
                 transaction_protected_in_flight: AtomicU64::new(0),
                 pending_normal_in_flight_bytes: AtomicU64::new(0),
                 pending_protected_in_flight_bytes: AtomicU64::new(0),
+                emergency_record_held: AtomicBool::new(false),
             }),
         })
     }
@@ -2081,9 +2231,11 @@ impl StoreReserve {
     /// admits nothing: pressure evidence is never manufactured for a
     /// partition that still admits the request. The protected partition is
     /// not read and not claimed, so an admitted cancellation/recovery record
-    /// keeps its path while this response is live. There is no emergency
-    /// cell here; reserve-loss recording stays with the front-door
-    /// last-resort slot.
+    /// keeps its path while this response is live. Exhausted protected
+    /// capacity is recorded through the W9 emergency constructors
+    /// ([`Self::record_reserve_exhaustion_gap`],
+    /// [`Self::record_control_guarantee_lost`],
+    /// [`Self::enter_manual_recovery`]), never through this response.
     ///
     /// # Errors
     ///
@@ -2229,6 +2381,179 @@ impl StoreReserve {
         )
     }
 
+    /// Records a reserve-exhaustion gap through the single preallocated
+    /// emergency record cell (issue #1679, W9).
+    ///
+    /// Only [`EmergencyOperationClass::ReserveExhaustionGapRecord`] enters
+    /// here: ordinary normal or protected work has no emergency constructor
+    /// and is refused with
+    /// [`StoreReserveError::EmergencyRefusesOrdinaryWork`]. The claim touches
+    /// no partition counter and grants no capacity; the returned
+    /// [`StoreEmergencyRecord`] is loss evidence only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::EmergencyOperationMismatch`] for a wrong
+    /// closed emergency variant, [`StoreReserveError::InvalidField`] for a
+    /// non-Store bottleneck or malformed bindings, or
+    /// [`StoreReserveError::ControlGuaranteeLost`] when the cell is already
+    /// held: loss of the emergency path itself is explicit
+    /// `CONTROL_GUARANTEE_LOST`, never ordinary pressure.
+    pub fn record_reserve_exhaustion_gap(
+        &self,
+        operation: EmergencyOperationClass,
+        request: StorePermitRequest<'_>,
+        bottleneck: CapacityBottleneck,
+    ) -> Result<StoreEmergencyRecord, StoreReserveError> {
+        self.claim_emergency_record(
+            operation,
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            &request,
+            bottleneck,
+        )
+    }
+
+    /// Records `CONTROL_GUARANTEE_LOST` through the single preallocated
+    /// emergency record cell (issue #1679, W9).
+    ///
+    /// Only [`EmergencyOperationClass::ControlGuaranteeLostRecord`] enters
+    /// here. The claim touches no partition counter and grants no capacity;
+    /// the returned [`StoreEmergencyRecord`] is loss evidence only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::EmergencyOperationMismatch`] for a wrong
+    /// closed emergency variant, [`StoreReserveError::InvalidField`] for a
+    /// non-Store bottleneck or malformed bindings, or
+    /// [`StoreReserveError::ControlGuaranteeLost`] when the cell is already
+    /// held: loss of the emergency path itself is explicit
+    /// `CONTROL_GUARANTEE_LOST`, never ordinary pressure.
+    pub fn record_control_guarantee_lost(
+        &self,
+        operation: EmergencyOperationClass,
+        request: StorePermitRequest<'_>,
+        bottleneck: CapacityBottleneck,
+    ) -> Result<StoreEmergencyRecord, StoreReserveError> {
+        self.claim_emergency_record(
+            operation,
+            EmergencyOperationClass::ControlGuaranteeLostRecord,
+            &request,
+            bottleneck,
+        )
+    }
+
+    /// Enters manual/platform recovery through the single preallocated
+    /// emergency record cell (issue #1679, W9).
+    ///
+    /// Only [`EmergencyOperationClass::EnterManualRecovery`] enters here. The
+    /// claim touches no partition counter and grants no capacity; the
+    /// returned [`StoreEmergencyRecord`] is recovery-entry evidence only. It
+    /// cannot execute ordinary work or replace exhausted protected capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::EmergencyOperationMismatch`] for a wrong
+    /// closed emergency variant, [`StoreReserveError::InvalidField`] for a
+    /// non-Store bottleneck or malformed bindings, or
+    /// [`StoreReserveError::ControlGuaranteeLost`] when the cell is already
+    /// held: loss of the emergency path itself is explicit
+    /// `CONTROL_GUARANTEE_LOST`, never ordinary pressure.
+    pub fn enter_manual_recovery(
+        &self,
+        operation: EmergencyOperationClass,
+        request: StorePermitRequest<'_>,
+        bottleneck: CapacityBottleneck,
+    ) -> Result<StoreEmergencyRecord, StoreReserveError> {
+        self.claim_emergency_record(
+            operation,
+            EmergencyOperationClass::EnterManualRecovery,
+            &request,
+            bottleneck,
+        )
+    }
+
+    /// Refuses ordinary work presented to the emergency-only path with a
+    /// typed denial (issue #1679, W9).
+    ///
+    /// Takes the existing [`StorePermitOperation`] union, so both normal and
+    /// protected work are deniable through this one constructor while no
+    /// emergency operation can enter it. Touches no counter, holds no cell
+    /// and grants nothing: the denial is the whole result.
+    #[must_use]
+    pub fn refuse_emergency_for_ordinary_work(
+        operation: StorePermitOperation,
+        operation_id: &str,
+        owner: &str,
+    ) -> StoreReserveError {
+        StoreReserveError::EmergencyRefusesOrdinaryWork {
+            operation,
+            operation_id: operation_id.to_owned(),
+            owner: owner.to_owned(),
+            detail: "the emergency path records reserve loss and enters manual/platform recovery only; it never executes ordinary work or replaces exhausted protected capacity",
+        }
+    }
+
+    /// Claims the single preallocated emergency record cell for exactly one
+    /// closed emergency operation without touching any partition counter.
+    ///
+    /// The presented operation must equal the constructor's closed variant, the
+    /// bottleneck must be one of the three Store dimensions, and the bindings
+    /// pass the same checked request validation as capacity work before the
+    /// cell is touched. A second claim while the cell is held fails closed
+    /// with [`StoreReserveError::ControlGuaranteeLost`].
+    fn claim_emergency_record(
+        &self,
+        operation: EmergencyOperationClass,
+        expected: EmergencyOperationClass,
+        request: &StorePermitRequest<'_>,
+        bottleneck: CapacityBottleneck,
+    ) -> Result<StoreEmergencyRecord, StoreReserveError> {
+        if operation != expected {
+            return Err(StoreReserveError::EmergencyOperationMismatch {
+                expected,
+                presented: operation,
+            });
+        }
+        if bottleneck != STORE_CONNECTION_BOTTLENECK
+            && bottleneck != STORE_TRANSACTION_BOTTLENECK
+            && bottleneck != STORE_PENDING_WRITE_BOTTLENECK
+        {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_emergency.bottleneck",
+                reason: "the Store emergency path records only Store bottleneck loss",
+            });
+        }
+        Self::checked_request(request)?;
+        if self
+            .inner
+            .emergency_record_held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(StoreReserveError::ControlGuaranteeLost {
+                bottleneck,
+                detail: "Store emergency record cell is already held; reserve loss cannot be recorded through any remaining Store path"
+                    .to_owned(),
+            });
+        }
+        Ok(StoreEmergencyRecord {
+            slot: Some(self.inner.clone()),
+            operation,
+            bottleneck,
+            operation_id: request.operation_id.to_owned(),
+            owner: request.owner.to_owned(),
+            owner_generation: request.owner_generation,
+            requester_generation: request.requester_generation,
+            profile_revision: request.profile_revision.to_owned(),
+            evidence: format!(
+                "store-emergency/{}/bridge-gen-{}/req-gen-{}",
+                bottleneck.as_contract_str(),
+                request.owner_generation,
+                request.requester_generation,
+            ),
+        })
+    }
+
     /// Re-applies one persisted record after a restart without resetting held
     /// capacity.
     ///
@@ -2311,7 +2636,9 @@ impl StoreReserve {
     /// both disjoint partitions, [`CapacityEnforcement::PhysicalPartition`]
     /// (normal acquisition paths never address the protected counters and
     /// vice versa; there is no shared pool to borrow from) and no emergency
-    /// partition. The evidence reference is owner-derived current evidence:
+    /// capacity: the W9 record cell grants none, so `emergency_limit` stays
+    /// `None` exactly as the frozen profile requires. The evidence reference
+    /// is owner-derived current evidence:
     /// the live available amount of each partition at publication time.
     /// The invalidation set names the two owner-known invalidation
     /// conditions: a bridge-generation move and a partition-config change.
