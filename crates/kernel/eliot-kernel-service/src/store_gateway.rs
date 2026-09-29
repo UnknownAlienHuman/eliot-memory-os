@@ -3160,6 +3160,11 @@ impl KernelStoreGateway {
             &request,
             response,
         )
+        .map_err(|error| {
+            RunNowPreflightAssembly::Unknown(format!(
+                "the retained normalization envelope did not survive the owner readback: {error}"
+            ))
+        })
     }
 
     /// Assembles the complete preflight projection for one committed `RunNow`
