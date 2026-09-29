@@ -1781,13 +1781,22 @@ impl KernelStoreGateway {
     {
         Self::validate_user_automation_request(&request)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
-        let sealed = self
-            .seal_user_automation_operation(&store, request)
-            .await
-            .map_err(user_automation_gateway_unknown)?;
-        let response = Box::pin(UserAutomationService::new(&store).dispatch(sealed.clone()))
-            .await
-            .map_err(user_automation_gateway_unknown)?;
+        // The sealed request is the one value this frame must keep across every
+        // remaining await, and it inlines the closed operator operation
+        // vocabulary, so holding it by value makes this future larger than the
+        // frame budget while it is suspended. The heap box is a storage detail
+        // only: it is read by reference everywhere below, and it is dropped at
+        // the same point the by-value value was dropped, so no step observes a
+        // different request, lifetime or ownership.
+        let sealed = Box::new(
+            self.seal_user_automation_operation(&store, request)
+                .await
+                .map_err(user_automation_gateway_unknown)?,
+        );
+        let response =
+            Box::pin(UserAutomationService::new(&store).dispatch(sealed.as_ref().clone()))
+                .await
+                .map_err(user_automation_gateway_unknown)?;
         if response.identity != sealed.identity
             || response.state_fence != sealed.context.state_fence
         {
