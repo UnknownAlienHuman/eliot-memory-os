@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 
 pub mod foreign_occupant_recovery;
+mod control_reserve;
 pub mod reactive_context_delivery;
 pub mod runtime_control;
 pub mod user_automation_durable_job;
@@ -22,6 +23,10 @@ pub mod user_automation_wake;
 
 mod service;
 
+pub use control_reserve::{
+    HOST_CANCELLATION_BOTTLENECK, HOST_LAUNCH_BOTTLENECK, HostDimension, HostPermit,
+    HostPermitOperation, HostReserve, HostReserveError,
+};
 pub use foreign_occupant_recovery::{
     AdmittedCollisionOperation, BlockedRecoveryOperation, CollisionOperationDisposition,
     CollisionOriginClass, CollisionRefusal, ForeignOccupantObservation,
