@@ -153,16 +153,21 @@ pub struct RefreshCatalogueRequest {
     pub reason: String,
 }
 
-/// Preference-replacement input: the exact full replacement policy plus the
-/// caller-pinned expected revision/digest. The expectation must equal the
-/// replacement's own revision and recomputed digest, so an expectation copied
-/// from a superseded revision fails closed with
-/// [`SwarmCommandCandidateError::StalePolicy`].
+/// Preference-replacement input: the exact current policy observed in the
+/// already validated envelope (CAS predecessor context) plus the exact full
+/// proposed replacement and the caller-pinned expected predecessor
+/// revision/digest. The expectation is compared against the current policy,
+/// never against the replacement: a P1 -> P2 change compiles only when the
+/// expectation equals P1's revision and recomputed digest, while an
+/// expectation copied from P2 (or from a superseded P0) fails closed with
+/// [`SwarmCommandCandidateError::StalePolicy`]. The replacement is validated
+/// independently and must keep the same account scope and policy ID.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplacePreferencePolicyRequest {
     pub binding: SwarmCommandCallerBinding,
     pub account_scope: String,
+    pub current_policy: HumanModelPreferencePolicy,
     pub policy: HumanModelPreferencePolicy,
     pub expected_policy_revision: String,
     pub expected_policy_digest: String,
@@ -247,9 +252,26 @@ pub enum SwarmCommandKind {
         reason: String,
     },
     ReplacePreferencePolicy {
-        preference_policy_id: String,
-        preference_revision: String,
-        preference_policy_digest: String,
+        /// Exact expected predecessor identity: policy ID, revision, and
+        /// recomputed digest of the current policy this candidate was
+        /// compiled against. CAS anchor for the #485 publisher.
+        ///
+        /// Wire decision (audit 5872365654): there is no legacy or default
+        /// predecessor. These fields are required and unknown fields are
+        /// denied, so a pre-CAS candidate without a predecessor fails
+        /// deserialization closed and is never silently upgraded into a
+        /// valid CAS command. The predecessor triple is covered by the
+        /// sealed canonical digest, so changing the predecessor or the
+        /// replacement changes the digest. This candidate is a view-time
+        /// check only: the #485 owner must recheck the predecessor
+        /// atomically when applying, not trust this earlier check.
+        expected_policy_id: String,
+        expected_policy_revision: String,
+        expected_policy_digest: String,
+        /// Full proposed replacement. Validated independently; must keep the
+        /// predecessor's account scope and policy ID. Its digest is
+        /// deliberately not required to equal the predecessor digest: an
+        /// actual replacement differs from the policy it replaces.
         policy: HumanModelPreferencePolicy,
     },
     RequestSwarmLaunch {
@@ -288,25 +310,26 @@ fn validate_refresh_payload(
 }
 
 fn validate_replace_payload(
-    preference_policy_id: &str,
-    preference_revision: &str,
-    expected_digest: &str,
+    account_scope: &str,
+    expected_policy_id: &str,
+    expected_policy_revision: &str,
+    expected_policy_digest: &str,
     policy: &HumanModelPreferencePolicy,
 ) -> Result<(), SwarmCommandCandidateError> {
-    validate_text(preference_policy_id, "command.preference_policy_id")?;
-    validate_text(preference_revision, "command.preference_revision")?;
-    validate_canonical_digest(expected_digest, "command.preference_policy_digest").map_err(
-        |_| SwarmCommandCandidateError::InvalidField("command.preference_policy_digest"),
-    )?;
+    validate_text(expected_policy_id, "command.expected_policy_id")?;
+    validate_text(expected_policy_revision, "command.expected_policy_revision")?;
+    validate_canonical_digest(expected_policy_digest, "command.expected_policy_digest")
+        .map_err(|_| SwarmCommandCandidateError::InvalidField("command.expected_policy_digest"))?;
     policy.validate()?;
-    if policy.policy_id != *preference_policy_id || policy.revision != *preference_revision {
+    if policy.policy_id != *expected_policy_id {
         return Err(SwarmCommandCandidateError::InvalidField(
             "command.preference_identity",
         ));
     }
-    let actual_digest = preference_policy_digest(policy)?;
-    if actual_digest != *expected_digest {
-        return Err(SwarmCommandCandidateError::StalePolicy);
+    if policy.account_scope != account_scope {
+        return Err(SwarmCommandCandidateError::InvalidField(
+            "command.account_scope",
+        ));
     }
     Ok(())
 }
@@ -409,14 +432,15 @@ impl SwarmCommandKind {
                 reason,
             } => validate_refresh_payload(catalogue_snapshot_id, catalogue_digest, reason),
             Self::ReplacePreferencePolicy {
-                preference_policy_id,
-                preference_revision,
-                preference_policy_digest: expected_digest,
+                expected_policy_id,
+                expected_policy_revision,
+                expected_policy_digest,
                 policy,
             } => validate_replace_payload(
-                preference_policy_id,
-                preference_revision,
-                expected_digest,
+                account_scope,
+                expected_policy_id,
+                expected_policy_revision,
+                expected_policy_digest,
                 policy,
             ),
             Self::RequestSwarmLaunch {
@@ -706,19 +730,31 @@ pub fn compile_refresh_catalogue_candidate(
     finalize_candidate(&request.binding, &request.account_scope, kind)
 }
 
-/// Compiles the preference-replacement candidate preserving the exact full
-/// Human policy plus the source-view identity. The caller-pinned expected
-/// revision/digest must equal the replacement's own revision and recomputed
-/// digest; a stale expectation fails closed.
+/// Compiles the preference-replacement candidate against the exact current
+/// policy carried in the validated envelope. The caller-pinned expected
+/// revision/digest is compared against that current policy (the CAS
+/// predecessor), never against the replacement: P1 -> P2 compiles only with
+/// the P1 expectation, a stale P0 expectation refuses, and a P2 expectation
+/// never bypasses a different current P1. The replacement is validated
+/// independently and must keep the same account scope and policy ID. Pure
+/// and deterministic: no provider call, no settings write, no dispatch.
 pub fn compile_replace_policy_candidate(
     request: &ReplacePreferencePolicyRequest,
 ) -> Result<SwarmCommandCandidate, SwarmCommandCandidateError> {
     validate_text(&request.account_scope, "command.account_scope")?;
     request.binding.validate_for(&request.account_scope)?;
+    request.current_policy.validate()?;
     request.policy.validate()?;
-    if request.policy.account_scope != request.account_scope {
+    if request.current_policy.account_scope != request.account_scope
+        || request.policy.account_scope != request.account_scope
+    {
         return Err(SwarmCommandCandidateError::InvalidField(
             "command.account_scope",
+        ));
+    }
+    if request.current_policy.policy_id != request.policy.policy_id {
+        return Err(SwarmCommandCandidateError::InvalidField(
+            "command.preference_identity",
         ));
     }
     validate_text(
@@ -729,17 +765,17 @@ pub fn compile_replace_policy_candidate(
         &request.expected_policy_digest,
         "command.expected_policy_digest",
     )?;
-    if request.policy.revision != request.expected_policy_revision {
+    if request.current_policy.revision != request.expected_policy_revision {
         return Err(SwarmCommandCandidateError::StalePolicy);
     }
-    let actual_digest = preference_policy_digest(&request.policy)?;
-    if actual_digest != request.expected_policy_digest {
+    let current_digest = preference_policy_digest(&request.current_policy)?;
+    if current_digest != request.expected_policy_digest {
         return Err(SwarmCommandCandidateError::StalePolicy);
     }
     let kind = SwarmCommandKind::ReplacePreferencePolicy {
-        preference_policy_id: request.policy.policy_id.clone(),
-        preference_revision: request.policy.revision.clone(),
-        preference_policy_digest: actual_digest,
+        expected_policy_id: request.current_policy.policy_id.clone(),
+        expected_policy_revision: request.current_policy.revision.clone(),
+        expected_policy_digest: current_digest,
         policy: request.policy.clone(),
     };
     finalize_candidate(&request.binding, &request.account_scope, kind)
