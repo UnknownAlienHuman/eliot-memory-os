@@ -1,6 +1,6 @@
 //! Deterministic schemas generated from the exact Serde contract types.
 
-use schemars::{JsonSchema, schema_for};
+use schemars::{JsonSchema, SchemaGenerator, SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,14 @@ pub const CANONICAL_TOOL_NAMES: [&str; 8] = [
     "eliot.coordinate",
     "eliot.finish",
 ];
+
+/// Supported JSON Schema dialect declared by every generated canonical schema.
+///
+/// Recorded generator configuration: the canonical catalogue is generated with
+/// [`SchemaSettings::draft2020_12`], so every served schema declares this
+/// `$schema` value. Generation output that declares anything else is rejected
+/// instead of being served with silently dropped constraints.
+pub const CANONICAL_SCHEMA_DIALECT: &str = schemars::consts::meta_schemas::DRAFT2020_12;
 
 /// Generated schema descriptor for one canonical tool.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,6 +58,9 @@ pub enum SchemaError {
     /// A generated descriptor and its semantic owner name different versions.
     #[error("generated schema and semantic owner disagree on definition version for {tool}")]
     DefinitionVersionMismatch { tool: String },
+    /// A generated schema declares an unexpected dialect.
+    #[error("generated schema does not declare the supported schema dialect")]
+    UnsupportedDialect,
 }
 
 /// Generates the canonical tool catalogue in stable semantic order.
@@ -67,10 +78,19 @@ pub fn canonical_tool_schemas() -> Result<Vec<ToolSchema>, SchemaError> {
 }
 
 /// Generates canonical JSON Schema from the same type used for Serde decoding.
+///
+/// The generator configuration is pinned to the recorded
+/// [`CANONICAL_SCHEMA_DIALECT`]; output that does not declare it is rejected
+/// rather than advertised with silently dropped constraints.
 pub fn canonical_schema<T: JsonSchema>() -> Result<Value, SchemaError> {
-    let value = serde_json::to_value(schema_for!(T))
+    let schema = SchemaGenerator::new(SchemaSettings::draft2020_12()).into_root_schema_for::<T>();
+    let value = serde_json::to_value(schema)
         .map_err(|error| SchemaError::Serialization(error.to_string()))?;
-    Ok(canonicalize(value))
+    let value = canonicalize(value);
+    if value.get("$schema").and_then(Value::as_str) != Some(CANONICAL_SCHEMA_DIALECT) {
+        return Err(SchemaError::UnsupportedDialect);
+    }
+    Ok(value)
 }
 
 fn descriptor<T: JsonSchema>(name: &str, description: &str) -> Result<ToolSchema, SchemaError> {
