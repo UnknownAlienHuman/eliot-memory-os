@@ -71,11 +71,11 @@ const DECLARED_MANIFEST_BYTES: &[u8] = include_bytes!("../hot-path.toml");
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum HotPathQueueId {
     /// The retained queued local-read pairs the daemon claim leg drains.
-    LocalReadClaim,
+    Claim,
     /// The in-flight bounded named read.
-    LocalRead,
+    Read,
     /// The retained result leg that binds a daemon result to its caller.
-    LocalReadResult,
+    Result,
 }
 
 /// The retained queued local-read queue the claim leg charges its admission
@@ -86,7 +86,7 @@ pub(crate) enum HotPathQueueId {
 /// through the registration this spine builds, not by a caller picking a
 /// bound out of thin air. Exposing all three here would let any holder charge
 /// a bound the declaration never wired to the point that spent it.
-pub(crate) const LOCAL_READ_CLAIM_QUEUE: HotPathQueueId = HotPathQueueId::LocalReadClaim;
+pub(crate) const LOCAL_READ_CLAIM_QUEUE: HotPathQueueId = HotPathQueueId::Claim;
 
 /// The declared operation ids the registration binds, in declaration order.
 ///
@@ -103,14 +103,14 @@ impl HotPathQueueId {
     /// The exact queue id the declaration and the running build both spell.
     const fn as_str(self) -> &'static str {
         match self {
-            Self::LocalReadClaim => "local_read_claim",
-            Self::LocalRead => "local_read",
-            Self::LocalReadResult => "local_read_result",
+            Self::Claim => "local_read_claim",
+            Self::Read => "local_read",
+            Self::Result => "local_read_result",
         }
     }
 
     /// Every queue the Kernel hot spine owns, in declaration order.
-    const ALL: [Self; 3] = [Self::LocalReadClaim, Self::LocalRead, Self::LocalReadResult];
+    const ALL: [Self; 3] = [Self::Claim, Self::Read, Self::Result];
 }
 
 /// A charge against one bound hot-path queue, minted at admission.
@@ -439,7 +439,7 @@ pub(crate) fn kernel_running_build_registration(
             RegisteredOperation {
                 operation: LOCAL_READ_CLAIM_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
-                    queue_id: HotPathQueueId::LocalReadClaim.as_str().to_owned(),
+                    queue_id: HotPathQueueId::Claim.as_str().to_owned(),
                     max_items: max_queued_local_reads,
                     max_bytes: queue_bytes,
                 },
@@ -447,7 +447,7 @@ pub(crate) fn kernel_running_build_registration(
             RegisteredOperation {
                 operation: LOCAL_READ_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
-                    queue_id: HotPathQueueId::LocalRead.as_str().to_owned(),
+                    queue_id: HotPathQueueId::Read.as_str().to_owned(),
                     max_items: max_queued_local_reads,
                     max_bytes: max_frame_bytes,
                 },
@@ -455,7 +455,7 @@ pub(crate) fn kernel_running_build_registration(
             RegisteredOperation {
                 operation: LOCAL_READ_RESULT_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
-                    queue_id: HotPathQueueId::LocalReadResult.as_str().to_owned(),
+                    queue_id: HotPathQueueId::Result.as_str().to_owned(),
                     max_items: max_queued_local_reads,
                     max_bytes: max_frame_bytes,
                 },
