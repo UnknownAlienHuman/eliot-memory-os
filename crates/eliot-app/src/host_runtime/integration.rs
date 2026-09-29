@@ -2723,7 +2723,7 @@ struct ClaudeMarketplaceArtifact {
 /// Flagged Claude MCP front-door artifacts staged into the generated plugin
 /// (issue #2562, item I6).
 ///
-/// `delegate_claude_mcp_to_agent_bridge` (crate root) resolves
+/// `delegate_host_mcp_to_agent_bridge` (crate root) resolves
 /// `eliot-agent-bridge.exe` and `agent-bridge/client-declaration-v2.json`
 /// beside the launched Governor and fails closed when either is absent, so
 /// the installed plugin must carry the same sibling layout in its `bin`
