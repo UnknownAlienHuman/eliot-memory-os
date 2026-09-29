@@ -9444,36 +9444,25 @@ impl HostComposition {
         host_lifecycle_observe_requested(BOUNDARY_RECONCILE_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_RECONCILE_TERMINAL);
         self.ensure_admission_open()?;
-        // #983: the outstanding installation-cutover disposition this Host
-        // journal owner currently retains, observed on the live approved
-        // contour reconcile. Observation only — the read appends nothing,
-        // activates nothing and retires nothing, and a failed read keeps the
-        // reconcile's own outcome rather than becoming one: this contour is a
-        // process/readiness reconcile, not a cutover gate, so a cutover
-        // disposition is never allowed to steer it.
+        // #983 W2: this contour deliberately performs NO retained-cutover
+        // disposition observation. The journal-slot read that used to stand
+        // here existed only to emit a progress log line whose value was
+        // discarded, and it cost up to `CUTOVER_DISPOSITION_READ_ATTEMPTS`
+        // exclusive registry opens plus six journal snapshots on every live
+        // contour tick of the occupied-slot path, purely for logging. W2 forbids
+        // additional owner reads and resource acquisition for logging, so the
+        // observation, its operation token and the retained-intent readback
+        // constructor that only it needed are removed rather than downgraded.
         //
-        // The corroboration lives in the projection, not here, and the value is
-        // deliberately not consumed by this caller. The observed artifact is
-        // the `observe_cutover_progress` record the projection emits, and that
-        // projection is the SHARED status read model: it resolves the
-        // disposition from BOTH owners on one coherence-bracketed read, through
-        // the same journal-owner retirement lookup and the same
-        // `reconcile_cutover_outcome` arms the separately admitted
-        // `backup_dispatch_cutover_disposition` port projects through, so a
-        // retained intent whose target is the active generation is reported
-        // `RetirementPending` only when the registry's own operation-bound
-        // receipt names this operation, and `Unknown` otherwise; a retained
-        // `Pending` intent reaches `Prepared` only when the installation
-        // registry's active generation is still the intent's own durable
-        // `expected_predecessor` and the cross-store pair read as one moment.
-        // So a journal slot alone cannot emit `Prepared` for a state the full
-        // owner read model calls ambiguous, and cannot emit a settlement claim
-        // either — which is what "nothing downstream to correct" means here: no
-        // observed word overstates what its two owners proved, and one durable
-        // state is no longer described two different ways. Nothing here needs
-        // the returned outcome, and reading it would add a gate this contour
-        // does not have.
-        let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
+        // No gate, decision or outcome is lost with them. A cutover disposition
+        // was never allowed to steer this contour — it is a process/readiness
+        // reconcile — and the returned value was never read, so nothing
+        // downstream depended on the progress-log side effect. The retained
+        // disposition stays observable exactly where it is an owner-answered
+        // question: the separately admitted
+        // `backup_dispatch_cutover_disposition` port, which projects the same
+        // `reconcile_cutover_outcome` arms over the same coherence-bracketed
+        // two-owner read of the journal and the installation registry.
         let active =
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())
