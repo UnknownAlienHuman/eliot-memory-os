@@ -5097,6 +5097,8 @@ impl InquiryGovernance {
                     field: "inquiry.claim_audit_binding",
                 });
             }
+        }
+        Ok(())
     }
 
     /// The lane class the discipline decided is bound to the same evidence the
