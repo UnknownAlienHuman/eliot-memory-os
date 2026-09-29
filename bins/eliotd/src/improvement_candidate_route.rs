@@ -35,10 +35,11 @@
 //! Every consumer of a committed record here verifies that the record carries
 //! the identity this daemon's build checks, so a record written under another
 //! domain, encoding revision, or algorithm is a typed refusal
-//! ([`UncheckedRecordIdentity`]) and never a tolerated value. The recorded
-//! digest is validated against the value the producer recorded; it is never
-//! recomputed over local state, and no digest, placeholder, or empty string
-//! stands in for a record this build cannot read.
+//! ([`eliot_maintenance::UncheckedRecordIdentity`]) and never a tolerated
+//! value. The recorded digest is validated against the value the producer
+//! recorded; it is never recomputed over local state, and no digest,
+//! placeholder, or empty string stands in for a record this build cannot
+//! read.
 
 use eliot_maintenance::improvement_pipeline::{
     ImprovementCurrentProposal, RetainedImprovementProposal, compare_improvement_commitments,
@@ -181,8 +182,9 @@ pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, 
 /// The assessment is derived only when `current` carries the SAME domain,
 /// encoding revision, and algorithm this daemon's build checks. A record under
 /// any other identity is refused as the typed
-/// [`UncheckedRecordIdentity`], which crosses into the daemon as the
-/// [`eliot_maintenance::PipelineError`] it wraps rather than becoming a verdict:
+/// [`eliot_maintenance::UncheckedRecordIdentity`], which crosses into the
+/// daemon as the [`eliot_maintenance::PipelineError`] it wraps rather than
+/// becoming a verdict:
 /// there is no fallback assessment, no empty or legacy digest standing in for
 /// the record, and no digest recomputed over what this process happens to hold.
 /// A digest is validated against the ORIGINAL recorded value; it is never
@@ -216,8 +218,8 @@ pub fn assess_improvement_repeat(
 /// The obligation names the exact commitment this run checked, so `current`
 /// must carry this build's checked identity: a record under another domain,
 /// encoding revision, or algorithm is refused as the typed
-/// [`UncheckedRecordIdentity`] rather than bound into an obligation whose
-/// named debt no owner can verify.
+/// [`eliot_maintenance::UncheckedRecordIdentity`] rather than bound into an
+/// obligation whose named debt no owner can verify.
 pub fn reconcile_improvement_unknown(
     prior: &ImprovementAdmissionDecision,
     current: &ImprovementCurrentProposal,
