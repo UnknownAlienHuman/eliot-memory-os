@@ -27,7 +27,7 @@ use eliot_wasm_runtime::component_contract::{
 };
 use eliot_wasm_runtime::{
     CancellationPolicy, EngineTermination, EpochPolicy, InvocationLimits, MAX_EPOCH_DEADLINE_TICKS,
-    Sha256Digest,
+    Sha256Digest, TrapClass,
 };
 
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
@@ -992,7 +992,17 @@ fn map_call_error(
         wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
         wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
         wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
-        _ => return TypedExecutionError::Engine(format!("{call}:guest-trap")),
+        // `unreachable` — the instruction a guest panic lowers to — is a
+        // guest trap, never a guest error: the owner-typed `Trap(GuestTrap)`
+        // cause keeps it distinct from `TypedDomainResult::GuestError` and
+        // from fuel, deadline, stack, and resource terminations. The staged
+        // `Invoke` wrapper records the terminal stage without claiming
+        // success, and the single invocation is never retried on another
+        // world.
+        wasmtime::Trap::UnreachableCodeReached => {
+            EngineTermination::Trap(TrapClass::GuestTrap)
+        }
+        _ => EngineTermination::Trap(TrapClass::GuestTrap),
     };
     TypedExecutionError::Engine(format!("{termination:?}"))
 }
