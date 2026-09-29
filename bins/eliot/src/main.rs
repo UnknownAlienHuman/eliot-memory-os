@@ -3259,6 +3259,20 @@ fn record_or_validate_profile_selection_receipt(
     Ok(recorded)
 }
 
+fn revalidate_recorded_profile_selection_receipt(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+) -> std::result::Result<InstallationTransaction, InstallationError> {
+    if uses_user_owned_supervision(transaction.profile)
+        && transaction.profile_selection_receipt().is_none()
+    {
+        return Err(InstallationError::IncompleteObservation(
+            "original current-user profile root selection receipt is missing".to_owned(),
+        ));
+    }
+    record_or_validate_profile_selection_receipt(store_path, transaction)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the CLI keeps coordinator reopen, sealed readback and bounded outcome output in one auditable boundary"
@@ -3376,11 +3390,22 @@ fn run_installation_effect(
             eliot_installation::InstallationEffectProgressState::Applied { .. }
         )
     });
-    let preflight_status = if preflight_transaction.profile == InstallationProfile::UserMode
+    if uses_user_owned_supervision(preflight_transaction.profile)
+        && preflight_transaction.stage() == InstallationStage::ActiveVerified
+        && let Err(error) =
+            revalidate_recorded_profile_selection_receipt(store_path, &preflight_transaction)
+    {
+        write_installation_error(
+            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+            &format!("current-user retained root selection revalidation failed: {error}"),
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let preflight_status = if uses_user_owned_supervision(preflight_transaction.profile)
         && preflight_transaction.stage() == InstallationStage::ActiveVerified
         && !preflight_effects_applied
     {
-        recover.then_some("PENDING_RUNTIME")
+        Some("PENDING_RUNTIME")
     } else {
         installation_preflight_status(preflight_transaction.stage(), recover)
     };
@@ -3472,18 +3497,18 @@ fn run_installation_effect(
                     eliot_installation::InstallationEffectProgressState::Applied { .. }
                 )
             });
-            let user_mode_supervision_pending = transaction.profile == InstallationProfile::UserMode
+            let user_owned_supervision_pending = uses_user_owned_supervision(transaction.profile)
                 && !all_effects_applied;
-            let terminal_status = if user_mode_supervision_pending {
+            let terminal_status = if user_owned_supervision_pending {
                 "PENDING_RUNTIME"
             } else {
                 "ACTIVE_VERIFIED"
             };
-            let staging = if user_mode_supervision_pending {
+            let staging = if user_owned_supervision_pending {
                 InstallationStagingDisposition {
                     disposition: "PENDING_RUNTIME",
                     reason: Some(
-                        "Host committed the generation, but current-user task registration and run evidence remain pending"
+                        "Host committed the generation, but current-user supervision registration and run evidence remain pending"
                             .to_owned(),
                     ),
                     registry: None,
@@ -3549,7 +3574,7 @@ fn run_installation_effect(
         }
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
-    let mut user_mode_pending = false;
+    let mut user_owned_profile_pending = false;
     let outcome = if recover {
         if preflight_transaction.has_activation_projection_intent() {
             rollback_with_activation_owner(
@@ -3706,25 +3731,32 @@ fn run_installation_effect(
             }
             outcome => outcome,
         }
-    } else if preflight_transaction.profile == InstallationProfile::UserMode {
+    } else if uses_user_owned_supervision(preflight_transaction.profile) {
         if preflight_transaction.stage() == InstallationStage::ActiveVerified {
-            user_mode_pending = true;
+            if let Err(error) = revalidate_recorded_profile_selection_receipt(
+                store_path,
+                &preflight_transaction,
+            ) {
+                write_installation_error(
+                    "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                    &format!("current-user retained root selection revalidation failed: {error}"),
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            user_owned_profile_pending = true;
             Ok(InstallationStepOutcome::Applied {
                 stage: InstallationStage::ActiveVerified,
                 evidence_refs: preflight_transaction.observed_postconditions.clone(),
             })
         } else {
         match coordinator.drive_until_host_bootstrap(&transaction_id) {
-            Ok(InstallationStepOutcome::Applied {
-                evidence_refs: bootstrap_evidence,
-                ..
-            }) => {
+            Ok(InstallationStepOutcome::Applied { .. }) => {
                 let current = match coordinator.store().load(&transaction_id) {
                     Ok(Some(transaction)) => transaction,
                     Ok(None) => {
                         write_installation_error(
                             "INSTALLATION_STATE_UNAVAILABLE",
-                            "UserMode bootstrap prefix applied but the transaction record is gone",
+                            "current-user bootstrap prefix applied but the transaction record is gone",
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
@@ -3732,13 +3764,49 @@ fn run_installation_effect(
                         write_installation_error(
                             "INSTALLATION_APPLY_RECOVERY_REQUIRED",
                             &format!(
-                                "UserMode bootstrap prefix applied but transaction readback failed: {error}"
+                                "current-user bootstrap prefix applied but transaction readback failed: {error}"
                             ),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
                 };
-                let current = match record_or_validate_profile_selection_receipt(
+                if let Err(error) = record_or_validate_profile_selection_receipt(
+                    store_path,
+                    &current,
+                ) {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &format!(
+                            "current-user root/package prefix applied but its original retained root receipt could not be established: {error}"
+                        ),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                match coordinator.drive_until_host_bootstrap(&transaction_id) {
+                    Ok(InstallationStepOutcome::Applied {
+                        evidence_refs: bootstrap_evidence,
+                        ..
+                    }) => {
+                let current = match coordinator.store().load(&transaction_id) {
+                    Ok(Some(transaction)) => transaction,
+                    Ok(None) => {
+                        write_installation_error(
+                            "INSTALLATION_STATE_UNAVAILABLE",
+                            "current-user pre-Phase-B prefix applied but the transaction record is gone",
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "current-user pre-Phase-B prefix applied but transaction readback failed: {error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let current = match revalidate_recorded_profile_selection_receipt(
                     store_path,
                     &current,
                 ) {
@@ -3747,7 +3815,7 @@ fn run_installation_effect(
                         write_installation_error(
                             "INSTALLATION_APPLY_RECOVERY_REQUIRED",
                             &format!(
-                                "UserMode root/package prefix applied but its original retained root receipt could not be established: {error}"
+                                "current-user retained root selection changed before pending projection: {error}"
                             ),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
@@ -3766,7 +3834,7 @@ fn run_installation_effect(
                     Err(error) => {
                         write_installation_error(
                             "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            &format!("retained UserMode Host root could not be reopened: {error}"),
+                            &format!("retained current-user Host root could not be reopened: {error}"),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
@@ -3776,14 +3844,14 @@ fn run_installation_effect(
                     Ok(_) => {
                         write_installation_error(
                             "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            "retained UserMode Host root differs from the exact transaction binding",
+                            "retained current-user Host root differs from the exact transaction binding",
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
                     Err(error) => {
                         write_installation_error(
                             "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            &format!("canonicalize retained UserMode Host root: {error}"),
+                            &format!("canonicalize retained current-user Host root: {error}"),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
@@ -3791,19 +3859,19 @@ fn run_installation_effect(
                 if let Err(error) = host_root.verify_stable_identity() {
                     write_installation_error(
                         "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                        &format!("retained UserMode Host root identity changed: {error}"),
+                        &format!("retained current-user Host root identity changed: {error}"),
                     );
                     return Ok(INVALID_REQUEST_EXIT);
                 }
                 let registry = match RedbInstallationRegistry::open_user_owned_at(
                     host_root,
-                    InstallationProfile::UserMode,
+                    preflight_transaction.profile,
                 ) {
                     Ok(registry) => registry,
                     Err(error) => {
                         write_installation_error(
                             "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            &format!("UserMode pending registry could not be opened: {error}"),
+                            &format!("current-user pending registry could not be opened: {error}"),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
@@ -3813,7 +3881,7 @@ fn run_installation_effect(
                     Err(error) => {
                         write_installation_error(
                             "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            &format!("UserMode pending registry preflight failed: {error}"),
+                            &format!("current-user pending registry preflight failed: {error}"),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
@@ -3825,16 +3893,19 @@ fn run_installation_effect(
                 ) {
                     write_installation_error(
                         "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                        &format!("UserMode pending registry projection failed: {error}"),
+                        &format!("current-user pending registry projection failed: {error}"),
                     );
                     return Ok(INVALID_REQUEST_EXIT);
                 }
                 drop(registry);
-                user_mode_pending = true;
+                user_owned_profile_pending = true;
                 Ok(InstallationStepOutcome::Applied {
                     stage: InstallationStage::Activating,
                     evidence_refs: bootstrap_evidence,
                 })
+                    }
+                    outcome => outcome,
+                }
             }
             outcome => outcome,
         }
@@ -3963,8 +4034,8 @@ fn run_installation_effect(
         && ((transaction.stage() == InstallationStage::Activating
             && transaction.profile == InstallationProfile::SystemService
             && matches!(effective_outcome, InstallationStepOutcome::Rejected))
-            || (transaction.profile == InstallationProfile::UserMode
-                && user_mode_pending
+            || (uses_user_owned_supervision(transaction.profile)
+                && user_owned_profile_pending
                 && matches!(
                     transaction.stage(),
                     InstallationStage::Activating | InstallationStage::ActiveVerified
@@ -3973,17 +4044,21 @@ fn run_installation_effect(
         InstallationStagingDisposition {
             disposition: "PENDING_RUNTIME",
             reason: Some(
-                if transaction.profile == InstallationProfile::UserMode
-                    && transaction.stage() == InstallationStage::ActiveVerified
-                {
-                    "Host committed the generation, but current-user task registration and run evidence remain pending"
-                        .to_owned()
-                } else if transaction.profile == InstallationProfile::UserMode {
-                    "UserMode pending registry projection is staged; Host Phase-B bootstrap and current-user task activation remain pending"
-                        .to_owned()
-                } else {
-                    "Host Phase-B response is unresolved; activation remains fenced and the next command will query-reconcile the exact receipt"
-                        .to_owned()
+                match (transaction.profile, transaction.stage()) {
+                    (_, InstallationStage::ActiveVerified) => {
+                        "Host committed the generation, but current-user supervision and run evidence remain pending"
+                            .to_owned()
+                    }
+                    (InstallationProfile::UserMode, _) => {
+                        "UserMode pending registry projection is staged; Host Phase-B bootstrap and current-user task activation remain pending"
+                            .to_owned()
+                    }
+                    (InstallationProfile::PortableDev, _) => {
+                        "PortableDev pending registry projection is staged; Host Phase-B bootstrap and current-user process supervision remain pending"
+                            .to_owned()
+                    }
+                    _ => "Host Phase-B response is unresolved; activation remains fenced and the next command will query-reconcile the exact receipt"
+                        .to_owned(),
                 },
             ),
             registry: None,
@@ -4236,7 +4311,7 @@ fn installation_command_status(
         InstallationStepOutcome::Applied {
             stage: InstallationStage::Activating,
             ..
-        } if !recover && profile == InstallationProfile::UserMode => "PENDING_RUNTIME",
+        } if !recover && uses_user_owned_supervision(profile) => "PENDING_RUNTIME",
         InstallationStepOutcome::Applied {
             stage: InstallationStage::Activating,
             ..
@@ -4244,13 +4319,13 @@ fn installation_command_status(
         InstallationStepOutcome::Applied {
             stage: InstallationStage::ActiveVerified,
             ..
-        } if !recover && profile == InstallationProfile::UserMode && all_effects_applied => {
+        } if !recover && uses_user_owned_supervision(profile) && all_effects_applied => {
             "ACTIVE_VERIFIED"
         }
         InstallationStepOutcome::Applied {
             stage: InstallationStage::ActiveVerified,
             ..
-        } if !recover && profile == InstallationProfile::UserMode => "PENDING_RUNTIME",
+        } if !recover && uses_user_owned_supervision(profile) => "PENDING_RUNTIME",
         InstallationStepOutcome::Applied {
             stage: InstallationStage::ActiveVerified,
             ..
@@ -4292,7 +4367,12 @@ fn should_query_host_terminal(
     stage: InstallationStage,
     has_activation_projection_intent: bool,
 ) -> bool {
-    matches!(profile, InstallationProfile::SystemService | InstallationProfile::UserMode)
+    matches!(
+        profile,
+        InstallationProfile::SystemService
+            | InstallationProfile::UserMode
+            | InstallationProfile::PortableDev
+    )
         && has_activation_projection_intent
         && matches!(
             stage,
@@ -4300,12 +4380,24 @@ fn should_query_host_terminal(
         )
 }
 
+const fn uses_user_owned_supervision(profile: InstallationProfile) -> bool {
+    matches!(
+        profile,
+        InstallationProfile::UserMode | InstallationProfile::PortableDev
+    )
+}
+
 fn activation_projection_state_is_invalid(
     profile: InstallationProfile,
     stage: InstallationStage,
     has_activation_projection_intent: bool,
 ) -> bool {
-    matches!(profile, InstallationProfile::SystemService | InstallationProfile::UserMode)
+    matches!(
+        profile,
+        InstallationProfile::SystemService
+            | InstallationProfile::UserMode
+            | InstallationProfile::PortableDev
+    )
         && stage == InstallationStage::Activating
         && !has_activation_projection_intent
 }
@@ -5893,7 +5985,7 @@ mod tests {
             InstallationStage::RollbackRequired,
             true,
         ));
-        assert!(!should_query_host_terminal(
+        assert!(should_query_host_terminal(
             InstallationProfile::PortableDev,
             InstallationStage::RollbackRequired,
             true,
