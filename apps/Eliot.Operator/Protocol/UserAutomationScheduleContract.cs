@@ -1054,7 +1054,7 @@ public static class UserAutomationOutcomeClassifier
     // Rust result/transition schema digest. Update only with a reviewed decoder
     // change; the generated mirror alone must not widen the accepted wire.
     private const string SupportedUserAutomationResultSchemaSha256 = "30ebaa34afb15650f576a87522ac2f47f4e367256b31f1ffb8e06d6eb44328e8";
-    private const int MaxTypedEnvelopeChars = 8_192;
+    private const int MaxTypedEnvelopeChars = OperatorProtocol.MaxLineChars;
     private const int MaxIdentityChars = 256;
     // The Kernel's bounded idempotency key is prefixed in operation_id.
     private const int MaxOperationIdChars = 320;

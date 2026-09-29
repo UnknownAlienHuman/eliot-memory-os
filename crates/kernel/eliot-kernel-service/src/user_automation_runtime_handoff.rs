@@ -1235,7 +1235,41 @@ impl UserAutomationOperatorTransition {
         {
             return Err("UserAutomation transition belongs to another request or State Fence".to_owned());
         }
+        self.validate_run_now_wake_readback(request)?;
         self.validate()
+    }
+
+    fn validate_run_now_wake_readback(
+        &self,
+        request: &UserAutomationServiceRequest,
+    ) -> Result<(), String> {
+        let Some(UserAutomationMutationResult::RunNow { invocation, .. }) =
+            self.configuration.mutation_result()
+        else {
+            return Ok(());
+        };
+        let UserAutomationWakePhase::Published { readback } = &self.wake else {
+            return Ok(());
+        };
+
+        let wake_request = run_now_wake_read_request(
+            request.context.clone(),
+            request.authenticated_principal.clone(),
+            self.identity.clone(),
+            invocation.clone(),
+        );
+        readback
+            .validate_for(&wake_request)
+            .map_err(|error| error.to_string())?;
+        if readback.operation_id != self.identity.operation_id
+            || readback.idempotency_key != self.identity.idempotency_key
+        {
+            return Err(
+                "UserAutomation wake readback identity does not match its committed parent"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 
     fn validate_phase_joins(&self) -> Result<(), String> {
