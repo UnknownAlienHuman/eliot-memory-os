@@ -3,7 +3,7 @@
 //!
 //! The canonical source of the daemon capability cells is
 //! `bins/eliotd/Cargo.toml::[package.metadata.eliot]` (`functional_cell_refs`
-/// plus exactly one `functional_cell_state_owners` row per cell), and the
+//! plus exactly one `functional_cell_state_owners` row per cell), and the
 //! migration-readable projection lives in
 //! `workstreams/core-daemons/capability-cell-registry.contract.toml` as
 //! `[[declared_functional_cell]]` rows. Both files are baked at compile time
