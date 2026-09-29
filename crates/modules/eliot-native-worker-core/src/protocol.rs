@@ -9,7 +9,7 @@ use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
     SecretRef,
 };
-use eliot_protocol::AckPhase;
+use eliot_protocol::{AckPhase, EncodingProfile};
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
 use schemars::JsonSchema;
@@ -112,9 +112,7 @@ impl WorkerHello {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(WorkerError::UnsupportedVersion);
         }
-        if self.encoding_profile != JSON_ENCODING_PROFILE {
-            return Err(WorkerError::UnsupportedEncoding);
-        }
+        require_ebp_encoding_profile(&self.encoding_profile)?;
         for (field, value) in [
             ("connection_id", &self.connection_id),
             ("artifact_manifest_digest", &self.artifact_manifest_digest),
@@ -266,9 +264,7 @@ impl WorkerFrame {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(WorkerError::UnsupportedVersion);
         }
-        if self.encoding_profile != JSON_ENCODING_PROFILE {
-            return Err(WorkerError::UnsupportedEncoding);
-        }
+        require_ebp_encoding_profile(&self.encoding_profile)?;
         for (field, value) in [
             ("connection_id", &self.connection_id),
             ("admission_revision", &self.admission_revision),
@@ -971,6 +967,29 @@ pub struct NativeWorkerExecutableExpectation {
     pub revoked: bool,
 }
 
+/// Requires the presented encoding profile to be the EBP-owned `json-v1`
+/// profile (Implements #22 W2).
+///
+/// Parses through the shared `eliot-protocol` contract type instead of
+/// comparing a worker-local string, so an EBP vocabulary change fails this
+/// wire closed instead of drifting. Only `json-v1` is admitted on this
+/// contour; any other profile — including a future EBP profile this contour
+/// does not speak — is refused without dispatch.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::UnsupportedEncoding`] for any profile that is not
+/// the EBP-owned `json-v1` vocabulary value.
+fn require_ebp_encoding_profile(profile: &str) -> Result<(), WorkerError> {
+    let parsed =
+        serde_json::from_value::<EncodingProfile>(serde_json::Value::String(profile.to_owned()))
+            .map_err(|_| WorkerError::UnsupportedEncoding)?;
+    if parsed != EncodingProfile::JsonV1 {
+        return Err(WorkerError::UnsupportedEncoding);
+    }
+    Ok(())
+}
+
 /// Resolves the owner-admitted facet identity governing one `Execute`
 /// dispatch (Implements #22 W2).
 ///
@@ -1639,13 +1658,18 @@ impl NativeReadyReport {
     /// registration-bound in `ClaimAdmissionRequest::validate_binding`); this
     /// gate additionally requires the consulted lease to be the report's own
     /// registration lease (registration identity and generation equality).
+    /// Credential authority is further scoped to the exact epoch and fence
+    /// that admitted it: fencing (epoch advance or fence cutover) revokes
+    /// credential scope even while the lease window is still live, and only
+    /// a new admission seals new authority.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::InvalidRequest`] for a report answering another
-    /// registration or an unbound lease/declaration time, and
-    /// [`WorkerError::StaleLease`] when credential references outlive the
-    /// registration lease.
+    /// registration or an unbound lease/declaration time,
+    /// [`WorkerError::StaleEpoch`]/[`WorkerError::StaleFence`] for a report
+    /// outside the admitting epoch/fence, and [`WorkerError::StaleLease`]
+    /// when credential references outlive the registration lease.
     pub fn validate_credential_lease(
         &self,
         registration: &NativeWorkerRegistration,
@@ -1657,6 +1681,15 @@ impl NativeReadyReport {
             || self.worker_generation != registration.worker_generation
         {
             return Err(WorkerError::InvalidRequest("credential_lease"));
+        }
+        if !self
+            .authority_epoch
+            .is_same_authority(&registration.authority_epoch)
+        {
+            return Err(WorkerError::StaleEpoch);
+        }
+        if self.state_fence != registration.state_fence {
+            return Err(WorkerError::StaleFence);
         }
         if registration.lease_expires_at_unix_ms == 0 || self.ready_at_unix_ms == 0 {
             return Err(WorkerError::InvalidRequest("credential_lease"));
