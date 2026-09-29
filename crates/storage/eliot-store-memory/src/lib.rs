@@ -2320,7 +2320,11 @@ fn learning_range_payload(
 /// rows scope-free — with scope gating at the decision layer per
 /// I12-26). Fence agreement is enforced by the caller: this helper runs
 /// only after `execute_named_sync` proves the query fence equals the
-/// state fence. Reads beyond
+/// state fence. Erasure disposition is checked here as well as on
+/// `GetEvidencePack` (issue #1142): an evidence-backed erased
+/// `(scope_id, subject)` pair is omitted by exact pair, so a purge
+/// cannot be undone by reading the same capture through this projection.
+/// Reads beyond
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
 /// fail closed with [`StoreError::PayloadTooLarge`] instead of
 /// truncating: a truncated audit range cannot prove journal
@@ -2370,6 +2374,20 @@ fn audit_range_payload(
         else {
             continue;
         };
+        // Erasure disposition is checked on this read too, not only on
+        // `GetEvidencePack` (issue #1142): this projection serves the same
+        // durable `CaptureObservation` rows, so an evidence-backed erased
+        // `(scope_id, subject)` pair must not reappear here after the
+        // evidence pack suppressed it. The check is the exact admitted pair
+        // under the row's own retained scope — the same key the erasure
+        // recorded — never a substring, a default scope, or a guess. A
+        // non-envelope subject is skipped below exactly as before.
+        if state
+            .erased_subjects
+            .contains(&(record.scope_id.to_string(), subject.to_owned()))
+        {
+            continue;
+        }
         let Some(candidate) = eliot_store_api::audit_envelope_candidate(subject) else {
             continue;
         };

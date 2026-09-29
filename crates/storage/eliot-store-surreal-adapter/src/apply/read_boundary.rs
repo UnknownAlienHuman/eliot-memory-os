@@ -2981,7 +2981,10 @@ async fn automation_failure_payload(
 /// contours and drop scope-free records the consumer must see. Each
 /// candidate row re-validates its bytes/digest provenance before
 /// shaping, so substituted or truncated evidence fails closed instead
-/// of projecting.
+/// of projecting. Erasure disposition is checked here as well as on
+/// `GetEvidencePack` (issue #1142): an evidence-backed erased
+/// `(scope_id, subject)` pair is omitted by exact pair, so a purge
+/// cannot be undone by reading the same capture through this projection.
 ///
 /// Continuation cursors (optional `cursor` selector): an absent cursor
 /// reads from the start and fails closed with `PayloadTooLarge` past
@@ -3010,6 +3013,13 @@ async fn audit_range_payload(
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
     let rows = read_evidence_records(db, config).await?;
+    let suppression = read_erasure_suppression(db, config).await?;
+    // Defence in depth for any internally constructed indeterminate state: it
+    // is unavailable, not a proved empty projection, and no candidate is
+    // served. The production path reaches the same verdict below.
+    if suppression == ErasureSuppression::Unknown {
+        return Err(AdapterError::Store(StoreError::Unavailable));
+    }
     // Deterministic candidate order across calls: commit sequence, then
     // per-receipt evidence position. Cursors resume by ordinal in this
     // order and stay valid only while revision heads are unchanged (the
@@ -3024,8 +3034,28 @@ async fn audit_range_payload(
             continue;
         }
         let sequence = row.commit_sequence.unwrap_or(u64::MAX);
+        // Erasure disposition is checked on this read too, not only on
+        // `GetEvidencePack` (issue #1142): this projection serves the same
+        // durable `CaptureObservation` rows, so an evidence-backed erased
+        // pair must not reappear here after the evidence pack suppressed it.
+        // The pair is the receipt's own admitted scope plus the row's exact
+        // subject — the same key the erasure recorded — never the caller's
+        // scope, a substring, or a guess. A receipt that cannot present its
+        // own scope cannot prove the pair is unerased, so it is not served.
+        let admitted_scope = row.receipt.as_ref().and_then(|receipt| {
+            receipt
+                .require_reconciliation_envelope()
+                .ok()
+                .map(|envelope| envelope.core.work_scope.scope_id.as_str().to_owned())
+        });
         for (index, evidence) in row.evidence_records.iter().flatten().enumerate() {
             validate_evidence_record(row, evidence).map_err(AdapterError::Store)?;
+            let Some(scope_id) = admitted_scope.as_deref() else {
+                continue;
+            };
+            if suppression.check(scope_id, &evidence.subject) {
+                continue;
+            }
             if let Some(candidate) = eliot_store_api::audit_envelope_candidate(&evidence.subject) {
                 ordered.push((sequence, index, candidate));
             }
