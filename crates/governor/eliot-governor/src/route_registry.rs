@@ -11,11 +11,13 @@
 //!
 //! - **Fingerprint.** [`RouteBehaviorFingerprint`] covers exactly the
 //!   semantics I3.4 lists as behaviour-changing: host family and adapter,
-//!   protocol/transport, runtime and adapter hashes, provider/model/auth/
-//!   billing, the declared execution identity and the User Broker class it is
-//!   delegated to, the message serializer, tool-call ID and role ordering, and
-//!   reasoning continuation/compaction plus feature-flag and tool/context
-//!   profile hashes. Task Policy/Config snapshots, privacy classes and budget
+//!   protocol/transport, adapter and runtime versions and hashes,
+//!   provider/model/auth/billing/account mode, the declared execution identity
+//!   and the User Broker class it is delegated to, retention and network
+//!   policy, session locator semantics, workspace/scope policy, the message
+//!   serializer, tool-call ID and role ordering, and reasoning
+//!   continuation/compaction plus feature-flag and tool/context profile
+//!   hashes. Task Policy/Config snapshots, privacy classes and budget
 //!   envelopes are deliberately outside it, so an unrelated policy edit does
 //!   not invalidate route capability evidence.
 //! - **Requested versus observed.** [`ActualRouteReceipt`] stores the
@@ -60,12 +62,14 @@ use crate::capability_evidence::{
 /// `eliot_contracts` (`canonical_json_bytes` over a struct carrying a
 /// `domain_separator`, then `sha256_hex`).
 ///
-/// Version `v2` is this constant because issue #1816 added the declared
-/// execution identity and its User Broker class to
-/// [`RouteBehaviorFingerprint`], so a `v1` key and a `v2` key over otherwise
-/// identical route material are different keys, exactly as the rule above
-/// requires.
-pub const EFFECTIVE_ROUTE_KEY_DOMAIN: &str = "eliot.governor.effective-route-key.v2";
+/// Version `v3` is this constant because issue #1816 persists the declared
+/// execution identity and its User Broker class (v2) and then the remaining
+/// route-fingerprint facets — adapter/runtime versions, account/credential
+/// mode, retention/network policy, session locator semantics, and
+/// workspace/scope policy — in [`RouteBehaviorFingerprint`], so a key over
+/// older material and a key over the complete material are different keys,
+/// exactly as the rule above requires.
+pub const EFFECTIVE_ROUTE_KEY_DOMAIN: &str = "eliot.governor.effective-route-key.v3";
 
 /// Execution identity a route is configured for (I3.4 `RuntimeRoute`).
 #[derive(
@@ -103,10 +107,27 @@ pub struct RuntimeRoute {
     pub auth_profile_class: String,
     /// Requested billing mode.
     pub billing_mode: String,
+    /// Account/credential mode the route runs under.
+    ///
+    /// Distinct account modes are separate fingerprints (I10.4): a route that
+    /// moves accounts requalifies instead of carrying its session silently
+    /// across the mode change.
+    pub account_mode: String,
     /// Identity the route is configured to execute under.
     pub execution_identity: ExecutionIdentity,
     /// User Broker class the route requires before it may run.
     pub required_user_broker_class: String,
+    /// Retention policy the route runs under (I10.5 records retention and
+    /// deletion for a remote route separately from a local one).
+    pub retention_policy: String,
+    /// Network policy the route runs under.
+    pub network_policy: String,
+    /// Session locator semantics the route assumes (I10.5 native session
+    /// locator: a local session never silently continues as a managed one).
+    pub session_locator_semantics: String,
+    /// Workspace/scope policy the route runs under (I10.7 working
+    /// root/scope).
+    pub workspace_scope_policy: String,
     /// Reasoning/tool/context serializer fingerprint the route assumes.
     pub serializer_fingerprint: String,
     /// Privacy classes the route is allowed to observe.
@@ -130,7 +151,11 @@ impl RuntimeRoute {
     /// User Broker" — is already covered by `required_user_broker_class` being
     /// in the required-identity list above: an `interactive_user` route that
     /// names no User Broker class is blank there and is refused here, and
-    /// `define_route` / `record_receipt` admit nothing that fails this.
+    /// `define_route` / `record_receipt` admit nothing that fails this. The
+    /// account/credential mode and the retention/network, session locator,
+    /// and workspace/scope policies are required here for the same reason:
+    /// they are persisted route-fingerprint facets (issue #1816, I10.4–I10.7),
+    /// so a route that leaves one blank names no usable fingerprint.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         [
@@ -139,7 +164,12 @@ impl RuntimeRoute {
             &self.provider_and_model_request,
             &self.auth_profile_class,
             &self.billing_mode,
+            &self.account_mode,
             &self.required_user_broker_class,
+            &self.retention_policy,
+            &self.network_policy,
+            &self.session_locator_semantics,
+            &self.workspace_scope_policy,
             &self.serializer_fingerprint,
             &self.required_capability_profile_ref,
         ]
@@ -150,6 +180,49 @@ impl RuntimeRoute {
                 .iter()
                 .chain(self.quota_sources.iter())
                 .all(|value| is_identity_text(value))
+    }
+
+    /// Returns whether this route may launch only through the authorized User
+    /// Broker.
+    ///
+    /// I10.3 names exactly one launch path for the interactive user identity;
+    /// `service` and `remote` routes carry no such requirement.
+    #[must_use]
+    pub fn requires_user_broker_delegation(&self) -> bool {
+        self.execution_identity == ExecutionIdentity::InteractiveUser
+    }
+
+    /// Authorizes one launch of this route under the stated delegation.
+    ///
+    /// `delegated_user_broker_class` names the User Broker class the launch
+    /// resolved to, or `None` when the daemon or Kernel launches the route
+    /// process directly. An `interactive_user` route is admitted only when the
+    /// launch resolved to the exact User Broker class the route declares, so
+    /// direct daemon/Kernel launching under a user-desktop identity is
+    /// rejected instead of being treated as equivalent. `service` and
+    /// `remote` routes carry no delegation requirement and are admitted under
+    /// either path; this function never widens a declared identity and never
+    /// infers one that was not declared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouteRegistryError::RouteNotWellFormed`] when the route is
+    /// not a usable intent record, and
+    /// [`RouteRegistryError::InteractiveUserRequiresUserBroker`] when an
+    /// `interactive_user` route is launched without its declared User Broker.
+    pub fn authorize_launch(
+        &self,
+        delegated_user_broker_class: Option<&str>,
+    ) -> Result<(), RouteRegistryError> {
+        if !self.is_well_formed() {
+            return Err(RouteRegistryError::RouteNotWellFormed);
+        }
+        if self.requires_user_broker_delegation()
+            && delegated_user_broker_class != Some(self.required_user_broker_class.as_str())
+        {
+            return Err(RouteRegistryError::InteractiveUserRequiresUserBroker);
+        }
+        Ok(())
     }
 }
 
@@ -164,12 +237,17 @@ impl RuntimeRoute {
 pub struct RouteInstallationIdentity {
     /// Host family the runtime belongs to.
     pub host_family: String,
+    /// Exact adapter version the fingerprint pins (I10.5 exact SDK/runtime
+    /// versions; I10.7 exact adapter/runtime probe).
+    pub adapter_version: String,
     /// Content hash of the exact adapter implementation or bundle.
     pub adapter_hash: String,
     /// Protocol kind, such as App Server or ACP.
     pub protocol_kind: String,
     /// Transport kind, such as stdio, HTTP+SSE or NDJSON sidecar.
     pub transport_kind: String,
+    /// Exact runtime version the fingerprint pins.
+    pub runtime_version: String,
     /// Content hash of the exact runtime executable or package.
     pub runtime_hash: String,
     /// Operating-system architecture of the runtime instance.
@@ -188,9 +266,11 @@ impl RouteInstallationIdentity {
     pub fn is_well_formed(&self) -> bool {
         [
             &self.host_family,
+            &self.adapter_version,
             &self.adapter_hash,
             &self.protocol_kind,
             &self.transport_kind,
+            &self.runtime_version,
             &self.runtime_hash,
             &self.os_architecture,
             &self.tool_call_id_and_role_ordering,
@@ -210,13 +290,13 @@ impl RouteInstallationIdentity {
 pub enum RouteIdentityLayer {
     /// Host family.
     HostFamily,
-    /// Adapter identity or implementation hash.
+    /// Adapter identity, implementation hash, or pinned version.
     Adapter,
     /// Protocol and transport kind.
     ProtocolTransport,
     /// Operating-system architecture of the runtime instance.
     OsArchitecture,
-    /// Runtime instance hash.
+    /// Runtime instance hash or pinned version.
     RuntimeInstance,
     /// Provider and model route.
     ProviderModelRoute,
@@ -224,6 +304,12 @@ pub enum RouteIdentityLayer {
     AuthProfileClass,
     /// Billing mode.
     BillingMode,
+    /// Account/credential mode.
+    ///
+    /// I10.4/I10.5 name distinct account modes as a continuity boundary of
+    /// their own: two routes that differ only in account mode are separate
+    /// fingerprints and a session never carries silently between them.
+    AccountMode,
     /// Message serializer or chat template fingerprint.
     Serializer,
     /// Tool-call ID and role ordering semantics.
@@ -240,6 +326,20 @@ pub enum RouteIdentityLayer {
     /// a `service` and an `interactive_user` route over one adapter and
     /// provider would report no divergence at all.
     ExecutionIdentityBroker,
+    /// Retention and network policy.
+    ///
+    /// One layer for the pair, the same way execution identity and its User
+    /// Broker class are one layer: either policy names the retention/network
+    /// terms the route's identity was approved under.
+    RetentionNetworkPolicy,
+    /// Session locator semantics.
+    ///
+    /// I10.5: a local session locator and a server-managed one are different
+    /// session worlds; a local session that reappears under managed locator
+    /// semantics is a rehydrated attempt, never a resumed one.
+    SessionLocator,
+    /// Workspace/scope policy (I10.7 working root/scope).
+    WorkspaceScopePolicy,
 }
 
 /// All route semantics that can change behaviour (I3.4 `RouteFingerprint`).
@@ -256,10 +356,14 @@ pub struct RouteBehaviorFingerprint {
     pub host_family: String,
     /// Adapter identity.
     pub adapter_id: String,
+    /// Pinned adapter version.
+    pub adapter_version: String,
     /// Protocol kind.
     pub protocol_kind: String,
     /// Transport kind.
     pub transport_kind: String,
+    /// Pinned runtime version.
+    pub runtime_version: String,
     /// Runtime instance hash.
     pub runtime_hash: String,
     /// Adapter implementation hash.
@@ -270,6 +374,8 @@ pub struct RouteBehaviorFingerprint {
     pub auth_profile_class: String,
     /// Billing mode.
     pub billing_mode: String,
+    /// Account/credential mode.
+    pub account_mode: String,
     /// Identity the route is configured to execute under.
     pub execution_identity: ExecutionIdentity,
     /// User Broker class this route is delegated to.
@@ -279,6 +385,14 @@ pub struct RouteBehaviorFingerprint {
     /// moves the fingerprint too: I10-04 makes "the two are separate
     /// `RuntimeRoute` fingerprints".
     pub required_user_broker_class: String,
+    /// Retention policy the route runs under.
+    pub retention_policy: String,
+    /// Network policy the route runs under.
+    pub network_policy: String,
+    /// Session locator semantics the route assumes.
+    pub session_locator_semantics: String,
+    /// Workspace/scope policy the route runs under.
+    pub workspace_scope_policy: String,
     /// Message serializer or chat template fingerprint.
     pub serializer_fingerprint: String,
     /// Tool-call ID and role ordering semantics.
@@ -296,15 +410,22 @@ impl RouteBehaviorFingerprint {
         Self {
             host_family: installation.host_family.clone(),
             adapter_id: route.adapter_id.clone(),
+            adapter_version: installation.adapter_version.clone(),
             protocol_kind: installation.protocol_kind.clone(),
             transport_kind: installation.transport_kind.clone(),
+            runtime_version: installation.runtime_version.clone(),
             runtime_hash: installation.runtime_hash.clone(),
             adapter_hash: installation.adapter_hash.clone(),
             provider_and_model_request: route.provider_and_model_request.clone(),
             auth_profile_class: route.auth_profile_class.clone(),
             billing_mode: route.billing_mode.clone(),
+            account_mode: route.account_mode.clone(),
             execution_identity: route.execution_identity,
             required_user_broker_class: route.required_user_broker_class.clone(),
+            retention_policy: route.retention_policy.clone(),
+            network_policy: route.network_policy.clone(),
+            session_locator_semantics: route.session_locator_semantics.clone(),
+            workspace_scope_policy: route.workspace_scope_policy.clone(),
             serializer_fingerprint: route.serializer_fingerprint.clone(),
             tool_call_id_and_role_ordering: installation.tool_call_id_and_role_ordering.clone(),
             reasoning_continuation_and_compaction: installation
@@ -323,7 +444,9 @@ impl RouteBehaviorFingerprint {
     /// all semantics I3.4 lists as behaviour-changing, including the layers an
     /// evidence scope does not carry (host family, protocol/transport,
     /// tool-call ordering, reasoning continuation/compaction, declared
-    /// execution identity and the User Broker class it is delegated to).
+    /// execution identity and the User Broker class it is delegated to,
+    /// account/credential mode, retention/network policy, session locator
+    /// semantics, and workspace/scope policy).
     #[must_use]
     pub fn diverging_layers(&self, other: &Self) -> Vec<RouteIdentityLayer> {
         let mut layers = Vec::new();
@@ -338,7 +461,9 @@ impl RouteBehaviorFingerprint {
         );
         record(
             RouteIdentityLayer::Adapter,
-            self.adapter_id != other.adapter_id || self.adapter_hash != other.adapter_hash,
+            self.adapter_id != other.adapter_id
+                || self.adapter_hash != other.adapter_hash
+                || self.adapter_version != other.adapter_version,
         );
         record(
             RouteIdentityLayer::ProtocolTransport,
@@ -347,7 +472,8 @@ impl RouteBehaviorFingerprint {
         );
         record(
             RouteIdentityLayer::RuntimeInstance,
-            self.runtime_hash != other.runtime_hash,
+            self.runtime_hash != other.runtime_hash
+                || self.runtime_version != other.runtime_version,
         );
         record(
             RouteIdentityLayer::ProviderModelRoute,
@@ -361,6 +487,10 @@ impl RouteBehaviorFingerprint {
             RouteIdentityLayer::BillingMode,
             self.billing_mode != other.billing_mode,
         );
+        record(
+            RouteIdentityLayer::AccountMode,
+            self.account_mode != other.account_mode,
+        );
         // Declared execution identity and the User Broker class it is delegated
         // to are one identity layer: a change to either names the same layer
         // once, so an interactive_user route and a service route over one
@@ -369,6 +499,23 @@ impl RouteBehaviorFingerprint {
             RouteIdentityLayer::ExecutionIdentityBroker,
             self.execution_identity != other.execution_identity
                 || self.required_user_broker_class != other.required_user_broker_class,
+        );
+        // Retention and network policy are one layer, the same way execution
+        // identity and its User Broker class are: either policy names the
+        // terms the route's identity was approved under, so a move on either
+        // is a new fingerprint.
+        record(
+            RouteIdentityLayer::RetentionNetworkPolicy,
+            self.retention_policy != other.retention_policy
+                || self.network_policy != other.network_policy,
+        );
+        record(
+            RouteIdentityLayer::SessionLocator,
+            self.session_locator_semantics != other.session_locator_semantics,
+        );
+        record(
+            RouteIdentityLayer::WorkspaceScopePolicy,
+            self.workspace_scope_policy != other.workspace_scope_policy,
         );
         record(
             RouteIdentityLayer::Serializer,
@@ -710,6 +857,14 @@ pub enum RouteRegistryError {
     /// as an unsupported observation.
     #[error("observed route requires at least one evidence-bearing observation reference")]
     ObservationEvidenceUnproven,
+    /// An `interactive_user` route was launched without resolving to its
+    /// declared User Broker class.
+    ///
+    /// I10.3 admits `interactive_user` launches only through the authorized
+    /// User Broker: direct daemon or Kernel launching under a user-desktop
+    /// identity is rejected instead of being treated as equivalent.
+    #[error("an interactive_user route may launch only through its declared User Broker class; direct daemon or kernel launching under a user-desktop identity is rejected")]
+    InteractiveUserRequiresUserBroker,
 }
 
 /// Evidence status, source and expiry shown with a route admission decision.
@@ -1043,17 +1198,23 @@ impl CapabilityRouteRegistry {
     /// the diverging layers so the route can be requalified.
     ///
     /// An execution-identity move is reported the same way, as an explicit
-    /// changed layer rather than silent continuity: `route_layers_changed`
+    /// changed layer rather than silent continuity — and so is every other
+    /// fingerprint move the evidence scope cannot see. `route_layers_changed`
     /// names [`RouteIdentityLayer::ExecutionIdentityBroker`] whenever the
     /// previously retained receipt for this `route_id` declared a different
-    /// execution identity or User Broker class. That layer alone also refuses
-    /// admission: the evidence scope carries no execution identity, so retained
-    /// records still match the current scope exactly across the move, and
-    /// without the refusal the route would be admitted under fresh evidence
-    /// observed for a different identity. The route must requalify under the
-    /// identity it now declares. This is the I10-04 "the two are separate
-    /// `RuntimeRoute` fingerprints and continuity does not transfer silently
-    /// between them" rule, derived rather than asserted.
+    /// execution identity or User Broker class, and likewise names a billing,
+    /// account-mode, adapter-version, or policy move. Any behaviour-layer
+    /// change at all refuses admission: the evidence scope carries no
+    /// execution identity, no billing/account mode, and none of the policy
+    /// facets, so retained records still match the current scope exactly
+    /// across such a move, and without the refusal the route would be admitted
+    /// under fresh evidence observed for a different identity, account, or
+    /// policy. The route must requalify under what it now declares. This is
+    /// the I10-04 "the two are separate `RuntimeRoute` fingerprints and
+    /// continuity does not transfer silently between them" rule, extended to
+    /// the I10.4/I10.5 local-versus-managed and distinct-account-mode
+    /// transitions: each is an explicit rehydrated/new attempt, derived rather
+    /// than asserted.
     ///
     /// # Errors
     ///
@@ -1110,15 +1271,16 @@ impl CapabilityRouteRegistry {
             retained.iter().map(|record| (*record).into()).collect();
         let observed_diverging_layers = receipt.observed.diverging_layers(&receipt.requested);
         let unknown_layers = receipt.observed.unknown_layers();
-        // I10-04: "The two are separate `RuntimeRoute` fingerprints and
-        // continuity does not transfer silently between them." The evidence
-        // scope carries no execution identity, so prior evidence still matches
-        // the current scope exactly across an identity change. Admission must
-        // therefore refuse on the identity layer itself rather than let the
-        // unchanged scope carry the route over silently; the route requalifies
-        // under evidence observed for the identity it now declares.
-        let identity_changed =
-            route_layers_changed.contains(&RouteIdentityLayer::ExecutionIdentityBroker);
+        // I10-04/I10-05: separate `RuntimeRoute` fingerprints never share
+        // continuity. The evidence scope carries no execution identity, no
+        // billing/account mode, and none of the policy facets, so retained
+        // records still match the current scope exactly across such a move.
+        // Admission therefore refuses on the fingerprint move itself: any
+        // behaviour-layer change since the previously retained receipt —
+        // local/managed adapter, service/interactive identity, distinct
+        // account mode, or policy move — is an explicit rehydrated/new
+        // attempt that must requalify, never silent continuation.
+        let continuity_breaking_change = !route_layers_changed.is_empty();
         let Some(current) = receipt.current_scope() else {
             return Ok(RouteAdmission {
                 route_id: receipt.route_id.clone(),
@@ -1147,7 +1309,7 @@ impl CapabilityRouteRegistry {
                 && record.is_time_fresh(now)
                 && evidence.admit_production_route(capability, &current, now)
         });
-        if let Some(record) = admitting.filter(|_| !identity_changed) {
+        if let Some(record) = admitting.filter(|_| !continuity_breaking_change) {
             return Ok(RouteAdmission {
                 route_id: receipt.route_id.clone(),
                 requested_fingerprint,
@@ -1171,11 +1333,12 @@ impl CapabilityRouteRegistry {
             .collect();
         let reason = if restrictive {
             RouteRefusalReason::EvidenceRestrictive
-        } else if identity_changed {
-            // Prior evidence was observed under a different declared execution
-            // identity. The evidence scope carries no identity, so the retained
-            // records still match it exactly; the route is stale for the
-            // identity it now declares and must be requalified.
+        } else if continuity_breaking_change {
+            // The fingerprint moved since the previously retained receipt —
+            // an identity, account-mode, adapter, or policy transition the
+            // evidence scope cannot see. The route is stale for what it now
+            // declares and must be requalified as an explicit rehydrated/new
+            // attempt.
             RouteRefusalReason::EvidenceStale
         } else if retained.is_empty() {
             RouteRefusalReason::EvidenceAbsent
