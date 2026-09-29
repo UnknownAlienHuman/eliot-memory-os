@@ -1082,31 +1082,31 @@ impl MaintenanceScheduleEvidence {
 /// desktop-bound work; I14.24 requires broker loss/revocation to stop affected
 /// interactive work while service-safe routes continue. The daemon's retained
 /// transport-session facts are not User Broker evidence and never satisfy a
-/// broker gate on their own: no broker lease/session observation is joined
-/// here yet, so interactive admission stays fail-closed and the stored flag
-/// only reports transport presence for the existing input field.
+/// broker gate on their own. The current Kernel client has no daemon-facing
+/// query for the authoritative broker registration/lease, so this evidence can
+/// only represent that the required owner observation is unavailable. No
+/// token, credential, or reusable desktop secret is carried.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaintenanceBrokerEvidence {
-    /// Whether the daemon retains a validated transport session.
-    pub transport_session_present: bool,
-}
+pub struct MaintenanceBrokerEvidence;
 
 impl MaintenanceBrokerEvidence {
-    /// Records transport-only presence: the one gate the daemon genuinely
-    /// observes, explicitly not broker admission.
+    /// Records that the authenticated User Broker owner query is unavailable.
+    ///
+    /// A validated daemon transport session is deliberately not accepted as a
+    /// substitute. Until the Kernel exposes a current authenticated broker
+    /// observation, interactive maintenance remains denied.
     #[must_use]
-    pub const fn transport_only(present: bool) -> Self {
-        Self {
-            transport_session_present: present,
-        }
+    pub const fn owner_query_unavailable() -> Self {
+        Self
     }
 
-    /// Transport presence carried by the existing input field. This is not
-    /// broker admission; `requires_interactive_session` stays denied until a
-    /// real broker observation plus the separate policy arrive.
+    /// Whether a current authenticated User Broker session is established.
+    ///
+    /// This returns `false` while the authoritative Kernel owner query is not
+    /// available; transport presence cannot promote it to `true`.
     #[must_use]
-    pub const fn transport_present(&self) -> bool {
-        self.transport_session_present
+    pub const fn authenticated_session_available(&self) -> bool {
+        false
     }
 }
 
