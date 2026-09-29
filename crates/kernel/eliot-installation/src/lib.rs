@@ -6003,9 +6003,13 @@ impl WindowsInstallationEffectPort {
             HostCredentialControlResponse::Absent { snapshot, .. } => {
                 snapshot.host_process_identity == *host_process_digest
             }
-            HostCredentialControlResponse::Matching { receipt }
-            | HostCredentialControlResponse::PhaseBPrepared { receipt }
-            | HostCredentialControlResponse::PhaseBReady { receipt } => {
+            HostCredentialControlResponse::Matching { receipt } => {
+                receipt.host_process_identity == *host_process_digest
+            }
+            HostCredentialControlResponse::PhaseBPrepared { receipt } => {
+                receipt.host_process_identity == *host_process_digest
+            }
+            HostCredentialControlResponse::PhaseBReady { receipt } => {
                 receipt.host_process_identity == *host_process_digest
             }
             HostCredentialControlResponse::Deleted { .. } => request
