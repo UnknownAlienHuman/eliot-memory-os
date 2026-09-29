@@ -6427,11 +6427,7 @@ impl KernelComposition {
         // by the next take. The typed outcome is consumed below but never
         // fails the write whose retain it records.
         let persist_outcome = pending_journal.as_ref().map(|snapshot| {
-            persist_pre_stage_corrections(
-                &self.work_root,
-                &self.pre_stage_identity_cache,
-                snapshot,
-            )
+            persist_pre_stage_corrections(&self.work_root, &self.pre_stage_identity_cache, snapshot)
         });
         // Consume the restore/save outcomes before admitting a dependent
         // write (issue #1796, audit 5890973032 defect 2): a failed recovery
