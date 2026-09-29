@@ -829,7 +829,10 @@ pub fn compile_swarm_admission_plan(
 /// staffed slot resolves to exactly one binding. Duplicate work-unit, attempt,
 /// lease, or route-receipt bindings fail closed here, mirroring the plan-level
 /// denominator check, so a crossed or replayed admission identity cannot pass
-/// the entry even before per-slot validation runs.
+/// the entry even before per-slot validation runs. The envelope lanes must
+/// already carry the same exact denominator: an envelope with a missing, extra,
+/// or triple-shared lane can never yield a plan, so it is refused here through
+/// the same owner check the plan level runs, before any slot digest is sealed.
 fn admit_all_slots(
     request: &SwarmAdmissionBindRequest,
 ) -> Result<Vec<SwarmBoundSlot>, SwarmAdmissionBindError> {
@@ -840,6 +843,7 @@ fn admit_all_slots(
             "admission.denominator",
         ));
     }
+    validate_lane_denominator(&request.admission, request.staffing.slots.len())?;
     let mut seen_slot_ids = BTreeSet::new();
     let mut seen_work_units = BTreeSet::new();
     let mut seen_attempts = BTreeSet::new();
