@@ -283,7 +283,7 @@ fn parse_manifest(text: &str) -> Result<Vec<ManifestCell>, CellRegistryError> {
         }
     }
     for row in &owners {
-        if !refs.iter().any(|reference| *reference == row.cell) {
+        if !refs.contains(&row.cell) {
             return Err(CellRegistryError::RefsOwnersMismatch {
                 detail: format!("owner row {} has no ref", row.cell),
             });
@@ -339,7 +339,7 @@ fn string_array(section: &[&str], key: &str) -> Result<Vec<String>, CellRegistry
         if value.is_empty() {
             return Err(malformed("entry is empty"));
         }
-        if values.iter().any(|seen| *seen == value) {
+        if values.contains(&value) {
             return Err(malformed(&format!("duplicate entry {value}")));
         }
         values.push(value);
@@ -526,7 +526,6 @@ fn parse_contract(text: &str) -> Result<Vec<ContractCell>, CellRegistryError> {
                 return Err(malformed("row repeats mutable_state_owner"));
             }
             owner = Some(value);
-            continue;
         }
     }
     flush(&mut cell, &mut owner, &mut rows)?;
