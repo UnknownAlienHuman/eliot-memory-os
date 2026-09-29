@@ -394,8 +394,17 @@ impl PreparationError {
 // /`projection_to_preparation`/`intent_json`/`result_json`/`destination_from_result`
 // /`owner_identity_evidence`/`reject_audit_note`
 // (private steps whose outcome surfaces with its exact category at the owning
-// boundary). No record asserts destination readiness, source retirement, or
-// activation: `destination_epoch` is preparation scope, never authority.
+// boundary). The durable sink adds only the same shape of step:
+// `HostStatePreparationJournal::{snapshot, record_fence, retained, append}` and
+// `preparation_handle`/`preparation_mutation`/`preparation_state_spelling` are
+// private steps whose outcome surfaces with its exact category at the owning
+// boundary; `HostStatePreparationJournal::{record_intent, record_result, load,
+// list_operations}` are the `PreparationJournal` port itself, whose refusals
+// propagate through the existing `record_intent`/`record_result` phase records
+// of `prepare_isolated_destination`, and `load`/`list_operations` are read-only
+// projections that observe no phase. No record asserts destination readiness,
+// source retirement, or activation: `destination_epoch` is preparation scope,
+// never authority.
 
 /// Operation tokens for preparation diagnostics (stable, static only).
 const OP_PREPARE: &str = "prepare";
@@ -812,11 +821,10 @@ pub trait PreparationJournal {
 ///
 /// This is the production sink for issue #958's A4. It holds a borrow of the
 /// composition's own [`ProductionHostStateJournal`] and writes the owner's
-/// [`BackupPreparationRecord`] through
-/// [`crate::journal_append::append_reconciled`] — the single reconcile-decision
-/// choke every `ProductionHostStateJournal` write in this crate already goes
-/// through, so an unknown append outcome is reconciled under one policy rather
-/// than forked here.
+/// [`BackupPreparationRecord`] through `crate::journal_append::append_reconciled`
+/// — the single reconcile-decision choke every `ProductionHostStateJournal`
+/// write in this crate already goes through, so an unknown append outcome is
+/// reconciled under one policy rather than forked here.
 ///
 /// It adds no storage, no writer and no lifecycle of its own: the record type,
 /// its state law, its fence, its idempotency keying and its `backup_preparations`
@@ -1092,6 +1100,13 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
     /// own values disagree with the retained frame is refused here as a typed
     /// conflict before any append, so a mismatched result never reaches the
     /// journal as a re-scoped preparation.
+    ///
+    /// The receipt is read back through [`destination_from_result`], the same
+    /// reader the in-memory path reconciles through, rather than decoded
+    /// structurally: `result_json` renders `root` and `root_identity` as plain
+    /// strings, so a structural decode of [`PreparedDestination`] would reject
+    /// the module's own result frame. Both sinks therefore accept exactly the
+    /// frames this module produces.
     fn record_result(
         &mut self,
         operation_id: &str,
@@ -1117,13 +1132,12 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
                     .to_owned(),
             });
         }
-        let destination: PreparedDestination =
-            serde_json::from_value(result.clone()).map_err(|_| {
-                PreparationError::InvalidRequest {
-                    field: "result",
-                    reason: "result frame is not a decodable prepared destination".to_owned(),
-                }
-            })?;
+        let Some(destination) = destination_from_result(operation_id, result) else {
+            return Err(PreparationError::InvalidRequest {
+                field: "result",
+                reason: "result frame is not a readable prepared destination".to_owned(),
+            });
+        };
         let pinned = destination.root_identity.identity.as_str();
         // The result must describe the very root and identity the durable
         // admission proposed, or it is not this operation's result. Every
