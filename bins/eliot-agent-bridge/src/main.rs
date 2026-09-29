@@ -1139,7 +1139,9 @@ fn main() {
 /// fails closed and stores nothing. The context is noted together with the
 /// supplied task inputs as one owner-produced snapshot sealed to the live
 /// attach, so the once-per-session auto-boot below composes from the same
-/// snapshot rather than a separate empty task set. The first successful
+/// snapshot rather than a separate empty task set. The sealed task set is
+/// frozen at note time: retrieval with any other task set refuses with a
+/// typed error instead of composing mixed-source authority. The first successful
 /// retrieval in a session also satisfies the once-per-session auto-boot;
 /// later retrievals use the explicit path so they stay available after
 /// auto-boot delivery.
