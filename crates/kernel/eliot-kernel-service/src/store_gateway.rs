@@ -6832,6 +6832,20 @@ fn decode_retained_cancellation_answer(
                 owner_operation_id,
             ));
         }
+        let expected_wake_ids = enumeration_receipt
+            .cancellation_targets()
+            .map_err(|_| {
+                unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
+            })?
+            .into_iter()
+            .map(|target| target.wake_id)
+            .collect::<Vec<_>>();
+        if expected_wake_ids.is_empty() || cancelled_wake_ids != expected_wake_ids {
+            return Err(unretained_cancellation_answer_reason(
+                automation_revision,
+                owner_operation_id,
+            ));
+        }
         return Ok((cancelled_wake_ids, *enumeration_receipt));
     }
     let Some(expected_transport_request_sha256) = expected_transport_request_sha256 else {
