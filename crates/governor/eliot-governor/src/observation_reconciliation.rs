@@ -364,7 +364,9 @@ fn check_problem_transition(
         }),
         containment: None,
         repair_history: Vec::new(),
-        next_probe: Some(format!("independent verification of effect {effect_digest}")),
+        next_probe: Some(format!(
+            "independent verification of effect {effect_digest}"
+        )),
         resolution_condition: format!("independent verification of effect {effect_digest}"),
         state: ProblemState::Verifying,
         acknowledged_by: None,
@@ -385,9 +387,7 @@ fn check_problem_transition(
     // authorise the resolution, so the resolution is never taken on a title
     // and a log dump.
     let brief = DiagnosticBrief::compile(&scratch).map_err(|error| {
-        owner_refused(format!(
-            "verified problem brief is not compilable: {error}"
-        ))
+        owner_refused(format!("verified problem brief is not compilable: {error}"))
     })?;
     if brief.evidence_handles != scratch.evidence_refs {
         return Err(owner_refused(

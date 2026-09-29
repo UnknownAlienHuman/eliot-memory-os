@@ -684,7 +684,7 @@ impl Problem {
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         owner_name(principal)?;
-        if self.owner.as_ref().map(OwnerRef::principal.as_str()) != Some(principal) {
+        if self.owner.as_ref().map(|owner| owner.principal.as_str()) != Some(principal) {
             return Err(ProblemError::OwnerMismatch);
         }
         match &self.acknowledged_by {
@@ -1060,7 +1060,7 @@ impl Incident {
         same_fence(expected_fence, &self.state_fence)?;
         promotion.validate()?;
         source.validate()?;
-        if &promotion.source_problem != &source.problem_id {
+        if promotion.source_problem != source.problem_id {
             return Err(ProblemError::InvalidField {
                 field: "source_problem",
                 reason: "promotion names a different source Problem",
@@ -1083,7 +1083,9 @@ impl Incident {
         candidate.state = IncidentState::Open;
         candidate.reason = Some(promotion.reason);
         candidate.source_problem = Some(source.problem_id.clone());
-        candidate.promotion_evidence = promotion.evidence_refs.clone();
+        candidate
+            .promotion_evidence
+            .clone_from(&promotion.evidence_refs);
         candidate.acknowledged_by = None;
         candidate.revision = revision;
         candidate.validate()?;
@@ -1110,7 +1112,7 @@ impl Incident {
     pub fn reopen(
         &mut self,
         expected_fence: &StateFence,
-        evidence: Vec<ArtifactId>,
+        evidence: &[ArtifactId],
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         if !matches!(
@@ -1122,11 +1124,11 @@ impl Incident {
                 to: "OPEN".to_owned(),
             });
         }
-        nonempty(&evidence, "new_evidence")?;
+        nonempty(evidence, "new_evidence")?;
         let revision = next_revision(self.revision)?;
         let reopen_count = next_reopen_count(self.reopen_count)?;
         let mut candidate = self.clone();
-        for reference in &evidence {
+        for reference in evidence {
             if !candidate.evidence_refs.contains(reference) {
                 candidate.evidence_refs.push(reference.clone());
             }
@@ -2450,9 +2452,7 @@ mod tests {
         assert_eq!(value.state, ProblemState::Open);
         assert!(!value.is_resolved());
         assert_eq!(value.acknowledged_by, None);
-        assert!(value
-            .evidence_refs
-            .contains(&artifact("lease-expiry-1")?));
+        assert!(value.evidence_refs.contains(&artifact("lease-expiry-1")?));
         assert!(matches!(
             value.acknowledge(&fence, "owner-1"),
             Err(ProblemError::OwnerMismatch)
@@ -2485,9 +2485,11 @@ mod tests {
         value.transition(&fence, ProblemState::Verifying)?;
         value.transition(&fence, ProblemState::Resolved)?;
         let before = value.clone();
-        assert!(value
-            .owner_loss(&fence, vec![artifact("lease-expiry-1")?])?
-            .is_none());
+        assert!(
+            value
+                .owner_loss(&fence, vec![artifact("lease-expiry-1")?])?
+                .is_none()
+        );
         assert_eq!(value, before);
         Ok(())
     }
@@ -2700,15 +2702,23 @@ mod tests {
         source.owner = None;
         let brief = DiagnosticBrief::compile(&source)?;
         assert_eq!(brief.evidence_handles, source.evidence_refs);
-        assert!(brief
-            .unknowns
-            .iter()
-            .any(|unknown| unknown.contains("unassigned")));
-        assert!(brief
-            .unknowns
-            .iter()
-            .any(|unknown| unknown.contains(&source.resolution_condition)));
-        assert!(brief.hypotheses.contains(&"retained effect is stale".to_owned()));
+        assert!(
+            brief
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.contains("unassigned"))
+        );
+        assert!(
+            brief
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.contains(&source.resolution_condition))
+        );
+        assert!(
+            brief
+                .hypotheses
+                .contains(&"retained effect is stale".to_owned())
+        );
         Ok(())
     }
 
