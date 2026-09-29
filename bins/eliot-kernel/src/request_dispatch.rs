@@ -147,6 +147,7 @@ use super::backup_capture::{
     KernelBackupCapture, MEMBER_DOMAIN_BLOB, MEMBER_DOMAIN_CANONICAL, MEMBER_DOMAIN_RECEIPT,
     archived_state_fence_digest, class_name, member_domain_count,
 };
+use super::backup_verify_provenance::{OwnerProvenanceEvidence, check_provenance_binding};
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
 use super::{
     CaptureCallerAuth, CaptureReport, CaptureState, KernelCaptureError, KernelComposition,
@@ -1157,6 +1158,19 @@ fn record_from_projection(
 ///   `archive_sha256` alone is content integrity, not the source/capture operation
 ///   identity (I5.27), which is why the archive's own source installation, owner
 ///   contract and export-fence digest travel with it.
+/// - `archive_handle`, `capture_receipt_digest` and `validity_attestation_digest`
+///   are the three #2862 owner-evidence commitments, and they come from the
+///   `OwnerProvenanceEvidence` PARAMETER rather than from anything decoded here.
+///   That is deliberate: they are the retained archive handle, the capture
+///   owner's own recorded receipt digest and the verifier's own recorded
+///   attestation digest, so their only legitimate source is the owner that
+///   issued them (I5.13 "Backup existence is not recovery proof"). The
+///   exhaustive checked adapter is
+///   `backup_verify_provenance::OwnerProvenanceEvidence::bind_into`, and the
+///   route has already bound and validated every owner value it holds through
+///   `backup_verify_provenance::check_provenance_binding` before this function
+///   runs. Nothing here re-derives a digest, and an absent owner answer stays
+///   `None`.
 /// - `operation_id` is the caller-provided idempotency text. It is the only
 ///   caller-authored value in the identity, and it is namespaced: it can never be
 ///   a durable key on its own.
@@ -1199,6 +1213,7 @@ fn backup_verify_identity(
     session: &Session,
     caller: &CaptureCallerAuth,
     report: &CaptureReport,
+    provenance: &OwnerProvenanceEvidence,
     idempotency_key: &str,
 ) -> Result<BackupVerifyRequestIdentity, String> {
     let mut identity = backup_verify_admitted_identity(session, caller, idempotency_key)?;
@@ -1236,6 +1251,18 @@ fn backup_verify_identity(
     identity
         .capture_receipt
         .clone_from(&report.receipt_identity);
+    // #2862 (item I2): the three owner-evidence commitments are written by the
+    // EXHAUSTIVE CHECKED ADAPTER in `backup_verify_provenance`, and only from
+    // the OWNER'S OWN RECORDED values. They are read from `provenance`, never
+    // from caller text and never from a sibling field of this identity, so a
+    // changed handle, capture receipt or attestation under one operation id is
+    // the I5.27 identity conflict rather than a second answer. On this tree the
+    // evidence is the owner's own `unissued()` answer, so all three stay `None`
+    // — an owner's absence, not a placeholder — and the digest below is
+    // unchanged from what it was before #2862 wired this path.
+    provenance
+        .bind_into(&mut identity)
+        .map_err(|error| format!("{}: {}", error.field(), error.reason()))?;
     identity
         .with_computed_digest()
         .map_err(|error| error.to_string())
@@ -1312,6 +1339,10 @@ fn backup_verify_admitted_identity(
         // validity attestation on this product at all. They are recorded as the
         // owner's own answer and are never filled from caller text; ORS
         // `validate()` requires each to be either a well-formed digest or absent.
+        // #2862 also left them absent HERE, and `backup_verify_identity` is where
+        // they are filled: from the owner's recorded evidence through
+        // `backup_verify_provenance::OwnerProvenanceEvidence::bind_into`, never
+        // from this probe, because the key preimage must not depend on them.
         archive_handle: None,
         capture_receipt_digest: None,
         validity_attestation_digest: None,
@@ -2202,6 +2233,25 @@ impl KernelComposition {
     /// decoded and validated first either way, so a reconciliation never skips the
     /// capture owner's admission gate.
     ///
+    /// #2862 adds one step between the successor branch and the identity: the
+    /// owner-issued archive provenance for THIS operation, and the binding of
+    /// every owner-issued value it holds to the archive the capture owner just
+    /// reported, in `super::backup_verify_provenance`. The step is placed AFTER
+    /// the successor branch so `successor_of` keeps byte-for-byte its current
+    /// caller-presented, fail-closed, lower-ceiling behaviour (I10), and it
+    /// changes no authority: it reads nothing, writes nothing, and its only
+    /// effect on a row is the three owner-evidence references the accepted
+    /// identity already carried as `None`. The chain is STRUCTURAL →
+    /// PROVENANCE → CLASS and never collapses: structural validation is the
+    /// capture owner's own level, provenance is the owner-issued evidence the
+    /// gate validates, and the class ceiling is the owner's own value that this
+    /// step never reads or raises — no matching text and no matching digest
+    /// promotes a level on this path (I5, I5.13 "Backup existence is not
+    /// recovery proof"). The route therefore still performs no restore, no
+    /// decryption or key-availability proof, no activation, no epoch change, no
+    /// import, no cutover and no Product-readiness transition, and its single
+    /// durable effect remains the one request/result/receipt row (I11).
+    ///
     /// The command stays read-only in every other respect: no restore, no
     /// activation, no cutover, no key availability, no Product readiness and no
     /// installation mutation. The added effect is one durable readback row.
@@ -2268,7 +2318,36 @@ impl KernelComposition {
                 idempotency_key,
             ));
         }
-        let identity = match backup_verify_identity(session, &caller, &report, idempotency_key) {
+        // #2862 (items I3/I4): the owner-issued archive provenance for THIS
+        // operation is resolved and every owner-issued value it holds is bound
+        // to the archive the capture owner just reported, BEFORE any verdict is
+        // produced. On today's tree the answer is
+        // `OwnerProvenanceEvidence::unissued` — no admitted owner resolves a
+        // retained handle and no `BackupRole::Verifier` session issues a capture
+        // receipt or an archive validity attestation (the measured reasons are
+        // enumerated in `backup_verify_provenance`'s module docs) — so this
+        // check is the reason a mismatched receipt can never reach a
+        // provenance-qualified verdict rather than an incidental guard: the
+        // refusal path is the same structural `invalid_reply` an
+        // archive-invalid frame already gets, and it carries no ceiling and no
+        // class claim. It runs AFTER the successor branch on purpose, so I10's
+        // caller-presented `successor_of` behaviour is byte-for-byte unchanged.
+        let provenance = OwnerProvenanceEvidence::unissued();
+        if let Err(refusal) = check_provenance_binding(&provenance, &report, &bundle_raw) {
+            return Ok(invalid_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                refusal.field(),
+                &bounded_reason(&refusal.reason()),
+            ));
+        }
+        let identity = match backup_verify_identity(
+            session,
+            &caller,
+            &report,
+            &provenance,
+            idempotency_key,
+        ) {
             Ok(identity) => identity,
             Err(reason) => {
                 return Ok(invalid_reply(
