@@ -1890,19 +1890,20 @@ impl DaemonComposition {
     /// until an installation-backed disclosure owner is supplied.
     ///
     /// Issue #2900 W12: this is the live attach/cold-start ingress that
-    /// reaches the scan port. The pre-owner question leg runs without a
-    /// store (no lease charge, no persistence). A completed scan must arrive
-    /// through the installation-bound durable owner
-    /// (`eliot_governor::InstallationScanDisclosureStore` bound via
-    /// `GovernorComposition::bind_installation_scan_store`) before
-    /// `BootstrapScanner::scan`, and the live terminal readiness receipt
-    /// must reference that durable handle through
+    /// reaches the scan port. The pre-owner question leg below runs without
+    /// a store (no lease charge, no persistence). The completion join is
+    /// [`Self::attach_cold_start_owner_receipt`]: the installation-bound
+    /// durable owner (`eliot_governor::InstallationScanDisclosureStore`
+    /// bound via `GovernorComposition::bind_installation_scan_store`) is
+    /// connected before `BootstrapScanner::scan`, and the live terminal
+    /// readiness receipt must reference that durable handle through
     /// `GovernorComposition::compile_cold_start_at_trigger`'s `scan_receipt`.
     /// Caller: live `bins/eliotd/src/lib.rs:1872` for the question leg;
     /// STITCH for the owner leg — the canonical
     /// `Arc<dyn eliot_governor::ScanDisclosureRecordOwner>` (Kernel
     /// `RedbRecoveryStore::open`) has no live `eliotd` thread yet, so
-    /// completion fails closed with no in-memory or loose-file fallback.
+    /// completion fails closed with the typed inaccessible cause and no
+    /// in-memory or loose-file fallback.
     fn attach_cold_start_question(
         ticket: &AgentActivationResolutionTicket,
         now: u64,
@@ -1939,9 +1940,62 @@ impl DaemonComposition {
                 persisted
                     .validate()
                     .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-                Err(DaemonError::Lifecycle(
-                    "cold-start scan completion requires installation-bound InstallationScanDisclosureStore before BootstrapScanner::scan (bound via GovernorComposition::bind_installation_scan_store from Arc<dyn ScanDisclosureRecordOwner>); terminal OnboardingReadinessReceipt must reference the durable ScanReceiptHandle via GovernorComposition::compile_cold_start_at_trigger scan_receipt; missing producer: Kernel RedbRecoveryStore owner handle has no live eliotd thread (STITCH)".to_owned(),
-                ))
+                Err(DaemonError::Composition(CompositionError::ScanDisclosure(
+                    eliot_workscope::WorkScopeError::ScanReceiptInaccessible,
+                )))
+            }
+        }
+    }
+
+    /// Runs the installation-bound owner completion leg for one attach
+    /// discovery (issue #2900 W12/B2/B6).
+    ///
+    /// This is the live attach/cold-start ingress's completion join to the
+    /// exact durable port: the observed lease, key and discovery inputs run
+    /// through `eliot_workscope::run_bootstrap_discovery` with the
+    /// installation-bound `eliot_governor::InstallationScanDisclosureStore`
+    /// and the owner binding, so `BootstrapScanner::scan` executes only
+    /// against the durable owner and the completed scan returns the exact
+    /// replayable owner receipt. The persisted handle is read back through
+    /// the same store before return: a missing, inaccessible, corrupt or
+    /// replaced record fails with its typed
+    /// `eliot_workscope::WorkScopeError` cause and never produces a
+    /// completed outcome, so no terminal readiness receipt may reference it.
+    /// A question outcome means the owner supplied no privacy inputs, which
+    /// fails as `ScanContourNotAdmitted`: there is no in-memory-only or
+    /// loose-file fallback.
+    ///
+    /// Caller: STITCH. No live `eliotd` thread holds the
+    /// `Arc<dyn eliot_governor::ScanDisclosureRecordOwner>` the store binds
+    /// (the Kernel `RedbRecoveryStore::open` implements it, unwired across
+    /// the process boundary), and the discovery-lease ingress carries no
+    /// owner binding yet, so the live route runs the question leg above and
+    /// completion stays failed closed.
+    pub fn attach_cold_start_owner_receipt(
+        store: &mut eliot_governor::InstallationScanDisclosureStore,
+        binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+        observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
+    ) -> Result<eliot_workscope::ScanReceiptHandle, eliot_workscope::WorkScopeError> {
+        let port: &mut (dyn eliot_workscope::ScanDisclosureStore + '_) = &mut *store;
+        let outcome = eliot_workscope::run_bootstrap_discovery(
+            Some(port),
+            Some(binding),
+            &mut observed.lease,
+            &observed.key,
+            &observed.discovery,
+        )?;
+        match outcome {
+            eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. } => {
+                persisted.validate()?;
+                let verified =
+                    eliot_workscope::ScanDisclosureStore::readback(store, &persisted, binding)?;
+                if verified.scan_ref != persisted.receipt_ref {
+                    return Err(eliot_workscope::WorkScopeError::ScanReceiptReplaced);
+                }
+                Ok(*persisted)
+            }
+            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => {
+                Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted)
             }
         }
     }

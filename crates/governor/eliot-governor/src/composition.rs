@@ -1130,6 +1130,15 @@ pub enum CompositionError {
     /// Durable recovery did not prove the complete owner set.
     #[error("Governor recovery failed: {0}")]
     Recovery(String),
+    /// Installation-bound scan disclosure refused an attach trigger's
+    /// completion with its exact owner cause preserved (issue #2900 B6).
+    ///
+    /// Missing, inaccessible, corrupt, replaced, stale, invalidated,
+    /// conflicted or unknown-commit scan records block completed readiness
+    /// here instead of collapsing into a recovery string, so the caller can
+    /// tell a lost record from a replaced one without re-reading the owner.
+    #[error(transparent)]
+    ScanDisclosure(#[from] WorkScopeError),
     /// Material readiness denied one effect with its exact receipt, directive,
     /// and missing-input details preserved for the caller.
     #[error(
@@ -6268,6 +6277,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
+    /// Maps a cold-start driver failure to its typed composition cause
+    /// (issue #2900 B6).
+    ///
+    /// A compilation failure already carries its typed [`WorkScopeError`]
+    /// owner cause — including the scan receipt missing/inaccessible/corrupt/
+    /// replaced states that block completed readiness — so it travels
+    /// unchanged instead of collapsing into a recovery string. A lease
+    /// refusal has no owner cause and keeps the existing recovery string.
+    fn cold_start_driver_error(error: eliot_workscope::CompileDriverError) -> CompositionError {
+        match error {
+            eliot_workscope::CompileDriverError::Compile(inner) => inner.into(),
+            eliot_workscope::CompileDriverError::Lease(_) => {
+                CompositionError::Recovery(error.to_string())
+            }
+        }
+    }
+
     /// Binds the installation-owned durable scan disclosure store (issue
     /// #2900, defect D + W12 construction ingress).
     ///
@@ -6301,9 +6327,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ors_object_ref.to_owned(),
             ors_generation,
         )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        .map_err(CompositionError::ScanDisclosure)?;
         InstallationScanDisclosureStore::bind(contour, owner)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(CompositionError::ScanDisclosure)
     }
 
     /// Runs one I4.4.1 cold-start trigger's discovery pass through the
@@ -6362,7 +6388,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             governing_source_refs,
             now,
         )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))
+        .map_err(Self::cold_start_driver_error)
     }
 
     /// Quarantines one loose `scan-disclosure-*.json` capture left by the
@@ -6381,7 +6407,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<LooseScanQuarantine, CompositionError> {
         store
             .quarantine_loose_capture(file_name, bytes)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(CompositionError::ScanDisclosure)
     }
 
     /// Joins one I4.4.1 trigger to the retained cold-start single-flight
@@ -6523,7 +6549,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 scan_receipt,
                 now,
             )
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(Self::cold_start_driver_error)
     }
 
     /// Projects the retained terminal cold-start surface for one exact lease
