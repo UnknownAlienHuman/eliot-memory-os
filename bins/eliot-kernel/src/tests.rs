@@ -321,6 +321,79 @@ fn real_executor_path_proof(
     }
 }
 
+/// Real-executor cases run inside one process-owned outer Job. Retain its
+/// handle for the test process lifetime: dropping a kill-on-close Job while
+/// its root is still running would terminate the test harness itself. This
+/// confines only this test process and its children, never Cargo or the runner.
+/// It supplies physical Job evidence, not production Host activation proof.
+#[cfg(windows)]
+fn real_executor_outer_binding(owner: &ProcessOwnerBinding) -> HostKernelCandidateBinding {
+    use eliot_platform_windows::{JobObject, JobObjectIdentity, JobObjectLimits, OuterKillDomain};
+    static JOB: std::sync::OnceLock<Mutex<JobObject>> = std::sync::OnceLock::new();
+    static BINDING: std::sync::OnceLock<eliot_kernel_service::HostJobBinding> =
+        std::sync::OnceLock::new();
+    let binding = BINDING
+        .get_or_init(|| {
+            let executable = std::env::current_exe().expect("test executable");
+            let identity = eliot_platform_windows::file_identity_for_path(&executable)
+                .expect("root file identity");
+            let job = JOB.get_or_init(|| {
+                let name = format!(
+                    "{}kernel-test-{}",
+                    OuterKillDomain::Kernel.host_job_name_prefix(),
+                    std::process::id()
+                );
+                Mutex::new(
+                    JobObject::new_named_outer_kill_on_close_with_limits(
+                        OuterKillDomain::Kernel,
+                        JobObjectIdentity::new(name).expect("Job name"),
+                        JobObjectLimits::default(),
+                    )
+                    .expect("test outer Job"),
+                )
+            });
+            let job = job.lock().expect("test outer Job lock");
+            let process = job
+                .assign_process(std::process::id())
+                .expect("assign exact test root");
+            eliot_kernel_service::HostJobBinding {
+                job: eliot_kernel_service::HostJobIdentity {
+                    name: job.identity().name().to_owned(),
+                },
+                root: eliot_kernel_service::HostJobRoot {
+                    process: eliot_kernel_service::HostProcessBinding {
+                        process_id: process.process_id,
+                        start_time_100ns: process.start_time_100ns,
+                        image_path: process.image_path,
+                    },
+                    executable: eliot_kernel_service::HostFileIdentity {
+                        volume_serial_number: identity.volume_serial_number,
+                        file_index: identity.file_index,
+                    },
+                },
+            }
+        })
+        .clone();
+    let candidate = HostKernelCandidateBinding {
+        installation_id: PlatformHandle::new("installation-1").expect("installation"),
+        host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
+        kernel_epoch: owner.authority_epoch().clone(),
+        activation_id: PlatformHandle::new("activation-1").expect("activation"),
+        artifact_hash: PlatformHandle::new("real-executor-test-artifact").expect("artifact"),
+        config_hash: PlatformHandle::new("real-executor-test-config").expect("config"),
+        job_object_id: PlatformHandle::new(binding.job.name.clone()).expect("Job identity"),
+        pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).expect("pipe identity"),
+        host_process: binding.root.process.clone(),
+        job_binding: binding,
+        supervision_incarnation: supervision_incarnation(),
+        restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).expect("restart budget"),
+        agent_bridge_admission: None,
+        containment_action: None,
+    };
+    candidate.validate().expect("valid physical test binding");
+    candidate
+}
+
 #[cfg(windows)]
 async fn start_real_executor_child(
     gateway: &ProcessExecutionGateway,
@@ -336,8 +409,9 @@ async fn start_real_executor_child(
             real_executor_path_proof(platform, admission),
         )
         .expect("retain path proof");
+    let outer_binding = real_executor_outer_binding(owner);
     let receipt = gateway
-        .execute(owner, request)
+        .execute(owner, request, Some(&outer_binding))
         .await
         .expect("WindowsProcessExecutor start");
     drop(path_guard);

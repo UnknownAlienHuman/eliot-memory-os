@@ -137,6 +137,15 @@ pub(crate) struct KernelHotSpine {
 }
 
 impl KernelHotSpine {
+    #[cfg(test)]
+    pub(crate) fn held_local_read_capacity(&self) -> Result<(u64, u64), HotSpineError> {
+        let capacity = self
+            .local_read
+            .lock()
+            .map_err(|_| HotSpineError::BoundSaturated)?;
+        Ok((capacity.held_items(), capacity.held_bytes()))
+    }
+
     /// Binds this crate's own declaration against the running build's settings.
     ///
     /// The registration is built from values this process actually enforces —

@@ -963,6 +963,12 @@ pub fn bind_hot_path_manifest_set(
             ));
         };
         for declared in &manifest.queues_and_capacity {
+            if declared.queue_id != queue.queue_id {
+                return Err(invalid(
+                    "queues_and_capacity",
+                    "the declared queue identity does not match the running build's registered queue",
+                ));
+            }
             if let Some(max_items) = declared.bounds.max_items
                 && max_items != queue.max_items
             {

@@ -5289,6 +5289,8 @@ mod tests {
         TestdAdmissionEnvelope {
             job_id: job_id.to_owned(),
             profile: "cargo-test".to_owned(),
+            // Fixed-argv cargo-test has no slotted arguments.
+            sealed_slot_suffix: Vec::new(),
             operation_id: operation.map(str::to_owned),
             cancellation: false,
             fence: FencingToken::new(

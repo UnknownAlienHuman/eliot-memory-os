@@ -2585,15 +2585,13 @@ impl KernelComposition {
             candidate.operation_id == operation_id
                 && candidate.request_digest == envelope.envelope_sha256
         }) {
-            candidate.local_read_envelope = Some(envelope.clone());
-            candidate.local_read_tool = Some(tool.clone());
-            // An existing ref is re-staged rather than freshly pushed, so its
-            // previous charge is returned before this admission's charge is
-            // recorded; the ledger then holds exactly one permit for this pair.
-            self.hot_spine
-                .release_local_read(candidate.local_read_held_bytes);
-            candidate.local_read_held_bytes = request_bytes;
-            candidate.local_read_attempt = local_read_attempt;
+            self.stage_local_read_payload(
+                candidate,
+                envelope,
+                tool,
+                request_bytes,
+                local_read_attempt,
+            );
         } else {
             refs.push(HostRequestOperationRef {
                 operation_id,
@@ -2624,6 +2622,27 @@ impl KernelComposition {
         // rather than a total carried forward.
         observe_local_read_queue_gauges(&index, queued);
         Ok(())
+    }
+
+    /// Installs the just-acquired permit and payload on an indexed row.
+    /// A placeholder owns no previous permit, including when its byte charge
+    /// is zero. A real zero-byte local read still owns one item permit.
+    fn stage_local_read_payload(
+        &self,
+        candidate: &mut HostRequestOperationRef,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        request_bytes: u64,
+        attempt: LocalReadAttemptState,
+    ) {
+        if candidate.local_read_envelope.is_some() {
+            self.hot_spine
+                .release_local_read(candidate.local_read_held_bytes);
+        }
+        candidate.local_read_envelope = Some(envelope.clone());
+        candidate.local_read_tool = Some(tool.clone());
+        candidate.local_read_held_bytes = request_bytes;
+        candidate.local_read_attempt = attempt;
     }
 
     /// Revalidates a queued operation's claimed application binding against
@@ -3019,18 +3038,18 @@ impl KernelComposition {
             return;
         };
         self.release_local_read_capacity_locked(&mut index, |candidate| {
-            !(candidate.operation_id == operation_id
+            candidate.operation_id == operation_id
                 && candidate.request_digest == request_digest
-                && candidate.local_read_envelope.is_some())
+                && candidate.local_read_envelope.is_some()
         });
     }
 
-    /// Returns the I12.14 bound charge for every local-read pair `remove`
-    /// excludes, and releases exactly that charge.    ///
+    /// Removes every selected row and releases its actual local-read permit.
+    ///
     /// I12.14 step 5 makes release an owner action, not a receipt action: the
     /// byte count returned is the one recorded at each pair's own admission
     /// (`local_read_held_bytes`) and is never recomputed from the pair's current
-    /// contents, which could differ. The caller owns the `retain` predicate, so
+    /// contents, which could differ. The caller owns the `remove` predicate, so
     /// this releases exactly the pairs that predicate removes and no other —
     /// there is one release per removed pair and no release for a kept one, so
     /// the ledger cannot drift away from the index it bounds.
@@ -3039,17 +3058,18 @@ impl KernelComposition {
         index: &mut BTreeMap<String, Vec<HostRequestOperationRef>>,
         remove: impl Fn(&HostRequestOperationRef) -> bool,
     ) {
-        let mut released_bytes = 0_u64;
         for refs in index.values_mut() {
             refs.retain(|candidate| {
                 if remove(candidate) {
-                    released_bytes = released_bytes.saturating_add(candidate.local_read_held_bytes);
+                    if candidate.local_read_envelope.is_some() {
+                        self.hot_spine
+                            .release_local_read(candidate.local_read_held_bytes);
+                    }
                     return false;
                 }
                 true
             });
         }
-        self.hot_spine.release_local_read(released_bytes);
     }
 
     /// Returns the I12.14 bound charge for pairs already taken out of the index.
@@ -3061,13 +3081,12 @@ impl KernelComposition {
     /// Every taken pair is released exactly once, and only local-read pairs carry
     /// a charge, so the ledger still tracks the index it bounds.
     fn release_local_read_capacity_for_refs(&self, operation_refs: &[HostRequestOperationRef]) {
-        let released_bytes = operation_refs
-            .iter()
-            .filter(|candidate| candidate.local_read_envelope.is_some())
-            .fold(0_u64, |released, candidate| {
-                released.saturating_add(candidate.local_read_held_bytes)
-            });
-        self.hot_spine.release_local_read(released_bytes);
+        for candidate in operation_refs {
+            if candidate.local_read_envelope.is_some() {
+                self.hot_spine
+                    .release_local_read(candidate.local_read_held_bytes);
+            }
+        }
     }
 
     /// Audits one claimed-lease expiry and retires the dead queue pair.
@@ -3128,9 +3147,8 @@ impl KernelComposition {
         // I12.14 step 5: a deadline-expired pair is an owner-safe release too. It
         // can never complete, so the charge its admission took is returned
         // through the same ledger, from the byte count recorded at that
-        // admission — accumulated in this same pass, so the removal below still
-        // decides `removed` exactly as before and cannot double-release.
-        let mut released_bytes = 0_u64;
+        // admission. Release once per removed permit; an empty match releases
+        // neither an item nor bytes.
         let mut removed = false;
         for refs in index.values_mut() {
             let before = refs.len();
@@ -3151,17 +3169,14 @@ impl KernelComposition {
                     && lane_present
                 {
                     if matches!(lane, ExpiryRetireLane::LocalRead) {
-                        released_bytes =
-                            released_bytes.saturating_add(candidate.local_read_held_bytes);
+                        self.hot_spine
+                            .release_local_read(candidate.local_read_held_bytes);
                     }
                     return false;
                 }
                 true
             });
             removed |= refs.len() != before;
-        }
-        if matches!(lane, ExpiryRetireLane::LocalRead) {
-            self.hot_spine.release_local_read(released_bytes);
         }
         if removed {
             // Issue #1837 orphan record reused for expiry cleanup (issue
@@ -8652,5 +8667,242 @@ mod invoke_read_tool_tests {
             None,
             "a half-present pair takes the fresh leg, never a partial serve"
         );
+    }
+
+    // These cases exercise the local owner/index, not authenticated transport
+    // admission or a live daemon. Their envelopes are inert test data.
+    #[cfg(windows)]
+    fn queue_fixture(name: &str) -> (KernelComposition, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("eliot-queue-4019-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("queue test root");
+        let kernel = KernelComposition::new(crate::KernelConfig::new(&root)).expect("cold Kernel");
+        (kernel, root)
+    }
+
+    #[cfg(windows)]
+    fn queue_row(operation: &str, digest: &str) -> HostRequestOperationRef {
+        HostRequestOperationRef {
+            operation_id: operation.to_owned(),
+            request_digest: digest.to_owned(),
+            local_read_envelope: None,
+            local_read_tool: None,
+            local_read_held_bytes: 0,
+            local_read_attempt: LocalReadAttemptState::default(),
+            observe_envelope: None,
+            observe_tool: None,
+            observe_reservation: None,
+            observe_attempt: LocalReadAttemptState::default(),
+            campaign_packet_envelope: None,
+            campaign_packet_tool: None,
+            campaign_packet_attempt: LocalReadAttemptState::default(),
+            task_controller_envelope: None,
+            task_controller_tool: None,
+            task_controller_attempt: LocalReadAttemptState::default(),
+            finish_envelope: None,
+            finish_tool: None,
+            finish_attempt: LocalReadAttemptState::default(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn charge_queue_row(
+        kernel: &KernelComposition,
+        operation: &str,
+        bytes: u64,
+    ) -> HostRequestOperationRef {
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        let mut row = queue_row(operation, operation);
+        kernel
+            .hot_spine
+            .acquire_local_read_capacity(bytes)
+            .expect("capacity acquired");
+        kernel.stage_local_read_payload(
+            &mut row,
+            &envelope,
+            &tool,
+            bytes,
+            LocalReadAttemptState::default(),
+        );
+        row
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queue_4019_completion_keeps_siblings_and_their_charge() {
+        let (kernel, root) = queue_fixture("completion");
+        let a = charge_queue_row(&kernel, "a", 10);
+        let b = charge_queue_row(&kernel, "b", 20);
+        let c = charge_queue_row(&kernel, "c", 0);
+        let d = queue_row("d", "d");
+        let survivors = format!("{b:?}{c:?}{d:?}");
+        *kernel.host_request_connection_index.lock().expect("index") = BTreeMap::from([
+            ("first".to_owned(), vec![a, b]),
+            ("other".to_owned(), vec![c, d]),
+        ]);
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (3, 30)
+        );
+        kernel.retire_local_read_pair_under_transition("a", "a");
+        {
+            let index = kernel.host_request_connection_index.lock().expect("index");
+            assert_eq!(
+                format!(
+                    "{:?}{:?}{:?}",
+                    index["first"][0], index["other"][0], index["other"][1]
+                ),
+                survivors
+            );
+            assert_eq!(index.values().map(Vec::len).sum::<usize>(), 3);
+        }
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (2, 20)
+        );
+        for (operation, digest) in [
+            ("a", "a"),
+            ("b", "wrong"),
+            ("missing", "missing"),
+            ("d", "d"),
+        ] {
+            kernel.retire_local_read_pair_under_transition(operation, digest);
+            assert_eq!(
+                kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+                (2, 20)
+            );
+        }
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queue_4019_batch_and_empty_removal_conserve_items_and_bytes() {
+        let (kernel, root) = queue_fixture("batch");
+        let rows = vec![
+            charge_queue_row(&kernel, "a", 10),
+            charge_queue_row(&kernel, "b", 20),
+            charge_queue_row(&kernel, "c", 0),
+            queue_row("d", "d"),
+        ];
+        let mut index = BTreeMap::from([("first".to_owned(), rows)]);
+        kernel.release_local_read_capacity_locked(&mut index, |_| false);
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (3, 30)
+        );
+        kernel.release_local_read_capacity_locked(&mut index, |row| {
+            row.local_read_envelope.is_some()
+        });
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (0, 0)
+        );
+        assert_eq!(index["first"].len(), 1);
+        let refs = vec![
+            charge_queue_row(&kernel, "e", 9),
+            charge_queue_row(&kernel, "f", 0),
+            queue_row("g", "g"),
+        ];
+        kernel.release_local_read_capacity_for_refs(&[]);
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (2, 9)
+        );
+        kernel.release_local_read_capacity_for_refs(&refs);
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (0, 0)
+        );
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queue_4019_expiry_releases_only_an_existing_permit() {
+        let (kernel, root) = queue_fixture("expiry");
+        let rows = vec![
+            charge_queue_row(&kernel, "a", 7),
+            charge_queue_row(&kernel, "b", 0),
+            queue_row("d", "d"),
+        ];
+        *kernel.host_request_connection_index.lock().expect("index") =
+            BTreeMap::from([("first".to_owned(), rows)]);
+        assert!(!kernel.retire_expired_claim_pair_under_transition(
+            ExpiryRetireLane::LocalRead,
+            "missing",
+            "missing"
+        ));
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (2, 7)
+        );
+        assert!(kernel.retire_expired_claim_pair_under_transition(
+            ExpiryRetireLane::LocalRead,
+            "a",
+            "a"
+        ));
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (1, 0)
+        );
+        assert!(!kernel.retire_expired_claim_pair_under_transition(
+            ExpiryRetireLane::LocalRead,
+            "a",
+            "a"
+        ));
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (1, 0)
+        );
+        kernel.retire_local_read_pair_under_transition("b", "b");
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (0, 0)
+        );
+        assert_eq!(
+            kernel.host_request_connection_index.lock().expect("index")["first"].len(),
+            1
+        );
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queue_4019_placeholder_and_replacement_keep_one_permit() {
+        let (kernel, root) = queue_fixture("replacement");
+        let mut row = charge_queue_row(&kernel, "a", 0);
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (1, 0)
+        );
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        kernel
+            .hot_spine
+            .acquire_local_read_capacity(13)
+            .expect("new permit");
+        kernel.stage_local_read_payload(
+            &mut row,
+            &envelope,
+            &tool,
+            13,
+            LocalReadAttemptState::default(),
+        );
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (1, 13)
+        );
+        kernel.release_local_read_capacity_for_refs(&[row]);
+        assert_eq!(
+            kernel.hot_spine.held_local_read_capacity().expect("ledger"),
+            (0, 0)
+        );
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
