@@ -431,12 +431,13 @@ pub use publication::{
 
 pub use rules::{
     ApplicabilitySubject, CompetentIntegrationCoverage, CorrelationInterval, EnvelopeMeasurement,
-    IntegrationGapEvaluation, IntegrationGapObservation, IntegrationGapSensor,
-    IntegrationGapSignalCandidate, IntegrationGapSignalContext, IntegrationGapUnknown,
-    ProviderAttemptIdentity, ProviderEventIdentity, RequiredObservation, RuleApplicability,
-    RuleClass, RuleDescriptor, RuleInapplicable, StateFenceProjection,
-    PROVIDER_HOST_EVENT_GAP_RULE_INDEX, RULE_TABLE, evaluate_provider_host_event_gap,
-    evaluate_rule_applicability, provider_host_event_gap_rule, rule_by_id,
+    IntegrationGapError, IntegrationGapEvaluation, IntegrationGapObservation,
+    IntegrationGapSensor, IntegrationGapSignalCandidate, IntegrationGapSignalContext,
+    MalformedProjection, NoGapReason, ProviderAttemptIdentity, ProviderEventIdentity,
+    RequiredObservation, RuleApplicability, RuleClass, RuleDescriptor, StateFenceProjection,
+    SupervisionGap, PROVIDER_HOST_EVENT_GAP_RULE_INDEX, RULE_TABLE,
+    evaluate_provider_host_event_gap, evaluate_rule_applicability, provider_host_event_gap_rule,
+    rule_by_id,
 };
 
 pub use health_detectors::{

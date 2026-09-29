@@ -5,9 +5,18 @@
 //! governs, the observation classes it requires, its correlation, bound,
 //! threshold, resulting Signal and its permissible proposed action. A rule whose
 //! required observations are absent or unusable is inapplicable and fails
-//! closed: it never fires, and it is never treated as having passed. Absent
-//! competent coverage is a supervision gap, never proof that a bypass class did
-//! not occur and never an accusation against an unknown principal.
+//! closed: it never fires, and it is never treated as having passed.
+//!
+//! Inapplicability is not one fact, and this module never collapses it into
+//! one. [`RuleApplicability`] separates the two causes a caller must never
+//! conflate. A required owner-issued observation that was never established is
+//! a [`RuleApplicability::CoverageGap`]: coverage was expected, its absence is
+//! itself the reportable supervision gap, and it is never proof that a bypass
+//! class did not occur and never an accusation against an unknown principal. A
+//! projection that is present but structurally unusable is a
+//! [`RuleApplicability::Malformed`]: the rule could not be evaluated at all, so
+//! the fault reaches the caller instead of being recorded as an absence. Only an
+//! applicable rule that evaluates cleanly and finds nothing is an absence.
 //!
 //! Only the coordinator's typed provider host-event sequence-gap rule has a
 //! typed projection and evaluation entrypoint in this revision. The coordinator
@@ -21,10 +30,10 @@
 
 use crate::health_detectors::HealthNoSignalReason;
 use crate::signals::{
-    AcknowledgementFact, CoverageRef, EvidenceRef, ExpectedRevision, ObservedTime, ProfileRevision,
-    RecordedValue, ReopenCondition, RuleRevision, Signal, SignalAttribution, SignalDelivery,
-    SignalDisposition, SignalId, SignalProcessing, SignalReferences, SignalRevision,
-    SignalSeverity, SignalTarget, SourceEventRef,
+    AcknowledgementFact, ClockDomain, CoverageRef, EvidenceRef, ExpectedRevision, ObservedTime,
+    ProfileRevision, RecordedValue, ReopenCondition, RuleRevision, Signal, SignalAttribution,
+    SignalDelivery, SignalDisposition, SignalId, SignalProcessing, SignalReferences,
+    SignalRevision, SignalSeverity, SignalTarget, SourceEventRef,
 };
 
 /// The bounded class of supervision question one table entry answers.
@@ -115,13 +124,30 @@ pub struct RuleDescriptor {
     pub result: &'static str,
     /// The only proposed action this rule's evidence may support.
     pub permissible_proposal: &'static str,
+    /// Identity of the health detector that already answers this exact
+    /// condition, when one exists.
+    ///
+    /// This is a merge obligation, not an alias. `build_signal` seeds a
+    /// candidate's `dedup_key` and `signal_id` from `rule_id`, so a table
+    /// entry that mints a second identity for a condition the detector
+    /// already detects would key the same episode twice. When this is
+    /// `Some`, `rule_id` is required to equal it, and a compile-time
+    /// assertion below enforces that equality for every entry.
+    pub merged_detector_rule_id: Option<&'static str>,
 }
 
 /// Position of the provider host-event sequence-gap rule in [`RULE_TABLE`].
 ///
 /// The table is the single source of rule descriptors; this index is the only
-/// way a caller reaches one of its entries by name.
+/// way a caller reaches one of its entries by name. It is a positional alias,
+/// so it is not trusted on its own: a compile-time assertion below binds this
+/// position to [`PROVIDER_HOST_EVENT_GAP_RULE_ID`], and reordering the table
+/// without moving the entry fails the build instead of silently re-pointing
+/// [`provider_host_event_gap_rule`] at a different rule.
 pub const PROVIDER_HOST_EVENT_GAP_RULE_INDEX: usize = 0;
+
+/// Stable rule identity of the provider host-event sequence-gap rule.
+const PROVIDER_HOST_EVENT_GAP_RULE_ID: &str = "provider_host_event_sequence_gap";
 
 /// The finite, enumerated Watchdog rule table.
 ///
@@ -147,6 +173,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "observed_sequence is greater than expected_sequence; the proven skip count is the difference",
         result: "warning Signal candidate for a provider host-event sequence supervision gap",
         permissible_proposal: "candidate-only signal routing or coverage inspection; no effect authority",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "workspace_change_without_post_tool_observation",
@@ -166,6 +193,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "workspace change count is greater than zero while the PostTool/observe observation count for the same interval is zero",
         result: "warning Signal candidate for an unobserved material workspace change",
         permissible_proposal: "candidate-only signal routing, a resync request, or coverage inspection; no effect authority",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "scope_drift",
@@ -184,6 +212,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the observed instance identity is not the bound instance identity for the same attempt and generation",
         result: "blocking-scope Signal candidate for a scope drift; dependent context and effects are frozen by their own owner",
         permissible_proposal: "a request to the existing guard/rebind owner to freeze only dependent scope or effects and request a rebind",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "stale_context_after_invalidation",
@@ -202,9 +231,10 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the material tool count after the invalidation reaches the profile bound while the packet/state refresh count is zero",
         result: "warning Signal candidate for stale context continuing after invalidation",
         permissible_proposal: "a bounded refresh requirement or candidate-only signal routing; no direct context mutation",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
-        rule_id: "repeated_failure_without_new_evidence",
+        rule_id: "agent_loop_signal",
         revision: 1,
         class: RuleClass::RepeatedFailure,
         subject: "the discriminating failure signature of one attempt within one interval",
@@ -216,11 +246,12 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
             RequiredObservation::CorrelationInterval,
             RequiredObservation::CompetentCoverage,
         ],
-        correlation: "occurrences share one owner-issued failure signature and fall in one declared interval; a retransmitted source event is not a new occurrence",
+        correlation: "occurrences share one owner-issued failure signature and fall in one declared interval; a retransmitted source event is not a new occurrence; this entry is the same condition as the health detector rule agent_loop_signal and shares its one rule identity, so one episode is keyed once",
         bound: "occurrences are counted by distinct source event identity only, never by delivery count",
         threshold: "distinct occurrences of the same signature reach the profile bound while the distinct-evidence count stays at zero",
         result: "warning Signal candidate for repeated failure without new evidence",
         permissible_proposal: "candidate-only attention routing or an evidence-bound diagnosis request; no repair authority",
+        merged_detector_rule_id: Some("agent_loop_signal"),
     },
     RuleDescriptor {
         rule_id: "orphan_descendant_without_admitted_attempt",
@@ -237,6 +268,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the observed descendant is not a member of any admitted attempt lineage and has no owner-recorded parent lineage",
         result: "warning Signal candidate for an orphan descendant; no proof or effect admission follows",
         permissible_proposal: "candidate-only lineage inspection; no process stop, kill or restart authority",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "envelope_overrun",
@@ -254,9 +286,10 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "measured usage is greater than or equal to the admitted bound",
         result: "warning Signal candidate for an envelope overrun",
         permissible_proposal: "a request to narrow or cancel only the admitted subtree; unrelated attempts stay available",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
-        rule_id: "persistent_agent_observation_gap",
+        rule_id: "observation_coverage_gap",
         revision: 1,
         class: RuleClass::AgentObservationGap,
         subject: "one configured observation window over an active attempt",
@@ -266,11 +299,12 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
             RequiredObservation::CorrelationInterval,
             RequiredObservation::CompetentCoverage,
         ],
-        correlation: "both the activity count and the observation count come from one owner-declared window for the same attempt; an idle agent with no external change is outside this rule entirely",
+        correlation: "both the activity count and the observation count come from one owner-declared window for the same attempt; an idle agent with no external change is outside this rule entirely; this entry is the same condition as the health detector rule observation_coverage_gap and shares its one rule identity, so one episode is keyed once",
         bound: "one configured window per evaluation; window lengths never accumulate",
         threshold: "the activity count is greater than zero while the ELIOT observation count for the same window is zero for the whole configured window",
         result: "warning Signal candidate for a persistent agent-observation gap; persistence lowers the governance profile through its own owner",
         permissible_proposal: "a bounded resync request to the agent or a governance-profile review; no profile mutation here",
+        merged_detector_rule_id: Some("observation_coverage_gap"),
     },
     RuleDescriptor {
         rule_id: "hook_chain_failure",
@@ -287,6 +321,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the owner recorded no competent result for a step the chain admitted as required",
         result: "warning Signal candidate for a hook-chain failure",
         permissible_proposal: "candidate-only hook inspection or re-admission through the hook owner; no direct hook execution",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_canonical_endpoint_access",
@@ -303,6 +338,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the access resolves outside the active Host-managed storage-bridge lineage",
         result: "blocking Signal candidate for bypassed canonical endpoint access; the observation remains evidence",
         permissible_proposal: "candidate-only routing to the security owner; no process control here",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_protected_database_path_access",
@@ -319,6 +355,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the touching process is not a member of the active Host-managed lineage for that path",
         result: "blocking Signal candidate for bypassed protected database path access",
         permissible_proposal: "candidate-only routing to the security owner; no process control here",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_unregistered_canonical_export_import",
@@ -335,6 +372,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "no owner recorded a registration for the observed canonical export or import",
         result: "blocking Signal candidate for an unregistered canonical export or import",
         permissible_proposal: "candidate-only routing to the security owner; rejection of the content is the receiving owner's decision",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_known_db_cli_query_path",
@@ -351,6 +389,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the observed execution path is a known database CLI or query path",
         result: "blocking Signal candidate for an agent-executed database path",
         permissible_proposal: "candidate-only routing to the security owner; no process control here",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_undeclared_effect_set_write",
@@ -368,6 +407,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the observed effect is not a member of the effect set declared for the same attempt and generation",
         result: "blocking Signal candidate for a write outside the declared effect set",
         permissible_proposal: "candidate-only routing to the security owner; no direct effect reversal here",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_unknown_protected_registry_mutation",
@@ -384,6 +424,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the mutating process has no owner-recorded lineage for the protected configuration, Module Catalog, Generation Registry or Capability Registry state it changed",
         result: "blocking Signal candidate for an unknown protected-state mutation; no principal is named without evidence",
         permissible_proposal: "candidate-only routing to the security owner; no accusation against an unknown principal",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_post_fence_generation_emission",
@@ -397,6 +438,7 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "the emitting generation is lower than the generation the owner already fenced for that lineage",
         result: "blocking Signal candidate for a post-fence emission",
         permissible_proposal: "candidate-only routing to the security owner; no generation replacement here",
+        merged_detector_rule_id: None,
     },
     RuleDescriptor {
         rule_id: "bypass_unattributed_external_effect",
@@ -413,10 +455,90 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         threshold: "no admitted action and no receipt matches the observed effect",
         result: "warning Signal candidate for an external effect without lineage; the effect itself remains evidence",
         permissible_proposal: "candidate-only lineage inspection or routing to the security owner; no effect reversal here",
+        merged_detector_rule_id: None,
     },
 ];
 
+/// Byte-wise equality usable in a const context.
+///
+/// `&str` equality is not a const operation, so the compile-time identity
+/// checks below cannot use `==` on a rule identity.
+const fn rule_id_is(actual: &str, expected: &str) -> bool {
+    let (actual, expected) = (actual.as_bytes(), expected.as_bytes());
+    if actual.len() != expected.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < actual.len() {
+        if actual[index] != expected[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Position of the entry carrying `rule_id`, or `usize::MAX` when absent.
+const fn rule_index(rule_id: &str) -> usize {
+    let mut index = 0;
+    while index < RULE_TABLE.len() {
+        if rule_id_is(RULE_TABLE[index].rule_id, rule_id) {
+            return index;
+        }
+        index += 1;
+    }
+    usize::MAX
+}
+
+/// True when one condition can never be keyed under two rule identities.
+///
+/// Two conditions collide when two entries share one `rule_id`, because
+/// `build_signal` seeds `dedup_key` and `signal_id` from it; and a merge
+/// obligation is unmet when an entry declares a detector that owns the
+/// condition but keeps a different identity of its own.
+const fn rule_table_has_one_identity_per_condition() -> bool {
+    let mut index = 0;
+    while index < RULE_TABLE.len() {
+        if let Some(merged) = RULE_TABLE[index].merged_detector_rule_id {
+            if !rule_id_is(RULE_TABLE[index].rule_id, merged) {
+                return false;
+            }
+        }
+        let mut other = index + 1;
+        while other < RULE_TABLE.len() {
+            if rule_id_is(RULE_TABLE[index].rule_id, RULE_TABLE[other].rule_id) {
+                return false;
+            }
+            other += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    rule_id_is(
+        RULE_TABLE[PROVIDER_HOST_EVENT_GAP_RULE_INDEX].rule_id,
+        PROVIDER_HOST_EVENT_GAP_RULE_ID
+    ),
+    "RULE_TABLE was reordered: PROVIDER_HOST_EVENT_GAP_RULE_INDEX no longer names the provider host-event sequence-gap rule"
+);
+
+const _: () = assert!(
+    rule_index(PROVIDER_HOST_EVENT_GAP_RULE_ID) == PROVIDER_HOST_EVENT_GAP_RULE_INDEX,
+    "RULE_TABLE was reordered: the provider host-event sequence-gap rule is no longer at PROVIDER_HOST_EVENT_GAP_RULE_INDEX"
+);
+
+const _: () = assert!(
+    rule_table_has_one_identity_per_condition(),
+    "two RULE_TABLE entries share one rule identity, or an entry keeps a second identity for a condition its health detector already owns"
+);
+
 /// Returns the finite rule descriptor used by the public evaluation entrypoint.
+///
+/// The positional alias is bound to [`PROVIDER_HOST_EVENT_GAP_RULE_ID`] by the
+/// compile-time assertions above, so a reordered table cannot make this
+/// function return a different rule.
 #[must_use]
 pub const fn provider_host_event_gap_rule() -> &'static RuleDescriptor {
     &RULE_TABLE[PROVIDER_HOST_EVENT_GAP_RULE_INDEX]
@@ -489,228 +611,234 @@ pub struct ApplicabilitySubject {
     pub competent_coverage: Option<CoverageRef>,
 }
 
-/// Why one bounded rule cannot be evaluated against one observation projection.
+/// A required owner-issued observation that was never established.
 ///
-/// Every variant is a fail-closed outcome. None of them permits the rule to
-/// fire, and none of them is evidence that the governed condition did not occur.
+/// This is the reportable supervision gap. The owning agent did not project the
+/// observation, so no rule requiring it could be evaluated at all; the absence
+/// of the coverage is the finding. It is never proof that the governed
+/// condition did not occur, and it never accuses a principal of anything.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuleInapplicable {
+pub struct SupervisionGap {
+    /// Identity of the rule whose required coverage is missing.
+    pub rule_id: &'static str,
+    /// The observation class that was never projected by its owner.
+    pub missing_observation: RequiredObservation,
+    /// The established no-signal reason for a never-projected observation.
+    ///
+    /// This reuses the health detector's vocabulary rather than a parallel
+    /// one: `evaluate_observation_coverage` reports absent handles as
+    /// `IncompleteEvidence`, and a never-projected observation is the same
+    /// fact.
+    pub no_signal_reason: HealthNoSignalReason,
+}
+
+/// A projection that is present but structurally unusable.
+///
+/// Every variant is a fault in the input, not an observation about the world.
+/// None of them permits the rule to fire, none of them is evidence that the
+/// governed condition did not occur, and none of them may be reported as an
+/// ordinary absence: the rule was not evaluated, so a caller must raise the
+/// fault rather than record a clean no-signal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MalformedProjection {
     /// The rule identity is not in the finite table.
     UnknownRule,
-    /// The owner-issued subject, scope or generation is absent.
+    /// The owner-issued subject, scope or generation is blank or non-positive.
     AbsentSubjectIdentity,
-    /// A required observation class was not projected by its owner.
-    AbsentObservation(RequiredObservation),
     /// A required owner-issued identity was projected but is blank.
     BlankObservation(RequiredObservation),
     /// The projected fence carries no positive resource generation.
     FenceWithoutGeneration,
-    /// The projected interval is unordered or spans more than one clock domain.
+    /// The projected interval is unordered, spans more than one clock domain,
+    /// or is expressed in an unrecorded clock domain.
     UnorderedCorrelationInterval,
     /// The projected envelope measurement admits no bound to compare against.
     UnboundedEnvelope,
-}
-
-impl RuleInapplicable {
-    /// Maps this applicability failure onto the existing fail-closed reason.
-    ///
-    /// This reuses the health detector's established no-signal vocabulary
-    /// instead of introducing a parallel one: an unusable source fact is
-    /// `OwnerEvidenceUnknown`, and a required observation that was never
-    /// projected is `IncompleteEvidence`.
-    #[must_use]
-    pub const fn no_signal_reason(self) -> HealthNoSignalReason {
-        match self {
-            Self::UnknownRule
-            | Self::AbsentSubjectIdentity
-            | Self::FenceWithoutGeneration
-            | Self::UnorderedCorrelationInterval
-            | Self::UnboundedEnvelope => HealthNoSignalReason::OwnerEvidenceUnknown,
-            Self::AbsentObservation(_) | Self::BlankObservation(_) => {
-                HealthNoSignalReason::IncompleteEvidence
-            }
-        }
-    }
-
-    /// The required observation class that could not be satisfied, when known.
-    #[must_use]
-    pub const fn missing_observation(self) -> Option<RequiredObservation> {
-        match self {
-            Self::AbsentObservation(required) | Self::BlankObservation(required) => Some(required),
-            Self::UnknownRule
-            | Self::AbsentSubjectIdentity
-            | Self::FenceWithoutGeneration
-            | Self::UnorderedCorrelationInterval
-            | Self::UnboundedEnvelope => None,
-        }
-    }
-
-    /// True when this absence is itself a reportable supervision gap.
-    ///
-    /// Absent competent coverage is a supervision gap. It is never proof that
-    /// the bypass class did not occur and never an accusation against an
-    /// unknown principal.
-    #[must_use]
-    pub const fn is_supervision_gap(self) -> bool {
-        matches!(
-            self,
-            Self::AbsentObservation(RequiredObservation::CompetentCoverage)
-        )
-    }
 }
 
 /// The pure applicability decision for one bounded rule.
 ///
 /// The decision is evidence about observability only. It does not decide that
 /// the governed condition occurred, and it confers no effect authority.
+///
+/// The two inapplicable variants are deliberately not one variant. A
+/// [`Self::CoverageGap`] is a reportable fact about absent coverage; a
+/// [`Self::Malformed`] is a fault in the projection that reached the evaluator.
+/// Collapsing them would let a malformed input be recorded as though the
+/// governed condition had been checked and found absent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuleApplicability {
     /// Every observation the rule requires is present and usable.
     Applicable,
-    /// At least one required observation is absent or unusable, so the rule
-    /// does not fire.
-    Inapplicable(RuleInapplicable),
+    /// A required observation was never established, so the rule could not be
+    /// evaluated and the missing coverage is itself the reportable gap.
+    CoverageGap(SupervisionGap),
+    /// The projection is structurally unusable, so the rule could not be
+    /// evaluated and the fault must be raised to the caller.
+    Malformed(MalformedProjection),
 }
 
-impl RuleApplicability {
-    /// True only when every required observation is present and usable.
-    #[must_use]
-    pub const fn is_applicable(self) -> bool {
-        matches!(self, Self::Applicable)
-    }
-
-    /// The fail-closed reason, when the rule did not become applicable.
-    #[must_use]
-    pub const fn inapplicable(self) -> Option<RuleInapplicable> {
-        match self {
-            Self::Applicable => None,
-            Self::Inapplicable(reason) => Some(reason),
-        }
-    }
-
-    /// True when the rule could not be evaluated because coverage is absent.
-    #[must_use]
-    pub const fn is_supervision_gap(self) -> bool {
-        matches!(self, Self::Inapplicable(reason) if reason.is_supervision_gap())
-    }
+/// The coverage gap for one required observation that was never projected.
+const fn coverage_gap(
+    rule_id: &'static str,
+    missing_observation: RequiredObservation,
+) -> RuleApplicability {
+    RuleApplicability::CoverageGap(SupervisionGap {
+        rule_id,
+        missing_observation,
+        no_signal_reason: HealthNoSignalReason::IncompleteEvidence,
+    })
 }
 
 /// Decides whether one table entry may be evaluated against one projection.
 ///
 /// This is a pure function over the closed table and the owner-issued
 /// projection. It reads no store, consults no clock, infers nothing and grants
-/// no authority. A rule whose requirements are unsatisfied is inapplicable;
-/// it is never an error, never a default-open pass, and never a firing.
+/// no authority. A rule whose requirements are unsatisfied never fires, and it
+/// is never a default-open pass: the caller receives either the reportable
+/// [`RuleApplicability::CoverageGap`] or the [`RuleApplicability::Malformed`]
+/// fault, and in neither case an ordinary absence.
 #[must_use]
 pub fn evaluate_rule_applicability(
     rule_id: &str,
     subject: &ApplicabilitySubject,
 ) -> RuleApplicability {
     let Some(rule) = rule_by_id(rule_id) else {
-        return RuleApplicability::Inapplicable(RuleInapplicable::UnknownRule);
+        return RuleApplicability::Malformed(MalformedProjection::UnknownRule);
     };
     let target = &subject.target;
     if target.subject_id.trim().is_empty()
         || target.scope_id.trim().is_empty()
         || target.generation == 0
     {
-        return RuleApplicability::Inapplicable(RuleInapplicable::AbsentSubjectIdentity);
+        return RuleApplicability::Malformed(MalformedProjection::AbsentSubjectIdentity);
     }
     for required in rule.required {
-        if let Some(reason) = absent_observation(*required, subject) {
-            return RuleApplicability::Inapplicable(reason);
+        if let Some(unusable) = unusable_observation(rule.rule_id, *required, subject) {
+            return unusable;
         }
     }
     RuleApplicability::Applicable
 }
 
-fn absent_observation(
+fn unusable_observation(
+    rule_id: &'static str,
     required: RequiredObservation,
     subject: &ApplicabilitySubject,
-) -> Option<RuleInapplicable> {
+) -> Option<RuleApplicability> {
     match required {
         RequiredObservation::WorkspaceInstanceIdentity => {
-            absent_identity(subject.workspace_instance.as_ref(), required)
+            unusable_identity(rule_id, subject.workspace_instance.as_ref(), required)
         }
-        RequiredObservation::AttemptIdentity => absent_identity(subject.attempt.as_ref(), required),
+        RequiredObservation::AttemptIdentity => {
+            unusable_identity(rule_id, subject.attempt.as_ref(), required)
+        }
         RequiredObservation::SourceEventObservation => {
-            absent_identity(subject.source_event.as_ref(), required)
+            unusable_identity(rule_id, subject.source_event.as_ref(), required)
         }
         RequiredObservation::FailureSignature => {
-            absent_identity(subject.failure_signature.as_ref(), required)
+            unusable_identity(rule_id, subject.failure_signature.as_ref(), required)
         }
         RequiredObservation::DescendantLineage => {
-            absent_identity(subject.descendant_lineage.as_ref(), required)
+            unusable_identity(rule_id, subject.descendant_lineage.as_ref(), required)
         }
         RequiredObservation::HookChainEvidence => {
-            absent_identity(subject.hook_evidence.as_ref(), required)
+            unusable_identity(rule_id, subject.hook_evidence.as_ref(), required)
         }
         RequiredObservation::CanonicalPathEvidence => {
-            absent_identity(subject.canonical_access.as_ref(), required)
+            unusable_identity(rule_id, subject.canonical_access.as_ref(), required)
         }
         RequiredObservation::StateFence => match &subject.fence {
-            None => Some(RuleInapplicable::AbsentObservation(required)),
+            None => Some(coverage_gap(rule_id, required)),
             Some(fence) => {
                 if fence.resource_generation == 0 {
-                    Some(RuleInapplicable::FenceWithoutGeneration)
+                    Some(RuleApplicability::Malformed(
+                        MalformedProjection::FenceWithoutGeneration,
+                    ))
                 } else if fence.authority_lineage_id.trim().is_empty()
                     || fence.authority_sequence == 0
                 {
-                    Some(RuleInapplicable::BlankObservation(required))
+                    Some(RuleApplicability::Malformed(
+                        MalformedProjection::BlankObservation(required),
+                    ))
                 } else {
                     None
                 }
             }
         },
         RequiredObservation::CorrelationInterval => match &subject.interval {
-            None => Some(RuleInapplicable::AbsentObservation(required)),
+            None => Some(coverage_gap(rule_id, required)),
             Some(interval) => {
                 if comparable_interval(interval) {
                     None
                 } else {
-                    Some(RuleInapplicable::UnorderedCorrelationInterval)
+                    Some(RuleApplicability::Malformed(
+                        MalformedProjection::UnorderedCorrelationInterval,
+                    ))
                 }
             }
         },
         RequiredObservation::EnvelopeMeasurement => match &subject.envelope {
-            None => Some(RuleInapplicable::AbsentObservation(required)),
+            None => Some(coverage_gap(rule_id, required)),
             Some(measurement) => {
                 if measurement.envelope_id.trim().is_empty() {
-                    Some(RuleInapplicable::BlankObservation(required))
+                    Some(RuleApplicability::Malformed(
+                        MalformedProjection::BlankObservation(required),
+                    ))
                 } else if measurement.admitted_limit == 0 {
-                    Some(RuleInapplicable::UnboundedEnvelope)
+                    Some(RuleApplicability::Malformed(
+                        MalformedProjection::UnboundedEnvelope,
+                    ))
                 } else {
                     None
                 }
             }
         },
         RequiredObservation::CompetentCoverage => match &subject.competent_coverage {
-            None => Some(RuleInapplicable::AbsentObservation(required)),
+            None => Some(coverage_gap(rule_id, required)),
             Some(coverage) if coverage.coverage_id.trim().is_empty() => {
-                Some(RuleInapplicable::BlankObservation(required))
+                Some(RuleApplicability::Malformed(
+                    MalformedProjection::BlankObservation(required),
+                ))
             }
             Some(_) => None,
         },
     }
 }
 
-fn absent_identity(
+/// Classifies one owner-issued identity slot as never projected or blank.
+fn unusable_identity(
+    rule_id: &'static str,
     identity: Option<&String>,
     required: RequiredObservation,
-) -> Option<RuleInapplicable> {
+) -> Option<RuleApplicability> {
     match identity {
-        None => Some(RuleInapplicable::AbsentObservation(required)),
-        Some(identity) if identity.trim().is_empty() => {
-            Some(RuleInapplicable::BlankObservation(required))
-        }
+        None => Some(coverage_gap(rule_id, required)),
+        Some(identity) if identity.trim().is_empty() => Some(RuleApplicability::Malformed(
+            MalformedProjection::BlankObservation(required),
+        )),
         Some(_) => None,
     }
 }
 
+/// True only when both ends of the interval share one recorded clock domain.
+///
+/// `ClockDomain::Unknown` is rejected on either end. An unrecorded clock domain
+/// is not a shared clock domain: two `Unknown` ends compare equal, so accepting
+/// them would let an interval whose ticks share no clock be treated as
+/// comparable, and an ordered-by-accident unknown interval is still not
+/// evidence ordered in time.
 fn comparable_interval(interval: &CorrelationInterval) -> bool {
-    interval.start.domain == interval.end.domain
+    known_clock_domain(&interval.start.domain)
+        && known_clock_domain(&interval.end.domain)
+        && interval.start.domain == interval.end.domain
         && interval.start.unit == interval.end.unit
         && interval.end.ticks >= interval.start.ticks
+}
+
+/// True when the domain names a clock the reading is actually expressed in.
+fn known_clock_domain(domain: &ClockDomain) -> bool {
+    !matches!(domain, ClockDomain::Unknown { .. })
 }
 
 /// Owner-issued provider attempt identity from `ProviderHostEventGap`.
@@ -777,17 +905,13 @@ pub struct IntegrationGapObservation {
     pub signal_context: IntegrationGapSignalContext,
 }
 
-/// Why an input did not prove a provider host-event sequence gap.
+/// Why an applicable rule evaluated cleanly and proved no sequence gap.
 ///
-/// Every variant is fail-closed. `Inapplicable` carries the exact unsatisfied
-/// requirement from the finite rule table, so a caller can tell an unusable
-/// observation apart from an observation that simply did not cross the
-/// threshold.
+/// Each variant names a check the rule passed. None of them is a statement
+/// about coverage: a caller that reaches this type has already proved the rule
+/// was applicable, so the absence is an ordinary one and nothing more.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IntegrationGapUnknown {
-    /// The rule's required observations were absent or unusable, so the rule
-    /// could not be evaluated and did not fire.
-    Inapplicable(RuleInapplicable),
+pub enum NoGapReason {
     /// The owner-issued source event does not bind the owner-issued attempt.
     AttemptMismatch,
     /// A provider event sequence cannot start at zero.
@@ -796,13 +920,36 @@ pub enum IntegrationGapUnknown {
     InvalidSequenceOrder,
 }
 
+/// Why one provider host-event projection could not be evaluated at all.
+///
+/// A malformed projection is never reported as an absence. The rule did not
+/// evaluate cleanly, so no conclusion may be drawn from this evaluation in
+/// either direction, and the caller must raise the fault rather than record it
+/// as a no-signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IntegrationGapError {
+    /// The projection is structurally unusable for this rule.
+    MalformedProjection(MalformedProjection),
+    /// The assembled candidate failed the signal layer's own validation.
+    MalformedSignal(crate::signals::SignalValidationError),
+}
+
 /// Evidence-only result from evaluating the provider host-event gap rule.
+///
+/// The three cases are kept apart at the type level. A
+/// [`Self::SupervisionGap`] reports missing coverage, which is a finding. A
+/// [`Self::NoGap`] is the only ordinary absence. A projection that could not be
+/// evaluated is not here at all; it is an [`IntegrationGapError`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IntegrationGapEvaluation {
     /// One forward sequence skip is proved by the owner-supplied observation.
     GapDetected(Box<IntegrationGapSignalCandidate>),
-    /// The source projection did not prove a forward gap.
-    Unknown(IntegrationGapUnknown),
+    /// A required observation was never established, so no gap could be
+    /// evaluated and the missing coverage is itself the reportable fact.
+    SupervisionGap(SupervisionGap),
+    /// The rule was applicable and the source projection did not prove a
+    /// forward gap.
+    NoGap(NoGapReason),
 }
 
 /// Complete immutable Signal candidate plus its exact typed source projection.
@@ -828,25 +975,34 @@ pub struct IntegrationGapSignalCandidate {
 /// along with owner-issued `SignalTarget` and signal metadata. Callers must not derive
 /// those identities from cwd strings, arbitrary paths, or hook text.
 ///
-/// The rule first proves its own applicability through
-/// [`evaluate_rule_applicability`]. An unsatisfied requirement returns
-/// `Unknown` and the rule does not fire; it is never treated as passing.
+/// The rule first proves its own applicability, passing the identity of the
+/// very descriptor it later builds its Signal from; the compile-time
+/// assertions above make that lookup resolve back to the same entry. An
+/// observation that was never projected yields
+/// [`IntegrationGapEvaluation::SupervisionGap`], which is the reportable
+/// finding: the rule could not be evaluated, and that is never proof that the
+/// gap did not occur. A structurally unusable projection yields
+/// [`IntegrationGapError`], because a malformed input is not an absence. Only
+/// an applicable rule that finds nothing yields
+/// [`IntegrationGapEvaluation::NoGap`].
 pub fn evaluate_provider_host_event_gap(
     observation: IntegrationGapObservation,
-) -> Result<IntegrationGapEvaluation, crate::signals::SignalValidationError> {
+) -> Result<IntegrationGapEvaluation, IntegrationGapError> {
     let rule = provider_host_event_gap_rule();
-    if let RuleApplicability::Inapplicable(reason) =
-        evaluate_rule_applicability(rule.rule_id, &applicability_subject(&observation))
-    {
-        return Ok(IntegrationGapEvaluation::Unknown(
-            IntegrationGapUnknown::Inapplicable(reason),
-        ));
+    match evaluate_rule_applicability(rule.rule_id, &applicability_subject(&observation)) {
+        RuleApplicability::Applicable => {}
+        RuleApplicability::CoverageGap(gap) => {
+            return Ok(IntegrationGapEvaluation::SupervisionGap(gap));
+        }
+        RuleApplicability::Malformed(malformed) => {
+            return Err(IntegrationGapError::MalformedProjection(malformed));
+        }
     }
     let skipped_sequence_count = match prove_sequence_gap(&observation) {
         Ok(count) => count,
-        Err(unknown) => return Ok(IntegrationGapEvaluation::Unknown(unknown)),
+        Err(reason) => return Ok(IntegrationGapEvaluation::NoGap(reason)),
     };
-    let signal = build_signal(&observation)?;
+    let signal = build_signal(&observation).map_err(IntegrationGapError::MalformedSignal)?;
 
     Ok(IntegrationGapEvaluation::GapDetected(Box::new(
         IntegrationGapSignalCandidate {
@@ -887,21 +1043,23 @@ fn applicability_subject(observation: &IntegrationGapObservation) -> Applicabili
     }
 }
 
-fn prove_sequence_gap(
-    observation: &IntegrationGapObservation,
-) -> Result<u64, IntegrationGapUnknown> {
+/// Proves the forward skip, or names the check the pair did not satisfy.
+///
+/// This runs only after the rule is applicable, so every failure here is an
+/// ordinary absence rather than a coverage or malformed-input fault.
+fn prove_sequence_gap(observation: &IntegrationGapObservation) -> Result<u64, NoGapReason> {
     if observation.signal_context.target.subject_id != observation.attempt.0 {
-        return Err(IntegrationGapUnknown::AttemptMismatch);
+        return Err(NoGapReason::AttemptMismatch);
     }
     if observation.expected_sequence == 0 {
-        return Err(IntegrationGapUnknown::ZeroExpectedSequence);
+        return Err(NoGapReason::ZeroExpectedSequence);
     }
     let Some(skipped_sequence_count) = observation
         .observed_sequence
         .checked_sub(observation.expected_sequence)
         .filter(|count| *count > 0)
     else {
-        return Err(IntegrationGapUnknown::InvalidSequenceOrder);
+        return Err(NoGapReason::InvalidSequenceOrder);
     };
     Ok(skipped_sequence_count)
 }
