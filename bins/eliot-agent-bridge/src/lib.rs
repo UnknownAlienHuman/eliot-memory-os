@@ -42,11 +42,11 @@ pub use eliot_agent_bridge_core::{
 };
 use eliot_contracts::{
     BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
-    BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeEventCapacityDimension, BridgeEventCapacityPressure,
-    BridgeEventLocalPhase, BridgeRecoveryPageCommitment, BridgeRecoverySelector,
-    BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition, BridgeTransportBackpressure,
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    canonical_json_bytes, sha256_hex,
+    BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
+    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
+    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
+    BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
+    RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -1459,21 +1459,31 @@ fn decode_recovery_window_expiry(
 /// Binds the v2 owner window identity legs to this live response before its
 /// facts can become an import candidate. The source revision remains part of
 /// the ORS page commitment; generation and connection must also match the
-/// separately authenticated Kernel presentation.
+/// separately authenticated Kernel presentation while the window is active.
 fn validate_recovery_window_identity_v2(
     reconciliation: &serde_json::Value,
+    disposition: BridgeRecoveryWindowDisposition,
     live_generation: u64,
     connection_echo: &str,
 ) -> Result<(), ProviderFailure> {
-    recovery_sequence(reconciliation, "window_source_revision")?;
+    let source_revision = recovery_sequence(reconciliation, "window_source_revision")?;
     let window_generation = recovery_sequence(reconciliation, "window_live_generation")?;
-    if window_generation != live_generation {
+    let window_connection = recovery_text(reconciliation, "window_presenting_connection")?;
+    if source_revision == 0 || window_generation == 0 {
+        return Err(event_shape_failure(
+            "reconciliation refused: window source revision and generation must be nonzero",
+        ));
+    }
+    if disposition == BridgeRecoveryWindowDisposition::Active
+        && window_generation != live_generation
+    {
         return Err(event_shape_failure(
             "reconciliation refused: v2 window generation differs from the live attach",
         ));
     }
-    let window_connection = recovery_text(reconciliation, "window_presenting_connection")?;
-    if window_connection != connection_echo {
+    if disposition == BridgeRecoveryWindowDisposition::Active
+        && window_connection != connection_echo
+    {
         return Err(event_shape_failure(
             "reconciliation refused: v2 window connection differs from the presenting attach",
         ));
@@ -1481,8 +1491,9 @@ fn validate_recovery_window_identity_v2(
     Ok(())
 }
 
-/// Enforces the v2 owner identity requirement and keeps legacy moved/expired
-/// windows as refresh denials instead of importing guessed completeness.
+/// Enforces the v2/v3 owner identity requirement and keeps legacy
+/// moved/expired windows as refresh denials instead of importing guessed
+/// completeness.
 fn decode_recovery_window_identity_version(
     reconciliation: &serde_json::Value,
     identity_version: u64,
@@ -1508,13 +1519,85 @@ fn decode_recovery_window_identity_version(
              refresh required, external reconciliation gate remains closed",
         ));
     }
-    if identity_version != 2 {
+    if !matches!(identity_version, 2 | 3) {
         return Err(event_shape_failure(
             "reconciliation refused: unsupported owner window identity version",
         ));
     }
-    validate_recovery_window_identity_v2(reconciliation, live_generation, connection_echo)?;
+    validate_recovery_window_identity_v2(
+        reconciliation,
+        disposition,
+        live_generation,
+        connection_echo,
+    )?;
     Ok(None)
+}
+
+/// A moved or expired selector may return its exact committed window identity
+/// after reconnect, but it cannot carry page facts or an acknowledgement that
+/// advances the retained consumed frontier.
+fn ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
+    value: &serde_json::Value,
+    reconciliation: &serde_json::Value,
+    window_status: RecoveryWindowStatus,
+    unresolved: &BridgeRecoveryUnresolvedFrontier,
+) -> Result<(), ProviderFailure> {
+    if window_status == RecoveryWindowStatus::Active {
+        return Ok(());
+    }
+    let streams = reconciliation
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: stream list absent"))?;
+    let unscoped_gaps = reconciliation
+        .get("unscoped_gaps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: unscoped gaps absent"))?;
+    if !streams.is_empty() || !unscoped_gaps.is_empty() {
+        return Err(event_shape_failure(
+            "reconciliation refused: moved or expired window cannot carry recovery facts",
+        ));
+    }
+    for field in [
+        "stream_list_continuation",
+        "stream_list_proof",
+        "unscoped_gaps_continuation",
+        "unscoped_gaps_proof",
+    ] {
+        if reconciliation
+            .get(field)
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: moved or expired window cannot carry continuation cursors or proofs",
+            ));
+        }
+    }
+    if reconciliation
+        .get("stream_list_complete")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+        || reconciliation
+            .get("unscoped_gaps_complete")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || !unresolved.stream_list_pending
+        || !unresolved.unscoped_gaps_pending
+        || !unresolved.stream_pages_pending
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: moved or expired window cannot claim completed coverage",
+        ));
+    }
+    if value
+        .get("acknowledgement")
+        .is_some_and(|receipt| !receipt.is_null())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: moved or expired window cannot confirm a consumed frontier",
+        ));
+    }
+    Ok(())
 }
 
 /// Decodes one owner stream page whole: identities, records, cursors, and
@@ -1890,6 +1973,42 @@ fn decode_reconciliation_identity<'a>(
     })
 }
 
+/// Checks owner window identity and the no-facts rule for terminal replies.
+fn validate_recovery_window_identity_and_reply_shape(
+    value: &serde_json::Value,
+    reconciliation: &serde_json::Value,
+    identity: &DecodedReconciliationIdentity<'_>,
+    disposition: BridgeRecoveryWindowDisposition,
+    window_status: RecoveryWindowStatus,
+    unresolved: &BridgeRecoveryUnresolvedFrontier,
+    expected: Option<&RecoveryReadRequest>,
+) -> Result<Option<ReconciliationPortOutcome>, ProviderFailure> {
+    let legacy_denial = decode_recovery_window_identity_version(
+        reconciliation,
+        identity.window_identity_version,
+        disposition,
+        identity.live_generation,
+        identity.connection_echo,
+    )?;
+    ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
+        value,
+        reconciliation,
+        window_status,
+        unresolved,
+    )?;
+    if let Some(legacy_denial) = legacy_denial {
+        check_expected_continuation(reconciliation, &[], expected)?;
+        return Ok(Some(legacy_denial));
+    }
+    Ok(None)
+}
+
+fn reconciliation_receipt_ref(key: &str) -> Result<ReconciliationReceiptRef, ProviderFailure> {
+    ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}")).map_err(|_| {
+        event_shape_failure("reconciliation refused: owner key does not form a receipt reference")
+    })
+}
+
 /// Decodes the owner's reconciliation answer into a port outcome, refusing any
 /// answer that does not belong to the presenting attach. The continuation
 /// checks live in [`check_expected_continuation`]: a required stream scope must
@@ -1928,12 +2047,14 @@ fn decode_reconciliation_outcome(
         disposition,
         &unresolved,
     )?;
-    if let Some(legacy_denial) = decode_recovery_window_identity_version(
+    if let Some(legacy_denial) = validate_recovery_window_identity_and_reply_shape(
+        value,
         reconciliation,
-        identity.window_identity_version,
+        &identity,
         disposition,
-        identity.live_generation,
-        identity.connection_echo,
+        window_status,
+        &unresolved,
+        expected,
     )? {
         return Ok(legacy_denial);
     }
@@ -1950,14 +2071,9 @@ fn decode_reconciliation_outcome(
     let key = verify_reconcile_key(reconciliation)?;
     decode_handoff_maintenance_pressure(reconciliation)?;
     let handoffs_reconciled = decode_handoffs_reconciled(reconciliation)?;
-    check_recovery_page_ordinals(reconciliation, expected)?;
     check_expected_continuation(reconciliation, &stream_facts, expected)?;
-    let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
-        .map_err(|_| {
-            event_shape_failure(
-                "reconciliation refused: owner key does not form a receipt reference",
-            )
-        })?;
+    check_recovery_page_ordinals(reconciliation, expected, window_status)?;
+    let receipt_ref = reconciliation_receipt_ref(&key)?;
     let presenting_connection = ConnectionId::new(identity.connection_echo).map_err(|_| {
         event_shape_failure("reconciliation refused: connection echo is not a valid identity")
     })?;
@@ -1997,7 +2113,11 @@ fn decode_reconciliation_outcome(
             "reconciliation refused: live attach binding does not seal the owner answer",
         )
     })?
-    .with_consumed_frontiers(consumed_frontiers);
+    .with_consumed_frontiers(if window_status == RecoveryWindowStatus::Active {
+        consumed_frontiers
+    } else {
+        Vec::new()
+    });
     Ok(ReconciliationPortOutcome::Reconciled(
         if expected.is_some() {
             result.as_pure_recovery_read()
@@ -2129,8 +2249,14 @@ fn recovery_scope_value(
     request: &RecoveryReadRequest,
 ) -> Result<BridgeRecoverySelector, ProviderFailure> {
     if request.is_resume() {
-        return Ok(BridgeRecoverySelector::Resume {
-            version: BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
+        return Ok(match request.window_key() {
+            Some(window_key) => BridgeRecoverySelector::ResumeWindow {
+                version: BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION,
+                window_key: window_key.to_owned(),
+            },
+            None => BridgeRecoverySelector::Resume {
+                version: BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
+            },
         });
     }
     let window_key = request.window_key().ok_or_else(|| {
@@ -2381,11 +2507,15 @@ fn check_finite_page_end(
 fn check_recovery_page_ordinals(
     reconciliation: &serde_json::Value,
     expected: Option<&RecoveryReadRequest>,
+    window_status: RecoveryWindowStatus,
 ) -> Result<(), ProviderFailure> {
     let streams = reconciliation
         .get("streams")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| event_shape_failure("reconciliation refused: stream list absent"))?;
+    if window_status != RecoveryWindowStatus::Active {
+        return Ok(());
+    }
     let list_predecessor = expected
         .and_then(RecoveryReadRequest::stream_list_scope)
         .map(|(after, _)| after.parse::<u64>())
@@ -3127,6 +3257,35 @@ impl KernelMcpForwardingPort {
                 })
         })
     }
+
+    fn validate_reconciliation_window_response(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<RecoveryWindowStatus, ProviderFailure> {
+        let window_status = match value
+            .get("reconciliation")
+            .ok_or_else(event_transport_failure)
+            .and_then(|reconciliation| {
+                decode_recovery_window_state(reconciliation).map(|(_, status)| status)
+            }) {
+            Ok(status) => status,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        if window_status != RecoveryWindowStatus::Active
+            && value
+                .get("acknowledgement")
+                .is_some_and(|receipt| !receipt.is_null())
+        {
+            self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+            return Err(event_shape_failure(
+                "reconciliation refused: moved or expired window cannot confirm a consumed frontier",
+            ));
+        }
+        Ok(window_status)
+    }
 }
 
 impl McpForwardingPort for KernelMcpForwardingPort {
@@ -3331,6 +3490,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 }
             };
         }
+        let window_status = self.validate_reconciliation_window_response(&value)?;
         match has_unresolved_handoff_mutation(&value) {
             Ok(true) => {
                 return match self.retain_acknowledgement_receipt(&value, false) {
@@ -3352,7 +3512,9 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 return Err(error);
             }
         }
-        if let Err(error) = self.retain_acknowledgement_receipt(&value, false) {
+        if window_status == RecoveryWindowStatus::Active
+            && let Err(error) = self.retain_acknowledgement_receipt(&value, false)
+        {
             self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
             return Err(error);
         }
@@ -3377,10 +3539,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// rights, including after a reconnect, and possession of the token
     /// alone authorizes nothing. The reply decodes through the same
     /// validating path as the full read, additionally requiring the
-    /// selected scope, predecessor, and next continuation to match. A Resume
-    /// selector carries no window identity: ORS resolves the unique persisted
-    /// owner-scoped window and its returned key is accepted only through the
-    /// page commitment and reconciliation-key checks.
+    /// selected scope, predecessor, and next continuation to match. A fresh-
+    /// process Resume omits the window key so ORS resolves the unique window
+    /// for the authenticated owner. A cached-core `ResumeWindow` constrains that
+    /// lookup to its previously admitted key, without a continuation proof or
+    /// authority; the returned key still passes the page-commitment and
+    /// reconciliation-key checks.
     fn reconcile_continue(
         &mut self,
         binding: &AttachBinding,

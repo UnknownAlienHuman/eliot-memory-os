@@ -264,26 +264,59 @@ impl InquiryObligation {
         Ok(obligation)
     }
 
-    /// Whether this obligation is satisfied by an admitted certificate of its
-    /// declared kind.
+    /// Whether an admitted certificate of kind `presented` satisfies this
+    /// obligation.
     ///
-    /// `presented` is the kind of the certificate the caller actually admitted.
-    /// A status is never enough on its own: only the certificate kind the
-    /// obligation declared can verify it, so a `Verified` obligation presented
-    /// with any other kind is not verified by that certificate.
+    /// I21.5: "An obligation is satisfied by its certificate, never by a
+    /// worker's report that it is done." The certificate kind is therefore the
+    /// input and the `status` field is **not**: `status` is this domain's own
+    /// record of a certificate verdict that already happened, so reading it back
+    /// as the answer would let a caller declare `Verified` in [`Self::new`] and
+    /// be told yes — the status echo this method used to be, which could not
+    /// perform the kind comparison its own comment promised because nothing on
+    /// this type carried a presented certificate. The status is read only to
+    /// refuse a late certificate: an obligation that was rejected, cancelled or
+    /// invalidated is no longer satisfiable, so no presented kind verifies it.
     ///
-    /// This used to take no argument and answer from `status` alone. It declared
-    /// a kind comparison it could not perform — nothing on this type carried a
-    /// presented certificate — so an obligation built with `status: Verified`
-    /// satisfied this method while declaring, say,
-    /// `ExactSourceIdentityAndPassage` and never producing that certificate.
-    /// Comparing the presented kind against `acceptance_certificate_kind` is what
-    /// makes the guarantee above true; the status alone is a caller-declared
-    /// literal.
+    /// `presented` is the kind of certificate the caller actually admitted.
+    /// Only the certificate kind the obligation declared can verify it, so a
+    /// certificate of any other kind leaves the obligation unsatisfied.
+    /// [`Self::admit_acceptance_certificate`] is the only path that acts on that
+    /// answer, which is what keeps a `Verified` status from ever being reached
+    /// without a certificate.
     #[must_use]
     pub fn is_verified_by_certificate(&self, presented: AcceptanceCertificateKind) -> bool {
-        self.status == InquiryObligationStatus::Verified
-            && presented == self.acceptance_certificate_kind
+        presented == self.acceptance_certificate_kind
+            && !matches!(
+                self.status,
+                InquiryObligationStatus::Rejected
+                    | InquiryObligationStatus::Cancelled
+                    | InquiryObligationStatus::Invalidated
+            )
+    }
+
+    /// Admits the acceptance certificate the run presented for this obligation.
+    ///
+    /// This is the only path to [`InquiryObligationStatus::Verified`], and it
+    /// reaches it only through [`Self::is_verified_by_certificate`]: the caller
+    /// hands over the kind of certificate it actually holds, and the obligation
+    /// becomes verified only when that certificate is of the kind the obligation
+    /// declared and the obligation is still satisfiable. A wrong kind leaves the
+    /// status exactly as it was, so a certificate of some other kind can never
+    /// relabel an obligation as satisfied — which is the same property I21.5
+    /// demands, enforced by the transition instead of asserted in prose.
+    ///
+    /// The digest is recomputed on the transition, so a verified obligation can
+    /// no longer re-present as the unverified one it was compiled as.
+    ///
+    /// Returns `true` when the presented certificate verified the obligation.
+    pub fn admit_acceptance_certificate(&mut self, presented: AcceptanceCertificateKind) -> bool {
+        if !self.is_verified_by_certificate(presented) {
+            return false;
+        }
+        self.status = InquiryObligationStatus::Verified;
+        self.digest = self.compute_digest();
+        true
     }
 
     /// Retains the invalidating cause, the resources spent and the reusable

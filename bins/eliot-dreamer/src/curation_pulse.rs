@@ -23,6 +23,14 @@
 //! omitted, unprocessed, or refused is `Partial`, never `Complete`, so absence
 //! of evidence can never read as safe completeness.
 //!
+//! Protection is carried, not summarized. The A-20 screen's per-member
+//! protection assessment reaches the receipt twice: whole, as
+//! [`CurationProductPulse::protection`], and per routed member as
+//! [`CurationMemberFinding::protection`]. An A-31 routing disposition answers
+//! "where did this route", never "what protects this record", so the two are
+//! separate fields and a protected exact-negative record stays distinguishable
+//! from an ordinary one in the emitted JSONL.
+//!
 //! Proof ceiling is recorded on two independent fields. [`CURATION_EDGE_PROOF_CEILING`]
 //! is what this narrow edge result proves; [`CURATION_PACKAGE_PROOF_CEILING`] is
 //! the package-level ceiling, carried separately and never merged into the edge
@@ -35,6 +43,7 @@ use eliot_dreamer_curation::{CurationCandidateSet, ValidatedCurationBatch};
 use serde::{Deserialize, Serialize};
 
 use crate::DreamerError;
+use crate::curation_screen_stage::{CurationProtection, CurationProtectionSet};
 
 /// Exact schema version accepted by [`CurationProductPulse`].
 pub const CURATION_PULSE_SCHEMA_VERSION: u32 = 1;
@@ -62,6 +71,13 @@ pub const CURATION_PACKAGE_PROOF_CEILING: &str = "LOCAL_EXACT_TREE_PACKAGE_PROOF
 /// Fail-closed reason when the routed set, the admitted batch denominator, and
 /// the owner screen binding do not describe the same operation.
 const CURATION_PULSE_BINDING_REFUSAL: &str = "curation product pulse binding invalid";
+
+/// Fail-closed reason when a candidate cannot be matched to the pulse finding
+/// that carries its protection assessment. Without that finding the candidate
+/// would be promoted with no protection record, which is exactly the gap this
+/// module exists to close, so the route refuses instead.
+pub(crate) const PROTECTION_FINDING_REFUSAL: &str =
+    "curation candidate has no owner protection finding";
 
 /// Returns the closed wire spelling of one routing-only rejection hint.
 ///
@@ -110,6 +126,19 @@ pub struct CurationMemberFinding {
     pub result_digest: Option<String>,
     /// Denominator targets the member was dispatched over, in batch order.
     pub targets: Vec<String>,
+    /// A-20 owner protection assessments for the screened records THIS member
+    /// proposes to transform, in `targets` order and copied verbatim from the
+    /// screen binding's own assessed denominator.
+    ///
+    /// One assessment per target, so a member that would merge a protected
+    /// exact-negative record carries that member's declaration and cannot be
+    /// read as an unremarkable candidate. A member whose targets drew no owner
+    /// declaration still carries their assessments: an empty list here would
+    /// be indistinguishable from a missing record, so the fail-closed
+    /// `Unknown` verdict is stated explicitly instead. An A-31 routing
+    /// disposition is a different question from protection and never stands in
+    /// for these records.
+    pub protection: Vec<CurationProtection>,
 }
 
 /// Closed overall disposition of one observed Curation route.
@@ -177,6 +206,14 @@ pub struct CurationProductPulse {
     pub expected_total: u32,
     /// Denominator members the A-20 owner screen bound, in binding order.
     pub screened_targets: Vec<String>,
+    /// A-20 owner protection assessment for the whole screened denominator,
+    /// carried verbatim from the screen path that derived it.
+    ///
+    /// This is the complete record, so a screened member no routed item
+    /// proposed (an omitted target) still shows its protection state instead of
+    /// vanishing with its finding. Per-member `protection` lists in `findings`
+    /// are a projection of this one owner record, never a second assessment.
+    pub protection: CurationProtectionSet,
     /// Denominator members the admitted batch declared, in batch order.
     pub denominator_members: Vec<String>,
     /// Identities of the members that produced a live candidate.
@@ -234,6 +271,47 @@ fn echoes_binding(
         && set.denominator.mode == batch.denominator.mode
 }
 
+/// Projects one A-20 owner protection assessment onto every routed member.
+///
+/// Each finding carries the assessments for the screened records that member
+/// proposes to transform, resolved by target handle against the assessment
+/// set and copied verbatim. A routed member naming a target with no assessment
+/// refuses rather than being reported as unassessed, so a protected record can
+/// never reach the receipt stripped of its owner declaration.
+fn member_findings(
+    protection: &CurationProtectionSet,
+    members: &[eliot_dreamer_curation::CurationMemberOutcome],
+) -> Result<Vec<CurationMemberFinding>, DreamerError> {
+    members
+        .iter()
+        .map(|member| {
+            let mut member_protection = Vec::with_capacity(member.targets.len());
+            for target in &member.targets {
+                let assessment = protection
+                    .members
+                    .iter()
+                    .find(|item| &item.member_id == target)
+                    .ok_or(DreamerError::InvalidAdmission(
+                        CURATION_PULSE_BINDING_REFUSAL,
+                    ))?;
+                member_protection.push(assessment.clone());
+            }
+            Ok(CurationMemberFinding {
+                member_id: member.member_id.clone(),
+                item_index: member.item_index,
+                handler_id: member.handler_id.clone(),
+                disposition: member.disposition.as_str().to_owned(),
+                rejection_hint: member.rejection_hint.map(rejection_hint_spelling),
+                calls: member.calls,
+                request_digest: member.request_digest.clone(),
+                result_digest: member.result_digest.clone(),
+                targets: member.targets.clone(),
+                protection: member_protection,
+            })
+        })
+        .collect()
+}
+
 /// Composes the Curation Product Pulse for one completed admitted Curation run.
 ///
 /// Binds the receipt to the operation by CONTENT, never by a second copy of a
@@ -242,6 +320,14 @@ fn echoes_binding(
 /// both screen digests, and the exact denominator. Disagreement refuses
 /// fail-closed; the composer never repairs, fills, or reorders a set.
 ///
+/// The A-20 owner protection assessment is a FOURTH record with its own
+/// producer, and it is checked against the routed set rather than against
+/// itself: every routed member must resolve to exactly one assessment, and the
+/// assessment denominator must be the screen binding's own target list. A
+/// member the owner declared protected therefore cannot reach the receipt
+/// stripped of its declaration, and a member with no declaration cannot read
+/// as assessed-and-clear.
+///
 /// `Complete` requires an all-or-nothing run with an empty omission list, an
 /// empty unprocessed frontier, and zero rejected, blocked, or unprocessed
 /// members. Partial aggregation, any omission, and any non-candidate member all
@@ -249,11 +335,13 @@ fn echoes_binding(
 ///
 /// # Errors
 ///
-/// Returns [`DreamerError::InvalidAdmission`] when the three owner records do
-/// not describe the same operation, or when a denominator total cannot be
-/// represented for comparison.
+/// Returns [`DreamerError::InvalidAdmission`] when the owner records do not
+/// describe the same operation, when a routed member has no protection
+/// assessment, or when a denominator total cannot be represented for
+/// comparison.
 pub(crate) fn compose_curation_pulse(
     screen: &ScreenBinding,
+    protection: &CurationProtectionSet,
     batch: &ValidatedCurationBatch,
     set: &CurationCandidateSet,
 ) -> Result<CurationProductPulse, DreamerError> {
@@ -279,6 +367,29 @@ pub(crate) fn compose_curation_pulse(
         return Err(refused());
     }
 
+    // The protection assessment must cover exactly the screened operation: one
+    // assessment per screened target, in binding order, naming that target.
+    // Without this a screened record could reach the receipt with no protection
+    // record at all, which is precisely the gap a protected minority member
+    // must not slip through: a missing or misaligned finding refuses instead
+    // of reading as no protection.
+    //
+    // The assessment is checked against the BINDING, not against the routed
+    // member count: one curation item may transform several screened targets,
+    // so an item count and a target count are different quantities and must
+    // never be compared. Per-member resolution happens in `member_findings`,
+    // where each member's own targets are looked up by handle.
+    if protection.screened_targets != screen.screened_targets
+        || protection.members.len() != protection.screened_targets.len()
+        || protection
+            .members
+            .iter()
+            .zip(&protection.screened_targets)
+            .any(|(assessment, target)| assessment.member_id != *target)
+    {
+        return Err(refused());
+    }
+
     // The routed set must echo the same operation the binding and the batch
     // describe; a rehashed or foreign set refuses instead of being narrated.
     if !echoes_binding(set, screen, batch) {
@@ -289,21 +400,7 @@ pub(crate) fn compose_curation_pulse(
     // protected, refused, or unprocessed member is recorded as a finding so no
     // member disappears from the receipt between the denominator and the
     // promoted candidates.
-    let findings: Vec<CurationMemberFinding> = set
-        .members
-        .iter()
-        .map(|member| CurationMemberFinding {
-            member_id: member.member_id.clone(),
-            item_index: member.item_index,
-            handler_id: member.handler_id.clone(),
-            disposition: member.disposition.as_str().to_owned(),
-            rejection_hint: member.rejection_hint.map(rejection_hint_spelling),
-            calls: member.calls,
-            request_digest: member.request_digest.clone(),
-            result_digest: member.result_digest.clone(),
-            targets: member.targets.clone(),
-        })
-        .collect();
+    let findings = member_findings(protection, &set.members)?;
     let candidate_ids: Vec<String> = findings
         .iter()
         .filter(|finding| finding.disposition == "candidate" && finding.calls == 1)
@@ -345,6 +442,7 @@ pub(crate) fn compose_curation_pulse(
         },
         expected_total: batch.denominator.expected_total,
         screened_targets: screen.screened_targets.clone(),
+        protection: protection.clone(),
         denominator_members: batch.denominator.members.clone(),
         candidate_ids,
         findings,
@@ -378,8 +476,21 @@ pub(crate) fn fixture_pulse(
     screened_targets: Vec<String>,
     candidate_ids: Vec<String>,
 ) -> CurationProductPulse {
+    use crate::curation_screen_stage::{ProtectionClass, ProtectionDecision};
+
     let denominator_members = screened_targets.clone();
     let expected_total = u32::try_from(denominator_members.len()).unwrap_or(u32::MAX);
+    // A fixture admits no owner conflict declaration, so every screened member
+    // is honestly `Unknown`: this helper must not manufacture clearance.
+    let fixture_protection: Vec<CurationProtection> = screened_targets
+        .iter()
+        .map(|member_id| CurationProtection {
+            member_id: member_id.clone(),
+            class: None::<ProtectionClass>,
+            decision: ProtectionDecision::Unknown,
+            owner_reference: None,
+        })
+        .collect();
     let findings: Vec<CurationMemberFinding> = candidate_ids
         .iter()
         .map(|member_id| CurationMemberFinding {
@@ -392,6 +503,7 @@ pub(crate) fn fixture_pulse(
             request_digest: None,
             result_digest: None,
             targets: screened_targets.clone(),
+            protection: fixture_protection.clone(),
         })
         .collect();
     CurationProductPulse {
@@ -416,6 +528,10 @@ pub(crate) fn fixture_pulse(
         disposition: CurationPulseDisposition::Partial,
         expected_total,
         screened_targets,
+        protection: CurationProtectionSet {
+            screened_targets: denominator_members.clone(),
+            members: fixture_protection,
+        },
         denominator_members,
         candidate_ids,
         findings,
