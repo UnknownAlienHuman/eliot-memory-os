@@ -2265,35 +2265,48 @@ fn revision_with_owner_normalization_receipt(
     request: &UserAutomationStoreRequest,
     revision: &UserAutomationRevision,
 ) -> Result<(UserAutomationRevision, ReceiptEnvelope), StoreError> {
+    let core = owner_normalization_receipt_core(request, revision)?;
+    let receipt = revision
+        .schedule
+        .issue_normalization_receipt(core.clone(), &request.authenticated_principal)
+        .map_err(|_| StoreError::InvalidField {
+            field: "automation.schedule.normalization_receipt",
+            reason: "owner-issued normalization receipt was refused",
+        })?;
+    // RETENTION. `issue_normalization_receipt` returns the typed payload and
+    // keeps the envelope it derived, so this leg re-issues the SAME immutable
+    // core to obtain the envelope bytes it must retain. That is not a second
+    // issuance authority: `ReceiptEnvelope::issue` is a pure function of the
+    // core, so the re-issued envelope is byte-identical to the one whose
+    // identity the payload already names, and the identity equality asserted
+    // below is what proves it rather than assuming it. Minting without
+    // retaining left the identity the immutable revision names unanswerable by
+    // any owner, which is exactly the gap the run-now readback closes.
+    let envelope = ReceiptEnvelope::issue(core).map_err(StoreError::Receipt)?;
+    if envelope.identity.receipt_id.as_str() != receipt.receipt_id {
+        return Err(StoreError::Receipt(ReceiptError::IdentityMismatch));
+    }
+    let mut owned = revision.clone();
+    owned.schedule.normalization_receipt = receipt;
+    Ok((owned, envelope))
+}
+
+/// Builds the exact receipt core this owner issues the schedule normalization
+/// receipt from, binding it to the request's fence.
+///
+/// Split out from [`revision_with_owner_normalization_receipt`] so that function
+/// reads as the two steps it actually is — issue the receipt, then retain the
+/// envelope those bytes were derived from — and this one is the declarative part
+/// that says what the receipt attests. The core stays a pure function of the
+/// admitted request and the submitted revision, which is what lets the sealing
+/// call and the dispatch call mint one identical envelope identity.
+fn owner_normalization_receipt_core(
+    request: &UserAutomationStoreRequest,
+    revision: &UserAutomationRevision,
+) -> Result<ReceiptCore, StoreError> {
     let state_fence = request.context.state_fence.clone();
-    // The owner-issued task/session bindings mirror the canonical Store
-    // receipt owner: a request that carries a task without the fence revision
-    // that task is pinned at cannot be bound honestly, so it is refused here
-    // instead of being committed with the binding dropped.
-    let task = match (request.context.task_id.clone(), state_fence.task_revision) {
-        (Some(task_id), Some(task_revision)) => Some(TaskBinding {
-            task_id,
-            task_revision,
-            state_fence: state_fence.clone(),
-        }),
-        (None, _) => None,
-        (Some(_), None) => {
-            return Err(StoreError::InvalidField {
-                field: "automation.context.task_id",
-                reason: "normalization receipt requires the fenced task revision",
-            });
-        }
-    };
-    let session = request
-        .context
-        .session_id
-        .clone()
-        .map(|session_id| SessionBinding {
-            session_id,
-            authority_epoch: state_fence.authority_epoch.clone(),
-            state_fence: state_fence.clone(),
-        });
-    let core = ReceiptCore {
+    let (task, session) = owner_normalization_receipt_bindings(request, &state_fence)?;
+    Ok(ReceiptCore {
         contract: eliot_receipts::contract_identity().map_err(StoreError::Receipt)?,
         kind: ReceiptKind::Verification,
         work_scope: WorkScopeBinding {
@@ -2359,30 +2372,45 @@ fn revision_with_owner_normalization_receipt(
         disposition: ReceiptDisposition::Success {
             proof: ProofCeiling::ScopedVerification,
         },
+    })
+}
+
+/// Binds the owner-issued normalization receipt to the calling task and session.
+///
+/// These mirror the canonical Store receipt owner rather than inventing their own
+/// rule: a request that carries a task without the fence revision that task is
+/// pinned at cannot be bound honestly, so it is refused here instead of being
+/// committed with the binding dropped. A session, by contrast, is bound whenever
+/// one is presented, and the epoch it was presented under is the one it is
+/// pinned at.
+fn owner_normalization_receipt_bindings(
+    request: &UserAutomationStoreRequest,
+    state_fence: &StateFence,
+) -> Result<(Option<TaskBinding>, Option<SessionBinding>), StoreError> {
+    let task = match (request.context.task_id.clone(), state_fence.task_revision) {
+        (Some(task_id), Some(task_revision)) => Some(TaskBinding {
+            task_id,
+            task_revision,
+            state_fence: state_fence.clone(),
+        }),
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(StoreError::InvalidField {
+                field: "automation.context.task_id",
+                reason: "normalization receipt requires the fenced task revision",
+            });
+        }
     };
-    let receipt = revision
-        .schedule
-        .issue_normalization_receipt(core.clone(), &request.authenticated_principal)
-        .map_err(|_| StoreError::InvalidField {
-            field: "automation.schedule.normalization_receipt",
-            reason: "owner-issued normalization receipt was refused",
-        })?;
-    // RETENTION. `issue_normalization_receipt` returns the typed payload and
-    // keeps the envelope it derived, so this leg re-issues the SAME immutable
-    // core to obtain the envelope bytes it must retain. That is not a second
-    // issuance authority: `ReceiptEnvelope::issue` is a pure function of the
-    // core, so the re-issued envelope is byte-identical to the one whose
-    // identity the payload already names, and the identity equality asserted
-    // below is what proves it rather than assuming it. Minting without
-    // retaining left the identity the immutable revision names unanswerable by
-    // any owner, which is exactly the gap the run-now readback closes.
-    let envelope = ReceiptEnvelope::issue(core).map_err(StoreError::Receipt)?;
-    if envelope.identity.receipt_id.as_str() != receipt.receipt_id {
-        return Err(StoreError::Receipt(ReceiptError::IdentityMismatch));
-    }
-    let mut owned = revision.clone();
-    owned.schedule.normalization_receipt = receipt;
-    Ok((owned, envelope))
+    let session = request
+        .context
+        .session_id
+        .clone()
+        .map(|session_id| SessionBinding {
+            session_id,
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+        });
+    Ok((task, session))
 }
 
 /// Renders the owner-minted normalization receipt envelope into the verbatim
