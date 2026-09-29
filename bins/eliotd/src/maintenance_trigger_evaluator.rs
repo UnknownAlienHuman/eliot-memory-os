@@ -420,9 +420,12 @@ impl DaemonComposition {
     ///
     /// A decision plus a durable downstream intent is distinct from an
     /// executed job or a delivered notification: this method never admits or
-    /// starts a job and never delivers anything. It only records the
-    /// commitment the Kernel ledger must validate before acknowledging the
-    /// trigger.
+    /// starts a job and never delivers anything. A job reference the decision
+    /// names is proven durable through the owning async read-back (same job
+    /// identity, same retained trigger) before it is bound; the save
+    /// transport acknowledgement is never accepted as that proof. It only
+    /// records the commitment the Kernel ledger must validate before
+    /// acknowledging the trigger.
     ///
     /// The commit is explicit about what it cannot do yet, and invents
     /// nothing in its place:
@@ -510,11 +513,22 @@ impl DaemonComposition {
         // A job reference names an already-durable job only; it is bound as a
         // reference, never admitted or started here. A blank reference binds
         // nothing: the receipt validator would refuse it, so it is dropped up
-        // front under the same nonblank rule.
+        // front under the same nonblank rule. A nonblank reference is proven
+        // durable through the owning async read-back before anything is
+        // committed: the save transport acknowledgement alone proves nothing,
+        // so a dangling or foreign reference fails closed here and the
+        // trigger stays retained instead of binding a phantom intent.
         let job_ref = decision
             .durable_job_ref
             .clone()
             .filter(|reference| is_commit_ref_text(reference));
+        let job_ref = match job_ref {
+            None => None,
+            Some(reference) => Some(
+                prove_job_intent_durable(kernel, &reference, &live_fence, &record.trigger_id)
+                    .await?,
+            ),
+        };
         // The durable downstream intent through its existing outbox owner.
         // The leg submits the Governor prepared transition to the admitted
         // notification route and proves the canonical commit receipt in hand;
@@ -641,6 +655,39 @@ fn policy_revision(policy: &MaintenancePolicyEvidence) -> String {
         (Some(revision), None) => format!("rev{revision}:unpublished"),
         (None, _) => format!("unpublished:{:?}", policy.mode()),
     }
+}
+
+/// Proves one job intent reference names an already-durable job before the
+/// decision receipt binds it (I14.22, issue #1694 W4).
+///
+/// The #1688 decision only ever *references* a job, and the reference is
+/// admitted through the `KernelDurableJobPort` save path whose transport
+/// acknowledgement alone proves nothing. This reads the job back through the
+/// owning async read path under the live fence and binds it only when the
+/// read-back row carries the same job identity and answers this exact
+/// retained trigger. A missing row, an identity mismatch, or a job admitted
+/// for another trigger fails closed with the owner's typed
+/// [`MaintenanceError::InvalidField`]: the trigger stays retained under its
+/// existing claim and no receipt is fabricated. Transport refusal stays a
+/// [`KernelPortError`] through [`MaintenanceDecisionCommitError::Kernel`].
+async fn prove_job_intent_durable(
+    kernel: &Arc<DaemonKernelClient>,
+    job_ref: &str,
+    live_fence: &eliot_contracts::StateFence,
+    trigger_id: &str,
+) -> Result<String, MaintenanceDecisionCommitError> {
+    let stored = kernel.load_durable_job_async(job_ref, live_fence).await?;
+    let Some(stored) = stored else {
+        return Err(MaintenanceDecisionCommitError::Maintenance(
+            MaintenanceError::InvalidField("maintenance_trigger_decision_receipt.job_ref"),
+        ));
+    };
+    if stored.job_id != job_ref || stored.trigger_id != trigger_id {
+        return Err(MaintenanceDecisionCommitError::Maintenance(
+            MaintenanceError::InvalidField("maintenance_trigger_decision_receipt.job_ref"),
+        ));
+    }
+    Ok(job_ref.to_owned())
 }
 
 /// Mirrors the protocol's nonblank reference rule for intent bindings.
