@@ -80,17 +80,18 @@
 //! ([`DurableRequestIdentity::digest_for`]) so the retained-state comparison
 //! runs on a contract-derived binding, not on a spelled string.
 
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-use eliot_ors::{RedbRecoveryStore, UnknownCommitOutcome, UnknownCommitRecord};
+use eliot_ors::{
+    RedbRecoveryStore, UnknownCommitOutcome, UnknownCommitPauseCoverage,
+    UnknownCommitPauseSnapshot, UnknownCommitRecord, UnknownCommitSendClaimRecord,
+};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableRequestIdentity};
 use eliot_store_api::{
     OperationIdentity, Resubmission, StoreError, WriteReceipt, WriteReceiptStatus,
 };
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::Mutex;
 
 /// Terminal classification of a Store receipt observed after a commit
 /// attempt whose outcome was uncertain.
@@ -300,48 +301,21 @@ fn ors_error(detail: impl std::fmt::Display) -> CommitRecoveryError {
 
 /// Bounded coverage of one checked pause observation.
 ///
-/// The owner query is bounded so a per-mutation admission check can never
+/// The owner snapshot is bounded so a per-mutation admission check can never
 /// become an unbounded full-store scan. Exhausting the bound yields
 /// [`CheckedPauseObservation::Unavailable`], never an empty page: a bounded
 /// answer that stopped early has not proven anything about the records it did
 /// not reach, so it closes admission rather than admitting on a partial read.
 pub const MAX_OBSERVED_OPEN_COMMITS: usize = 4096;
 
-/// Identity of the owner that answered one observation, plus the monotonic
-/// observation revision.
-///
-/// `owner` is the concrete durable pause-ledger handle that produced the
-/// answer, so a gateway reconstructed against a different handle cannot
-/// mistake its own uninitialized empty mirror for a ledger that owner has
-/// cleared. `revision` increases once per observation and is what the mirror
-/// records per entry, so a later release can prove which observation an entry
-/// came from instead of guessing.
+/// Identity and revision issued by the durable owner for one observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseLedgerBinding {
-    /// Identity of the answering owner handle.
-    pub owner: String,
-    /// Monotonic observation revision assigned by the observing mirror.
-    pub revision: u64,
-}
-
-impl PauseLedgerBinding {
-    /// Renders the owner identity for a handle reference.
-    ///
-    /// `RedbRecoveryStore` owns no published path or name, so the handle
-    /// address is the honest current-owner identity available here: it
-    /// distinguishes one live owner from a rebound one, which is exactly the
-    /// property admission needs, and it is never compared across processes.
-    fn of_owner(ors: Option<&RedbRecoveryStore>, revision: u64) -> Self {
-        Self {
-            owner: match ors {
-                Some(store) => {
-                    format!("ors:{:p}", std::ptr::from_ref::<RedbRecoveryStore>(store))
-                }
-                None => "ors:absent".to_owned(),
-            },
-            revision,
-        }
-    }
+    /// Durable ORS owner generation. Failed observations have no current
+    /// owner binding and therefore carry `None`.
+    pub owner_generation: Option<String>,
+    /// Durable ORS revision that produced this complete observation.
+    pub revision: Option<u64>,
 }
 
 /// One checked observation of the durable unknown-commit pause ledger.
@@ -358,6 +332,10 @@ pub enum CheckedPauseObservation {
     CompleteEmpty {
         /// Owner and revision that answered.
         binding: PauseLedgerBinding,
+        /// Complete set of unresolved claims; empty for this variant.
+        claims: Vec<UnknownCommitSendClaimRecord>,
+        /// Exact complete owner snapshot used for an atomic send claim.
+        snapshot: UnknownCommitPauseSnapshot,
     },
     /// The owner answered completely and these are every open record.
     CompleteWithRecords {
@@ -365,6 +343,10 @@ pub enum CheckedPauseObservation {
         binding: PauseLedgerBinding,
         /// Every open record, with its own operation and scope binding.
         records: Vec<UnknownCommitRecord>,
+        /// Claims that reserve scopes before a send and may remain after crash.
+        claims: Vec<UnknownCommitSendClaimRecord>,
+        /// Exact complete owner snapshot used for an atomic send claim.
+        snapshot: UnknownCommitPauseSnapshot,
     },
     /// The pause set is NOT known: absent handle, decode or storage failure,
     /// poisoned required state, or a bounded query that lost coverage.
@@ -381,7 +363,7 @@ impl CheckedPauseObservation {
     #[must_use]
     pub const fn binding(&self) -> &PauseLedgerBinding {
         match self {
-            Self::CompleteEmpty { binding }
+            Self::CompleteEmpty { binding, .. }
             | Self::CompleteWithRecords { binding, .. }
             | Self::Unavailable { binding, .. } => binding,
         }
@@ -406,6 +388,35 @@ impl CheckedPauseObservation {
         }
     }
 
+    /// Returns unresolved send claims carried by a complete owner snapshot.
+    #[must_use]
+    pub fn claims(&self) -> &[UnknownCommitSendClaimRecord] {
+        match self {
+            Self::CompleteWithRecords { claims, .. } | Self::CompleteEmpty { claims, .. } => claims,
+            Self::Unavailable { .. } => &[],
+        }
+    }
+
+    /// Returns a crash-surviving claim for this exact key, if one was
+    /// included in the complete owner snapshot.
+    #[must_use]
+    pub fn claim_for_key(&self, key: &str) -> Option<&UnknownCommitSendClaimRecord> {
+        self.claims()
+            .iter()
+            .find(|claim| claim.record.idempotency_key == key)
+    }
+
+    /// Returns the exact complete owner snapshot, when available.
+    #[must_use]
+    pub fn owner_snapshot(&self) -> Option<&UnknownCommitPauseSnapshot> {
+        match self {
+            Self::CompleteWithRecords { snapshot, .. } | Self::CompleteEmpty { snapshot, .. } => {
+                Some(snapshot)
+            }
+            Self::Unavailable { .. } => None,
+        }
+    }
+
     /// Returns the typed fail-closed refusal when durable recovery state is
     /// not available, and `None` when the observation is complete.
     ///
@@ -419,7 +430,10 @@ impl CheckedPauseObservation {
             Self::Unavailable { binding, detail } => Some(CommitRecoveryError::OrsUnavailable {
                 detail: format!(
                     "durable unknown-commit pause state is unavailable at observation revision {} from owner {}: {detail}; dependent durable mutation admission is closed and a permitted read of an exact receipt stays available",
-                    binding.revision, binding.owner
+                    binding
+                        .revision
+                        .map_or_else(|| "unknown".to_owned(), |revision| revision.to_string()),
+                    binding.owner_generation.as_deref().unwrap_or("unknown")
                 ),
             }),
             Self::CompleteEmpty { .. } | Self::CompleteWithRecords { .. } => None,
@@ -456,27 +470,37 @@ impl CheckedPauseObservation {
     }
 }
 
-/// One retained mirror entry: the scope, the key that paused it, and the
-/// observation revision that proved it.
+/// One retained mirror entry: its exact scope and operation source, plus the
+/// ORS owner revision that proved it when available.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PausedScopeEntry {
     /// Ordering Scope this entry holds paused.
     pub scope: String,
     /// Idempotency key of the open record that paused it, when durably known.
     pub paused_by_key: String,
-    /// Observation revision that last proved the pause.
-    pub observed_revision: u64,
+    /// Full operation and scope source for this positive pause.
+    pub source: UnknownCommitRecord,
+    /// Owner generation that proved this source, when observed durably.
+    pub owner_generation: Option<String>,
+    /// Owner revision that proved this source, when observed durably.
+    pub observed_revision: Option<u64>,
+    /// True only when the preceding ORS stage failed after an effect may
+    /// have been issued. A complete empty snapshot cannot dispose of it.
+    pub memory_uncertain: bool,
 }
 
 /// State of the in-process pause mirror.
 ///
-/// Coverage is stored, never inferred: `owner: None` is the constructor's
+/// Coverage is stored, never inferred: `owner_generation: None` is the constructor's
 /// uninitialized state and is explicitly *not* an observed clear ledger, so
 /// no negative answer can be taken from it.
 #[derive(Default)]
 struct PausedScopeMirrorState {
-    entries: BTreeMap<String, PausedScopeEntry>,
-    owner: Option<String>,
+    entries: BTreeMap<(String, String), PausedScopeEntry>,
+    owner_generation: Option<String>,
+    observed_revision: Option<u64>,
+    pending_staged: BTreeMap<String, UnknownCommitRecord>,
+    memory_uncertain: BTreeMap<String, UnknownCommitRecord>,
     coverage: PauseCoverage,
     last_refresh_limitation: Option<String>,
 }
@@ -504,7 +528,6 @@ pub enum PauseCoverage {
 /// object shared by reference with the gateway — there is no second pause
 /// index anywhere.
 pub struct PausedScopeMirror {
-    revision: AtomicU64,
     state: Mutex<PausedScopeMirrorState>,
 }
 
@@ -518,16 +541,8 @@ impl PausedScopeMirror {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            revision: AtomicU64::new(0),
             state: Mutex::new(PausedScopeMirrorState::default()),
         }
-    }
-
-    /// Returns the next monotonic observation revision.
-    fn next_revision(&self) -> u64 {
-        self.revision
-            .fetch_add(1, AtomicOrdering::Relaxed)
-            .saturating_add(1)
     }
 
     /// Observes the durable pause ledger through the owner and reconciles
@@ -543,86 +558,214 @@ impl PausedScopeMirror {
     /// erase a possibly issued effect, because a failed query is `Unavailable`
     /// and keeps every last-known positive entry with its source.
     pub fn observe(&self, ors: Option<&RedbRecoveryStore>) -> CheckedPauseObservation {
-        let binding = PauseLedgerBinding::of_owner(ors, self.next_revision());
+        let pending_at_start = match self.state.lock() {
+            Ok(state) => state
+                .pending_staged
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            Err(_) => {
+                return self.record_unavailable(
+                    PauseLedgerBinding { owner_generation: None, revision: None },
+                    "the in-process unknown-commit pause mirror is poisoned, so required source state cannot be read".to_owned(),
+                );
+            }
+        };
         let Some(store) = ors else {
             return self.record_unavailable(
-                binding,
+                PauseLedgerBinding {
+                    owner_generation: None,
+                    revision: None,
+                },
                 "no durable recovery owner is bound to this gateway, so the pause ledger was \
                  never read"
                     .to_owned(),
             );
         };
-        let records = match store.list_open_unknown_commits() {
-            Ok(records) => records,
+        let snapshot = match store.observe_open_unknown_commits() {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 return self.record_unavailable(
-                    binding,
+                    PauseLedgerBinding {
+                        owner_generation: None,
+                        revision: None,
+                    },
                     format!("the durable pause ledger could not be read: {error}"),
                 );
             }
         };
-        if records.len() > MAX_OBSERVED_OPEN_COMMITS {
+        if snapshot.coverage != UnknownCommitPauseCoverage::Complete
+            || snapshot.records.len() + snapshot.claims.len() > MAX_OBSERVED_OPEN_COMMITS
+        {
             return self.record_unavailable(
-                binding,
+                PauseLedgerBinding {
+                    owner_generation: Some(snapshot.owner_generation),
+                    revision: Some(snapshot.revision),
+                },
                 format!(
-                    "the bounded owner query returned {} open records, above the {MAX_OBSERVED_OPEN_COMMITS} coverage bound; the answer is incomplete, not empty",
-                    records.len()
+                    "the bounded owner query returned {} open records or incomplete coverage, above the {MAX_OBSERVED_OPEN_COMMITS} coverage bound; the answer is incomplete, not empty",
+                    snapshot.records.len() + snapshot.claims.len()
                 ),
             );
         }
+        let binding = PauseLedgerBinding {
+            owner_generation: Some(snapshot.owner_generation.clone()),
+            revision: Some(snapshot.revision),
+        };
+        let claims = snapshot.claims.clone();
+        let mut records = snapshot.records.clone();
+        records.extend(claims.iter().map(|claim| claim.record.clone()));
         let observation = if records.is_empty() {
             CheckedPauseObservation::CompleteEmpty {
                 binding: binding.clone(),
+                claims: claims.clone(),
+                snapshot: snapshot.clone(),
             }
         } else {
             CheckedPauseObservation::CompleteWithRecords {
                 binding: binding.clone(),
                 records: records.clone(),
+                claims: claims.clone(),
+                snapshot: snapshot.clone(),
             }
         };
-        self.apply_complete(&binding, &records);
-        observation
+        if let Err(detail) = self.apply_complete(&snapshot, &binding, &pending_at_start) {
+            return self.record_unavailable(binding, detail);
+        }
+        let uncertain = self.memory_uncertainty_limitation();
+        match uncertain {
+            Some(detail) => self.record_unavailable(binding, detail),
+            None => observation,
+        }
     }
 
     /// Reconciles the mirror from a complete observation.
     ///
-    /// An entry stamped by a strictly newer revision than this observation
-    /// was proved by a pause staged after the read that decided this answer,
-    /// so it survives: an older observation cannot erase a concurrent new
-    /// pause. Everything else is replaced, and an entry this observation no
-    /// longer covers is healed because its original record is resolved or
-    /// otherwise authoritatively dispositioned.
-    fn apply_complete(&self, binding: &PauseLedgerBinding, records: &[UnknownCommitRecord]) {
-        let mut entries: BTreeMap<String, PausedScopeEntry> = BTreeMap::new();
-        for record in records {
+    /// A stage whose owner revision was not observed is tracked separately
+    /// and retained until a later complete observation begun after the stage.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the snapshot reconciliation must remain one auditable mirror transaction"
+    )]
+    fn apply_complete(
+        &self,
+        snapshot: &UnknownCommitPauseSnapshot,
+        binding: &PauseLedgerBinding,
+        pending_at_start: &std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        let Some(owner_generation) = binding.owner_generation.as_ref() else {
+            return Ok(());
+        };
+        let Some(revision) = binding.revision else {
+            return Ok(());
+        };
+        let mut entries: BTreeMap<(String, String), PausedScopeEntry> = BTreeMap::new();
+        for record in snapshot
+            .records
+            .iter()
+            .chain(snapshot.claims.iter().map(|claim| &claim.record))
+        {
             for scope in &record.ordering_scopes {
-                entries
-                    .entry(scope.clone())
-                    .or_insert_with(|| PausedScopeEntry {
+                entries.insert(
+                    (scope.clone(), record.idempotency_key.clone()),
+                    PausedScopeEntry {
                         scope: scope.clone(),
                         paused_by_key: record.idempotency_key.clone(),
-                        observed_revision: binding.revision,
-                    });
+                        source: record.clone(),
+                        owner_generation: Some(owner_generation.clone()),
+                        observed_revision: Some(revision),
+                        memory_uncertain: false,
+                    },
+                );
             }
         }
-        let Ok(mut state) = self.state.lock() else {
-            // A poisoned mirror lock must never look like a clear ledger. The
-            // observation already answered; the mirror simply keeps its
-            // previous state and stays Unavailable, and every admission
-            // consults the observation rather than this cache.
-            return;
-        };
-        state.entries.retain(|scope, entry| {
-            if entry.observed_revision > binding.revision {
-                // Concurrently staged after this observation was read.
+        let mut state = self.state.lock().map_err(|_| "the in-process unknown-commit pause mirror is poisoned while applying an owner snapshot".to_owned())?;
+        if state.entries.iter().any(|(key, entry)| {
+            entry
+                .owner_generation
+                .as_deref()
+                .is_some_and(|source_owner| source_owner != owner_generation)
+                && entries
+                    .get(key)
+                    .is_some_and(|current| current.source != entry.source)
+        }) {
+            return Err("the current ORS owner has a conflicting operation under a still-mirrored idempotency key; the prior positive pause is retained".to_owned());
+        }
+        if state.owner_generation.as_deref() == Some(owner_generation.as_str())
+            && (state
+                .observed_revision
+                .is_some_and(|current| current > revision)
+                || state.entries.values().any(|entry| {
+                    entry.owner_generation.as_deref() == Some(owner_generation.as_str())
+                        && entry
+                            .observed_revision
+                            .is_some_and(|current| current > revision)
+                }))
+        {
+            return Err(format!(
+                "stale ORS pause snapshot revision {revision} is older than the mirror's owner-issued revision; the checked answer cannot be used for admission"
+            ));
+        }
+        let uncertain_confirmed: Vec<String> = state
+            .memory_uncertain
+            .iter()
+            .filter(|(_, source)| {
+                snapshot
+                    .records
+                    .iter()
+                    .chain(snapshot.claims.iter().map(|claim| &claim.record))
+                    .any(|record| record == *source)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in uncertain_confirmed {
+            if let Some(source) = state.memory_uncertain.remove(&key) {
+                for scope in &source.ordering_scopes {
+                    state.entries.remove(&(scope.clone(), key.clone()));
+                }
+            }
+        }
+        let pending_keys: std::collections::BTreeSet<String> =
+            state.pending_staged.keys().cloned().collect();
+        state.entries.retain(|key, entry| {
+            if entry.memory_uncertain
+                || pending_keys.contains(&entry.paused_by_key)
+                    && !pending_at_start.contains(&entry.paused_by_key)
+                || entry
+                    .owner_generation
+                    .as_deref()
+                    .is_some_and(|source_owner| source_owner != owner_generation)
+                || entry.owner_generation.as_deref() == Some(owner_generation.as_str())
+                    && entry
+                        .observed_revision
+                        .is_some_and(|source_revision| source_revision > revision)
+            {
                 return true;
             }
-            !entries.contains_key(scope)
+            // The same owner revision is an idempotent observation. A newer
+            // owner revision may heal an obsolete source only after ORS has
+            // actually removed or dispositioned that exact record.
+            entries.contains_key(key)
         });
         state.entries.extend(entries);
-        state.owner = Some(binding.owner.clone());
-        state.coverage = PauseCoverage::Complete;
-        state.last_refresh_limitation = None;
+        state
+            .pending_staged
+            .retain(|key, _| !pending_at_start.contains(key));
+        state.owner_generation = Some(owner_generation.clone());
+        state.observed_revision = Some(revision);
+        if state.memory_uncertain.is_empty() {
+            state.coverage = PauseCoverage::Complete;
+            state.last_refresh_limitation = None;
+        }
+        if state.entries.values().any(|entry| {
+            entry
+                .owner_generation
+                .as_deref()
+                .is_some_and(|source_owner| source_owner != owner_generation)
+        }) {
+            return Err("the current ORS owner differs from the owner that staged a still-open mirrored source; the previous positive pause is retained and disposition is required".to_owned());
+        }
+        Ok(())
     }
 
     /// Records a failed observation: entries and their source are kept as
@@ -634,7 +777,6 @@ impl PausedScopeMirror {
     ) -> CheckedPauseObservation {
         if let Ok(mut state) = self.state.lock() {
             state.coverage = PauseCoverage::Unavailable;
-            state.owner = Some(binding.owner.clone());
             state.last_refresh_limitation = Some(detail.clone());
         }
         CheckedPauseObservation::Unavailable { binding, detail }
@@ -642,28 +784,129 @@ impl PausedScopeMirror {
 
     /// Records a pause proved by a successful durable stage.
     ///
-    /// Called only after ORS accepted the record, so the mirror never names a
-    /// pause that no durable record backs. The entry is stamped with a freshly
-    /// allocated revision, so it is strictly newer than any observation taken
-    /// before the stage: a release or refresh already in flight cannot erase
-    /// this pause with the older scan it decided on.
-    pub fn record_paused(&self, scopes: &[String], key: &str) {
-        if scopes.is_empty() {
+    /// Called only after ORS accepted the record. The entry is stamped with
+    /// the owner-issued generation and revision returned by that stage; a
+    /// stale observation cannot erase it.
+    pub fn record_paused(
+        &self,
+        record: &UnknownCommitRecord,
+        owner_generation: Option<&str>,
+        revision: Option<u64>,
+    ) {
+        if record.ordering_scopes.is_empty() {
             return;
         }
-        let revision = self.next_revision();
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        for scope in scopes {
-            state
-                .entries
-                .entry(scope.clone())
-                .or_insert_with(|| PausedScopeEntry {
+        if state.memory_uncertain.get(&record.idempotency_key) == Some(record) {
+            state.memory_uncertain.remove(&record.idempotency_key);
+        }
+        state
+            .pending_staged
+            .insert(record.idempotency_key.clone(), record.clone());
+        if let (Some(owner_generation), Some(revision)) = (owner_generation, revision) {
+            if state.owner_generation.as_deref() == Some(owner_generation) {
+                state.observed_revision = Some(
+                    state
+                        .observed_revision
+                        .map_or(revision, |current| current.max(revision)),
+                );
+            } else {
+                state.owner_generation = Some(owner_generation.to_owned());
+                state.observed_revision = Some(revision);
+            }
+        }
+        for scope in &record.ordering_scopes {
+            state.entries.insert(
+                (scope.clone(), record.idempotency_key.clone()),
+                PausedScopeEntry {
                     scope: scope.clone(),
-                    paused_by_key: key.to_owned(),
+                    paused_by_key: record.idempotency_key.clone(),
+                    source: record.clone(),
+                    owner_generation: owner_generation.map(str::to_owned),
                     observed_revision: revision,
-                });
+                    memory_uncertain: false,
+                },
+            );
+        }
+    }
+
+    /// Records a possibly issued effect whose durable stage failed. This is
+    /// volatile positive evidence; an empty later snapshot cannot clear it.
+    pub fn record_memory_uncertain(&self, record: &UnknownCommitRecord) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state
+            .memory_uncertain
+            .get(&record.idempotency_key)
+            .is_some_and(|existing| existing != record)
+        {
+            state.coverage = PauseCoverage::Unavailable;
+            state.last_refresh_limitation = Some(format!(
+                "conflicting volatile recovery sources reuse idempotency key {}; neither source can be discarded",
+                record.idempotency_key
+            ));
+            return;
+        }
+        state
+            .memory_uncertain
+            .insert(record.idempotency_key.clone(), record.clone());
+        for scope in &record.ordering_scopes {
+            state.entries.insert(
+                (scope.clone(), record.idempotency_key.clone()),
+                PausedScopeEntry {
+                    scope: scope.clone(),
+                    paused_by_key: record.idempotency_key.clone(),
+                    source: record.clone(),
+                    owner_generation: None,
+                    observed_revision: None,
+                    memory_uncertain: true,
+                },
+            );
+        }
+        state.coverage = PauseCoverage::Unavailable;
+        state.last_refresh_limitation = Some(format!(
+            "unknown commit {} may have issued an effect but its ORS open record could not be staged; the in-process recovery source is retained and admission remains unavailable",
+            record.idempotency_key
+        ));
+    }
+
+    /// Returns the exact volatile record requiring disposition before a
+    /// same-identity replay can proceed.
+    pub fn memory_uncertain_record(
+        &self,
+        key: &str,
+    ) -> Result<Option<UnknownCommitRecord>, CommitRecoveryError> {
+        self.state.lock().map(|state| state.memory_uncertain.get(key).cloned()).map_err(|_| CommitRecoveryError::OrsUnavailable {
+            detail: "the in-process unknown-commit pause mirror is poisoned while reading a memory-only recovery source".to_owned(),
+        })
+    }
+
+    /// Clears volatile uncertainty only after an exact matching durable stage
+    /// or receipt-backed terminal disposition has been verified.
+    pub fn clear_memory_uncertain(&self, record: &UnknownCommitRecord) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.memory_uncertain.get(&record.idempotency_key) == Some(record) {
+            state.memory_uncertain.remove(&record.idempotency_key);
+            for scope in &record.ordering_scopes {
+                state
+                    .entries
+                    .remove(&(scope.clone(), record.idempotency_key.clone()));
+            }
+            state.last_refresh_limitation = None;
+        }
+    }
+
+    fn memory_uncertainty_limitation(&self) -> Option<String> {
+        match self.state.lock() {
+            Ok(state) => (!state.memory_uncertain.is_empty()).then(|| {
+                format!("{} possibly-issued unknown commit(s) have only volatile recovery sources; exact disposition is required before admission", state.memory_uncertain.len())
+            }),
+            Err(_) => Some("the in-process unknown-commit pause mirror is poisoned, so required source state cannot be read".to_owned()),
         }
     }
 
@@ -699,7 +942,10 @@ impl PausedScopeMirror {
     /// or `None` while it has never been answered.
     #[must_use]
     pub fn owner(&self) -> Option<String> {
-        self.state.lock().ok().and_then(|state| state.owner.clone())
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.owner_generation.clone())
     }
 
     /// Returns the retained limitation from the last failed refresh, if any.
@@ -748,7 +994,7 @@ impl PausedScopeMirror {
                 detail,
             };
         }
-        let revision = observation.binding().revision;
+        let revision = observation.binding().revision.unwrap_or_default();
         let retained: Vec<String> = scopes
             .iter()
             .filter(|scope| {
@@ -786,18 +1032,39 @@ impl PausedScopeMirror {
         let mut removed: Vec<String> = Vec::new();
         let mut superseded: Vec<String> = Vec::new();
         for scope in &released {
-            let concurrent = state
+            let matching: Vec<(String, String)> = state
                 .entries
-                .get(scope)
-                .is_some_and(|entry| entry.observed_revision > revision);
-            if concurrent {
+                .keys()
+                .filter(|(entry_scope, key)| entry_scope == scope && key == resolved_key)
+                .cloned()
+                .collect();
+            if matching.iter().any(|entry_key| {
+                state
+                    .entries
+                    .get(entry_key)
+                    .is_some_and(|entry| entry.memory_uncertain)
+            }) {
                 superseded.push(scope.clone());
-            } else if state.entries.remove(scope).is_some() {
+                continue;
+            }
+            for entry_key in matching {
+                state.entries.remove(&entry_key);
                 removed.push(scope.clone());
             }
         }
+        if let Some(record) = state.memory_uncertain.get(resolved_key).cloned() {
+            // This method is called only after an exact durable disposition;
+            // remove volatility after the complete owner read succeeded.
+            state.memory_uncertain.remove(resolved_key);
+            for scope in record.ordering_scopes {
+                state.entries.remove(&(scope, resolved_key.to_owned()));
+            }
+        }
         state.last_refresh_limitation = None;
-        state.owner = Some(observation.binding().owner.clone());
+        state
+            .owner_generation
+            .clone_from(&observation.binding().owner_generation);
+        state.observed_revision = observation.binding().revision;
         PauseReleaseOutcome::Released {
             scopes: removed,
             retained,
@@ -862,7 +1129,7 @@ async fn dispose_open_record<QueryFut>(
     open: &UnknownCommitRecord,
     identity: &OperationIdentity,
     query: impl Fn() -> QueryFut,
-) -> Result<Option<WriteReceipt>, CommitRecoveryError>
+) -> Result<Option<RecoveredCommit>, CommitRecoveryError>
 where
     QueryFut: Future<Output = Result<WriteReceipt, StoreError>>,
 {
@@ -890,13 +1157,20 @@ where
     verify_receipt_binding(&receipt, identity)?;
     match classify_commit_receipt(&receipt) {
         CommitRecoveryClass::Committed => {
-            resolve_staged(ors, paused, &key, UnknownCommitOutcome::Committed, &receipt)?;
-            Ok(Some(receipt))
+            let pause_release =
+                resolve_staged(ors, paused, &key, UnknownCommitOutcome::Committed, &receipt)?;
+            Ok(Some(RecoveredCommit {
+                receipt,
+                pause_release: Some(pause_release),
+            }))
         }
         CommitRecoveryClass::KnownRollback => Ok(None),
         CommitRecoveryClass::NeedsNewIdentity(outcome) => {
-            resolve_staged(ors, paused, &key, outcome, &receipt)?;
-            Ok(Some(receipt))
+            let pause_release = resolve_staged(ors, paused, &key, outcome, &receipt)?;
+            Ok(Some(RecoveredCommit {
+                receipt,
+                pause_release: Some(pause_release),
+            }))
         }
     }
 }
@@ -908,8 +1182,8 @@ where
 /// step whose failure is an error. Release follows and its outcome is
 /// returned rather than raised, because a mirror refresh that fails after a
 /// proven commit must not turn that commit into a reported failure. The
-/// [`PauseReleaseOutcome::RefreshUnavailable`] arm is how a caller with a
-/// typed carrier (the Dreamer gateway) still exposes the limitation.
+/// typed [`RecoveredCommit`] carrier preserves
+/// [`PauseReleaseOutcome::RefreshUnavailable`] for gateway diagnostics.
 fn resolve_staged(
     ors: &RedbRecoveryStore,
     paused: &PausedScopeMirror,
@@ -985,6 +1259,18 @@ pub(crate) fn resolve_open_record(
     }
 }
 
+/// Receipt-backed recovery success and any refresh result after disposition.
+///
+/// Kernel gateway callers retain the proven receipt while exposing a failed
+/// mirror refresh as an advisory; it never changes the commit result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredCommit {
+    /// Exact receipt whose identity was verified by recovery.
+    pub receipt: WriteReceipt,
+    /// Release result when this path resolved a previously open record.
+    pub pause_release: Option<PauseReleaseOutcome>,
+}
+
 /// How one durable resolution ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResolutionOutcome {
@@ -1032,14 +1318,39 @@ impl ResolutionOutcome {
 /// durable record so admission gating never depends on a database round trip
 /// alone, and never trusted as the admission input on its own: the gate below
 /// reads the authoritative checked observation.
+///
+/// This receipt-only wrapper is retained for legacy/reference callers.
+/// Production gateway paths use [`recover_commit_with_refresh`] so the
+/// disposition's pause-refresh advisory is not discarded.
 pub async fn recover_commit<SendFut, QueryFut>(
+    ors: Option<&RedbRecoveryStore>,
+    paused: &PausedScopeMirror,
+    identity: &OperationIdentity,
+    ordering_scopes: &[String],
+    send: impl FnMut() -> SendFut,
+    query: impl Fn() -> QueryFut,
+) -> Result<WriteReceipt, CommitRecoveryError>
+where
+    SendFut: Future<Output = Result<WriteReceipt, StoreError>>,
+    QueryFut: Future<Output = Result<WriteReceipt, StoreError>>,
+{
+    recover_commit_with_refresh(ors, paused, identity, ordering_scopes, send, query)
+        .await
+        .map(|recovered| recovered.receipt)
+}
+
+/// Runs commit recovery while preserving a pause-refresh advisory alongside
+/// the verified receipt. Production gateway callers use this result to keep
+/// refresh limitations visible through their checked pause diagnostic; the
+/// receipt-only [`recover_commit`] remains for legacy/reference callers.
+pub(crate) async fn recover_commit_with_refresh<SendFut, QueryFut>(
     ors: Option<&RedbRecoveryStore>,
     paused: &PausedScopeMirror,
     identity: &OperationIdentity,
     ordering_scopes: &[String],
     mut send: impl FnMut() -> SendFut,
     query: impl Fn() -> QueryFut,
-) -> Result<WriteReceipt, CommitRecoveryError>
+) -> Result<RecoveredCommit, CommitRecoveryError>
 where
     SendFut: Future<Output = Result<WriteReceipt, StoreError>>,
     QueryFut: Future<Output = Result<WriteReceipt, StoreError>>,
@@ -1050,6 +1361,7 @@ where
     // lazy (only on unknown outcomes), so a fresh key starts unstaged.
     let mut staged = false;
     if let Some(ors) = ors {
+        stage_memory_uncertainty(ors, paused, &key)?;
         // 1. Disposition-first: an already-open record means a previous attempt
         //    under this key ended unknown. Fresh evidence decides; never a
         //    blind send.
@@ -1073,11 +1385,15 @@ where
                     },
                 })?;
                 verify_receipt_binding(&receipt, identity)?;
-                return Ok(receipt);
+                return Ok(RecoveredCommit {
+                    receipt,
+                    pause_release: None,
+                });
             }
-            if let Some(receipt) = dispose_open_record(ors, paused, &open, identity, &query).await?
+            if let Some(recovered) =
+                dispose_open_record(ors, paused, &open, identity, &query).await?
             {
-                return Ok(receipt);
+                return Ok(recovered);
             }
             // The record stays open across the send below and resolves
             // exactly once when that journey ends.
@@ -1121,6 +1437,50 @@ where
     .await
 }
 
+/// Re-stages a volatile failed-stage source before a same-identity replay can
+/// reach send. A successful owner write and exact open-record readback
+/// converts the source into ordinary durable recovery state; failure leaves
+/// the volatile source intact and fails closed.
+pub(crate) fn stage_memory_uncertainty(
+    ors: &RedbRecoveryStore,
+    paused: &PausedScopeMirror,
+    key: &str,
+) -> Result<(), CommitRecoveryError> {
+    let Some(source) = paused.memory_uncertain_record(key)? else {
+        return Ok(());
+    };
+    let staged = ors
+        .stage_unknown_commit_with_revision(&source)
+        .map_err(ors_error)?;
+    let persisted = ors
+        .load_unknown_commit(key)
+        .map_err(ors_error)?
+        .ok_or_else(|| CommitRecoveryError::OrsUnavailable {
+            detail: format!(
+                "volatile unknown-commit source {key} was staged without an exact durable readback"
+            ),
+        })?;
+    if persisted.idempotency_key != source.idempotency_key
+        || persisted.operation_id != source.operation_id
+        || persisted.canonical_request_hash != source.canonical_request_hash
+        || persisted.ordering_scopes != source.ordering_scopes
+        || !persisted.is_open()
+    {
+        return Err(CommitRecoveryError::RetainedRecordConflict {
+            idempotency_key: key.to_owned(),
+            detail: "the durable open record does not match the exact volatile recovery source"
+                .to_owned(),
+        });
+    }
+    paused.clear_memory_uncertain(&source);
+    paused.record_paused(
+        &persisted,
+        Some(&staged.owner_generation),
+        Some(staged.revision),
+    );
+    Ok(())
+}
+
 /// Handles one send outcome: branch, retry once on known rollback, or open
 /// Problem State on a still-unknown outcome.
 ///
@@ -1135,7 +1495,7 @@ async fn handle_send_outcome<SendFut>(
     staged: bool,
     attempt: Result<WriteReceipt, StoreError>,
     send: impl FnMut() -> SendFut,
-) -> Result<WriteReceipt, CommitRecoveryError>
+) -> Result<RecoveredCommit, CommitRecoveryError>
 where
     SendFut: Future<Output = Result<WriteReceipt, StoreError>>,
 {
@@ -1147,22 +1507,27 @@ where
                     // Exactly one reconciled canonical operation: the send
                     // above is the only mutation. A record staged by the
                     // disposition path reconciles now.
-                    if staged {
+                    let pause_release = if staged {
                         let Some(ors) = ors else {
                             return Err(CommitRecoveryError::OrsUnavailable {
                                 detail: "staged unknown-commit record lost its ORS owner"
                                     .to_owned(),
                             });
                         };
-                        resolve_staged(
+                        Some(resolve_staged(
                             ors,
                             paused,
                             &identity.idempotency_key,
                             UnknownCommitOutcome::Committed,
                             &receipt,
-                        )?;
-                    }
-                    Ok(receipt)
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok(RecoveredCommit {
+                        receipt,
+                        pause_release,
+                    })
                 }
                 CommitRecoveryClass::KnownRollback => {
                     // Known rollback under the identical identity: one
@@ -1170,16 +1535,27 @@ where
                     retry_same_identity(ors, paused, identity, ordering_scopes, staged, send).await
                 }
                 CommitRecoveryClass::NeedsNewIdentity(outcome) => {
-                    if staged {
+                    let pause_release = if staged {
                         let Some(ors) = ors else {
                             return Err(CommitRecoveryError::OrsUnavailable {
                                 detail: "staged unknown-commit record lost its ORS owner"
                                     .to_owned(),
                             });
                         };
-                        resolve_staged(ors, paused, &identity.idempotency_key, outcome, &receipt)?;
-                    }
-                    Ok(receipt)
+                        Some(resolve_staged(
+                            ors,
+                            paused,
+                            &identity.idempotency_key,
+                            outcome,
+                            &receipt,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok(RecoveredCommit {
+                        receipt,
+                        pause_release,
+                    })
                 }
             }
         }
@@ -1208,7 +1584,7 @@ async fn retry_same_identity<SendFut>(
     ordering_scopes: &[String],
     staged: bool,
     mut send: impl FnMut() -> SendFut,
-) -> Result<WriteReceipt, CommitRecoveryError>
+) -> Result<RecoveredCommit, CommitRecoveryError>
 where
     SendFut: Future<Output = Result<WriteReceipt, StoreError>>,
 {
@@ -1224,15 +1600,26 @@ where
                 CommitRecoveryClass::KnownRollback => UnknownCommitOutcome::RolledBack,
                 CommitRecoveryClass::NeedsNewIdentity(outcome) => outcome,
             };
-            if staged {
+            let pause_release = if staged {
                 let Some(ors) = ors else {
                     return Err(CommitRecoveryError::OrsUnavailable {
                         detail: "staged unknown-commit record lost its ORS owner".to_owned(),
                     });
                 };
-                resolve_staged(ors, paused, &identity.idempotency_key, outcome, &receipt)?;
-            }
-            Ok(receipt)
+                Some(resolve_staged(
+                    ors,
+                    paused,
+                    &identity.idempotency_key,
+                    outcome,
+                    &receipt,
+                )?)
+            } else {
+                None
+            };
+            Ok(RecoveredCommit {
+                receipt,
+                pause_release,
+            })
         }
         Err(
             StoreError::MissingReceiptEnvelope
@@ -1260,7 +1647,7 @@ fn open_problem_state(
     paused: &PausedScopeMirror,
     identity: &OperationIdentity,
     ordering_scopes: &[String],
-) -> Result<WriteReceipt, CommitRecoveryError> {
+) -> Result<RecoveredCommit, CommitRecoveryError> {
     let Some(ors) = ors else {
         return Err(CommitRecoveryError::OrsUnavailable {
             detail: format!(
@@ -1270,10 +1657,30 @@ fn open_problem_state(
         });
     };
     let record = open_record_for(identity, ordering_scopes)?;
-    ors.stage_unknown_commit(&record).map_err(ors_error)?;
+    let staged = match ors.stage_unknown_commit_with_revision(&record) {
+        Ok(staged) => staged,
+        Err(error) => {
+            paused.record_memory_uncertain(&record);
+            return Err(ors_error(error));
+        }
+    };
     // Only a durably staged record may mark a scope paused, and the mirror
     // keeps that source with the entry.
-    paused.record_paused(ordering_scopes, identity.idempotency_key.as_str());
+    if staged
+        .existing
+        .as_ref()
+        .is_some_and(|existing| !existing.is_open())
+    {
+        return Err(CommitRecoveryError::ReceiptQueryFailed {
+            idempotency_key: identity.idempotency_key.clone(),
+            detail: "a terminal record already exists for the uncertain operation; exact receipt reconciliation is required before disposition".to_owned(),
+        });
+    }
+    paused.record_paused(
+        &record,
+        Some(&staged.owner_generation),
+        Some(staged.revision),
+    );
     Err(CommitRecoveryError::UnknownCommitOpen {
         idempotency_key: identity.idempotency_key.clone(),
         paused_scopes: ordering_scopes.to_owned(),

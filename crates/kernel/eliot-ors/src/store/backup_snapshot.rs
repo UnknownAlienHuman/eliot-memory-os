@@ -95,8 +95,8 @@
 //! declares — by referencing `store.rs`'s own constants, so a renamed table
 //! cannot drift from its entry — and compares that set with the tables redb
 //! reports for the file being read, under the same transaction as the pages.
-//! Counted at the time of writing: 59 declared tables, 39 backing a dispositioned
-//! row family and 20 carrying an explicit source-bound nonrestorable/forensic
+//! Counted at the time of writing: 61 declared tables, 39 backing a dispositioned
+//! row family and 22 carrying an explicit source-bound nonrestorable/forensic
 //! exclusion with the reason written next to it; 42 dispositioned families, of
 //! which 3 (the restore-journal families) are table-less by design and named as
 //! such. A table with no disposition is refused with
@@ -898,13 +898,13 @@ struct DispositionedTable {
 /// [`check_row_family_census`] is the only place a literal name appears at all —
 /// and there it comes from redb, not from this file.
 ///
-/// Counted against `store.rs` at the time of writing: 59 declared tables, of
-/// which 39 back a dispositioned row family and 20 are explicit source-bound
+/// Counted against `store.rs` at the time of writing: 61 declared tables, of
+/// which 39 back a dispositioned row family and 22 are explicit source-bound
 /// exclusions. `row_family_denominator` carries 42 families; the three that are
 /// not table-backed are named in [`table_less_families`].
 ///
 /// Split in two so neither half can grow past the point where a reader stops
-/// checking it: 39 table-backed families and 20 source-bound exclusions.
+/// checking it: 39 table-backed families and 22 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -1062,7 +1062,7 @@ fn supervision_and_replay_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 20 tables that are explicitly NOT backup row families, each with the
+/// The 22 tables that are explicitly NOT backup row families, each with the
 /// disposition and the reason that excludes it.
 ///
 /// Grouped by what makes a table un-restorable rather than alphabetically, so
@@ -1073,7 +1073,7 @@ fn source_bound_exclusions() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The five exclusions that are owner state: three re-established by the
+/// The seven exclusions that are owner state: five re-established by the
 /// receiving owner, two superseded or already-committed facts.
 fn owner_state_exclusions() -> Vec<DispositionedTable> {
     vec![
@@ -1102,6 +1102,22 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             super::HOST_REQUEST_LOGICAL_KEYS,
             RowDisposition::NonrestorableHistorical,
             "a derived lookup index over HOST_REQUESTS; it is rebuilt from those rows and holds no row of its own",
+        ),
+        // A derived complete-open-set index over UNKNOWN_COMMIT_RECOVERY. It
+        // is backfilled from that authoritative family under the receiving
+        // owner's own revision and must never be restored as another owner's
+        // clearance state.
+        excluded(
+            super::UNKNOWN_COMMIT_PAUSE_INDEX,
+            RowDisposition::NonrestorableHistorical,
+            "a derived open-set index over UNKNOWN_COMMIT_RECOVERY; it is rebuilt under the receiving owner's own revision and is never restored as clearance state",
+        ),
+        // Unresolved send claims belong to the exact Kernel/ORS instance and
+        // cannot be imported into another owner as executable admissions.
+        excluded(
+            super::UNKNOWN_COMMIT_SEND_CLAIMS,
+            RowDisposition::NonrestorableHistorical,
+            "unresolved pre-send claims are instance-bound admissions; restore must rebuild owner state and must never replay another installation's send authority",
         ),
         // ---- Explicit source-bound exclusions: superseded or committed ----
         // Superseded by `GRANT_CLOSURE_CURRENT` (v2). Its bytes are an explicit
@@ -1297,7 +1313,7 @@ fn table_less_families() -> &'static [RowFamilyKind] {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 59-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 61-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 fn check_row_family_census(read: &ReadTransaction) -> Result<(), OrsError> {
