@@ -1,6 +1,6 @@
 //! Typed foreign-occupant collision recovery (issue #1775).
 //!
-//! Implementation `I3.3` requires that an existing SurrealDB process which
+//! Implementation `I3.3` requires that an existing `SurrealDB` process which
 //! merely occupies the planned endpoint stays an observation or import
 //! candidate and never becomes an implicit member of the ELIOT store lineage:
 //! "Setup never kills, adopts or reuses an unrelated process merely because its
@@ -225,7 +225,9 @@ enum CollisionOperationClass {
 
 /// Ownership evidence an ownership claim must bind before a destructive or
 /// adoption-grade class could ever be admitted.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OwnershipEvidenceClass {
     /// Installation and managed-generation lineage.
@@ -438,11 +440,9 @@ impl ForeignOccupantRecoveryDirective {
             {
                 CollisionOperationDisposition::Permitted(operation)
             }
-            CollisionOperationClass::ReadOnly(_) => {
-                CollisionOperationDisposition::Refused(
-                    CollisionRefusal::ReadOnlyAlternativeUnavailable { requested },
-                )
-            }
+            CollisionOperationClass::ReadOnly(_) => CollisionOperationDisposition::Refused(
+                CollisionRefusal::ReadOnlyAlternativeUnavailable { requested },
+            ),
             CollisionOperationClass::Destructive(operation) => {
                 CollisionOperationDisposition::Refused(CollisionRefusal::OwnershipEvidenceMissing {
                     operation,
@@ -537,9 +537,9 @@ const fn operation_class(requested: RequestedProcessOperation) -> CollisionOpera
         RequestedProcessOperation::ReadOnlyStatus => {
             CollisionOperationClass::ReadOnly(PermittedRecoveryOperation::ReadOnlyStatus)
         }
-        RequestedProcessOperation::ProbeObserve => {
-            CollisionOperationClass::ReadOnly(PermittedRecoveryOperation::ReadOnlyProcessOriginProbe)
-        }
+        RequestedProcessOperation::ProbeObserve => CollisionOperationClass::ReadOnly(
+            PermittedRecoveryOperation::ReadOnlyProcessOriginProbe,
+        ),
         RequestedProcessOperation::ReadOnlyImportInspection => CollisionOperationClass::ReadOnly(
             PermittedRecoveryOperation::ExplicitReadOnlyImportInspection,
         ),
@@ -579,8 +579,7 @@ const fn permitted_for(
     requested: RequestedProcessOperation,
 ) -> bool {
     match requested {
-        RequestedProcessOperation::ReadOnlyStatus
-        | RequestedProcessOperation::ProbeObserve => true,
+        RequestedProcessOperation::ReadOnlyStatus | RequestedProcessOperation::ProbeObserve => true,
         RequestedProcessOperation::ReadOnlyImportInspection
         | RequestedProcessOperation::SelectAlternateEndpoint => matches!(
             admitted_operation,

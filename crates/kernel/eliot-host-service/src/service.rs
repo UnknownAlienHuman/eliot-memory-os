@@ -629,17 +629,16 @@ where
             // left running. `ServiceProcessRecord` carries no managed-tree
             // membership, so the origin stays unclassified here.
             PortOutcome::Known(observation) if observation.process.is_some() => {
-                let directive =
-                    ForeignOccupantRecoveryDirective::for_observed_occupant(
-                        AdmittedCollisionOperation::FreshDependencyStart,
-                        &plan.service,
-                        &observation,
-                        ManagedTreeObservation::Unavailable,
-                    )
-                    .map_err(|_error| HostServiceError::InvalidField {
-                        field: "dependency.foreign_occupant_directive",
-                        reason: "observed occupant evidence was not complete enough to classify",
-                    })?;
+                let directive = ForeignOccupantRecoveryDirective::for_observed_occupant(
+                    AdmittedCollisionOperation::FreshDependencyStart,
+                    &plan.service,
+                    &observation,
+                    ManagedTreeObservation::Unavailable,
+                )
+                .map_err(|_error| HostServiceError::InvalidField {
+                    field: "dependency.foreign_occupant_directive",
+                    reason: "observed occupant evidence was not complete enough to classify",
+                })?;
                 return Err(HostServiceError::ForeignOccupant(directive));
             }
             PortOutcome::Known(_) => return Err(HostServiceError::ReadinessNotProven),
