@@ -4134,6 +4134,9 @@ pub struct AgentBridgeCore {
     replay: ReplayLedger,
     acknowledged_phases: BTreeMap<EventIdentityKey, AckPhase>,
     pending_deliveries: BTreeMap<EventIdentityKey, PendingDelivery>,
+    /// Phase-qualified sequences beyond the contiguous local cursor. Owner
+    /// receipts remain authoritative; a later receipt cannot bridge a hole.
+    acknowledged_out_of_order: BTreeMap<String, BTreeSet<u64>>,
     cursors: BTreeMap<String, u64>,
     host_journal: Vec<HostEventEnvelope>,
     attempt_transitions: Vec<AttemptTransition>,
@@ -4163,6 +4166,7 @@ impl AgentBridgeCore {
             replay: ReplayLedger::new(),
             acknowledged_phases: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
+            acknowledged_out_of_order: BTreeMap::new(),
             cursors: BTreeMap::new(),
             host_journal: Vec::new(),
             attempt_transitions: Vec::new(),
@@ -4242,6 +4246,7 @@ impl AgentBridgeCore {
         self.active = Some(active);
         self.replay = ReplayLedger::new();
         self.acknowledged_phases.clear();
+        self.acknowledged_out_of_order.clear();
         self.cursors.clear();
         self.host_journal.clear();
         self.attempt_transitions.clear();
@@ -5310,16 +5315,14 @@ impl AgentBridgeCore {
                 .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         }
 
-        let cursor_advanced = phase_reaches(required_phase, ack.phase);
-        if cursor_advanced {
+        let phase_qualified = phase_reaches(required_phase, ack.phase);
+        let mut cursor_advanced = false;
+        if phase_qualified {
             self.replay = completed_probe;
             self.pending_deliveries.remove(&replay_key);
             self.acknowledged_phases
                 .insert(replay_key.clone(), ack.phase);
-            self.cursors
-                .entry(event.stream_id.clone())
-                .and_modify(|cursor| *cursor = (*cursor).max(event.sequence))
-                .or_insert(event.sequence);
+            cursor_advanced = self.advance_contiguous_cursor(&event.stream_id, event.sequence);
         } else {
             self.pending_deliveries.insert(
                 replay_key,
@@ -5335,6 +5338,32 @@ impl AgentBridgeCore {
             disposition: ack.disposition,
             cursor_advanced,
         })
+    }
+
+    /// Retains a later qualified receipt without publishing a cursor across
+    /// a missing sequence. A subsequent receipt can close the hole and advance
+    /// through every already-qualified successor in one local transition.
+    fn advance_contiguous_cursor(&mut self, stream_id: &str, sequence: u64) -> bool {
+        let mut frontier = self.cursors.get(stream_id).copied().unwrap_or(0);
+        let ready = self
+            .acknowledged_out_of_order
+            .entry(stream_id.to_owned())
+            .or_default();
+        if sequence > frontier {
+            ready.insert(sequence);
+        }
+        let previous = frontier;
+        while let Some(next) = frontier.checked_add(1) {
+            if !ready.remove(&next) {
+                break;
+            }
+            frontier = next;
+        }
+        if frontier != previous {
+            self.cursors.insert(stream_id.to_owned(), frontier);
+            return true;
+        }
+        false
     }
 
     fn forward_best_effort(
