@@ -14,9 +14,10 @@
 //! source vocabulary it projects.
 //!
 //! The fence is not asserted by the caller. Every fence field is read from the
-//! source view the port returns: state fence, revision heads, ordering heads,
-//! event range, scope, schema/store generation and the store-declared
-//! residency-key reachability set. Coherence is then *proved* before a byte is
+//! source view the port returns: the installation identity the owner observed,
+//! state fence, revision heads, ordering heads, event range, scope,
+//! schema/store generation and the store-declared residency-key reachability
+//! set. Coherence is then *proved* before a byte is
 //! written, and the proof fails closed (I05-10 "consistent export boundary";
 //! I5.13: an incoherent boundary fails that class rather than producing a
 //! partial successful backup):
@@ -54,6 +55,23 @@
 //! [`BackupError::PublishReconciliationRequired`] outcome carrying the export
 //! identity and the published package path, never as proof that nothing was
 //! published.
+//!
+//! This module is a port, not a reachable edge. [`EcxfSourceStore`] has no
+//! implementor in the workspace and [`export_ecxf_package`] has no caller, so
+//! no process currently produces an `ECXF/1` package. Nothing here stands in
+//! for that edge: a source that returns nothing would make an export look real.
+//! I5.1 puts the coherent read behind the store bridge, and this crate depends
+//! on the neutral store contracts only, so the implementor belongs to the
+//! bridge crate and the composition call site to the process that owns the
+//! export request. Two observations bound that implementor: the neutral
+//! `SnapshotSourceIdentity::installation_id` is a request field and the neutral
+//! snapshot receipts echo no installation identity, so the source view's
+//! `installation_id` has to be read from the bridge's own durable state rather
+//! than filled in from the request; and the adapter-side
+//! `active_store_identity` in
+//! `crates/storage/eliot-store-surreal-adapter/src/backup_restore.rs` derives
+//! its installation part from adapter configuration, which is a name, not
+//! ownership evidence.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -64,7 +82,7 @@ pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
 use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, SnapshotCompleteness, WriteReceipt};
 use serde::{Deserialize, Serialize};
 
-use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256};
+use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256, text};
 
 /// Record-type label of one canonical store write receipt inside the `ECXF/1`
 /// receipt stream.
@@ -123,6 +141,26 @@ pub struct CoherentSourceExport {
     /// other value refuses the export (I05-10: if neither route can prove a
     /// coherent boundary, the export fails).
     pub completeness: SnapshotCompleteness,
+    /// Installation identity the source owner observed at the bound
+    /// consistency point.
+    ///
+    /// This is the owner's own durable state, read through the port at export
+    /// time. A caller string, a configuration value or a request field is not
+    /// an installation identity — a predictable name is not ownership — so a
+    /// source that cannot observe this value leaves it blank and is refused by
+    /// `prove_coherent_boundary` before the archive is assembled, instead of
+    /// filling it in. An export that cannot be attributed to one installation
+    /// produces a package nobody can hold responsible for it.
+    ///
+    /// BLOCKED-BY `crates/storage/eliot-ecxf/src/lib.rs`: neither
+    /// `eliot_ecxf::ExportFence` nor `eliot_ecxf::EcxfManifest` (distinct from
+    /// this crate's own `eliot_backup::EcxfManifest`, which the backup bundle
+    /// carries) has an installation identity member, so the value bound here
+    /// cannot yet be carried into the emitted `manifest.json`. The binding is
+    /// proved at the port and reaches the package when that struct gains the
+    /// member; it is never derived from the exporter, a config value or the
+    /// request.
+    pub installation_id: String,
     /// Store adapter identity that produced this view.
     pub source_adapter: String,
     /// Store adapter version that produced this view.
@@ -326,6 +364,12 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
 /// fence and the source owner reports that as
 /// [`SnapshotCompleteness::Complete`]. Anything else refuses here, before the
 /// archive is assembled.
+///
+/// The source must also have observed its own installation identity at that
+/// point. It is the one fence input the exporter cannot derive from anything it
+/// already holds, so it is required rather than defaulted: a source view that
+/// leaves it blank is refused here rather than exported under a name the
+/// exporter chose.
 fn prove_coherent_boundary(
     snapshot: &CoherentSourceExport,
     request: &EcxfExportRequest,
@@ -333,6 +377,7 @@ fn prove_coherent_boundary(
     if !snapshot.completeness.is_complete() {
         return Err(BackupError::InconsistentBoundary);
     }
+    text(&snapshot.installation_id, "ecxf.installation_id")?;
     if snapshot.scope_id.as_ref() != Some(&request.scope_id) {
         return Err(BackupError::FenceMismatch {
             subject: "export scope".to_owned(),
