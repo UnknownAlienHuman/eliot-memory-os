@@ -27,6 +27,11 @@
 //! output, and [`super::RuntimeStateRoots`] remains the sole retained
 //! runtime topology.
 
+use std::path::{Path, PathBuf};
+
+use eliot_platform_windows::profile_supervision::{
+    CurrentUserTaskRequest, ProfileRootRequest, ProfileSelection as PlatformProfileSelection,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +40,274 @@ use super::runtime_root_contract::{
     InstallationProfile, RuntimeRootLease, RuntimeRootLeaseProvider, RuntimeStateRoots,
 };
 use super::{
-    InstallationError, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider, joined_windows_path,
-    same_windows_root, text,
+    CandidateManifest, InstallationError, InstallationRoots, PlatformHandle, ResourceGeneration,
+    WindowsPathIdentity, WindowsRuntimeRootLeaseProvider, handle, joined_windows_path,
+    same_windows_root, sha256_handle, text,
 };
+
+/// Phase-A template for one UserMode current-user Task Scheduler registration.
+///
+/// This plan binds the transaction and immutable candidate. It intentionally
+/// carries no Phase-B authority digest: the final task request can be built
+/// only from the live descriptor after Host has materialized and read it back.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeTaskRegistrationPlan {
+    /// Installation transaction that owns this planned task effect.
+    pub transaction_id: PlatformHandle,
+    /// Stable effect identity included in the task registration receipt.
+    pub effect_id: PlatformHandle,
+    /// Installation identity from the immutable candidate epoch.
+    pub installation_id: PlatformHandle,
+    /// Exact immutable candidate generation.
+    pub candidate_generation: PlatformHandle,
+    /// Digest of the complete immutable candidate manifest.
+    pub candidate_manifest_digest: PlatformHandle,
+    /// Component identity selected by I3.1.
+    pub profile_component: PlatformHandle,
+    /// Immutable version identity selected by I3.1.
+    pub profile_version: PlatformHandle,
+    /// Current-user installation key selected by I3.1.
+    pub profile_installation_key: Option<PlatformHandle>,
+    /// Exact four-root and digest-bound runtime topology from the candidate.
+    pub profile_roots: Box<InstallationRoots>,
+    /// Phase-B descriptor path fixed by the candidate; its digest is supplied
+    /// only after Host materializes the live descriptor.
+    pub authority_descriptor_path: PlatformHandle,
+    /// Authority generation selected by the candidate.
+    pub authority_generation: ResourceGeneration,
+    /// Exact approved Host image path.
+    pub host_executable_path: PlatformHandle,
+    /// Exact approved Host image SHA-256.
+    pub host_executable_sha256: PlatformHandle,
+    /// Exact working directory, fixed to the immutable binaries root.
+    pub working_directory: PlatformHandle,
+}
+
+impl UserModeTaskRegistrationPlan {
+    pub(crate) fn for_candidate(
+        transaction_id: PlatformHandle,
+        effect_id: PlatformHandle,
+        candidate: &CandidateManifest,
+    ) -> Result<Self, InstallationError> {
+        let launch = &candidate.runtime_launch;
+        if launch.profile != InstallationProfile::UserMode {
+            return Err(InstallationError::ProfileViolation(
+                "current-user task registration requires a UserMode candidate".to_owned(),
+            ));
+        }
+        let (host_executable_path, host_executable_sha256) = launch.host_artifact_binding()?;
+        let working_directory = PlatformHandle::new(
+            launch.profile_governed_roots.immutable_binaries.clone(),
+        )
+        .map_err(|error| InstallationError::InvalidField {
+            field: "user_mode_task.working_directory".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let plan = Self {
+            transaction_id,
+            effect_id,
+            installation_id: launch.installation_epoch.installation.clone(),
+            candidate_generation: candidate.generation.clone(),
+            candidate_manifest_digest: candidate.compute_digest()?,
+            profile_component: launch.profile_component.clone(),
+            profile_version: launch.profile_version.clone(),
+            profile_installation_key: launch.profile_installation_key.clone(),
+            profile_roots: Box::new(launch.profile_governed_roots.clone()),
+            authority_descriptor_path: launch.authority_descriptor_path.clone(),
+            authority_generation: launch.authority_generation.clone(),
+            host_executable_path: host_executable_path.clone(),
+            host_executable_sha256: host_executable_sha256.clone(),
+            working_directory,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Validates the immutable plan without inventing a live Phase-B digest.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        for (value, field) in [
+            (&self.transaction_id, "user_mode_task.transaction_id"),
+            (&self.effect_id, "user_mode_task.effect_id"),
+            (&self.installation_id, "user_mode_task.installation_id"),
+            (
+                &self.candidate_generation,
+                "user_mode_task.candidate_generation",
+            ),
+            (
+                &self.profile_component,
+                "user_mode_task.profile_component",
+            ),
+            (&self.profile_version, "user_mode_task.profile_version"),
+        ] {
+            handle(value, field)?;
+        }
+        sha256_handle(
+            &self.candidate_manifest_digest,
+            "user_mode_task.candidate_manifest_digest",
+        )?;
+        sha256_handle(
+            &self.host_executable_sha256,
+            "user_mode_task.host_executable_sha256",
+        )?;
+        if self.authority_generation.value() == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "user_mode_task.authority_generation".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        self.profile_roots.validate(InstallationProfile::UserMode)?;
+        for (value, field) in [
+            (
+                &self.authority_descriptor_path,
+                "user_mode_task.authority_descriptor_path",
+            ),
+            (
+                &self.host_executable_path,
+                "user_mode_task.host_executable_path",
+            ),
+            (
+                &self.working_directory,
+                "user_mode_task.working_directory",
+            ),
+        ] {
+            handle(value, field)?;
+            if !Path::new(value.as_str()).is_absolute() {
+                return Err(InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: "must be an absolute path".to_owned(),
+                });
+            }
+        }
+        let expected_host = format!(
+            "{}\\eliot-host.exe",
+            self.profile_roots.immutable_binaries
+        );
+        let descriptor_name = Path::new(self.authority_descriptor_path.as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "user_mode_task.authority_descriptor_path".to_owned(),
+                reason: "must name the Phase-B descriptor".to_owned(),
+            })?;
+        let expected_descriptor = format!(
+            "{}\\{descriptor_name}",
+            self.profile_roots.immutable_binaries
+        );
+        if !same_windows_root(
+            self.working_directory.as_str(),
+            &self.profile_roots.immutable_binaries,
+        )? || !same_windows_root(self.host_executable_path.as_str(), &expected_host)?
+            || !same_windows_root(
+                self.authority_descriptor_path.as_str(),
+                &expected_descriptor,
+            )?
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Binds the immutable UserMode task template to a live, Host-materialized
+/// Phase-B root request and the already-admitted Host argv tail.
+///
+/// The pending Phase-A marker is rejected by `sha256_handle`; the returned
+/// platform request is therefore safe to pass to
+/// `register_current_user_task` only after the live descriptor exists.
+pub fn complete_user_mode_task_request(
+    plan: &UserModeTaskRegistrationPlan,
+    roots: ProfileRootRequest,
+    bootstrap_arguments: Vec<String>,
+) -> Result<CurrentUserTaskRequest, InstallationError> {
+    plan.validate()?;
+    let authority_digest = PlatformHandle::new(roots.authority_descriptor_sha256.clone()).map_err(
+        |error| InstallationError::InvalidField {
+            field: "user_mode_task.live_authority_digest".to_owned(),
+            reason: error.to_string(),
+        },
+    )?;
+    sha256_handle(
+        &authority_digest,
+        "user_mode_task.live_authority_digest",
+    )?;
+    if roots.profile != PlatformProfileSelection::UserMode
+        || roots.installation_id != plan.installation_id.as_str()
+        || roots.installation_key.as_deref() != self_handle_option(&plan.profile_installation_key)
+        || roots.component != plan.profile_component.as_str()
+        || roots.version != plan.profile_version.as_str()
+        || roots.generation != plan.candidate_generation.as_str()
+        || roots.authority_generation != plan.authority_generation.value()
+        || roots.authority_descriptor_path
+            != PathBuf::from(plan.authority_descriptor_path.as_str())
+        || roots.repository_root.is_some()
+        || bootstrap_arguments.is_empty()
+        || !same_request_roots(plan, &roots)?
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(CurrentUserTaskRequest {
+        transaction_id: plan.transaction_id.as_str().to_owned(),
+        effect_id: plan.effect_id.as_str().to_owned(),
+        roots,
+        executable: PathBuf::from(plan.host_executable_path.as_str()),
+        executable_sha256: plan.host_executable_sha256.as_str().to_owned(),
+        working_directory: PathBuf::from(plan.working_directory.as_str()),
+        bootstrap_arguments,
+    })
+}
+
+fn self_handle_option(value: &Option<PlatformHandle>) -> Option<&str> {
+    value.as_ref().map(PlatformHandle::as_str)
+}
+
+fn same_request_roots(
+    plan: &UserModeTaskRegistrationPlan,
+    request: &ProfileRootRequest,
+) -> Result<bool, InstallationError> {
+    let expected = &plan.profile_roots;
+    for (left, right) in [
+        (&expected.immutable_binaries, &request.roots.immutable_binaries),
+        (&expected.durable_data, &request.roots.durable_data),
+        (&expected.user_config, &request.roots.user_config),
+        (&expected.user_cache, &request.roots.user_cache),
+    ] {
+        let right = right.to_string_lossy();
+        if !same_windows_root(left, right.as_ref())? {
+            return Ok(false);
+        }
+    }
+    let runtime = &expected.runtime_state_roots;
+    let expected_runtime = [
+        ("runtime_state_roots.profile_anchor_root", &runtime.profile_anchor_root),
+        ("runtime_state_roots.installation_root", &runtime.installation_root),
+        ("runtime_state_roots.host_state_root", &runtime.host_state_root),
+        ("runtime_state_roots.kernel_ors_root", &runtime.kernel_ors_root),
+        ("runtime_state_roots.kernel_work_root", &runtime.kernel_work_root),
+        ("runtime_state_roots.store_data_root", &runtime.store_data_root),
+        ("runtime_state_roots.store_work_root", &runtime.store_work_root),
+        ("runtime_state_roots.store_temp_root", &runtime.store_temp_root),
+        ("runtime_state_roots.watchdog_state_root", &runtime.watchdog_state_root),
+    ];
+    if request.roots.runtime_state_roots.len() != expected_runtime.len() {
+        return Ok(false);
+    }
+    for (role, expected_path) in expected_runtime {
+        let Some((_, actual_path)) = request
+            .roots
+            .runtime_state_roots
+            .iter()
+            .find(|(actual_role, _)| actual_role == role)
+        else {
+            return Ok(false);
+        };
+        let actual_path = actual_path.to_string_lossy();
+        if !same_windows_root(expected_path.as_str(), actual_path.as_ref())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 /// The supervision path a selected profile is intended to use.
 ///

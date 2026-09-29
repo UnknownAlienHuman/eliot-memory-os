@@ -14,6 +14,7 @@ use super::{
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest, sha256_handle,
     validate_package_relative_text,
 };
+use super::profile_supervision::UserModeTaskRegistrationPlan;
 mod contract_models;
 
 pub use contract_models::{
@@ -119,6 +120,15 @@ pub enum InstallerEffectPlan {
         /// Secret-free immutable current-user provision plan.
         provision: Box<UserModeSupervisionAuthorityProvisionPlan>,
     },
+    /// Register the exact current-user Task Scheduler action for one UserMode
+    /// candidate. The typed registration template contains no Phase-B digest;
+    /// Host must materialize the live descriptor before this effect executes.
+    RegisterCurrentUserTask {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Immutable UserMode task registration template.
+        registration: Box<UserModeTaskRegistrationPlan>,
+    },
     /// Publish the Host-owned Phase-B overlay and hand the exact pending
     /// activation to Host after the credential effect has been durably read
     /// back. This is a separate effect so materialization has its own
@@ -155,6 +165,7 @@ impl InstallerEffectPlan {
             | Self::StartService { effect_id, .. }
             | Self::ProvisionStoreCredential { effect_id, .. }
             | Self::ProvisionUserModeSupervisionAuthority { effect_id, .. }
+            | Self::RegisterCurrentUserTask { effect_id, .. }
             | Self::MaterializePhaseB { effect_id, .. } => effect_id,
         }
     }
@@ -289,6 +300,16 @@ impl InstallerEffectPlan {
                 }
                 Ok(())
             }
+            Self::RegisterCurrentUserTask {
+                effect_id,
+                registration,
+            } => {
+                registration.validate()?;
+                if registration.effect_id != *effect_id {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(())
+            }
             Self::MaterializePhaseB {
                 candidate_manifest_digest,
                 static_template,
@@ -382,6 +403,16 @@ pub(super) fn validate_effect_profile(
                     .to_owned(),
             ))
         }
+        InstallerEffectPlan::RegisterCurrentUserTask { .. }
+            if profile == InstallationProfile::UserMode =>
+        {
+            Ok(())
+        }
+        InstallerEffectPlan::RegisterCurrentUserTask { .. } => {
+            Err(InstallationError::ProfileViolation(
+                "current-user task registration requires UserMode profile".to_owned(),
+            ))
+        }
         InstallerEffectPlan::MaterializePhaseB { .. } => Err(InstallationError::ProfileViolation(
             "Phase-B materialization requires SystemService profile".to_owned(),
         )),
@@ -469,6 +500,60 @@ pub(super) fn validate_user_mode_authority_effect_bindings(
     }
 }
 
+pub(super) fn validate_user_mode_task_effect_bindings(
+    transaction_id: &PlatformHandle,
+    candidate: &CandidateManifest,
+    roots: &super::InstallationRoots,
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    let expected_manifest_digest = candidate.compute_digest()?;
+    let mut matched = 0_usize;
+    for effect in effects {
+        let InstallerEffectPlan::RegisterCurrentUserTask {
+            effect_id,
+            registration,
+        } = effect
+        else {
+            continue;
+        };
+        matched += 1;
+        let launch = &candidate.runtime_launch;
+        if launch.profile != InstallationProfile::UserMode
+            || registration.transaction_id != *transaction_id
+            || registration.effect_id != *effect_id
+            || registration.installation_id != launch.installation_epoch.installation
+            || registration.candidate_generation != candidate.generation
+            || registration.candidate_manifest_digest != expected_manifest_digest
+            || registration.profile_component != launch.profile_component
+            || registration.profile_version != launch.profile_version
+            || registration.profile_installation_key != launch.profile_installation_key
+            || registration.profile_roots.as_ref() != roots
+            || registration.authority_descriptor_path != launch.authority_descriptor_path
+            || registration.authority_generation != launch.authority_generation
+            || registration.host_executable_path != launch.host_executable_path
+            || registration.host_executable_sha256 != launch.host_artifact_digest
+            || registration.working_directory.as_str()
+                != launch.profile_governed_roots.immutable_binaries
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    match (candidate.runtime_launch.profile, matched) {
+        (InstallationProfile::UserMode, 1) => Ok(()),
+        (InstallationProfile::UserMode, 0) => Err(InstallationError::IncompleteObservation(
+            "UserMode candidate is missing its current-user task registration effect".to_owned(),
+        )),
+        (InstallationProfile::UserMode, _) => Err(InstallationError::Duplicate {
+            kind: "UserMode current-user task effect".to_owned(),
+            identity: transaction_id.as_str().to_owned(),
+        }),
+        (_, 0) => Ok(()),
+        (_, _) => Err(InstallationError::ProfileViolation(
+            "UserMode task effect is inconsistent with the candidate profile".to_owned(),
+        )),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "ordered fail-closed installer validation is kept in one auditable boundary"
@@ -509,6 +594,7 @@ pub(super) fn validate_installer_effects(
     let mut phase_b_index = None;
     let mut package_index = None;
     let mut user_mode_authority_index = None;
+    let mut user_mode_task_index = None;
     for (index, effect) in effects.iter().enumerate() {
         effect.validate()?;
         if !effect_ids.insert(effect.effect_id().as_str()) {
@@ -742,6 +828,27 @@ pub(super) fn validate_installer_effects(
                     ));
                 }
             }
+            InstallerEffectPlan::RegisterCurrentUserTask { registration, .. } => {
+                if profile != InstallationProfile::UserMode {
+                    return Err(InstallationError::ProfileViolation(
+                        "current-user task registration is admitted only for UserMode".to_owned(),
+                    ));
+                }
+                if user_mode_task_index.replace(index).is_some() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "UserMode current-user task effect".to_owned(),
+                        identity: registration.effect_id.as_str().to_owned(),
+                    });
+                }
+                if user_mode_authority_index.is_none_or(|authority| index <= authority)
+                    || index + 1 != effects.len()
+                {
+                    return Err(InstallationError::IncompleteObservation(
+                        "UserMode task registration must follow authority provisioning as the final installer effect"
+                            .to_owned(),
+                    ));
+                }
+            }
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 if phase_b_index.replace(index).is_some() {
                     return Err(InstallationError::Duplicate {
@@ -887,6 +994,16 @@ pub(super) fn validate_installer_effects(
         return Err(InstallationError::IncompleteObservation(
             "UserMode transaction requires its current-user supervision authority effect"
                 .to_owned(),
+        ));
+    }
+    if profile == InstallationProfile::UserMode && user_mode_task_index.is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "UserMode transaction requires its current-user task registration effect".to_owned(),
+        ));
+    }
+    if profile != InstallationProfile::UserMode && user_mode_task_index.is_some() {
+        return Err(InstallationError::ProfileViolation(
+            "current-user task registration effect is admitted only for UserMode".to_owned(),
         ));
     }
     if profile != InstallationProfile::UserMode && user_mode_authority_index.is_some() {
