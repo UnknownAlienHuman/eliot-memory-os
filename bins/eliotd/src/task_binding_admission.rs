@@ -142,7 +142,8 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_bootstrap::capture::observe_workspace_instance;
+use eliot_bootstrap::capture::{WorkspaceInstanceFacts, observe_workspace_instance};
+use eliot_contracts::sha256_hex;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
     CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
@@ -152,8 +153,21 @@ use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
-    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt, TaskBindingState,
+    BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
+    DiscoveryRead, DiscoveryReadLease, ManifestEvidence, ObservedScopeResources, OnboardingLease,
+    OnboardingReadinessReceipt, TaskBindingState, issue_discovery_lease,
 };
+
+/// Authenticated activation's bounded filesystem/VCS observation and its
+/// scanner inputs. The ticket binds the explicit selector to the admitted
+/// Bridge request and peer receipt; all identity/evidence fields below are
+/// derived from the Host observer, never accepted from the caller.
+#[derive(Clone, Debug)]
+pub struct ColdStartDiscoveryInput {
+    pub lease: DiscoveryReadLease,
+    pub key: DiscoveryLeaseKey,
+    pub discovery: BootstrapDiscoveryInputs,
+}
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -1244,13 +1258,152 @@ pub fn observe_explicit_workspace(
     workspace_root: &Path,
     fence: &StateFence,
 ) -> Result<ObservedScopeResources, TaskBindingError> {
+    observe_explicit_workspace_facts(workspace_root, fence).map(|(_, observed)| observed)
+}
+
+fn observe_explicit_workspace_facts(
+    workspace_root: &Path,
+    fence: &StateFence,
+) -> Result<(WorkspaceInstanceFacts, ObservedScopeResources), TaskBindingError> {
     let facts = observe_workspace_instance(workspace_root).map_err(|error| {
         TaskBindingError::scope_incompatible(format!("workspace observation failed: {error}"))
     })?;
-    derive_observed_resources(&facts, fence.resource_generation, None).map_err(|error| {
+    let observed =
+        derive_observed_resources(&facts, fence.resource_generation, None).map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "observed workspace resources invalid: {error}"
+            ))
+        })?;
+    Ok((facts, observed))
+}
+
+/// Observes one authenticated activation selector and creates the exact
+/// discovery lease/evidence inputs admitted by the privacy-bounded scanner.
+///
+/// Only Host-observed filesystem, VCS and root-manifest name facts are
+/// populated. Known-format inspection and governing-source discovery remain
+/// explicitly unresolved. No privacy class, boundary, source closure, or
+/// task is inferred here; the scanner returns its smallest privacy question
+/// until the applicable owner supplies those inputs.
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded Host observations and the matching discovery lease are assembled in one auditable path"
+)]
+pub fn observe_cold_start_discovery(
+    ticket: &eliot_protocol::AgentActivationResolutionTicket,
+    fence: &StateFence,
+    now: u64,
+) -> Result<ColdStartDiscoveryInput, TaskBindingError> {
+    let selector = ticket.workspace_selector.as_deref().ok_or_else(|| {
+        TaskBindingError::selection_required(
+            "activation has no explicit workspace selector for bounded discovery",
+        )
+    })?;
+    let workspace_root = Path::new(selector);
+    if !workspace_root.is_absolute() {
+        return Err(TaskBindingError::scope_incompatible(
+            "activation workspace selector must be an explicit absolute path",
+        ));
+    }
+    if now == 0 {
+        return Err(TaskBindingError::selection_required(
+            "activation discovery clock is not available",
+        ));
+    }
+    let (facts, observed) = observe_explicit_workspace_facts(workspace_root, fence)?;
+    let instance = observed.instances.first().ok_or_else(|| {
+        TaskBindingError::scope_incompatible("Host observer returned no workspace instance")
+    })?;
+    let instance_ref = instance.instance_ref.clone();
+    let root_identity = instance.root_identity.clone();
+    let proposed_kind = observed.kind;
+    let mut allowed_reads = vec![DiscoveryRead::FilesystemIdentity];
+    if facts.has_git {
+        allowed_reads.push(DiscoveryRead::VcsIdentity);
+    }
+    if !facts.manifest_names.is_empty() {
+        allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
+    }
+    let request = DiscoveryLeaseRequest {
+        proposer_ref: ticket.activation_request_id.as_str().to_owned(),
+        session_ref: ticket.connection_id.clone(),
+        host_ref: ticket.peer_admission_receipt_sha256.clone(),
+        candidate_root_ref: root_identity.clone(),
+        root_filesystem_identity_ref: root_identity.clone(),
+        allowed_reads,
+        consumption_limit: 3,
+        deadline: ticket.kernel_deadline_unix_ms,
+    };
+    let key = DiscoveryLeaseKey {
+        proposer_ref: request.proposer_ref.clone(),
+        session_ref: request.session_ref.clone(),
+        host_ref: request.host_ref.clone(),
+        root_filesystem_identity_ref: request.root_filesystem_identity_ref.clone(),
+    };
+    let lease = issue_discovery_lease(&request).map_err(|error| {
         TaskBindingError::scope_incompatible(format!(
-            "observed workspace resources invalid: {error}"
+            "Host-observed discovery lease refused: {error}"
         ))
+    })?;
+    let mut attested_reads = vec![DiscoveryRead::FilesystemIdentity];
+    if facts.has_git {
+        attested_reads.push(DiscoveryRead::VcsIdentity);
+    }
+    let mut manifests = facts
+        .manifest_names
+        .iter()
+        .map(|name| {
+            let name_hash = sha256_hex(name.as_bytes());
+            ManifestEvidence {
+                manifest_ref: format!("manifest:{name_hash}"),
+                name_hash,
+            }
+        })
+        .collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.manifest_ref.cmp(&right.manifest_ref));
+    if !manifests.is_empty() {
+        attested_reads.push(DiscoveryRead::ManifestNamesAndHashes);
+    }
+    let evidence = BootstrapScanEvidence {
+        canonical_root_ref: root_identity.clone(),
+        filesystem_identity_ref: root_identity,
+        vcs_branch_ref: observed.generation.branch_ref.clone(),
+        vcs_commit_ref: observed.generation.commit_ref.clone(),
+        vcs_dirty_summary_ref: observed.generation.dirty_summary_ref.clone(),
+        file_distribution: Vec::new(),
+        manifests,
+        build_profiles: Vec::new(),
+        root_services: Vec::new(),
+        editor_workspaces: Vec::new(),
+        existing_records: Vec::new(),
+        adapters: Vec::new(),
+        recent_changes: Vec::new(),
+        artifact_dirs: Vec::new(),
+        execution_identity: None,
+        broker_attached: None,
+        redacted_literal_identities: Vec::new(),
+        unresolved_fields: vec![
+            DiscoveryRead::KnownFormatHeaders,
+            DiscoveryRead::GoverningSourceCandidates,
+        ],
+        attested_reads,
+    };
+    let discovery = BootstrapDiscoveryInputs {
+        scan_ref: format!("scan:{}", ticket.ticket_id),
+        candidate_privacy: None,
+        privacy_boundary: None,
+        observed,
+        policy: None,
+        proposed_kind,
+        identity_fingerprint: instance_ref,
+        evidence,
+        governing_source_refs: Vec::new(),
+        now,
+    };
+    Ok(ColdStartDiscoveryInput {
+        lease,
+        key,
+        discovery,
     })
 }
 

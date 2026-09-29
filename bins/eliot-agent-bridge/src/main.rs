@@ -308,6 +308,8 @@ enum Response {
     Attached {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
     },
     Reconnected {
         previous_connection_id: String,
@@ -909,7 +911,8 @@ fn main() {
         total_records = next_total;
         let mut response = match decode_bounded_request(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(_) => {
+                Ok(view) => {
+                    let cold_start_question = view.cold_start_question().cloned();
                     // Best-effort durable restore for the fresh attach: a
                     // refused or absent restore keeps the current empty-ledger
                     // behavior and is reported on stderr without failing the
@@ -921,7 +924,10 @@ fn main() {
                     ) {
                         emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
                     }
-                    Response::Attached { bootstrap: None }
+                    Response::Attached {
+                        bootstrap: None,
+                        cold_start_question,
+                    }
                 }
                 Err(error) => {
                     provider_failure |= matches!(error, BridgeError::PlanGap(_));
@@ -1212,7 +1218,7 @@ fn attach_recovery_bootstrap_if_it_fits(runner: &mut BridgeRunner, response: &mu
 fn response_bootstrap_slot(response: &mut Response) -> Option<&mut Option<UnderstandingBootstrap>> {
     match response {
         Response::Status { bootstrap, .. }
-        | Response::Attached { bootstrap }
+        | Response::Attached { bootstrap, .. }
         | Response::Reconnected { bootstrap, .. }
         | Response::Detached { bootstrap, .. }
         | Response::Invocation { bootstrap, .. }
