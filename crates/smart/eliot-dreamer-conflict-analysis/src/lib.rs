@@ -3182,7 +3182,8 @@ fn validate_causal_evidence(
         // the evidence material join, and the intervention receipt are all
         // checked against the same position's bytes rather than against the
         // union of every member in the analysis.
-        let Some(member) = find_source_member(&records.source_members, &record.source_handle) else {
+        let Some(member) = find_source_member(&records.source_members, &record.source_handle)
+        else {
             return Err(ConflictAnalysisError::Binding {
                 field: "causal_evidence.source_handle".to_owned(),
                 detail: format!(
@@ -3269,8 +3270,9 @@ fn check_evidence_joins(
     {
         return Err(ConflictAnalysisError::Binding {
             field: "causal_evidence.intervention.receipt_digest".to_owned(),
-            detail: "the intervention receipt is not the receipt of a retained envelope for this claim"
-                .to_owned(),
+            detail:
+                "the intervention receipt is not the receipt of a retained envelope for this claim"
+                    .to_owned(),
         });
     }
     Ok(())
