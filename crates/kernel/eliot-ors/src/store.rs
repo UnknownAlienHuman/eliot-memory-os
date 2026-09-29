@@ -24282,6 +24282,34 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Loads and verifies the manifest-bound execution decision for one
+    /// generation (issue #22; I1.9).
+    ///
+    /// The manifest comes from the Generation Registry row keyed by the
+    /// request's exact module and generation. Readback validates the stored
+    /// manifest digest and key identity; the existing pure verifier then checks
+    /// the request's bound digest, Authority Epoch, candidate launch binding,
+    /// compatibility evidence, restart budget, and authorization-class
+    /// specific Catalog/Policy view, revocation, and delivery state. An absent
+    /// row remains a typed `ManifestAbsent` decision.
+    ///
+    /// The returned admitted decision carries the sealed immutable manifest,
+    /// including its exact digest, launch binding, Job Object/resource limits,
+    /// restart budget, readiness reference, and state-class behavior. This is
+    /// a read-only manifest authorization projection; it does not acquire a
+    /// State Fence, certify a live process/Job lineage, or start a process.
+    pub fn load_and_verify_kernel_execution_restart(
+        &self,
+        request: &crate::KernelExecutionRestartRequest,
+    ) -> Result<crate::KernelRestartDecision, OrsError> {
+        request.validate()?;
+        let manifest = self.load_kernel_execution_manifest(
+            request.module_id.as_str(),
+            request.generation.value(),
+        )?;
+        crate::verify_kernel_execution_restart(manifest.as_ref(), request)
+    }
+
     /// Persists one effect-replay reconciliation intent (issue #1885; I1.9).
     ///
     /// A denied, expired or unknown replay escalates here instead of being
