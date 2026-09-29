@@ -88,11 +88,12 @@
 //!   finish legs.
 //! - [`observe_and_admit_task`] has **zero call sites**, so
 //!   [`admit_task_bound_with_observed_scope`] is transitively dead with it.
-//! - [`DaemonComposition::admit_scope_attach`](super::DaemonComposition) — the
-//!   only caller of [`ScopeAttachIngress`] — has **zero call sites**, and
-//!   `GovernorComposition::admit_observed_scope_attach` fails closed unless a
-//!   `WorkScope` owner is *already* retained, so the entry is additionally
-//!   circular: its only producer of the state it requires is itself.
+//! - [`DaemonComposition::admit_scope_attach`](super::DaemonComposition) has
+//!   **zero production callers**. It now admits only an explicit attach to an
+//!   already retained WorkScope owner and constructs the typed privacy
+//!   snapshot before installation. No authenticated claim/settle transport
+//!   currently feeds that ingress, and the dedicated Kernel owner port returns
+//!   `UNAVAILABLE` until ORS adds its durable owner ledger.
 //!
 //! The single blocking symbol for the evidence leg is the compiled readiness
 //! receipt. `TaskSelectionEvidence` needs a non-zero `task_revision` and a
@@ -145,14 +146,17 @@ use std::path::{Path, PathBuf};
 use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
-    CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
-    WorkScopeDescriptor, derive_observed_resources,
+    BridgeEventDisclosureClosureOwner, BridgeEventDisclosureDomainRule,
+    BridgeEventPrivacyRecipient, BridgeEventRetentionPolicy, CanonicalWriteEnvelope,
+    ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding, WorkScopeDescriptor,
+    derive_observed_resources,
 };
 use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
-    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt, TaskBindingState,
+    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt, PrivacyBoundary,
+    TaskBindingState,
 };
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
@@ -1046,8 +1050,15 @@ impl ColdStartAttachInput {
 /// - `privacy_class`, `governing_source_generation`, `sources`, `privacy`:
 ///   the scope's admitted privacy class and the onboarding-retained source
 ///   closure that authenticates the observed instance;
-/// - `owner_revision`: caller-sequenced durable revision for the admitted
-///   owner (same convention as the sibling admission entries).
+/// - `privacy_boundary`: the owner-issued boundary used for event disclosure;
+///   it must narrow the descriptor's admitted classes and include the live
+///   scope class. It is carried as evidence, never replaced by a class label;
+/// - `retention`, `domain_rules`, `closure`, and `recipient`: explicit
+///   disclosure owner inputs from the authenticated attach request. No class
+///   label supplies a retention grant or recipient capability;
+///
+/// The admitted WorkScope owner issues the resulting owner revision at the
+/// exact state fence; callers cannot supply or predict that revision.
 ///
 /// [`ScopeAttachIngress::validate`] checks shape only: it never authenticates
 /// the scope, the lineage, or the authorization — the live owner read at the
@@ -1077,8 +1088,16 @@ pub struct ScopeAttachIngress {
     pub sources: GoverningSourceSet,
     /// Privacy boundary the new binding must satisfy.
     pub privacy: PrivacyProfile,
-    /// Caller-sequenced durable revision for the admitted owner.
-    pub owner_revision: u64,
+    /// Owner-issued disclosure boundary for this exact attach.
+    pub privacy_boundary: PrivacyBoundary,
+    /// Explicit host-event retention rules, covering every normalized class.
+    pub retention: BridgeEventRetentionPolicy,
+    /// Domain closure and required recipient capabilities.
+    pub domain_rules: Vec<BridgeEventDisclosureDomainRule>,
+    /// Completeness and transformation lineage for the disclosure closure.
+    pub closure: BridgeEventDisclosureClosureOwner,
+    /// Authenticated Kernel/ORS recipient and capabilities from attach evidence.
+    pub recipient: BridgeEventPrivacyRecipient,
 }
 
 impl ScopeAttachIngress {
@@ -1114,11 +1133,6 @@ impl ScopeAttachIngress {
                 "attach ingress governing_source_generation is zero",
             ));
         }
-        if self.owner_revision == 0 {
-            return Err(TaskBindingError::selection_required(
-                "attach ingress owner_revision is zero",
-            ));
-        }
         self.descriptor.validate().map_err(|error| {
             TaskBindingError::scope_incompatible(format!(
                 "attach ingress descriptor invalid: {error}"
@@ -1129,10 +1143,78 @@ impl ScopeAttachIngress {
                 "attach ingress privacy boundary invalid: {error}"
             ))
         })?;
+        self.privacy_boundary.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "attach ingress privacy boundary invalid: {error}"
+            ))
+        })?;
+        self.retention.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "attach ingress retention policy invalid: {error}"
+            ))
+        })?;
+        if self.domain_rules.is_empty() {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress disclosure domain closure is empty",
+            ));
+        }
+        for rule in &self.domain_rules {
+            rule.domain.validate().map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "attach ingress disclosure domain invalid: {error}"
+                ))
+            })?;
+            if rule.required_capabilities.is_empty()
+                || rule.required_capabilities.iter().any(|capability| {
+                    capability.trim().is_empty() || capability.chars().any(char::is_control)
+                })
+            {
+                return Err(TaskBindingError::scope_incompatible(
+                    "attach ingress domain capabilities are empty or malformed",
+                ));
+            }
+        }
+        if self.recipient.principal_or_route.trim().is_empty()
+            || self
+                .recipient
+                .principal_or_route
+                .chars()
+                .any(char::is_control)
+            || self.recipient.capabilities.iter().any(|capability| {
+                capability.trim().is_empty() || capability.chars().any(char::is_control)
+            })
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress recipient identity or capabilities are malformed",
+            ));
+        }
+        if self.descriptor.privacy != self.privacy {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress privacy profile disagrees with its WorkScope descriptor",
+            ));
+        }
         if !self.privacy.admits(self.privacy_class) {
             return Err(TaskBindingError::scope_incompatible(
                 "attach ingress privacy class is outside the admitted boundary",
             ));
+        }
+        if !self.privacy_boundary.admits(self.privacy_class)
+            || self
+                .privacy_boundary
+                .admitted_classes
+                .iter()
+                .any(|class| !self.privacy.admits(*class))
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress privacy boundary widens or excludes the live scope class",
+            ));
+        }
+        if let Some(lineage) = self.privacy_boundary.lineage.as_ref() {
+            if self.descriptor.lineage.as_ref() != Some(lineage) {
+                return Err(TaskBindingError::scope_incompatible(
+                    "attach ingress privacy boundary lineage disagrees with its WorkScope descriptor",
+                ));
+            }
         }
         Ok(())
     }

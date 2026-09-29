@@ -6,12 +6,12 @@
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::{
-    ClosureCompleteness, DisclosureDecision, DisclosureDecisionKind,
-    DisclosureDependencyClosure, ObservationDomainRef, PolicyFence, PrivacyClass,
+    ClosureCompleteness, DisclosureDecision, DisclosureDecisionKind, DisclosureDependencyClosure,
+    ObservationDomainRef, PolicyFence, PrivacyClass,
 };
 use eliot_workscope::{
-    PrivacyBoundary, ScopeRelocationKind, ScopeRelocationOrAttachReceipt,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    PrivacyBoundary, ScopeRelocationKind, ScopeRelocationOrAttachReceipt, WorkScopeBindingOwner,
+    WorkScopeBindingSnapshot,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -194,12 +194,22 @@ impl BridgeEventPrivacyOwnerSnapshot {
             || attach_receipt.kind != ScopeRelocationKind::Attach
             || attach_receipt.scope_ref != work_scope.binding.scope.scope_ref
             || attach_receipt.lineage.lineage_ref
-                != work_scope.binding.scope.lineage_ref.as_deref().unwrap_or_default()
-            || attach_receipt.observed_instance.instance_ref != work_scope.binding.scope.instance_ref
-            || attach_receipt.observed_instance.root_identity != work_scope.binding.scope.root_identity
+                != work_scope
+                    .binding
+                    .scope
+                    .lineage_ref
+                    .as_deref()
+                    .unwrap_or_default()
+            || attach_receipt.observed_instance.instance_ref
+                != work_scope.binding.scope.instance_ref
+            || attach_receipt.observed_instance.root_identity
+                != work_scope.binding.scope.root_identity
             || attach_receipt.observed_instance.generation != work_scope.binding.scope.generation
             || !privacy_boundary.admits(work_scope.binding.privacy_class)
-            || privacy_boundary.lineage.as_ref().map(|lineage| lineage.lineage_ref.as_str())
+            || privacy_boundary
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.lineage_ref.as_str())
                 != work_scope.binding.scope.lineage_ref.as_deref()
         {
             return Err(BridgeEventPrivacyError::InvalidOwner(
@@ -254,7 +264,13 @@ impl BridgeEventPrivacyOwnerSnapshot {
             || self.attach_receipt.kind != ScopeRelocationKind::Attach
             || self.attach_receipt.scope_ref != self.work_scope.binding.scope.scope_ref
             || self.attach_receipt.lineage.lineage_ref
-                != self.work_scope.binding.scope.lineage_ref.as_deref().unwrap_or_default()
+                != self
+                    .work_scope
+                    .binding
+                    .scope
+                    .lineage_ref
+                    .as_deref()
+                    .unwrap_or_default()
             || self.attach_receipt.observed_instance.instance_ref
                 != self.work_scope.binding.scope.instance_ref
             || self.attach_receipt.observed_instance.root_identity
@@ -278,7 +294,9 @@ impl BridgeEventPrivacyOwnerSnapshot {
         self.retention.validate()?;
         self.recipient.validate()?;
         if self.domain_rules.is_empty() {
-            return Err(BridgeEventPrivacyError::InvalidOwner("empty domain closure"));
+            return Err(BridgeEventPrivacyError::InvalidOwner(
+                "empty domain closure",
+            ));
         }
         let mut seen_domains = Vec::with_capacity(self.domain_rules.len());
         for rule in &self.domain_rules {
@@ -300,7 +318,9 @@ impl BridgeEventPrivacyOwnerSnapshot {
             || !unique_nonblank(&self.closure.derivation_or_transformation_refs)
             || !unique_nonblank(&self.closure.declassification_receipt_refs)
         {
-            return Err(BridgeEventPrivacyError::InvalidOwner("closure lineage references"));
+            return Err(BridgeEventPrivacyError::InvalidOwner(
+                "closure lineage references",
+            ));
         }
         Ok(())
     }
@@ -318,10 +338,13 @@ impl BridgeEventRetentionPolicy {
             BridgeEventSourcePrivacyClass::RedactedSummary,
             BridgeEventSourcePrivacyClass::RestrictedHandleOnly,
         ];
-        if required
-            .iter()
-            .any(|class| self.rules.iter().filter(|rule| rule.source_class == *class).count() != 1)
-        {
+        if required.iter().any(|class| {
+            self.rules
+                .iter()
+                .filter(|rule| rule.source_class == *class)
+                .count()
+                != 1
+        }) {
             return Err(BridgeEventPrivacyError::InvalidOwner(
                 "retention policy must define each source class exactly once",
             ));
@@ -329,10 +352,7 @@ impl BridgeEventRetentionPolicy {
         Ok(())
     }
 
-    fn rule_for(
-        &self,
-        class: BridgeEventSourcePrivacyClass,
-    ) -> Option<&BridgeEventRetentionRule> {
+    fn rule_for(&self, class: BridgeEventSourcePrivacyClass) -> Option<&BridgeEventRetentionRule> {
         self.rules.iter().find(|rule| rule.source_class == class)
     }
 }
@@ -340,7 +360,9 @@ impl BridgeEventRetentionPolicy {
 impl BridgeEventPrivacyRecipient {
     fn validate(&self) -> Result<(), BridgeEventPrivacyError> {
         if !valid_text(&self.principal_or_route) || !unique_nonblank(&self.capabilities) {
-            return Err(BridgeEventPrivacyError::InvalidOwner("recipient identity or capabilities"));
+            return Err(BridgeEventPrivacyError::InvalidOwner(
+                "recipient identity or capabilities",
+            ));
         }
         Ok(())
     }
@@ -363,10 +385,13 @@ pub fn decide_bridge_event_disclosure(
     let owner_snapshot_sha256 = sha256_hex(
         &canonical_json_bytes(owner).map_err(|_| BridgeEventPrivacyError::Canonicalization)?,
     );
-    let retention_rule = owner
-        .retention
-        .rule_for(source_class)
-        .ok_or(BridgeEventPrivacyError::InvalidOwner("missing source class rule"))?;
+    let retention_rule =
+        owner
+            .retention
+            .rule_for(source_class)
+            .ok_or(BridgeEventPrivacyError::InvalidOwner(
+                "missing source class rule",
+            ))?;
     let closure_ref = format!("bridge-event-closure:{source_hash}");
     let closure = DisclosureDependencyClosure {
         closure_id: closure_ref.clone(),
@@ -413,9 +438,7 @@ pub fn decide_bridge_event_disclosure(
     } else {
         match retention_rule.disposition {
             BridgeEventRetentionDisposition::RawAllowed => DisclosureDecisionKind::Allow,
-            BridgeEventRetentionDisposition::RedactedOnly => {
-                DisclosureDecisionKind::AllowRedacted
-            }
+            BridgeEventRetentionDisposition::RedactedOnly => DisclosureDecisionKind::AllowRedacted,
             BridgeEventRetentionDisposition::Denied => DisclosureDecisionKind::Deny,
         }
     };

@@ -14,9 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
-    GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
-    KernelGenerationSnapshotProvider, PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
+    BridgeEventPrivacyOwnerSnapshot, CompositionError, CompositionReadiness, FinishAttemptDraft,
+    FinishAttemptError, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
+    KernelGenerationPort, KernelGenerationSnapshotProvider, PreparedFinishDecision,
+    PreparedKernelExchange, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -674,6 +675,11 @@ pub struct DaemonComposition {
     /// [`Self::replay_bridge_external_attach`], which reads back the exact
     /// retained binding on replay.
     external_attach: Option<Box<ExternalAttachIngressRecord>>,
+    /// Current typed Bridge event privacy owner assembled from the live
+    /// WorkScope and Policy owners and the exact attach receipt. Only the
+    /// authenticated Kernel owner port can make it effective for Bridge
+    /// events; this local copy is not an authorization by itself.
+    bridge_event_privacy_owner: Option<Box<BridgeEventPrivacyOwnerSnapshot>>,
     /// Retained solo-agent driver state (issue #2567).
     ///
     /// Holds the bounded solo intake queue plus the single live attempt
@@ -978,6 +984,7 @@ impl DaemonComposition {
             learning_closure: eliot_governor::LearningClosureService::new(),
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
             external_attach: None,
+            bridge_event_privacy_owner: None,
             solo_state: std::sync::Mutex::new(solo_agent_driver::SoloDriverState::new()),
             swarm_attachment: eliot_governor::SwarmAttachmentComposition::new(
                 eliot_governor::SwarmPlanAttachmentService::new(),
@@ -3530,58 +3537,25 @@ impl DaemonComposition {
         Ok(current_surface)
     }
 
-    /// Admits one explicit workspace instance as an attach to the retained
-    /// `WorkScope` binding (issue #1929, I04.4 attach trigger).
+    /// Admits one explicit workspace attach candidate and assembles the
+    /// matching Governor privacy snapshot (issue #1934).
     ///
-    /// The daemon owns exactly one step here and owns no other: it observes
-    /// the caller's explicit absolute root mechanically through
-    /// [`task_binding_admission::observe_explicit_workspace`] and then hands
-    /// that live observation to the Governor's real attach/receipt owner,
-    /// [`eliot_governor::GovernorComposition::admit_observed_scope_attach`],
-    /// together with the retained descriptor, the trigger-authenticated
-    /// authorization reference, the privacy boundary, and the onboarding-
-    /// retained source closure. The Governor produces the owner-issued
-    /// relocation/attach receipt, rebinds with it, requires a fresh `MATCHED`
-    /// source-closure check for the observed instance, and only then is the
-    /// admitted owner installed into the live composition by
-    /// [`eliot_governor::GovernorComposition::install_admitted_work_scope_owner`].
+    /// The ingress carries the exact owner request: descriptor, source closure,
+    /// privacy boundary, retention rules, disclosure domains, closure lineage,
+    /// and recipient capabilities. The daemon observes only the explicit root.
+    /// Governor admission creates an attach receipt and issues the next
+    /// WorkScope revision from the exact live owner; no request counter or
+    /// privacy label supplies that revision. The privacy snapshot is validated
+    /// against that uninstalled owner and the exact live PolicyOwner before the
+    /// new WorkScope owner is installed and the snapshot retained here.
     ///
-    /// The installed binding is immediately effective: every later
-    /// [`Self::commit_canonical_and_refresh`] runs
-    /// `check_canonical_write_work_scope` against it, so a write addressing a
-    /// different instance, root, or generation quarantines instead of
-    /// committing. Shape failures (non-absolute root, blank reference, zero
-    /// counter, invalid descriptor or privacy boundary) and a root that cannot
-    /// be observed fail closed as [`DaemonError::TaskBinding`] carrying
-    /// `TASK_SELECTION_REQUIRED` or `TASK_SCOPE_INCOMPATIBLE`, and the
-    /// retained binding, task state, and project memory stay untouched.
-    ///
-    /// The daemon never infers a workspace from cwd, proximity, or recency, and
-    /// never mints a receipt of its own: `ScopeAttachIngress` is the only
-    /// accepted input and its `receipt_ref` is a reference the Governor binds,
-    /// not an authority the daemon asserts.
-    ///
-    /// # Not yet reached (issue #1929)
-    ///
-    /// This method currently has zero call sites, and it cannot acquire one
-    /// without inventing authority, so it is reported here rather than wired to
-    /// a synthetic caller. Three measured reasons:
-    ///
-    /// - it is **circular** — `GovernorComposition::admit_observed_scope_attach`
-    ///   fails closed unless a `WorkScope` owner is already retained, and this
-    ///   method is the only daemon path that installs one;
-    /// - the daemon holds no `WorkScopeDescriptor`, no `GoverningSourceSet`, and
-    ///   no authenticated authorization reference, so three of the nine
-    ///   `ScopeAttachIngress` fields would have to be fabricated;
-    /// - the daemon knows only its own config and state directories, which are
-    ///   not a user `WorkScope`. Attaching one of them as a scope would create
-    ///   a `WorkScope` binding the user never declared.
-    ///
-    /// The legitimate owner is the attach-transport ingress
-    /// `eliot_governor::GovernorComposition` already documents as blocked
-    /// ("attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease"). A startup attach was deliberately not
-    /// added to manufacture a caller.
+    /// The caller must obtain this ingress from an authenticated host/session
+    /// attach claim; shape validation here does not authenticate its references.
+    /// This method does not claim publication. The authenticated Kernel owner
+    /// port currently answers `UNAVAILABLE`; a durable attach claim/settle
+    /// caller and ORS owner ledger are required before Bridge events can use
+    /// the snapshot. Invalid owner data or a stale fence fails before the new
+    /// WorkScope owner is installed.
     pub fn admit_scope_attach(
         &mut self,
         ingress: &task_binding_admission::ScopeAttachIngress,
@@ -3597,6 +3571,16 @@ impl DaemonComposition {
         }
         ingress.validate()?;
         let fence = self.governor.kernel_snapshot().state_fence();
+        let policy_owner = self.policy_owner().cloned().ok_or_else(|| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "Policy owner is unavailable for Bridge event privacy admission".to_owned(),
+            ))
+        })?;
+        if policy_owner.state_fence() != &fence {
+            return Err(DaemonError::Composition(CompositionError::Recovery(
+                "Policy owner fence is stale for Bridge event privacy admission".to_owned(),
+            )));
+        }
         let observed = task_binding_admission::observe_explicit_workspace(
             ingress.explicit_root.as_path(),
             &fence,
@@ -3610,13 +3594,32 @@ impl DaemonComposition {
             ingress.governing_source_generation,
             &ingress.sources,
             &ingress.privacy,
-            ingress.owner_revision,
         )?;
+        let privacy_owner = BridgeEventPrivacyOwnerSnapshot::from_owners(
+            &owner,
+            &policy_owner,
+            receipt.clone(),
+            ingress.privacy_boundary.clone(),
+            ingress.retention.clone(),
+            ingress.domain_rules.clone(),
+            ingress.closure.clone(),
+            ingress.recipient.clone(),
+        )
+        .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
         let snapshot = self
             .governor
             .install_admitted_work_scope_owner(owner)
             .map_err(DaemonError::Composition)?;
+        self.bridge_event_privacy_owner = Some(Box::new(privacy_owner));
         Ok((receipt, snapshot))
+    }
+
+    /// Returns the privacy owner assembled by the last admitted explicit
+    /// attach. It is local retained evidence only until Kernel confirms the
+    /// exact snapshot through its durable owner publication/readback route.
+    #[must_use]
+    pub fn bridge_event_privacy_owner_snapshot(&self) -> Option<&BridgeEventPrivacyOwnerSnapshot> {
+        self.bridge_event_privacy_owner.as_deref()
     }
 
     /// Resolves the current, applicable task selection for admission from the

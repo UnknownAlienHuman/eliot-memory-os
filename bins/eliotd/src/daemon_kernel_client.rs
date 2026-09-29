@@ -18,13 +18,19 @@ use eliot_contracts::{
     StateFence,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+use eliot_governor::{
+    BridgeEventPrivacyOwnerSnapshot, GovernorLaunchConfig, KernelGenerationSnapshot,
+    KernelPortError,
+};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
+    AgentActivationResultSubmit, BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION,
+    BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION, BridgeEventPrivacyOwnerDisposition,
+    BridgeEventPrivacyOwnerPublishOperation, BridgeEventPrivacyOwnerQuery,
+    BridgeEventPrivacyOwnerReceipt, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
     MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
@@ -126,6 +132,70 @@ struct OwnerBundleReadbackWire {
     bound: bool,
     revision: Option<u64>,
     digest: Option<String>,
+}
+
+fn bridge_privacy_owner_receipt_matches(
+    receipt: &BridgeEventPrivacyOwnerReceipt,
+    snapshot: &BridgeEventPrivacyOwnerSnapshot,
+    expected_json: Option<&str>,
+    expected_sha256: &str,
+    require_snapshot: bool,
+) -> Result<(), String> {
+    if receipt.disposition != BridgeEventPrivacyOwnerDisposition::Bound {
+        return Err(format!(
+            "Kernel Bridge privacy owner is {:?}: {}",
+            receipt.disposition,
+            receipt
+                .reason_code
+                .as_deref()
+                .unwrap_or("no refusal reason"),
+        ));
+    }
+    if receipt.scope_ref != snapshot.work_scope.binding.scope.scope_ref
+        || receipt.owner_revision != Some(snapshot.work_scope.owner_revision)
+        || receipt.policy_snapshot_id.as_deref() != Some(snapshot.policy_snapshot_id.as_str())
+        || receipt.policy_revision != Some(snapshot.policy_revision)
+        || receipt.state_fence != snapshot.policy_state_fence
+        || receipt.owner_snapshot_sha256.is_none()
+        || receipt.reason_code.is_some()
+    {
+        return Err("Kernel Bridge privacy owner receipt identity disagrees".to_owned());
+    }
+    let actual_sha = receipt
+        .owner_snapshot_sha256
+        .as_deref()
+        .ok_or_else(|| "Kernel Bridge privacy owner readback omitted snapshot digest".to_owned())?;
+    if actual_sha != expected_sha256 {
+        return Err("Kernel Bridge privacy owner receipt digest disagrees".to_owned());
+    }
+    if let Some(expected_json) = expected_json {
+        if receipt.owner_snapshot_json.as_deref() != Some(expected_json)
+            || sha256_hex(expected_json.as_bytes()) != actual_sha
+        {
+            return Err("Kernel Bridge privacy owner readback bytes disagree".to_owned());
+        }
+    }
+    if require_snapshot {
+        let actual_json = receipt.owner_snapshot_json.as_deref().ok_or_else(|| {
+            "Kernel Bridge privacy owner readback omitted snapshot bytes".to_owned()
+        })?;
+        if sha256_hex(actual_json.as_bytes()) != actual_sha {
+            return Err("Kernel Bridge privacy owner readback digest disagrees".to_owned());
+        }
+        let readback: BridgeEventPrivacyOwnerSnapshot =
+            serde_json::from_str(actual_json).map_err(|error| {
+                format!("Kernel Bridge privacy owner snapshot does not decode: {error}")
+            })?;
+        readback
+            .validate()
+            .map_err(|error| format!("Kernel Bridge privacy owner snapshot is invalid: {error}"))?;
+        if &readback != snapshot {
+            return Err(
+                "Kernel Bridge privacy owner readback is not the submitted snapshot".to_owned(),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1151,6 +1221,164 @@ impl DaemonKernelClient {
                 "Kernel owner readback has an incoherent bound/revision/digest shape".to_owned(),
             )),
         }
+    }
+
+    /// Publishes a Governor-built Bridge privacy snapshot through its
+    /// dedicated authenticated Kernel owner port, then proves exact readback.
+    /// The P-07 `publish_owner_bundle` route is a different owner contract and
+    /// is never used for this snapshot. `UNAVAILABLE` and `UNBOUND` are hard
+    /// refusals; neither is promoted to a local allow.
+    pub async fn publish_bridge_event_privacy_owner(
+        &self,
+        snapshot: &BridgeEventPrivacyOwnerSnapshot,
+    ) -> Result<(), super::DaemonError> {
+        snapshot
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let bytes = canonical_json_bytes(snapshot)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let owner_snapshot_json = String::from_utf8(bytes)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let owner_snapshot_sha256 = sha256_hex(owner_snapshot_json.as_bytes());
+        let operation = BridgeEventPrivacyOwnerPublishOperation {
+            operation: BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION.to_owned(),
+            scope_ref: snapshot.work_scope.binding.scope.scope_ref.clone(),
+            owner_revision: snapshot.work_scope.owner_revision,
+            policy_snapshot_id: snapshot.policy_snapshot_id.clone(),
+            policy_revision: snapshot.policy_revision,
+            state_fence: snapshot.policy_state_fence.clone(),
+            owner_snapshot_json: owner_snapshot_json.clone(),
+            owner_snapshot_sha256: owner_snapshot_sha256.clone(),
+        };
+        operation
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let payload = serde_json::to_value(&operation)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION, payload)
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = super::kind_value(&value, "bridge_event_privacy_owner_receipt")
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let receipt: BridgeEventPrivacyOwnerReceipt = serde_json::from_value(value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        bridge_privacy_owner_receipt_matches(
+            &receipt,
+            snapshot,
+            None,
+            &owner_snapshot_sha256,
+            false,
+        )
+        .map_err(super::DaemonError::Kernel)?;
+
+        let readback = self
+            .query_bridge_event_privacy_owner(
+                &snapshot.work_scope.binding.scope.scope_ref,
+                &snapshot.policy_state_fence,
+            )
+            .await?;
+        bridge_privacy_owner_receipt_matches(
+            &readback,
+            snapshot,
+            Some(owner_snapshot_json.as_str()),
+            &owner_snapshot_sha256,
+            true,
+        )
+        .map_err(super::DaemonError::Kernel)
+    }
+
+    /// Reads the dedicated retained Bridge privacy owner. A positive result
+    /// must carry canonical typed snapshot bytes with a matching digest and
+    /// the exact queried scope/fence; the current Kernel port answers
+    /// `UNAVAILABLE`, which remains a typed refusal.
+    pub async fn query_bridge_event_privacy_owner(
+        &self,
+        scope_ref: &str,
+        state_fence: &StateFence,
+    ) -> Result<BridgeEventPrivacyOwnerReceipt, super::DaemonError> {
+        let query = BridgeEventPrivacyOwnerQuery {
+            operation: BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION.to_owned(),
+            scope_ref: scope_ref.to_owned(),
+            state_fence: state_fence.clone(),
+        };
+        query
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let payload = serde_json::to_value(&query)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION, payload)
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = super::kind_value(&value, "bridge_event_privacy_owner_readback")
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let receipt: BridgeEventPrivacyOwnerReceipt = serde_json::from_value(value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if receipt.scope_ref != scope_ref || receipt.state_fence != *state_fence {
+            return Err(super::DaemonError::Kernel(
+                "Kernel Bridge privacy owner readback disagrees with the requested scope/fence"
+                    .to_owned(),
+            ));
+        }
+        match receipt.disposition {
+            BridgeEventPrivacyOwnerDisposition::Bound => {
+                let snapshot_json = receipt.owner_snapshot_json.as_deref().ok_or_else(|| {
+                    super::DaemonError::Kernel(
+                        "bound Bridge privacy owner readback omitted snapshot bytes".to_owned(),
+                    )
+                })?;
+                let snapshot_sha256 =
+                    receipt.owner_snapshot_sha256.as_deref().ok_or_else(|| {
+                        super::DaemonError::Kernel(
+                            "bound Bridge privacy owner readback omitted snapshot digest"
+                                .to_owned(),
+                        )
+                    })?;
+                if sha256_hex(snapshot_json.as_bytes()) != snapshot_sha256 {
+                    return Err(super::DaemonError::Kernel(
+                        "Kernel Bridge privacy owner readback digest disagrees".to_owned(),
+                    ));
+                }
+                let snapshot: BridgeEventPrivacyOwnerSnapshot = serde_json::from_str(snapshot_json)
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                snapshot
+                    .validate()
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                let canonical = canonical_json_bytes(&snapshot)
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                if canonical.as_slice() != snapshot_json.as_bytes()
+                    || snapshot.work_scope.binding.scope.scope_ref != scope_ref
+                    || snapshot.policy_state_fence != *state_fence
+                    || receipt.owner_revision != Some(snapshot.work_scope.owner_revision)
+                    || receipt.policy_snapshot_id.as_deref()
+                        != Some(snapshot.policy_snapshot_id.as_str())
+                    || receipt.policy_revision != Some(snapshot.policy_revision)
+                    || receipt.reason_code.is_some()
+                {
+                    return Err(super::DaemonError::Kernel(
+                        "Kernel Bridge privacy owner readback identity is incoherent".to_owned(),
+                    ));
+                }
+            }
+            BridgeEventPrivacyOwnerDisposition::Unbound
+            | BridgeEventPrivacyOwnerDisposition::Unavailable => {
+                if receipt.owner_snapshot_json.is_some()
+                    || receipt.owner_snapshot_sha256.is_some()
+                    || receipt.owner_revision.is_some()
+                    || receipt.policy_snapshot_id.is_some()
+                    || receipt.policy_revision.is_some()
+                    || (receipt.disposition == BridgeEventPrivacyOwnerDisposition::Unavailable
+                        && receipt.reason_code.is_none())
+                {
+                    return Err(super::DaemonError::Kernel(
+                        "unbound Bridge privacy owner readback has incoherent owner evidence"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(receipt)
     }
 
     /// Submits one already-resolved v2 result through the existing authenticated

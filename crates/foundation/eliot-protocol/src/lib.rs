@@ -143,12 +143,10 @@ pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 2;
 /// Authenticated daemon operation that attempts to publish one Governor-owned
 /// Bridge event privacy snapshot to the Kernel owner port.
-pub const BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION: &str =
-    "publish_bridge_event_privacy_owner";
+pub const BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION: &str = "publish_bridge_event_privacy_owner";
 /// Authenticated daemon operation that reads the currently retained Bridge
 /// event privacy owner for one scope and fence.
-pub const BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION: &str =
-    "query_bridge_event_privacy_owner";
+pub const BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION: &str = "query_bridge_event_privacy_owner";
 /// Version of the canonical Governor owner snapshot carried by the dedicated
 /// Bridge event privacy owner publication.
 pub const BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION: u16 = 1;
@@ -238,9 +236,7 @@ impl BridgeEventPrivacyOwnerPublishOperation {
         let owner_revision = snapshot
             .pointer("/work_scope/owner_revision")
             .and_then(Value::as_u64);
-        let policy_snapshot_id = snapshot
-            .get("policy_snapshot_id")
-            .and_then(Value::as_str);
+        let policy_snapshot_id = snapshot.get("policy_snapshot_id").and_then(Value::as_str);
         let policy_revision = snapshot.get("policy_revision").and_then(Value::as_u64);
         let schema_version = snapshot.get("schema_version").and_then(Value::as_u64);
         if scope_ref != Some(self.scope_ref.as_str())
@@ -248,9 +244,13 @@ impl BridgeEventPrivacyOwnerPublishOperation {
             || policy_snapshot_id != Some(self.policy_snapshot_id.as_str())
             || policy_revision != Some(self.policy_revision)
             || schema_version != Some(u64::from(BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION))
-            || snapshot.get("work_scope").and_then(|value| value.get("state_fence"))
+            || snapshot
+                .get("work_scope")
+                .and_then(|value| value.get("state_fence"))
                 != Some(&fence)
-            || snapshot.get("attach_receipt").and_then(|value| value.get("state_fence"))
+            || snapshot
+                .get("attach_receipt")
+                .and_then(|value| value.get("state_fence"))
                 != Some(&fence)
             || snapshot.get("policy_state_fence") != Some(&fence)
         {

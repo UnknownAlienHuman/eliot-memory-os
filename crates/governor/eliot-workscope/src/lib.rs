@@ -3085,12 +3085,13 @@ impl WorkScopeBindingOwner {
         {
             return Err(WorkScopeError::StateFenceMismatch);
         }
-        let owner_revision = current
-            .owner_revision
-            .checked_add(1)
-            .ok_or(WorkScopeError::InvalidCounter {
-                field: "owner_revision",
-            })?;
+        let owner_revision =
+            current
+                .owner_revision
+                .checked_add(1)
+                .ok_or(WorkScopeError::InvalidCounter {
+                    field: "owner_revision",
+                })?;
         let snapshot = WorkScopeBindingSnapshot::new(
             state_fence.clone(),
             owner_revision,
