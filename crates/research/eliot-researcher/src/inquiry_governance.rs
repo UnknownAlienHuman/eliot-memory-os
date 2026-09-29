@@ -55,8 +55,8 @@ use crate::evidence_portfolio::{
     CoverageAccount, EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster,
     ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
     SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank,
-    push_count, push_field, reject_vague, text,
+    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name,
+    grade_rank, push_count, push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,

@@ -6180,10 +6180,7 @@ impl ClosedEmptyScope {
             });
         }
         digest(&inquiry_digest, "closed_empty_scope.inquiry_digest")?;
-        digest(
-            &denominator_digest,
-            "closed_empty_scope.denominator_digest",
-        )?;
+        digest(&denominator_digest, "closed_empty_scope.denominator_digest")?;
         text(
             &denominator_revision,
             "closed_empty_scope.denominator_revision",
