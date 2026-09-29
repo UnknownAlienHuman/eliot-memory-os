@@ -111,13 +111,10 @@ public sealed record UserAutomationEditOperation(
         {
             throw new InvalidOperationException("UserAutomation edit must supersede one distinct revision of the same automation.");
         }
-        // An edit is a NEW immutable revision, so an effect-relevant schedule
-        // change has to be backed by a NEW owner normalization result. This
-        // refuses the two provable stale-owner-evidence cases: reusing the
-        // previous revision's occurrence source digest after changing the source,
-        // and carrying a digest foreign to an unchanged source. Neither revision
-        // is ever rewritten here; the Operator derives no normalization of its
-        // own, so a genuine re-normalization must come from the owner.
+        // Retained operations are validated during exact-identity recovery, so
+        // this remains a structural/local consistency check. Fresh create/edit
+        // admission separately fails closed until the owner result can be bound
+        // to the submitted immutable revision.
         UserAutomationScheduleMirror.RequireFreshOwnerEvidenceForEdit(
             PreviousRevision.Schedule,
             Revision.Schedule);
@@ -514,20 +511,20 @@ public sealed record UserAutomationNormalizedSchedule(
         UserAutomationScheduleNormalizationReceipt NormalizationBinding)
 {
     /// <summary>
-    /// Validates the bounded wire shape and the exact supported contract version
-    /// of the owner-issued occurrence set.
+    /// Validates the bounded wire shape and exact supported contract version of
+    /// the supplied occurrence set.
     /// </summary>
     /// <remarks>
     /// <para>
     /// Every field of the versioned occurrence record is checked against the
     /// grammar in <c>UserAutomationScheduleMirror</c>, which is a generated port
-    /// of the Kernel owner contract, so this method can no longer accept a
-    /// revision the Kernel refuses. Three things changed decisively here:
+    /// of the Kernel owner contract. This check does not prove owner issuance or
+    /// substitute for Kernel validation. The following rules apply:
     /// </para>
     /// <list type="bullet">
     /// <item>
     /// The exact contract version and the pinned zone database release are
-    /// READ OFF the owner's own occurrence bytes. They are not a second copy
+    /// read from the supplied occurrence bytes. They are not a second copy
     /// carried on this record: the owner side is <c>deny_unknown_fields</c>, so
     /// a member the owner does not know would make every request undecodable.
     /// </item>
@@ -537,7 +534,7 @@ public sealed record UserAutomationNormalizedSchedule(
     /// an immutable revision is only ever superseded by a new one.
     /// </item>
     /// <item>
-    /// Ordering is decided by the resolved canonical instant, NEVER by a lexical
+    /// Ordering is decided by the resolved canonical instant, never by a lexical
     /// comparison of the raw records. Mixed offsets are exactly the case where
     /// the two disagree, and the Kernel orders by the instant.
     /// </item>
@@ -569,8 +566,27 @@ public sealed record UserAutomationNormalizedSchedule(
             throw new InvalidOperationException("ONE_SHOT schedules require one next occurrence.");
         }
         NormalizationBinding.Validate();
-        UserAutomationScheduleMirror.ReadOwnerSchedule(
+        var projection = UserAutomationScheduleMirror.ReadScheduleProjection(
             Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
+        if (!string.Equals(
+                NormalizationBinding.SourceDigest, projection.SourceDigest, StringComparison.Ordinal))
+        {
+            throw new UserAutomationScheduleContractException(
+                "Invalid",
+                UserAutomationScheduleMirror.OwnerText("Invalid", "schedule.normalization_receipt.source_digest"),
+                "obtain a new owner normalization for this expression and calendar; preserve the current immutable revision");
+        }
+        if (!string.Equals(
+                NormalizationBinding.ZoneDatabaseRevision,
+                projection.PinnedZoneDatabaseRelease,
+                StringComparison.Ordinal))
+        {
+            throw new UserAutomationScheduleContractException(
+                "ZoneDatabaseRevision",
+                UserAutomationScheduleMirror.OwnerText(
+                    "ZoneDatabaseRevision", "schedule.normalization_receipt.zone_database_revision"),
+                "obtain a new owner normalization against the pinned zone database; preserve the current immutable revision");
+        }
     }
 
     /// <summary>
@@ -589,45 +605,37 @@ public sealed record UserAutomationNormalizedSchedule(
     /// the owner admitted or normalized the revision.
     /// </para>
     /// </remarks>
-    public UserAutomationScheduleReceipt NormalizationReceipt()
+    public UserAutomationScheduleProjection ReadLocalProjection()
     {
         Validate();
-        return UserAutomationScheduleMirror.ReadOwnerSchedule(
+        var projection = UserAutomationScheduleMirror.ReadScheduleProjection(
             Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
+        return projection with { NormalizationReceipt = NormalizationBinding };
     }
 }
 
 /// <summary>
-/// The owner-issued normalization evidence the owner's schedule contract now
-/// REQUIRES on every normalized revision.
+/// The normalization evidence field required by the owner schedule wire
+/// contract. Parsing this caller-supplied DTO does not prove owner issuance.
 /// </summary>
 /// <remarks>
 /// <para>
 /// The owner side of this record is <c>deny_unknown_fields</c>, so this member
 /// is not optional: without it a 1.2.0 revision cannot round-trip through the
-/// Operator at all. It is owner-issued evidence over the compiled occurrence
-/// set, not an Operator claim about it.
+/// Operator at all. These caller-supplied fields are not verified until Kernel
+/// joins the receipt ID to the exact owner-issued envelope in the authenticated
+/// preflight assembly.
 /// </para>
 /// <para>
-/// <b>Why the C# member on the schedule is named <c>NormalizationBinding</c>
-/// while the JSON name is <c>normalization_receipt</c>.</b>
-/// <c>UserAutomationNormalizedSchedule</c> already exposes a
-/// <c>NormalizationReceipt()</c> METHOD that projects the parsed owner schedule,
-/// and C# forbids a property and a method sharing one name in a type. The JSON
-/// property name is what the wire contract depends on, so it stays exactly
-/// <c>normalization_receipt</c>; only the C# identifier is renamed, and no call
-/// site in another file has to move.
+/// <b>Why the C# member on the schedule is named <c>NormalizationBinding</c>.</b>
+/// The schedule exposes the same JSON member as <c>normalization_receipt</c>;
+/// this distinct C# name keeps it separate from the projection method.
 /// </para>
 /// <para>
-/// Every member below is checked for closed shape ONLY. The two digests are
-/// SHA-256 values over the owner's canonical JSON encoding of an expression
-/// language this surface does not own, and the receipt id is the identity of a
-/// receipt envelope the owner derives from its own bytes. The Operator can
-/// therefore reproduce none of them, and it does not: it never claims the
-/// occurrence set is the compiled result of the expression, never recomputes a
-/// digest, and never treats a locally well-formed receipt as normalization
-/// evidence. Whether the set is actually the compiled result of the declared
-/// expression is the owner's decision, enforced by the owner.
+/// Every member below is checked for bounded wire shape ONLY. The digests are
+/// SHA-256 values over owner-defined canonical bytes that this surface does not
+/// reproduce. The Operator never treats a locally well-formed receipt as proof
+/// of normalization or provenance.
 /// </para>
 /// </remarks>
 public sealed record UserAutomationScheduleNormalizationReceipt(
@@ -651,9 +659,8 @@ public sealed record UserAutomationScheduleNormalizationReceipt(
     /// </remarks>
     public void Validate()
     {
-        UserAutomationContract.RequireText(ReceiptId, "schedule.normalization_receipt.receipt_id");
-        UserAutomationContract.RequireText(
-            NormalizerAuthority, "schedule.normalization_receipt.normalizer_authority");
+        RequireBoundedText(ReceiptId, "schedule.normalization_receipt.receipt_id", OperatorScheduleContract.MAX_TEXT_BYTES);
+        RequireBoundedText(NormalizerAuthority, "schedule.normalization_receipt.normalizer_authority", 256);
         RequireDigest(SourceDigest, "schedule.normalization_receipt.source_digest");
         RequireDigest(
             OccurrencesDigest, "schedule.normalization_receipt.occurrences_digest");
@@ -669,6 +676,15 @@ public sealed record UserAutomationScheduleNormalizationReceipt(
         if (value.Length != 64 || value.Any(character => !Uri.IsHexDigit(character)))
         {
             throw new InvalidOperationException($"{field} must be a 64-character hex digest.");
+        }
+    }
+
+    private static void RequireBoundedText(string value, string field, int maxBytes)
+    {
+        UserAutomationContract.RequireText(value, field);
+        if (Encoding.UTF8.GetByteCount(value) > maxBytes)
+        {
+            throw new InvalidOperationException($"{field} exceeds its UTF-8 byte bound.");
         }
     }
 }
