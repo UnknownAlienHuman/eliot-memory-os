@@ -819,7 +819,7 @@ impl UserOwnedRootReadLease {
     pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
         #[cfg(windows)]
         {
-            let directory = open_user_owned_directory(&self.path, &self.sid)?;
+            let directory = open_user_owned_directory_read_only(&self.path, &self.sid)?;
             let identity = crate::process_identity::file_identity_from_handle(&directory)
                 .map_err(|_| ProtectedPathError::Io)?;
             (identity == self.identity)
@@ -948,7 +948,7 @@ impl UserOwnedRootLease {
     pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
         #[cfg(windows)]
         {
-            let directory = open_user_owned_directory(&self.path, &self.sid)?;
+            let directory = open_user_owned_directory_read_only(&self.path, &self.sid)?;
             let identity = crate::process_identity::file_identity_from_handle(&directory)
                 .map_err(|_| ProtectedPathError::Io)?;
             (identity == self.identity)
