@@ -2812,6 +2812,61 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
     }
 }
 
+/// The **owner-issued** projection of the active manifest binding, in the shape
+/// the Kernel's `DestinationManifestEvidence` producer consumes (issue #962,
+/// AUDIT-7).
+///
+/// This is a *projection of owner records*, not a second binding. The Host
+/// binding itself is the [`ApprovedGenerationRegistry`] plus the
+/// [`ApprovedGeneration`] it committed; every field below is copied out of a
+/// record that [`OwnerEvidence::inspect`] already validated, and no field is a
+/// copy of a caller value, a recomputed digest, or a default. The Kernel-side
+/// consumer names this owner as its issuer and cannot substitute for the Host
+/// binding: the two registry records stay in this crate, and a projection of
+/// three validated values is not the registry.
+///
+/// Deliberately three values and a counter. The Host roots type
+/// ([`RuntimeStateRoots`]) is never carried: the roots digest is what a restore
+/// can verify, and shipping the roots themselves would create a second readable
+/// copy of the mutable root topology on a boundary that has no other reason to
+/// hold it.
+///
+/// No credential-typed or secret-typed value is read to build it. The committed
+/// fence's `credential_receipt_digest` and `host_process_nonce_digest` are
+/// visible on a record this owner reads and are, as everywhere else in this
+/// module, deliberately not extracted (I5.13).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostManifestBinding {
+    /// The active approved manifest's own configuration digest.
+    pub manifest_digest: String,
+    /// The manifest-bound runtime roots' own digest.
+    pub roots_digest: String,
+    /// The registry CAS revision observed at inspection time.
+    pub registry_revision: u64,
+}
+
+impl HostManifestBinding {
+    /// Shape-checks the two owner-issued digests with this module's existing
+    /// 64-lowercase-hex rule.
+    ///
+    /// This is a guard on owner-issued content, exactly like
+    /// [`AuditFenceNote::validate`] inside [`OwnerEvidence::owner_audit_note`]:
+    /// the values are owner records, so a shape failure is a broken owner record
+    /// rather than an expected outcome, and it must fail here at the owner
+    /// boundary instead of after being carried into a restore. It is not a
+    /// substitute for the consumer's own comparison of these values.
+    ///
+    /// # Errors
+    ///
+    /// [`PreparationError::InvalidRequest`] naming the offending field, with the
+    /// module's static reason. The owner's own error text is never echoed.
+    pub fn validate(&self) -> Result<(), PreparationError> {
+        check_digest(&self.manifest_digest, "owner_manifest_digest")?;
+        check_digest(&self.roots_digest, "owner_roots_digest")?;
+        Ok(())
+    }
+}
+
 /// Registry-committed owner evidence for one protected Host root.
 ///
 /// This is the delegation-time read bundle preparation consumes: the
@@ -3499,6 +3554,106 @@ impl OwnerEvidence {
             Err(error) => Err(note_prepare_error(
                 OP_OWNER_EVIDENCE,
                 "purge_revision",
+                error,
+                0,
+            )),
+        }
+    }
+
+    /// Returns the **owner-issued** active-manifest binding projection the
+    /// Kernel's `DestinationManifestEvidence` is built from (issue #962,
+    /// AUDIT-7; I5.13 `full_recovery` manifest; A13.7 provenance/integrity).
+    ///
+    /// Three owner records, one value each, and no fourth:
+    ///
+    /// - `manifest_digest` is the ACTIVE approved generation's own manifest
+    ///   `config_digest` — the manifest [`OwnerEvidence::inspect`] already
+    ///   validated through its own `validate`, which proves it is a 64-hex
+    ///   digest, binds `runtime_state_roots_digest` to the launch roots, and
+    ///   agrees with the committed activation fence on generation, configuration
+    ///   digest and authority generation. It is the same value
+    ///   [`OwnerEvidence::project_backup_configuration`] hands the configuration
+    ///   projector as `binding.config_digest`, read from the same record, so a
+    ///   caller cannot present a competing configuration digest and this method
+    ///   does not re-derive one.
+    /// - `roots_digest` is the manifest-bound runtime roots' OWN `roots_digest`
+    ///   field. It is not an owner-computed summary: `RuntimeStateRoots::validate`,
+    ///   which [`OwnerEvidence::inspect`] ran on these exact roots, recomputes it
+    ///   from the nine root fields and refuses a mismatch, and the manifest's own
+    ///   `validate` independently requires
+    ///   `runtime_state_roots_digest == runtime_launch.runtime_state_roots.roots_digest`.
+    ///   So the value read here is a digest the owner proved against the roots
+    ///   it committed. The roots THEMSELVES are not carried: this projection
+    ///   crosses into a restore, and a restore needs to verify the digest, not
+    ///   to re-read the Host's mutable root topology.
+    /// - `registry_revision` is [`OwnerEvidence::revision`], the registry CAS
+    ///   revision observed at inspection time — the same observation
+    ///   `HostComposition` already compares to detect registry movement between
+    ///   inspection and use. It is deliberately NOT the purge-ledger revision,
+    ///   whose authority belongs to the backup domain and whose counter belongs
+    ///   to the ORS owner ([`OwnerEvidence::owner_purge_ledger_revision`]).
+    ///
+    /// The retained protected-root lease is **re-proved here**, not at
+    /// inspection only, by calling [`OwnerEvidence::owner_lease_ref`] and
+    /// requiring it to succeed: the same identity-plus-current-final-path proof
+    /// that accessor performs is reused rather than duplicated, so there is one
+    /// implementation of "the retained lease still pins the inspected source
+    /// root" in this module. A source root that moved or was replaced refuses
+    /// typed here rather than yielding a manifest binding read from a lineage
+    /// the rest of this chain no longer admits.
+    ///
+    /// ## What this proves, and what it does not
+    ///
+    /// PROVED: the three values are the ones this owner validated and still
+    /// holds; the retained lease still pins the same source object at the same
+    /// path; the roots digest is the digest of the roots the active manifest
+    /// binds; and the revision is a real observed registry revision, not a
+    /// placeholder.
+    ///
+    /// NOT PROVED, and deliberately not claimed:
+    ///
+    /// - the registry is NOT re-read at issue time. `OwnerEvidence::inspect`
+    ///   observed it once; this projection is a snapshot of that read, exactly
+    ///   like the audit note's. The window between inspection and issue is
+    ///   covered by the caller's own revision comparison, the same way it is for
+    ///   every other fact in this bundle — not by anything here.
+    /// - the digests are NOT recomputed. A fresh checksum here would replace the
+    ///   owner's proof with a local one, so both are read from records the
+    ///   owner's own validators checked.
+    /// - nothing about the CURRENT contents of the roots. `roots_digest` binds
+    ///   the approved root TOPOLOGY, not the bytes under those roots; a tree
+    ///   that changed under an unchanged topology leaves this value untouched.
+    /// - no destination readiness, no archive integrity, no cutover authority,
+    ///   and no restore effect of any kind.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with a static [`PreparationError`]: a stale or moved retained
+    /// lease is whatever typed error [`OwnerEvidence::owner_lease_ref`] reports
+    /// (re-proved, never re-derived here), and a digest that is not 64 lowercase
+    /// hex is [`PreparationError::InvalidRequest`] from
+    /// [`HostManifestBinding::validate`]. The outcome is observed once through
+    /// `note_prepare_error`, and no owner error text, path or record body is
+    /// echoed.
+    pub fn owner_manifest_binding(&self) -> Result<HostManifestBinding, PreparationError> {
+        let issued = (|| -> Result<HostManifestBinding, PreparationError> {
+            // The retained lease is re-proved at issue time, through the one
+            // accessor that already implements that proof. Its value is not part
+            // of this projection; the refusal it raises is the point.
+            self.owner_lease_ref()?;
+            let binding = HostManifestBinding {
+                manifest_digest: self.approved.manifest.config_digest.as_str().to_owned(),
+                roots_digest: self.runtime_roots().roots_digest.as_str().to_owned(),
+                registry_revision: self.revision(),
+            };
+            binding.validate()?;
+            Ok(binding)
+        })();
+        match issued {
+            Ok(binding) => Ok(binding),
+            Err(error) => Err(note_prepare_error(
+                OP_OWNER_EVIDENCE,
+                "manifest_binding",
                 error,
                 0,
             )),
