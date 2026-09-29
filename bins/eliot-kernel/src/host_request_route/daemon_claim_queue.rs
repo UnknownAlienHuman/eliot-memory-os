@@ -41,19 +41,19 @@ use super::{
     check_local_read_admission,
 };
 
-/// Reports whether a campaign-packet staging candidate repeats retained work.
+/// Refuses a campaign-packet staging candidate that repeats retained work.
 ///
 /// I7.24 W3/A2: a materially repeated effect-capable call on unchanged
 /// inputs without a new expected delta is a loop/no-progress signal, not a
 /// fresh dispatch. Only campaign-packet pairs are compared; other lanes and
 /// unreconstructible pairs never match.
-fn campaign_staged_repeat_without_progress(
+fn refuse_campaign_staged_repeat(
     index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
-) -> bool {
+) -> Result<(), TransportError> {
     let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool) else {
-        return false;
+        return Ok(());
     };
     let retained = index.values().flatten().filter_map(|candidate| {
         Some((
@@ -61,7 +61,10 @@ fn campaign_staged_repeat_without_progress(
             candidate.campaign_packet_tool.as_ref()?,
         ))
     });
-    crate::tool_exposure::staged_repeat_without_progress(retained, &current).is_some()
+    if crate::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+        return Err(TransportError::IdentityConflict);
+    }
+    Ok(())
 }
 
 impl KernelComposition {
@@ -111,9 +114,7 @@ impl KernelComposition {
                 return Ok(());
             }
         }
-        if campaign_staged_repeat_without_progress(&index, envelope, tool) {
-            return Err(TransportError::IdentityConflict);
-        }
+        refuse_campaign_staged_repeat(&index, envelope, tool)?;
         let queued = index
             .values()
             .flatten()
