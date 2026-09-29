@@ -50,6 +50,14 @@
 //! `tests/legacy_facade.rs` case 26 already proves the same
 //! table/decoder agreement over all ten frozen spellings.
 //!
+//! The legacy-text admissibility rule ("blank after trimming, or carries a
+//! control character") was additionally written out at ten call sites across
+//! this crate and `legacy_adapter`. #1143 work item 4 collapsed those copies
+//! into the single crate-private owner [`is_blank_or_control`], so the rule
+//! can no longer drift into disagreeing with itself. Each site keeps its own
+//! stable `field` in [`FacadeError::EnvelopeInvalid`], so no refusal path
+//! changed. This removed no public item and added none.
+//!
 //! Removed duplicates (compile-proof; see `tests/legacy_facade.rs`):
 //! local `CueKind`/`MatchMode`/`CueStrength`, all `normalize_value*`
 //! copies, `CueKey` constructors/comparison, `CueRecord` construction and
@@ -141,12 +149,12 @@ impl LegacyEliotCuesV1Row {
             ("row.value", &self.value),
             ("row.target", &self.target),
         ] {
-            if value.trim().is_empty() || value.chars().any(char::is_control) {
+            if is_blank_or_control(value) {
                 return Err(FacadeError::EnvelopeInvalid { field });
             }
         }
         if let Some(mode) = &self.mode
-            && (mode.trim().is_empty() || mode.chars().any(char::is_control))
+            && is_blank_or_control(mode)
         {
             return Err(FacadeError::EnvelopeInvalid { field: "row.mode" });
         }
@@ -287,8 +295,21 @@ impl V1SnapshotMigration {
     }
 }
 
+/// The single owner of the legacy-text admissibility rule.
+///
+/// "Blank after trimming, or carries a control character" was written out at
+/// ten call sites across this crate and `legacy_adapter`. Each copy was a
+/// second canonicalization rule that could drift into disagreeing with the
+/// others, which is the duplication this issue removes. Every site now reads
+/// the rule from here. The `field` each site reports stays a property of that
+/// site, so no refusal path changes its stable field path, and this helper
+/// never decides membership, a target, a kind or a profile.
+pub(crate) fn is_blank_or_control(value: &str) -> bool {
+    value.trim().is_empty() || value.chars().any(char::is_control)
+}
+
 fn validate_legacy_identity(value: &str) -> Result<(), FacadeError> {
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
+    if is_blank_or_control(value) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_identity",
         });
@@ -371,7 +392,7 @@ impl V1MigrationRejection {
 /// A replay claim without the original bytes is not a closed migration. Use
 /// [`preserve_v1_row_bytes`] with the exact v1 payload instead.
 pub fn preserve_v1_row(legacy_row_id: &str) -> Result<V1RowMigration, FacadeError> {
-    if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
+    if is_blank_or_control(legacy_row_id) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",
         });
@@ -387,7 +408,7 @@ pub fn preserve_v1_row_bytes(
     legacy_row_id: &str,
     legacy_bytes: &[u8],
 ) -> Result<V1RowMigration, FacadeError> {
-    if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
+    if is_blank_or_control(legacy_row_id) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",
         });
@@ -415,7 +436,7 @@ pub fn preserve_v1_row_bytes(
 pub fn preserve_v1_snapshot(row_ids: &[String]) -> Result<V1SnapshotMigration, FacadeError> {
     if row_ids
         .iter()
-        .any(|row_id| row_id.trim().is_empty() || row_id.chars().any(char::is_control))
+        .any(|row_id| is_blank_or_control(row_id.as_str()))
     {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",
@@ -446,7 +467,7 @@ pub fn preserve_v1_snapshot_bytes(
     }
     if row_ids
         .iter()
-        .any(|row_id| row_id.trim().is_empty() || row_id.chars().any(char::is_control))
+        .any(|row_id| is_blank_or_control(row_id.as_str()))
     {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",

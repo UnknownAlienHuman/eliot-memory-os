@@ -47,14 +47,15 @@ in_package_consumers = [
 ]
 in_package_consumer_note = "Per the issue, the package itself, public type definitions without a call site, in-package unit tests and doc examples are NOT consumers. The two entries above are therefore excluded from the reverse-consumer set."
 conclusion = "Zero identified current consumers. Four items are already owned one-for-one by a verified current cell or are pure re-exports of an owner (migrate); the remainder have no consumer and no owner to preserve them (delete)."
+reverified_at = "e47a5eda (origin/main, 2026-09-28), after rebasing onto the merge of PR #3902. `git grep -n 'eliot_dreamer_core' -- crates bins` filtered outside this package still returns zero production call sites; the surviving hits are this package's own ledgers, the generated serde registry, `crates/smart/cognitive-donor-map.toml`, ten owner donor anchors pointing at the legacy path, and `crates/governor/eliot-governor/src/migration_inventory.rs` which records the package with `ComponentDisposition::Unknown` and explicitly infers no retirement."
 
 [counts]
-public_items = 37
+public_items = 39
 migrate = 4
 bounded_fixture = 0
-delete = 33
-removed_in_work_item_4 = 8
-denominator_basis = "Exhaustive enumeration of unrestricted `pub` items in crates/smart/eliot-dreamer-core/src/{lib.rs,advice_gate.rs}, excluding `pub(crate)` items, `#[cfg(test)]` modules and the package name itself, per the issue's non-consumer exclusions. The eight `advice_gate` items re-exported by lib.rs are counted once each at their definition site."
+delete = 35
+removed_in_work_item_4 = 10
+denominator_basis = "Exhaustive enumeration of unrestricted `pub` items in crates/smart/eliot-dreamer-core/src/{lib.rs,advice_gate.rs}, excluding `pub(crate)` items, `#[cfg(test)]` modules and the package name itself, per the issue's non-consumer exclusions. The eight `advice_gate` items re-exported by lib.rs are counted once each at their definition site. The prior turn's count of 37 was NOT exhaustive: it omitted `AdviceGate::candidates` and `AdviceGate::candidate`, two `pub` read accessors. Work item 4 removed them, and the two rows are recorded below, so the enumeration is exhaustive at 39 for the first time."
 bounded_fixture_zero_reason = "The issue defines a bounded fixture as retained 'only for an identified current consumer'. No current consumer was identified, so no item can honestly qualify. Recording a fixture row would be fabricated retention authority."
 work_item_4_removed_set = [
   "CONTRACT_NAME",
@@ -65,9 +66,12 @@ work_item_4_removed_set = [
   "Requester",
   "PrivacyClass",
   "DreamBudget (+ DreamBudget::validate)",
+  "AdviceGate::candidates",
+  "AdviceGate::candidate",
   "DreamerError::InvalidText / ::TooMany / ::MissingLineage / ::InvalidFence (bound-error variants; not `pub` items, they were the error face of the four deleted bound owners above and had zero construction sites)",
 ]
-work_item_4_removal_rule = "A `delete` row was executed only when all three held: (1) its named current owner already carries the behaviour in admitted source, (2) its measured production call-site set is empty (`git grep` over crates/bins finds no reference outside this package, and the package has zero Cargo reverse-dependents), and (3) removing it cannot drop a proof, because the only reader was a fixture assertion about the duplicate itself. The 25 remaining `delete` rows fail at least one of those tests and are recorded, not executed; each names its blocker below."
+work_item_4_removed_rule = "A `delete` row was executed only when all three held: (1) its named current owner already carries the behaviour in admitted source, or the item is a second way to observe state an owner of that same state already returns and has no behaviour of its own, (2) its measured production call-site set is empty (`git grep` over crates/bins finds no reference outside this package, and the package has zero Cargo reverse-dependents), and (3) removing it cannot drop a proof, because the only reader was a fixture assertion about the duplicate itself. The 25 remaining `delete` rows fail at least one of those tests and are recorded, not executed; each names its blocker below."
+work_item_4_duplicate_canonicalization_2026_09_28 = "The advice-text whitespace fold (`split_whitespace().collect::<Vec<_>>().join(\" \")`) was implemented twice in src/advice_gate.rs: once inside `AdviceGate::propose` for every discriminator and once inside `normalise_statement` for the hypothesis key. Both copies now read one private owner, `fold_whitespace`. Case folding stayed on the hypothesis-key path alone, so `AdviceGate::record_failure` still accumulates case-significant discriminator identity verbatim. This removed no public item, added none, and changed no wire value."
 
 [metadata_references_to_close_before_any_delete]
 # Work item 6 owns the actual removal. Measured 2026-09-27 at a318023b.
@@ -83,12 +87,10 @@ shipped_serde_boundary_rows = [
   "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:OwnerDecision:80",
   "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:CandidateArtifact:303",
   "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:CandidateKind:202",
-  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:DreamBudget:235",
   "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:DreamPacket:321",
   "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:PreservationReport:288",
-  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:PrivacyClass:226",
-  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:Requester:191",
 ]
+shipped_serde_boundary_rows_note_2026_09_28 = "Corrected against the registry. The prior turn removed the `lib.rs:DreamBudget:235`, `lib.rs:PrivacyClass:226` and `lib.rs:Requester:191` rows by hand (merged to main as PR #3902, commit e47a5eda) but this list was not corrected with them, so it named three rows that no longer exist. `git grep -n 'id = \"eliot-dreamer-core' -- crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml` now returns exactly the 11 rows listed above. The two advice_gate accessors removed this turn were not `pub` types and owned no registry row, so removing them orphans nothing."
 donor_map_rows = [
   "crates/smart/cognitive-donor-map.toml:41 [[donor]] crates/smart/eliot-dreamer-core",
 ]
@@ -112,15 +114,15 @@ generated_doc_indexes = ["docs/code-navigation/PACKAGE_DOCS_INDEX.md", "docs/cod
 generated_serde_registry = "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
 
 [removal_precondition]
-statement = "Work item 4 removed the eight duplicate owners listed in `[counts].work_item_4_removed_set`. The 25 remaining `delete` rows are recorded, not executed, because each still fails at least one test in `[counts].work_item_4_removal_rule`."
-blocking_residue = "Root `Cargo.toml:113` member line, the `Cargo.lock` own-entry, the shipped-serde-boundary rows for the eight removed types, and the whole package removal itself. No consumer has migrated (work item 5 found zero production call sites), so the package is still a workspace member and #1100/#11 still cannot run with aggregate fallback disabled."
+statement = "Work item 4 removed the ten public duplicate owners listed in `[counts].work_item_4_removed_set` (plus the four `DreamerError` bound-error variants, which were never `pub` items) and collapsed two duplicated canonicalization rules into one owner each. The 25 remaining `delete` rows are recorded, not executed, because each still fails at least one test in `[counts].work_item_4_removal_rule`."
+blocking_residue = "Root `Cargo.toml:113` member line, the `Cargo.lock` own-entry, the 11 shipped-serde-boundary rows listed above, and the whole package removal itself. No consumer has migrated (work item 5 found zero production call sites, re-verified at origin/main e47a5eda), so the package is still a workspace member and #1100/#11 still cannot run with aggregate fallback disabled."
 separate_issues = "work items 4 (duplicate owners), 5 (consumer-edge migration) and 6 (residue removal) of #1143; #1924 owns the advice change-control gate acceptance."
 
 # ------------------------------------------------- CrateExtractionDecision ---
 
 [extraction_decision]
 affected_functional_cells_and_lifecycle_owners = "None declared by this package. Contract shapes are owned by smart.dreamer.contracts (A-03); assembly by smart.dreamer.bundle (A-04); validation by smart.dreamer.candidate_validation (A-05); the kind families and 13 typed handler cells by smart.dreamer.curation and the A-21..A-31 handlers. The advice change-control gate has no admitted current cell — see blocked_items below."
-current_source_dependency_and_change_closure = "src/lib.rs (739 lines) and src/advice_gate.rs (444 lines). Depends only on eliot-dreamer-contracts, eliot-contracts, blake3, schemars, serde, serde_json, thiserror. Change closure is the package plus the generated serde registry and ten owner donor anchors."
+current_source_dependency_and_change_closure = "src/lib.rs (637 lines) and src/advice_gate.rs (455 lines). Depends only on eliot-dreamer-contracts, eliot-contracts, blake3, schemars, serde, serde_json, thiserror. Change closure is the package plus the generated serde registry and ten owner donor anchors."
 proposed_package_boundary = "None new. The remaining body is a candidate-only generator, a set of superseded duplicate shapes and an unadmitted advice gate; none is a new capability boundary."
 public_contract_and_independent_test_entrypoint = "mod differential_1143 (EDGE-DRM-1143, three fixtures) and mod advice_gate_1924 (issue #1924 acceptance). Both are in-package fixtures and are explicitly not consumers."
 first_real_consumer_or_time_bounded_migration_facade = "Time-bounded migration facade with no first real consumer. Measured reverse-dependency set is empty. Three items (JobClass, DreamJobInput, ModelDraft) are already re-exports of eliot-dreamer-contracts, so the facade is a re-export surface plus one generator rather than a second contract owner."
@@ -430,6 +432,26 @@ current_owner = "none admitted"
 owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:144 — the only mutable state in either package (a private BTreeMap<String, NegativeMemoryEntry>); `git grep -n '&mut self' -- crates/smart/eliot-{cues,dreamer-core}/src` returns exactly three hits, all inside this impl block"
 basis = "The single mutable-state owner across both aggregate packages. It is unadmitted, in-memory, non-durable and never persisted, so it is not a second canonical state owner, but it is the one item whose deletion would remove real behaviour rather than only duplicated shape."
 removal_condition = "Only after the advice change-control duty has an admitted current owner. Recorded, not removed."
+
+[[item_disposition]]
+item = "AdviceGate::candidates"
+kind = "method"
+disposition = "removed"
+current_owner = "AdviceGate::propose / AdviceGate::record_owner_decision / AdviceGate::record_verifier_outcome return values"
+owner_package = "eliot-dreamer-core"
+owner_evidence = "Removed from crates/smart/eliot-dreamer-core/src/advice_gate.rs in #1143 work item 4 (branch refactor/1143-duplicate-owner-removal-W22). `git grep -n '\\.candidates()' -- crates bins` returns zero hits on this type (the only `.candidates()`/`.candidate(` hits in the workspace are unrelated types in eliot-agent-claude, eliot-context-admission and eliot-context-contracts)."
+basis = "A second way to observe the gate's own private candidate ledger, with no reader. The prior turn's inventory claimed to be exhaustive at 37 public items and omitted this item entirely, so it was never dispositioned. It is not a state, contract, canonicalization, activation, handler, routing or policy owner: it returns a reference to a `BTreeMap` the same impl block writes, and every committed record is already handed back by the mutator that committed it. Under `[counts].work_item_4_removal_rule` clauses 2 and 3 it qualified (empty call-site set, no fixture assertion lost); clause 1 holds because the mutator return values, not this accessor, are the read path the module already relies on."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. The mutator return values are the only read path for a committed candidate record."
+
+[[item_disposition]]
+item = "AdviceGate::candidate"
+kind = "method"
+disposition = "removed"
+current_owner = "AdviceGate::propose / AdviceGate::record_owner_decision / AdviceGate::record_verifier_outcome return values"
+owner_package = "eliot-dreamer-core"
+owner_evidence = "Removed from crates/smart/eliot-dreamer-core/src/advice_gate.rs in #1143 work item 4 (branch refactor/1143-duplicate-owner-removal-W22). `git grep -n '\\.candidate(' -- crates/smart/eliot-dreamer-core` returns zero hits."
+basis = "The by-key single-record form of the same uncalled read surface, omitted from the prior turn's inventory for the same reason as `AdviceGate::candidates`. It owned no behaviour: a state-transition check never consults the map (every transition validates the record the caller passed in), so the map is written-only apart from this accessor and the serde snapshot."
+removal_condition = "Satisfied 2026-09-28: removed in work item 4. No read path over the committed ledger remains other than the mutator return values and the serde snapshot."
 
 [[item_disposition]]
 item = "AdviceGate::new"
