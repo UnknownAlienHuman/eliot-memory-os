@@ -588,100 +588,97 @@ impl RedbJournalBackend {
             .database
             .begin_read()
             .map_err(|_| BackendError::Unavailable)?;
-        match read_profile_binding(&read)? {
-            Some(stored) => {
-                if stored.matches_current_selection(selection)? {
-                    return Ok(());
-                }
-                Err(BackendError::Unavailable)
+        if let Some(stored) = read_profile_binding(&read)? {
+            if stored.matches_current_selection(selection)? {
+                return Ok(());
             }
-            None => {
-                drop(read);
-                let snapshot = self.snapshot()?;
-                if !snapshot.epochs.is_empty()
-                    || !snapshot.prepared.is_empty()
-                    || !snapshot.receipts.is_empty()
+            Err(BackendError::Unavailable)
+        } else {
+            drop(read);
+            let snapshot = self.snapshot()?;
+            if !snapshot.epochs.is_empty()
+                || !snapshot.prepared.is_empty()
+                || !snapshot.receipts.is_empty()
+            {
+                return Err(BackendError::Unavailable);
+            }
+            let encoded = encode_bounded(
+                &StoredUserProfileBinding::new(selection)?,
+                MAX_METADATA_BYTES,
+            )?;
+            let write = self
+                .database
+                .begin_write()
+                .map_err(|_| BackendError::Unavailable)?;
+            {
+                let epochs = write
+                    .open_table(EPOCHS)
+                    .map_err(|_| BackendError::Unavailable)?;
+                if epochs
+                    .iter()
+                    .map_err(|_| BackendError::Unavailable)?
+                    .next()
+                    .is_some()
                 {
                     return Err(BackendError::Unavailable);
                 }
-                let encoded = encode_bounded(
-                    &StoredUserProfileBinding::new(selection)?,
-                    MAX_METADATA_BYTES,
-                )?;
-                let write = self
-                    .database
-                    .begin_write()
-                    .map_err(|_| BackendError::Unavailable)?;
-                {
-                    let epochs = write
-                        .open_table(EPOCHS)
-                        .map_err(|_| BackendError::Unavailable)?;
-                    if epochs
-                        .iter()
-                        .map_err(|_| BackendError::Unavailable)?
-                        .next()
-                        .is_some()
-                    {
-                        return Err(BackendError::Unavailable);
-                    }
-                }
-                {
-                    let prepared = write
-                        .open_table(PREPARED)
-                        .map_err(|_| BackendError::Unavailable)?;
-                    if prepared
-                        .iter()
-                        .map_err(|_| BackendError::Unavailable)?
-                        .next()
-                        .is_some()
-                    {
-                        return Err(BackendError::Unavailable);
-                    }
-                }
-                {
-                    let receipts = write
-                        .open_table(RECEIPTS)
-                        .map_err(|_| BackendError::Unavailable)?;
-                    if receipts
-                        .iter()
-                        .map_err(|_| BackendError::Unavailable)?
-                        .next()
-                        .is_some()
-                    {
-                        return Err(BackendError::Unavailable);
-                    }
-                }
-                {
-                    let payloads = write
-                        .open_table(PAYLOADS)
-                        .map_err(|_| BackendError::Unavailable)?;
-                    if payloads
-                        .iter()
-                        .map_err(|_| BackendError::Unavailable)?
-                        .next()
-                        .is_some()
-                    {
-                        return Err(BackendError::Unavailable);
-                    }
-                }
-                {
-                    let mut table = write
-                        .open_table(USER_PROFILE_BINDINGS)
-                        .map_err(|_| BackendError::Unavailable)?;
-                    if table
-                        .iter()
-                        .map_err(|_| BackendError::Unavailable)?
-                        .next()
-                        .is_some()
-                    {
-                        return Err(BackendError::Conflict);
-                    }
-                    table
-                        .insert(USER_PROFILE_BINDING_KEY, encoded.as_slice())
-                        .map_err(|_| BackendError::Unavailable)?;
-                }
-                commit_write(write)
             }
+            {
+                let prepared = write
+                    .open_table(PREPARED)
+                    .map_err(|_| BackendError::Unavailable)?;
+                if prepared
+                    .iter()
+                    .map_err(|_| BackendError::Unavailable)?
+                    .next()
+                    .is_some()
+                {
+                    return Err(BackendError::Unavailable);
+                }
+            }
+            {
+                let receipts = write
+                    .open_table(RECEIPTS)
+                    .map_err(|_| BackendError::Unavailable)?;
+                if receipts
+                    .iter()
+                    .map_err(|_| BackendError::Unavailable)?
+                    .next()
+                    .is_some()
+                {
+                    return Err(BackendError::Unavailable);
+                }
+            }
+            {
+                let payloads = write
+                    .open_table(PAYLOADS)
+                    .map_err(|_| BackendError::Unavailable)?;
+                if payloads
+                    .iter()
+                    .map_err(|_| BackendError::Unavailable)?
+                    .next()
+                    .is_some()
+                {
+                    return Err(BackendError::Unavailable);
+                }
+            }
+            {
+                let mut table = write
+                    .open_table(USER_PROFILE_BINDINGS)
+                    .map_err(|_| BackendError::Unavailable)?;
+                if table
+                    .iter()
+                    .map_err(|_| BackendError::Unavailable)?
+                    .next()
+                    .is_some()
+                {
+                    return Err(BackendError::Conflict);
+                }
+                table
+                    .insert(USER_PROFILE_BINDING_KEY, encoded.as_slice())
+                    .map_err(|_| BackendError::Unavailable)?;
+            }
+            commit_write(write)
         }
     }
 
