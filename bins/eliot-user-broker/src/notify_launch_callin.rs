@@ -398,15 +398,15 @@ pub fn request_names_notify_image(request: &eliot_user_broker_core::LaunchReques
 /// principal is deliberately NOT a wire field. I11.3:13 places the
 /// acknowledging act in the Human's hands, so the identity recorded on the
 /// canonical record is the principal this broker admitted and proved, never
-/// caller-supplied text. This struct mints no authority: the transition itself
-/// is applied and re-validated on the admitted Kernel route inside the spawned
-/// adapter, and the acknowledgement deliberately leaves the record unresolved
-/// (I11.7:5).
+/// caller-supplied text. This struct mints no authority: the canonical
+/// transition itself is owned by `eliotd` (issue #1780, A2), never by this
+/// edge or by any spawned adapter, and the acknowledgement deliberately
+/// leaves the record unresolved (I11.7:5).
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifyAcknowledge {
-    /// The notification record being acknowledged. The adapter resolves its
-    /// canonical store binding from this, so it is the same request the
+    /// The notification record being acknowledged. The owning route resolves
+    /// its canonical store binding from this, so it is the same request the
     /// delivery leg was issued against.
     pub parent: NotificationRequest,
     /// The exact canonical notification handle recorded on that request.
@@ -425,8 +425,8 @@ pub struct NotifyAcknowledge {
 ///
 /// `principal` is the authenticated principal the broker admitted for this
 /// request. It is the only actor the record can name, and it travels as record
-/// data: the acknowledged transition is applied and re-validated on the admitted
-/// Kernel route inside the adapter, not by this line.
+/// data: the canonical transition is applied by the owning `eliotd` route
+/// (issue #1780, A2), not by this line and not inside any spawned adapter.
 ///
 /// The trailing newline is the line-protocol frame the adapter's
 /// [`eliot_notify::parse_notify_stdin_request`] reader expects; the carriage in

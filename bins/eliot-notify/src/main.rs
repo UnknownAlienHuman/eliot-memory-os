@@ -238,16 +238,20 @@ fn main() {
                 Err(error) => composition_error(error.to_string()),
             }
         }
-        Ok(NotifyStdinRequest::Acknowledge {
-            parent,
-            notification_id,
-            principal,
-        }) => match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
-            Ok(mut composition) => {
-                dispatch_acknowledge(&mut composition, &parent, notification_id, principal)
-            }
-            Err(error) => composition_error(error.to_string()),
-        },
+        Ok(NotifyStdinRequest::Acknowledge { .. }) => {
+            // The acknowledgement leg is owned by `eliotd` (issue #1780, A2):
+            // this broker-spawned adapter is never the canonical owner
+            // (I11.6:19), and its direct frame reaches the store only through
+            // a dead route — the surface selector is admitted by no
+            // `frame_dispatch.rs` predicate, and the serving arm requires the
+            // daemon session. Opening the Kernel front door here would mint a
+            // second ungoverned owner path (A0.3), so the admitted line is
+            // refused with the owner named instead of attempted.
+            composition_error(
+                "canonical notification acknowledgement is owned by eliotd; this adapter performs no canonical write"
+                    .to_owned(),
+            )
+        }
         Ok(NotifyStdinRequest::Resolve {
             parent,
             notification_id,
@@ -523,21 +527,6 @@ fn is_provider_rejection(response: &Response) -> bool {
             *code == NOTIFICATION_PROVIDER_REJECTED
         }
         _ => false,
-    }
-}
-
-/// Records one operator acknowledgement through the same authenticated Kernel
-/// route as the create/coalesce and delivery legs, and answers with the
-/// owner's committed record so the caller sees the record is still unresolved.
-fn dispatch_acknowledge(
-    composition: &mut NotificationComposition,
-    parent: &NotificationRequest,
-    notification_id: PlatformHandle,
-    principal: String,
-) -> Response {
-    match composition.acknowledge_notification(parent, notification_id, principal) {
-        Ok(state) => canonical_state_response(state),
-        Err(error) => notify_error(&error),
     }
 }
 

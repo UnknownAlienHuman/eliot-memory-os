@@ -88,11 +88,12 @@ enum Request {
     /// line itself.
     ///
     /// The acknowledging act is a Human role action (I11.3:13) and the
-    /// principal is record data, not authority: the transition is applied and
-    /// re-validated on the admitted Kernel route inside the adapter, and the
+    /// principal is record data, not authority: the admitted triple is
+    /// validated but no child is spawned and no canonical write is performed
+    /// here — the transition is owned by `eliotd` (issue #1780, A2) — and the
     /// record stays unresolved (I11.7:5). The same `admit_human_state_change`
     /// and the same notify-image binding gate as delivery apply before
-    /// anything is dispatched.
+    /// anything is answered.
     ///
     /// The acknowledged record's identity travels as typed fields and never as
     /// caller bytes: the acknowledged principal is deliberately NOT a wire
@@ -107,8 +108,10 @@ enum Request {
     ///
     /// Acknowledgement suppresses repeated toast, not the problem: the record
     /// stays unresolved and a critical item stays on the board
-    /// (I11.7:5-6), and the admitted Kernel route re-validates the transition
-    /// before the store applies it.
+    /// (I11.7:5-6). The admitted triple is answered here with an explicit
+    /// non-completion until the acknowledgement intake lane forwards it to
+    /// the owning `eliotd` route; no launch receipt is issued for a write
+    /// this broker cannot perform.
     NotifyAcknowledge {
         request: LaunchRequest,
         acknowledgement: NotifyAcknowledge,
