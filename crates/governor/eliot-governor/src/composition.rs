@@ -105,9 +105,10 @@ use eliot_workscope::{
     OnboardingSingleFlight, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
     ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
     ResolutionRequest, ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
-    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
-    TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeBindingGuardReceipt,
+    ScopeIdentity, ScopeKind, ScopeQuarantineReceipt, ScopeRelocationOrAttachReceipt,
+    ScopeResolution, SourceAdmissionRequest, TaskBindingInput, TaskBindingState,
+    TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
     WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
     WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
@@ -1012,6 +1013,21 @@ pub enum CompositionError {
     ScopeObservationAmbiguous {
         trigger: GuardTrigger,
         observed_instances: usize,
+    },
+    /// A scope-identity conflict the durable `WorkScope` owner has not
+    /// resolved blocks memory reuse for that scope (issue #1787, W5/AUD4).
+    ///
+    /// The count and triggers come from the owner's own retained section, so
+    /// the refusal names real evidence rather than a boolean. Resolution needs
+    /// the explicit authorized rebind path, never a write against the
+    /// observed root.
+    #[error(
+        "scope {scope_ref} retains {unresolved} unresolved scope-identity conflict(s) at triggers {triggers:?}; project memory reuse is withheld"
+    )]
+    ScopeQuarantineUnresolved {
+        scope_ref: String,
+        unresolved: usize,
+        triggers: Vec<GuardTrigger>,
     },
     /// A startup transition was attempted out of order.
     #[error("startup order violation: expected {expected}, observed {observed}")]
@@ -3637,13 +3653,32 @@ pub enum CompositionReadiness {
     Stopped,
 }
 
-/// Bound on the in-process scope-quarantine projection retained by
-/// [`GovernorComposition`] (issue #1787, W6). A later mismatch must not
-/// silently discard an earlier unresolved conflict, so mismatches accumulate
-/// up to this bound instead of overwriting one slot; the bound itself keeps
-/// the projection from growing without owner storage. Durable quarantine with
-/// restart recovery still belongs to the `WorkScope` owner path.
-const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
+/// Bound on the in-process scope-quarantine PROJECTION retained by
+/// [`GovernorComposition`] (issue #1787, W6/AUD5).
+///
+/// This is not the durable bound: the owner enforces
+/// [`eliot_workscope::MAX_UNRESOLVED_SCOPE_QUARANTINE`] on the persisted
+/// section, and this projection is rebuilt from the owner on recovery. It
+/// exists so one process cannot accumulate an unbounded diagnostic mirror
+/// while the owner is being written through; because the owner bound is the
+/// same size, the projection never hides an owner-retained record.
+const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize =
+    eliot_workscope::MAX_UNRESOLVED_SCOPE_QUARANTINE;
+
+/// One entry of the in-process quarantine projection: the conflicting-evidence
+/// record together with the owner-issued write receipt that admitted it.
+///
+/// The receipt is retained so a withheld operation can be reconciled against
+/// owner state through
+/// [`WorkScopeBindingOwner::readback_scope_quarantine`] instead of trusting
+/// this process's memory. The pair is never a durability proof on its own.
+#[derive(Clone, Debug)]
+pub struct ScopeQuarantineEntry {
+    /// The conflicting-identity evidence the owner retained.
+    pub record: QuarantinedScopeRecord,
+    /// The owner-issued write receipt for that record.
+    pub receipt: ScopeQuarantineReceipt,
+}
 
 /// One daemon-owned Governor composition. There is no second provider or
 /// process executor hidden behind this value.
@@ -3651,7 +3686,10 @@ const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
 /// The in-process scope-quarantine projection below keeps at most
 /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`] records (one per mandatory
 /// trigger plus margin); older records evict first. It is a diagnostic
-/// projection only, never durable owner state.
+/// projection of the durable `WorkScope` owner's retained conflicts, never the
+/// authority: admission reads the owner through
+/// [`Self::scope_quarantine_history`] and
+/// [`Self::admit_project_memory_reuse`].
 pub struct GovernorComposition<P: ?Sized> {
     kernel: Arc<P>,
     /// Retained P-07 authority port. `None` means diagnosed degradation
@@ -3683,17 +3721,17 @@ pub struct GovernorComposition<P: ?Sized> {
     /// cold-start legs below coalesces on exact workspace identity, privacy
     /// boundary and governing-source generation.
     cold_start: OnboardingSingleFlight,
-    /// Bounded in-process diagnostic projection of scope-identity mismatches
-    /// (issue #1787, W6 partial projection). Newest record is last; a later
-    /// mismatch appends instead of overwriting, up to
-    /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`] records, so one unresolved
-    /// conflict cannot silently discard another. This is not durable,
-    /// rehydrated, or an authority for rebind: durable quarantine with an
-    /// owner-issued write/readback receipt and restart recovery belongs to
-    /// the `WorkScope` owner path. Read the latest with
-    /// [`Self::last_scope_quarantine`]; read the full bounded history with
-    /// [`Self::scope_quarantine_history`].
-    scope_quarantine: Vec<QuarantinedScopeRecord>,
+    /// Bounded in-process read-model of the durable `WorkScope` owner's
+    /// unresolved scope-identity conflicts (issue #1787, W6/AUD1/AUD3).
+    ///
+    /// This is a CACHE AND PROJECTION of owner state, never the authority:
+    /// the owner-issued receipt travels with each entry, nothing here admits a
+    /// scope or authorizes a rebind, and the whole vector is rebuilt from the
+    /// recovered owner on every construction and refresh. It exists so an
+    /// operator can see what this process already handed to the owner without
+    /// a second store. The durable, rehydrated, restart-surviving record is
+    /// [`eliot_workscope::WorkScopeBindingSnapshot::unresolved_quarantine`].
+    scope_quarantine: Vec<ScopeQuarantineEntry>,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -4559,45 +4597,111 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(job)
     }
 
-    /// Returns the latest process-local scope-identity mismatch projection
-    /// (issue #1787). It is not durable and is lost when this composition is
-    /// dropped or restarted.
+    /// Returns the latest scope-identity conflict the DURABLE `WorkScope`
+    /// owner retains (issue #1787).
     ///
-    /// `None` means no mismatch has been observed since construction. The
-    /// retained binding is never replaced by this record.
-    #[must_use]
-    pub fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
-        self.scope_quarantine.last()
-    }
-
-    /// Returns the bounded in-process quarantine history with authenticated
-    /// readback (issue #1787, AUD3 readback leg).
-    ///
-    /// Every returned record was built through
-    /// [`QuarantinedScopeRecord::for_report`] and
-    /// [`QuarantinedScopeRecord::validate`] at retention; this read
-    /// re-validates each record through the same existing validator so a
-    /// corrupt projection fails here instead of reaching a rebind decision.
-    /// An empty history means no mismatch has been observed since
-    /// construction (unavailable, not committed). This is not durable, not
-    /// rehydrated, and never an authority for rebind: committed,
-    /// possible-commit, and retired states belong to the durable `WorkScope`
-    /// owner path. The STITCH consumer is the future rebind/recovery
-    /// reconciliation.
+    /// This reads the recovered owner section, not the in-process projection,
+    /// so a conflict recorded before a restart is still reported after it and
+    /// a conflict recorded in another process is not hidden. `None` means the
+    /// owner retains no conflict. The retained binding is never replaced by
+    /// what is returned.
     ///
     /// # Errors
     ///
-    /// Returns [`CompositionError::Recovery`] when any retained record fails
-    /// its existing validation.
-    pub fn scope_quarantine_history(&self) -> Result<&[QuarantinedScopeRecord], CompositionError> {
-        for record in &self.scope_quarantine {
-            record.validate().map_err(|error| {
-                CompositionError::Recovery(format!(
-                    "retained scope quarantine history is corrupt: {error}"
-                ))
-            })?;
+    /// Returns [`CompositionError::Recovery`] when the owner is unbound or not
+    /// readable at the retained fence, or when a retained record fails its own
+    /// existing validation.
+    pub fn last_scope_quarantine(&self) -> Result<Option<&QuarantinedScopeRecord>, CompositionError> {
+        Ok(self
+            .retained_work_scope_quarantine()?
+            .last()
+            .map(|record| record))
+    }
+
+    /// Returns the owner-issued disposition of one scope-quarantine operation
+    /// by an authenticated readback against the durable owner
+    /// (issue #1787, AUD3).
+    ///
+    /// This is the read half of the owner-issued write receipt: the receipt
+    /// returned when the record was retained names the operation, and this
+    /// asks the owner what it now holds for that operation. The states are the
+    /// owner's own — `Committed`, `PossibleCommit`, `Unavailable`, `Corrupt`,
+    /// `Retired` — and are never inferred from the absence of a later
+    /// observation. A retained record is re-validated through its own
+    /// `validate()` rather than re-derived.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] when the owner is unbound or the
+    /// state fence is malformed.
+    pub fn scope_quarantine_disposition(
+        &self,
+        operation_id: &str,
+    ) -> Result<ScopeQuarantineReceipt, CompositionError> {
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; no quarantine operation can be read back".to_owned(),
+            )
+        })?;
+        owner
+            .readback_scope_quarantine(&fence, operation_id)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Returns the bounded unresolved scope-identity conflicts the DURABLE
+    /// `WorkScope` owner retains, each re-validated through its own existing
+    /// validator (issue #1787, AUD3 readback leg).
+    ///
+    /// The owner is the authority: an empty result means the owner retains no
+    /// conflict, and a record that fails validation fails this read rather than
+    /// reaching a rebind decision. This is never an authority for rebind — an
+    /// authorized relocation still needs its explicit owner receipt through
+    /// [`Self::admit_scope_relocation`]. The in-process
+    /// [`Self::scope_quarantine_projection`] is a diagnostic mirror of what
+    /// this process already handed the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] when the owner is unbound, is not
+    /// readable at the retained fence, or retains a record that fails its
+    /// existing validation.
+    pub fn scope_quarantine_history(
+        &self,
+    ) -> Result<&[QuarantinedScopeRecord], CompositionError> {
+        self.retained_work_scope_quarantine()
+    }
+
+    /// Returns the in-process projection of conflicts this composition already
+    /// handed to the durable owner (issue #1787, AUD5).
+    ///
+    /// This is a cache and a diagnostic view, never the authority and never a
+    /// durability proof: it is rebuilt from the recovered owner on every
+    /// construction and refresh, and nothing consults it for admission. Use
+    /// [`Self::scope_quarantine_history`] for owner state.
+    #[must_use]
+    pub fn scope_quarantine_projection(&self) -> &[ScopeQuarantineEntry] {
+        &self.scope_quarantine
+    }
+
+    /// Reads the owner's retained section through the same fence-checked path
+    /// admission uses, so a reader can never see a section the guard would not.
+    fn retained_work_scope_quarantine(
+        &self,
+    ) -> Result<&[QuarantinedScopeRecord], CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
         }
-        Ok(&self.scope_quarantine)
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; no quarantine state is retained".to_owned(),
+            )
+        })?;
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(&snapshot.unresolved_quarantine)
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -5403,9 +5507,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `Allow` with a full `MATCHED` receipt). Any other report withholds
     /// with the structured [`CompositionError::ScopeGuardWithheld`] carrying
     /// the exact trigger report; an identity mismatch is additionally
-    /// retained in the bounded process-local diagnostic projection before
-    /// withholding. The retained binding, task state, and project memory
-    /// are untouched on any failure.
+    /// retained in the DURABLE `WorkScope` owner (and mirrored into the bounded
+    /// in-process projection) before withholding, through
+    /// [`Self::push_scope_quarantine_record`]. The retained binding, task
+    /// state, and project memory are untouched on any failure.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     pub fn require_scope_guard_for_observed(
@@ -5617,6 +5722,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the fence generation, so the same operation is admitted afterwards
     /// only with that instance identity and generation fence. Anything else
     /// fails without touching the retained binding.
+    ///
+    /// An incoming owner is MERGED with the RETAINED owner's unresolved
+    /// quarantine rather than replacing it: a conflict the previous binding
+    /// never resolved stays on the persisted section, so an authorized rebind
+    /// cannot silently discard the evidence that motivated it. Merge is by
+    /// the stable operation identity (content), oldest-first within each
+    /// owner's own persisted order, and the union is then held to the SAME
+    /// owner bound with oldest-first eviction — an over-long union is never
+    /// admitted, and eviction is bounded retention, not resolution. The
+    /// in-process projection is cleared because it is rebuilt from the owner;
+    /// a cleared projection never means a cleared owner.
     pub fn install_admitted_work_scope_owner(
         &mut self,
         owner: WorkScopeBindingOwner,
@@ -5625,6 +5741,45 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
+        let incoming = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        // Union the two owners' sections, retained (older) first so the result
+        // stays in oldest-first order, keyed on the stable operation identity.
+        let mut merged: Vec<QuarantinedScopeRecord> = Vec::new();
+        let retained = self.owners.work_scope.as_ref();
+        let retained_records: &[QuarantinedScopeRecord] = match retained {
+            Some(retained) => retained.unresolved_quarantine(),
+            None => &[],
+        };
+        for record in retained_records.iter().chain(owner.unresolved_quarantine()) {
+            let key = record
+                .operation_identity()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?
+                .1;
+            let already_present = merged.iter().any(|existing| {
+                existing
+                    .operation_identity()
+                    .is_ok_and(|(_, existing_key)| existing_key == key)
+            });
+            if !already_present {
+                merged.push(record.clone());
+            }
+        }
+        if merged.len() > MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
+            let excess = merged.len() - MAX_RETAINED_SCOPE_QUARANTINE_RECORDS;
+            merged.drain(..excess);
+        }
+        let merged = WorkScopeBindingSnapshot::from_parts(
+            incoming.state_fence,
+            incoming.owner_revision,
+            incoming.binding,
+            incoming.guard_receipt,
+            merged,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let owner = WorkScopeBindingOwner::new(merged)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let snapshot = owner
             .read_current(&fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -5636,31 +5791,101 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         self.owners.work_scope = Some(owner);
+        self.scope_quarantine.clear();
         Ok(snapshot)
     }
 
-    /// Retains one scope-identity mismatch in the bounded in-process
-    /// diagnostic projection (issue #1787, W6 partial projection).
+    /// Admits project-specific memory reuse for the retained scope only when
+    /// the binding guard is `MATCHED` at the current fence and the durable
+    /// owner retains no unresolved scope-identity conflict
+    /// (issue #1787, W5).
     ///
-    /// Builds the [`QuarantinedScopeRecord`] for `report` through its
-    /// existing constructor and validator, then appends it instead of
-    /// overwriting: a record whose stable idempotency identity is already
-    /// retained adds no new evidence, anything else appends with
-    /// oldest-first eviction at
-    /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`]. The retained binding,
-    /// task state, and project memory stay untouched. Construction or
-    /// identity failure is never silent: it fails closed here so the
+    /// This is the guard at the memory-reuse boundary. A scope-identity
+    /// conflict that is still unresolved is fail-closed evidence: reusing
+    /// project memory under it would transfer task state or project memory to
+    /// an observed root that has not been proven to be the bound one, which is
+    /// exactly the silent transfer the retention rules forbid.
+    ///
+    /// The returned receipt is the OWNER'S OWN retained `MATCHED` guard
+    /// receipt, returned as-is. No verdict is synthesized here: the owner's
+    /// `read_current` already refuses any snapshot whose receipt is not
+    /// `Matched` or whose fence is not the live one, so re-deriving an
+    /// `Allow` from a comparison against itself would replace that proof with
+    /// a shape check. The unresolved check reads the retained section
+    /// directly through [`WorkScopeBindingOwner::has_unresolved_quarantine`]
+    /// rather than inferring it from the absence of a fresh receipt.
+    ///
+    /// `scope_ref` is the scope the memory is addressed to and must equal the
+    /// retained binding's scope reference; it never selects a candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not
+    /// ready, [`CompositionError::Recovery`] when the owner is unbound or not
+    /// readable at the retained fence, and
+    /// [`CompositionError::ScopeQuarantineUnresolved`] when the address names
+    /// another scope or the owner retains any unresolved conflict, carrying
+    /// the exact count and triggers.
+    pub fn admit_project_memory_reuse(
+        &self,
+        scope_ref: &str,
+    ) -> Result<ScopeBindingGuardReceipt, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; project memory reuse is unavailable".to_owned(),
+            )
+        })?;
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        ensure_snapshot_fresh(&snapshot, "project memory reuse WorkScope is not fresh")?;
+        if scope_ref != snapshot.binding.scope.scope_ref.as_str()
+            || owner.has_unresolved_quarantine()
+        {
+            return Err(CompositionError::ScopeQuarantineUnresolved {
+                scope_ref: scope_ref.to_owned(),
+                unresolved: usize::try_from(snapshot.unresolved_quarantine.len())
+                    .unwrap_or(usize::MAX),
+                triggers: snapshot
+                    .unresolved_quarantine
+                    .iter()
+                    .map(|record| record.trigger)
+                    .collect(),
+            });
+        }
+        Ok(snapshot.guard_receipt)
+    }
+
+    /// Retains one scope-identity mismatch in the durable `WorkScope` owner
+    /// and mirrors it into the bounded in-process projection
+    /// (issue #1787, W6/AUD1/AUD3).
+    ///
+    /// The owner is the authority. The [`QuarantinedScopeRecord`] is built
+    /// through its existing constructor and validator, then written through
+    /// [`WorkScopeBindingOwner::record_scope_quarantine`], which dedupes by
+    /// the stable operation/idempotency identity, enforces the owner's own
+    /// bound, and returns the owner-issued write receipt. That receipt is
+    /// retained alongside the record so the withheld operation can be
+    /// reconciled against owner state instead of against this process.
+    ///
+    /// `self.scope_quarantine` is a read-model projection of exactly what the
+    /// owner retained; it is never consulted to decide admission and is
+    /// rebuilt from the owner on recovery. Construction, identity, or owner
+    /// write failure is never silent: it fails closed here, so the
     /// conflicting evidence cannot disappear while the write is withheld.
-    /// This projection is not durable, rehydrated, or an authority for
-    /// rebind; durable quarantine still belongs to the `WorkScope`
-    /// owner path.
+    /// The retained binding, task state, and project memory stay untouched on
+    /// every path.
     fn push_scope_quarantine_record(
         &mut self,
         expected: &ScopeBinding,
         observed: &ScopeBinding,
         report: &TriggerReport,
         fence_generation: u64,
-    ) -> Result<(), CompositionError> {
+    ) -> Result<ScopeQuarantineReceipt, CompositionError> {
         let record = QuarantinedScopeRecord::for_report(
             expected,
             observed,
@@ -5669,35 +5894,32 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
         .map_err(|error| {
             CompositionError::Recovery(format!(
-                "scope guard withheld at trigger {:?} after scope mismatch, but its process-local diagnostic could not be retained: {error}",
+                "scope guard withheld at trigger {:?} after scope mismatch, but its quarantine record could not be built: {error}",
                 report.trigger
             ))
         })?;
-        let (_, idempotency_key) = record.operation_identity().map_err(|error| {
-            CompositionError::Recovery(format!(
-                "scope guard withheld at trigger {:?} after scope mismatch, but its quarantine identity could not be derived: {error}",
-                report.trigger
-            ))
+        let owner = self.owners.work_scope.as_mut().ok_or_else(|| {
+            CompositionError::Recovery(
+                "scope guard withheld at trigger after a scope mismatch, but the WorkScope owner is unbound, so the conflict could not be retained durably"
+                    .to_owned(),
+            )
         })?;
-        // Preserve every unresolved conflict instead of overwriting one
-        // slot: a record whose stable idempotency identity is already
-        // retained anywhere in the bounded history adds no new evidence,
-        // anything else appends with oldest-first eviction at the bound.
-        // The retained binding, task state, and project memory stay
-        // untouched; durable quarantine still belongs to the WorkScope
-        // owner path.
-        let already_retained = self.scope_quarantine.iter().any(|retained| {
-            retained
-                .operation_identity()
-                .is_ok_and(|(_, retained_key)| retained_key == idempotency_key)
+        let receipt = owner
+            .record_scope_quarantine(record.clone())
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "scope guard withheld at trigger {:?} after scope mismatch, but the WorkScope owner could not retain the conflict: {error}",
+                    report.trigger
+                ))
+            })?;
+        self.scope_quarantine.push(ScopeQuarantineEntry {
+            record,
+            receipt: receipt.clone(),
         });
-        if !already_retained {
-            if self.scope_quarantine.len() >= MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
-                self.scope_quarantine.remove(0);
-            }
-            self.scope_quarantine.push(record);
+        if self.scope_quarantine.len() > MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
+            self.scope_quarantine.remove(0);
         }
-        Ok(())
+        Ok(receipt)
     }
 
     /// Checks the canonical write against the caller-supplied, actual observed
@@ -5706,9 +5928,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the guard returns `Allow` with a fresh `MATCHED` source-closure receipt.
     /// The observed binding is never derived from the retained binding or the
     /// write claim. Missing binding or source closure fails closed. Identity
-    /// mismatches append to the bounded process-local diagnostic projection
-    /// (no silent overwrite, no state or memory transfer); durable quarantine
-    /// and restart recovery remain partial (W6).
+    /// mismatches are retained in the DURABLE `WorkScope` owner and mirrored
+    /// into the bounded in-process projection (no silent overwrite, no state or
+    /// memory transfer), and the owner rehydrates them on restart.
+    ///
     /// Runs the retained `WorkScope` guard at one I4.2.1 use boundary from a
     /// live resource observation (issue #1746, W3).
     ///
@@ -5733,10 +5956,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// (`DIFFERENT_INSTANCE`, `AMBIGUOUS`, `STALE_BINDING`) and the
     /// receipt disposition (`MATCHED`, `STALE_BINDING`, `DIFFERENT_INSTANCE`,
     /// `AMBIGUOUS`, `CONFLICTED`), and every non-identity-clear outcome also
-    /// retains the conflicting lineage in the bounded process-local quarantine
-    /// projection. A mismatching observation never moves the retained binding,
-    /// a task, or any scope's memory, and it never re-binds silently: a
-    /// relocation still needs its explicit owner receipt through
+    /// retains the conflicting lineage in the DURABLE `WorkScope` owner's
+    /// unresolved quarantine section. A mismatching observation never moves the
+    /// retained binding, a task, or any scope's memory, and it never re-binds
+    /// silently: a relocation still needs its explicit owner receipt through
     /// [`Self::admit_scope_relocation`].
     #[allow(
         clippy::too_many_arguments,
@@ -6529,9 +6752,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// The presented receipt must name exactly the live `WorkScope` binding
     /// read at that fence. A readiness denial preserves its typed directive; a
     /// scope-guard failure preserves the structured guard report and retains
-    /// conflicting identity evidence in the bounded process-local diagnostic
-    /// projection (fail-closed retention; never durable, never an authority
-    /// for rebind).
+    /// conflicting identity evidence in the DURABLE `WorkScope` owner
+    /// (fail-closed retention that survives restart; still never an authority
+    /// for rebind on its own — an authorized rebind is still required).
     pub fn check_material_readiness_for_effect(
         &mut self,
         effect: RequestedEffect,
@@ -6634,8 +6857,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// returned as [`CompositionError::MaterialReadinessDenied`] with its
     /// receipt, requested effect, directive, and exact missing inputs; nothing
     /// is committed on any failure. A scope-guard mismatch retains the
-    /// conflicting evidence in the bounded process-local diagnostic
-    /// projection before withholding.
+    /// conflicting evidence in the DURABLE `WorkScope` owner before
+    /// withholding.
     pub fn check_material_readiness_for_write(
         &mut self,
         readiness: &MaterialReadinessInputs<'_>,
@@ -6664,8 +6887,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// canonical-write edge calls this method instead of `commit_canonical`
     /// directly; safe-capture experience commits keep using `commit_canonical`
     /// because the contract permits safe capture before `READY_MATERIAL`.
-    /// A scope-guard mismatch retains the conflicting evidence in the
-    /// bounded process-local diagnostic projection before withholding.
+    /// A scope-guard mismatch retains the conflicting evidence in the DURABLE
+    /// `WorkScope` owner before withholding.
     pub async fn commit_canonical_with_readiness(
         &mut self,
         identity: &RequestIdentity,

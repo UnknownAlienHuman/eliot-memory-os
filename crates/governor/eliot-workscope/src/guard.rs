@@ -22,8 +22,9 @@
 //!
 //! A mismatching observation never moves task state or project memory.
 //! `DIFFERENT_INSTANCE` and `AMBIGUOUS` quarantine: the retained binding is
-//! preserved and the conflicting observation is held separately until an
-//! explicit authorized rebind ([`rebind_with_receipt`]) completes.
+//! preserved and the conflicting observation is held separately by the
+//! `WorkScope` owner until an explicit authorized rebind
+//! ([`rebind_with_receipt`]) completes.
 
 use super::{
     GoverningSourceSet, ObservedScopeResources, PrivacyProfile, ScopeBinding,
@@ -191,16 +192,20 @@ impl TriggerReport {
     }
 }
 
-/// In-process record of one withheld or quarantined scope-identity observation
-/// (issue #1787, W6 partial projection; this type is not durable by itself).
+/// One withheld or quarantined scope-identity observation (issue #1787, W6).
 ///
 /// When a trigger evaluation detects an identity mismatch, this record holds
 /// the expected and observed scope, lineage, instance, root, and generation
 /// references, the trigger, identity-leg outcome, and verdict. The retained
-/// binding, task state, and project memory remain untouched. The type carries
-/// no persistence or restart-recovery guarantee; a caller may keep it only as
-/// an in-process diagnostic projection. The record proves a mismatch; it
-/// never admits the observed scope.
+/// binding, task state, and project memory remain untouched.
+///
+/// A record VALUE is not durability by itself. The record is durable when the
+/// `WorkScope` owner retains it in
+/// [`crate::WorkScopeBindingSnapshot::unresolved_quarantine`], which is
+/// persisted with the owner snapshot and rehydrated by
+/// [`crate::WorkScopeBindingOwner::from_snapshot`] on restart; a caller that
+/// only holds this value in memory has retained a diagnostic, not evidence.
+/// The record proves a mismatch; it never admits the observed scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuarantinedScopeRecord {
@@ -314,9 +319,12 @@ impl QuarantinedScopeRecord {
     /// The idempotency key is the SHA-256 of the canonical record bytes, so
     /// the same conflicting evidence always maps to the same key while a
     /// corrected payload maps to a new one; the operation id names the
-    /// quarantine family plus that key. The durable owner keys its
-    /// write/readback receipt on this pair; the in-process projection uses
-    /// the key for history-wide duplicate suppression.
+    /// quarantine family plus that key.
+    /// [`crate::WorkScopeBindingOwner::record_scope_quarantine`] keys the
+    /// owner's durable write on this pair, and
+    /// [`crate::WorkScopeBindingOwner::readback_scope_quarantine`] compares a
+    /// later read against it, so the same evidence is admitted once and
+    /// read back by content rather than by name.
     ///
     /// # Errors
     ///
@@ -332,6 +340,64 @@ impl QuarantinedScopeRecord {
             format!("scope-quarantine:{digest}"),
         ))
     }
+}
+
+/// Bound on the unresolved conflicting-identity records one `WorkScope` owner
+/// retains.
+///
+/// A later mismatch must not silently discard an earlier unresolved conflict,
+/// so records accumulate up to this bound with oldest-first eviction; the
+/// bound keeps the owner's own record from growing without limit. Eviction is
+/// a bounded retention decision, never a resolution: an evicted record is
+/// reported as [`ScopeQuarantineDisposition::Retired`] and never as a
+/// committed or cleared conflict.
+pub const MAX_UNRESOLVED_SCOPE_QUARANTINE: usize = 8;
+
+/// Owner-issued disposition of one scope-quarantine write or readback
+/// (issue #1787, AUD3).
+///
+/// Each state names what the `WorkScope` owner proves about this operation
+/// with its own stored evidence; none of them is inferred from the absence of
+/// a later observation:
+///
+/// - `Committed` — the owner retains the record at the read fence and the
+///   record passed its own existing `validate()`.
+/// - `PossibleCommit` — the owner could not commit the record (it is unbound,
+///   or its snapshot is not readable at the current fence), so the evidence
+///   survives only in a caller's process-local projection and may be lost on
+///   restart. The caller must still fail closed.
+/// - `Unavailable` — the owner is readable at the fence and retains no record
+///   for this operation identity.
+/// - `Corrupt` — a retained record failed its own existing `validate()`. The
+///   value is never re-derived or recomputed to "repair" it.
+/// - `Retired` — the record left the owner's unresolved set, either through the
+///   bounded-history eviction above or through an authorized rebind that
+///   resolved the conflict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ScopeQuarantineDisposition {
+    Committed,
+    PossibleCommit,
+    Unavailable,
+    Corrupt,
+    Retired,
+}
+
+/// Owner-issued write/readback receipt for one scope-quarantine operation.
+///
+/// `operation_id` and `idempotency_key` are the stable pair
+/// [`QuarantinedScopeRecord::operation_identity`] derives from the record's
+/// exact canonical bytes, so the same conflicting evidence always names the
+/// same operation and a corrected payload names a different one. `retained` is
+/// the count of unresolved records the owner holds after this operation, read
+/// from the owner's own retained set rather than from a caller counter.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeQuarantineReceipt {
+    pub operation_id: String,
+    pub idempotency_key: String,
+    pub disposition: ScopeQuarantineDisposition,
+    pub retained: u64,
 }
 
 /// Produces an authorized attach receipt for one newly observed workspace instance.

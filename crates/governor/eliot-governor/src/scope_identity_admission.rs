@@ -39,12 +39,14 @@ pub use eliot_workscope::{
     BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
     HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,
     PrivacyProfile, ProposalSource, RegisteredInstanceEvidence, ResolutionAuthentication,
-    ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint, ScopeRelocationOrAttachReceipt,
-    ScopeResolution, SessionTaskClaim, TriggerReport, WorkScopeBindingOwner,
-    WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeResolutionReceipt, WorkScopeResolver,
-    WorkspaceInstanceIdentity, check_at_trigger, derive_observed_resources, identity_legs,
-    issue_resolution_receipt, produce_attach_receipt, rebind_with_receipt,
+    ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence,
+    MAX_UNRESOLVED_SCOPE_QUARANTINE, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard,
+    ScopeFingerprint, ScopeQuarantineDisposition, ScopeQuarantineReceipt,
+    ScopeRelocationOrAttachReceipt, ScopeResolution, SessionTaskClaim, TriggerReport,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
+    WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity, check_at_trigger,
+    derive_observed_resources, identity_legs, issue_resolution_receipt, produce_attach_receipt,
+    rebind_with_receipt,
 };
 
 /// Daemon-edge scope observation verdict.

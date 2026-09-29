@@ -38,7 +38,8 @@ pub use governance::{
     TaskSelectionRequired, admit_governing_sources, source_readiness, task_selection_required,
 };
 pub use guard::{
-    GuardTrigger, GuardVerdict, IdentityLegOutcome, QuarantinedScopeRecord, TriggerReport,
+    GuardTrigger, GuardVerdict, IdentityLegOutcome, MAX_UNRESOLVED_SCOPE_QUARANTINE,
+    QuarantinedScopeRecord, ScopeQuarantineDisposition, ScopeQuarantineReceipt, TriggerReport,
     check_at_trigger, identity_legs, produce_attach_receipt, rebind_with_receipt,
 };
 pub use identity::{
@@ -458,6 +459,15 @@ pub struct ScopeBindingGuardReceipt {
 /// This is a closed snapshot: it carries no task, plan, session, principal or
 /// kernel-generation authority.  Admission and recovery validate the guard
 /// receipt against the retained binding before exposing the snapshot.
+///
+/// `unresolved_quarantine` is the owner's durable record of conflicting
+/// identity evidence (issue #1787, W6/AUD1). It is bounded by
+/// [`MAX_UNRESOLVED_SCOPE_QUARANTINE`], deduplicated by the stable operation
+/// identity [`QuarantinedScopeRecord::operation_identity`] derives, and
+/// rehydrated with the rest of this snapshot on restart, so a conflicting
+/// observation cannot disappear while the write it blocked is withheld. Each
+/// record holds conflicting *observations* only: the retained binding, task
+/// state, and project memory are never moved to the observed root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeBindingSnapshot {
@@ -465,6 +475,7 @@ pub struct WorkScopeBindingSnapshot {
     pub owner_revision: u64,
     pub binding: ScopeBinding,
     pub guard_receipt: ScopeBindingGuardReceipt,
+    pub unresolved_quarantine: Vec<QuarantinedScopeRecord>,
 }
 
 /// The canonical owner for one current `WorkScope` binding.
@@ -2960,6 +2971,11 @@ impl ScopeBinding {
 
 impl WorkScopeBindingSnapshot {
     /// Constructs a persisted current binding only after full receipt closure.
+    ///
+    /// The durable quarantine section starts empty: a binding that has never
+    /// seen a conflicting observation retains no record, so an absent section
+    /// is never read as "checked and clear". Use
+    /// [`WorkScopeBindingOwner::record_scope_quarantine`] to retain one.
     pub fn new(
         state_fence: StateFence,
         owner_revision: u64,
@@ -2971,12 +2987,43 @@ impl WorkScopeBindingSnapshot {
             owner_revision,
             binding,
             guard_receipt,
+            unresolved_quarantine: Vec::new(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Constructs a persisted snapshot with its durable unresolved-quarantine
+    /// section, as recovery and the owner write path both need.
+    ///
+    /// This is the single construction point for a snapshot that carries
+    /// conflicting evidence, so `new` cannot silently drop a retained record
+    /// and deserialization cannot admit an unvalidated section.
+    pub fn from_parts(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        unresolved_quarantine: Vec<QuarantinedScopeRecord>,
+    ) -> Result<Self, WorkScopeError> {
+        let snapshot = Self {
+            state_fence,
+            owner_revision,
+            binding,
+            guard_receipt,
+            unresolved_quarantine,
         };
         snapshot.validate()?;
         Ok(snapshot)
     }
 
     /// Validates the complete closed snapshot before construction or recovery.
+    ///
+    /// Every retained quarantine record is re-validated through its own
+    /// existing [`QuarantinedScopeRecord::validate`] rather than by recomputing
+    /// any identity value, and the section is checked for duplicate operation
+    /// identities and its bound, so a corrupt or over-full durable section
+    /// fails recovery instead of being silently accepted or trimmed.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         self.state_fence
             .validate()
@@ -3009,6 +3056,28 @@ impl WorkScopeBindingSnapshot {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        self.check_unresolved_quarantine()
+    }
+
+    /// Validates the durable conflicting-evidence section against an
+    /// independent expectation: the bound and the set of distinct operation
+    /// identities, each record re-validated through its own `validate()`.
+    fn check_unresolved_quarantine(&self) -> Result<(), WorkScopeError> {
+        if self.unresolved_quarantine.len() > MAX_UNRESOLVED_SCOPE_QUARANTINE {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "unresolved_quarantine",
+            });
+        }
+        let mut identities = BTreeSet::new();
+        for record in &self.unresolved_quarantine {
+            record.validate()?;
+            let (_, idempotency_key) = record.operation_identity()?;
+            if !identities.insert(idempotency_key) {
+                return Err(WorkScopeError::DuplicateReference {
+                    field: "unresolved_quarantine",
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -3020,6 +3089,11 @@ struct WorkScopeBindingSnapshotWire {
     owner_revision: u64,
     binding: ScopeBinding,
     guard_receipt: ScopeBindingGuardReceipt,
+    /// Absent in rows persisted before the durable quarantine section existed;
+    /// those rows carry no conflicting-evidence claim, so the section starts
+    /// empty rather than being inferred from the guard receipt.
+    #[serde(default)]
+    unresolved_quarantine: Vec<QuarantinedScopeRecord>,
 }
 
 impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
@@ -3028,11 +3102,12 @@ impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = WorkScopeBindingSnapshotWire::deserialize(deserializer)?;
-        Self::new(
+        Self::from_parts(
             wire.state_fence,
             wire.owner_revision,
             wire.binding,
             wire.guard_receipt,
+            wire.unresolved_quarantine,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -3046,6 +3121,11 @@ impl WorkScopeBindingOwner {
     }
 
     /// Recovers the owner through the same fail-closed validation path.
+    ///
+    /// Recovery rehydrates the durable unresolved-quarantine section together
+    /// with the binding, and `validate` re-checks every retained record through
+    /// its own `validate()`. A conflict withheld before a restart is therefore
+    /// still unresolved after it, rather than being reconstructed as absent.
     pub fn from_snapshot(snapshot: WorkScopeBindingSnapshot) -> Result<Self, WorkScopeError> {
         Self::new(snapshot)
     }
@@ -3063,6 +3143,149 @@ impl WorkScopeBindingOwner {
             return Err(WorkScopeError::StateFenceMismatch);
         }
         Ok(self.snapshot.clone())
+    }
+
+    /// Retains one conflicting-identity record in the owner's durable
+    /// unresolved section and returns its owner-issued write receipt
+    /// (issue #1787, AUD1/AUD3).
+    ///
+    /// The record is re-validated through its own `validate()`, and its
+    /// stable operation/idempotency identity is compared by CONTENT with the
+    /// retained set: the same conflicting evidence maps to the same operation
+    /// and adds nothing, a corrected payload is a different operation and is
+    /// appended. Retention is bounded by [`MAX_UNRESOLVED_SCOPE_QUARANTINE`]
+    /// with oldest-first eviction, and the receipt distinguishes a newly
+    /// committed record from one that left the unresolved set through that
+    /// eviction (`Retired`) rather than reporting both as committed.
+    ///
+    /// The retained binding, guard receipt, task state, and project memory are
+    /// untouched: this records a conflict, it never rebinds and never admits
+    /// the observed scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record or the resulting snapshot is invalid.
+    pub fn record_scope_quarantine(
+        &mut self,
+        record: QuarantinedScopeRecord,
+    ) -> Result<ScopeQuarantineReceipt, WorkScopeError> {
+        record.validate()?;
+        let (operation_id, idempotency_key) = record.operation_identity()?;
+        let already_retained = self
+            .snapshot
+            .unresolved_quarantine
+            .iter()
+            .any(|retained| {
+                retained
+                    .operation_identity()
+                    .is_ok_and(|(_, retained_key)| retained_key == idempotency_key)
+            });
+        if already_retained {
+            let retained = self.snapshot.unresolved_quarantine.len();
+            return Ok(ScopeQuarantineReceipt {
+                operation_id,
+                idempotency_key,
+                disposition: ScopeQuarantineDisposition::Committed,
+                retained: u64::try_from(retained).unwrap_or(u64::MAX),
+            });
+        }
+        let mut disposition = ScopeQuarantineDisposition::Committed;
+        if self.snapshot.unresolved_quarantine.len() >= MAX_UNRESOLVED_SCOPE_QUARANTINE {
+            self.snapshot.unresolved_quarantine.remove(0);
+            disposition = ScopeQuarantineDisposition::Retired;
+        }
+        self.snapshot.unresolved_quarantine.push(record);
+        self.snapshot.validate()?;
+        let retained = self.snapshot.unresolved_quarantine.len();
+        Ok(ScopeQuarantineReceipt {
+            operation_id,
+            idempotency_key,
+            disposition,
+            retained: u64::try_from(retained).unwrap_or(u64::MAX),
+        })
+    }
+
+    /// Reads back one retained operation's disposition from the owner's own
+    /// stored section (issue #1787, AUD3).
+    ///
+    /// The owner must be readable at the exact fence first: an owner that
+    /// cannot be read at the current fence has not proven anything about this
+    /// operation, so the answer is `PossibleCommit` and the caller still fails
+    /// closed. Once readable, the retained set is the authority: a record
+    /// present and valid is `Committed`, a record whose own `validate()` fails
+    /// is `Corrupt` (never re-derived to repair it), and an operation the owner
+    /// does not retain is `Unavailable` — an explicit read of owner state, not
+    /// an inference from a missing write response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state fence is malformed or `operation_id` is
+    /// blank.
+    pub fn readback_scope_quarantine(
+        &self,
+        state_fence: &StateFence,
+        operation_id: &str,
+    ) -> Result<ScopeQuarantineReceipt, WorkScopeError> {
+        text(operation_id, "operation_id")?;
+        let snapshot = match self.read_current(state_fence) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Ok(ScopeQuarantineReceipt {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: String::new(),
+                    disposition: ScopeQuarantineDisposition::PossibleCommit,
+                    retained: 0,
+                });
+            }
+        };
+        let retained = snapshot.unresolved_quarantine.len();
+        for record in &snapshot.unresolved_quarantine {
+            // A record that fails its own validator is reported as corrupt
+            // through the owner's own state; it is never re-derived, and its
+            // identity is not consulted to "repair" it.
+            let Ok((retained_id, retained_key)) = record.operation_identity() else {
+                return Ok(ScopeQuarantineReceipt {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: String::new(),
+                    disposition: ScopeQuarantineDisposition::Corrupt,
+                    retained: u64::try_from(retained).unwrap_or(u64::MAX),
+                });
+            };
+            if retained_id == operation_id {
+                return Ok(ScopeQuarantineReceipt {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: retained_key,
+                    disposition: ScopeQuarantineDisposition::Committed,
+                    retained: u64::try_from(retained).unwrap_or(u64::MAX),
+                });
+            }
+        }
+        Ok(ScopeQuarantineReceipt {
+            operation_id: operation_id.to_owned(),
+            idempotency_key: String::new(),
+            disposition: ScopeQuarantineDisposition::Unavailable,
+            retained: u64::try_from(retained).unwrap_or(u64::MAX),
+        })
+    }
+
+    /// Returns whether the owner retains any unresolved conflicting evidence.
+    ///
+    /// The answer reads the flag directly from the retained section rather
+    /// than inferring it from the absence of a guard receipt.
+    #[must_use]
+    pub fn has_unresolved_quarantine(&self) -> bool {
+        !self.snapshot.unresolved_quarantine.is_empty()
+    }
+
+    /// Returns this owner's retained records ordered oldest first, so a caller
+    /// that merges two owners' sections keeps a deterministic order.
+    ///
+    /// The order is the owner's own persisted order, not a re-sort by identity:
+    /// retention appends and evicts oldest-first, so the persisted sequence IS
+    /// the resolution order.
+    #[must_use]
+    pub fn unresolved_quarantine(&self) -> &[QuarantinedScopeRecord] {
+        &self.snapshot.unresolved_quarantine
     }
 }
 
