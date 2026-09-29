@@ -6390,7 +6390,16 @@ impl KernelComposition {
             (gate_outcome, pending_journal)
         };
         if let Some(snapshot) = pending_journal {
-            persist_pre_stage_corrections(&self.work_root, &snapshot);
+            // Write-ahead and best-effort: the helper below acknowledges the
+            // exact saved revision only after the rename commits, so a failed
+            // save stays pending and is offered again by the next take. The
+            // typed outcome is observed here but never fails the write whose
+            // retain it records.
+            let _persist_outcome = persist_pre_stage_corrections(
+                &self.work_root,
+                &self.pre_stage_identity_cache,
+                &snapshot,
+            );
         }
         let verified_correction = match gate_outcome {
             Err(rejection) => {
@@ -9037,19 +9046,23 @@ fn pre_stage_correction_journal_path(work_root: &std::path::Path) -> std::path::
 /// Restores retained refusals from the Kernel-owned durable pre-stage
 /// journal into a freshly started, still-empty gate cache (issue #1796 F1).
 ///
-/// Merging is a union over deterministic records, so a retain that landed
-/// after the journal was read is never lost by the merge. Best-effort: a
-/// missing or unreadable journal starts empty, which is exactly the
-/// pre-journal behavior, and a cache that already holds a live refusal is
-/// never overwritten by stale disk state. No store, receipt, or envelope
-/// format is touched.
+/// A legitimate first-use absent journal restores nothing, which is exactly
+/// the pre-journal behavior. An existing journal that cannot be read,
+/// decoded, or validated leaves the cache unrestored instead of being
+/// claimed as an empty cache: it is re-read on the next request, and until
+/// then the gate issues no correction lineage at all rather than stamping
+/// an unproven one. A cache that already holds a live refusal is never
+/// overwritten by stale disk state. No store, receipt, or envelope format
+/// is touched.
 #[cfg(windows)]
 fn restore_pre_stage_corrections(
     work_root: &std::path::Path,
     cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
 ) {
-    let Ok(bytes) = std::fs::read(pre_stage_correction_journal_path(work_root)) else {
-        return;
+    let bytes = match std::fs::read(pre_stage_correction_journal_path(work_root)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => return,
+        Ok(bytes) => bytes,
     };
     let Ok(snapshot) =
         serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes)
@@ -9060,8 +9073,31 @@ fn restore_pre_stage_corrections(
         return;
     };
     if guard.is_empty() {
-        guard.restore(snapshot);
+        // Validated merge: an inconsistent snapshot is refused without
+        // partial mutation, so the cache stays empty for the next attempt.
+        let _ = guard.restore(snapshot);
     }
+}
+
+/// Typed outcome of one durable pre-stage journal write attempt (issue
+/// #1796 AUD2): a file-write attempt is reported, never treated as a
+/// persistence acknowledgement.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalPersistOutcome {
+    /// The rename committed and the exact saved revision was acknowledged.
+    Persisted,
+    /// The snapshot could not be encoded; nothing reached the disk.
+    SerializeFailed,
+    /// The journal directory could not be prepared; nothing was written.
+    JournalDirUnreachable,
+    /// The temporary journal file could not be written.
+    JournalWriteFailed,
+    /// The temporary journal file could not be committed over the journal.
+    JournalCommitFailed,
+    /// A newer retain landed while this save was in flight; the older save
+    /// retired nothing and wrote nothing over the newer state.
+    Superseded,
 }
 
 /// Persists retained refusals to the Kernel-owned durable pre-stage journal
@@ -9070,28 +9106,51 @@ fn restore_pre_stage_corrections(
 /// Called write-ahead of the commit the retain authorizes, so a restart
 /// between commit and response still replays the lineage. Best-effort: a
 /// failed write keeps the in-memory behavior and never fails the write it
-/// records. The tmp-plus-rename keeps a crash from leaving a half-written
-/// journal behind.
+/// records. The pending journal stays pending until its exact revision is
+/// acknowledged after the rename commits, so a failed save is offered again
+/// instead of being forgotten; the revision comparison also keeps an older
+/// in-flight save from overwriting newer retained refusals. The
+/// tmp-plus-rename keeps a crash from leaving a half-written journal
+/// behind.
 #[cfg(windows)]
 fn persist_pre_stage_corrections(
     work_root: &std::path::Path,
+    cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
     snapshot: &eliot_kernel_service::PreStageIdentitySnapshot,
-) {
+) -> JournalPersistOutcome {
+    let pending = match cache.lock() {
+        Ok(guard) => guard.pending_journal_revision(),
+        Err(_) => return JournalPersistOutcome::Superseded,
+    };
+    if pending != Some(snapshot.revision()) {
+        return JournalPersistOutcome::Superseded;
+    }
     let Ok(bytes) = serde_json::to_vec_pretty(snapshot) else {
-        return;
+        return JournalPersistOutcome::SerializeFailed;
     };
     let path = pre_stage_correction_journal_path(work_root);
     if path
         .parent()
         .is_some_and(|dir| std::fs::create_dir_all(dir).is_err())
     {
-        return;
+        return JournalPersistOutcome::JournalDirUnreachable;
     }
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, &bytes).is_err() {
-        return;
+        return JournalPersistOutcome::JournalWriteFailed;
     }
-    let _ = std::fs::rename(&tmp, &path);
+    if std::fs::rename(&tmp, &path).is_err() {
+        return JournalPersistOutcome::JournalCommitFailed;
+    }
+    let acknowledged = match cache.lock() {
+        Ok(mut guard) => guard.acknowledge_journal_save(snapshot.revision()),
+        Err(_) => false,
+    };
+    if acknowledged {
+        JournalPersistOutcome::Persisted
+    } else {
+        JournalPersistOutcome::Superseded
+    }
 }
 fn store_apply_response(
     receipt: &WriteReceipt,
