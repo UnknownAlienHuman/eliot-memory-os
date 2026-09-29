@@ -251,22 +251,20 @@ fn dreamer_pause_refusal(
         return paused;
     }
     if !proof.work_scope_proven && observed.any_open_except(key) {
-        return Some(
-            CommitRecoveryError::OrderingScopeUnresolved {
-                operation: "dreamer-job".to_owned(),
-                detail: format!(
-                    "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
+        return Some(CommitRecoveryError::OrderingScopeUnresolved {
+            operation: "dreamer-job".to_owned(),
+            detail: format!(
+                "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
                      its ledger record is ordered inside, so its coverage by the open \
                      unknown-commit record set observed at revision {} cannot be proven and \
                      dependent durable admission stays closed",
-                    proof.rendered(),
-                    observed
-                        .binding()
-                        .revision
-                        .map_or_else(|| "unknown".to_owned(), |revision| revision.to_string(),)
-                ),
-            },
-        );
+                proof.rendered(),
+                observed
+                    .binding()
+                    .revision
+                    .map_or_else(|| "unknown".to_owned(), |revision| revision.to_string(),)
+            ),
+        });
     }
     None
 }
@@ -4679,12 +4677,14 @@ impl KernelStoreGateway {
             {
                 return Err(refusal.into());
             }
-            let ors = self.commit_ors.as_deref().ok_or_else(|| {
-                CommitRecoveryError::OrsUnavailable {
-                    detail: "no durable recovery owner is bound at the Dreamer send claim boundary"
-                        .to_owned(),
-                }
-            })?;
+            let ors =
+                self.commit_ors
+                    .as_deref()
+                    .ok_or_else(|| CommitRecoveryError::OrsUnavailable {
+                        detail:
+                            "no durable recovery owner is bound at the Dreamer send claim boundary"
+                                .to_owned(),
+                    })?;
             let snapshot = observed.owner_snapshot().ok_or_else(|| {
                 CommitRecoveryError::OrsUnavailable {
                     detail: "the checked pause observation carries no complete owner snapshot for the send claim".to_owned(),
@@ -5342,22 +5342,23 @@ impl KernelStoreGateway {
                     ),
                 }
             })?;
-        let outcome = terminal.outcome.ok_or_else(|| {
-            CommitRecoveryError::OrsUnavailable {
+        let outcome = terminal
+            .outcome
+            .ok_or_else(|| CommitRecoveryError::OrsUnavailable {
                 detail: format!(
                     "exact receipt reconciliation for {} did not produce a terminal owner record",
                     identity.idempotency_key
                 ),
-            }
-        })?;
-        let evidence_receipt_digest = terminal.evidence_receipt_digest.clone().ok_or_else(|| {
-            CommitRecoveryError::OrsUnavailable {
-                detail: format!(
-                    "exact receipt reconciliation for {} did not retain its evidence digest",
-                    identity.idempotency_key
-                ),
-            }
-        })?;
+            })?;
+        let evidence_receipt_digest =
+            terminal.evidence_receipt_digest.clone().ok_or_else(|| {
+                CommitRecoveryError::OrsUnavailable {
+                    detail: format!(
+                        "exact receipt reconciliation for {} did not retain its evidence digest",
+                        identity.idempotency_key
+                    ),
+                }
+            })?;
         // The disposition is only complete once the pause it released can be
         // proven, so an unprovable refresh is reported as a limitation carried
         // by the answer rather than dropped.

@@ -6565,10 +6565,8 @@ impl KernelComposition {
                         ));
                     }
                 }
-                let mut response =
-                    store_apply_response(receipt, verified_correction.as_ref());
-                response["recovery"] =
-                    recovered_commit_recovery(recovered.pause_release.as_ref());
+                let mut response = store_apply_response(receipt, verified_correction.as_ref());
+                response["recovery"] = recovered_commit_recovery(recovered.pause_release.as_ref());
                 Ok(response)
             }
             Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
