@@ -171,6 +171,7 @@ impl SkillIndexEntry {
         check_text(&self.skill_id, "index.skill_id")?;
         check_text(&self.name, "index.name")?;
         check_single_line(&self.trigger, "index.trigger", MAX_TRIGGER_CHARS)?;
+        check_no_authority_claim(&self.trigger, "index.trigger")?;
         if self.eligible_routes.is_empty()
             && self.eligible_profiles.is_empty()
             && self.eligible_policies.is_empty()

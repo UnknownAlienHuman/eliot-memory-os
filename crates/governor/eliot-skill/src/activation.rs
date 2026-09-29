@@ -761,7 +761,8 @@ pub fn gate_material_use(
 ///
 /// [`gate_material_use`] covers stored status plus the dependency set; this
 /// is the full-leg variant the bridge activation path runs before Material
-/// use once it can supply the operation-observed live world: stored status,
+/// use once it can supply the operation-observed live world: structural
+/// validation, stored status,
 /// the promotion-evidence binding for `Current`, the dependency set, the
 /// host/profile versions, the admitted Tool Definition version, and the
 /// declared tool basis rechecked against the tool owner's view. Any drift
@@ -782,6 +783,7 @@ pub fn gate_material_use_against(
     entry: &SkillCatalogueEntry,
     world: &LiveSkillWorld<'_>,
 ) -> Result<(), SkillError> {
+    entry.validate()?;
     if !material_use_allowed(entry.status) {
         return Err(SkillError::InvalidField {
             field: "entry.status",
