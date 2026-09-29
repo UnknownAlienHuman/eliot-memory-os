@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use eliot_contracts::AuthorityEpoch;
+use eliot_contracts::{AuthorityEpoch, StateFence};
 use eliot_ors::{
     OperationIdentity, OrsError, RedbRecoveryStore, SupervisionLeaseCommitTicket,
     SupervisionLeaseOperation, SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
@@ -649,6 +649,110 @@ impl KernelSupervisionLeaseAuthority {
         self.ors
             .commit_terminal_supervision_lease(ticket, &verified)
             .map_err(Into::into)
+    }
+
+    /// Terminalizes an `Active` supervision lease whose validity interval has
+    /// elapsed without a proved renewal.
+    ///
+    /// I1.5: "If renewal cannot be proved, coverage ends at expiry and is
+    /// reported honestly." An expired-but-`Active` durable head still blocks
+    /// generation retirement (`RuntimeLeaseCensus::is_fully_retired` admits
+    /// only terminal heads), so the expiry must be committed durably rather
+    /// than merely refused in memory. The commit reuses the staged-ticket
+    /// owner (`prepare`) and the terminal boundary (`commit_terminal`): the
+    /// `Expire` ticket is fenced on the exact current revision and receipt,
+    /// preserves the current lineage including its timing, and carries no
+    /// renewal evidence because none was observed.
+    ///
+    /// Returns `Ok(None)` when no expiry is due: no head exists, the head is
+    /// already non-`Active`, or `now_ms` precedes `expires_at_ms`. The caller
+    /// supplies its own tick clock (`now_ms`) and the fence it currently
+    /// supervises; a fence mismatch fails closed rather than expiring another
+    /// generation's lease. A staged `Expire` ticket for the same predecessor
+    /// is resumed by identity; a staged ticket for any other operation is a
+    /// typed conflict, never stomped.
+    ///
+    /// STITCH caller: the Kernel supervision tick holding the admitted
+    /// contour (out of scope: `bins/eliot-kernel/src/lib.rs`).
+    pub fn expire_past_due_lease(
+        &self,
+        supervision_lease_id: &str,
+        expected_fence: &StateFence,
+        now_ms: u64,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
+        let Some(current) = self.current_snapshot(supervision_lease_id)? else {
+            return Ok(None);
+        };
+        if current.record.state != LeaseState::Active
+            || current.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+            || now_ms < current.record.binding.expires_at_ms
+        {
+            return Ok(None);
+        }
+        if current.record.binding.state_fence != *expected_fence {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        let mut binding = current.record.binding.clone();
+        binding.state = LeaseState::Expired;
+        binding.terminal_disposition = Some(SupervisionLeaseTerminalDisposition::Expired);
+        let stage = if let Some(stage) = self.staged_snapshot(supervision_lease_id)? {
+            if stage.ticket.operation != SupervisionLeaseOperation::Expire
+                || stage.ticket.expected_revision != Some(current.record.revision)
+                || stage.ticket.previous_receipt_sha256.as_deref()
+                    != Some(current.receipt.receipt_sha256.as_str())
+                || stage.ticket.binding != binding
+            {
+                return Err(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseTicketConflict,
+                ));
+            }
+            stage
+        } else {
+            self.prepare(SupervisionLeasePrepareRequest {
+                ticket_id: supervision_operation_identity(
+                    "expire-ticket",
+                    supervision_lease_id,
+                    Some(&current.receipt.receipt_sha256),
+                )?,
+                operation_id: supervision_operation_identity(
+                    "expire-operation",
+                    supervision_lease_id,
+                    Some(&current.receipt.receipt_sha256),
+                )?,
+                lease_id: OperationIdentity::new(supervision_lease_id.to_owned())?,
+                expected_revision: Some(current.record.revision),
+                operation: SupervisionLeaseOperation::Expire,
+                binding,
+            })?
+        };
+        // F-LOG-KERNEL-3 (#901): lease-expiry boundary. Only an attempted
+        // expiry is observed; routine not-due ticks stay unlogged. Exactly one
+        // terminal is emitted per failed commit and no lease material is
+        // logged.
+        observe_supervision_lease("kernel.supervision.expire_requested", "attempt");
+        match self.commit_terminal(&stage.ticket) {
+            Ok(snapshot) => {
+                if snapshot.record.state != LeaseState::Expired
+                    || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Terminal
+                {
+                    observe_supervision_lease("kernel.supervision.expire_failed", "rejected");
+                    return Err(SupervisionLeaseAuthorityError::Ors(
+                        OrsError::SupervisionLeaseBindingMismatch,
+                    ));
+                }
+                observe_supervision_lease("kernel.supervision.expire_committed", "success");
+                Ok(Some(snapshot))
+            }
+            Err(error) => {
+                observe_supervision_lease("kernel.supervision.expire_failed", "rejected");
+                crate::kernel_diagnostics::observe_terminal_error(
+                    supervision_authority_terminal_code(&error),
+                );
+                Err(error)
+            }
+        }
     }
 
     pub fn reconcile(
