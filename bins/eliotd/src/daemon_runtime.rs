@@ -3235,6 +3235,33 @@ fn local_delta_adoption_name(adoption: &LocalDeltaAdoption) -> &'static str {
     }
 }
 
+/// Derives the task-bound scope the reconstruction composition borrow pins
+/// for one admitted pair (#2564 I6/A1).
+///
+/// The envelope work scope, else its session — never an MCP argument — exactly
+/// as the reconstruction route's own trusted-scope derivation reads the same
+/// admitted envelope. A pair with no usable scope fails the poll step before
+/// any borrow, so an unscoped claim can never reach the reconstruction owner.
+fn reconstruction_borrow_scope(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+) -> Result<eliot_store_api::ScopeId, String> {
+    let scope_text = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .as_deref()
+                .filter(|scope| !scope.trim().is_empty())
+        })
+        .ok_or_else(|| "daemon reconstruction borrow binds no scope".to_owned())?;
+    eliot_store_api::ScopeId::new(scope_text.to_owned())
+        .map_err(|error| format!("daemon reconstruction borrow scope: {error}"))
+}
+
 /// Runs one local-read poll step: `local_read_claim` (pair plus fenced
 /// attempt capability, or null meaning backoff), then
 /// [`forward_admitted_local_read`] for the admitted pair under that attempt,
@@ -3472,6 +3499,29 @@ async fn run_local_read_poll(
     // pair is never silently dropped. Every other query shape keeps the
     // forwarded path byte-identical.
     if eliotd::is_context_reconstruction_query(&envelope, &tool) {
+        // #2564 (I6/A1): this branch is the live production invocation of the
+        // reconstruction owner behind `serve_context_reconstruction`
+        // (`daemon_runtime.rs::run_local_read_poll` — not the activation
+        // `submit_agent_activation_result` leg, which serves no state/packet
+        // pair). The serve is reached through the daemon composition's
+        // `DaemonComposition::reconstruction_composition` borrow: readiness is
+        // checked there, and the exact admitted fence plus the task-bound
+        // scope are pinned at borrow time. The guard is dropped before any
+        // owner read, so no composition lock crosses the reconstruction
+        // awaits. A refused borrow, or a fence pin that no longer matches the
+        // admitted pair, is a typed step failure like any other prerequisite
+        // refusal, so the claimed pair is never silently discarded.
+        let reads = KernelContextReadClient::new(Arc::clone(kernel));
+        let scope = reconstruction_borrow_scope(&envelope)?;
+        {
+            let guard = composition.lock().await;
+            let borrowed = guard
+                .reconstruction_composition(kernel, &reads, scope)
+                .map_err(|error| format!("daemon reconstruction composition: {error}"))?;
+            if *borrowed.admitted_fence() != envelope.state_fence {
+                return Err("daemon reconstruction fence moved before serve".to_owned());
+            }
+        }
         let body = Box::pin(eliotd::serve_context_reconstruction(
             kernel, &envelope, &tool, &attempt,
         ))
