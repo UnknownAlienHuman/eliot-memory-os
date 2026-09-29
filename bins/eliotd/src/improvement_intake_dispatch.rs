@@ -173,7 +173,7 @@ use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
     ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
     SafeBoundary, SourcedEvidence, brief_at_safe_boundary, candidate_from_evidence,
-    check_class_gate, classify, is_prohibited_tuning_surface, sourced_evidence,
+    check_class_gate, classify, sourced_evidence,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
@@ -501,34 +501,41 @@ pub fn assemble_improvement_artifact(
 ///
 /// [`ImprovementCandidate::target_surface`] is the candidate's OWN closed
 /// surface record, and it is the only class evidence this path holds. The
-/// class flags are read from it and from what the candidate does NOT record:
+/// descriptor is therefore built by
+/// [`ChangeDescriptor::from_recorded_surface`], the crate's own constructor for
+/// exactly this situation:
 ///
-/// - `touches_protected` is [`is_prohibited_tuning_surface`] over that surface,
-///   so it is a comparison of the candidate's recorded surface against the
-///   owner's closed rule, not a spelled literal. A candidate recorded on
-///   [`ImprovementSurface::Verifier`] or [`ImprovementSurface::Scheduler`]
-///   classifies as `Protected` and is refused below, because the owner class
-///   for those surfaces requires an explicit owner decision and a
-///   corresponding migration/proof (I12.24:93) and this path holds neither.
-///   `ASSUMPTION:` those two surfaces map to `Protected` rather than to
-///   `CodeModuleConfig`, because I12.24:93 names `verifier` and `authority` in
-///   the protected class and I12.24:87-88 names `verifier definition` and
-///   `Kernel/Watchdog reserve` as never-tuning — so the owner-decision route
-///   the crate's own [`is_prohibited_tuning_surface`] names for them is the
+/// - `touches_protected` is [`eliot_improvement::is_prohibited_tuning_surface`]
+///   over that surface, so it is a comparison of the candidate's recorded
+///   surface against the owner's closed rule, not a spelled literal. A
+///   candidate recorded on [`ImprovementSurface::Verifier`] or
+///   [`ImprovementSurface::Scheduler`] classifies as `Protected` and is refused
+///   below, because the owner class for those surfaces requires an explicit
+///   owner decision and a corresponding migration/proof (I12.24:93) and this
+///   path holds neither. `ASSUMPTION:` those two surfaces map to `Protected`
+///   rather than to `CodeModuleConfig`, because I12.24:93 names `verifier` and
+///   `authority` in the protected class and I12.24:87-88 names
+///   `verifier definition` and `Kernel/Watchdog reserve` as never-tuning — so
+///   the owner-decision route the crate's own
+///   [`eliot_improvement::is_prohibited_tuning_surface`] names for them is the
 ///   protected one. `Protected` is also the stricter of the two routes that
 ///   function allows, so the mapping fails closed.
-/// - `bounded_tuning` and `has_work_item_ref` are `false` because the candidate
-///   records NO bounded-tuning range and NO work-item reference. Neither the
-///   I12.24:20-38 `ImprovementCandidate` schema nor the crate's
-///   [`ImprovementCandidate`] struct carries a field for either, so there is
-///   nothing to read and nothing is invented. This is the real ceiling of this
-///   path, and it is stated rather than papered over — the
-///   `PreAuthorizedTuning` and `CodeModuleConfig` classes are NOT REACHABLE
-///   here, because the descriptor cannot be given the content that would
-///   select them. A future change that wants either class has to add the
-///   evidence to the candidate first; until then there is nothing for this gate
-///   to refuse on those two classes, and this comment does not claim
-///   otherwise.
+/// - `bounded_tuning` and `has_work_item_ref` are NOT spelled on this call at
+///   all, and cannot be: that constructor exposes no parameter for them,
+///   precisely because this path holds no evidence for either. I12.24:85 admits
+///   pre-authorized tuning only "inside a declared safe range" and the
+///   I12.24:20-38 `ImprovementCandidate` schema lists no safe range, so there
+///   is nothing to read; I12.24:90 admits code/module/config delivery as a
+///   "normal work item", and I12.24:65 places that work item after "decision
+///   owner selects reject / investigate / work item / experiment", so the
+///   candidate assembled here carries none. `ASSUMPTION:` this path therefore
+///   cannot honestly select either class, and the correct outcome is to say so
+///   rather than to mint a `true`: the `PreAuthorizedTuning` and
+///   `CodeModuleConfig` classes are NOT REACHABLE here, structurally, because
+///   the only descriptor this path can build has no way to claim them. A
+///   future change that wants either has to add the safe range or the real work
+///   item to the candidate first; until then there is nothing for this gate to
+///   refuse on those two classes, and this comment does not claim otherwise.
 ///
 /// [`ImprovementCandidate::advisory_only`] is deliberately NOT used as a class
 /// flag. It is a real recorded field, but it is not the same thing as these
@@ -559,12 +566,7 @@ pub fn assemble_improvement_artifact(
 fn enforce_advisory_class_gate(
     candidate: &ImprovementCandidate,
 ) -> Result<(), ImprovementDispatchError> {
-    let change = ChangeDescriptor {
-        target_surface: candidate.target_surface,
-        bounded_tuning: false,
-        touches_protected: is_prohibited_tuning_surface(candidate.target_surface),
-        has_work_item_ref: false,
-    };
+    let change = ChangeDescriptor::from_recorded_surface(candidate.target_surface);
     let class = classify(&change);
     check_class_gate(class, &change, 0, &candidate.rollback, None, false, None)?;
     Ok(())
