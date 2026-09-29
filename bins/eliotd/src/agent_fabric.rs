@@ -3894,3 +3894,81 @@ pub struct AgentFabricDescriptor {
     /// Coordinator capacity identity threaded for this composition.
     pub capacity_identity: String,
 }
+
+/// Frozen solo-slice port binding (issue #2567, AUD1/AUD2/I1).
+///
+/// One row of the frozen six-port table returned by
+/// [`solo_slice_port_freeze`]: the single supported solo path is
+/// `eliot.coordinate { operation: delegate }` (I7.6) under the `SoloVerified`
+/// recipe (I10.15 first supported recipe: one capable agent, then a
+/// deterministic verifier, with optional narrow review). The public MCP
+/// schema is the canonical `DelegateRequest` (`goal`, `owned_resources`,
+/// `expected_result`); the daemon-side intake mirrors those fields instead of
+/// depending on the surface crate, so the bridge direction never inverts.
+/// Task-bound shape is a single lane with `max_fanout == 1`; anything wider
+/// needs the swarm path. Limits are the driver-enforced bounds (bounded
+/// intake queue, bounded projection file, single live slot, future-dated
+/// claim deadline).
+///
+/// Owner methods frozen per row: `ModelRegistryPort::resolve_route` over the
+/// staffing receipt lanes plus the fabric evidence gate; `PeerChannelPort`
+/// and `SwarmControlPort` honestly unused (no accepted B-PEER/B-SWARM
+/// revision on this base, never called on this path, never fabricated);
+/// `AdmissionAuthorityPort::stage_reservation` plus `commit_admission`
+/// coordinating the frozen definition digest, staffing receipt and live
+/// fence/epoch; `ActivationAuthorityPort::activate` binding the committed
+/// admission, attempt membership and live fence/epoch;
+/// `DispatchEgressPort::emit` retaining the activated intent plus the
+/// claim-compatible binding (retention only, never completion). Revisions are
+/// referenced from the enforcing adapters rather than restated here, so the
+/// freeze cannot drift from the code it pins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SoloSlicePortFreeze {
+    /// Which injected seam this row freezes.
+    pub port: FabricPortId,
+    /// Owner-affirmed interface revision the solo slice runs on, or `None`
+    /// when the seam is honestly unused on this path and must stay missing
+    /// rather than fabricate success.
+    pub expect_bound_revision: Option<&'static str>,
+}
+
+/// Returns the frozen six-port table for the solo slice (issue #2567).
+///
+/// The four load-bearing rows pin the exact adapter revisions the solo
+/// driver enforces; the peer/swarm rows pin honestly-unused. Consumers
+/// retain this table alongside the admitted attempt (see
+/// `agent_fabric_solo_adapters`) so a future revision move under a live
+/// attempt is observable instead of silent.
+#[must_use]
+pub fn solo_slice_port_freeze() -> [SoloSlicePortFreeze; 6] {
+    [
+        SoloSlicePortFreeze {
+            port: FabricPortId::ModelRegistry,
+            expect_bound_revision: Some(crate::solo_agent_driver::SOLO_MODEL_REGISTRY_REVISION),
+        },
+        SoloSlicePortFreeze {
+            port: FabricPortId::PeerChannel,
+            expect_bound_revision: None,
+        },
+        SoloSlicePortFreeze {
+            port: FabricPortId::SwarmControl,
+            expect_bound_revision: None,
+        },
+        SoloSlicePortFreeze {
+            port: FabricPortId::AdmissionAuthority,
+            expect_bound_revision: Some(
+                crate::solo_agent_driver::SOLO_ADMISSION_AUTHORITY_REVISION,
+            ),
+        },
+        SoloSlicePortFreeze {
+            port: FabricPortId::ActivationAuthority,
+            expect_bound_revision: Some(
+                crate::solo_agent_driver::SOLO_ACTIVATION_AUTHORITY_REVISION,
+            ),
+        },
+        SoloSlicePortFreeze {
+            port: FabricPortId::DispatchEgress,
+            expect_bound_revision: Some(crate::solo_agent_driver::SOLO_DISPATCH_EGRESS_REVISION),
+        },
+    ]
+}

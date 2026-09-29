@@ -38,6 +38,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+mod agent_fabric_solo_adapters;
 pub mod authority_revocation_ingress;
 pub mod campaign_context_owner;
 pub mod campaign_evaluation_owner;
@@ -746,6 +747,21 @@ pub struct DaemonComposition {
     /// of the store image itself follows the canonical-write envelope wiring
     /// (remainder, #1699); this field never claims it.
     swarm_attachment: eliot_governor::SwarmAttachmentComposition,
+    /// Retained solo-slice live pointer (issue #2567, AUD6 wiring toward one
+    /// persistent live fabric).
+    ///
+    /// At most one live binding exists: refreshed when a drive, poll tick, or
+    /// restore admits (or re-admits) an attempt, consulted on every
+    /// status/cancel/ingest readback for same-attempt divergence. It is
+    /// memory-only and cleared by restart — the state-root projection stays
+    /// the truth — so a missing slot simply defers to the durable readback.
+    /// Interior mutability follows the same `solo_state` pattern above: the
+    /// runtime poll hook and the direct drive entry borrow
+    /// `&DaemonComposition`. Semantics stay in
+    /// [`agent_fabric_solo_adapters`](crate::agent_fabric_solo_adapters);
+    /// this field is only its owner. No lock here is ever held across an
+    /// await: every consult is a bounded in-memory compare.
+    solo_slice_live: std::sync::Mutex<Option<agent_fabric_solo_adapters::SoloSliceLivePointer>>,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -1054,6 +1070,7 @@ impl DaemonComposition {
             swarm_attachment: eliot_governor::SwarmAttachmentComposition::new(
                 eliot_governor::SwarmPlanAttachmentService::new(),
             ),
+            solo_slice_live: std::sync::Mutex::new(None),
         })
     }
 
@@ -3358,7 +3375,9 @@ impl DaemonComposition {
         kernel: &Arc<DaemonKernelClient>,
         intake: solo_agent_driver::SoloDelegateIntake,
     ) -> Result<solo_agent_driver::SoloDriveOutcome, DaemonError> {
-        solo_agent_driver::drive_solo_delegate(self, kernel, intake, unix_ms())
+        let outcome = solo_agent_driver::drive_solo_delegate(self, kernel, intake, unix_ms())?;
+        self.store_solo_slice_live(agent_fabric_solo_adapters::retain_solo_slice_live(&outcome))?;
+        Ok(outcome)
     }
 
     /// Drives one solo delegate through the nonblocking authenticated Kernel
@@ -3390,7 +3409,15 @@ impl DaemonComposition {
         &self,
         kernel: &Arc<DaemonKernelClient>,
     ) -> Result<solo_agent_driver::SoloPollOutcome, DaemonError> {
-        solo_agent_driver::solo_poll_queue(self, kernel)
+        let outcome = solo_agent_driver::solo_poll_queue(self, kernel)?;
+        if let solo_agent_driver::SoloPollOutcome::Drove {
+            operation_id,
+            dispatch_id,
+        } = &outcome
+        {
+            self.refresh_solo_slice_after_poll(operation_id, dispatch_id);
+        }
+        Ok(outcome)
     }
 
     /// Reads one solo attempt status under its durable identity
@@ -3398,49 +3425,69 @@ impl DaemonComposition {
     ///
     /// Thin wrapper over
     /// [`solo_agent_driver::solo_status`](crate::solo_agent_driver::solo_status).
+    /// The retained live pointer is consulted: a same-operation attempt
+    /// divergence refuses instead of serving the wrong attempt.
     ///
     /// # Errors
     ///
-    /// Returns the readiness or readback rejection unchanged.
+    /// Returns the readiness, readback, or live-pointer divergence rejection
+    /// unchanged.
     pub fn solo_status(
         &self,
         operation_id: &str,
     ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
-        solo_agent_driver::solo_status(self, operation_id)
+        let status = solo_agent_driver::solo_status(self, operation_id)?;
+        self.check_solo_slice_live(&status)?;
+        Ok(status)
     }
 
     /// Requests cancellation of one solo attempt (issue #2567).
     ///
     /// Thin wrapper over
     /// [`solo_agent_driver::solo_request_cancel`](crate::solo_agent_driver::solo_request_cancel):
-    /// records the request; possible effects remain reconciling.
+    /// records the request; possible effects remain reconciling. The live
+    /// pointer is consulted so cancellation addresses the same durable
+    /// attempt the slot serves.
     ///
     /// # Errors
     ///
-    /// Returns the readiness or cancellation rejection unchanged.
+    /// Returns the readiness, cancellation, or live-pointer divergence
+    /// rejection unchanged.
     pub fn solo_request_cancel(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         operation_id: &str,
     ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
-        solo_agent_driver::solo_request_cancel(self, kernel, operation_id)
+        let status = solo_agent_driver::solo_request_cancel(self, kernel, operation_id)?;
+        self.check_solo_slice_live(&status)?;
+        Ok(status)
     }
 
     /// Reconciles an observed terminal solo cancellation (issue #2567).
     ///
     /// Thin wrapper over
     /// [`solo_agent_driver::solo_reconcile_cancel`](crate::solo_agent_driver::solo_reconcile_cancel).
+    /// The live pointer is consulted so reconciliation addresses the same
+    /// durable attempt the slot serves.
     ///
     /// # Errors
     ///
-    /// Returns the readiness or reconciliation rejection unchanged.
+    /// Returns the readiness, reconciliation, or live-pointer divergence
+    /// rejection unchanged.
     pub fn solo_reconcile_cancel(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         operation_id: &str,
         terminal_evidence: &str,
     ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
-        solo_agent_driver::solo_reconcile_cancel(self, kernel, operation_id, terminal_evidence)
+        let status = solo_agent_driver::solo_reconcile_cancel(
+            self,
+            kernel,
+            operation_id,
+            terminal_evidence,
+        )?;
+        self.check_solo_slice_live(&status)?;
+        Ok(status)
     }
 
     /// Ingests one worker observation as the correlated candidate result
@@ -3449,11 +3496,13 @@ impl DaemonComposition {
     /// Thin wrapper over
     /// [`solo_agent_driver::solo_ingest_result`](crate::solo_agent_driver::solo_ingest_result):
     /// acknowledgement first (never success), then the candidate result
-    /// (never Finish).
+    /// (never Finish). The live pointer is consulted so the result binds to
+    /// the same durable attempt the slot serves.
     ///
     /// # Errors
     ///
-    /// Returns the readiness or ingestion rejection unchanged.
+    /// Returns the readiness, ingestion, or live-pointer divergence rejection
+    /// unchanged.
     pub fn solo_ingest_result(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3462,14 +3511,16 @@ impl DaemonComposition {
         result_digest: &str,
         observed_via: &str,
     ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
-        solo_agent_driver::solo_ingest_result(
+        let status = solo_agent_driver::solo_ingest_result(
             self,
             kernel,
             operation_id,
             worker_id,
             result_digest,
             observed_via,
-        )
+        )?;
+        self.check_solo_slice_live(&status)?;
+        Ok(status)
     }
 
     /// Restores one solo attempt after a restart without relaunching
@@ -3477,17 +3528,112 @@ impl DaemonComposition {
     ///
     /// Thin wrapper over
     /// [`solo_agent_driver::solo_restore`](crate::solo_agent_driver::solo_restore).
+    /// When the live slot already serves this operation its dispatch binding
+    /// is carried forward with the freshly embedded freeze; otherwise the
+    /// slot is left alone and the durable projection rules.
     ///
     /// # Errors
     ///
-    /// Returns the readiness, readback, restore, or reconciliation rejection
-    /// unchanged.
+    /// Returns the readiness, readback, restore, reconciliation, or
+    /// live-pointer rejection unchanged.
     pub fn solo_restore(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         operation_id: &str,
     ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
-        solo_agent_driver::solo_restore(self, kernel, operation_id)
+        let status = solo_agent_driver::solo_restore(self, kernel, operation_id)?;
+        self.refresh_solo_slice_after_restore(&status)?;
+        Ok(status)
+    }
+
+    /// Stores the solo-slice live pointer on the single slot (issue #2567).
+    ///
+    /// Short critical section only; the lock is never held across an await
+    /// or owner call. A poisoned slot fails closed.
+    fn store_solo_slice_live(
+        &self,
+        pointer: agent_fabric_solo_adapters::SoloSliceLivePointer,
+    ) -> Result<(), DaemonError> {
+        let mut slot = self
+            .solo_slice_live
+            .lock()
+            .map_err(|_| agent_fabric_solo_adapters::slice_slot_poisoned())?;
+        *slot = Some(pointer);
+        Ok(())
+    }
+
+    /// Consults the live pointer against a durable readback (issue #2567).
+    ///
+    /// Short critical section only; the lock is never held across an await
+    /// or owner call. A missing slot or a different operation defers to the
+    /// durable projection; a same-operation attempt divergence refuses.
+    fn check_solo_slice_live(
+        &self,
+        status: &solo_agent_driver::SoloAttemptStatus,
+    ) -> Result<(), DaemonError> {
+        let slot = self
+            .solo_slice_live
+            .lock()
+            .map_err(|_| agent_fabric_solo_adapters::slice_slot_poisoned())?;
+        agent_fabric_solo_adapters::check_retained_solo_slice(slot.as_ref(), status)
+    }
+
+    /// Refreshes the live pointer from a poll-tick durable readback
+    /// (issue #2567).
+    ///
+    /// Best-effort bookkeeping after an already-retained drive: a failed
+    /// readback or a poisoned slot leaves the previous slot in place and is
+    /// logged, so the tick outcome the runtime already observed is never
+    /// rewritten and no binding is invented.
+    fn refresh_solo_slice_after_poll(&self, operation_id: &str, dispatch_id: &str) {
+        match solo_agent_driver::solo_status(self, operation_id) {
+            Ok(status) => {
+                let pointer =
+                    agent_fabric_solo_adapters::pointer_from_solo_status(&status, dispatch_id);
+                if let Err(error) = self.store_solo_slice_live(pointer) {
+                    tracing::warn!(
+                        target: "eliotd::diagnostics",
+                        event = "eliotd.solo_slice_retain_refused",
+                        detail = %error,
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.solo_slice_retain_refused",
+                    detail = %error,
+                );
+            }
+        }
+    }
+
+    /// Carries the live pointer across a restore of the same operation
+    /// (issue #2567).
+    ///
+    /// The dispatch binding is carried from the existing slot — restore
+    /// re-resolves evidence but never mints a new dispatch — with the
+    /// current freeze freshly embedded. Any other operation (or no slot)
+    /// leaves the slot alone: the durable projection rules. Short critical
+    /// section only; a poisoned slot fails closed.
+    fn refresh_solo_slice_after_restore(
+        &self,
+        status: &solo_agent_driver::SoloAttemptStatus,
+    ) -> Result<(), DaemonError> {
+        let mut slot = self
+            .solo_slice_live
+            .lock()
+            .map_err(|_| agent_fabric_solo_adapters::slice_slot_poisoned())?;
+        if let Some(live) = slot.as_ref()
+            && live.operation_id == status.operation_id
+        {
+            let dispatch_id = live.dispatch_id.clone();
+            *slot = Some(agent_fabric_solo_adapters::pointer_from_solo_status(
+                status,
+                &dispatch_id,
+            ));
+        }
+        Ok(())
     }
 
     /// Resolves the session-observed owner half of one verified provider
