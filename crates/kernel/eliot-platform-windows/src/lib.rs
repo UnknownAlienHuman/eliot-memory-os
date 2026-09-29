@@ -254,9 +254,9 @@ pub use process_job::{
 pub use process_path_lease::RetainedProcessPathLease;
 pub use protected_path::{
     ProtectedPathError, ProtectedPathLease, ProtectedPathStage, ProtectedRootLease,
-    canonical_windows_path, prepare_protected_directory, protected_program_data_path,
-    protected_program_data_root, read_protected_file, require_protected_program_data_path,
-    validate_protected_file,
+    ProtectedRootRemoval, canonical_windows_path, prepare_protected_directory,
+    protected_program_data_path, protected_program_data_root, read_protected_file,
+    require_protected_program_data_path, validate_protected_file,
 };
 pub use runtime_receipt_publication::{
     PublicationOutcome, PublicationPrecondition, PublicationReceipt, PublicationUnknown,

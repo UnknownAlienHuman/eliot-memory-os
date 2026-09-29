@@ -223,6 +223,20 @@ pub struct ProtectedRootLease {
     pub(crate) directories: Vec<std::fs::File>,
 }
 
+/// Outcome of one bounded, identity-bound removal of a retained protected root.
+///
+/// There is no third outcome on purpose. A root that cannot be removed is an
+/// error, never a silent success, and the only question a caller has to answer
+/// afterwards is whether the object it held is gone or was left untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtectedRootRemoval {
+    /// The retained root was removed as a single empty directory object.
+    RemovedEmpty,
+    /// The retained root still held at least one entry and was preserved
+    /// whole, together with everything under it.
+    Populated,
+}
+
 impl std::fmt::Debug for ProtectedRootLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -310,6 +324,155 @@ impl ProtectedRootLease {
             Err(ProtectedPathError::UnsupportedPlatform)
         }
     }
+
+    /// Removes this retained root as one empty directory, or proves that it is
+    /// populated and leaves it untouched.
+    ///
+    /// This is the identity-preserving counterpart to a pathname removal. The
+    /// caller never re-proves a name and then deletes that name: the pinned
+    /// ownership proof travels into the irreversible operation itself, and the
+    /// operation is issued on a handle whose stable identity was compared to
+    /// the lease's own pinned identity immediately before it.
+    ///
+    /// # Boundedness
+    ///
+    /// The removal is a single delete disposition against one directory object.
+    /// It cannot enumerate, recurse, or follow into children: the kernel either
+    /// unlinks that one empty directory or refuses, and the refusal is the
+    /// emptiness proof. There is therefore no unbounded recursive sweep on any
+    /// path that reaches this method, and no name-based follow-up delete.
+    ///
+    /// # The emptiness proof is the removal
+    ///
+    /// The disposition is evaluated against the object the handle names at the
+    /// instant it is issued, so emptiness is never proved by a separate
+    /// listing that a later write could invalidate. A root that has been
+    /// populated or adopted after this module created it yields
+    /// [`ProtectedRootRemoval::Populated`], survives whole, and stays
+    /// individually re-provable.
+    ///
+    /// # Consumption
+    ///
+    /// The lease is consumed: the retained leaf handle must be released before
+    /// a delete-access open of the same object is possible, so a lease that
+    /// had issued a removal must not be reused afterwards. Every contour handle
+    /// above the leaf stays open for the whole operation, so the root cannot be
+    /// moved out of the protected contour while the removal runs.
+    pub fn remove_retained_empty_directory(
+        self,
+    ) -> Result<ProtectedRootRemoval, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            remove_retained_empty_directory_inner(self)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn remove_retained_empty_directory_inner(
+    lease: ProtectedRootLease,
+) -> Result<ProtectedRootRemoval, ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let ProtectedRootLease {
+        path,
+        identity,
+        mut directories,
+    } = lease;
+    // Release the retained leaf and only the leaf. It was pinned without delete
+    // sharing, which is exactly what would otherwise refuse a delete-access
+    // open of the same object; every contour handle below it in the vector
+    // stays retained, so the root cannot be moved out of the protected contour
+    // while this operation runs.
+    drop(directories.pop().ok_or(ProtectedPathError::InvalidPath)?);
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options
+        .open(&path)
+        .map_err(|error| protected_path_io_error(ProtectedPathStage::CreateFileW, &error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| protected_path_io_error(ProtectedPathStage::FileMetadata, &error))?;
+    if !metadata.is_dir() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    // The pinned proof is checked on the very handle the removal will be issued
+    // on. A replacement object that won the name while the leaf handle was
+    // released fails this comparison and is refused; and even if one appeared
+    // afterwards, the disposition below would still act on the object this
+    // handle names, never on the name.
+    let observed = file_identity_from_handle(&file).map_err(|error| {
+        protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
+    })?;
+    if observed != identity {
+        return Err(ProtectedPathError::IdentityMismatch);
+    }
+    let final_path = final_windows_path_from_handle(&file)?;
+    if !crate::windows_paths_equal(&final_path, &path) {
+        return Err(ProtectedPathError::IdentityMismatch);
+    }
+    if mark_retained_directory_for_delete(&file)? {
+        Ok(ProtectedRootRemoval::RemovedEmpty)
+    } else {
+        Ok(ProtectedRootRemoval::Populated)
+    }
+}
+
+/// Issues one delete disposition on a retained directory handle and reports
+/// whether the kernel refused it because the directory is not empty.
+///
+/// A successful disposition is a committed removal: the object is unlinked from
+/// its name when this handle closes, which happens before the caller observes
+/// the outcome. The populated refusal leaves the directory and everything under
+/// it exactly as it was. Any other refusal is an error, never a success.
+#[cfg(windows)]
+fn mark_retained_directory_for_delete(file: &std::fs::File) -> Result<bool, ProtectedPathError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    // `ERROR_DIR_NOT_EMPTY`: the Windows status for a delete disposition
+    // refused because the directory still holds at least one entry.
+    const ERROR_DIR_NOT_EMPTY: u32 = 145;
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let ok = unsafe {
+        // SAFETY: `file` is a live directory handle opened with DELETE access
+        // and without delete sharing, and the disposition buffer is the
+        // documented layout and size for `FileDispositionInfo`.
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                .map_err(|_| ProtectedPathError::Io)?,
+        )
+    };
+    if ok != 0 {
+        return Ok(true);
+    }
+    // SAFETY: the last-error value belongs to the calling thread and is read
+    // immediately after the failed call above, before any other Win32 call.
+    if unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_DIR_NOT_EMPTY {
+        return Ok(false);
+    }
+    Err(ProtectedPathError::Io)
 }
 
 impl std::fmt::Debug for ProtectedPathLease {

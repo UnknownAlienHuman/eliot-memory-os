@@ -155,7 +155,23 @@
 //!   root created here is by construction one whose removal path
 //!   ([`remove_reverified_destination`]) can be reached. The proof is taken at
 //!   admission; the recorded root is proved again through the same owner
-//!   immediately before any removal, and preserved when that proof fails.
+//!   immediately before any removal, and that proof is *carried into* the
+//!   removal as the retained lease the removal is issued on, rather than being
+//!   discharged and re-opened by name. The root is preserved whenever the proof
+//!   fails.
+//! - **Cleanup removes only explicitly owned unactivated resources, and
+//!   preserves unknown state rather than deleting by path name.** A removal is
+//!   a single delete disposition issued on the re-proved handle, so it can only
+//!   ever unlink the one empty directory object that handle names. A root with
+//!   any entry in it is `Populated`: preserved whole, reported in
+//!   [`CleanupReport::preserved`] with a static reason, and re-provable on the
+//!   next bounded pass. There is no recursive sweep on any path this module can
+//!   reach, because a `Prepared` record is terminal in the owner's transition
+//!   law — no later record distinguishes a root nobody touched from one a
+//!   restore or another owner populated or adopted, the pinned directory
+//!   identity is provably insensitive to both, and I5.27 holds that a committed
+//!   canonical intent never proves an external effect occurred. Cancellation is
+//!   not that proof and never authorizes a removal.
 //! - **The generation comparison is an owner comparison on the delegated
 //!   path.**
 //!   [`DelegatedPreparation::prepare`] sources
@@ -175,8 +191,10 @@
 //!   [`MAX_CLEANUP_REQUESTED_IDS`], [`MAX_CLEANUP_SWEEP_OPERATIONS`] and
 //!   [`CLEANUP_SWEEP_BUDGET`], and refuses with
 //!   [`PreparationError::SweepBudget`] instead of letting an unbounded journal
-//!   drive unbounded reconciles and `remove_dir_all` calls (A13.9: a Durable
-//!   Job carries a budget).
+//!   drive unbounded reconciles and removals (A13.9: a Durable Job carries a
+//!   budget). A refusal raised after a removal names the operations already
+//!   removed and the ones never reached, so the record of this call's
+//!   irreversible effects is never dropped with its local report.
 //!
 //! # Target build and profile are owner-approved identities
 //!
@@ -208,7 +226,7 @@ use eliot_installation::{
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease,
+    FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease, ProtectedRootRemoval,
     ProtectedRuntimePathLease, windows_paths_equal,
 };
 use serde::{Deserialize, Serialize};
@@ -233,11 +251,12 @@ pub const MAX_CLEANUP_REQUESTED_IDS: usize = 256;
 ///
 /// Each swept operation costs one journal load, one protected-root lease open
 /// (which pins the whole directory contour by retained handle) and at most one
-/// `remove_dir_all`, so the swept key set is the sweep's real work bound. 256
-/// covers every realistic leftover of one Host's preparation history while
-/// staying far below the handle and time pressure of an unbounded journal; a
-/// larger set is refused whole and swept in bounded passes, never truncated
-/// silently (truncation would hide owned roots that still exist).
+/// single-directory removal issued on that lease, so the swept key set is the
+/// sweep's real work bound. 256 covers every realistic leftover of one Host's
+/// preparation history while staying far below the handle and time pressure of
+/// an unbounded journal; a larger set is refused whole and swept in bounded
+/// passes, never truncated silently (truncation would hide owned roots that
+/// still exist).
 ///
 /// The bound applies to the set the call will actually sweep — the journal's own
 /// operations intersected with the caller's narrowing list, or the whole owned
@@ -254,13 +273,14 @@ pub const MAX_CLEANUP_SWEEP_OPERATIONS: usize = 256;
 /// The clock starts before the owned set is listed and is checked after the
 /// listing returns and again before every swept operation, so the bound caps the
 /// number of *subsequent* reconciles and removals rather than interrupting one in
-/// flight (`remove_dir_all` cannot be cancelled once issued) and the listing's
-/// own unbounded cost still falls inside the window even though the call itself
-/// cannot be interrupted. 30 s is generous headroom for 256 individually
-/// re-proven owned roots on a loaded volume and still far below any caller wait
-/// that a runaway sweep could justify; exhaustion refuses with
-/// [`PreparationError::SweepBudget`], names any roots already removed in the same
-/// call, and preserves everything not yet swept.
+/// flight (a removal already issued on a retained handle cannot be cancelled)
+/// and the listing's own unbounded cost still falls inside the window even though
+/// the call itself cannot be interrupted. 30 s is generous headroom for 256
+/// individually re-proven owned roots on a loaded volume and still far below any
+/// caller wait that a runaway sweep could justify; exhaustion refuses with
+/// [`PreparationError::SweepBudget`], names the roots already removed and the
+/// operations not yet swept in the same call, and preserves everything not yet
+/// swept.
 pub const CLEANUP_SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// Domain separator for owner-evidence-bound destination identities.
 pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
@@ -354,30 +374,91 @@ pub enum PreparationError {
     /// deleted and nothing is deleted by truncation, so every root this module
     /// created stays individually re-provable on the next bounded pass. When
     /// the refusal follows removals already performed in the same call, `reason`
-    /// additionally names those completed operation ids — a budget error raised
-    /// after an irreversible effect must never hide which effects occurred.
+    /// additionally names those completed operation ids and the operations this
+    /// call never reached — a budget error raised after an irreversible effect
+    /// must never hide which effects occurred, nor what was left undone.
     #[error("cleanup sweep budget exceeded on {field}: {reason}")]
     SweepBudget { field: &'static str, reason: String },
+    /// A refusal that arrived after this call had already removed owned roots.
+    ///
+    /// A sweep that stops on a post-effect failure must not hide the effects it
+    /// already performed, whatever the refusal was: the removed operation ids
+    /// and the operations that were never reconciled travel with it here
+    /// instead of being dropped with the local report. The wrapped refusal is
+    /// carried unchanged, so its own category and every payload a caller
+    /// matched on before are still present; this variant only adds the
+    /// completed-effect and unswept-remainder evidence.
+    ///
+    /// It exists because several refusals carry no reason field to append to,
+    /// and rewriting them into a different variant would misreport what
+    /// happened.
+    #[error(
+        "cleanup stopped with {removed:?} already removed and {unreconciled:?} not reconciled \
+         in this call; original refusal: {inner}"
+    )]
+    CleanupAfterRemovals {
+        inner: Box<PreparationError>,
+        removed: Vec<String>,
+        unreconciled: Vec<String>,
+    },
+}
+
+/// Appends the completed-effect evidence sentence to one existing reason.
+fn removed_evidence_sentence(removed: &[String], unreconciled: &[String]) -> String {
+    format!(
+        "already removed in this call: {removed:?}; not reconciled in this call: {unreconciled:?}"
+    )
 }
 
 impl PreparationError {
-    /// Names the operations this call already removed, so a refusal raised after
-    /// an irreversible effect still carries the evidence of that effect.
+    /// Names the operations this call already removed and the operations it
+    /// never reached, so a refusal raised after an irreversible effect still
+    /// carries the evidence of that effect.
     ///
     /// Appended to the static reason, never replacing it, and bounded to the
     /// number of ids the sweep can have completed under
-    /// [`MAX_CLEANUP_SWEEP_OPERATIONS`]. An empty set leaves the reason exactly
+    /// [`MAX_CLEANUP_SWEEP_OPERATIONS`]. An empty set leaves the error exactly
     /// as it was.
-    fn with_removed(self, removed: &[String]) -> Self {
-        if removed.is_empty() {
+    ///
+    /// This is a *post-effect* helper: it must be applied on every failure a
+    /// sweep can raise after a removal, not only on budget expiry. Dropping the
+    /// local report at any such `?` loses the only record of the roots this
+    /// module already deleted, which is evidence loss immediately after an
+    /// irreversible effect. Refusals that carry a reason absorb the sentence
+    /// into it; the ones that do not are wrapped in
+    /// [`PreparationError::CleanupAfterRemovals`] rather than rewritten into a
+    /// different refusal, because their payload is the information.
+    fn with_removed(self, removed: &[String], unreconciled: &[String]) -> Self {
+        if removed.is_empty() && unreconciled.is_empty() {
             return self;
         }
+        let evidence = removed_evidence_sentence(removed, unreconciled);
         match self {
+            Self::InvalidRequest { field, reason } => Self::InvalidRequest {
+                field,
+                reason: format!("{reason}; {evidence}"),
+            },
+            Self::ArbitraryPath { reason } => Self::ArbitraryPath {
+                reason: format!("{reason}; {evidence}"),
+            },
+            Self::UnknownState { operation, reason } => Self::UnknownState {
+                operation,
+                reason: format!("{reason}; {evidence}"),
+            },
+            Self::JournalFault(message) => Self::JournalFault(format!("{message}; {evidence}")),
+            Self::FilesystemEffect { path, reason } => Self::FilesystemEffect {
+                path,
+                reason: format!("{reason}; {evidence}"),
+            },
             Self::SweepBudget { field, reason } => Self::SweepBudget {
                 field,
-                reason: format!("{reason}; already removed in this call: {removed:?}"),
+                reason: format!("{reason}; {evidence}"),
             },
-            other => other,
+            other => Self::CleanupAfterRemovals {
+                inner: Box::new(other),
+                removed: removed.to_vec(),
+                unreconciled: unreconciled.to_vec(),
+            },
         }
     }
 }
@@ -497,6 +578,9 @@ fn preparation_error_category(error: &PreparationError) -> (&'static str, &'stat
         PreparationError::PlatformUnsupported => ("platform_unsupported", "platform"),
         PreparationError::FilesystemEffect { .. } => ("filesystem_effect", "path"),
         PreparationError::SweepBudget { field, .. } => ("sweep_budget", field),
+        // The wrapper adds completed-effect evidence, not a new category: the
+        // refusal it carries keeps its own exact category and field.
+        PreparationError::CleanupAfterRemovals { inner, .. } => preparation_error_category(inner),
     }
 }
 
@@ -784,6 +868,13 @@ pub enum ReconcileDisposition {
 }
 
 /// Cleanup report: removed owned-unactivated roots vs preserved unknowns.
+///
+/// `removed` is exactly the set this call issued a single-directory removal
+/// for, and every entry in it was individually re-proved owned *and* empty
+/// through the retained protected-root handle the removal was issued on.
+/// `preserved` is everything else with the exact reason it was not removed,
+/// including a root that is provably owned but no longer empty: that one
+/// survives whole and stays individually re-provable on the next bounded pass.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CleanupReport {
     /// Operation ids whose owned roots were removed.
@@ -1669,7 +1760,8 @@ fn protected_path_to_preparation(
     }
 }
 
-/// Re-proves one recorded destination through the real protected-root owner.
+/// Re-proves one recorded destination through the real protected-root owner
+/// and hands the retained proof back to the caller.
 ///
 /// A recorded receipt is evidence of a past effect, not proof of a live root.
 /// Before a recorded destination is reused ([`reconcile_preparation`]) or
@@ -1681,10 +1773,17 @@ fn protected_path_to_preparation(
 /// [`FileIdentity`] compared against the recorded values. Any failure is a
 /// typed [`PreparationError`]: the recorded root is no longer an owned
 /// protected object, and the caller preserves it rather than acting on a name.
+///
+/// The [`ProtectedRootLease`] is **returned**, not dropped. Re-proving a name
+/// and then acting on that name is the gap this module must not have: a caller
+/// that needs an irreversible operation carries this lease into it, so the
+/// ownership proof is consumed by the operation itself rather than being
+/// discharged into a `Result<(), _>` and a fresh, unprotected open. Callers
+/// that only need the answer (reconciliation) drop the lease immediately.
 fn reverify_recorded_destination(
     operation_id: &str,
     destination: &PreparedDestination,
-) -> Result<(), PreparationError> {
+) -> Result<ProtectedRootLease, PreparationError> {
     let recorded = &destination.root;
     let lease = ProtectedRootLease::open_existing(recorded)
         .map_err(|error| protected_path_to_preparation(operation_id, recorded, error))?;
@@ -1707,7 +1806,7 @@ fn reverify_recorded_destination(
             observed,
         });
     }
-    Ok(())
+    Ok(lease)
 }
 
 /// Validates one admission without effects (cases 958/5-7).
@@ -2167,7 +2266,10 @@ pub fn reconcile_preparation<J: PreparationJournal>(
         });
     };
     match reverify_recorded_destination(operation_id, &destination) {
-        Ok(()) => {
+        // The retained proof has served its purpose here: reconciliation only
+        // answers, and an answer is never an irreversible effect. It is dropped
+        // at the end of this arm, not carried into a later removal.
+        Ok(_lease) => {
             observe_prepare_progress(
                 OP_RECONCILE,
                 "outcome",
@@ -2255,7 +2357,18 @@ pub fn cancel_preparation<J: PreparationJournal>(
 /// root is re-proved through the real protected-root owner immediately before
 /// the irreversible delete ([`reverify_recorded_destination`], applied again
 /// here so the proof is adjacent to the effect, not merely somewhere earlier
-/// in the reconcile). Anything uncertain, foreign, mismatched, unleased, or
+/// in the reconcile). That re-proof **returns the retained lease**, and the
+/// removal is issued on it ([`remove_reverified_destination`]): the pinned
+/// ownership proof is carried into the irreversible operation rather than
+/// discharged and re-opened by name.
+///
+/// The removal is bounded to one empty directory. A root that has been
+/// populated or adopted since this module created it is preserved whole and
+/// reported under [`CleanupReport::preserved`]; nothing is recursively swept,
+/// because a `Prepared` record is terminal in the owner's transition law, so no
+/// later record distinguishes a root nobody touched from one a restore or
+/// another owner adopted, and the pinned directory identity is insensitive to
+/// both. Anything uncertain, foreign, mismatched, unleased, or
 /// source-related is preserved with its reason. Never deletes by bare path
 /// name: every removal is keyed by operation id through the journal, and
 /// `ARCH-RES-03` (A13.7) holds — recovery preserves what it cannot prove it
@@ -2272,6 +2385,13 @@ pub fn cancel_preparation<J: PreparationJournal>(
 /// roots that still exist. Every operation already swept in that call had been
 /// individually re-proven owned before its removal, and the remainder stays
 /// reconcilable by the next bounded pass.
+///
+/// A sweep that stops on *any* post-effect failure — the budget above, or a
+/// journal refusal raised by [`reconcile_preparation`] on a later operation —
+/// names both the operations it already removed and the ones it never reached,
+/// through [`PreparationError::with_removed`]. A bare `?` at either point would
+/// drop the local report and with it the only record of the roots this call
+/// already deleted.
 pub fn cleanup_preparations<J: PreparationJournal>(
     journal: &J,
     operation_ids: &[String],
@@ -2328,24 +2448,36 @@ pub fn cleanup_preparations<J: PreparationJournal>(
             ));
         }
     }
-    for operation_id in &owned {
+    for (index, operation_id) in owned.iter().enumerate() {
         if !operation_ids.is_empty() && !operation_ids.contains(operation_id) {
             continue;
         }
         if budget_start.elapsed() >= CLEANUP_SWEEP_BUDGET {
-            // Removals already performed in THIS call are named in the refusal.
-            // Returning a bare error here would discard the only record of roots
-            // this module already deleted, which is evidence loss immediately
-            // after an irreversible effect.
+            let unreconciled = unreconciled_remainder(&owned[index..], operation_ids);
+            // Removals already performed in THIS call, and the operations this
+            // one never reached, are both named in the refusal. Returning a bare
+            // error here would discard the only record of roots this module
+            // already deleted, which is evidence loss immediately after an
+            // irreversible effect.
             return Err(sweep_budget_refusal(
                 "sweep_elapsed",
                 "sweep budget exhausted; the remainder is preserved for a later pass",
             )
-            .with_removed(&report.removed));
+            .with_removed(&report.removed, &unreconciled));
         }
-        match reconcile_preparation(journal, operation_id)
-            .map_err(|error| note_prepare_error(OP_CLEANUP, "reconcile", error, 0))?
-        {
+        // A reconcile refusal here is also post-effect once an earlier
+        // operation was removed, so the completed removals and the unreached
+        // remainder travel with it. A bare `?` would drop the local report and
+        // take the only record of this call's irreversible effects with it.
+        let disposition = match reconcile_preparation(journal, operation_id) {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                let unreconciled = unreconciled_remainder(&owned[index..], operation_ids);
+                return Err(note_prepare_error(OP_CLEANUP, "reconcile", error, 0)
+                    .with_removed(&report.removed, &unreconciled));
+            }
+        };
+        match disposition {
             ReconcileDisposition::Current(destination) => {
                 remove_reverified_destination(operation_id, &destination, &mut report);
             }
@@ -2388,10 +2520,11 @@ pub fn cleanup_preparations<J: PreparationJournal>(
 /// duration is reported as this stable category plus its static field only.
 ///
 /// When the refusal follows removals that already happened in the same call, the
-/// caller appends those operation ids to the reason through `with_removed`. A
-/// budget error that arrived after irreversible effects must never hide which
-/// effects occurred, so the removed set travels with the refusal instead of
-/// being dropped with the local report.
+/// caller appends those operation ids, and the operations it never reached, to
+/// the reason through [`PreparationError::with_removed`]. A budget error that
+/// arrived after irreversible effects must never hide which effects occurred,
+/// so both sets travel with the refusal instead of being dropped with the local
+/// report.
 fn sweep_budget_refusal(field: &'static str, reason: &'static str) -> PreparationError {
     note_prepare_error(
         OP_CLEANUP,
@@ -2404,37 +2537,83 @@ fn sweep_budget_refusal(field: &'static str, reason: &'static str) -> Preparatio
     )
 }
 
-/// Removes one re-proven owned root, or preserves it with the reason.
+/// Removes one re-proven owned root as a single empty directory, or preserves
+/// it with the reason.
 ///
-/// The protected-root proof is repeated here, immediately before the
-/// irreversible effect: [`reconcile_preparation`] proves the recorded root at
-/// reconcile time, and this is the last chance to notice that the object at
-/// that path is no longer the one this lane created.
+/// The protected-root proof is taken here, immediately before the irreversible
+/// effect, and it is **carried into** the effect rather than discharged: the
+/// lease returned by [`reverify_recorded_destination`] is handed straight to
+/// [`ProtectedRootLease::remove_retained_empty_directory`], which compares the
+/// pinned identity on the very handle the removal is issued on. There is no
+/// pathname between the proof and the delete, and no second, unprotected open.
+///
+/// The removal is bounded to one empty directory. A root that still holds any
+/// entry is not this module's to destroy: a `Prepared` record is terminal in the
+/// owner's transition law, so nothing downstream records that a restore or
+/// another owner populated or adopted the root, and the pinned identity is
+/// provably insensitive to that. I5.27 is the same rule from the other side — a
+/// committed canonical intent never proves an external effect occurred exactly
+/// once — so the receipt cannot be read as permission to destroy what is now
+/// there. Such a root is therefore reported
+/// [`ProtectedRootRemoval::Populated`] and preserved whole, under
+/// [`CleanupReport::preserved`], with a static reason naming the exact reason —
+/// it needs the owning cleanup protocol, not a recursive sweep. It survives this
+/// pass and stays individually re-provable on the next bounded one.
+///
+/// Cancellation is not that proof and is never consulted here. Only a recorded
+/// `Prepared` receipt, re-proved against the pinned identity, authorizes a
+/// removal, and even then only of an empty root.
 fn remove_reverified_destination(
     operation_id: &str,
     destination: &PreparedDestination,
     report: &mut CleanupReport,
 ) {
-    if let Err(error) = reverify_recorded_destination(operation_id, destination) {
-        observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
-        report
-            .preserved
-            .push((operation_id.to_owned(), error.to_string()));
-        return;
-    }
-    match std::fs::remove_dir_all(&destination.root) {
-        Ok(()) => {
+    let lease = match reverify_recorded_destination(operation_id, destination) {
+        Ok(lease) => lease,
+        Err(error) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            report
+                .preserved
+                .push((operation_id.to_owned(), error.to_string()));
+            return;
+        }
+    };
+    match lease.remove_retained_empty_directory() {
+        Ok(ProtectedRootRemoval::RemovedEmpty) => {
             observe_prepare_progress(OP_CLEANUP, "remove", "removed", 0, 0);
             report.removed.push(operation_id.to_owned());
         }
-        Err(error) => {
+        Ok(ProtectedRootRemoval::Populated) => {
             observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
             report.preserved.push((
                 operation_id.to_owned(),
-                format!("removal failed, preserved: {error}"),
+                "re-proven owned root is no longer empty; contents are not provably owned by this \
+                 preparation, so the root and its contents are preserved whole and require the \
+                 owning cleanup protocol, never a recursive sweep by path name"
+                    .to_owned(),
             ));
         }
+        Err(error) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            let refusal = protected_path_to_preparation(operation_id, &destination.root, error);
+            report
+                .preserved
+                .push((operation_id.to_owned(), refusal.to_string()));
+        }
     }
+}
+
+/// The journal-owned operations this sweep has not yet reconciled or removed,
+/// starting at `rest` and narrowed by the same rule the sweep itself uses.
+///
+/// Named on a post-effect failure so a refusal never hides the work that was
+/// left undone. The list is bounded by [`MAX_CLEANUP_SWEEP_OPERATIONS`], the
+/// same bound that produced it.
+fn unreconciled_remainder(rest: &[String], requested: &[String]) -> Vec<String> {
+    rest.iter()
+        .filter(|operation_id| requested.is_empty() || requested.contains(operation_id))
+        .cloned()
+        .collect()
 }
 
 /// Resolves the source installation root from manifest-bound owner runtime
