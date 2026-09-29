@@ -851,9 +851,11 @@ fn v1_string_authority_wire_is_rejected_before_admission() {
     value["state_fence"] = serde_json::json!("legacy-fence");
     assert!(serde_json::from_value::<WorkerHello>(value).is_err());
 
-    let mut value =
-        serde_json::to_value(frame("request-1", WorkerFrameBody::Execute(execute_call(None))))
-            .expect("fixture");
+    let mut value = serde_json::to_value(frame(
+        "request-1",
+        WorkerFrameBody::Execute(execute_call(None)),
+    ))
+    .expect("fixture");
     value["protocol_version"] = serde_json::json!("eliot-native-worker/v1");
     value["authority_epoch"] = serde_json::json!("1");
     value["state_fence"] = serde_json::json!("legacy-fence");
@@ -959,14 +961,20 @@ fn stale_epoch_and_fence_are_rejected_before_live_provider_use() {
         .lock()
         .expect("admission lock")
         .revalidations;
-    let mut stale_epoch = frame("execute-epoch", WorkerFrameBody::Execute(execute_call(None)));
+    let mut stale_epoch = frame(
+        "execute-epoch",
+        WorkerFrameBody::Execute(execute_call(None)),
+    );
     stale_epoch.authority_epoch = test_epoch(2);
     stale_epoch.state_fence.authority_epoch = test_epoch(2);
     assert_eq!(
         block_on(core.handle(stale_epoch)),
         Err(WorkerError::StaleEpoch)
     );
-    let mut stale_fence = frame("execute-fence", WorkerFrameBody::Execute(execute_call(None)));
+    let mut stale_fence = frame(
+        "execute-fence",
+        WorkerFrameBody::Execute(execute_call(None)),
+    );
     stale_fence.state_fence = StateFence::new(
         test_epoch(1),
         ResourceGeneration::new(2).expect("generation"),
@@ -1561,9 +1569,11 @@ fn native_case_19_protocol_label_and_field_shape_must_match_v2() {
         serde_json::to_value(hello("connection-19", "request-19")).expect("hello wire");
     hello_wire["authority_epoch"] = serde_json::json!("1");
     assert!(serde_json::from_value::<WorkerHello>(hello_wire).is_err());
-    let mut frame_wire =
-        serde_json::to_value(frame("request-19", WorkerFrameBody::Execute(execute_call(None))))
-            .expect("frame wire");
+    let mut frame_wire = serde_json::to_value(frame(
+        "request-19",
+        WorkerFrameBody::Execute(execute_call(None)),
+    ))
+    .expect("frame wire");
     frame_wire["state_fence"] = serde_json::json!("legacy-fence");
     assert!(serde_json::from_value::<WorkerFrame>(frame_wire).is_err());
 
