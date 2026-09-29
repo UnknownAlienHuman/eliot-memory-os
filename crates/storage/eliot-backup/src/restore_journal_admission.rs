@@ -107,6 +107,25 @@ pub struct DurableJournalRecord {
 /// it: the check compares that answer, transaction included, against a second
 /// read of the same owner, so a value that was never committed durably cannot
 /// agree with itself across the two reads of a live store.
+///
+/// What an implementation owes, in order:
+///
+/// 1. Answer for the `journal_key` it was asked about, or refuse. It must not
+///    answer for whichever key it likes.
+/// 2. Read the database, the installation, the generation and the receipt from
+///    its own committed records, and return the receipt's recorded value
+///    rather than a digest recomputed over what it is holding.
+/// 3. Return the transaction it durably admitted, from that same committed
+///    state. This is what makes the record an *operation* record; without it
+///    the same admission would be replayable for any other plan sharing the
+///    stream, and the issuer refuses.
+/// 4. Refuse, typed, when it holds nothing for that key. An empty record is not
+///    an answer.
+///
+/// A real implementation belongs beside the store it reads: the composition
+/// that holds the restore journal together with the installation registry it
+/// admits against. This crate supplies no owner of its own, and a port with no
+/// owner behind it issues nothing.
 pub trait RestoreJournalAdmissionOwner {
     /// Reads the owner's durable journal record for `journal_key`.
     ///
