@@ -289,7 +289,7 @@ impl DrainHalt {
     reason = "the publication is a coherent one-reader snapshot; splitting it would fork the observed state"
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ShutdownPublication {
+pub struct ShutdownPublication {
     pub(crate) generation: String,
     pub(crate) requested: bool,
     pub(crate) phases_completed: Vec<String>,
