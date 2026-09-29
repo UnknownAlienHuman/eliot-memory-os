@@ -709,11 +709,13 @@ pub struct InstallationEffectProgress {
 }
 
 struct UserModeActivationEffectPositions {
+    store_credential: usize,
     phase_b: usize,
     task: usize,
 }
 
 struct PortableDevActivationEffectPositions {
+    store_credential: usize,
     phase_b: usize,
 }
 
@@ -1831,30 +1833,29 @@ impl InstallationTransaction {
         }
 
         let positions = self.user_mode_activation_effect_positions()?;
-        let phase_b = positions.phase_b;
         if !self.service_registration_approvals_unchecked()?.is_empty() {
             return Err(InstallationError::ProfileViolation(
                 "UserMode activation cannot produce SCM service approvals".to_owned(),
             ));
         }
         for (index, progress) in self.effect_progress.iter().enumerate() {
-            let expected_applied = index < phase_b;
-            let state_matches = match (&progress.state, expected_applied) {
-                (InstallationEffectProgressState::Applied { .. }, true)
-                | (InstallationEffectProgressState::Pending, false) => true,
-                _ => false,
+            let expected_applied = index < positions.store_credential;
+            let state_matches = if expected_applied {
+                matches!(progress.state, InstallationEffectProgressState::Applied { .. })
+            } else {
+                matches!(progress.state, InstallationEffectProgressState::Pending)
             };
             if !state_matches {
                 return Err(InstallationError::IncompleteObservation(
-                    "UserMode activation requires its root, package, authority, and current-user credential prefix Applied while PhaseB/task remain Pending"
+                    "UserMode pending activation requires roots, package, and authority Applied while the current-user credential, PhaseB, and task remain Pending"
                         .to_owned(),
                 ));
             }
-            if index >= phase_b
+            if index >= positions.store_credential
                 && (progress.phase_b_receipt.is_some() || progress.staging_receipt.is_some())
             {
                 return Err(InstallationError::IncompleteObservation(
-                    "pending UserMode PhaseB/task suffix must not carry synthetic receipts"
+                    "pending UserMode credential/PhaseB/task suffix must not carry synthetic receipts"
                         .to_owned(),
                 ));
             }
@@ -1910,10 +1911,18 @@ impl InstallationTransaction {
         let positions = self.user_mode_activation_effect_positions()?;
         for (index, progress) in self.effect_progress.iter().enumerate() {
             let expected_applied = index <= positions.phase_b;
-            let state_matches = match (&progress.state, expected_applied) {
-                (InstallationEffectProgressState::Applied { .. }, true)
-                | (InstallationEffectProgressState::Pending, false) => true,
-                _ => false,
+            let state_matches = if expected_applied {
+                matches!(progress.state, InstallationEffectProgressState::Applied { .. })
+            } else if index == positions.task {
+                matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Pending
+                        | InstallationEffectProgressState::IntentCommitted { .. }
+                        | InstallationEffectProgressState::Unknown { .. }
+                        | InstallationEffectProgressState::Applied { .. }
+                )
+            } else {
+                matches!(progress.state, InstallationEffectProgressState::Pending)
             };
             if !state_matches {
                 return Err(InstallationError::IncompleteObservation(
@@ -1922,6 +1931,7 @@ impl InstallationTransaction {
                 ));
             }
             if index > positions.phase_b
+                && index != positions.task
                 && (progress.phase_b_receipt.is_some()
                     || progress.staging_receipt.is_some()
                     || progress.current_user_task_receipt.is_some()
@@ -1939,6 +1949,36 @@ impl InstallationTransaction {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
+    }
+
+    /// Returns the exact persisted RunEx intent for the planned UserMode task.
+    ///
+    /// Callers must validate the transaction before using this read-only
+    /// projection. The retained session identifies the RunEx attempt and may
+    /// differ from the session in the original registration receipt.
+    #[must_use]
+    pub fn current_user_task_run_intent(&self) -> Option<&CurrentUserTaskRunIntent> {
+        self.installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .find_map(|(effect, progress)| {
+                matches!(effect, InstallerEffectPlan::RegisterCurrentUserTask { .. })
+                    .then_some(progress.current_user_task_run_intent.as_ref())
+                    .flatten()
+            })
+    }
+
+    /// Returns the exact persisted RunEx receipt for the planned UserMode task.
+    #[must_use]
+    pub fn current_user_task_run_receipt(&self) -> Option<&CurrentUserTaskRunReceipt> {
+        self.installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .find_map(|(effect, progress)| {
+                matches!(effect, InstallerEffectPlan::RegisterCurrentUserTask { .. })
+                    .then_some(progress.current_user_task_run_receipt.as_ref())
+                    .flatten()
+            })
     }
 
     /// Retains the exact live Phase-B request before the current-user task
@@ -1987,7 +2027,11 @@ impl InstallationTransaction {
     /// second time.
     pub(crate) fn record_current_user_task_run_intent(
         &mut self,
+        live_session_id: u32,
     ) -> Result<CurrentUserTaskRunIntent, InstallationError> {
+        if live_session_id == 0 {
+            return Err(InstallationError::IdentityConflict);
+        }
         let positions = self.user_mode_activation_effect_positions()?;
         let progress = self
             .effect_progress
@@ -2014,7 +2058,7 @@ impl InstallationTransaction {
             )?,
             task_name: receipt.task_name.clone(),
             sid: receipt.sid.clone(),
-            session_id: receipt.session_id,
+            session_id: live_session_id,
             task_xml_sha256: task_digest_handle(
                 &receipt.task_xml_sha256,
                 "effect_progress.current_user_task_run_intent.task_xml_sha256",
@@ -2205,6 +2249,21 @@ impl InstallationTransaction {
                 reason: error.to_string(),
             }
         })?;
+        let task_index = self.user_mode_activation_effect_positions()?.task;
+        let absence_snapshot = self.effect_progress[task_index]
+            .admitted_precondition
+            .as_ref()
+            .and_then(|precondition| precondition.current_user_task_snapshot.as_ref())
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "task receipt validation requires its original typed absence observation"
+                    .to_owned(),
+            })?;
+        if absence_snapshot.request_digest.as_str() != expected_request_digest
+            || absence_snapshot.task_name != receipt.task_name
+            || absence_snapshot.sid != receipt.sid
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         text(&receipt.task_name, "current_user_task_receipt.task_name")?;
         text(&receipt.sid, "current_user_task_receipt.sid")?;
         sha256_handle(
@@ -2282,7 +2341,6 @@ impl InstallationTransaction {
             || intent.task_name != task_receipt.task_name
             || intent.sid != task_receipt.sid
             || intent.session_id == 0
-            || intent.session_id != task_receipt.session_id
             || intent.task_xml_sha256.as_str() != task_receipt.task_xml_sha256
         {
             return Err(InstallationError::IdentityConflict);
@@ -2483,7 +2541,11 @@ impl InstallationTransaction {
                     .to_owned(),
             ));
         }
-        Ok(UserModeActivationEffectPositions { phase_b, task })
+        Ok(UserModeActivationEffectPositions {
+            store_credential,
+            phase_b,
+            task,
+        })
     }
 
     fn require_portable_dev_pre_activation_effects_at(
@@ -2523,19 +2585,19 @@ impl InstallationTransaction {
         }
         let positions = self.portable_dev_activation_effect_positions()?;
         for (index, progress) in self.effect_progress.iter().enumerate() {
-            let expected_applied = index < positions.phase_b;
-            let state_matches = match (&progress.state, expected_applied) {
-                (InstallationEffectProgressState::Applied { .. }, true)
-                | (InstallationEffectProgressState::Pending, false) => true,
-                _ => false,
+            let expected_applied = index < positions.store_credential;
+            let state_matches = if expected_applied {
+                matches!(progress.state, InstallationEffectProgressState::Applied { .. })
+            } else {
+                matches!(progress.state, InstallationEffectProgressState::Pending)
             };
             if !state_matches {
                 return Err(InstallationError::IncompleteObservation(
-                    "PortableDev activation requires roots, package, authority, and current-user Store credential Applied while PhaseB remains Pending"
+                    "PortableDev pending activation requires roots, package, and authority Applied while the current-user Store credential and PhaseB remain Pending"
                         .to_owned(),
                 ));
             }
-            if index >= positions.phase_b
+            if index >= positions.store_credential
                 && (progress.phase_b_receipt.is_some()
                     || progress.staging_receipt.is_some()
                     || progress.current_user_task_receipt.is_some()
@@ -2589,7 +2651,112 @@ impl InstallationTransaction {
                     .to_owned(),
             ));
         }
-        Ok(PortableDevActivationEffectPositions { phase_b })
+        Ok(PortableDevActivationEffectPositions {
+            store_credential,
+            phase_b,
+        })
+    }
+
+    /// Validates the signed post-launch prefix from which the current-user
+    /// credential and Phase-B effects may be driven.
+    ///
+    /// The roots/package/profile authority prefix must already be applied.
+    /// The credential and Phase-B effects may be pending or unresolved so the
+    /// coordinator can reconcile their exact durable intents after the
+    /// profile Host has started. This method does not infer that a Host is
+    /// alive; the authenticated Host effect adapter proves that at each call.
+    pub(crate) fn require_profile_phase_b_drive_ready(
+        &self,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        if self.stage != InstallationStage::Activating
+            || self.activation_projection_intent.is_none()
+            || !matches!(
+                self.profile,
+                InstallationProfile::UserMode | InstallationProfile::PortableDev
+            )
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "profile Phase-B drive requires a signed, activating UserMode or PortableDev transaction"
+                    .to_owned(),
+            ));
+        }
+        let selection = self
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "profile Phase-B drive requires the original retained root selection"
+                    .to_owned(),
+            })?;
+        self.profile_governed_roots
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?
+            .validate_profile_selection_receipt(&self.candidate_manifest.runtime_launch, selection)?;
+        self.require_profile_root_creation_complete()?;
+        if self.installer_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                InstallerEffectPlan::RegisterService { .. }
+                    | InstallerEffectPlan::StartService { .. }
+            )
+        }) || !self.service_registration_approvals_unchecked()?.is_empty()
+        {
+            return Err(InstallationError::ProfileViolation(
+                "current-user Phase-B drive cannot depend on SCM effects or approvals".to_owned(),
+            ));
+        }
+        let (store_credential, phase_b) = match self.profile {
+            InstallationProfile::UserMode => {
+                let positions = self.user_mode_activation_effect_positions()?;
+                (positions.store_credential, positions.phase_b)
+            }
+            InstallationProfile::PortableDev => {
+                let positions = self.portable_dev_activation_effect_positions()?;
+                (positions.store_credential, positions.phase_b)
+            }
+            InstallationProfile::SystemService => return Err(InstallationError::IdentityConflict),
+        };
+        if self.effect_progress[..store_credential].iter().any(|progress| {
+            !matches!(progress.state, InstallationEffectProgressState::Applied { .. })
+        }) {
+            return Err(InstallationError::IncompleteObservation(
+                "profile roots, package and supervision authority must be Applied before Phase-B drive"
+                    .to_owned(),
+            ));
+        }
+        let credential_progress = &self.effect_progress[store_credential];
+        if !matches!(
+            credential_progress.state,
+            InstallationEffectProgressState::Pending
+                | InstallationEffectProgressState::IntentCommitted { .. }
+                | InstallationEffectProgressState::Unknown { .. }
+                | InstallationEffectProgressState::Applied { .. }
+        ) || (matches!(
+            credential_progress.state,
+            InstallationEffectProgressState::Applied { .. }
+        ) && credential_progress
+            .store_credential
+            .as_ref()
+            .is_none_or(|progress| progress.receipt.is_none()))
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "current-user credential effect lacks a reconcilable exact receipt state"
+                    .to_owned(),
+            ));
+        }
+        let phase_b_progress = &self.effect_progress[phase_b];
+        if !matches!(
+            phase_b_progress.state,
+            InstallationEffectProgressState::Pending
+                | InstallationEffectProgressState::IntentCommitted { .. }
+                | InstallationEffectProgressState::Unknown { .. }
+                | InstallationEffectProgressState::Applied { .. }
+        ) {
+            return Err(InstallationError::IncompleteObservation(
+                "Phase-B effect is not in a reconcilable transaction state".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn required_effect_position(
@@ -3112,6 +3279,14 @@ impl InstallationTransaction {
                             && precondition.os_snapshot.is_none()
                             && precondition.credential_snapshot.is_none()
                             && precondition.package_snapshot.is_none()
+                    }
+                    InstallerEffectPlan::RegisterCurrentUserTask { .. } => {
+                        precondition.current_user_task_snapshot.is_some()
+                            && precondition.os_snapshot.is_none()
+                            && precondition.credential_snapshot.is_none()
+                            && precondition.package_snapshot.is_none()
+                            && precondition.user_mode_authority_snapshot.is_none()
+                            && precondition.portable_dev_authority_snapshot.is_none()
                     }
                     InstallerEffectPlan::StagePackage { .. }
                     | InstallerEffectPlan::MaterializePhaseB { .. } => {
@@ -4308,6 +4483,9 @@ impl InstallationTransaction {
             ));
         }
         self.validate()?;
+        if self.profile == InstallationProfile::UserMode {
+            self.require_all_effects_applied()?;
+        }
         handles(&evidence, "stage_evidence", true)?;
         receipt.validate_against_transaction(self)?;
         if self.active_verified_receipt.is_some() {
