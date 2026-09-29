@@ -16,12 +16,12 @@ use std::collections::BTreeMap;
 
 use eliot_context_contracts::{
     AdmissionDisposition, AdmittedAtom, AdmittedContextSet, AtomRepresentation,
-    BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryDenominator, BoundaryDisposition,
-    BoundaryDispositionRecord, BoundaryMember, BoundaryMemberCoverage, BoundaryMemberOrigin,
-    BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole, BoundaryMetadataEnvelope,
-    BoundaryMetadataSet, BoundaryPrecision, BoundaryRecovery, BoundaryTransformRelation,
-    BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ContextBinding,
-    ContextError, ContextRecipe, RenderedAtom,
+    BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryDenominator,
+    BoundaryDisposition, BoundaryDispositionRecord, BoundaryMember, BoundaryMemberCoverage,
+    BoundaryMemberOrigin, BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole,
+    BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryRecovery,
+    BoundaryTransformRelation, BoundaryTransformerRevision, BoundaryUnitKind,
+    BoundaryValidationLimits, ContextBinding, ContextError, ContextRecipe, RenderedAtom,
 };
 use eliot_contracts::{ArtifactId, ContractVersion, canonical_json_bytes, sha256_hex};
 use serde::Serialize;
@@ -265,8 +265,7 @@ pub fn read_back_boundaries(
     output_digest: &str,
     rendered: &[RenderedAtom],
 ) -> Result<BoundaryMetadataSet, ContextError> {
-    let reconstructed =
-        BoundaryMetadataSet::unpack(packed, &assembly_boundary_limits())?;
+    let reconstructed = BoundaryMetadataSet::unpack(packed, &assembly_boundary_limits())?;
     verify_boundary_binding(
         recorded_binding,
         admitted_receipt_digest,

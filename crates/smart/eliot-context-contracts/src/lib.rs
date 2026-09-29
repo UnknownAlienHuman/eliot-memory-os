@@ -47,10 +47,9 @@ pub use boundary::{
     BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
     BoundaryDenominator, BoundaryDisposition, BoundaryDispositionRecord, BoundaryGap,
     BoundaryGapReason, BoundaryMember, BoundaryMemberCoverage, BoundaryMemberOrigin,
-    BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole,
-    BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryRecovery,
-    BoundaryTransformRelation, BoundaryTransformerRevision, BoundaryUnitKind,
-    BoundaryValidationLimits, ExactSourceRange,
+    BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole, BoundaryMetadataEnvelope,
+    BoundaryMetadataSet, BoundaryPrecision, BoundaryRecovery, BoundaryTransformRelation,
+    BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ExactSourceRange,
 };
 
 pub use canonical_projections::{

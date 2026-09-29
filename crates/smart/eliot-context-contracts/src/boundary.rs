@@ -673,7 +673,9 @@ impl BoundaryMetadataEnvelope {
             BoundaryRecovery::NonRecoverable(_) | BoundaryRecovery::Unknown => &[],
         };
         if claimed.len() != self.expansion_refs.len()
-            || !claimed.iter().all(|handle| self.expansion_refs.contains(handle))
+            || !claimed
+                .iter()
+                .all(|handle| self.expansion_refs.contains(handle))
         {
             return Err(ContextError::OmissionHandleInvalid);
         }
@@ -1087,8 +1089,7 @@ impl BoundaryMetadataSet {
     /// nothing else, so byte transport chunking stays separate from logical
     /// segmentation: reassembling the exact bytes restores the exact units.
     pub fn pack(&self) -> Result<Vec<u8>, ContextError> {
-        canonical_json_bytes(self)
-            .map_err(|_| ContextError::InvalidField("boundary.pack_payload"))
+        canonical_json_bytes(self).map_err(|_| ContextError::InvalidField("boundary.pack_payload"))
     }
 
     /// Reassemble a packed set from canonical wire bytes and validate it.

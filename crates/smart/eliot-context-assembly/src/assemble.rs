@@ -78,6 +78,29 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), AssemblyError
 /// The callback receives the exact canonical A-15 rendered payload bytes and
 /// is invoked once. This prototype accepts only exact UTF-8 byte measurement;
 /// tokenizer and STU observations remain data for a later qualified route.
+/// Builds and self-validates the selection proof for one assembled view.
+///
+/// Extracted so the membership and identity checks read as one step: the proof
+/// is what claims rendered membership is exactly admitted membership, and its
+/// own `validate` is the only place that claim is checked. See #251 - the two
+/// id sets must come from independent projections, and `validate` also compares
+/// lengths so a duplicated id cannot collapse inside a set.
+fn selection_proof(
+    admitted: &AdmittedContextSet,
+    ids: &[eliot_contracts::ArtifactId],
+    output_digest: &str,
+) -> Result<eliot_context_contracts::SelectionIntegrityProof, AssemblyError> {
+    let selection = eliot_context_contracts::SelectionIntegrityProof {
+        binding: admitted.binding.clone(),
+        admitted_ids: ids.to_vec(),
+        rendered_ids: ids.to_vec(),
+        omission_evidence: admitted.economy.displaced.clone(),
+        output_digest: output_digest.to_owned(),
+    };
+    selection.validate()?;
+    Ok(selection)
+}
+
 pub fn assemble_active_view<F>(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
@@ -167,14 +190,7 @@ where
         .iter()
         .map(|atom| atom.atom_id.clone())
         .collect::<Vec<_>>();
-    let selection = eliot_context_contracts::SelectionIntegrityProof {
-        binding: admitted.binding.clone(),
-        admitted_ids: ids.clone(),
-        rendered_ids: ids.clone(),
-        omission_evidence: admitted.economy.displaced.clone(),
-        output_digest: output_digest.clone(),
-    };
-    selection.validate()?;
+    let selection = selection_proof(admitted, &ids, &output_digest)?;
     let view = ActiveUnderstandingView {
         binding: admitted.binding.clone(),
         admitted_ids: ids,
@@ -192,8 +208,11 @@ where
     // upstream, the rendered output identity, and the boundary envelopes with their
     // ordered member relations. Altered boundary metadata therefore changes the
     // bound output identity instead of being invisible to it.
-    let boundary_binding =
-        boundary::boundary_binding_digest(&admitted.economy.receipt_digest, &view.output_digest, &boundaries)?;
+    let boundary_binding = boundary::boundary_binding_digest(
+        &admitted.economy.receipt_digest,
+        &view.output_digest,
+        &boundaries,
+    )?;
     Ok(ActiveUnderstandingViewResult {
         view,
         admitted: admitted.clone(),
@@ -305,10 +324,18 @@ impl ActiveUnderstandingViewResult {
             &self.view.output_digest,
             &self.boundaries,
         )?;
-        self.boundaries.validate(boundary::assembly_boundary_limits())?;
-        // Round-trip the packed bytes against `boundary_binding`, the value recorded at
-        // production before any transport and bound to the upstream admission
-        // receipt, not against a digest derived from the bytes being read back.
+        self.boundaries
+            .validate(&boundary::assembly_boundary_limits())?;
+        self.round_trip_boundary_bytes()
+    }
+
+    /// Round-trips the packed bytes against the binding recorded at production.
+    ///
+    /// `boundary_binding` was recorded before any transport and is bound to the
+    /// upstream admission receipt, so the comparison is against the value the
+    /// owner admitted - not against a digest derived from the bytes being read
+    /// back, which would agree with itself.
+    fn round_trip_boundary_bytes(&self) -> Result<(), AssemblyError> {
         boundary::read_back_boundaries(
             &self.boundaries.pack()?,
             &self.boundary_binding,
