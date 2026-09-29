@@ -77,7 +77,8 @@ pub use execution_manifest::{
 pub use maintenance_trigger_staging::{
     MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
     MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest,
-    MaintenanceTriggerStagingRoute, stage_maintenance_trigger_intake,
+    MaintenanceTriggerStagingRoute, prove_maintenance_trigger_staging,
+    stage_maintenance_trigger_intake,
 };
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
