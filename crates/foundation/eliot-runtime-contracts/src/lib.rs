@@ -132,9 +132,13 @@ pub use runtime_live::{
 };
 
 pub use supervision_authority::{
-    ProvisionedSupervisionAuthority, SUPERVISION_AUTHORITY_HOST_SERVICE,
-    SUPERVISION_AUTHORITY_SERVICE_SID_TYPE, SupervisionSealedKeyFileIdentity,
-    SupervisionSealedKeyReference, WINDOWS_SERVICE_SID_DPAPI_NG_PROVIDER,
+    PORTABLE_DEV_DISPOSABLE_KEY_PROVIDER, PORTABLE_DEV_SUPERVISION_KEY_PREFIX,
+    PortableDevSupervisionKeyReference, ProvisionedSupervisionAuthority,
+    SUPERVISION_AUTHORITY_HOST_SERVICE, SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
+    SupervisionAuthorityKeyReference, SupervisionOwnerSidReceipt, SupervisionSealedKeyFileIdentity,
+    SupervisionSealedKeyReference, USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX,
+    UserModeSupervisionKeyReference, WINDOWS_CURRENT_USER_CREDENTIAL_MANAGER_PROVIDER,
+    WINDOWS_SERVICE_SID_DPAPI_NG_PROVIDER,
 };
 
 pub use supervision_incarnation::{

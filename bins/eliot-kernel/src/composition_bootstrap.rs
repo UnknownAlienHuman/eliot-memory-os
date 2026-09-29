@@ -1215,7 +1215,19 @@ impl KernelComposition {
             .supervision_lease_authority
             .clone()
             .map(|authority| {
-                KernelSupervisionLeaseAuthority::new(Arc::clone(&ors), work_root.clone(), authority)
+                let profile = config.supervision_installation_profile.ok_or_else(|| {
+                    KernelBuildError::Service(
+                        "supervision authority requires the retained installation profile"
+                            .to_owned(),
+                    )
+                })?;
+                KernelSupervisionLeaseAuthority::new(
+                    Arc::clone(&ors),
+                    work_root.clone(),
+                    profile,
+                    config.portable_dev_repository_root.clone(),
+                    authority,
+                )
             })
             .transpose()?;
         let _ = &platform;

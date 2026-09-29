@@ -141,7 +141,14 @@ pub(super) fn verify_host_artifact_at(
         HostError::ProcessContour(error.to_string())
     })?;
     let launch = &manifest.runtime_launch;
-    let portable_root = if launch.profile == InstallationProfile::PortableDev {
+    let portable_root = if launch.profile == InstallationProfile::UserMode {
+        Some(
+            UserOwnedRootLease::open_existing(Path::new(
+                launch.profile_governed_roots.immutable_binaries.as_str(),
+            ))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        )
+    } else if launch.profile == InstallationProfile::PortableDev {
         Some(
             UserOwnedRootLease::open_existing(Path::new(
                 launch

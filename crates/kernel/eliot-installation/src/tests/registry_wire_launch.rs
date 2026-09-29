@@ -63,6 +63,7 @@ fn system_service_registry_wire_rejects_zero_and_partial_approval_pairs() {
                 ),
                 active: false,
                 last_known_good: false,
+                profile_selection_receipt: None,
             }],
             service_registration_approvals,
             active_generation: None,
@@ -92,6 +93,7 @@ fn current_registry_rejects_omitted_watchdog_service_control_grant_member() {
             ),
             active: false,
             last_known_good: false,
+            profile_selection_receipt: None,
         }],
         service_registration_approvals: must(transaction.service_registration_approvals()),
         active_generation: None,
@@ -157,7 +159,7 @@ fn v2_registry_wire_requires_explicit_restage_without_defaults() {
 }
 
 #[test]
-fn v9_registry_wire_requires_explicit_migration_to_v16() {
+fn v9_registry_wire_requires_explicit_migration_to_v17() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object["registry_wire_version"] = serde_json::json!({
@@ -174,7 +176,7 @@ fn v9_registry_wire_requires_explicit_migration_to_v16() {
         matches!(
             error,
             InstallationError::MigrationRequired { ref reason }
-                if reason.contains("registry wire 9.0.0") && reason.contains("16.0.0")
+                if reason.contains("registry wire 9.0.0") && reason.contains("17.0.0")
         ),
         "unexpected raw v9 classification: {error:?}"
     );
@@ -227,86 +229,86 @@ fn v10_registry_with_v1_rebind_requires_restage_without_adoption() {
         error,
         InstallationError::MigrationRequired { reason }
             if reason.contains("wire v10")
-                && reason.contains("re-stage as v16")
+                && reason.contains("re-stage as v17")
                 && reason.contains("never synthesized or adopted")
     ));
 }
 
 #[test]
-fn v11_registry_wire_requires_explicit_migration_to_v16() {
+fn v11_registry_wire_requires_explicit_migration_to_v17() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(11, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 11.0.0") && reason.contains("16.0.0")
+            if reason.contains("registry wire 11.0.0") && reason.contains("17.0.0")
     ));
 }
 
 #[test]
-fn v15_registry_wire_requires_explicit_migration_to_v16() {
+fn v15_registry_wire_requires_explicit_migration_to_v17() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 15.0.0") && reason.contains("16.0.0")
+            if reason.contains("registry wire 15.0.0") && reason.contains("17.0.0")
     ));
 }
 
 #[test]
-fn v16_registry_wire_round_trips_without_synthesizing_control_grants() {
+fn v17_registry_wire_round_trips_without_synthesizing_control_grants() {
     let current = ApprovedGenerationRegistry::new();
     let bytes = must(serde_json::to_vec(&current));
     let decoded = must(decode_registry_bytes(&bytes));
     assert_eq!(decoded, current);
     assert_eq!(
         decoded.registry_wire_version(),
-        ContractVersion::new(16, 0, 0)
+        ContractVersion::new(17, 0, 0)
     );
     assert!(decoded.active_phase_b_rebind().is_none());
 }
 
 #[test]
-fn v12_registry_wire_requires_explicit_migration_to_v16() {
+fn v12_registry_wire_requires_explicit_migration_to_v17() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(12, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 12.0.0") && reason.contains("16.0.0")
+            if reason.contains("registry wire 12.0.0") && reason.contains("17.0.0")
     ));
 }
 
 #[test]
-fn v13_registry_wire_requires_explicit_migration_to_v16() {
+fn v13_registry_wire_requires_explicit_migration_to_v17() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(13, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 13.0.0") && reason.contains("16.0.0")
+            if reason.contains("registry wire 13.0.0") && reason.contains("17.0.0")
     ));
 }
 
 #[test]
-fn v14_registry_wire_requires_explicit_migration_to_v16() {
+fn v14_registry_wire_requires_explicit_migration_to_v17() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(14, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 14.0.0") && reason.contains("16.0.0")
+            if reason.contains("registry wire 14.0.0") && reason.contains("17.0.0")
     ));
 }
 
 #[test]
-fn v16_registry_wire_rejects_omitted_mandatory_rebind_member() {
+fn v17_registry_wire_rejects_omitted_mandatory_rebind_member() {
     let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     current
         .as_object_mut()
@@ -867,6 +869,7 @@ fn pre_split_registry_value() -> serde_json::Value {
             approval,
             active: true,
             last_known_good: false,
+            profile_selection_receipt: None,
         }],
         service_registration_approvals: Vec::new(),
         active_generation: Some(generation),
@@ -929,6 +932,7 @@ fn pre_credential_binding_registry_value() -> serde_json::Value {
             approval,
             active: true,
             last_known_good: false,
+            profile_selection_receipt: None,
         }],
         service_registration_approvals: Vec::new(),
         active_generation: Some(generation),
@@ -992,6 +996,7 @@ fn pre_eliotd_config_registry_value() -> serde_json::Value {
             approval,
             active: true,
             last_known_good: false,
+            profile_selection_receipt: None,
         }],
         service_registration_approvals: Vec::new(),
         active_generation: Some(generation),
@@ -1037,6 +1042,7 @@ fn pre_host_artifact_binding_registry_value() -> serde_json::Value {
             approval,
             active: true,
             last_known_good: false,
+            profile_selection_receipt: None,
         }],
         service_registration_approvals: Vec::new(),
         active_generation: Some(generation),

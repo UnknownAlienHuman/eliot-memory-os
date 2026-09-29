@@ -2,6 +2,8 @@
 
 mod host_console_protocol;
 
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
@@ -24,7 +26,11 @@ use eliot_host_state::HostState;
 #[cfg(windows)]
 use eliot_host_state::WakeDisposition;
 #[cfg(windows)]
+use eliot_installation::InstallationProfile;
+#[cfg(windows)]
 use eliot_platform::PlatformHandle;
+#[cfg(windows)]
+use eliot_platform_windows::profile_supervision::USER_MODE_SUPERVISOR_SWITCH;
 use host_console_protocol::{Request, Response, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
@@ -296,7 +302,36 @@ fn console_process_exit_code() -> i32 {
 // B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
 
 fn main() {
-    let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
+    let mut process_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(windows)]
+    let profile_supervisor_selection =
+        match process_args.first().and_then(|argument| argument.to_str()) {
+            Some(USER_MODE_SUPERVISOR_SWITCH) => {
+                match process_args.get(1).and_then(|argument| argument.to_str()) {
+                    Some("user_mode") => Some(InstallationProfile::UserMode),
+                    Some("portable_dev") => Some(InstallationProfile::PortableDev),
+                    _ => {
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: unsupported current-user supervisor profile"
+                        );
+                        std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+                    }
+                }
+            }
+            _ => None,
+        };
+    #[cfg(not(windows))]
+    let profile_supervisor_selection: Option<()> = None;
+    if profile_supervisor_selection.is_some() {
+        process_args.drain(0..2);
+    }
+    let bootstrap = if profile_supervisor_selection.is_some() {
+        HostLaunchOptions::parse(process_args.clone()).map_err(|error| error.to_string())
+    } else {
+        parse_process_bootstrap(process_args.clone())
+    };
+    let _ = PROCESS_BOOTSTRAP.set(bootstrap);
     // HOST-0 (issue #889): best-effort diagnostics install; never gates startup.
     let _ = eliot_host::host_diagnostics::install_host_diagnostics();
     // One bounded Event Log worker owns the potentially blocking OS call.
@@ -311,15 +346,34 @@ fn main() {
     );
     // #889 projection: serving process started for the start operation.
     // Process id and operation only; never launch material (B1).
-    observe_host_request(
-        &HostRequestProjection::process_started(
-            eliot_host::host_diagnostics::EntrypointStage::Startup,
-            std::process::id(),
-        )
-        .with_operation(AdmittedEvent::ServiceStart),
+    let process_started = HostRequestProjection::process_started(
+        eliot_host::host_diagnostics::EntrypointStage::Startup,
+        std::process::id(),
     );
+    observe_host_request(&if profile_supervisor_selection.is_some() {
+        process_started
+    } else {
+        process_started.with_operation(AdmittedEvent::ServiceStart)
+    });
     #[cfg(windows)]
-    match run_as_scm_service() {
+    if let Some(profile) = profile_supervisor_selection {
+        let result = run_profile_supervisor(process_args, profile);
+        eliot_host::host_diagnostics::shutdown_event_log_reporting();
+        if let Err(error) = result {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: current-user supervisor failed: {error}"
+            );
+            std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+        }
+        return;
+    }
+    #[cfg(windows)]
+    match if is_nonce_free_host_bootstrap(&process_args) {
+        Ok(false)
+    } else {
+        run_as_scm_service()
+    } {
         Ok(true) => {
             eliot_host::host_diagnostics::shutdown_event_log_reporting();
             return;
@@ -329,7 +383,11 @@ fn main() {
             // fallback, recorded distinctly from dispatcher failure below.
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                 eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
-                "console_fallback",
+                if is_nonce_free_host_bootstrap(&process_args) {
+                    "current_user_profile_launcher"
+                } else {
+                    "console_fallback"
+                },
             );
         }
         Err(error) => {
@@ -574,6 +632,185 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
     (drained, Some(launch_options))
 }
 
+#[cfg(windows)]
+fn run_profile_supervisor(
+    arguments: Vec<OsString>,
+    profile: InstallationProfile,
+) -> Result<(), HostError> {
+    use std::sync::atomic::Ordering;
+
+    if !matches!(
+        profile,
+        InstallationProfile::UserMode | InstallationProfile::PortableDev
+    ) {
+        return Err(HostError::ProcessContour(
+            "current-user supervisor handoff requires UserMode or PortableDev".to_owned(),
+        ));
+    }
+    STOP_REQUESTED.store(false, Ordering::Release);
+    let launch_options = HostLaunchOptions::parse(arguments)?;
+    if launch_options.registration_nonce().is_some() {
+        return Err(HostError::ProcessContour(
+            "current-user profile action must not carry a SystemService nonce".to_owned(),
+        ));
+    }
+    let mut host = HostComposition::open_for_profile(launch_options.clone(), profile)?;
+    if host.registry().pending_activation().is_some() {
+        return run_pending_current_user_bootstrap(&mut host);
+    }
+    let active = host.registry().active().ok_or_else(|| {
+        HostError::ProcessContour(format!(
+            "{profile:?} supervisor has no active approved generation"
+        ))
+    })?;
+    if active.manifest.runtime_launch.profile != profile {
+        let _ = host.stop();
+        return Err(HostError::ProcessContour(
+            "profile supervisor selector differs from the active approved profile".to_owned(),
+        ));
+    }
+    // Opening Host already executes its authenticated child process handshake.
+    // Require the retained liveness/readiness contour to confirm that evidence
+    // before this scheduler-launched process enters its long-running loop.
+    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if !host.running() {
+            let _ = host.stop();
+            return Err(HostError::ProcessContour(
+                "profile Host stopped before authenticated readiness".to_owned(),
+            ));
+        }
+        match run_scm_contour_tick(&mut host)? {
+            ScmContourTickOutcome::LeasePreserved
+            | ScmContourTickOutcome::Reconciled(HostBranchDisposition::Healthy) => break,
+            ScmContourTickOutcome::ReadinessRetryPending
+            | ScmContourTickOutcome::Reconciled(
+                HostBranchDisposition::LiveAwaitingReadiness
+                | HostBranchDisposition::ReadinessDegraded,
+            ) if std::time::Instant::now() < readiness_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            ScmContourTickOutcome::ReadinessRetryPending | ScmContourTickOutcome::Reconciled(_) => {
+                let _ = host.stop();
+                return Err(HostError::ProcessContour(
+                    "profile Host authenticated readiness was not established".to_owned(),
+                ));
+            }
+        }
+    }
+
+    // Current-user profiles never enter the SystemService credential-control endpoint,
+    // which requires Administrators and opens ProgramData. `open_for_profile`
+    // has bound this launch descriptor to the approved profile generation
+    // and retained the current user's descriptor-bound roots before startup.
+    let runtime_control = match host.runtime_control() {
+        Ok(control) => control,
+        Err(error) => {
+            STOP_REQUESTED.store(true, Ordering::Release);
+            let _ = host.stop();
+            return Err(error);
+        }
+    };
+    let runtime_queue = runtime_control.queue();
+    let runtime_thread = match spawn_runtime_control(runtime_control) {
+        Ok(thread) => thread,
+        Err(error) => {
+            STOP_REQUESTED.store(true, Ordering::Release);
+            let _ = host.stop();
+            return Err(error);
+        }
+    };
+
+    let mut idle_drain = HostIdleDrainSupervisor::new();
+    let mut loop_failure = None;
+    while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+        let durable_fence = match host.has_durable_branch_fence() {
+            Ok(fenced) => fenced,
+            Err(error) => {
+                loop_failure = Some(error);
+                break;
+            }
+        };
+        if !durable_fence && host.has_process_contour() {
+            match run_scm_contour_tick(&mut host) {
+                Ok(outcome) => {
+                    let reconciled = match outcome {
+                        ScmContourTickOutcome::Reconciled(disposition) => Some(disposition),
+                        ScmContourTickOutcome::LeasePreserved
+                        | ScmContourTickOutcome::ReadinessRetryPending => None,
+                    };
+                    report_scm_tick(outcome);
+                    if let Some(disposition) = reconciled {
+                        idle_drain.observe_readiness(&mut host, disposition);
+                    }
+                }
+                Err(error) => {
+                    loop_failure = Some(error);
+                    break;
+                }
+            }
+        }
+        for (trigger, evidence) in process_runtime_control_requests(&mut host, &runtime_queue) {
+            idle_drain.note_observable_use(&mut host, trigger, &evidence);
+        }
+        process_user_automation_owner_requests(&host);
+        if !durable_fence {
+            let drain_tick = idle_drain.evaluate(&mut host, std::time::Instant::now());
+            report_activation_diagnostics(&host, &idle_drain.last_census);
+            if drain_tick == IdleDrainTick::CommitDue {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    STOP_REQUESTED.store(true, Ordering::Release);
+    let _ = runtime_thread.join();
+    if host.running() {
+        host.stop()?;
+    } else if host.shutdown_failed() {
+        return Err(HostError::ProcessContour(
+            "profile Host stopped with a durable recovery obligation".to_owned(),
+        ));
+    }
+    if let Some(error) = loop_failure {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_pending_current_user_bootstrap(host: &mut HostComposition) -> Result<(), HostError> {
+    use std::sync::atomic::Ordering;
+
+    // The installer retains the dedicated current-user Job until this Host
+    // finishes its one pending Phase-B handoff. The Host owner serves the
+    // credential and Phase-B requests; the installer never issues their
+    // owner-epoch or process-identity receipts itself.
+    let control = host.credential_control()?;
+    let phase_b_queue = control.phase_b_queue();
+    let credential_thread = spawn_credential_control(control)?;
+    let mut completed = false;
+    while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+        process_phase_b_requests(host, &phase_b_queue);
+        if host.registry().pending_activation().is_none() {
+            completed = host.registry().active().is_some();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    STOP_REQUESTED.store(true, Ordering::Release);
+    let _ = credential_thread.join();
+    if host.running() {
+        host.stop()?;
+    }
+    if !completed {
+        return Err(HostError::RecoveryRequired(
+            "current-user pending Host ended without an active Phase-B terminal".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_process_bootstrap<I, S>(args: I) -> Result<HostLaunchOptions, String>
 where
     I: IntoIterator<Item = S>,
@@ -595,6 +832,22 @@ fn captured_process_bootstrap() -> Result<HostLaunchOptions, HostError> {
 
 fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostError> {
     HostComposition::open(launch_options)
+}
+
+#[cfg(windows)]
+fn is_nonce_free_host_bootstrap(arguments: &[OsString]) -> bool {
+    const FLAGS: [&str; 5] = [
+        "--config-descriptor",
+        "--config-descriptor-sha256",
+        "--installation-id",
+        "--tx-plan-generation",
+        "--host-state-root",
+    ];
+    arguments.len() == 10
+        && FLAGS
+            .iter()
+            .enumerate()
+            .all(|(index, flag)| arguments[index * 2].to_str() == Some(*flag))
 }
 
 /// #889 projection: status-query outcome at this journal state.

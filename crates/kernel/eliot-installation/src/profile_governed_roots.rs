@@ -35,7 +35,7 @@ const PRODUCT_DIR: &str = "Eliot";
 const USER_PROGRAMS_DIR: &str = "Programs";
 /// Repository-local immutable root for the `portable_dev` profile (I3.1 table).
 const PORTABLE_BINARIES_DIR: &str = "target\\eliot-dev";
-/// Repository-local state root prefix for the `portable_dev` profile (I3.1 table).
+/// Repository-local mutable root for the `portable_dev` profile (I3.1 table).
 const PORTABLE_STATE_DIR: &str = ".eliot-dev";
 /// User configuration root name, where I3.1 publishes a `config|cache` pair.
 const USER_CONFIG_DIR: &str = "config";
@@ -79,8 +79,8 @@ fn required_anchor(
 /// The I3.1 root set resolved for one explicitly selected profile.
 ///
 /// `user_cache` is the sibling root of `user_config` where I3.1 publishes the
-/// `config|cache` pair; for `system_service`, whose user root is a single
-/// `%LocalAppData%\Eliot`, both name that same root.
+/// `config|cache` pair for `user_mode` and `portable_dev`. `system_service`
+/// retains its single `%LocalAppData%\Eliot` user root in both role fields.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileGovernedRoots {
@@ -256,16 +256,17 @@ pub fn select_profile_roots(
                 ));
             };
             text(generation, "generation")?;
-            let state_root = joined_windows_path(&repository, PORTABLE_STATE_DIR);
-            let config_root = joined_windows_path(&state_root, USER_CONFIG_DIR);
-            let cache_root = joined_windows_path(&state_root, USER_CACHE_DIR);
+            let profile_root = joined_windows_path(&repository, PORTABLE_STATE_DIR);
+            let state_root = joined_windows_path(&profile_root, "state");
+            let config_root = joined_windows_path(&profile_root, USER_CONFIG_DIR);
+            let cache_root = joined_windows_path(&profile_root, USER_CACHE_DIR);
             ProfileGovernedRoots {
                 profile,
                 immutable_binaries: joined_windows_path(
                     &joined_windows_path(&repository, PORTABLE_BINARIES_DIR),
                     generation,
                 ),
-                durable_data: joined_windows_path(&state_root, "state"),
+                durable_data: state_root,
                 user_config: config_root,
                 user_cache: cache_root,
             }

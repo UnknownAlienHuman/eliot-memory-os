@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +123,13 @@ pub struct ApprovedGeneration {
     pub active: bool,
     /// Whether this generation is the last-known-good activation.
     pub last_known_good: bool,
+    /// Original no-follow current-user selection of this generation's roots.
+    ///
+    /// This is present only for `UserMode` and `PortableDev`. Its absence on an
+    /// older projection is reported as migration/recovery when a consumer
+    /// requires retained file-object identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_selection_receipt: Option<ProfileSelectionReceipt>,
 }
 
 /// Durable provider-neutral proof that an auxiliary Agent Bridge stage was
@@ -2556,7 +2564,14 @@ impl ApprovedGeneration {
     pub fn validate(&self) -> Result<(), InstallationError> {
         self.manifest.validate()?;
         self.approval.validate()?;
-        validate_approval_against_manifest(&self.approval, &self.manifest, "approved_generation")
+        validate_approval_against_manifest(&self.approval, &self.manifest, "approved_generation")?;
+        if let Some(receipt) = self.profile_selection_receipt.as_ref() {
+            self.manifest
+                .runtime_launch
+                .profile_governed_roots
+                .validate_profile_selection_receipt(&self.manifest.runtime_launch, receipt)?;
+        }
+        Ok(())
     }
 }
 
@@ -3080,6 +3095,7 @@ impl ApprovedGenerationRegistry {
             activation_fixture.approval.clone(),
             service_registration_approvals,
             activation_fixture.activation_intent_digest.clone(),
+            None,
         )
     }
 
@@ -3091,6 +3107,7 @@ impl ApprovedGenerationRegistry {
         approval: InstallationActivationApproval,
         service_registration_approvals: &[InstallerServiceRegistrationApproval],
         activation_intent_digest: PlatformHandle,
+        profile_selection_receipt: Option<ProfileSelectionReceipt>,
     ) -> Result<(), InstallationError> {
         self.validate()?;
         if self
@@ -3153,6 +3170,7 @@ impl ApprovedGenerationRegistry {
             approval: pending.approval.clone(),
             active: false,
             last_known_good: false,
+            profile_selection_receipt,
         });
         self.pending_activation = Some(pending);
         self.service_registration_approvals
@@ -3255,6 +3273,20 @@ impl ApprovedGenerationRegistry {
         activation_intent_digest: &PlatformHandle,
         approvals: &[InstallerServiceRegistrationApproval],
     ) -> Result<(), InstallationError> {
+        transaction.validate()?;
+        let profile_selection_receipt = match transaction.profile {
+            InstallationProfile::SystemService => None,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let receipt = transaction
+                    .profile_selection_receipt()
+                    .cloned()
+                    .ok_or_else(|| InstallationError::MigrationRequired {
+                        reason: "transaction has no original profile selection receipt for registry staging"
+                            .to_owned(),
+                    })?;
+                Some(receipt)
+            }
+        };
         if let Some(existing) = self.pending_activation.as_ref()
             && existing.transaction_id == transaction.transaction_id
             && existing.plan_digest == transaction.installer_plan_digest
@@ -3262,6 +3294,16 @@ impl ApprovedGenerationRegistry {
             && &existing.approval == approval
             && existing.activation_intent_digest.as_ref() == Some(activation_intent_digest)
         {
+            let generation_receipt = self
+                .generations
+                .iter()
+                .find(|generation| {
+                    generation.manifest.generation == transaction.candidate_manifest.generation
+                })
+                .and_then(|generation| generation.profile_selection_receipt.as_ref());
+            if generation_receipt != profile_selection_receipt.as_ref() {
+                return Err(InstallationError::IdentityConflict);
+            }
             for scm_approval in approvals {
                 if self.service_registration_approval(&scm_approval.generation, scm_approval.role)
                     != Some(scm_approval)
@@ -3276,6 +3318,7 @@ impl ApprovedGenerationRegistry {
             approval.clone(),
             approvals,
             activation_intent_digest.clone(),
+            profile_selection_receipt,
         )
     }
 
@@ -3934,6 +3977,35 @@ impl ApprovedGenerationRegistry {
     #[must_use]
     pub fn generations(&self) -> &[ApprovedGeneration] {
         &self.generations
+    }
+
+    /// Returns the exact original current-user root selection retained for a
+    /// generation. An absent generation or pre-receipt record is a typed
+    /// recovery condition; callers must not substitute a newly opened path.
+    pub fn profile_selection_receipt_for_generation(
+        &self,
+        generation: &PlatformHandle,
+    ) -> Result<&ProfileSelectionReceipt, InstallationError> {
+        self.validate()?;
+        let approved = self
+            .generations
+            .iter()
+            .find(|approved| approved.manifest.generation == *generation)
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: format!(
+                    "generation {} has no approved registry record for retained profile selection",
+                    generation.as_str()
+                ),
+            })?;
+        approved
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: format!(
+                    "generation {} predates retained profile root identities and requires explicit recovery",
+                    generation.as_str()
+                ),
+            })
     }
 
     /// Returns the active generation identity, if committed by Host.
@@ -4884,11 +4956,6 @@ impl PendingActivation {
             return Err(InstallationError::IdentityConflict);
         }
         if let Some(intent) = &self.phase_b_intent {
-            if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B intent requires the SystemService profile".to_owned(),
-                ));
-            }
             intent.validate()?;
             if intent.transaction_id != self.transaction_id
                 || intent.installation_plan_digest != self.plan_digest
@@ -4907,11 +4974,6 @@ impl PendingActivation {
             stage.validate_against_phase_b(intent, self)?;
         }
         if let Some(prepared) = &self.phase_b_prepared {
-            if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B preparation requires the SystemService profile".to_owned(),
-                ));
-            }
             prepared.validate()?;
             if prepared.transaction_id != self.transaction_id
                 || prepared.manifest_digest != self.manifest_digest
@@ -4969,11 +5031,6 @@ impl PendingActivation {
             }
         }
         if let Some(receipt) = &self.phase_b_receipt {
-            if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B receipt requires the SystemService profile".to_owned(),
-                ));
-            }
             receipt.validate()?;
             if receipt.transaction_id != self.transaction_id
                 || receipt.candidate_manifest_digest != self.manifest_digest

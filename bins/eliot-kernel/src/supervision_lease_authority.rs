@@ -9,16 +9,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_contracts::{AuthorityEpoch, StateFence};
+#[cfg(windows)]
+use eliot_installation::InstallationProfile;
 use eliot_ors::{
     OperationIdentity, OrsError, RedbRecoveryStore, SupervisionLeaseCommitTicket,
     SupervisionLeaseOperation, SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt,
 };
 use eliot_platform_windows::{
-    InstallerRootPrimitiveSpec, InstallerRootProfile, WindowsSupervisionAuthorityKeyStore,
-    protected_program_data_root,
+    FileIdentity, InstallerRootPrimitiveSpec, InstallerRootProfile,
+    WindowsPortableDevSupervisionAuthorityKeyProvider, WindowsSupervisionAuthorityKeyStore,
+    WindowsUserModeSupervisionAuthorityCredentialProvider, protected_program_data_root,
 };
 use eliot_process::EliotdLiveSupervisionEvidence;
+#[cfg(windows)]
+use eliot_runtime_contracts::SupervisionAuthorityKeyReference;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
     DaemonSupervisionCurrentState, DaemonSupervisionHeartbeatError,
@@ -29,8 +34,7 @@ use eliot_runtime_contracts::{
     Ed25519SupervisionLeaseSigner, LeaseState, ProvisionedSupervisionAuthority, SupervisionLease,
     SupervisionLeaseActiveStateBinding, SupervisionLeaseError, SupervisionLeasePredecessorIdentity,
     SupervisionLeasePredecessorProof, SupervisionLeaseSigner, SupervisionLeaseTerminalDisposition,
-    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionSealedKeyReference,
-    SupervisionTrustAnchor,
+    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionTrustAnchor,
 };
 
 use crate::KernelBuildError;
@@ -122,7 +126,11 @@ impl From<OrsError> for SupervisionLeaseAuthorityError {
 #[cfg(windows)]
 pub struct ProtectedSupervisionLeaseSigner {
     kernel_root: PathBuf,
+    installation_profile: InstallationProfile,
+    portable_dev_repository_root: Option<(PathBuf, FileIdentity)>,
     key_store: WindowsSupervisionAuthorityKeyStore,
+    user_mode_key_provider: WindowsUserModeSupervisionAuthorityCredentialProvider,
+    portable_dev_key_provider: WindowsPortableDevSupervisionAuthorityKeyProvider,
     authority: ProvisionedSupervisionAuthority,
     signer_id: String,
     key_id: String,
@@ -140,23 +148,35 @@ impl fmt::Debug for ProtectedSupervisionLeaseSigner {
                 "expected_public_key_fingerprint",
                 &self.expected_public_key_fingerprint,
             )
-            .field("key_provider", &self.authority.key_reference.provider)
+            .field("key_provider", &self.authority.key_reference.provider())
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(windows)]
 impl ProtectedSupervisionLeaseSigner {
-    pub(super) fn new(
+    pub(super) fn new_for_profile(
         kernel_root: PathBuf,
+        installation_profile: InstallationProfile,
+        portable_dev_repository_root: Option<(PathBuf, FileIdentity)>,
         config: &SupervisionLeaseAuthorityConfig,
     ) -> Result<Self, SupervisionLeaseAuthorityError> {
         config
             .validate()
             .map_err(SupervisionLeaseAuthorityError::Configuration)?;
+        validate_profile_key_reference(
+            installation_profile,
+            portable_dev_repository_root.as_ref(),
+            &config.authority.key_reference,
+        )
+        .map_err(SupervisionLeaseAuthorityError::Configuration)?;
         let signer = Self {
             kernel_root,
+            installation_profile,
+            portable_dev_repository_root,
             key_store: WindowsSupervisionAuthorityKeyStore::new(),
+            user_mode_key_provider: WindowsUserModeSupervisionAuthorityCredentialProvider::new(),
+            portable_dev_key_provider: WindowsPortableDevSupervisionAuthorityKeyProvider::new(),
             authority: config.authority.clone(),
             signer_id: config.authority.trust_anchor.signer_id.clone(),
             key_id: config.authority.trust_anchor.key_id.clone(),
@@ -173,38 +193,131 @@ impl ProtectedSupervisionLeaseSigner {
     }
 
     fn load_signer(&self) -> Result<Ed25519SupervisionLeaseSigner, SupervisionLeaseError> {
-        let spec = supervision_authority_root_spec(&self.kernel_root)?;
-        let secret = self
-            .key_store
-            .unseal_for_kernel(&spec, &self.kernel_root, &self.authority)
-            .map_err(|_| {
-                SupervisionLeaseError::Signing(
-                    "service-SID sealed supervision key unavailable".to_owned(),
-                )
-            })?;
-        if secret.expose().len() != 32 || secret.expose().iter().all(|byte| *byte == 0) {
+        let signer = match (&self.installation_profile, &self.authority.key_reference) {
+            (
+                InstallationProfile::SystemService,
+                SupervisionAuthorityKeyReference::SystemService(_),
+            ) => {
+                let spec = supervision_authority_root_spec(&self.kernel_root)?;
+                let secret = self
+                    .key_store
+                    .unseal_for_kernel(&spec, &self.kernel_root, &self.authority)
+                    .map_err(|_| {
+                        SupervisionLeaseError::Signing(
+                            "service-SID sealed supervision key unavailable".to_owned(),
+                        )
+                    })?;
+                if secret.expose().len() != 32 || secret.expose().iter().all(|byte| *byte == 0) {
+                    return Err(SupervisionLeaseError::Signing(
+                        "protected key has invalid length or value".to_owned(),
+                    ));
+                }
+                let mut key_bytes = [0_u8; 32];
+                key_bytes.copy_from_slice(secret.expose());
+                let signer_result = Ed25519SupervisionLeaseSigner::from_secret_key(
+                    self.signer_id.clone(),
+                    self.key_id.clone(),
+                    key_bytes,
+                );
+                key_bytes.fill(0);
+                signer_result?
+            }
+            (
+                InstallationProfile::UserMode,
+                SupervisionAuthorityKeyReference::UserMode(reference),
+            ) => self
+                .user_mode_key_provider
+                .load_signer_for_kernel(reference, &self.authority.trust_anchor)
+                .map_err(|_| {
+                    SupervisionLeaseError::Signing(
+                        "current-user supervision signing key unavailable".to_owned(),
+                    )
+                })?,
+            (
+                InstallationProfile::PortableDev,
+                SupervisionAuthorityKeyReference::PortableDev(reference),
+            ) => {
+                let (repository_root, repository_root_identity) =
+                    self.portable_dev_repository_root.as_ref().ok_or_else(|| {
+                        SupervisionLeaseError::Signing(
+                            "PortableDev repository root is unavailable".to_owned(),
+                        )
+                    })?;
+                self.portable_dev_key_provider
+                    .load_signer_for_kernel(
+                        reference,
+                        repository_root,
+                        *repository_root_identity,
+                        &self.authority.trust_anchor,
+                    )
+                    .map_err(|_| {
+                        SupervisionLeaseError::Signing(
+                            "PortableDev supervision signing key unavailable".to_owned(),
+                        )
+                    })?
+            }
+            _ => {
+                return Err(SupervisionLeaseError::Signing(
+                    "installation profile does not match supervision key reference".to_owned(),
+                ));
+            }
+        };
+        if signer.signer_id() != self.signer_id
+            || signer.key_id() != self.key_id
+            || sha256_hex(&signer.public_key()) != self.expected_public_key_fingerprint
+        {
             return Err(SupervisionLeaseError::Signing(
-                "protected key has invalid length or value".to_owned(),
-            ));
-        }
-        let mut key_bytes = [0_u8; 32];
-        key_bytes.copy_from_slice(secret.expose());
-        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
-            self.signer_id.clone(),
-            self.key_id.clone(),
-            key_bytes,
-        )?;
-        key_bytes.fill(0);
-        if sha256_hex(&signer.public_key()) != self.expected_public_key_fingerprint {
-            return Err(SupervisionLeaseError::Signing(
-                "protected key does not match the installation trust anchor".to_owned(),
+                "supervision signing key does not match the installation trust anchor".to_owned(),
             ));
         }
         Ok(signer)
     }
 
-    pub fn key_reference(&self) -> &SupervisionSealedKeyReference {
+    pub fn key_reference(&self) -> &SupervisionAuthorityKeyReference {
         &self.authority.key_reference
+    }
+}
+
+#[cfg(windows)]
+fn validate_profile_key_reference(
+    profile: InstallationProfile,
+    portable_dev_repository_root: Option<&(PathBuf, FileIdentity)>,
+    key_reference: &SupervisionAuthorityKeyReference,
+) -> Result<(), String> {
+    let reference_is_valid = match (profile, portable_dev_repository_root, key_reference) {
+        (
+            InstallationProfile::SystemService,
+            None,
+            SupervisionAuthorityKeyReference::SystemService(reference),
+        ) => reference.validate().is_ok(),
+        (
+            InstallationProfile::UserMode,
+            None,
+            SupervisionAuthorityKeyReference::UserMode(reference),
+        ) => reference.validate().is_ok(),
+        (
+            InstallationProfile::PortableDev,
+            Some((repository_root, _)),
+            SupervisionAuthorityKeyReference::PortableDev(reference),
+        ) => {
+            repository_root.is_absolute()
+                && !repository_root.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+                && reference.validate().is_ok()
+        }
+        _ => false,
+    };
+    if reference_is_valid {
+        Ok(())
+    } else {
+        Err(
+            "selected installation profile does not match its supervision key reference or root"
+                .to_owned(),
+        )
     }
 }
 
@@ -275,10 +388,17 @@ impl KernelSupervisionLeaseAuthority {
     pub(super) fn new(
         ors: Arc<RedbRecoveryStore>,
         kernel_root: PathBuf,
+        installation_profile: InstallationProfile,
+        portable_dev_repository_root: Option<(PathBuf, FileIdentity)>,
         config: SupervisionLeaseAuthorityConfig,
     ) -> Result<Self, KernelBuildError> {
-        let signer = ProtectedSupervisionLeaseSigner::new(kernel_root, &config)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
+            kernel_root,
+            installation_profile,
+            portable_dev_repository_root,
+            &config,
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         Ok(Self {
             ors,
             signer,
@@ -291,7 +411,7 @@ impl KernelSupervisionLeaseAuthority {
         &self.trust_anchor
     }
 
-    pub fn key_reference(&self) -> &SupervisionSealedKeyReference {
+    pub fn key_reference(&self) -> &SupervisionAuthorityKeyReference {
         self.signer.key_reference()
     }
 
