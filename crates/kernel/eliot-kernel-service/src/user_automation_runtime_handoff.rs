@@ -36,12 +36,12 @@ use super::user_automation::{
     UserAutomationStoreOutcome,
 };
 use super::user_automation_execution::{
-    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobPort,
-    UserAutomationFailurePublication, UserAutomationFailureRecord, UserAutomationHorizonTrigger,
-    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationRuntimePort,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
-    UserAutomationWakeEnumerationRequest, UserAutomationWakePort, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback,
+    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobMaterial,
+    UserAutomationDurableJobPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
+    UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
+    UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionObserver,
@@ -1678,7 +1678,7 @@ where
 {
     async fn admit_occurrence(
         &self,
-        request: UserAutomationRuntimeAdmission,
+        mut request: UserAutomationRuntimeAdmission,
     ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError> {
         request
             .validate()
@@ -1687,17 +1687,31 @@ where
             .invocation
             .occurrence_identity()
             .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
-        // The concrete Host Durable Job owner admits a complete owner-issued
-        // submission. A canonical Store receipt is not one: it carries neither
-        // the qualified artifact content reference nor the job admission
-        // receipt, and inventing either would fabricate content evidence and
-        // authority. The absence is reported, never substituted.
+        // The Host Durable Job owner admits a complete K0 submission. When the
+        // caller did not supply one, this boundary compiles it from the admitted
+        // revision and the committed source receipt the preflight receipt
+        // already carries: the qualified artifact identity, its certified
+        // capability profile, the declared Skill/Tool closure, the requester,
+        // the bound scope/authority/session/epoch, the declared route, cost
+        // ceiling and runtime ceiling, and the committed admission receipt. No
+        // value is asserted on any owner's behalf and nothing is defaulted, so
+        // the same closure, the same fence and the same occurrence identity
+        // reach the owner. A material the Durable Job owner itself issued still
+        // travels unchanged: this only fills the absent case.
         if request.durable_job.is_none() {
-            return Err(UserAutomationRuntimeError::Unavailable(format!(
-                "occurrence {occurrence_id} has no owner-issued Durable Job submission material; \
-                 the qualified artifact content reference and the job admission receipt are issued \
-                 by the Durable Job owner and are not derivable from the canonical Store commit"
-            )));
+            request.durable_job = Some(
+                UserAutomationDurableJobMaterial::from_admitted_occurrence(&request).map_err(
+                    |error| {
+                        UserAutomationRuntimeError::Rejected(format!(
+                            "occurrence {occurrence_id} admitted by preflight but has no \
+                             derivable Durable Job submission: {error}"
+                        ))
+                    },
+                )?,
+            );
+            request
+                .validate()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
         }
         let execution =
             UserAutomationDurableJobPort::admit_occurrence(self.client, request).await?;

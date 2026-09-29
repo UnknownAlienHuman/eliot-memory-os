@@ -44,11 +44,12 @@ pub use peer_communication::{
     PeerDeliveryReceipt, PeerDeliveryTarget, PeerDurability, PeerDurabilityAttestation,
     PeerDurabilityPort, PeerEndpointLossReport, PeerEnqueueReceipt, PeerEnvelopeHeader,
     PeerMessage, PeerMessageDiagnostic, PeerMessageKind, PeerMessageState, PeerReconnectReport,
-    PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewDenominator, PeerReviewLifecycle,
-    PeerReviewReceipt, PeerReviewStanding, PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId,
-    PostBoardEntry, PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict,
-    ReviewCompleteness, ReviewKind, ReviewRecommendation, ReviewTargetKind, ReviseBoardEntry,
-    SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
+    PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewBatch, PeerReviewDenominator,
+    PeerReviewLifecycle, PeerReviewObligation, PeerReviewReceipt, PeerReviewStanding,
+    PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId, PostBoardEntry, PrivacyClass,
+    REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict, ReviewCompleteness, ReviewKind,
+    ReviewRecommendation, ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview,
+    decode_peer_envelope, peer_digest_hex,
 };
 
 pub use eliot_contracts::{BoardEntryState, PeerBoardKind};

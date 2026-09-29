@@ -1503,6 +1503,11 @@ mod tests {
                 binding_digest: "d".repeat(64),
                 receipt_ref: "b".repeat(64),
             },
+            // The coordination owner this fixture stands for retains no review
+            // expectation, obligation, or artifact head, so its review projection
+            // is genuinely empty. It is read through the same owner path the
+            // production snapshot uses, never written here.
+            review_batches: Vec::new(),
         }
     }
 

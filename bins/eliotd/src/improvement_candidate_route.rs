@@ -29,6 +29,17 @@
 //! or legacy value, or swallows a failure: a hashing or serialization failure is
 //! produced once by the pipeline and crosses into the daemon as the typed
 //! `PipelineError` it is.
+//!
+//! # The consumer checks the producer's version or refuses the record
+//!
+//! Every consumer of a committed record here verifies that the record carries
+//! the identity this daemon's build checks, so a record written under another
+//! domain, encoding revision, or algorithm is a typed refusal
+//! ([`eliot_maintenance::UncheckedRecordIdentity`]) and never a tolerated
+//! value. The recorded digest is validated against the value the producer
+//! recorded; it is never recomputed over local state, and no digest,
+//! placeholder, or empty string stands in for a record this build cannot
+//! read.
 
 use eliot_maintenance::improvement_pipeline::{
     ImprovementCurrentProposal, RetainedImprovementProposal, compare_improvement_commitments,
@@ -164,21 +175,30 @@ pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, 
 /// is the exact commitment and discriminator projection the pipeline computed
 /// and carried into the canary handoff, and `retained` is the prior record its
 /// owner retained. This route commits nothing and hashes nothing, so it can
-/// neither substitute a second opinion, an empty digest, nor a legacy value, and
-/// it has no failure channel to swallow one — a hashing or serialization
-/// failure is produced once by the pipeline and reaches the daemon as the typed
-/// [`eliot_maintenance::PipelineError`] from [`route_improvement_candidate`].
+/// neither substitute a second opinion, an empty digest, nor a legacy value.
+///
+/// # The consumer uses the producer's checked version, or refuses
+///
+/// The assessment is derived only when `current` carries the SAME domain,
+/// encoding revision, and algorithm this daemon's build checks. A record under
+/// any other identity is refused as the typed
+/// [`eliot_maintenance::UncheckedRecordIdentity`], which crosses into the
+/// daemon as the [`eliot_maintenance::PipelineError`] it wraps rather than
+/// becoming a verdict:
+/// there is no fallback assessment, no empty or legacy digest standing in for
+/// the record, and no digest recomputed over what this process happens to hold.
+/// A digest is validated against the ORIGINAL recorded value; it is never
+/// recomputed over local state and called a match.
 ///
 /// The caller supplies no progress boolean: a new proposal identity, a different
 /// digest, or a repeat all establish no progress by themselves, an absent or
 /// non-discriminating retained record establishes nothing, and no unknown
 /// external effect is cleared here. Effect retry stays with its own owner.
-#[must_use]
 pub fn assess_improvement_repeat(
     retained: &RetainedImprovementProposal,
     current: &ImprovementCurrentProposal,
-) -> eliot_maintenance::ImprovementReplayAssessment {
-    compare_improvement_commitments(retained, current)
+) -> Result<eliot_maintenance::ImprovementReplayAssessment, eliot_maintenance::PipelineError> {
+    compare_improvement_commitments(retained, current).map_err(Into::into)
 }
 
 /// Preserves an unknown external activation outcome without retrying blindly.
@@ -194,12 +214,17 @@ pub fn assess_improvement_repeat(
 ///
 /// This route records the unresolved disposition and issues no new attempt.
 /// Effect reconciliation and retry stay with the external owners.
-#[must_use]
+///
+/// The obligation names the exact commitment this run checked, so `current`
+/// must carry this build's checked identity: a record under another domain,
+/// encoding revision, or algorithm is refused as the typed
+/// [`eliot_maintenance::UncheckedRecordIdentity`] rather than bound into an
+/// obligation whose named debt no owner can verify.
 pub fn reconcile_improvement_unknown(
     prior: &ImprovementAdmissionDecision,
     current: &ImprovementCurrentProposal,
     rollback: &RollbackContract,
-) -> eliot_maintenance::ImprovementTerminalDisposition {
+) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
     reconcile_unknown_activation(prior, current, rollback)
 }
 

@@ -155,6 +155,15 @@ pub enum RegistryError {
     /// match the exact disposition cause instead of parsing a message.
     #[error(transparent)]
     Disposition(#[from] crate::package_disposition::DispositionError),
+    /// A recorded Testd dispatch profile could not be resolved.
+    ///
+    /// The typed
+    /// [`TestdDispatchError`](crate::testd_profile_dispatch::TestdDispatchError)
+    /// is carried across unchanged, so a live package that names a profile the
+    /// Testd worker cannot dispatch, or a dispatchable profile no registry
+    /// entry claims, is a matchable variant rather than a message.
+    #[error(transparent)]
+    TestdDispatch(#[from] crate::testd_profile_dispatch::TestdDispatchError),
     /// One profile identity slot is unbound.
     #[error("{instrument} leaves the {slot} identity slot unbound")]
     IdentitySlotBlank {
@@ -1083,6 +1092,7 @@ impl ProviderRegistry {
         let registry = Self::build(entries, generation, normative_pair_digest)?;
         registry.verify_profile_identities()?;
         crate::package_disposition::verify_disposition_coverage(&registry)?;
+        crate::testd_profile_dispatch::verify_testd_dispatch(&registry)?;
         Ok(registry)
     }
 

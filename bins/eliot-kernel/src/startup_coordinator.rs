@@ -124,6 +124,9 @@ impl AuthorityCeiling {
         }
     }
 
+    /// Test-only ceiling probe: production never mints a profile, so the only
+    /// callers are the unit tests below.
+    #[cfg(test)]
     fn allows_material(self) -> bool {
         matches!(self, Self::Material | Self::Critical)
     }
@@ -659,14 +662,19 @@ impl StartupCoordinator {
     /// Returns the blocking [`StartupRejection`] or a profile-ceiling
     /// rejection when the profile does not permit Material authority.
     ///
-    /// Production does not reach this directly. Every production
-    /// Material/Critical effect, including the origin-control decide path,
-    /// reaches it through
+    /// Production Material/Critical effects never mint a profile for this
+    /// check. They bind the recorded Governor-issued projection through
     /// [`KernelComposition::admit_material_authority_for_governor_issued_fence`](super::KernelComposition::admit_material_authority_for_governor_issued_fence),
-    /// which first binds the current Governor-issued governance profile; it is
-    /// the startup-gate half of that decision, and the dynamic
-    /// Watchdog-coverage half is
+    /// which admits only the current Governor derivation revision (a newer
+    /// degraded revision revokes everything issued under the old one); the
+    /// dynamic Watchdog-coverage half is
     /// [`KernelComposition::admit_material_authority_for_fence`](super::KernelComposition::admit_material_authority_for_fence).
+    /// This remains the startup-prerequisite and profile-ceiling check,
+    /// covered by the unit tests below. Test-only: production
+    /// Material/Critical effects never mint a profile (see above), and the
+    /// removed `KernelComposition::admit_material_authority` was its last
+    /// production caller (#1935 AUD1).
+    #[cfg(test)]
     pub(crate) fn admit_material_authority(
         &self,
         profile: GovernanceProfile,

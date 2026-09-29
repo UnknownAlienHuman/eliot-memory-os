@@ -130,6 +130,7 @@ fn revision(automation_id: &str, revision_id: &str) -> UserAutomationRevision {
             },
         },
         portable_skill_package_revision_refs: vec!["skill-package@1".to_owned()],
+        trusted_tool_definition_refs: vec!["skill-package@1".to_owned()],
         workdir_ref: "workdir-1".to_owned(),
         route_cost_policy: RouteCostPolicy {
             route_ref: "deterministic-local".to_owned(),

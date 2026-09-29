@@ -1162,6 +1162,66 @@ function Get-GovernorRetirementTrustPolicyPreimage([object]$TrustPolicy) {
     return (@($lines) -join "`n")
 }
 
+function New-GovernorRetirementCandidateFreeze(
+    # #18-side freeze of candidate C (issue #18 AUD-5847600066-1/2, two-time workflow step 1).
+    [string]$Repo,
+    [string]$SourceCommit,
+    [string]$OutputPath) {
+    $repoFull = [System.IO.Path]::GetFullPath($Repo)
+    $candidateTree = Get-GovernorRetirementCandidateTree $Repo $SourceCommit
+    $closure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit
+    if ([string]$closure.status -cne 'COMPLETE') {
+        throw "retirement freeze refused: the independent consumer closure over $SourceCommit is $($closure.status), unclassified=$([string]::Join(',', @($closure.unclassified_paths)))"
+    }
+    $inventory = Get-GovernorRetirementCandidateInventorySurfaces $Repo $SourceCommit
+    if ([string]::IsNullOrWhiteSpace($OutputPath) -or -not [System.IO.Path]::IsPathRooted($OutputPath)) {
+        throw 'retirement freeze requires the detached freeze record path as an explicit absolute path outside the candidate tree'
+    }
+    $outputFull = [System.IO.Path]::GetFullPath($OutputPath)
+    if ($outputFull.StartsWith("$repoFull$([System.IO.Path]::DirectorySeparatorChar)", [System.StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($outputFull, $repoFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'the detached freeze record must remain outside the candidate tree C'
+    }
+    $parent = Split-Path -Parent $outputFull
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw "the detached freeze parent directory does not exist: $parent"
+    }
+    $record = [ordered]@{
+        schema = 'eliot-governor-retirement-receipt-v1'
+        receipt_kind = 'detached-approval-pointer'
+        candidate_commit = [string]$SourceCommit
+        candidate_tree = [string]$candidateTree
+        closure_rule_set = [string]$script:GovernorRetirementClosureRuleSet
+        closure_verifier = 'Get-GovernorRetirementConsumerClosure'
+        closure_digest_sha256 = [string]$closure.digest_sha256
+        trust_policy = [string]$script:GovernorRetirementTrustPolicyPath
+        consumer_count = @($inventory.surfaces).Count
+        approval = $null
+        replay_conflict = 'EXACT_REPLAY_SAME_DECISION; CHANGED_SAME_OPERATION_CONTENT_CONFLICTS'
+        self_certification = 'FORBIDDEN: this receipt never asserts identity with its own HEAD; the candidate is frozen first and the approval R(C) is issued afterwards outside the certified commit'
+    }
+    $json = ([pscustomobject]$record) | ConvertTo-Json -Depth 6
+    $stream = [System.IO.File]::Open($outputFull, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $payload = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $stream.Write($payload, 0, $payload.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    $roundtrip = Read-GovernorRetirementJsonFile $outputFull 'frozen retirement candidate record'
+    if ([string](Read-GovernorApprovalField $roundtrip 'candidate_commit') -cne [string]$SourceCommit -or [string](Read-GovernorApprovalField $roundtrip 'closure_digest_sha256') -cne [string]$closure.digest_sha256) {
+        throw 'the frozen candidate record does not read back its own candidate and closure identity; freeze refused'
+    }
+    [pscustomobject]@{
+        path = $outputFull
+        candidate_commit = [string]$SourceCommit
+        candidate_tree = [string]$candidateTree
+        closure_digest_sha256 = [string]$closure.digest_sha256
+        consumer_count = @($inventory.surfaces).Count
+    }
+}
+
 function New-GovernorRetirementApproval(
     [string]$Repo,
     [string]$SourceCommit,

@@ -3766,6 +3766,67 @@ def _validate_candidate_release_advisories(
     }
 
 
+PREPARATION_ENTRYPOINT = "scripts/prepare-dependency-policy-inputs.py"
+PREPARATION_MANIFEST_DEFAULT = ".eliot/dependency-policy-preparation.json"
+PREPARATION_AUDIT_REF = "5886153415"
+
+
+def classify_evidence_scope(record: str) -> str:
+    """Source-vs-installed evidence classification (audit 5886153415).
+
+    The installed workstation observation (``observed_installed`` and its
+    advisory disposition) is installed scope: it gates installed/runtime/
+    release acceptance. Every other external-executable record is source
+    scope. Installed scope separates acceptance; it does not exempt the
+    record from the verdict: the installed observation is presence-checked
+    in every profile run, and an unavailable installed binary keeps the
+    verdict non-PASS through explicit DEP-009 findings (boundary stated in
+    ``build_preparation_record``). These labels are additive evidence data;
+    they suppress no finding and change no status.
+    """
+    if record in ("observed_installed", "installed_advisory_disposition"):
+        return "installed"
+    return "source"
+
+
+def build_preparation_record(profile: str) -> dict:
+    """Declared clean-runner handoff record (audit 5886153415).
+
+    Names the one reproducible scanner/input preparation entrypoint that
+    #3004/#1225 invoke on a clean hosted runner before their applicable
+    policy profile, and reconciles the installed-binary policy boundary
+    explicitly: the current contract presence-checks the installed
+    observation in every source run, so an unavailable installed binary
+    stays a visible non-PASS instead of a suppressed pass. This record is
+    additive receipt data; it creates no runtime, advisory,
+    release-acceptance or Product support claim, suppresses no finding,
+    and changes no status.
+    """
+    return {
+        "audit": PREPARATION_AUDIT_REF,
+        "entrypoint": PREPARATION_ENTRYPOINT,
+        "manifest": PREPARATION_MANIFEST_DEFAULT,
+        "profile": profile,
+        "invoker_contract": (
+            f"python {PREPARATION_ENTRYPOINT} --root . --profile {profile} "
+            f"--manifest-out {PREPARATION_MANIFEST_DEFAULT}; run "
+            "python scripts/verify-dependency-policy.py --root . "
+            f"--profile {profile} only when the preparation manifest reports "
+            "ready=true, otherwise report its missing_inputs instead of "
+            "running the profile"
+        ),
+        "evidence_scope_boundary": [
+            "source-scope inputs (pinned scanner identity, provisioned project-local inputs, standalone adjacent locks, advisory snapshot binding) gate the source verdict",
+            "installed-scope evidence (the observed workstation binary) is presence-checked in every profile run: an unavailable installed observation keeps the verdict non-PASS via explicit DEP-009 findings and gates installed/runtime/release acceptance, never a source-only compilation claim",
+            "a missing tool, missing adjacent lock, or failed provisioning is an explicit incomplete state, never PASS and never fabricated",
+        ],
+        "proof_ceiling_note": (
+            "Preparation establishes input readiness only; it creates no runtime, "
+            "advisory, release-acceptance or Product support claim"
+        ),
+    }
+
+
 def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     evidence: dict = {}
@@ -4042,6 +4103,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         "status": "findings" if findings else "observed",
         "configured": surreal,
         "pinned_artifact": {
+            "evidence_scope": classify_evidence_scope("pinned_artifact"),
             "version": surreal.get("version"),
             "sha256": configured_sha,
             "catalog": catalog_evidence,
@@ -4049,12 +4111,14 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         },
         "provisioning_receipt": provisioning_receipt,
         "observed_installed": {
+            "evidence_scope": classify_evidence_scope("observed_installed"),
             "path": str(observed_path.resolve()) if observed_path else None,
             "version": observed_version,
             "sha256": observed_sha,
             "version_probe": version_probe,
         },
         "advisory_snapshot": {
+            "evidence_scope": classify_evidence_scope("advisory_snapshot"),
             "source": advisory_source,
             "query": surreal.get("advisory_query"),
             "package": advisory_package,
@@ -5649,6 +5713,7 @@ def build_receipt(
             "advisory_binding_digest": scanner_execution.get("advisory_binding_digest"),
         },
         "ecosystem_denominator": ecosystem_denominator,
+        "preparation": build_preparation_record(profile),
         "input_digests": digests,
         "missing_inputs": missing_inputs,
         "exceptions": manifest_data.get("exceptions", []),
