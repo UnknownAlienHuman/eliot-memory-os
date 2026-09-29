@@ -609,7 +609,7 @@ async fn create_lists_and_reads_back_typed_revision() {
     else {
         panic!("status must read");
     };
-    assert_eq!(status, revision);
+    assert_eq!(*status, revision);
     let response = admitted_response(
         &port,
         "op-port-inspect-1",
@@ -629,7 +629,7 @@ async fn create_lists_and_reads_back_typed_revision() {
     else {
         panic!("inspect must read");
     };
-    assert_eq!(bound, revision);
+    assert_eq!(*bound, revision);
     assert_eq!(failure, None);
 }
 
