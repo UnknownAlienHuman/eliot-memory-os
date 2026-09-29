@@ -74,7 +74,13 @@
 #   without signalling any process, and forced termination is refused when
 #   the observed descendant closure is explicitly incomplete.
 # - VerifyCleanup checks the owner marker, process descendants, port, locks,
-#   secrets, and roots; it is idempotent and never deletes foreign state.
+#   secrets, and roots; it is idempotent and never deletes foreign state. Once
+#   every check is clean it removes exactly the run root this operation created
+#   by exclusive marker create, and only that tree: the removal re-proves the
+#   recorded owner/generation claim from marker CONTENT, refuses on any foreign
+#   entry, reparse point, or missing proof, and reports a remaining root instead
+#   of deleting it. A refusal or unknown removal keeps the root and returns
+#   ReconciliationRequired.
 #   Unbound process/port observers default to real observation, an
 #   explicitly incomplete descendant closure blocks a clean verdict, and
 #   unresolved launch/stop/cleanup reconciliation blocks a clean verdict.
@@ -2173,6 +2179,166 @@ function New-StoreStopReconciliationResult {
     }
 }
 
+# Real file probe for the owned-root removal step. It reports only what it
+# observed by enumerating the owned run root: locksHeld is true when the root
+# or a child cannot be enumerated, secretsPresent when secret material remains
+# under the secret root, and rootsPresent only when an entry is outside the
+# owned allowlist (a foreign entry is preserved, never deleted). In:
+# {runRoot,runId}. Out: {runRoot,runId,locksHeld,secretsPresent,rootsPresent}.
+function New-StoreDefaultFileProbe {
+    [CmdletBinding()]
+    [OutputType([scriptblock])]
+    param()
+    $allowedChildren = $Script:StoreAllowedRootChildren
+    $ownerMarkerName = $Script:StoreOwnerMarkerFile
+    $probe = {
+        param($Request)
+        if ($null -eq $Request -or $Request -isnot [hashtable] -or -not $Request.ContainsKey('runRoot')) {
+            throw [System.ArgumentException]::new('STORE-INVALID-FILE-PROBE: file probe request needs a runRoot.')
+        }
+        $probeRoot = [System.IO.Path]::GetFullPath([string]$Request['runRoot'])
+        $locksHeld = $false
+        $secretsPresent = $false
+        $rootsPresent = $false
+        if (Test-Path -LiteralPath $probeRoot -PathType Container) {
+            $entries = @()
+            try {
+                $entries = @(Get-ChildItem -LiteralPath $probeRoot -Force -ErrorAction Stop)
+            } catch {
+                $locksHeld = $true
+            }
+            foreach ($entry in $entries) {
+                if ([string]$entry.Name -cnotin $allowedChildren -and [string]$entry.Name -cne $ownerMarkerName) {
+                    $rootsPresent = $true
+                }
+            }
+            foreach ($child in @('data', 'logs', 'secrets')) {
+                $childPath = Join-Path $probeRoot $child
+                if (-not (Test-Path -LiteralPath $childPath -PathType Container)) { continue }
+                $children = @()
+                try {
+                    $children = @(Get-ChildItem -LiteralPath $childPath -Force -ErrorAction Stop)
+                } catch {
+                    $locksHeld = $true
+                    continue
+                }
+                if ($child -ceq 'secrets' -and $children.Count -gt 0) { $secretsPresent = $true }
+            }
+        }
+        return @{
+            runRoot         = $probeRoot
+            runId           = [string]$Request['runId']
+            locksHeld       = $locksHeld
+            secretsPresent  = $secretsPresent
+            rootsPresent    = $rootsPresent
+        }
+    }
+    return $probe.GetNewClosure()
+}
+
+function Remove-StoreOwnedRoot {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Binding,
+        [Parameter(Mandatory)]
+        [hashtable]$Allocation,
+        [Parameter(Mandatory)]
+        [scriptblock]$FileProbe
+    )
+    $runId = [string]$Binding['runId']
+    $owner = [string]$Binding['owner']
+    $generation = [int]$Binding['generation']
+    $runRoot = [System.IO.Path]::GetFullPath([string]$Allocation['runRoot'])
+    $markerPath = [System.IO.Path]::GetFullPath((Join-Path $runRoot $Script:StoreOwnerMarkerFile))
+    if (-not (Test-Path -LiteralPath $runRoot -PathType Container)) {
+        return @{ removed = $true; alreadyAbsent = $true; failures = @(); ownedRoot = $runRoot }
+    }
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('owner-marker-missing') }
+    }
+    # Ownership is proven by marker CONTENT, never by the path name: the
+    # recorded claim must name this run, owner, generation, and marker value.
+    # A marker that does not match belongs to another run and is never removed.
+    $recorded = $null
+    try {
+        $recorded = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('owner-marker-unreadable') }
+    }
+    $recordedGeneration = -1
+    try { $recordedGeneration = [int]$recorded.generation } catch { $recordedGeneration = -1 }
+    if ([string]$recorded.marker -cne $Script:StoreOwnedRootMarker -or
+        [string]$recorded.run_id -cne $runId -or
+        [string]$recorded.owner -cne $owner -or
+        $recordedGeneration -ne $generation) {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('ownership-verification-failed') }
+    }
+    $topLevel = @()
+    try {
+        $topLevel = @(Get-ChildItem -LiteralPath $runRoot -Force -ErrorAction Stop)
+    } catch {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('owned-root-unreadable') }
+    }
+    $foreign = @()
+    $reparse = @()
+    foreach ($entry in $topLevel) {
+        if ([string]$entry.Name -cnotin $Script:StoreAllowedRootChildren) {
+            $foreign += [string]$entry.Name
+        }
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $reparse += [string]$entry.Name
+        }
+    }
+    if ($reparse.Count -gt 0) {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('reparse-entry-preserved:' + ($reparse -join ',')) }
+    }
+    if ($foreign.Count -gt 0) {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('foreign-entry-preserved:' + ($foreign -join ',')) }
+    }
+    $reparseCount = 0
+    try {
+        foreach ($item in @(Get-ChildItem -LiteralPath $runRoot -Force -Recurse -ErrorAction Stop)) {
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $reparseCount++ }
+        }
+    } catch {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('owned-root-unreadable') }
+    }
+    if ($reparseCount -gt 0) {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('reparse-entry-preserved') }
+    }
+    # Removal deletes nothing while a lock, a secret, or a still-present root is
+    # reported by the caller's probe, and never touches a root the probe reports
+    # as foreign.
+    $probe = $null
+    try {
+        $probe = (& $FileProbe @{ runRoot = $runRoot; runId = $runId })
+    } catch {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('file-probe-failed') }
+    }
+    if ($null -eq $probe -or $probe -isnot [hashtable]) {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('file-probe-failed') }
+    }
+    if ($probe.ContainsKey('runRoot') -and [System.IO.Path]::GetFullPath([string]$probe['runRoot']) -ine $runRoot) {
+        throw [System.InvalidOperationException]::new('STORE-FOREIGN-ROOT: removal file probe returned a foreign root.')
+    }
+    foreach ($heldField in @('locksHeld', 'secretsPresent', 'rootsPresent')) {
+        if ($probe.ContainsKey($heldField) -and [bool]$probe[$heldField]) {
+            return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @($heldField) }
+        }
+    }
+    try {
+        Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop
+    } catch {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('removal-unknown') }
+    }
+    if (Test-Path -LiteralPath $runRoot) {
+        return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('roots-present') }
+    }
+    return @{ removed = $true; alreadyAbsent = $false; failures = @(); ownedRoot = $runRoot }
+}
+
 function Invoke-StoreVerifyCleanup {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -2359,6 +2525,25 @@ function Invoke-StoreVerifyCleanup {
             cleanupState = 'ReconciliationRequired'
             cleaned   = $false
             failures  = @($failures)
+            ownedRoot = $runRoot
+        }
+    }
+    # Every check is clean, so the owned root is removed exactly once here.
+    # 'roots-present' above is a pre-removal observation, not a terminal
+    # verdict: without this step the root this operation created could never be
+    # proven gone. A removal that refuses or is unknown keeps the root and
+    # returns reconciliation instead of a clean verdict.
+    $removalProbe = $FileProbe
+    if ($null -eq $removalProbe) {
+        $removalProbe = New-StoreDefaultFileProbe
+    }
+    $removal = Remove-StoreOwnedRoot -Binding $Binding -Allocation $Allocation -FileProbe $removalProbe
+    if (-not [bool]$removal['removed']) {
+        return @{
+            runId     = $runId
+            cleanupState = 'ReconciliationRequired'
+            cleaned   = $false
+            failures  = @($removal['failures'])
             ownedRoot = $runRoot
         }
     }
@@ -4277,6 +4462,8 @@ Export-ModuleMember -Function @(
     'Invoke-StoreCollectEvidence',
     'Invoke-StoreStop',
     'Invoke-StoreVerifyCleanup',
+    'Remove-StoreOwnedRoot',
+    'New-StoreDefaultFileProbe',
     'Get-StoreAmbientEnvironment',
     'Test-StoreLoopbackEndpoint',
     'Read-StoreReconciliationRecord',
