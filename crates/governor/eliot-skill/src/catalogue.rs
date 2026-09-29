@@ -1590,6 +1590,16 @@ impl HotsetDeliveryReceipt {
                     reason: "stale or retired Skills cannot be delivered",
                 });
             }
+            // Promotion-gate binding on the delivery entry (issue #1882
+            // W2/A4, `I7.13`): same `Current`-requires-evidence rule as
+            // `activation_display`, so an unvalidated `Current` is never
+            // representable as generally delivered.
+            if entry.status == SkillStatus::Current && entry.promotion_evidence.is_none() {
+                return Err(SkillError::InvalidField {
+                    field: "entry.promotion_evidence",
+                    reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
+                });
+            }
             if entry.status != SkillStatus::Current {
                 provisional = true;
             }
