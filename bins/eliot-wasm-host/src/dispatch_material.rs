@@ -1475,6 +1475,18 @@ fn restore_aside_if_absent(aside: &std::path::Path, fixed: &std::path::Path) {
     let _ = std::fs::rename(aside, fixed);
 }
 
+fn consume_staged_unlocked(path: &std::path::Path) -> ReclaimOutcome {
+    match std::fs::remove_file(path) {
+        Ok(()) => ReclaimOutcome::Reclaimed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReclaimOutcome::NotFound,
+        Err(error) if error.raw_os_error() == Some(32) => ReclaimOutcome::SharingViolation,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            ReclaimOutcome::AccessDenied
+        }
+        Err(error) => ReclaimOutcome::Other(error.kind().to_string()),
+    }
+}
+
 /// Reclaims one fixed staging name by claim: renames the fixed name aside
 /// under the claimed-identity name, re-verifies the aside bytes against
 /// the claim, and deletes only the verified aside. A fixed name that went
