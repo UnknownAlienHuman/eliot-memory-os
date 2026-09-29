@@ -3080,7 +3080,7 @@ impl CoverageReceipt {
         } else {
             CounterSearchStatus::NotRequired
         };
-        let denominator_kind = denominator_kind(CompleteScopeEvidence {
+        let evidence = CompleteScopeEvidence {
             all_closed,
             accounted,
             absence_verdict: &absence_verdict,
@@ -3088,7 +3088,8 @@ impl CoverageReceipt {
             absence_proof_ceiling_grade,
             degradation_count: provider_degradation.len(),
             counter_search_status,
-        });
+        };
+        let denominator_kind = denominator_kind(&evidence);
         let mut receipt = Self {
             inquiry_id: profile.inquiry_id.clone(),
             profile_digest: profile.integrity_digest.clone(),
@@ -3209,16 +3210,7 @@ impl CoverageReceipt {
         for handle in &self.eligible_handles {
             push_field(&mut preimage, "eligible_handle", handle);
         }
-        for (tag, values) in [
-            ("unknown_coverage", &self.unknown_coverage),
-            ("route_used", &self.routes_used),
-            ("degradation", &self.provider_degradation),
-        ] {
-            push_count(&mut preimage, tag, values.len());
-            for value in values {
-                push_field(&mut preimage, tag, value);
-            }
-        }
+        push_repeated_fields(&mut preimage, self);
         push_field(
             &mut preimage,
             "counter_search_status",
@@ -3256,6 +3248,25 @@ impl CoverageReceipt {
             push_field(&mut preimage, "budget_limitation", limitation);
         }
         freeze(&preimage)
+    }
+}
+
+/// Pushes the receipt's three free-valued retained lists onto a digest preimage.
+///
+/// Each list is bound as a count followed by that many values under the same
+/// tag, so a reader of the preimage can tell an empty list from a list whose
+/// values were never reached. The tag order is the field order, and the order
+/// of the values within each list is the order the receipt itself carries.
+fn push_repeated_fields(preimage: &mut String, receipt: &CoverageReceipt) {
+    for (tag, values) in [
+        ("unknown_coverage", &receipt.unknown_coverage),
+        ("route_used", &receipt.routes_used),
+        ("degradation", &receipt.provider_degradation),
+    ] {
+        push_count(preimage, tag, values.len());
+        for value in values {
+            push_field(preimage, tag, value);
+        }
     }
 }
 
@@ -3306,10 +3317,10 @@ struct CompleteScopeEvidence<'a> {
 /// `Proven` without an owner-issued evaluation; they are written out rather
 /// than assumed, so a future assessor that grew a new way to prove absence
 /// cannot raise this receipt's denominator kind without a record behind it.
-fn denominator_kind(evidence: CompleteScopeEvidence<'_>) -> DenominatorKind {
+fn denominator_kind(evidence: &CompleteScopeEvidence<'_>) -> DenominatorKind {
     if evidence.all_closed
         && evidence.accounted
-        && *evidence.absence_verdict == AbsenceVerdict::Proven
+        && evidence.absence_verdict == &AbsenceVerdict::Proven
         && evidence.absence_evidence_digest.is_some()
         && evidence.absence_proof_ceiling_grade.is_some()
         && evidence.degradation_count == 0
