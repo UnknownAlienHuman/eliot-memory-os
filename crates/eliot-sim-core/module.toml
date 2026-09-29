@@ -1,0 +1,143 @@
+# Cell manifest for the `sim-core` functional capability cell.
+#
+# One manifest represents one FunctionalCapabilityCell, never one Cargo
+# package (I2.20:26), and package membership never transfers lifecycle
+# authority to a cell (I2.20:22). This file records the cell contract the
+# crate did not previously carry; every value below is an existing
+# declaration of this crate, not a new policy claim. A field the
+# documentation does not determine for this cell stays undeclared and is
+# named with its reason in `[i2_10].undetermined` instead of being defaulted
+# (I2.10:3, I2.20:63).
+schema_version = 4
+module_id = "sim-core"
+crate = "eliot-sim-core"
+# Carried verbatim from `[package.metadata.eliot]` in
+# `crates/eliot-sim-core/Cargo.toml`. Read from that declaration, never from
+# the crate name (I2.10:3).
+source_layer = "C1"
+lifecycle_owner = "go39-1916"
+# Quoted verbatim from `[package].description` in the crate's own manifest.
+primary_responsibility = "Pure deterministic simulation boundary: commands, events, state, seeded scheduler, fault injection, seed artifacts, mandatory scenarios"
+# Quoted from the crate's own `src/lib.rs` module contract: a run is fully
+# determined by its ScenarioId and seed.
+causal_property = "A seeded, fault-scripted command/event delivery schedule is folded deterministically through a pure state machine into one simulation report"
+# I2.10:45-48 defines `stateless` as no state surviving request or process;
+# the reason for this cell's class is recorded in `[i2_10].state_class`.
+state_class = "stateless"
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["ScenarioId", "simulation seed", "SimConfig", "ScriptedFault plan"]
+outputs = ["SimulationSeedArtifact", "delivery schedule", "terminal SimState", "InvariantVerdict list", "failure trace"]
+depends_on = []
+# The generated module graph is empty: `Cargo.lock` records no package that
+# depends on `eliot-sim-core`, and
+# `python scripts/code_navigation.py capsules` classifies this cell
+# `UNREACHABLE`, so no bin reaches it. This is read from the observed
+# dependency graph, not inferred from the cell name (I2.10:3).
+consumers = []
+# Quoted from `src/lib.rs`: the crate drives pure command/event/state
+# transitions without Tokio, databases, model SDKs, Wasmtime, process
+# spawning, or file/network IO, and the adapter traits are declarations only
+# that this crate never calls into a runtime.
+non_goals = ["production runtime execution", "process, store, model or authority implementation", "any effect outside the simulated boundary"]
+# Quoted from `src/lib.rs`: running the same scenario with the same seed
+# twice yields identical digests, schedule, terminal state, invariants, and
+# failure trace; a simulation PASS proves only the modeled contracts.
+invariants = ["same ScenarioId and seed reproduce the same digests, schedule, terminal state, invariants and failure trace", "a simulation PASS is never evidence for the real-edge or live fault proof the scenario names"]
+# Quoted from the crate's own proof entrypoint and its `tests/` tree.
+proof_surface = ["deterministic replay", "mandatory scenario coverage", "fault and disposition rejection"]
+proof_ceiling = "Module proof of the modeled contracts only; the real-edge or live fault proof each scenario names stays separate, as the crate itself records"
+# Quoted from `[package.metadata.eliot].workspace_admission`: the crate
+# carries "no runtime, store, model, or process authority".
+replacement_boundary = "package ownership creates no runtime, store, model, process or semantic authority; replacing this cell replaces a pure simulation library and never a production generation"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+# I2.10 classification of this functional capability cell. Every value below
+# is an explicit declaration of THIS cell, recorded per I2.10:124 ("The
+# decision and rejected alternatives are recorded in the Module Catalog").
+# No value is derived from a crate, bundle, source-layer or runtime-layer
+# name (I2.10:3), and an undetermined field is recorded as undetermined with
+# its reason instead of being defaulted (I2.10:3, I2.20:63).
+[i2_10]
+# Functional capability cell: sim-core
+cell = "sim-core"
+# I2.10:12 admits the `development_only` contour for "generators, fuzzers,
+# benchmarks, migration/test utilities" whose use is "never required by
+# production runtime", and I2.10:41 admits the `development_tool` runtime
+# class for an "impact/schema/simulation generator" whose default
+# replacement is "never required at runtime". This cell declares that
+# non-requirement from its own evidence, never from its name (I2.10:3):
+#   * `python scripts/code_navigation.py capsules` reports this cell
+#     `UNREACHABLE`, which is this repository's own statement that no bin
+#     reaches the package, so it is on no production execution path;
+#   * `Cargo.lock` records no package that depends on `eliot-sim-core`, and
+#     the only references to the crate in the tree are the root
+#     `Cargo.toml` workspace member list and its own `Cargo.toml`;
+#   * `[package.metadata.eliot].workspace_admission` records "no runtime,
+#     store, model, or process authority";
+#   * the cell declares no runtime layer and no runtime bundle above.
+# A production-required cell carrying either development classification is
+# refused by manifest generation with
+# CellManifestError::DevelopmentClassifiedProductionRequired; a
+# non-production-required cell carrying neither is refused with
+# CellManifestError::DevelopmentClassificationMissing.
+production_required = false
+# I2.10:12 names `development_only` and gives its use verbatim: generators,
+# fuzzers, benchmarks, migration/test utilities, never required by the
+# production runtime, with simctl and fuzz targets as examples. A simulation
+# boundary whose only declared consumer set is empty and which no bin
+# reaches is that contour. It is not read off the crate name (I2.10:3).
+execution_contour = "DEVELOPMENT_ONLY"
+# I2.10:41 names `development_tool` for an "impact/schema/simulation
+# generator" and gives its default replacement as "never required at
+# runtime". This cell is a simulation generator: it turns a ScenarioId and a
+# seed into a delivery schedule, a terminal state, invariant verdicts and a
+# seed artifact, and its own module contract says a run is fully determined
+# by that ScenarioId and seed. The class is not read off the crate, bundle,
+# source-layer or runtime-layer name (I2.10:3).
+runtime_class = "DEVELOPMENT_TOOL"
+# I2.10:45-48 defines `stateless` as "no state survives request/process".
+# This cell declares
+#   owned_mutable_state = []
+#   allowed_effects      = []
+# so nothing it owns survives the run: every SimState and every
+# SimulationSeedArtifact is constructed inside the call and returned to the
+# caller rather than retained. host_state_externalized, rebuildable,
+# checkpointed_operational and external_canonical_adapter each require owned
+# or externally anchored state this cell does not declare. Read from the
+# declared state and effect sets, not from a crate, bundle or layer name.
+state_class = "STATELESS"
+# I2.10:62-63 states that canonical storage, semantic admission and
+# mechanical fencing remain one path with separated responsibilities, and
+# that no hot-replaceable module declares canonical_semantic. This cell
+# declares no canonical write, persistence or authority role above or in
+# its own module contract, so it claims none. A hot-replaceable cell that
+# claimed it would be refused with
+# CellManifestError::HotReplaceableCanonicalSemantic.
+canonical_semantic = "NOT_CLAIMED"
+least_privilege_reason = "I2.10:108 selects the least privileged contour that can express the capability, and I2.10:12 is the contour that exists for exactly this capability: generators, fuzzers, benchmarks, simulations and migration/test utilities that are never required by the production runtime. This cell declares that non-requirement in its own evidence (consumers = [], an UNREACHABLE module graph, no runtime layer, no runtime bundle, and an admitted scope of 'no runtime, store, model, or process authority'), and its own module contract excludes the OS, tool, credential and async I/O work that the wider contours exist to contain, so there is no production capability surface left for this cell to hold. I2.10:41 is the matching runtime class: the cell's declared responsibility is to generate a deterministic simulation from a ScenarioId and a seed, and that class's default replacement is 'never required at runtime', which is the only replacement statement that is true of this cell. Neither value is inferred from the crate, bundle, source-layer or runtime-layer name (I2.10:3)."
+promotion_path = "No promotion is owed and none is available: I2.10:12 bounds this contour by 'never required by the production runtime', so moving the cell onto a production contour would be a change of the cell's own purpose rather than a promotion. I2.10:124 makes a later change of contour a governed promotion or migration, never an invisible build optimization, so if a future cell ever needs a production execution path it is a new cell with its own manifest and its own selection record, not a reclassification of this one. The cell's own proof ceiling already records that a simulation PASS proves only the modeled contracts and that the real-edge or live fault proof each scenario names remains required."
+
+# Contours and runtime classes considered and rejected, with the reason each
+# does not express this capability (I2.10:124). The chosen classification is
+# never among them.
+rejected_alternatives = [
+  { contour = "wasm_component", reason = "I2.10:9 admits wasm_component for pure or nearly pure experimental logic with a narrow capability surface, isolated as a Wasmtime Store/instance with an immutable component generation. This cell is pure, but it is never admitted by a production component host: it declares no runtime bundle, no runtime layer and an empty consumer set, so there is no host generation that would load it. Claiming wasm_component would assert a production execution position this cell does not have, and I2.10:12 is the contour that records the opposite fact." },
+  { contour = "native_process", reason = "I2.10:10 admits a native process for OS, Cargo, Git, LSP, browser, native-library, credential or long-CPU work behind a separate process or Job Object. This cell's own module contract excludes process spawning, file and network IO, databases, model SDKs and Wasmtime, and it declares allowed_effects = [], so a separate process would add IPC latency and a second lifecycle owner for no declared capability." },
+  { contour = "static_native", reason = "I2.10:11 admits a static native release candidate for a trusted Kernel or control path or a measured stable hot path, and I2.10:21 states that static native is not a default reward for maturity. This cell is neither a control path nor a hot path, and no measurement is recorded for it. A development-only cell is never required by the production runtime (I2.10:12), so it can never be a trusted control path." },
+  { class = "test_execution_plane", reason = "I2.10:35 names test_execution_plane for a build, test or simulation service whose default replacement is an independent testd generation. The production build and test execution plane in this repository is the `eliot-testd` binary, which the Kernel admits and launches as a real runtime process (bins/eliot-kernel/src/dispatch_launch.rs). This cell is an in-process pure library, not that service, and declaring the service class for it would name a runtime process the cell does not provide and would demand a runtime bundle it correctly does not have." },
+  { class = "derived_index", reason = "I2.10:36 names derived_index for a code graph, cue or search index that is rebuilt, shadowed and switched. This cell publishes no index: it declares consumers = [] and an UNREACHABLE module graph, so no runtime ever queries a projection it produces." },
+  { class = "process_bridge", reason = "I2.10:33 names process_bridge for an MCP, LSP, provider or tool bridge replaced through an independent process generation. This cell starts no process and speaks no provider, LSP or MCP protocol; its own module contract says the adapter traits are declarations only and that this crate never calls into a runtime." },
+]
+
+# Fields the documentation does not determine for this cell. They stay
+# undeclared on purpose: manifest generation refuses an absent
+# classification with CellManifestError::MissingField instead of accepting a
+# synthesized value (I2.10:3, I2.20:63).
+undetermined = [
+  { field = "replacement_class", reason = "I2.10:69-84 names the cutover of a sandboxed component generation, a native process generation, a daemon generation, the external Host/SCM cutover, or an offline release with an explicit owner, reason and recovery. This cell hosts nothing and is replaced only as a source library, so the documentation records no cutover to name, and the class must not be read off the hosting bundle or crate name (I2.10:3)." },
+  { field = "iteration_lane", reason = "I2.20:53-63 requires a ProofLatencyProfile carrying the exact machine, toolchain, cache and build fingerprint with measured p50/p95/p99/max before a lane is claimed. No such profile is recorded for this cell, and I2.20:63 states that missing proof-latency evidence disables automatic assignment to the interactive lane without naming a substitute lane, so every lane value here would be invented." },
+  { field = "runtime_layer", reason = "I2.10:12 bounds this contour to capabilities never required by the production runtime, so the crate declares no runtime layer. Inventing one would assert a production runtime position the cell explicitly does not have (I2.10:3)." },
+  { field = "runtime_bundle", reason = "The cell runs in the caller's own process when a simulation is requested and is admitted by no production bundle, so there is no bundle to name. I2.10:3 forbids defaulting it from a layer or bundle name." },
+]
