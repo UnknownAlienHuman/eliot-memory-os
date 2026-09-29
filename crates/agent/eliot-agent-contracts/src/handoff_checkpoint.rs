@@ -562,7 +562,10 @@ impl HandoffCheckpoint {
     pub fn has_unfinished_verifiers_or_effects(&self) -> bool {
         !self.pending_verifier_refs.is_empty()
             || self.effects.iter().any(|effect| {
-                matches!(effect.disposition, HandoffEffectDisposition::OutcomeUnknown { .. })
+                matches!(
+                    effect.disposition,
+                    HandoffEffectDisposition::OutcomeUnknown { .. }
+                )
             })
     }
 }
@@ -866,7 +869,10 @@ impl HandoffCaptureOperation {
     /// operation: only durable readback admits it. Unknown acceptance fails
     /// closed.
     pub fn permits_compaction(&self) -> bool {
-        matches!(self.acceptance, HandoffCaptureAcceptance::DurablyStored { .. })
+        matches!(
+            self.acceptance,
+            HandoffCaptureAcceptance::DurablyStored { .. }
+        )
     }
 
     /// Refuses the requested compaction unless durable readback was observed.
@@ -938,7 +944,10 @@ impl HandoffProviderGap {
     /// checkpoint. Every other continuity is refused and the dependent
     /// action stays refused until the resume owner admits `Rehydrated`.
     pub fn admits_continuation(&self, continuity: HandoffContinuity) -> bool {
-        matches!(continuity, HandoffContinuity::Rehydrated | HandoffContinuity::Fresh)
+        matches!(
+            continuity,
+            HandoffContinuity::Rehydrated | HandoffContinuity::Fresh
+        )
     }
 }
 
