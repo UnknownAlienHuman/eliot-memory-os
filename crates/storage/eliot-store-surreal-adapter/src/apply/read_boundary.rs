@@ -2537,9 +2537,9 @@ async fn read_revisions_after(
                 automation_id: automation_row_text(object, "automation_id")?,
                 revision: automation_row_text(object, "revision")?,
                 revision_json: automation_row_text(object, "revision_json")?,
-                normalization_receipt_json: object.get(
-                    eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON,
-                ).cloned(),
+                normalization_receipt_json: object
+                    .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+                    .cloned(),
                 state_fence: automation_row_fence(object)?,
             })
         })

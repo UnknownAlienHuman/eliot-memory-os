@@ -1052,7 +1052,8 @@ fn dispatch_apply_automation_state(
                 match state.automation_revisions.get(&key) {
                     Some(existing)
                         if existing.revision_json != revision_json
-                            || existing.normalization_receipt_json != normalization_receipt_json =>
+                            || existing.normalization_receipt_json
+                                != normalization_receipt_json =>
                     {
                         return Err(StoreError::IdentityConflict);
                     }
@@ -1115,7 +1116,8 @@ fn dispatch_apply_automation_state(
                 match state.automation_revisions.get(&key) {
                     Some(existing)
                         if existing.revision_json != revision_json
-                            || existing.normalization_receipt_json != normalization_receipt_json =>
+                            || existing.normalization_receipt_json
+                                != normalization_receipt_json =>
                     {
                         return Err(StoreError::IdentityConflict);
                     }

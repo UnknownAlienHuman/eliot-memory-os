@@ -1336,9 +1336,8 @@ fn validate_automation_normalization_envelope(
     let Some(envelope) = envelope else {
         return Ok(None);
     };
-    let decoded: ReceiptEnvelope = serde_json::from_value(envelope.clone()).map_err(|error| {
-        AdapterError::Store(StoreError::Serialization(error.to_string()))
-    })?;
+    let decoded: ReceiptEnvelope = serde_json::from_value(envelope.clone())
+        .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
     decoded
         .validate()
         .map_err(|_| AdapterError::Store(StoreError::InvalidReceipt))?;
