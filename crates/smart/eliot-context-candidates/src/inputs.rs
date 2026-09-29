@@ -35,7 +35,7 @@ use eliot_context_contracts::{
     ContextRecipe, MeasurementRef, PrivacyClass, ProofBinding, ProviderId, ProviderRole,
     SemanticRole, SourceSnapshot,
 };
-use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId};
+use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId, fences_match_exact};
 use eliot_cue_contracts::{ActivationResult, Completeness};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition, SourceAssurance};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope};
@@ -731,8 +731,11 @@ impl MemoryInput {
     ///
     /// The caller supplies the compilation binding and the slot projection
     /// state; the set supplies the verdict. Task and scope must equal the
-    /// set binding exactly and the fences must be compatible, otherwise the
-    /// set belongs to another read and is rejected. Applicable handles,
+    /// set binding exactly and the fences must match exactly in both
+    /// directions, otherwise the set belongs to another read and is rejected.
+    /// An absent optional revision on one side is not a wildcard for the
+    /// other, so a set read under a different revision cannot be absorbed.
+    /// Applicable handles,
     /// exclusions with exact reason classes, advisory cue-hit flags, the
     /// known-denominator bit, and the truncation flag all transfer
     /// field-for-field; cue-hit handles are re-sorted for a deterministic
@@ -749,11 +752,7 @@ impl MemoryInput {
         if set.binding.task_id != binding.task_id || set.binding.scope_id != binding.scope_id {
             return Err(ContextError::InvalidField("memory.binding"));
         }
-        if !set
-            .binding
-            .state_fence
-            .is_compatible_with(&binding.state_fence)
-        {
+        if !fences_match_exact(&set.binding.state_fence, &binding.state_fence) {
             return Err(ContextError::InvalidField("memory.binding"));
         }
         let mut applicable = Vec::with_capacity(set.applicable.len());

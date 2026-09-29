@@ -4,7 +4,7 @@
 //! owner-neutral projection set consumed through contracts. It takes only
 //! shared references (`TaskLifecycleSnapshot`, `SessionLifecycleSnapshot`,
 //! `WorkScopeBindingSnapshot`, and `ObservationJournalEntry` slices), enforces
-//! one fence via [`StateFence::is_compatible_with`], and reports gaps as
+//! one fence via [`eliot_contracts::fences_match_exact`], and reports gaps as
 //! explicit [`ProjectionOmission`] records. It opens no store, touches no
 //! Kernel port, and defines no new port: the output is data for the Smart
 //! contract set, never an effect.
@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{StateFence, TaskId};
+use eliot_contracts::{StateFence, TaskId, fences_match_exact};
 use eliot_observation::{ObservationAdmissionResult, ObservationJournalEntry};
 use eliot_session::SessionLifecycleSnapshot;
 use eliot_task::{TaskLifecycleSnapshot, TaskState};
@@ -254,9 +254,12 @@ pub struct GovernorProjectionSet {
 
 impl GovernorProjectionSet {
     /// Returns whether one fence can share this set's decision scope.
+    ///
+    /// Exact in both directions, so an absent optional revision on the
+    /// presented fence is not a wildcard for this set's revision.
     #[must_use]
     pub fn is_compatible_with(&self, fence: &StateFence) -> bool {
-        self.fence.is_compatible_with(fence)
+        fences_match_exact(&self.fence, fence)
     }
 
     /// Validates the set: versions, fence, members, and omission coverage.
@@ -368,9 +371,7 @@ fn project_task(
         });
         return Ok(None);
     };
-    if !record.state_fence.is_compatible_with(fence)
-        || !fence.is_compatible_with(&record.state_fence)
-    {
+    if !fences_match_exact(&record.state_fence, fence) {
         return Err(GovernorProjectionError::FenceMismatch);
     }
     check_text(&record.goal, "task.goal")?;
@@ -404,10 +405,7 @@ fn project_continuity(
         if session.task_scope.as_deref() != Some(wanted.as_str()) {
             continue;
         }
-        if session.state_fence.is_compatible_with(fence)
-            && fence.is_compatible_with(&session.state_fence)
-            && !session.status.terminal()
-        {
+        if fences_match_exact(&session.state_fence, fence) && !session.status.terminal() {
             open = open.saturating_add(1);
         }
     }
@@ -493,9 +491,7 @@ pub fn compose_canonical_projections(
     scope_snapshot
         .validate()
         .map_err(|_| GovernorProjectionError::InvalidSnapshot("workscope"))?;
-    if !scope_snapshot.state_fence.is_compatible_with(fence)
-        || !fence.is_compatible_with(&scope_snapshot.state_fence)
-    {
+    if !fences_match_exact(&scope_snapshot.state_fence, fence) {
         return Err(GovernorProjectionError::FenceMismatch);
     }
     let scope_ref = scope_snapshot.binding.scope.scope_ref.clone();
