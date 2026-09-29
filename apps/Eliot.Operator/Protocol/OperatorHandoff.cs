@@ -62,6 +62,36 @@ public static class OperatorIdentityFields
     }
 }
 
+/// The closed broker-issued Human role and capability vocabulary the UI
+/// renders under (I11.3, I11.8). The owner mints exactly one role with the two
+/// capabilities below (`crates/surfaces/eliot-user-broker-core::OPERATOR_ROLE`
+/// / `OPERATOR_CAPABILITIES`, exact-match enforced owner-side); the client
+/// pins the same closed set and refuses anything wider. Per-view and
+/// per-action gating reads the GRANTED binding, never a constant, so a
+/// narrower future binding withholds rather than executes.
+public static class OperatorCapabilityNames
+{
+    public const string HumanOperatorRole = "human_operator";
+    public const string ControlboardRead = "controlboard.read";
+    public const string OperatorCommand = "operator.command";
+}
+
+/// The broker-granted role and exact capability set one established UI
+/// binding was redeemed for. It carries no credential: role and capabilities
+/// are the non-sensitive grant description the broker echoed at challenge and
+/// redemption.
+public sealed record OperatorRoleBinding(
+    string Role,
+    IReadOnlyList<string> Capabilities)
+{
+    public bool Grants(string capability) =>
+        Capabilities.Contains(capability, StringComparer.Ordinal);
+
+    public bool GrantsReads => Grants(OperatorCapabilityNames.ControlboardRead);
+
+    public bool GrantsCommands => Grants(OperatorCapabilityNames.OperatorCommand);
+}
+
 /// One owner-issued, single-use, expiring, generation-bound Operator handoff.
 ///
 /// The owner issues exactly six wire fields

@@ -61,6 +61,36 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     private const int LifecycleClosing = 1;
     private const int LifecycleDisposed = 2;
 
+    /// The broker-granted role and exact capability set the live connection
+    /// was redeemed for, read off the handoff that authenticated it. A
+    /// dropped, aborted or half-open transport grants nothing: only a live
+    /// connection reports its grant, and an unreadable transport reports
+    /// null rather than a stale grant. Null never authorizes; callers treat
+    /// it as "let the transport authenticate", never as a capability.
+    public OperatorRoleBinding? GrantedBinding
+    {
+        get
+        {
+            try
+            {
+                var connection = Volatile.Read(ref _connection);
+                var endpoint = connection?.Handoff?.Endpoint;
+                if (connection is null
+                    || endpoint is null
+                    || connection.IsAborted
+                    || !connection.Pipe.IsConnected)
+                {
+                    return null;
+                }
+                return new OperatorRoleBinding(endpoint.Role, endpoint.Capabilities);
+            }
+            catch (Exception error) when (error is ObjectDisposedException or IOException or InvalidOperationException)
+            {
+                return null;
+            }
+        }
+    }
+
     private GovernorConnection? _connection;
     private long _requestId;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
