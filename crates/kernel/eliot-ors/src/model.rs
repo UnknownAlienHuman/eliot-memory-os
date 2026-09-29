@@ -7620,6 +7620,29 @@ pub struct HostRequestRecord {
     pub parent_operation_id: Option<OpaqueLabel>,
     pub request_digest: String,
     pub payload_digest: String,
+    /// Schema identity of the staged payload (issue #1739 W2).
+    ///
+    /// Bound at stage time from the admitted envelope, so execution after a
+    /// restart resolves the exact typed bytes against the exact schema. `None`
+    /// only on rows staged before this binding existed.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_schema_id: Option<OpaqueLabel>,
+    /// Exact bounded typed payload bytes bound to `payload_digest` (issue
+    /// #1739 W2).
+    ///
+    /// Opaque to ORS: the Kernel binder stores the canonical tool JSON here
+    /// before the observe claim is handed out, and execution after a restart
+    /// reads it off the row instead of relying on the digest alone. Excluded
+    /// from [`HostRequestRecord::same_binding`] as ORS-owned progression (the
+    /// binding arrives after staging): `validate` re-checks the
+    /// digest equality on every read, so sameness is implied by the compared
+    /// `payload_digest`. `None` until bound; never cleared or replaced once
+    /// set. Bounded to the same structured ceiling as
+    /// [`MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES`].
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_body: Option<Value>,
     pub connection_ref: OpaqueLabel,
     pub session_ref: Option<OpaqueLabel>,
     pub task_ref: Option<OpaqueLabel>,
@@ -7722,8 +7745,10 @@ impl HostRequestRecord {
 
     /// Returns whether two records carry the exact same request binding.
     ///
-    /// State, result, and commit order are excluded: they are ORS-owned
-    /// progression, not caller binding.
+    /// State, result, commit order, and the post-stage payload body are
+    /// excluded: they are ORS-owned progression, not caller binding. The body
+    /// stays implied by the compared `payload_digest` because `validate`
+    /// re-checks body/digest equality on every read.
     pub fn same_binding(&self, other: &Self) -> bool {
         self.operation_id == other.operation_id
             && self.kind == other.kind
@@ -7734,6 +7759,10 @@ impl HostRequestRecord {
             && self.parent_operation_id == other.parent_operation_id
             && self.request_digest == other.request_digest
             && self.payload_digest == other.payload_digest
+            && Self::same_payload_schema(
+                self.payload_schema_id.as_ref(),
+                other.payload_schema_id.as_ref(),
+            )
             && self.connection_ref == other.connection_ref
             && self.session_ref == other.session_ref
             && self.task_ref == other.task_ref
@@ -7744,6 +7773,18 @@ impl HostRequestRecord {
             && self.generation == other.generation
             && self.deadline_unix_ms == other.deadline_unix_ms
             && self.transport_channel_binding_sha256 == other.transport_channel_binding_sha256
+    }
+
+    /// Returns whether two staged payload-schema bindings agree.
+    ///
+    /// A missing schema on either side is a row staged before the issue #1739
+    /// W2 binding existed, never a changed schema: only two present but
+    /// different schemas disagree.
+    fn same_payload_schema(left: Option<&OpaqueLabel>, right: Option<&OpaqueLabel>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
     }
 
     /// Validates identity shape and state/result coherence.
@@ -7796,6 +7837,13 @@ impl HostRequestRecord {
                 field: "host_request_deadline",
                 reason: "must be greater than zero",
             });
+        }
+        // Issue #1739 W2: a bound body always proves it is the admitted
+        // payload. Absence stays readable (rows bound before the claim, or
+        // staged before this binding existed); a present body that is not the
+        // digest-bound bytes is refused on read rather than trusted.
+        if let Some(body) = &self.payload_body {
+            validate_payload_body(body, &self.payload_digest)?;
         }
         match (&self.state, &self.result_digest, &self.result_response) {
             (
@@ -7890,6 +7938,9 @@ impl HostRequestRecord {
         }
         validate_digest(&self.request_digest, "host_request_request_digest")?;
         validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        if let Some(schema) = &self.payload_schema_id {
+            validate_text(schema.as_str(), "host_request_payload_schema_id")?;
+        }
         match (
             self.send_claim_protocol_version,
             self.transport_channel_binding_sha256.as_deref(),
@@ -8297,6 +8348,47 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Or
 /// Mirrors `eliot-protocol::HARD_STRUCTURED_RESPONSE_BYTES` without adding a
 /// wire-crate edge to durable state.
 pub const MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Bounded size of one stored host-request payload body (issue #1739 W2).
+///
+/// Mirrors `eliot-protocol::HARD_STRUCTURED_RESPONSE_BYTES` like the result
+/// body: the staged tool bytes are bounded structured JSON.
+pub const MAX_HOST_REQUEST_PAYLOAD_BODY_BYTES: usize = 256 * 1024;
+
+/// Validates exact staged payload bytes against their admitted digest.
+///
+/// The body must be a bounded JSON object whose canonical digest (the shared
+/// `eliot_contracts::canonical_json_bytes` recipe, identical to the protocol
+/// invoke-read carrier check) equals the staged `payload_digest`. Shape and
+/// bound are checked before the digest so oversized or malformed bodies fail
+/// with their own reason.
+pub(crate) fn validate_payload_body(body: &Value, payload_digest: &str) -> Result<(), OrsError> {
+    if !body.is_object() {
+        return Err(OrsError::InvalidField {
+            field: "host_request_payload_body",
+            reason: "payload body must be a bounded JSON object",
+        });
+    }
+    let encoded = serde_json::to_vec(body).map_err(|_| OrsError::InvalidField {
+        field: "host_request_payload_body",
+        reason: "payload body must serialize to bounded JSON",
+    })?;
+    if encoded.len() > MAX_HOST_REQUEST_PAYLOAD_BODY_BYTES {
+        return Err(OrsError::InvalidField {
+            field: "host_request_payload_body",
+            reason: "payload body exceeds the bounded payload ceiling",
+        });
+    }
+    let canonical =
+        canonical_json_bytes(body).map_err(|error| OrsError::Encoding(error.to_string()))?;
+    if sha256_hex(&canonical) != payload_digest {
+        return Err(OrsError::InvalidField {
+            field: "host_request_payload_body",
+            reason: "payload body does not match the admitted payload digest",
+        });
+    }
+    Ok(())
+}
 
 pub(crate) fn validate_result_response(body: &Value) -> Result<(), OrsError> {
     if !body.is_object() {

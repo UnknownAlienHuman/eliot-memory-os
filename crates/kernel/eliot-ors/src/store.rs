@@ -10051,6 +10051,65 @@ impl RedbRecoveryStore {
         Ok(Some(record))
     }
 
+    /// Binds the exact typed payload bytes to one staged operation (issue
+    /// #1739 W2).
+    ///
+    /// Persist-before-claim: the Kernel calls this before the observe claim is
+    /// handed out, so execution after a restart reads the exact bytes off the
+    /// durable row instead of relying on the payload digest alone. The body
+    /// must be a bounded JSON object whose canonical digest equals the staged
+    /// `payload_digest`; anything else fails closed. Binding is monotonic:
+    /// re-binding the same bytes returns the durable row unchanged, while
+    /// different bytes under the same operation/request identity fail with
+    /// [`OrsError::HostRequestIdentityConflict`] and can never replace the
+    /// admitted operation. Input cannot be bound after a result completed.
+    pub fn bind_host_request_payload(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        body: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        crate::model::validate_payload_body(body, &existing.payload_digest)?;
+        if let Some(staged) = existing.payload_body.as_ref() {
+            if staged == body {
+                return Ok(Some(existing));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if existing.result_digest.is_some() || existing.result_response.is_some() {
+            return Err(OrsError::InvalidTransition);
+        }
+        let mut next = existing.clone();
+        next.payload_body = Some(body.clone());
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
     /// Persists one bounded local-read result body alongside its digest.
     ///
     /// See [`OperationalRecoveryStore::persist_host_request_result`] for the
@@ -33475,6 +33534,8 @@ mod host_request_result_tests {
             parent_operation_id: None,
             request_digest: digest.to_owned(),
             payload_digest: "b".repeat(64),
+            payload_schema_id: None,
+            payload_body: None,
             connection_ref: label("conn-1"),
             session_ref: Some(label("session-1")),
             task_ref: None,
