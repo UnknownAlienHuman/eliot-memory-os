@@ -15,12 +15,11 @@
 //!
 //! The fence is not asserted by the caller. Every fence field is read from the
 //! source view the port returns: the installation identity the owner observed,
-//! state fence, revision heads, ordering heads, event range, scope,
-//! schema/store generation and the store-declared residency-key reachability
-//! set. Coherence is then *proved* before a byte is
-//! written, and the proof fails closed (I05-10 "consistent export boundary";
-//! I5.13: an incoherent boundary fails that class rather than producing a
-//! partial successful backup):
+//! state fence, revision heads, ordering heads, event range, scope, schema/store
+//! generation and the store-declared residency-key reachability set. Coherence
+//! is then *proved* before a byte is written, and the proof fails closed
+//! (I05-10 "consistent export boundary"; I5.13: an incoherent boundary fails
+//! that class rather than producing a partial successful backup):
 //!
 //! * a source whose capture is not [`SnapshotCompleteness::Complete`] never
 //!   reaches the archive builder, so no manifest is ever written with an
