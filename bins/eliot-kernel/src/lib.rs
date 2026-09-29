@@ -4137,8 +4137,26 @@ impl KernelComposition {
             .current_snapshot(lease_id)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?
             .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let now_ms = unix_ms();
+        if now_ms >= before.record.binding.expires_at_ms {
+            // I1.5 W4 (expiry, probe pre-check): the probe meets the same
+            // past-due `Active` head the renewal-refusal tick terminalizes in
+            // `renew_current_supervision_with_progress`, but on the past-due
+            // path that tick is never reached because the verify below
+            // refuses first. The probe clock and the admitted contour fence
+            // are the fresh evidence; the authority re-reads the head and
+            // commits the fenced `Expire` revision (or resumes it by
+            // identity), so the ORS head reaches `Expired`/terminal instead
+            // of lingering `Active` past its validity interval and blocking
+            // exact-fence generation retirement. A fenced authority failure
+            // refuses the probe closed and is retried on the next probe
+            // through the staged-ticket resume.
+            authority
+                .expire_past_due_lease(lease_id, &contour.state_fence, now_ms)
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        }
         authority
-            .verify_active_snapshot(&before, lease_id, unix_ms())
+            .verify_active_snapshot(&before, lease_id, now_ms)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         if !supervision_binding_matches_contour(&before.record.binding, &contour)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?

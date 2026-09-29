@@ -672,9 +672,11 @@ impl KernelSupervisionLeaseAuthority {
     /// is resumed by identity; a staged ticket for any other operation is a
     /// typed conflict, never stomped.
     ///
-    /// Production caller: `KernelComposition::renew_current_supervision_with_progress`
-    /// (`bins/eliot-kernel/src/lib.rs`), on the renewal-refusal tick, for
-    /// both the progress-submit and probe paths.
+    /// Production callers in `bins/eliot-kernel/src/lib.rs`:
+    /// `KernelComposition::renew_current_supervision_with_progress`, on the
+    /// renewal-refusal tick for both the progress-submit and probe paths, and
+    /// `KernelComposition::renew_daemon_supervision_for_probe`, on the probe
+    /// pre-check where that tick is never reached for a past-due head.
     pub fn expire_past_due_lease(
         &self,
         supervision_lease_id: &str,
