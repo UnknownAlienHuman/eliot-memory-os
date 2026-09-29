@@ -7519,7 +7519,7 @@ impl HostComposition {
             .map(|roots| roots.selection().clone());
         let control = HostCredentialControl::new_for_profile(
             self.host.clone(),
-            launch,
+            &launch,
             selected_roots,
             capability,
             expected_transaction_id,
@@ -7710,81 +7710,8 @@ impl HostComposition {
         host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_REQUESTED);
         let mut resume_terminal_emitted = false;
         let result = (|| {
-            intent
-                .validate()
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-            final_receipt
-                .validate()
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-            let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
-                HostError::RecoveryRequired(
-                    "FinalizePhaseB requires the exact pending activation".to_owned(),
-                )
-            })?;
-            self.validate_phase_b_credential_receipt_for_profile(
-                credential_receipt,
-                &pending.manifest,
-                intent,
-            )?;
-            let prepared = pending.phase_b_prepared_receipt.as_ref().ok_or_else(|| {
-                HostError::RecoveryRequired(
-                    "FinalizePhaseB has no durable prepared receipt".to_owned(),
-                )
-            })?;
-            if pending.phase_b_receipt.is_some()
-                || final_receipt.transaction_id != intent.transaction_id
-                || final_receipt.effect_id != intent.effect_id
-                || final_receipt.candidate_manifest_digest != intent.candidate_manifest_digest
-                || final_receipt.request_digest != intent.request_digest
-                || prepared.transaction_id != final_receipt.transaction_id
-                || prepared.effect_id != final_receipt.effect_id
-                || prepared.request_digest != final_receipt.request_digest
-                || prepared.candidate_manifest_digest != final_receipt.candidate_manifest_digest
-                || prepared.host_owner_epoch != final_receipt.host_owner_epoch
-                || prepared.host_process_identity != final_receipt.host_process_identity
-                || prepared.authority_descriptor_digest != final_receipt.authority_descriptor_digest
-                || prepared.config_file_digest != final_receipt.config_file_digest
-                || prepared.store_bootstrap_descriptor_digest
-                    != final_receipt.store_bootstrap_descriptor_digest
-                || prepared.eliotd_descriptor_digest != final_receipt.eliotd_descriptor_digest
-                || prepared.provisioned_supervision_authority
-                    != final_receipt.provisioned_supervision_authority
-                || prepared
-                    .agent_bridge
-                    .as_ref()
-                    .map(|b| b.stage_prepared.clone())
-                    != final_receipt
-                        .agent_bridge
-                        .as_ref()
-                        .map(|b| b.prepared.stage_prepared.clone())
-            {
-                return Err(HostError::RecoveryRequired(
-                    "final Phase-B receipt is not bound to the prepared proof".to_owned(),
-                ));
-            }
-            if let Some(final_bridge) = final_receipt.agent_bridge.as_ref() {
-                let prepared_bridge = prepared.agent_bridge.as_ref().ok_or_else(|| {
-                    HostError::RecoveryRequired(
-                        "final bridge proof has no prepared counterpart".to_owned(),
-                    )
-                })?;
-                if !final_bridge.matches_prepared_core(prepared_bridge) {
-                    return Err(HostError::RecoveryRequired(
-                        "final bridge proof substituted its prepared core".to_owned(),
-                    ));
-                }
-                final_bridge
-                    .validate_against_phase_b(intent, &pending)
-                    .map_err(HostError::Installation)?;
-                let _lease = open_agent_bridge_final_lease(
-                    final_bridge,
-                    final_bridge.approved_user_sid.as_str(),
-                )?;
-            } else if intent.agent_bridge_source.is_some() || prepared.agent_bridge.is_some() {
-                return Err(HostError::RecoveryRequired(
-                    "bridge-enabled Phase-B final proof is absent".to_owned(),
-                ));
-            }
+            let pending =
+                self.validate_phase_b_finalization(intent, credential_receipt, final_receipt)?;
             let host_capability = self.owner_lease.activation_capability();
             self.persist_pending_phase_b_receipt(&pending, final_receipt, &host_capability)?;
             if let Some(materialization) = self.phase_b.as_mut() {
@@ -7811,6 +7738,89 @@ impl HostComposition {
                 pending_ref: phase_b_unknown_ref("phase-b-finalize", "FinalizePhaseB", intent),
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn validate_phase_b_finalization(
+        &self,
+        intent: &HostPhaseBMaterializationIntent,
+        credential_receipt: &CredentialAccessReceipt,
+        final_receipt: &HostPhaseBMaterializationReceipt,
+    ) -> Result<eliot_installation::PendingActivation, HostError> {
+        intent
+            .validate()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        final_receipt
+            .validate()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "FinalizePhaseB requires the exact pending activation".to_owned(),
+            )
+        })?;
+        self.validate_phase_b_credential_receipt_for_profile(
+            credential_receipt,
+            &pending.manifest,
+            intent,
+        )?;
+        let prepared = pending.phase_b_prepared_receipt.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired("FinalizePhaseB has no durable prepared receipt".to_owned())
+        })?;
+        if pending.phase_b_receipt.is_some()
+            || final_receipt.transaction_id != intent.transaction_id
+            || final_receipt.effect_id != intent.effect_id
+            || final_receipt.candidate_manifest_digest != intent.candidate_manifest_digest
+            || final_receipt.request_digest != intent.request_digest
+            || prepared.transaction_id != final_receipt.transaction_id
+            || prepared.effect_id != final_receipt.effect_id
+            || prepared.request_digest != final_receipt.request_digest
+            || prepared.candidate_manifest_digest != final_receipt.candidate_manifest_digest
+            || prepared.host_owner_epoch != final_receipt.host_owner_epoch
+            || prepared.host_process_identity != final_receipt.host_process_identity
+            || prepared.authority_descriptor_digest != final_receipt.authority_descriptor_digest
+            || prepared.config_file_digest != final_receipt.config_file_digest
+            || prepared.store_bootstrap_descriptor_digest
+                != final_receipt.store_bootstrap_descriptor_digest
+            || prepared.eliotd_descriptor_digest != final_receipt.eliotd_descriptor_digest
+            || prepared.provisioned_supervision_authority
+                != final_receipt.provisioned_supervision_authority
+            || prepared
+                .agent_bridge
+                .as_ref()
+                .map(|b| b.stage_prepared.clone())
+                != final_receipt
+                    .agent_bridge
+                    .as_ref()
+                    .map(|b| b.prepared.stage_prepared.clone())
+        {
+            return Err(HostError::RecoveryRequired(
+                "final Phase-B receipt is not bound to the prepared proof".to_owned(),
+            ));
+        }
+        if let Some(final_bridge) = final_receipt.agent_bridge.as_ref() {
+            let prepared_bridge = prepared.agent_bridge.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "final bridge proof has no prepared counterpart".to_owned(),
+                )
+            })?;
+            if !final_bridge.matches_prepared_core(prepared_bridge) {
+                return Err(HostError::RecoveryRequired(
+                    "final bridge proof substituted its prepared core".to_owned(),
+                ));
+            }
+            final_bridge
+                .validate_against_phase_b(intent, &pending)
+                .map_err(HostError::Installation)?;
+            let _lease = open_agent_bridge_final_lease(
+                final_bridge,
+                final_bridge.approved_user_sid.as_str(),
+            )?;
+        } else if intent.agent_bridge_source.is_some() || prepared.agent_bridge.is_some() {
+            return Err(HostError::RecoveryRequired(
+                "bridge-enabled Phase-B final proof is absent".to_owned(),
+            ));
+        }
+        Ok(pending)
     }
 
     /// Handles a durable Phase-B response-loss retry without invoking any
