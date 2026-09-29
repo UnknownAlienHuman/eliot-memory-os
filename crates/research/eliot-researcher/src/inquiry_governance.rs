@@ -3453,9 +3453,7 @@ impl EvidenceFreeze {
         // different evidence are different freezes and say so.
         let content_commitment = freeze(&format!(
             "freeze-identity/v1;{}|{}|{}|{}",
-            params.portfolio_digest,
-            params.manifest_digest,
-            params.coverage_receipt_digest,
+            params.portfolio_digest, params.manifest_digest, params.coverage_receipt_digest,
             params.evidence_set_id
         ));
         let mut record = Self {
@@ -3521,7 +3519,9 @@ impl EvidenceFreeze {
             self.supersede_reason.is_some(),
             self.expected_revision.is_some(),
         ];
-        if present.iter().filter(|held| **held).count() != 0 && !present.iter().all(|held| *held) {
+        if present.iter().filter(|held| **held).count() != 0
+            && !present.iter().all(|held| *held)
+        {
             return Err(InquiryError::IntegrityMismatch {
                 field: "freeze.successor_relation",
             });
