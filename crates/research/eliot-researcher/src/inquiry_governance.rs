@@ -3134,7 +3134,9 @@ impl EvidenceFreeze {
         // different evidence are different freezes and say so.
         let content_commitment = freeze(&format!(
             "freeze-identity/v1;{}|{}|{}|{}",
-            params.portfolio_digest, params.manifest_digest, params.coverage_receipt_digest,
+            params.portfolio_digest,
+            params.manifest_digest,
+            params.coverage_receipt_digest,
             params.evidence_set_id
         ));
         let mut record = Self {
@@ -3200,9 +3202,7 @@ impl EvidenceFreeze {
             self.supersede_reason.is_some(),
             self.expected_revision.is_some(),
         ];
-        if present.iter().filter(|held| **held).count() != 0
-            && !present.iter().all(|held| *held)
-        {
+        if present.iter().filter(|held| **held).count() != 0 && !present.iter().all(|held| *held) {
             return Err(InquiryError::IntegrityMismatch {
                 field: "freeze.successor_relation",
             });
@@ -4375,10 +4375,7 @@ impl InquiryTerminalRecord {
         push_field(
             preimage,
             "evidence_freeze_supersede_reason",
-            self.freeze
-                .supersede_reason
-                .as_deref()
-                .unwrap_or("none"),
+            self.freeze.supersede_reason.as_deref().unwrap_or("none"),
         );
         push_field(
             preimage,
@@ -5199,10 +5196,8 @@ impl InquiryGovernance {
     /// refuses, so a consumer reads WHICH requirement failed rather than only
     /// that the release is blocked.
     pub fn release_gate(&self) -> Result<(), InquiryError> {
-        if let Some(prior) = crate::evidence_portfolio::require_complete_claim_coverage(
-            &self.claim_coverage,
-        )
-        .err()
+        if let Some(prior) =
+            crate::evidence_portfolio::require_complete_claim_coverage(&self.claim_coverage).err()
         {
             return Err(InquiryError::ReleaseGateRefused {
                 gate: "claim_coverage",
@@ -7553,10 +7548,7 @@ fn evidence_freeze(
             included_evidence_refs: included,
             excluded_evidence: excluded,
             unresolved_contradictions: contradictions,
-            open_research_debts: debts
-                .iter()
-                .map(|debt| debt.debt_id.clone())
-                .collect(),
+            open_research_debts: debts.iter().map(|debt| debt.debt_id.clone()).collect(),
             frozen_at_ms: observation.assessment_time_ms,
             supersedes,
             supersede_reason,
