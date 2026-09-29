@@ -5684,32 +5684,43 @@ impl HostComposition {
     /// [`BackupCallerAuth`](crate::backup_preparation::BackupCallerAuth)
     /// owner gate (held lease covers the launch installation, presented
     /// source equals it), and the destination is prepared from inspected
-    /// owner evidence through the caller-supplied journal sink. The sink
-    /// returns alongside the destination so the caller can reconcile,
-    /// cancel, or clean up the same operation later. Durable production
-    /// journal binding awaits the Host-state owner's preparation record
-    /// variant; until then the sink stays a port. Caller-channel
-    /// authentication beyond this installation binding stays parameterized
-    /// pending role-bound control contracts.
+    /// owner evidence through this composition's own durable Host journal sink.
+    /// The sink returns alongside the destination so the caller can reconcile,
+    /// cancel, or clean up the same operation later.
+    ///
+    /// The sink is
+    /// [`HostStatePreparationJournal`](crate::backup_preparation::HostStatePreparationJournal),
+    /// built here from `self.journal`: intent and result are written as the
+    /// owner's `BackupPreparationRecord` through the same single-writer
+    /// reconcile choke every other Host journal write uses, so a repeated
+    /// request resolves the original preparation across a process or Host
+    /// restart instead of starting a second one. The port deliberately does not
+    /// accept a caller-supplied sink, which would let a caller choose how
+    /// durable this operation's admission is. Caller-channel authentication
+    /// beyond this installation binding stays parameterized pending
+    /// role-bound control contracts.
     ///
     /// # Errors
     ///
     /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
     /// when the caller gate, lease/installation binding, owner evidence,
     /// admission, or journal persistence fails closed.
-    pub fn prepare_backup_destination<J: crate::backup_preparation::PreparationJournal>(
+    pub fn prepare_backup_destination(
         &self,
-        journal: J,
         caller: &crate::backup_preparation::BackupCallerAuth,
         request: &crate::backup_preparation::PresentedPreparationRequest,
     ) -> Result<
         (
-            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::DelegatedPreparation<
+                crate::backup_preparation::HostStatePreparationJournal<'_>,
+            >,
             crate::backup_preparation::PreparedDestination,
         ),
         crate::backup_preparation::PreparationError,
     > {
-        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence, PreparationError};
+        use crate::backup_preparation::{
+            DelegatedPreparation, HostStatePreparationJournal, OwnerEvidence, PreparationError,
+        };
         caller.authenticate_for_owner(
             &self.owner_lease,
             self.launch_options.installation(),
@@ -5725,7 +5736,7 @@ impl HostComposition {
                 reason: "owner registry moved between inspection and preparation".to_owned(),
             });
         }
-        let mut sink = DelegatedPreparation::new(journal);
+        let mut sink = DelegatedPreparation::new(HostStatePreparationJournal::new(&self.journal));
         let prepared = sink.prepare(&evidence, request)?;
         Ok((sink, prepared))
     }
@@ -5939,14 +5950,15 @@ impl HostComposition {
     /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
     /// when the caller gate, lease/installation binding, owner evidence,
     /// admission, or journal persistence fails closed.
-    pub fn backup_dispatch_prepare<J: crate::backup_preparation::PreparationJournal>(
+    pub fn backup_dispatch_prepare(
         &self,
-        journal: J,
         caller: &crate::backup_preparation::BackupCallerAuth,
         request: &crate::backup_preparation::PresentedPreparationRequest,
     ) -> Result<
         (
-            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::DelegatedPreparation<
+                crate::backup_preparation::HostStatePreparationJournal<'_>,
+            >,
             crate::backup_preparation::PreparedDestination,
         ),
         crate::backup_preparation::PreparationError,
@@ -5962,7 +5974,7 @@ impl HostComposition {
         // preparation must resolve without cutover admission, cutover with
         // it, and rehearsal completion to no entry.
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        let prepared = self.prepare_backup_destination(journal, caller, request)?;
+        let prepared = self.prepare_backup_destination(caller, request)?;
         host_terminal.disarm();
         Ok(prepared)
     }
