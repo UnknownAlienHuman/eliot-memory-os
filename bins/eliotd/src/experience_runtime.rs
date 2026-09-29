@@ -9,10 +9,14 @@
 //!
 //! - [`read_current_position`]: the TRUE edge position read. Issues the
 //!   existing `GetCurrentEpistemicPosition` catalogue read (scope-bound,
-//!   `ExactFence`, `position` subject) through the real
-//!   [`KernelContextReadClient`] and extracts the `Current` admitted
-//!   position from the durable readback. Works today: capability and
-//!   store handler both exist.
+//!   `ExactFence`, `position` subject) through the Governor read owner
+//!   ([`ReadService`]) over the real
+//!   [`KernelContextReadClient`](super::KernelContextReadClient), and
+//!   extracts the `Current` admitted position from the durable readback.
+//!   Works today: capability and store handler both exist. Routing the
+//!   request through the read owner rather than the raw Store port is what
+//!   keeps this leg a consumer of the one read engine instead of a second
+//!   answer to the same source/fence/freshness questions (#1144).
 //! - [`produce_journal_projection`]: the terminal journal-leg call. Runs
 //!   the provider chain
 //!   ([`produce_journal_read`](eliot_experience_provider::produce_journal_read))
@@ -62,11 +66,14 @@ use eliot_observation_contracts::{
     ProjectionOmission, RetentionHold, RetentionSchedule,
 };
 use eliot_protocol::RequestIdentity;
+use eliot_read::{
+    NamedParameters, ReadApi, ReadError, ReadOrderingBinding, ReadService, StateRequest,
+};
 use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
-    CanonicalReadClient, EXPERIENCE_PAGE_NEXT_CURSOR, NamedReadOperation, NamedReadRequest,
-    OrderingHeadExpectation, ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId,
-    StoreError, WriteReceipt, epistemic_revision::EpistemicPositionReadback,
+    CanonicalReadClient, EXPERIENCE_PAGE_NEXT_CURSOR, NamedReadOperation, OrderingHeadExpectation,
+    ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
+    epistemic_revision::EpistemicPositionReadback,
 };
 use eliot_understanding_assessment::{
     AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
@@ -85,6 +92,15 @@ pub enum ExperienceDriverError {
     /// The bridge call failed.
     #[error("bridge read failed: {0}")]
     Bridge(#[from] StoreError),
+    /// The Governor read owner refused or degraded the read.
+    ///
+    /// This keeps the read owner's closed [`ReadOutcome`] vocabulary intact at
+    /// the driver boundary: `NotRunning`, `Unknown`, `Partial`,
+    /// `Unavailable`, `Stale` and `Conflicted` arrive as distinct typed
+    /// values rather than collapsing into one "bridge failed" string, and
+    /// none of them can be read back as a successful empty result.
+    #[error("governor read owner: {0}")]
+    ReadOwner(#[from] ReadError),
     /// The provider chain rejected the read.
     #[error("experience provider: {0}")]
     Provider(#[from] ProviderError),
@@ -182,13 +198,29 @@ pub fn propose_memory_extinction_candidate(
     Ok(eliot_dreamer_memory_revision::propose(intake)?)
 }
 
-/// Read the TRUE admitted edge position through the real bridge client.
+/// Read the TRUE admitted edge position through the Governor read owner.
 ///
 /// Issues `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, exact
-/// `position` subject) via a per-call client from the composition,
-/// validates the response identity and fence, parses the durable
-/// readback, and returns the `Current` admitted position. A superseded or
-/// absent current position fails closed; nothing is synthesized.
+/// `position` subject) as a [`ReadApi::bound_state`] read over a per-call
+/// `ReadService` wrapping the real
+/// [`KernelContextReadClient`](super::KernelContextReadClient), then parses
+/// the durable readback and returns the `Current` admitted position. A
+/// superseded or absent current position fails closed; nothing is synthesized.
+///
+/// #1144: this leg used to build a bare `NamedReadRequest` and call
+/// `CanonicalReadClient::execute_named` directly, which made it a second
+/// answer to source, fence and freshness questions the read owner already
+/// answers. It now goes through the one engine, which adds the source/schema/
+/// coverage comparison, the order-head declaration, the observed-head
+/// closure, the exact-fence stale check and the degraded-payload refusal that
+/// the raw port had none of. The response is still validated here: the owner
+/// proves the read is *current*, and this consumer still has to prove the
+/// payload is the versioned position readback it expects.
+///
+/// The `ExactFence` dependency is **observed, not invented**: the current
+/// scope revision head is read first and its revision becomes the declared
+/// minimum, so a head that moves between the two reads fails closed as
+/// [`ReadError::StaleRevision`] rather than being served as current.
 pub async fn read_current_position(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -210,31 +242,46 @@ pub async fn read_current_position(
     let client = composition
         .context_read_client(kernel)
         .map_err(|error| ExperienceDriverError::Composition(error.to_string()))?;
-    let mut parameters = BTreeMap::new();
-    parameters.insert(
+    let scope_key = RevisionKey::new(format!("scope:{scope}"))?;
+    let observed = client.revision_heads(vec![scope_key.clone()]).await?;
+    let minimum = observed.iter().find(|head| head.key == scope_key).ok_or(
+        ExperienceDriverError::Position {
+            field: "revision_heads",
+            reason: "store observed no head for the requested scope",
+        },
+    )?;
+    let mut dependency_revisions = BTreeMap::new();
+    dependency_revisions.insert(scope_key, minimum.revision);
+    let parameters = NamedParameters::from_map(BTreeMap::from([(
         "position".to_owned(),
         serde_json::Value::String(position_subject),
-    );
-    let request = NamedReadRequest {
-        operation: NamedReadOperation::GetCurrentEpistemicPosition,
-        scope_id: Some(scope),
-        consistency: ReadConsistency::ExactFence,
-        state_fence: ctx.state_fence.clone(),
-        parameters,
-    };
-    request.validate().map_err(ExperienceDriverError::Bridge)?;
-    let response: eliot_store_api::NamedReadResponse = client.execute_named(request).await?;
-    response.validate().map_err(ExperienceDriverError::Bridge)?;
+    )]))
+    .map_err(ExperienceDriverError::ReadOwner)?;
+    let reads = ReadService::new(client);
+    let bound = reads
+        .bound_state(
+            ctx,
+            StateRequest {
+                operation: NamedReadOperation::GetCurrentEpistemicPosition,
+                scope_id: Some(scope),
+                consistency: ReadConsistency::ExactFence,
+                dependency_revisions,
+                // This position read declares no conflict-serialization head:
+                // its coherence is proven by the scope revision head observed
+                // above plus the request fence. The declaration is explicit so
+                // the resolved identity records the absence instead of leaving
+                // the order-head dimension unstated.
+                ordering: ReadOrderingBinding::without_order_dependency(),
+                parameters,
+                provenance_handles: Vec::new(),
+            },
+        )
+        .await?;
+    let response = &bound.view;
     if response.operation != NamedReadOperation::GetCurrentEpistemicPosition {
         return Err(ExperienceDriverError::Position {
             field: "response.operation",
             reason: "bridge did not answer the position read",
-        });
-    }
-    if !response.state_fence.is_compatible_with(&ctx.state_fence) {
-        return Err(ExperienceDriverError::Position {
-            field: "response.state_fence",
-            reason: "bridge fence is not compatible with the read fence",
         });
     }
     let readback: EpistemicPositionReadback = serde_json::from_value(response.payload.clone())
