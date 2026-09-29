@@ -50,15 +50,15 @@ pub const MAX_RESTORE_LEDGER_BYTES: usize = 1024 * 1024;
 /// publish.
 pub const MAX_RESTORE_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
-/// Authenticated whole-ledger replacement candidate. The outer RequestIdentity
+/// Authenticated whole-ledger replacement candidate. The outer `RequestIdentity`
 /// binds the session/fence and idempotency; these fields are repeated so the
 /// Kernel can reject caller/payload mismatches before Store IO.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReactiveLedgerMutationRequest {
-    /// Live attach session, repeated from RequestIdentity metadata.
+    /// Live attach session, repeated from `RequestIdentity` metadata.
     pub session_id: String,
-    /// Live attach fence, repeated from RequestIdentity binding.
+    /// Live attach fence, repeated from `RequestIdentity` binding.
     pub state_fence: StateFence,
     /// Exact owner revision read before candidate construction (`0` absent).
     pub expected_revision: u64,
