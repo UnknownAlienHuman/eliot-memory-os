@@ -19,9 +19,15 @@
 //! must not move types across): [`DrainWakeDisposition`] mirrors the
 //! `WakeDisposition` wire vocabulary as evidence strings, and
 //! [`DrainCommitDecision`] documents the exact field contract Host carries
-//! into `DrainCommitRecord` through its journal helper. The phase vocabulary
-//! here is Kernel-owned; `DrainState` (`Requested`/`Draining`/`Cancelled`/
-//! `Failed`) stays Host-journal owned.
+//! into `DrainCommitRecord` through its journal helper. That contract is not
+//! prose here: [`DrainCommitDecision::validate`] is the one rule set applied
+//! both by the linearization point before it writes the decision and by the
+//! recovery read path when it loads one, so a persisted `DrainCommitRecord`
+//! boundary can never state something the commit would have refused, and
+//! [`ShutdownDrainCoordinator::committed_decision`] is the production reader
+//! that hands the persisted boundary back to be published. The phase
+//! vocabulary here is Kernel-owned; `DrainState`
+//! (`Requested`/`Draining`/`Cancelled`/`Failed`) stays Host-journal owned.
 //!
 //! Handoffs (recorded, not implemented here): audit/outbox flush is
 //! Governor/`eliotd`-owned — Kernel flushes ORS staged rows and records the
@@ -186,6 +192,22 @@ impl DrainWakeDisposition {
     pub(crate) const fn fences_old_authority(self) -> bool {
         matches!(self, Self::QueueNextGeneration | Self::RejectStale)
     }
+
+    /// The exact `WakeDisposition` wire spelling this disposition mirrors, so a
+    /// published boundary states the same vocabulary the durable
+    /// `DrainCommitRecord` records. `Proceed` has no counterpart variant in
+    /// `WakeDisposition` because it means "no drain in progress" and never
+    /// reaches a durable record;
+    /// [`DrainCommitDecision::validate`] is what enforces that, so this arm is
+    /// reachable only from a projection that did not linearize.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proceed => "PROCEED",
+            Self::CancelDrain => "CANCEL_DRAIN",
+            Self::QueueNextGeneration => "QUEUE_NEXT_GENERATION",
+            Self::RejectStale => "REJECT_STALE",
+        }
+    }
 }
 
 /// Durable terminal of one drain generation. `Incomplete` retains the pending
@@ -249,7 +271,7 @@ impl ShutdownTerminal {
 /// cache its load failure, and the Kernel would be unusable for that work root
 /// until someone hand-deleted it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct DrainCommitDecision {
+pub struct DrainCommitDecision {
     pub(crate) generation: String,
     pub(crate) lease_and_pending_snapshot: Vec<String>,
     pub(crate) authority_epochs_fenced: Vec<String>,
@@ -259,6 +281,74 @@ pub(crate) struct DrainCommitDecision {
     pub(crate) wake_disposition: DrainWakeDisposition,
     pub(crate) irreversible_stage: String,
     pub(crate) recovery_owner: String,
+}
+
+impl DrainCommitDecision {
+    /// The durable `DrainCommitRecord` boundary contract, applied on the write
+    /// path ([`ShutdownDrainCoordinator::commit_drain`]) *and* on the recovery
+    /// read path ([`validate_durable_state`]), so a persisted linearization can
+    /// never state something the linearization point itself would have refused.
+    ///
+    /// `HostState::DrainCommit(DrainCommitRecord)`'s own `validate` remains the
+    /// Host-side authority for the wire shape, and this binary must not depend
+    /// on `eliot-host-state`; these are the rules that shape already states,
+    /// checked here over the Kernel-owned mirror that [`Self`] is. The fenced
+    /// activation generation is validated with the runtime-contract owner of
+    /// that identity ([`SupervisionJournalEpoch::validate`]), not with a local
+    /// copy of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reason when a boundary field is blank, when the decision
+    /// carries a non-empty lease/pending snapshot, when it names no fenced
+    /// authority, when it records `Proceed` as the post-linearization wake
+    /// disposition (`Proceed` means "no drain in progress" and never reaches a
+    /// durable record), or when a recorded fenced activation generation is not
+    /// a complete journal identity.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.generation.trim().is_empty() {
+            return Err("drain decision generation is empty".to_owned());
+        }
+        // Linearization is admitted only on the reconciled-empty registry the
+        // receipt gate proved, so a persisted snapshot that still carries work
+        // is a contradiction of the commit, never an obligation.
+        if !self.lease_and_pending_snapshot.is_empty() {
+            return Err("drain decision carries unreconciled pending snapshot".to_owned());
+        }
+        if self.authority_epochs_fenced.is_empty()
+            || self
+                .authority_epochs_fenced
+                .iter()
+                .any(|epoch| epoch.trim().is_empty())
+        {
+            return Err("drain decision names no fenced authority epoch".to_owned());
+        }
+        if self
+            .branches_to_stop
+            .iter()
+            .any(|branch| branch.trim().is_empty())
+        {
+            return Err("drain decision names a blank branch to stop".to_owned());
+        }
+        if self.wake_disposition == DrainWakeDisposition::Proceed {
+            return Err("drain decision records a no-drain wake disposition".to_owned());
+        }
+        if self.irreversible_stage.trim().is_empty() {
+            return Err("drain decision names no irreversible stage".to_owned());
+        }
+        if self.recovery_owner.trim().is_empty() {
+            return Err("drain decision names no recovery owner".to_owned());
+        }
+        // `None` is the documented backward-compatible "this commit recorded no
+        // fenced activation generation"; a recorded one is a full journal
+        // identity, not a blank lineage at sequence zero.
+        if let Some(fenced) = self.activation_generation_fenced.as_ref() {
+            fenced
+                .validate("drain.activation_generation_fenced")
+                .map_err(|error| format!("fenced activation generation is invalid: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Early halt of the ordered drain: the reason plus every pending item the
@@ -569,6 +659,10 @@ fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
         {
             return Err("shutdown state has an invalid drain commit".to_owned());
         }
+        // The recovered boundary is held to the same contract the
+        // linearization point enforces, so recovery can never read a
+        // `DrainCommitRecord` boundary the commit path would have refused.
+        committed.validate()?;
         if durable.terminal.is_none() && !durable.pending.is_empty() {
             return Err("committed shutdown has pending work without a terminal".to_owned());
         }
@@ -869,6 +963,21 @@ impl ShutdownDrainCoordinator {
         self.lock().pending.iter().cloned().collect()
     }
 
+    /// Read-only projection of the durable `DrainCommitRecord` boundary: the
+    /// linearization exactly as this coordinator persisted it, or `None` when
+    /// this generation has not linearized.
+    ///
+    /// This is the production reader of the persisted decision. The commit
+    /// path proves the boundary before writing it, and the recovery read path
+    /// re-proves it on load, so a caller that needs to state the boundary must
+    /// read it back here rather than reuse the value it happened to build:
+    /// that is the whole content of the durable record, including after a
+    /// restart, and it is what a downstream `DrainCommitRecord` has to agree
+    /// with.
+    pub(crate) fn committed_decision(&self) -> Option<DrainCommitDecision> {
+        self.lock().committed.clone()
+    }
+
     /// Requires the canonical-data lease-zero precondition before any
     /// store-stop request.
     pub(crate) const fn check_lease_zero(has_outstanding_lease: bool) -> Result<(), &'static str> {
@@ -1099,9 +1208,9 @@ impl ShutdownDrainCoordinator {
         if decision.generation != state.generation {
             return Err("drain decision carries a foreign generation".to_owned());
         }
-        if !decision.lease_and_pending_snapshot.is_empty() {
-            return Err("drain decision carries unreconciled pending snapshot".to_owned());
-        }
+        // The same boundary contract the recovery read path applies, so the
+        // durable record can never be written in a shape it would refuse.
+        decision.validate()?;
         let mut candidate = state.clone();
         candidate.committed = Some(decision);
         self.persist_state(&candidate)?;

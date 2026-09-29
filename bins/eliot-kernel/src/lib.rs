@@ -4762,11 +4762,16 @@ impl KernelComposition {
         coordinator.commit_drain(decision.clone()).map_err(|_| {
             DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
         })?;
-        // Issue #1837: durable audit evidence for the drain commit.
-        self.audit_observe(AuditEventDraft::shutdown_drain_committed(
-            &decision.generation,
-            decision.authority_epochs_fenced.len(),
-        ));
+        // Issue #1837 / I14.23 W1: durable audit evidence for the drain commit,
+        // read back from the coordinator *after* the linearization is durable
+        // so the record carries the boundary that was actually persisted rather
+        // than the one this branch intended to persist. A commit the
+        // coordinator cannot hand back is a refused commit, never a published
+        // one, and the halt still produces the incomplete-shutdown terminal.
+        let committed = coordinator
+            .committed_decision()
+            .ok_or_else(|| DrainHalt::new("drain-commit-not-persisted"))?;
+        self.audit_observe(AuditEventDraft::shutdown_drain_committed(&committed));
 
         // Service stop follows linearization; a committed drain without a
         // clean stop is incomplete recovery state, never a silent success.
