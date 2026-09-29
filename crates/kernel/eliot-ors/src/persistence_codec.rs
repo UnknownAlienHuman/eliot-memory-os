@@ -42,6 +42,7 @@ use crate::SupervisionLeaseStageResolution;
 use crate::UnknownCommitRecord;
 use crate::cutover_ownership::StoredCutoverOwnership;
 use eliot_runtime_contracts::GenerationCutoverState;
+use eliot_runtime_contracts::RuntimeLease;
 use eliot_store_api::{
     CampaignLearningStateViewPublication, CampaignSourceHead, CampaignSourceRecord,
 };
@@ -896,6 +897,15 @@ impl PersistedValue for KernelReconciliationItem {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+impl PersistedValue for RuntimeLease {
+    const RECORD_TYPE: &'static str = "runtime_lease_current";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
     }
 }
 

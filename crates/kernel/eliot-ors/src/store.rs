@@ -19,7 +19,8 @@ use eliot_receipts::{
 };
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
-    SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
+    RuntimeLease, SignedSupervisionLease, VerifiedSupervisionLease,
+    VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
@@ -207,6 +208,16 @@ const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
 const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
+/// Durable `RuntimeLease` current rows for the #1918 ACT-1/A4 retirement
+/// census (I1.5). Keyed by lease identity; one row per exact-fence durable
+/// runtime lease the Kernel may retire. The durable issuance writer belongs
+/// to #1751; until it lands, the table holds no rows and the census reports
+/// that observed store fact rather than a default. This is one more table in
+/// the existing ORS table family, owned by the same `RedbRecoveryStore` and
+/// written through the same `persistence_codec`; it is not a second journal
+/// or table owner.
+const RUNTIME_LEASE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_runtime_lease_current_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
 const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
@@ -4166,6 +4177,23 @@ impl ScanDisclosureRecordOwner for RedbRecoveryStore {
     ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError> {
         RedbRecoveryStore::list_scan_disclosures(self, installation_id, limit)
     }
+}
+
+/// Exact-fence retirement census rows read from the canonical ORS tables.
+///
+/// Returned by
+/// [`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`]: the
+/// current supervision row bound to the presented fence and the exact-fence
+/// `RuntimeLease` current set ordered by lease id. The Kernel composes the
+/// wire census response from these rows; the store never authors the census
+/// response itself, because the response type lives in the kernel service
+/// crate, which already depends on this crate.
+#[derive(Clone, Debug)]
+pub struct RuntimeLeaseCensusRows {
+    /// Current supervision row bound to the census fence.
+    pub supervision: SupervisionLeaseSnapshot,
+    /// Exact-fence `RuntimeLease` rows ordered by lease id.
+    pub runtime_leases: Vec<RuntimeLease>,
 }
 
 impl RedbRecoveryStore {
@@ -24058,6 +24086,77 @@ impl RedbRecoveryStore {
                 Ok(snapshot)
             })
             .transpose()
+    }
+
+    /// Exact-fence retirement census rows for the #1918 ACT-1/A4 drain gate
+    /// (I1.5, I18.53 ACT-1/ACT-4).
+    ///
+    /// Reads the current supervision row for the census identity and the
+    /// exact-fence `RuntimeLease` current set from the canonical ORS tables.
+    /// The supervision row must be bound to the presented fence; a row bound
+    /// to another fence cannot close this fence's proof (`FenceMismatch`).
+    /// An absent supervision head fails closed: it is the exact-mismatch the
+    /// Kernel census treats as unprovable, never as an expired lease.
+    /// `RuntimeLease` rows are re-validated on readback, key-checked against
+    /// their own lease identity, selected by exact fence equality, and
+    /// returned ordered by lease id, so the caller never re-sorts or
+    /// re-filters. A store that never recorded a runtime-lease table has no
+    /// durable rows to return; that observed absence is reported as the empty
+    /// set, exactly like the supervision-status `has_table` precedent, and
+    /// never as a caller-supplied default.
+    pub fn load_runtime_lease_census_by_state_fence(
+        &self,
+        fence: &eliot_contracts::StateFence,
+        supervision_lease_id: &crate::OperationIdentity,
+    ) -> Result<RuntimeLeaseCensusRows, OrsError> {
+        let supervision = self
+            .load_current_supervision_lease(supervision_lease_id)?
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "runtime_lease_census",
+                reason: "supervision head absent for census identity".to_owned(),
+            })?;
+        if supervision.record.binding.state_fence != *fence {
+            return Err(OrsError::FenceMismatch);
+        }
+        let runtime_leases = self.load_runtime_leases_by_state_fence(fence)?;
+        Ok(RuntimeLeaseCensusRows {
+            supervision,
+            runtime_leases,
+        })
+    }
+
+    /// Reads the exact-fence `RuntimeLease` current set, ordered by lease id.
+    ///
+    /// The fence-only half of
+    /// [`Self::load_runtime_lease_census_by_state_fence`] for readers that
+    /// already established supervision coverage through their own leg, such as
+    /// the Kernel idle-lease census runtime leg.
+    pub fn load_runtime_leases_by_state_fence(
+        &self,
+        fence: &eliot_contracts::StateFence,
+    ) -> Result<Vec<RuntimeLease>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = match read.open_table(RUNTIME_LEASE_CURRENT) {
+            Ok(current) => current,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(storage(error)),
+        };
+        let mut runtime_leases = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let lease: RuntimeLease = decode(value.value())?;
+            if key.value() != lease.lease_id.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease_current",
+                    reason: "current key does not match lease identity".to_owned(),
+                });
+            }
+            if lease.state_fence == *fence {
+                runtime_leases.push(lease);
+            }
+        }
+        runtime_leases.sort_by(|first, second| first.lease_id.cmp(&second.lease_id));
+        Ok(runtime_leases)
     }
 
     /// Loads the recorded effect operation lease for one exact authorized

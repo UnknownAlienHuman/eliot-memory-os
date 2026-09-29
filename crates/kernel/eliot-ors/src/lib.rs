@@ -119,7 +119,7 @@ pub use status_projection::{
 };
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
-    ScanDisclosureRecordOwner,
+    RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
 };
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,
