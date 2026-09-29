@@ -1246,9 +1246,19 @@ impl HostComposition {
         let launch = self.jobs.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
         })?;
+        // Issue #1775: the retained old child is admitted only through the
+        // committed predecessor binding proved just above; any other occupant
+        // produces the typed collision directive and an unreadable owner
+        // defers. `launch.generation`/`authority_state_fence` are the approved
+        // identity this recovery contour is already bound to.
         host_job_launch::ensure_store_endpoint_available_or_owned(
             &launch.canonical_store_arguments,
             Some(old_proc.process_id),
+            &host_job_launch::StoreEndpointOwnershipBinding {
+                installation: &self.host.installation,
+                generation: &launch.generation,
+                state_fence: &launch.authority_state_fence,
+            },
         )?;
         self.jobs.store_restart_attempts = self
             .jobs

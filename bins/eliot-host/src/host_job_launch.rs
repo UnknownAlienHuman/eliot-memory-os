@@ -18,6 +18,13 @@ use eliot_installation::{
 #[cfg(windows)]
 use eliot_kernel_service::semantic_store_config_hash_from_json;
 #[cfg(windows)]
+use eliot_contracts::StateFence;
+#[cfg(windows)]
+use eliot_host_service::{
+    MissingOwnershipEvidence, OriginCollisionDirective, OriginNextAction, OriginOperationClass,
+    ProcessOriginClassification, StoreEndpointCollision,
+};
+#[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
@@ -222,72 +229,293 @@ pub(super) fn planned_store_endpoint(
     Ok(endpoint)
 }
 
+/// One bounded, neutral observation of the planned Store endpoint's listener.
+///
+/// I3.4 requires that readiness be derived from multiple orthogonal
+/// observations and "never one boolean, PID, port or cached declaration". A
+/// `Result<Option<u32>, _>` collapses that into two facts, and the caller then
+/// reads the empty `None` as a clean absence. This type keeps the three real
+/// facts apart:
+///
+/// * [`StoreEndpointObservation::Absent`] — the read *completed* and reported
+///   no listener for this exact endpoint. This is the only clean-absence fact.
+/// * [`StoreEndpointObservation::Occupied`] — the read *completed* and reported
+///   exactly one listener owner process.
+/// * [`StoreEndpointObservation::Unreadable`] — the read did **not** produce a
+///   trustworthy answer, so occupancy is unknown rather than absent.
+///
+/// "The owner could not be read" and "there is no owner" are different facts
+/// and no caller may collapse them. `Unreadable` is deliberately not an
+/// `Err`: a failed read is an observation outcome to be recorded and refused
+/// on, not a thrown defect that reads like a malformed launch contour.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StoreEndpointObservation {
+    /// The read completed and no listener owns this exact endpoint.
+    Absent,
+    /// The read completed and exactly one process owns this exact endpoint.
+    Occupied {
+        /// Observed owner process ID. Observation data only: it is never an
+        /// ownership proof and never authorizes a control effect on its own.
+        owner_process_id: u32,
+    },
+    /// The read did not yield a trustworthy answer. Occupancy is *unknown*,
+    /// never absent.
+    Unreadable {
+        /// Exact platform classification of why the read is untrustworthy.
+        /// Retained so the refusal names the real reason instead of prose.
+        reason: TcpListenerOwnerError,
+    },
+}
+
 /// Observes whether one exact loopback TCP endpoint currently has a listener
-/// owner. Returns `Ok(Some(pid))` when a process owns the endpoint,
-/// `Ok(None)` when no exact listener exists, and a typed error when the
-/// owner cannot be determined.
+/// owner, keeping "no listener" and "owner unreadable" as distinct facts.
 ///
 /// Issue #1775: this is a read-only observation. It never kills, adopts, or
-/// reuses the occupying process. Inability to read the owner is not absence
-/// of a collision; the caller must fail closed.
+/// reuses the occupying process, and it grants no ownership to any listener.
+/// Inability to read the owner is not absence of a collision; the caller
+/// refuses on `Unreadable` rather than proceeding.
 #[cfg(windows)]
 pub(super) fn store_endpoint_foreign_occupant(
     endpoint: std::net::SocketAddr,
-) -> Result<Option<u32>, HostError> {
+) -> StoreEndpointObservation {
     match observe_loopback_tcp_listener_owner(endpoint) {
-        Ok(observation) => Ok(Some(observation.process_id())),
-        Err(TcpListenerOwnerError::Missing) => Ok(None),
-        Err(error) => Err(HostError::ProcessContour(format!(
-            "planned Store endpoint owner observation failed: {error}"
-        ))),
+        Ok(observation) => StoreEndpointObservation::Occupied {
+            owner_process_id: observation.process_id(),
+        },
+        // The only genuine absence: the bounded table read completed and held
+        // no row for this exact endpoint.
+        Err(TcpListenerOwnerError::Missing) => StoreEndpointObservation::Absent,
+        // Every other classification — denied, ambiguous, raced, malformed,
+        // oversized, unsupported or otherwise unclassifiable — means the read
+        // itself was untrustworthy. None of them is evidence of absence.
+        Err(reason) => StoreEndpointObservation::Unreadable { reason },
     }
 }
 
-/// Observes the planned Store endpoint and refuses launch when it is occupied.
+/// Identity this installation holds for one planned Store endpoint.
 ///
-/// The listener owner PID is observation data only; it does not prove that
-/// the process is part of this installation. The error preserves that
-/// boundary and does not authorize termination, adoption, reuse, or
-/// credential attachment.
+/// Threaded into the collision path so a typed directive can be built from
+/// facts the site actually holds, rather than from a free-form string. Every
+/// field is the *approved* identity: nothing here is inferred from a listener,
+/// a name, a path or a port.
+#[cfg(windows)]
+pub(super) struct StoreEndpointOwnershipBinding<'a> {
+    /// Installation identity that planned and owns this endpoint.
+    pub(super) installation: &'a PlatformHandle,
+    /// Managed generation that planned this endpoint.
+    pub(super) generation: &'a PlatformHandle,
+    /// Authority fence under which the endpoint was planned and observed.
+    pub(super) state_fence: &'a StateFence,
+}
+
+/// Observes the planned Store endpoint and refuses launch when it is occupied
+/// by anything this installation has not proven it owns.
+///
+/// The listener owner PID is observation data only; it does not prove that the
+/// process is part of this installation. The returned directive preserves that
+/// boundary and authorizes no termination, adoption, reuse, or credential
+/// attachment.
 #[cfg(windows)]
 pub(super) fn ensure_store_endpoint_available(
     canonical_store_arguments: &[PlatformHandle],
+    binding: &StoreEndpointOwnershipBinding<'_>,
 ) -> Result<(), HostError> {
-    ensure_store_endpoint_available_or_owned(canonical_store_arguments, None)
+    ensure_store_endpoint_available_or_owned(canonical_store_arguments, None, binding)
 }
 
 /// Checks a pre-recovery endpoint while the retained, independently verified
 /// old Store child may still own its listener. The caller must prove the old
 /// child's Job membership and committed predecessor binding before passing
 /// its PID; this observation grants no ownership to any other listener.
+///
+/// A preflight port check is not sufficient on its own: the occupant can
+/// change between this read and the real connection. This function therefore
+/// never treats the endpoint as free-and-therefore-safe on the strength of a
+/// single observation. It only classifies what it saw; the launch itself is
+/// still admitted solely through the suspended-launch identity proof in
+/// [`HostJobBranches::launch`], and a collision refuses the launch outright
+/// rather than degrading into a second, trivially-passing check.
 #[cfg(windows)]
 pub(super) fn ensure_store_endpoint_available_or_owned(
     canonical_store_arguments: &[PlatformHandle],
     retained_old_child_pid: Option<u32>,
+    binding: &StoreEndpointOwnershipBinding<'_>,
 ) -> Result<(), HostError> {
     let endpoint = planned_store_endpoint(canonical_store_arguments).inspect_err(|_error| {
         host_launch_observe("host.launch store endpoint configuration rejected");
     })?;
 
     match store_endpoint_foreign_occupant(endpoint) {
-        Ok(Some(owner_pid)) if Some(owner_pid) == retained_old_child_pid => {
+        StoreEndpointObservation::Occupied { owner_process_id }
+            if Some(owner_process_id) == retained_old_child_pid =>
+        {
+            // The caller proved this exact PID is the retained child of *this*
+            // Job through committed predecessor binding, so the read agrees
+            // with retained identity rather than contradicting it. It still
+            // grants no ownership beyond that retained child.
             host_launch_observe("host.launch retained store endpoint owner observed");
             Ok(())
         }
-        Ok(Some(owner_pid)) => {
+        StoreEndpointObservation::Occupied { owner_process_id } => {
             host_launch_observe("host.launch store endpoint collision observed");
-            Err(HostError::RecoveryRequired(format!(
-                "planned Store endpoint {endpoint} is occupied by a listener (observed owner PID {owner_pid}); exact installation ownership is unproven and the listener remains an observation/import candidate only; no kill, credential attachment, adoption, or reuse was performed"
-            )))
+            // #1775: the real detector now produces the typed directive from an
+            // actual observation, not a prose string. `origin` is deliberately
+            // `Unknown`: a listener PID on the planned endpoint proves
+            // neither managed-tree nor shared-substrate membership, and a name,
+            // port or endpoint response can never establish control. I3.3
+            // admits only inspection/import or a separately admitted alternate
+            // endpoint, so the next-action set is read-only by construction.
+            //
+            // The occupant is left RUNNING. Nothing here terminates, kills,
+            // authenticates against, adopts, reuses or migrates from it.
+            Err(HostError::OriginCollisionUnproven(
+                store_endpoint_collision_directive(
+                    endpoint,
+                    Some(owner_process_id),
+                    retained_old_child_pid,
+                    binding,
+                )?,
+            ))
         }
-        Ok(None) => {
+        StoreEndpointObservation::Absent => {
             host_launch_observe("host.launch store endpoint free");
             Ok(())
         }
-        Err(error) => {
-            host_launch_observe("host.launch store endpoint owner unknown");
-            Err(error)
+        StoreEndpointObservation::Unreadable { reason } => {
+            // A read that FAILED is not a read that SUCCEEDED WITH AN EMPTY
+            // ANSWER. I3.3 requires verifying the owning lineage "before every
+            // start/reconnect"; an unreadable owner leaves that unverified, so
+            // the launch DEFERS rather than proceeding on a clean-absence
+            // reading that was never established.
+            host_launch_observe("host.launch store endpoint owner unreadable");
+            Err(HostError::StoreEndpointOwnerUnreadable(format!(
+                "planned Store endpoint {endpoint} owner could not be read ({reason}); a failed read is not absence, so the start/reconnect defers until exact installation ownership is observable"
+            )))
         }
+    }
+}
+
+/// Builds the typed process-origin collision directive for one observed
+/// foreign occupant of the planned Store endpoint.
+///
+/// Everything passed here is what this site actually holds: the endpoint read
+/// back from the approved launch descriptor, the observed owner process ID
+/// (or `None` when the owner could not be read), the retained owned child PID
+/// the caller proved through Job membership and committed predecessor binding,
+/// the managed generation from the approved descriptor, and the installation
+/// epoch whose authority fence scopes the observation.
+///
+/// The result is a directive, never an effect: it names the blocked control
+/// class and the missing ownership evidence, and it grants nothing.
+#[cfg(windows)]
+fn store_endpoint_collision_directive(
+    endpoint: std::net::SocketAddr,
+    observed_owner_process_id: Option<u32>,
+    retained_owned_process_id: Option<u32>,
+    binding: &StoreEndpointOwnershipBinding<'_>,
+) -> Result<OriginCollisionDirective, HostError> {
+    let observed_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            HostError::ProcessContour(format!(
+                "system clock is before the Unix epoch; collision evidence cannot be timestamped: {error}"
+            ))
+        })?
+        .as_millis();
+    let observed_at_unix_ms = u64::try_from(observed_at_unix_ms).map_err(|_error| {
+        HostError::ProcessContour(
+            "collision observation timestamp exceeds the representable range".to_owned(),
+        )
+    })?;
+    if observed_at_unix_ms == 0 {
+        return Err(HostError::ProcessContour(
+            "collision observation timestamp is zero".to_owned(),
+        ));
+    }
+
+    // The authority fence is the one the approved handoff descriptor already
+    // carries (`RuntimeLaunchDescriptor::authority_state_fence`), not one
+    // synthesised here. Deriving a fresh fence would let a collision be
+    // described against a generation this installation never approved, and a
+    // generation handle is an opaque identity rather than a parseable counter,
+    // so a derived fence would be a fabrication. The launch descriptor's own
+    // fence is the real binding; an invalid one fails closed below.
+    binding.state_fence.validate().map_err(|error| {
+        HostError::ProcessContour(format!(
+            "collision state fence is not a valid contract fence: {error}"
+        ))
+    })?;
+
+    // Role-filtered, bounded references only. No raw key, bearer token, argv
+    // text or config body is carried here; the endpoint and the observed owner
+    // PID are the facts the directive is actually about.
+    let evidence_refs = vec![
+        format!("store-endpoint-planned:{endpoint}"),
+        format!("store-endpoint-owner:{}", observed_owner_process_id_label(
+            observed_owner_process_id
+        )),
+    ];
+
+    let collision = StoreEndpointCollision {
+        planned_endpoint_host: endpoint.ip().to_string(),
+        planned_endpoint_port: endpoint.port(),
+        installation: binding.installation.clone(),
+        generation: binding.generation.clone(),
+        state_fence: binding.state_fence.clone(),
+        origin: ProcessOriginClassification::Unknown,
+        observed_owner_process_id,
+        retained_owned_process_id,
+        observed_at_unix_ms,
+        evidence_refs,
+    };
+
+    let directive = OriginCollisionDirective::new(
+        collision,
+        // The control class a collision blocks. `Stop` is the class this
+        // launch/reconnect path would need to reach past the occupant; the
+        // directive names it as *blocked*, and `OriginOperationClass::Stop` is
+        // a control class, so the constructor's read-only refusal cannot apply.
+        OriginOperationClass::Stop,
+        &[
+            OriginNextAction::InspectForeignOccupant,
+            OriginNextAction::ImportLegacyDataReadOnly,
+            OriginNextAction::SelectAlternateEndpoint,
+        ],
+        &[
+            MissingOwnershipEvidence::InstallationLineage,
+            MissingOwnershipEvidence::ProcessStartIdentity,
+            MissingOwnershipEvidence::ImageArtifact,
+            MissingOwnershipEvidence::AuthorityEpochAndStateFence,
+            MissingOwnershipEvidence::OperationChallenge,
+            MissingOwnershipEvidence::ConnectionOwner,
+        ],
+    )
+    .map_err(|error| {
+        HostError::ProcessContour(format!(
+            "planned Store endpoint collision evidence is invalid: {error}"
+        ))
+    })?;
+    // Fail closed at the producer: a directive that cannot be rendered is not a
+    // usable recovery instruction, and silently degrading it to prose is
+    // exactly the failure #1775 exists to remove.
+    directive.render().map_err(|error| {
+        HostError::ProcessContour(format!(
+            "planned Store endpoint collision directive could not be rendered: {error}"
+        ))
+    })?;
+    Ok(directive)
+}
+
+/// Renders the observed owner for an evidence reference without ever widening a
+/// missing observation into an invented process identity.
+#[cfg(windows)]
+fn observed_owner_process_id_label(observed_owner_process_id: Option<u32>) -> String {
+    match observed_owner_process_id {
+        Some(process_id) => format!("observed-pid:{process_id}"),
+        // I3.3: an unreadable owner is not an absent one. The reference says so
+        // explicitly instead of reading like "no owner".
+        None => "observed-pid:unreadable".to_owned(),
     }
 }
 
@@ -874,7 +1102,16 @@ impl HostJobBranches {
         )?;
         // Issue #1775: resolve collision before credential use. Listener PID
         // is observation only; the preflight does not prove socket identity.
-        ensure_store_endpoint_available(&launch.canonical_store_arguments)?;
+        // The typed directive is produced from this real observation, and an
+        // unreadable owner defers rather than reporting clean absence.
+        ensure_store_endpoint_available(
+            &launch.canonical_store_arguments,
+            &StoreEndpointOwnershipBinding {
+                installation: &host.installation,
+                generation: &launch.generation,
+                state_fence: &launch.authority_state_fence,
+            },
+        )?;
         let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(
