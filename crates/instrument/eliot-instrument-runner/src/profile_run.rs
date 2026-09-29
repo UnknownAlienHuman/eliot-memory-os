@@ -1179,31 +1179,6 @@ impl TestdPlaneAdmission {
         Ok((entry.adapter.clone(), entry.generation))
     }
 
-    /// Retains the durable stage identity before possible execution (I10.8.13).
-    ///
-    /// The retained identity carries the stable `(profile, revision, stage_id)`
-    /// triple with no operation binding yet. On cancellation, timeout, or
-    /// reconnect the execution lane queries this same stage through
-    /// [`TestdPlaneAdmission::requery_key`] rather than starting a
-    /// replacement, so a retried stage never hides the first attempt.
-    pub fn retain_stage_identity(route: &TestExecutionPlaneRoute) -> StageIdentity {
-        route.stage().clone()
-    }
-
-    /// Stable query key for one retained stage identity.
-    ///
-    /// The key covers only the durable triple, never the bound operation, so
-    /// the same key addresses the stage before launch, after launch, and
-    /// across a reconnect: a replacement operation under the same triple is a
-    /// new attempt of the same stage, never a new stage.
-    pub fn requery_key(identity: &StageIdentity) -> String {
-        let material = format!(
-            "{}\0{}\0{}",
-            identity.profile, identity.profile_revision, identity.stage_id,
-        );
-        sha256_hex(material.as_bytes())
-    }
-
     /// Refuses a pure in-process stage without an explicitly registered pure
     /// implementation (I10.8.4).
     ///
