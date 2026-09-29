@@ -287,7 +287,9 @@ def _enclosing_job_block(lines: list[str], index: int, indent: int) -> list[int]
     to (but not including) the next shallower mapping line. Every governing
     `if:`/`continue-on-error:`/`timeout-minutes:` a job body can carry is one
     of those lines, so a skipped or soft-failure job is seen no matter which
-    key carries it or where in the job body the key is written.
+    key carries it or where in the job body the key is written. The `steps:`
+    container may sit at the step entries' own column (legal YAML for a block
+    sequence), and that spelling still opens the job body.
     """
     governing: list[int] = []
     body_indent: int | None = None
@@ -299,7 +301,14 @@ def _enclosing_job_block(lines: list[str], index: int, indent: int) -> list[int]
         if key is None:
             continue
         leading = len(line) - len(line.lstrip(" "))
-        if leading >= indent:
+        if leading > indent:
+            continue
+        if leading == indent and key != "steps" and body_indent != leading:
+            # Same column as the step entry but not the `steps:` container
+            # itself (a sibling entry such as `- name:` still reads as a key
+            # here): only the container at this column opens the job body, so
+            # sibling keys above it are skipped while job-body keys at the
+            # same column below it are kept.
             continue
         if body_indent is not None and leading < body_indent:
             # Shallower than a job-body key: this is the job header, so the job
