@@ -399,8 +399,11 @@ pub struct UserOwnedPathLease {
     sid: String,
     #[cfg(windows)]
     _root: std::fs::File,
+    /// No-follow handles for every retained parent directory, outermost first.
+    /// They are kept alive for the lease lifetime and the last entry is the
+    /// immediate parent synced after a durable write.
     #[cfg(windows)]
-    _directories: Vec<std::fs::File>,
+    retained_parent_directories: Vec<std::fs::File>,
     #[cfg(windows)]
     file: std::fs::File,
 }
@@ -455,7 +458,7 @@ impl UserOwnedPathLease {
                 identity,
                 sid: root.sid.clone(),
                 _root: root_handle,
-                _directories: directories,
+                retained_parent_directories: directories,
                 file,
             };
             lease.verify_path_identity()?;
@@ -505,7 +508,7 @@ impl UserOwnedPathLease {
                 identity,
                 sid: root.sid.clone(),
                 _root: root_handle,
-                _directories: directories,
+                retained_parent_directories: directories,
                 file,
             })
         }
@@ -571,7 +574,7 @@ impl UserOwnedPathLease {
                 identity,
                 sid: root.sid.clone(),
                 _root: root_handle,
-                _directories: directories,
+                retained_parent_directories: directories,
                 file,
             };
             lease.verify_path_identity()?;
@@ -700,7 +703,7 @@ impl UserOwnedPathLease {
                 .map_err(|_| ProtectedPathError::Io)?;
             self.file.sync_all().map_err(|_| ProtectedPathError::Io)?;
             let parent = self
-                ._directories
+                .retained_parent_directories
                 .last()
                 .ok_or(ProtectedPathError::IdentityMismatch)?;
             crate::sync_directory_handle(parent).map_err(|_| ProtectedPathError::Io)?;
