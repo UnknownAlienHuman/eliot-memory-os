@@ -288,10 +288,7 @@ fn validate_relative_path(value: &str) -> bool {
 }
 
 fn validate_hint(hint: &KernelChangeHint) -> Result<(), ChangeMonitorError> {
-    if !text(&hint.hint_id)
-        || !text(&hint.resource)
-        || !validate_relative_path(&hint.path)
-    {
+    if !text(&hint.hint_id) || !text(&hint.resource) || !validate_relative_path(&hint.path) {
         return Err(ChangeMonitorError::InvalidHint);
     }
     if let Some(origin_ref) = &hint.origin_ref
@@ -405,7 +402,10 @@ pub(crate) fn material_transition_ids(
         after_digest.unwrap_or("absent")
     );
     let transition_digest = crate::sha256_hex(preimage.as_bytes());
-    (format!("cmu:{hint_id}:{transition_digest}"), transition_digest)
+    (
+        format!("cmu:{hint_id}:{transition_digest}"),
+        transition_digest,
+    )
 }
 
 /// Confirms one pending hint with trusted content and readback evidence
@@ -455,13 +455,9 @@ pub(crate) fn confirm_hint(
         .hint
         .resource
         .clone();
-    let reconciled = ledger
-        .governed
-        .values()
-        .any(|record| {
-            record.resource == resource
-                && record.after_digest.as_deref() == Some(after_digest.as_str())
-        });
+    let reconciled = ledger.governed.values().any(|record| {
+        record.resource == resource && record.after_digest.as_deref() == Some(after_digest.as_str())
+    });
     let evidence_id = ledger
         .governed
         .iter()
@@ -479,9 +475,7 @@ pub(crate) fn confirm_hint(
             transition_digest,
             reconciled,
         });
-    if reconciled
-        && let Some(evidence_id) = evidence_id
-    {
+    if reconciled && let Some(evidence_id) = evidence_id {
         ledger.reconciliations.push(UnknownReconciliation {
             unknown_change_id: change_id.clone(),
             evidence_change_id: evidence_id,
@@ -541,10 +535,7 @@ pub(crate) fn record_governed_tool_change(
             return Err(ChangeMonitorError::InvalidGovernedChange);
         }
     }
-    let before_digest = change
-        .before_bytes
-        .as_deref()
-        .map(crate::sha256_hex);
+    let before_digest = change.before_bytes.as_deref().map(crate::sha256_hex);
     let after_digest = change.after_bytes.as_deref().map(crate::sha256_hex);
     if before_digest == after_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
@@ -566,10 +557,7 @@ pub(crate) fn record_governed_tool_change(
         fence_invalidated: change.fence_invalidated,
     };
     let mut ledger = ledger()?;
-    if let Some(bound) = ledger
-        .governed_by_operation
-        .get(&change.operation)
-        .cloned()
+    if let Some(bound) = ledger.governed_by_operation.get(&change.operation).cloned()
         && bound != change.change_id
     {
         return Err(ChangeMonitorError::OperationReuse);
@@ -652,6 +640,9 @@ pub(crate) fn governed_acceptance_blocked() -> bool {
     let Ok(ledger) = ledger() else {
         return true;
     };
-    ledger.hints.values().any(|entry| entry.confirmation.is_none())
+    ledger
+        .hints
+        .values()
+        .any(|entry| entry.confirmation.is_none())
         || ledger.unknown.values().any(|unknown| !unknown.reconciled)
 }

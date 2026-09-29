@@ -1230,7 +1230,10 @@ fn observe_finish_governed_change(body: &FinishResultBody, persisted: &HostReque
         after_revision: Some(body.result_digest.clone()),
         after_bytes: Some(after_bytes),
         session: body.attempt.session_id.clone(),
-        action_lease: format!("{}:{}", body.attempt.attempt_id, body.attempt.fencing_generation),
+        action_lease: format!(
+            "{}:{}",
+            body.attempt.attempt_id, body.attempt.fencing_generation
+        ),
         operation: body.operation_id.clone(),
         attempt_receipt: body.attempt.attempt_id.clone(),
         diff_handle: body.result_digest.clone(),
@@ -1239,12 +1242,11 @@ fn observe_finish_governed_change(body: &FinishResultBody, persisted: &HostReque
     };
     let _ = super::change_monitor::record_governed_tool_change(&change);
     let hint_id = super::change_monitor::host_hint_id(&body.operation_id);
-    let (unknown_change_id, transition_digest) =
-        super::change_monitor::material_transition_ids(
-            &hint_id,
-            Some(body.request_sha256.as_str()),
-            Some(body.result_digest.as_str()),
-        );
+    let (unknown_change_id, transition_digest) = super::change_monitor::material_transition_ids(
+        &hint_id,
+        Some(body.request_sha256.as_str()),
+        Some(body.result_digest.as_str()),
+    );
     let _ = super::change_monitor::reconcile_unknown_change(&unknown_change_id, &transition_digest);
 }
 
