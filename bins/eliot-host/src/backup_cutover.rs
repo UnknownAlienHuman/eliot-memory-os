@@ -12,8 +12,19 @@
 //! `HostComposition::backup_dispatch_cutover` (the Host console protocol, the
 //! Host runtime-control endpoint, the CLI `CommandId`) is owned by #962 (no
 //! transport) and #945 (no public command surface). Nothing here adds a
-//! caller, an adapter or a startup probe for it, and nothing here claims an
-//! operator command can reach this module.
+//! transport, an adapter or a startup probe for it, and nothing here claims an
+//! operator command can reach that port.
+//!
+//! What IS reachable in production, and what #983 observes, is the registered
+//! backup owner's cutover DISPATCH arm
+//! (`HostBackupDispatchOwner::dispatch_backup_operation`, host `lib.rs`):
+//! `HostComposition::backup_owner_registration` registers it on the control
+//! endpoint's closed prepare/cutover dispatch table and the endpoint installs
+//! that registration on the canonical runtime-control pipe, so `eliot-kernel`'s
+//! `HostBackupOwnerClient` dispatches a cutover through it across the process
+//! boundary. That arm is a real cutover decision and is observed on its own
+//! `op` token by `observe_live_cutover_dispatch`; it routes and refuses, and it
+//! does not yet hand an admitted body to the port above.
 //!
 //! Actual-owner integration (read from current main, no substitutes):
 //! - Admission: `eliot_protocol::{HostRequestEnvelope,
@@ -266,6 +277,18 @@ const CUTOVER_DISPOSITION_READ_ATTEMPTS: u8 = 3;
 /// distinguishable in the diagnostic stream. `op` selects nothing: both call the
 /// same read with the same owners and the same arms.
 const RETAINED_CUTOVER_OP: &str = "contour_reconcile";
+
+/// Diagnostic operation token for the live cutover admission decision.
+///
+/// This is the token of the registered backup owner's cutover dispatch arm
+/// (`HostBackupDispatchOwner::dispatch_backup_operation`), the one production
+/// cutover ingress registered on the Host control endpoint's closed dispatch
+/// table. It is a separate token from [`RETAINED_CUTOVER_OP`] because it records
+/// an admission DECISION on the dispatch contour, not a two-owner disposition
+/// read on the reconcile contour: a routed cutover and an owner-observed cutover
+/// disposition are different observations and must stay separately attributable
+/// in the stream.
+const LIVE_CUTOVER_OP: &str = "cutover_dispatch";
 
 /// Diagnostic operation token for the admitted-request disposition read.
 ///
@@ -1153,24 +1176,51 @@ pub enum CutoverError {
 // here is deduplicated away: there is no global dedup cache, so a second
 // failed operation still reports its own terminal.
 //
-// Production disposition call sites (#983): `cutover_disposition_token` has TWO
-// production callers. The first is `reconcile_cutover_outcome` below, which
-// projects the full owner read model. The second is
-// `observe_retained_cutover_disposition`, which the Host's existing approved
-// contour reconcile (`HostComposition::reconcile_approved_contour`, reached
-// from `fn main` through `run_scm_contour_tick`) now calls, so the retained
-// `pending_cutover` disposition is observed on the live contour. That read
-// never reaches `validate_cutover_request`: the owner gate set requires an
-// admitted `CutoverRequest` plus the #960 owner-issued
+// Production call sites (#983). There are TWO distinct live cutover contours
+// and each is observed on its own token; they are not the same observation and
+// never claim the same thing.
+//
+// 1. The live cutover DISPATCH contour. `HostBackupDispatchOwner::
+//    dispatch_backup_operation` (host `lib.rs`) is the one production cutover
+//    ingress in this base: `HostComposition::backup_owner_registration`
+//    registers it on the Host control endpoint's closed prepare/cutover
+//    dispatch table, and the endpoint installs that registration on the
+//    canonical runtime-control pipe, so `eliot-kernel`'s
+//    `HostBackupOwnerClient` dispatches a cutover through it across the process
+//    boundary. `observe_live_cutover_dispatch` observes that owner decision.
+//    Its `op` token is `LIVE_CUTOVER_OP` and its `disposition` field is always
+//    `"none"`: a ROUTED cutover proves only that it selected the cutover
+//    target, never that it was admitted, activated, committed or retired, and
+//    rehearsal completion is excluded from cutover admission upstream so it
+//    can never produce a cutover word of any kind from this path.
+//
+// 2. The live cutover DISPOSITION contour. `HostComposition::
+//    reconcile_approved_contour` (reached from `fn main` through
+//    `run_scm_contour_tick`) calls `observe_retained_cutover_disposition`, which
+//    reports the retained `pending_cutover` word that
+//    `cutover_disposition_token` projects from the OWNER'S returned evidence.
+//    Its `op` token is `RETAINED_CUTOVER_OP`.
+//
+// Requested (a routed cutover) and owner-observed commit (the two-owner
+// disposition read) therefore stay two distinct records under two distinct
+// tokens; neither is derived from the other's spelling.
+//
+// What contour 2 does NOT do is reach `validate_cutover_request`. Its owner
+// gate set requires an admitted `CutoverRequest` plus the #960 owner-issued
 // `IsolatedRecoveryEvidence`, and NEITHER is reconstructible from the durable
 // journal slot (`CutoverIntentRecord` retains no envelope, admission receipt,
-// archive digest/class, activation fence, or recovery evidence). Only the
-// admitted cutover dispatch `HostComposition::backup_dispatch_cutover` holds
-// those two values, and it has no production caller on this base because the
-// console wire is closed with Status/Stop and `eliot-kernel` does not depend
-// on `eliot-host`. Manufacturing one would need a new transport surface this
-// issue does not own, so the gap is stated here rather than papered over with
-// a fabricated request.
+// archive digest/class, activation fence, or recovery evidence). Those two
+// values are held only by the admitted cutover dispatch
+// `HostComposition::backup_dispatch_cutover`, which is the port contour 1's
+// owner is defined in terms of but which this base does not itself invoke: the
+// live owner arm above refuses with a bounded typed refusal precisely because
+// no separately admitted cutover body is retained. Turning that refusal into a
+// real admitted call needs the #962/#945 transport surface this issue does not
+// own, so the gap is stated here rather than papered over with a fabricated
+// request. `validate_cutover_request` therefore has exactly one production
+// caller, `HostComposition::backup_dispatch_cutover`, and its diagnostic
+// records are emitted on the same `op` token the owner arm would file them
+// under, so the records line up if and when that transport lands.
 //
 // What that gap does NOT justify is projecting a disposition from the journal
 // slot alone. The `CutoverIntentRecord` DOES retain this operation's
@@ -1348,6 +1398,72 @@ pub fn observe_retained_cutover_disposition(
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     Ok(Some(outcome))
+}
+
+/// Observes the live cutover ADMISSION decision taken by the Host's registered
+/// backup owner on the closed prepare/cutover dispatch table, before any
+/// effect.
+///
+/// This is the one production cutover ingress in this base:
+/// `HostBackupDispatchOwner::dispatch_backup_operation` is registered with the
+/// Host control endpoint's closed dispatch table (through
+/// `HostComposition::backup_owner_registration`, installed on the canonical
+/// runtime-control pipe), so the kernel's backup owner client dispatches through
+/// it across the process boundary. Its `Cutover` arm is the live point at which
+/// a cutover is routed and either admitted to the owner gate set or refused with
+/// a bounded typed refusal. This helper observes that DECISION; it does not run
+/// it, and it admits nothing.
+///
+/// The observed word is a STATIC category derived from the routing decision the
+/// owner already made — never from an unvalidated caller string, never from the
+/// spelling of a helper, and never from a module comment:
+///
+/// - `admission_required` — the operation routes to the `Cutover` target and the
+///   closed table requires a separately admitted cutover body. This is the live
+///   cutover ADMISSION point, and it is deliberately NOT a cutover success: a
+///   routed cutover has proved only that it is the right target, never that it
+///   activated anything;
+/// - `admission_not_required` — the operation routes to the preparation target,
+///   which the closed table admits without cutover admission;
+/// - `rehearsal_excluded` — the operation is rehearsal completion, which the
+///   closed table excludes from cutover admission and which therefore can never
+///   emit a cutover success of any kind;
+/// - `no_registered_target` — no Host backup owner operation is registered for
+///   the method, so there is no cutover decision to observe at all;
+/// - `stale_cutover_registration` — the composition's routing and the endpoint's
+///   own accepted table disagree about cutover admission, a stale registration
+///   that fails before any effect and is never a cutover progress claim.
+///
+/// The `disposition` field is deliberately `"none"`: this records an admission
+/// DECISION, never an owner-observed cutover disposition. The disposition words
+/// come from the two-owner evidence read through [`cutover_disposition_token`]
+/// on the live contour, so a REQUESTED cutover here and an OWNER-OBSERVED
+/// disposition there stay distinct records rather than one overwriting the
+/// other, and a rehearsal or a routed-but-refused cutover can never produce a
+/// `committed` word from this path.
+///
+/// It is an OBSERVATION beside the routing decision, not a second gate on it and
+/// not a recovery, readiness or authority receipt. It reads no journal, opens no
+/// registry, appends nothing, mutates nothing, and returns nothing, so the
+/// owner's return value, ordering and refusal text are untouched.
+pub fn observe_live_cutover_dispatch(
+    operation: eliot_protocol::backup::BackupOperationKind,
+    target: Option<crate::BackupDispatchTarget>,
+    cutover_admission_required: bool,
+) {
+    let outcome = match (operation, target) {
+        (eliot_protocol::backup::BackupOperationKind::CompleteRehearsal, _) => "rehearsal_excluded",
+        (_, None) => "no_registered_target",
+        (_, Some(crate::BackupDispatchTarget::Cutover)) => {
+            if cutover_admission_required {
+                "admission_required"
+            } else {
+                "stale_cutover_registration"
+            }
+        }
+        (_, Some(crate::BackupDispatchTarget::Prepare)) => "admission_not_required",
+    };
+    observe_cutover_progress(LIVE_CUTOVER_OP, outcome, "none", 0);
 }
 
 /// Observes one nonterminal cutover phase outcome after the decision exists.
