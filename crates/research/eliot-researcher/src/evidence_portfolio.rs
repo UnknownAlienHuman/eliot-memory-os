@@ -2079,7 +2079,7 @@ impl CoverageAccount {
     /// prevent.
     ///
     /// Transitively `absence-preconditions/v2` binds this digest through
-    /// `account_digest` and `coverage-receipt/v2` through `account_digest` and
+    /// `account_digest` and `coverage-receipt/v3` through `account_digest` and
     /// `AbsencePreconditions`'s own set, so all three change value for the same
     /// run. Their own field sets and domains are unchanged, and the value
     /// changing in a field a digest already declared is the dependency behaving
@@ -2670,6 +2670,20 @@ impl NoMatchEvaluation {
             .iter()
             .map(|result| result.member.clone())
             .collect()
+    }
+
+    /// The proof ceiling this record carries, when it carries one.
+    ///
+    /// An issued record always carries one, but the field stays `Option` because
+    /// an absent ceiling is unknown coverage rather than unrestricted, and a
+    /// reader has to be able to tell those apart. The holder presenting this
+    /// record reads it here to learn the strongest claim it may not make:
+    /// [`crate::inquiry_governance::CoverageReceipt`] binds it into its own
+    /// digest, so a releasing owner revalidates the ceiling behind the verdict
+    /// rather than the verdict class alone.
+    #[must_use]
+    pub fn proof_ceiling_grade(&self) -> Option<u8> {
+        self.proof_ceiling_grade
     }
 
     /// Validates the record's shape, independently of its frozen digest.
@@ -3920,12 +3934,14 @@ fn member_join_reason(
 /// [`AbsencePreconditions::derive`] or of [`NoMatchEvaluationIssuer::new`]; see
 /// the limitation note on
 /// [`NoMatchEvaluation`] for why no in-crate check can close it. The live
-/// composition owner does re-check the retained record: `coverage-receipt/v2`
-/// binds both this verdict's class and the reason it carries, and
-/// `InquiryGovernance::validate_integrity` re-checks that receipt digest against
-/// the evidence freeze and the terminal record. It does **not** re-run this
-/// assessment, and it cannot raise the verdict above the proof ceiling carried on
-/// the bound evaluation.
+/// composition owner does re-check the retained record, and it now does so by
+/// name rather than by verdict class alone: `coverage-receipt/v3` binds this
+/// verdict's class, the reason it carries, the digest of the exact
+/// owner-issued evaluation it was derived from and that record's proof ceiling,
+/// and `InquiryGovernance::validate_integrity` re-checks that receipt digest
+/// against the evidence freeze and the terminal record. It does **not** re-run
+/// this assessment, and it cannot raise the verdict above the proof ceiling
+/// carried on the bound evaluation.
 ///
 /// `account` is the accounting the preconditions are claimed to describe. It is
 /// required so the preconditions cannot be re-bound to a different accounting
@@ -4164,7 +4180,7 @@ fn unclosed_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdi
 /// to reach the *absent-evaluation* arm instead, because it never entered
 /// `incompatible` at all. No test in this crate asserts this string, so treat it
 /// as unblessed by the suite: changing it is a visible change to every receipt
-/// that carries the reason, and it moves `coverage-receipt/v2`.
+/// that carries the reason, and it moves `coverage-receipt/v3`.
 fn incompatible_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
     if preconditions.incompatible.is_empty() {
         return None;
@@ -4284,7 +4300,7 @@ fn unestablished_dimensions(evaluation: &NoMatchEvaluation) -> Option<AbsenceVer
 /// that covered exactly the pre-#2893 `closed` set is now a mismatch. Every such
 /// input was already `Unproven` — the incompatibility arm runs first — so no
 /// input changes from `Proven` to `Unproven` or back. What changes is which
-/// reason a caller reads, and it moves `coverage-receipt/v2`. No test in this
+/// reason a caller reads, and it moves `coverage-receipt/v3`. No test in this
 /// crate asserts this string.
 fn mismatched_evaluated_members(
     evaluation: &NoMatchEvaluation,

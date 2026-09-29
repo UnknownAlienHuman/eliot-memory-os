@@ -52,11 +52,11 @@ use eliot_research_exchange_api::{
 use crate::evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, AuditedClaim,
     AuthorizedManifest, AuthorizedManifestParams, ClaimCoverageMap, ClaimVerdict, CoverageAccount,
-    EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, ObservedOutsideScope,
-    PortfolioError, PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
-    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, audit_claim, bool_text,
-    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
-    push_field, reject_vague, text,
+    EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, NoMatchEvaluation,
+    ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
+    SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
+    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank,
+    push_count, push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -2865,6 +2865,34 @@ fn vetted_records(records: &[SourceAdmissibilityRecord]) -> BTreeMap<String, Sou
         .collect()
 }
 
+/// The one seam through which an admitted route presents owner-issued absence
+/// evidence to the live coverage receipt.
+///
+/// Before this type existed there was no place at all to present such a record:
+/// [`CoverageReceipt::compute`] hard-passed `None` in both the manifest and the
+/// evaluation positions of [`AbsencePreconditions::derive`], so the
+/// evidence-gated arms of
+/// [`assess_absence`](crate::evidence_portfolio::assess_absence) were
+/// unreachable not because the evidence was refused but because nothing could be
+/// handed over. The two are paired deliberately and cannot be separated: an
+/// owner-issued [`NoMatchEvaluation`] is only meaningful against the exact
+/// [`AuthorizedManifest`] its own commitments name, and presenting the record
+/// without the manifest it was issued under would be presenting a claim with no
+/// authorizing document behind it.
+///
+/// This is a *presentation* point, not a producer. The query/evaluator owner that
+/// can fill it is the live composition in #1762/#1767; the ordinary research route
+/// presents `None` at its construction site, with the reason written there, which
+/// is the fail-closed state issue step 11 and checklist item W11 require. No
+/// evaluation is fabricated to complete a receipt.
+#[derive(Clone, Debug)]
+pub struct AbsenceEvidence {
+    /// The authorized manifest the evaluation was issued under.
+    pub manifest: AuthorizedManifest,
+    /// The owner-issued per-member predicate evaluation.
+    pub evaluation: NoMatchEvaluation,
+}
+
 /// Coverage receipt for one inquiry (I21.6).
 ///
 /// "No result" is not absence or completeness without a declared denominator
@@ -2912,6 +2940,24 @@ pub struct CoverageReceipt {
     pub counter_search_status: CounterSearchStatus,
     /// Absence assessment over the exact accounting.
     pub absence_verdict: AbsenceVerdict,
+    /// Digest of the owner-issued [`NoMatchEvaluation`] the verdict was derived
+    /// against, when the route presented one.
+    ///
+    /// `coverage-receipt/v2` bound the verdict class and its reason but never the
+    /// record behind it, so a receipt could publish an `AbsenceVerdict` into the
+    /// evidence-freeze and terminal-record digests with nothing nameable to
+    /// revalidate. A holder reads this to re-prove the exact record rather than
+    /// trust the verdict it produced. `None` is the fail-closed state and is
+    /// digested explicitly as `absent`, so "nothing was presented" is a bound
+    /// fact about this receipt rather than an omission a reader has to notice.
+    pub absence_evidence_digest: Option<String>,
+    /// Proof ceiling the presented evidence may not exceed, when one was
+    /// presented.
+    ///
+    /// Retained beside the verdict so a releasing owner can refuse to publish a
+    /// claim stronger than the evidence's own ceiling allows, rather than
+    /// re-deriving that ceiling from records it may no longer hold.
+    pub absence_proof_ceiling_grade: Option<u8>,
     /// Declared denominator kind.
     pub denominator_kind: DenominatorKind,
     /// Budget limitation that bounded the run, when one applied.
@@ -2920,32 +2966,73 @@ pub struct CoverageReceipt {
     pub digest: String,
 }
 
+/// Named arguments for [`CoverageReceipt::compute`].
+///
+/// A parameter list here is not cosmetic. The eleven inputs a coverage receipt
+/// consumes are eleven chances to transpose two of them, and the seam argument
+/// added by #2893 is the one whose order matters most: an evaluation presented
+/// against the wrong account is exactly the caller-constructed negative this
+/// issue exists to refuse. Named fields make that a compile error instead.
+#[derive(Clone, Debug)]
+pub struct CoverageReceiptParams<'a> {
+    /// Resolved protocol profile the receipt is computed under.
+    pub profile: &'a InquiryProtocolProfile,
+    /// Exact requested scope text.
+    pub requested_scope: &'a str,
+    /// Digest of the frozen scope snapshot the receipt accounts over.
+    pub frozen_scope_digest: &'a str,
+    /// The exact coverage accounting being receipted.
+    pub account: &'a CoverageAccount,
+    /// Vetted admissibility records this run admitted.
+    pub records: &'a [SourceAdmissibilityRecord],
+    /// Owner-issued absence evidence, when the route holds it.
+    pub absence_evidence: Option<&'a AbsenceEvidence>,
+    /// Routes the run used.
+    pub routes_used: Vec<String>,
+    /// Provider degradation observed on this run.
+    pub provider_degradation: Vec<String>,
+    /// Explicit coverage unknowns, preserved rather than smoothed.
+    pub unknown_coverage: Vec<String>,
+    /// Budget limitation that bounded the run, when one applied.
+    pub budget_limitation: Option<String>,
+    /// The run's own assessment instant.
+    pub assessment_time_ms: i64,
+}
+
 impl CoverageReceipt {
     /// Computes the receipt from the exact accounting and the eligibility set.
+    ///
+    /// `absence_evidence` is the single seam through which a route that holds an
+    /// owner-issued record presents it, as the authorized manifest and the
+    /// evaluation the record was issued under. `None` is the ordinary state and is
+    /// the fail-closed answer, not a placeholder: with no evaluation bound, the
+    /// absence verdict can never be [`AbsenceVerdict::Proven`], the denominator
+    /// kind stays [`DenominatorKind::Unknown`] and the receipt names the missing
+    /// record as its reason. The research plane records per-source acquisition
+    /// dispositions, not per-member query predicate results, and #2893 forbids
+    /// fabricating one here.
     ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IncompleteDenominator`] when the frozen
     /// denominator has no member to account, a field error for a vague
     /// scope or a malformed frozen-scope digest, and the absence-precondition
-    /// error when a bound predicate evaluation names no member or no longer
-    /// re-proves its own identity. This route binds neither a bounded predicate
-    /// evaluation nor an authorized manifest, so the absence verdict it produces
-    /// can never be [`AbsenceVerdict::Proven`] and the receipt stays
-    /// fail-closed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn compute(
-        profile: &InquiryProtocolProfile,
-        requested_scope: &str,
-        frozen_scope_digest: &str,
-        account: &CoverageAccount,
-        records: &[SourceAdmissibilityRecord],
-        routes_used: Vec<String>,
-        provider_degradation: Vec<String>,
-        unknown_coverage: Vec<String>,
-        budget_limitation: Option<String>,
-        assessment_time_ms: i64,
-    ) -> Result<Self, InquiryError> {
+    /// error when presented evidence names no member, does not re-prove its own
+    /// identity, or does not join the records this run admitted.
+    pub fn compute(params: CoverageReceiptParams<'_>) -> Result<Self, InquiryError> {
+        let CoverageReceiptParams {
+            profile,
+            requested_scope,
+            frozen_scope_digest,
+            account,
+            records,
+            absence_evidence,
+            routes_used,
+            provider_degradation,
+            unknown_coverage,
+            budget_limitation,
+            assessment_time_ms,
+        } = params;
         require_scope(requested_scope, "coverage.requested_scope")?;
         require_digest(frozen_scope_digest, "coverage.frozen_scope_digest")?;
         let expected_members = account.denominator_size();
@@ -2965,40 +3052,43 @@ impl CoverageReceipt {
         eligible_handles.dedup();
         let observed_outside_scope = account.observed_outside_scope();
         let enumeration_state = enumeration_state(account, &observed_outside_scope);
-        // This plane records per-source acquisition dispositions, not per-member
-        // query predicate results, and it holds no authoritative enumeration
-        // attestation for the route. It therefore binds no bounded predicate
-        // evaluation and no `AuthorizedManifest` here, and the absence assessment
-        // names the accounting facts that block the negative as its reason
-        // instead of resting on a caller-supplied flag. Both arguments are the
-        // fail-closed answer, not a placeholder: `AbsencePreconditions::derive`
-        // admits an owner-issued `NoMatchEvaluation` only when the live route
-        // supplies one, and #2893 forbids fabricating one here to complete the
-        // receipt.
+        // The evaluation and the manifest it was issued under arrive together or
+        // not at all, through `AbsenceEvidence` above. Presenting a record
+        // without its manifest would be presenting a claim with no authorizing
+        // document behind it, and `AbsencePreconditions::derive` re-proves both
+        // on the way in, so a rewritten one is refused before any of its content
+        // is believed.
         let absence_preconditions = AbsencePreconditions::derive(
             account,
             &vetted_records(records),
-            None,
+            absence_evidence.map(|evidence| &evidence.manifest),
             assessment_time_ms,
             frozen_scope_digest,
-            None,
+            absence_evidence.map(|evidence| evidence.evaluation.clone()),
         )?;
         let absence_verdict = assess_absence(account, &absence_preconditions);
+        // The retained identity and ceiling come from the record the derivation
+        // just re-proved, not from the presented argument, so they cannot disagree
+        // with the verdict the assessor produced from that same record.
+        let absence_evidence_digest = absence_evidence
+            .map(|evidence| evidence.evaluation.canonical_digest())
+            .transpose()?;
+        let absence_proof_ceiling_grade = absence_evidence
+            .and_then(|evidence| evidence.evaluation.proof_ceiling_grade());
         let counter_search_status = if profile.hypothesis_policy.requires_counter_search() {
             CounterSearchStatus::RequiredAndOpen
         } else {
             CounterSearchStatus::NotRequired
         };
-        let denominator_kind = if all_closed
-            && accounted
-            && absence_verdict == AbsenceVerdict::Proven
-            && provider_degradation.is_empty()
-            && counter_search_status == CounterSearchStatus::Satisfied
-        {
-            DenominatorKind::CompleteScope
-        } else {
-            DenominatorKind::Unknown
-        };
+        let denominator_kind = denominator_kind(CompleteScopeEvidence {
+            all_closed,
+            accounted,
+            absence_verdict: &absence_verdict,
+            absence_evidence_digest: absence_evidence_digest.as_deref(),
+            absence_proof_ceiling_grade,
+            degradation_count: provider_degradation.len(),
+            counter_search_status,
+        });
         let mut receipt = Self {
             inquiry_id: profile.inquiry_id.clone(),
             profile_digest: profile.integrity_digest.clone(),
@@ -3020,6 +3110,8 @@ impl CoverageReceipt {
             provider_degradation,
             counter_search_status,
             absence_verdict,
+            absence_evidence_digest,
+            absence_proof_ceiling_grade,
             denominator_kind,
             budget_limitation,
             digest: String::new(),
@@ -3029,14 +3121,17 @@ impl CoverageReceipt {
     }
 
     fn compute_digest(&self) -> String {
-        // Bumped `v1` -> `v2` by #2893, and the reason is that this preimage does
-        // not bind an identity, it binds a *reason string verbatim* (see the
-        // `absence_reason` push below). #2893 changed two of those strings and the
-        // population that reaches them, so for the same run this digest now
-        // produces a different value under one name — the exact defect the
-        // declared-domain rule exists to prevent. The preimage field set did not
-        // change; what changed is the value space of a field that was already
-        // there, which is the same reason `source-record/v1` -> `v2` was recorded.
+        // Bumped `v1` -> `v2` by #2893 for a changed *value space* under one name:
+        // this preimage binds a reason string verbatim (see the `absence_reason`
+        // push below), and #2893 changed two of those strings and the population
+        // that reaches them. #2893 then bumped `v2` -> `v3` for the other reason
+        // named by the declared-domain rule: the preimage field set GREW. The
+        // receipt now binds the digest of the owner-issued record its verdict was
+        // derived from, and the proof ceiling that record may not be exceeded
+        // past. Under `v2` those two facts were carried on the record but reached
+        // no digest, so two receipts with the same verdict and different evidence
+        // behind it were indistinguishable, which is precisely what this issue
+        // exists to prevent.
         //
         // Transitively, `evidence-freeze/v2` and `inquiry-terminal-record/*` bind
         // this digest and therefore produce different values for the same run.
@@ -3050,7 +3145,7 @@ impl CoverageReceipt {
         // freeze, the claim audit and the unsupported-precision residue became
         // carried fields. `research-debt/v1` is unaffected because its preimage
         // never named the receipt digest.
-        let mut preimage = String::from("coverage-receipt/v2;");
+        let mut preimage = String::from("coverage-receipt/v3;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
         push_field(&mut preimage, "requested_scope", &self.requested_scope);
@@ -3139,6 +3234,21 @@ impl CoverageReceipt {
         if let Some(reason) = absence_reason(&self.absence_verdict) {
             push_field(&mut preimage, "absence_reason", reason);
         }
+        // The retained record identity and its ceiling. `absent` is spelled
+        // rather than omitted, so "no evidence was presented" is a bound state
+        // of this preimage and not an indistinguishable one: an omitted field
+        // would make a receipt that presented nothing digest identically to a
+        // receipt whose absent field was simply not reached.
+        match &self.absence_evidence_digest {
+            Some(digest) => push_field(&mut preimage, "absence_evidence", digest),
+            None => push_field(&mut preimage, "absence_evidence", "absent"),
+        }
+        match self.absence_proof_ceiling_grade {
+            Some(ceiling) => {
+                push_field(&mut preimage, "absence_ceiling", &ceiling.to_string())
+            }
+            None => push_field(&mut preimage, "absence_ceiling", "unknown"),
+        }
         push_field(
             &mut preimage,
             "denominator_kind",
@@ -3151,8 +3261,68 @@ impl CoverageReceipt {
     }
 }
 
-/// Highest anchor precision the evidence set supports, with the residue the
-/// reference firewall produces (I21.7).
+/// The facts a complete-scope denominator claim is decided from.
+///
+/// A named struct rather than a positional list, because four of these seven
+/// inputs are `Option`-shaped or reference-shaped and a positional call at this
+/// width makes transposition a compile-time no-op. The two #2893 added are the
+/// ones that matter most: presenting an evaluation against the wrong account is
+/// exactly the caller-constructed negative this issue exists to refuse, and
+/// reading a verdict's ceiling off the wrong field would publish a claim
+/// stronger than the evidence allows.
+struct CompleteScopeEvidence<'a> {
+    /// Whether every accounted member closed intact.
+    all_closed: bool,
+    /// Whether every expected member is accounted exactly once.
+    accounted: bool,
+    /// The absence assessment produced for this run.
+    absence_verdict: &'a AbsenceVerdict,
+    /// Digest of the owner-issued record the verdict was derived from.
+    absence_evidence_digest: Option<&'a str>,
+    /// That record's proof ceiling.
+    absence_proof_ceiling_grade: Option<u8>,
+    /// How many provider degradations this run observed.
+    degradation_count: usize,
+    /// Whether the hypothesis policy's counter search is satisfied.
+    counter_search_status: CounterSearchStatus,
+}
+
+/// Decides which denominator kind a run may publish.
+///
+/// [`DenominatorKind::CompleteScope`] is the only kind that grounds a scoped
+/// absence, so every condition here is load-bearing and none of them
+/// substitutes for another: the accounting must be complete and intact, the
+/// assessor must have returned [`AbsenceVerdict::Proven`], the provider must not
+/// have degraded, and the hypothesis policy's counter search must be satisfied.
+///
+/// #2893 added the two evidence conditions, and they are the point of this
+/// function. Before them, a complete-scope claim rested on the verdict enum
+/// alone, so the receipt published `CompleteScope` with nothing nameable behind
+/// it and a releasing owner had no retained record to revalidate. The verdict and
+/// the record are now required together, which is a statement about *evidence*,
+/// not about a different verdict: the record is what the verdict was derived
+/// from, so demanding both cannot refuse a run that could pass on the verdict
+/// alone, and it does refuse a run whose verdict came from somewhere that kept
+/// no record. Both conditions are unreachable in production today, because
+/// [`assess_absence`](crate::evidence_portfolio::assess_absence) cannot return
+/// `Proven` without an owner-issued evaluation; they are written out rather
+/// than assumed, so a future assessor that grew a new way to prove absence
+/// cannot raise this receipt's denominator kind without a record behind it.
+fn denominator_kind(evidence: CompleteScopeEvidence<'_>) -> DenominatorKind {
+    if evidence.all_closed
+        && evidence.accounted
+        && *evidence.absence_verdict == AbsenceVerdict::Proven
+        && evidence.absence_evidence_digest.is_some()
+        && evidence.absence_proof_ceiling_grade.is_some()
+        && evidence.degradation_count == 0
+        && evidence.counter_search_status == CounterSearchStatus::Satisfied
+    {
+        DenominatorKind::CompleteScope
+    } else {
+        DenominatorKind::Unknown
+    }
+}
+
 ///
 /// A source that supports a document-level claim does not automatically support
 /// a symbol, line, causal mechanism or population-wide statement, so a
@@ -5397,18 +5567,33 @@ impl InquiryGovernance {
             SourcePortfolio::assemble(&observation.inquiry_id, &profile, &admissibility)?;
         let account = coverage_account(&observation, &admissibility)?;
         let degradation = degradation(&observation, &account);
-        let coverage_receipt = CoverageReceipt::compute(
-            &profile,
-            &observation.scope,
-            &observation.reference_manifest.digest,
-            &account,
-            &admissibility,
-            observation.admissible_routes.clone(),
-            degradation.provider_degradation,
-            degradation.unknown_coverage,
-            degradation.budget_limitation,
-            observation.assessment_time_ms,
-        )?;
+        // The absence-evidence seam is presented empty here, and that is the
+        // honest state rather than a placeholder: this plane carries per-source
+        // acquisition custody, not per-member query predicate results, so there
+        // is no record here that could be issued from. An owner-issued
+        // `NoMatchEvaluation` needs a query/evaluator owner that ran the predicate
+        // per member and named the result identities, and no such route exists in
+        // this repository — building one is a second query engine, which this
+        // issue forbids. Presenting `None` keeps the receipt fail-closed: the
+        // verdict stays `Unproven`, the denominator stays `Unknown` and the
+        // receipt retains `absence_evidence_digest = None` naming exactly what is
+        // missing. #2893 item 11 requires precisely this and forbids fabricating
+        // a record to make the receipt look complete. The evaluator route that
+        // will fill it is BLOCKED-BY #1762/#1767.
+        let absence_evidence: Option<AbsenceEvidence> = None;
+        let coverage_receipt = CoverageReceipt::compute(CoverageReceiptParams {
+            profile: &profile,
+            requested_scope: &observation.scope,
+            frozen_scope_digest: &observation.reference_manifest.digest,
+            account: &account,
+            records: &admissibility,
+            absence_evidence: absence_evidence.as_ref(),
+            routes_used: observation.admissible_routes.clone(),
+            provider_degradation: degradation.provider_degradation,
+            unknown_coverage: degradation.unknown_coverage,
+            budget_limitation: degradation.budget_limitation,
+            assessment_time_ms: observation.assessment_time_ms,
+        })?;
         let precision = EvidenceSetPrecision::evaluate(
             &observation.inquiry_id,
             observation.reference_manifest.allowed_anchor_precision,
