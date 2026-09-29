@@ -2560,7 +2560,7 @@ impl KernelComposition {
             return successor_not_observed_reply(idempotency_key);
         }
         if stored.identity.identity_digest != successor.predecessor_identity_digest
-            || stored.identity.archive_sha256 != report.archive_sha256
+            || !owner_reproves_predecessor_operation(report, &stored)
         {
             return successor_not_observed_reply(idempotency_key);
         }
