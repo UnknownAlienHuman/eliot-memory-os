@@ -89,10 +89,10 @@ fn host_launch_observe_terminal(code: &str) {
 
 /// One nonce-free current-user Host supervisor retained in a fresh kill-on-close Job.
 ///
-/// This launcher admits only UserMode and PortableDev, retains the exact
+/// This launcher admits only `UserMode` and `PortableDev`, retains the exact
 /// descriptor-selected roots and Host executable, and never routes through
 /// SCM. The same bounded owner is used for the pending Phase-A Host handoff
-/// and a live PortableDev repository-local supervisor.
+/// and a live `PortableDev` repository-local supervisor.
 #[cfg(windows)]
 pub struct ProfileSupervisorJob {
     child: RunningJobChild<PlatformHandle>,
@@ -108,7 +108,7 @@ pub struct ProfileSupervisorJob {
 impl ProfileSupervisorJob {
     /// Starts one approved profile Host in a fresh kill-on-close Job.
     ///
-    /// original_selection must be the durable selection receipt captured for
+    /// `original_selection` must be the durable selection receipt captured for
     /// the activation. The fresh descriptor-derived selection may differ in
     /// session and Phase-B digest only; installation, owner, roles, paths, and
     /// file identities must still match that retained receipt.
@@ -433,7 +433,7 @@ impl ProfileSupervisorJob {
     /// Stops the complete fresh Job and returns its exact terminal process receipt.
     ///
     /// The method is consuming and the adapter uses bounded terminate/reap;
-    /// the caller must not start the UserMode Task until this returns Ok.
+    /// the caller must not start the `UserMode` Task until this returns Ok.
     ///
     /// # Errors
     /// Returns an error when the retained roots/image changed or Job shutdown

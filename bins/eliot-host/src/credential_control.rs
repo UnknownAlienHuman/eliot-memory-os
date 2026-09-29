@@ -420,7 +420,7 @@ impl HostCredentialControl {
     /// exact selected current-user principal and profile-disjoint endpoint.
     pub(super) fn new_for_profile(
         host_epoch: HostInstallationEpoch,
-        launch: RuntimeLaunchDescriptor,
+        launch: &RuntimeLaunchDescriptor,
         selected_roots: Option<ProfileSelectionReceipt>,
         capability: Option<HostCredentialMutationCapability>,
         expected_transaction_id: PlatformHandle,
