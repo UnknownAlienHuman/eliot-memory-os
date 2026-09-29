@@ -42,6 +42,8 @@
 //! handling, no second archive format, no concrete Surreal/Host/Watchdog
 //! binary dependency.
 
+use std::collections::BTreeSet;
+
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupClass, BackupError, CanonicalRecord, ExportFence,
     HostStateAuditFence, OrsSnapshotFence, WatchdogSpoolFence, suspended_recovery_entries,
@@ -487,6 +489,8 @@ pub const MEMBER_DOMAIN_ORS_CUTOVER: &str = "ors_cutover:";
 pub const MEMBER_DOMAIN_WATCHDOG_SIGNAL: &str = "watchdog_signal:";
 /// Forensic Host audit obligation domain; never active authority.
 pub const MEMBER_DOMAIN_HOST_AUDIT: &str = "host_audit:";
+/// Canonical projection obligation domain.
+pub const MEMBER_DOMAIN_PROJECTION: &str = "projection:";
 
 /// The blob owner's own residency-key digest for one carried sealed envelope.
 ///
@@ -606,6 +610,31 @@ pub fn owner_fence_dispositions(
         }
     }
     Ok(dispositions)
+}
+
+/// Validates member identity uniqueness across the complete disposition set.
+///
+/// Identity is the obligation-domain-qualified member key; the disposition is
+/// its state, not part of its identity. Counting `(key, disposition)` pairs
+/// would let one member appear twice under different labels and falsely pass
+/// the denominator. The archive validator owns canonical reference closure;
+/// this check ensures that the coordinator's carried and owner-declared
+/// dispositions form one unambiguous identity set around that validated
+/// archive.
+pub fn validate_disposition_identities(
+    dispositions: &[(String, String)],
+) -> Result<(), KernelCaptureError> {
+    let mut identities = BTreeSet::new();
+    for (identity, disposition) in dispositions {
+        non_blank(identity, "capture.member_identity")?;
+        non_blank(disposition, "capture.member_disposition")?;
+        if !identities.insert(identity.as_str()) {
+            return Err(KernelCaptureError::DenominatorIncomplete(format!(
+                "member {identity} has more than one disposition"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One immutable verified archive bound to its single publication operation:
