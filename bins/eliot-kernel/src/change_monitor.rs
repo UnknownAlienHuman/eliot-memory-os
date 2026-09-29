@@ -384,15 +384,21 @@ pub(crate) fn confirm_hint(
         return Err(ChangeMonitorError::UnstableReadback);
     }
     let mut ledger = ledger()?;
-    let entry = ledger
+    if let Some(confirmed) = ledger
         .hints
-        .get_mut(hint_id)
-        .ok_or(ChangeMonitorError::UnknownHint)?;
-    if let Some(confirmed) = entry.confirmation.clone() {
+        .get(hint_id)
+        .ok_or(ChangeMonitorError::UnknownHint)?
+        .confirmation
+        .clone()
+    {
         return Ok(confirmed);
     }
     let after_digest = verification.reread.digest().map(str::to_owned);
     if verification.before_digest.as_deref() == after_digest.as_deref() {
+        let entry = ledger
+            .hints
+            .get_mut(hint_id)
+            .ok_or(ChangeMonitorError::UnknownHint)?;
         entry.confirmation = Some(HintConfirmation::VerifiedImmaterial);
         return Ok(HintConfirmation::VerifiedImmaterial);
     }
@@ -402,11 +408,22 @@ pub(crate) fn confirm_hint(
         after_digest.as_deref().unwrap_or("absent")
     );
     let change_id = format!("cmu:{hint_id}:{}", crate::sha256_hex(transition_preimage.as_bytes()));
-    let resource = entry.hint.resource.clone();
+    let resource = ledger
+        .hints
+        .get(hint_id)
+        .ok_or(ChangeMonitorError::UnknownHint)?
+        .hint
+        .resource
+        .clone();
     let reconciled = ledger
         .governed
         .values()
         .any(|record| record.resource == resource && record.after_digest == after_digest);
+    let evidence_id = ledger
+        .governed
+        .iter()
+        .find(|(_, record)| record.resource == resource && record.after_digest == after_digest)
+        .map(|(evidence_id, _)| evidence_id.clone());
     ledger
         .unknown
         .entry(change_id.clone())
@@ -417,16 +434,17 @@ pub(crate) fn confirm_hint(
             reconciled,
         });
     if reconciled {
-        if let Some((evidence_id, _)) = ledger.governed.iter().find(|(_, record)| {
-            record.resource == resource && record.after_digest == after_digest
-        }) {
-            let evidence_id = evidence_id.clone();
+        if let Some(evidence_id) = evidence_id {
             ledger.reconciliations.push(UnknownReconciliation {
                 unknown_change_id: change_id.clone(),
                 evidence_change_id: evidence_id,
             });
         }
     }
+    let entry = ledger
+        .hints
+        .get_mut(hint_id)
+        .ok_or(ChangeMonitorError::UnknownHint)?;
     entry.confirmation = Some(HintConfirmation::MaterialRecorded {
         change_id: change_id.clone(),
         reconciled,
