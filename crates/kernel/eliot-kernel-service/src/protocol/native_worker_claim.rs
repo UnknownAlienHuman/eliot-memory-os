@@ -44,6 +44,7 @@
 use eliot_contracts::{
     CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_store_api::EffectClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -307,6 +308,292 @@ impl NativeWorkerExecutableBinding {
             });
         }
         Ok(())
+    }
+}
+
+/// Closed Kernel-side mirror of the complete Governor owner publication
+/// record. It preserves the Governor field set and digest domain without a
+/// C1 → C4 dependency; its validator follows the Governor v1 validator
+/// byte-for-byte for the original `binding_digest` preimage.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerExecutableBindingPublication {
+    pub claim_id: String,
+    pub registration_id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub work_scope_id: String,
+    pub attempt: u32,
+    pub lease_id: String,
+    pub operation_id: String,
+    pub canonical_request_hash: String,
+    pub installation_id: String,
+    pub principal_id: String,
+    pub session_id: String,
+    pub worker_generation: u64,
+    pub process_tree_id: String,
+    pub process_generation: u64,
+    pub process_fence: String,
+    pub route_ref: String,
+    pub adapter_id: String,
+    pub adapter_revision: u64,
+    pub artifact_digest: String,
+    pub config_digest: String,
+    pub protocol_digest: String,
+    pub command_ref: String,
+    pub facet_manifest_ref: String,
+    pub capability_cell: CapabilityCellId,
+    pub introduction_refs: Vec<String>,
+    pub supporting_grant_refs: Vec<String>,
+    pub grant_graph_revision: u64,
+    pub module_catalog_revision: u64,
+    pub effective_ceiling: EffectClass,
+    pub credential_refs: Vec<String>,
+    pub resource_refs: Vec<String>,
+    pub replay_stream_id: String,
+    pub launch_nonce: String,
+    pub process_invocation_digest: String,
+    pub state_fence: StateFence,
+    pub authority_epoch: EpochId,
+    pub generation: ResourceGeneration,
+    pub deadline_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub plan_id: String,
+    pub plan_revision: String,
+    pub task_revision: u64,
+    pub config_snapshot_digest: String,
+    pub admission_revision_ref: String,
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub binding_digest: String,
+}
+
+impl NativeWorkerExecutableBindingPublication {
+    /// Governor v1 record wire identity.
+    pub const WIRE_ID: &'static str = "eliot.governor.native-worker-executable-binding";
+    /// Governor v1 record wire revision.
+    pub const WIRE_VERSION: u16 = 1;
+
+    /// Validates the closed full record and the original Governor digest.
+    pub fn validate_original_binding(&self) -> Result<(), KernelServiceError> {
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.wire",
+                reason: "unsupported Governor binding wire",
+            });
+        }
+        for (value, field) in [
+            (&self.claim_id, "claim_id"),
+            (&self.registration_id, "registration_id"),
+            (&self.task_id, "task_id"),
+            (&self.work_unit_id, "work_unit_id"),
+            (&self.work_scope_id, "work_scope_id"),
+            (&self.lease_id, "lease_id"),
+            (&self.operation_id, "operation_id"),
+            (&self.installation_id, "installation_id"),
+            (&self.principal_id, "principal_id"),
+            (&self.session_id, "session_id"),
+            (&self.process_tree_id, "process_tree_id"),
+            (&self.process_fence, "process_fence"),
+            (&self.route_ref, "route_ref"),
+            (&self.adapter_id, "adapter_id"),
+            (&self.command_ref, "command_ref"),
+            (&self.facet_manifest_ref, "facet_manifest_ref"),
+            (&self.replay_stream_id, "replay_stream_id"),
+            (&self.plan_id, "plan_id"),
+            (&self.plan_revision, "plan_revision"),
+            (&self.admission_revision_ref, "admission_revision_ref"),
+        ] {
+            validate_wire_text(value, "native_worker_executable_binding_publication.text")
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "native_worker_executable_binding_publication.text",
+                    reason: field,
+                })?;
+        }
+        for (value, field) in [
+            (&self.canonical_request_hash, "canonical_request_hash"),
+            (&self.artifact_digest, "artifact_digest"),
+            (&self.config_digest, "config_digest"),
+            (&self.protocol_digest, "protocol_digest"),
+            (&self.process_invocation_digest, "process_invocation_digest"),
+            (&self.config_snapshot_digest, "config_snapshot_digest"),
+            (&self.binding_digest, "binding_digest"),
+        ] {
+            validate_wire_digest(value, "native_worker_executable_binding_publication.digest")
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "native_worker_executable_binding_publication.digest",
+                    reason: field,
+                })?;
+        }
+        validate_wire_text(
+            &self.launch_nonce,
+            "native_worker_executable_binding_publication.launch_nonce",
+        )?;
+        if !(16..=256).contains(&self.launch_nonce.len()) {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.launch_nonce",
+                reason: "launch nonce must be 16..=256 characters",
+            });
+        }
+        for values in [
+            &self.introduction_refs,
+            &self.supporting_grant_refs,
+            &self.credential_refs,
+            &self.resource_refs,
+        ] {
+            if values.len() > 64 {
+                return Err(KernelServiceError::InvalidField {
+                    field: "native_worker_executable_binding_publication.references",
+                    reason: "reference list exceeds bound",
+                });
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for value in values {
+                validate_wire_text(
+                    value,
+                    "native_worker_executable_binding_publication.reference",
+                )?;
+                if !seen.insert(value) {
+                    return Err(KernelServiceError::InvalidField {
+                        field: "native_worker_executable_binding_publication.references",
+                        reason: "reference list contains duplicates",
+                    });
+                }
+            }
+        }
+        if self.worker_generation == 0
+            || self.process_generation == 0
+            || self.adapter_revision == 0
+            || self.grant_graph_revision == 0
+            || self.module_catalog_revision == 0
+            || self.task_revision == 0
+            || self.deadline_unix_ms == 0
+            || self.expires_at_unix_ms <= self.deadline_unix_ms
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.bounds",
+                reason: "revisions, generation, and deadline window are invalid",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::HandshakeMismatch {
+                field: "native_worker_executable_binding_publication.state_fence",
+            })?;
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+            || self.generation != self.state_fence.resource_generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_executable_binding_publication.fence_binding",
+            });
+        }
+        if self.compute_original_binding_digest()? != self.binding_digest {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.binding_digest",
+                reason: "original Governor binding digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Recomputes the Governor v1 digest only to validate its original
+    /// `binding_digest` field; callers persist and compare that original value.
+    pub fn compute_original_binding_digest(&self) -> Result<String, KernelServiceError> {
+        let mut value =
+            serde_json::to_value(self).map_err(|_| KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication",
+                reason: "record cannot be encoded",
+            })?;
+        value
+            .as_object_mut()
+            .ok_or(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication",
+                reason: "record must encode as an object",
+            })?
+            .remove("binding_digest");
+        let bytes = canonical_json_bytes(&value).map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_executable_binding_publication",
+            reason: "record cannot be canonicalized",
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Returns the exact canonical JSON retained by the ORS claim row.
+    pub fn canonical_record_json(&self) -> Result<String, KernelServiceError> {
+        let value = serde_json::to_value(self).map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_executable_binding_publication",
+            reason: "record cannot be encoded",
+        })?;
+        let bytes = canonical_json_bytes(&value).map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_executable_binding_publication",
+            reason: "record cannot be canonicalized",
+        })?;
+        String::from_utf8(bytes).map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_executable_binding_publication",
+            reason: "canonical record is not UTF-8",
+        })
+    }
+
+    /// Projects only identity, currentness, epoch and fence fields required
+    /// by Kernel/ORS. The original digest remains untouched.
+    pub fn to_ors_projection(&self) -> eliot_ors::NativeWorkerClaimExecutableBindingProjection {
+        eliot_ors::NativeWorkerClaimExecutableBindingProjection {
+            claim_id: self.claim_id.clone(),
+            registration_id: self.registration_id.clone(),
+            task_id: self.task_id.clone(),
+            work_scope_id: self.work_scope_id.clone(),
+            attempt: self.attempt,
+            operation_id: self.operation_id.clone(),
+            worker_generation: self.worker_generation,
+            session_id: self.session_id.clone(),
+            route_ref: self.route_ref.clone(),
+            adapter_id: self.adapter_id.clone(),
+            adapter_revision: self.adapter_revision,
+            config_digest: self.config_digest.clone(),
+            facet_manifest_ref: self.facet_manifest_ref.clone(),
+            capability_cell: self.capability_cell.clone(),
+            grant_graph_revision: self.grant_graph_revision,
+            module_catalog_revision: self.module_catalog_revision,
+            replay_stream_id: self.replay_stream_id.clone(),
+            launch_nonce: self.launch_nonce.clone(),
+            process_invocation_digest: self.process_invocation_digest.clone(),
+            authority_epoch: self.authority_epoch.clone(),
+            generation: self.generation,
+            state_fence: self.state_fence.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+            executable_wire_version: self.wire_version,
+            executable_binding_digest: self.binding_digest.clone(),
+        }
+    }
+
+    /// Builds the reduced Kernel expectation from the full Governor record.
+    pub fn to_kernel_expectation(&self) -> NativeWorkerExecutableExpectation {
+        NativeWorkerExecutableExpectation {
+            current: NativeWorkerExecutableBinding {
+                route_ref: self.route_ref.clone(),
+                adapter_id: self.adapter_id.clone(),
+                adapter_revision: self.adapter_revision,
+                config_digest: self.config_digest.clone(),
+                facet_manifest_ref: self.facet_manifest_ref.clone(),
+                capability_cell: self.capability_cell.clone(),
+                grant_graph_revision: self.grant_graph_revision,
+                module_catalog_revision: self.module_catalog_revision,
+                replay_stream_id: self.replay_stream_id.clone(),
+                launch_nonce: self.launch_nonce.clone(),
+                process_invocation_digest: self.process_invocation_digest.clone(),
+                authority_epoch: self.authority_epoch.clone(),
+                generation: self.generation,
+                state_fence: self.state_fence.clone(),
+                deadline_unix_ms: self.deadline_unix_ms,
+                expires_at_unix_ms: self.expires_at_unix_ms,
+                executable_wire_version: self.wire_version,
+                executable_binding_digest: self.binding_digest.clone(),
+            },
+            revoked: false,
+        }
     }
 }
 

@@ -44,9 +44,10 @@
 //! `UnknownRequest`; an elapsed absolute deadline is `Timeout`.
 
 use super::{
-    KernelComposition, KernelFrameAction, KernelServiceState, ProcessExecutionRequest,
-    caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
-    status_frame, unix_ms,
+    ACTIVE_DAEMON_CALLER, KernelComposition, KernelFrameAction, KernelServiceState,
+    ProcessExecutionRequest, caller_binding,
+    native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json, status_frame,
+    unix_ms,
 };
 use eliot_contracts::{CapabilityCellId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
@@ -55,9 +56,13 @@ use eliot_kernel_service::{
     NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
-    NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
+    NativeWorkerExecutableBinding, NativeWorkerExecutableBindingPublication,
+    NativeWorkerExecutableExpectation,
 };
-use eliot_ors::{NativeWorkerClaimRecord, NativeWorkerClaimState, OperationIdentity, OrsError};
+use eliot_ors::{
+    NativeWorkerClaimExecutableBindingProjection, NativeWorkerClaimRecord, NativeWorkerClaimState,
+    OperationIdentity, OrsError,
+};
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde::Serialize;
@@ -80,9 +85,15 @@ pub(crate) const NATIVE_WORKER_CHECKPOINT_OPERATION: &str = "native_worker.check
 pub(crate) const NATIVE_WORKER_RESULT_SUBMIT_OPERATION: &str = "native_worker.result_submit";
 /// Observes cancellation for one exact attempt and fences it.
 pub(crate) const NATIVE_WORKER_CANCEL_OBSERVE_OPERATION: &str = "native_worker.cancel_observe";
+/// Publishes one full Governor executable binding onto its existing ORS claim.
+pub(crate) const NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION: &str =
+    "native_worker.executable_binding.publish";
+/// Reads one previously published full Governor binding from its ORS claim.
+pub(crate) const NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION: &str =
+    "native_worker.executable_binding.read";
 
-/// Returns true for the eight native-worker operations (seven lifecycle
-/// operations owned here plus reconciliation owned by the sibling
+/// Returns true for the ten native-worker operations (nine operations owned
+/// here plus reconciliation owned by the sibling
 /// `native_worker_reconcile_route` module).
 ///
 /// Paired with the worker-side operation constants in
@@ -98,6 +109,8 @@ pub(crate) fn is_native_worker_operation(operation: &str) -> bool {
             | NATIVE_WORKER_CHECKPOINT_OPERATION
             | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
+            | NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION
+            | NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION
             | NATIVE_WORKER_RECONCILE_OPERATION
     )
 }
@@ -745,6 +758,7 @@ fn native_worker_operation_requires_watchdog(operation: &str) -> bool {
             | NATIVE_WORKER_CLAIM_OPERATION
             | NATIVE_WORKER_READY_OPERATION
             | NATIVE_WORKER_CHECKPOINT_OPERATION
+            | NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION
     )
 }
 
@@ -758,6 +772,7 @@ fn native_worker_operation_allows_degraded(operation: &str, payload: &serde_json
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
             | NATIVE_WORKER_RECONCILE_OPERATION
             | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
+            | NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION
     ) {
         return true;
     }
@@ -852,6 +867,15 @@ impl KernelComposition {
             });
         }
         let receipt = match operation {
+            NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION => self
+                .handle_native_worker_executable_binding_publish(
+                    session,
+                    &identity_value,
+                    &payload,
+                ),
+            NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION => {
+                self.handle_native_worker_executable_binding_readback(session, &payload)
+            }
             NATIVE_WORKER_REGISTRATION_OPERATION => {
                 self.handle_native_worker_registration(&identity_value, &payload)
             }
@@ -1675,33 +1699,64 @@ impl KernelComposition {
             })?;
         let service = self.service_guard()?;
         let live_epoch = service.authority_epoch();
+        let durable_claim_id = OperationIdentity::new(request.claim_id.as_str())
+            .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?;
+        let durable_claim = self
+            .generation_gateway
+            .ors
+            .load_native_worker_claim(&durable_claim_id)
+            .map_err(|_| NativeWorkerRouteError::Fence { field: "ors_load" })?;
+        let owner_binding = durable_claim
+            .as_ref()
+            .and_then(|record| record.executable_binding_record_json.as_deref())
+            .map(|record_json| {
+                let binding: NativeWorkerExecutableBindingPublication =
+                    serde_json::from_str(record_json).map_err(|_| {
+                        NativeWorkerRouteError::Shape {
+                            field: "executable_binding_owner_record",
+                        }
+                    })?;
+                binding
+                    .validate_original_binding()
+                    .map_err(|_| NativeWorkerRouteError::Shape {
+                        field: "executable_binding_owner_record",
+                    })?;
+                Ok::<_, NativeWorkerRouteError>(binding)
+            })
+            .transpose()?;
+        let expectation = owner_binding
+            .as_ref()
+            .map(NativeWorkerExecutableBindingPublication::to_kernel_expectation);
+        if let Some(owner) = owner_binding.as_ref() {
+            let (capability_cell, module_catalog_revision) =
+                native_worker_catalog_binding(registration)?;
+            if owner.config_digest != require_digest(registration, "worker_config_digest")?
+                || owner.capability_cell != capability_cell
+                || owner.module_catalog_revision != module_catalog_revision
+                || owner.state_fence != registration_fence
+                || !owner.authority_epoch.is_same_authority(&live_epoch)
+            {
+                return Err(NativeWorkerRouteError::Fence {
+                    field: "executable_binding_owner_currentness",
+                });
+            }
+        }
         let decision = service
-            .admit_native_worker_claim(self.generation_gateway.ors.as_ref(), &request, now)
+            .admit_native_worker_claim_with_expectation(
+                self.generation_gateway.ors.as_ref(),
+                &request,
+                owner_binding.as_ref(),
+                expectation.as_ref(),
+                now,
+            )
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "service_state",
             })?;
-        // T9-02 executable enforcement (Implements #22): an `Admitted`
-        // decision carries no launch authority until the presented v2 join
-        // agrees with the current owner record built from the live
-        // registration, admission, activation, and epoch records above. A
-        // stale or old-wire binding is a typed reject here — `ADMITTED` is
-        // never emitted — while `Rejected`/`Conflict` decisions seal
-        // unchanged below.
-        if matches!(decision, NativeWorkerClaimResponse::Admitted(_)) {
-            let expectation = Self::build_executable_expectation(
-                request.executable_binding.as_ref(),
-                registration,
-                &registration_fence,
-                &live_epoch,
-            )?;
-            Self::enforce_claim_executable_binding(&request, &expectation, now)?;
-        }
-        // The sealed executable digest lets later reconcile observe the exact
-        // binding this admission sealed (kind `native_worker_claim` only).
-        let executable_echo = request
-            .executable_binding
+        // The sealed echo is sourced from the independently persisted
+        // Governor owner record, never copied from the worker presentation.
+        let executable_echo = owner_binding
             .as_ref()
-            .map(|join| join.executable_binding_digest.clone());
+            .map(|owner| owner.binding_digest.clone());
         let extra_echo: Vec<(&str, &str)> = match executable_echo.as_deref() {
             Some(digest) => vec![("executable_binding_digest", digest)],
             None => Vec::new(),
@@ -1714,6 +1769,254 @@ impl KernelComposition {
             &extra_echo,
             &decision,
         )
+    }
+
+    fn require_active_daemon_publisher(session: &Session) -> Result<(), NativeWorkerRouteError> {
+        let (owner, _) = caller_binding(session).map_err(|_| NativeWorkerRouteError::Fence {
+            field: "daemon_owner_session",
+        })?;
+        if owner.module_id() != ACTIVE_DAEMON_CALLER
+            || owner.generation().get() != session.module_generation.generation.value()
+            || !owner
+                .authority_epoch()
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "daemon_owner_session",
+            });
+        }
+        Ok(())
+    }
+
+    /// Publishes a complete Governor record onto the existing Requested ORS
+    /// row. A publication that races ahead of claim staging is not retained;
+    /// the owner must retry the identical claim/attempt/operation identity.
+    fn handle_native_worker_executable_binding_publish(
+        &self,
+        session: &Session,
+        identity: &serde_json::Value,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        Self::require_active_daemon_publisher(session)?;
+        let attempt_id = require_claim_text(payload, "attempt_id")?;
+        let binding_value = payload
+            .get("binding")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or(NativeWorkerRouteError::Shape { field: "binding" })?;
+        let binding: NativeWorkerExecutableBindingPublication =
+            serde_json::from_value(binding_value)
+                .map_err(|_| NativeWorkerRouteError::Shape { field: "binding" })?;
+        binding
+            .validate_original_binding()
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding.binding_digest",
+            })?;
+        Self::require_message_identity(identity, &binding.claim_id)?;
+        let claim_id = OperationIdentity::new(binding.claim_id.as_str()).map_err(|_| {
+            NativeWorkerRouteError::Shape {
+                field: "binding.claim_id",
+            }
+        })?;
+        let durable = self
+            .generation_gateway
+            .ors
+            .load_native_worker_claim(&claim_id)
+            .map_err(|_| NativeWorkerRouteError::Fence { field: "ors_load" })?;
+        let Some(durable) = durable else {
+            return Ok(serde_json::json!({
+                "kind": "native_worker_executable_binding_publication",
+                "status": "pending",
+                "claim_id": binding.claim_id,
+                "attempt_id": attempt_id,
+                "operation_id": binding.operation_id,
+            }));
+        };
+        let now = unix_ms();
+        if now == 0 || now >= binding.deadline_unix_ms {
+            return Err(NativeWorkerRouteError::ExpiredDeadline);
+        }
+        let state_fence_digest = canonical_json_bytes(&binding.state_fence)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding.state_fence",
+            })?;
+        #[derive(Serialize)]
+        struct ResourceEnvelope<'a> {
+            installation_id: &'a str,
+            worker_artifact_digest: &'a str,
+            worker_config_digest: &'a str,
+        }
+        let resource_envelope_digest = canonical_json_bytes(&ResourceEnvelope {
+            installation_id: &binding.installation_id,
+            worker_artifact_digest: &binding.artifact_digest,
+            worker_config_digest: &binding.config_digest,
+        })
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| NativeWorkerRouteError::Shape {
+            field: "binding.resource_envelope",
+        })?;
+        if attempt_id != durable.attempt_id.as_str()
+            || binding.registration_id != durable.registration_id.as_str()
+            || binding.task_id != durable.task_id.as_str()
+            || binding.work_scope_id != durable.work_scope_id.as_str()
+            || binding.operation_id != durable.operation_id.as_str()
+            || binding.worker_generation != durable.worker_generation
+            || binding.deadline_unix_ms != durable.deadline_unix_ms
+            || binding.authority_epoch.sequence.get() != durable.authority_epoch
+            || state_fence_digest != durable.fence_digest
+            || resource_envelope_digest != durable.resource_envelope_digest
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "binding.claim_owner_tuple",
+            });
+        }
+        let record_json =
+            binding
+                .canonical_record_json()
+                .map_err(|_| NativeWorkerRouteError::Shape {
+                    field: "binding.canonical_json",
+                })?;
+        let projection = binding.to_ors_projection();
+        let durable = self
+            .generation_gateway
+            .ors
+            .bind_native_worker_claim_executable_binding(&claim_id, &record_json, &projection)
+            .map_err(|error| match error {
+                OrsError::NativeWorkerClaimIdentityConflict { .. } => {
+                    NativeWorkerRouteError::Fence {
+                        field: "binding.owner_conflict",
+                    }
+                }
+                _ => NativeWorkerRouteError::Fence { field: "ors_bind" },
+            })?;
+        let Some(durable) = durable else {
+            return Ok(serde_json::json!({
+                "kind": "native_worker_executable_binding_publication",
+                "status": "pending",
+                "claim_id": binding.claim_id,
+                "attempt_id": attempt_id,
+                "operation_id": binding.operation_id,
+            }));
+        };
+        let projection = durable.executable_binding_projection.as_ref().ok_or(
+            NativeWorkerRouteError::Fence {
+                field: "binding.owner_readback",
+            },
+        )?;
+        let mut receipt = serde_json::json!({
+            "kind": "native_worker_executable_binding_receipt",
+            "wire_version": "eliot-kernel-native-worker-binding-publication/v1",
+            "claim_id": durable.claim_id.as_str(),
+            "registration_id": durable.registration_id.as_str(),
+            "attempt_id": durable.attempt_id.as_str(),
+            "operation_id": durable.operation_id.as_str(),
+            "worker_generation": durable.worker_generation,
+            "state_fence": &projection.state_fence,
+            "session_id": &projection.session_id,
+            "executable_binding_digest": durable.executable_binding_digest.as_deref(),
+        });
+        let receipt_digest = canonical_json_bytes(&receipt)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "binding.receipt",
+            })?;
+        receipt["receipt_digest"] = serde_json::Value::String(receipt_digest);
+        Ok(serde_json::json!({
+            "kind": "native_worker_executable_binding_publication",
+            "status": "published",
+            "receipt": receipt,
+        }))
+    }
+
+    /// Reads the full owner record only through the existing claim row. A
+    /// missing claim or an as-yet-unpublished binding returns Pending and
+    /// never creates durable state.
+    fn handle_native_worker_executable_binding_readback(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        Self::require_active_daemon_publisher(session)?;
+        let claim_id_text = require_op_id(payload, "claim_id")?;
+        let attempt_id = require_claim_text(payload, "attempt_id")?;
+        let operation_id = require_claim_text(payload, "operation_id")?;
+        let task_id = require_claim_text(payload, "task_id")?;
+        let claim_id = OperationIdentity::new(claim_id_text.as_str())
+            .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?;
+        let durable = self
+            .generation_gateway
+            .ors
+            .load_native_worker_claim(&claim_id)
+            .map_err(|_| NativeWorkerRouteError::Fence { field: "ors_load" })?;
+        let observed_at_unix_ms = unix_ms();
+        if observed_at_unix_ms == 0 {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "binding.observed_at_unix_ms",
+            });
+        }
+        let Some(durable) = durable else {
+            return Ok(serde_json::json!({
+                "kind": "native_worker_executable_binding_readback",
+                "status": "pending",
+                "claim_id": claim_id.as_str(),
+                "attempt_id": attempt_id,
+                "operation_id": operation_id,
+                "task_id": task_id,
+                "observed_at_unix_ms": observed_at_unix_ms,
+            }));
+        };
+        if durable.attempt_id.as_str() != attempt_id
+            || durable.operation_id.as_str() != operation_id
+            || durable.task_id.as_str() != task_id
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "binding.readback_identity",
+            });
+        }
+        let Some(record_json) = durable.executable_binding_record_json.as_deref() else {
+            return Ok(serde_json::json!({
+                "kind": "native_worker_executable_binding_readback",
+                "status": "pending",
+                "claim_id": claim_id.as_str(),
+                "attempt_id": attempt_id,
+                "operation_id": operation_id,
+                "task_id": task_id,
+                "observed_at_unix_ms": observed_at_unix_ms,
+            }));
+        };
+        let binding: NativeWorkerExecutableBindingPublication =
+            serde_json::from_str(record_json).map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding.readback_record",
+            })?;
+        binding
+            .validate_original_binding()
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding.readback_digest",
+            })?;
+        let projection: &NativeWorkerClaimExecutableBindingProjection = durable
+            .executable_binding_projection
+            .as_ref()
+            .ok_or(NativeWorkerRouteError::Fence {
+                field: "binding.readback_projection",
+            })?;
+        let binding_value: serde_json::Value =
+            serde_json::from_str(record_json).map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding.readback_record",
+            })?;
+        Ok(serde_json::json!({
+            "kind": "native_worker_executable_binding_readback",
+            "status": "found",
+            "claim_id": claim_id.as_str(),
+            "attempt_id": attempt_id,
+            "operation_id": operation_id,
+            "task_id": task_id,
+            "binding": binding_value,
+            "executable_binding_digest": durable.executable_binding_digest.as_deref(),
+            "executable_binding_projection": projection,
+            "claim_state": durable.state,
+            "observed_at_unix_ms": observed_at_unix_ms,
+        }))
     }
 
     /// Validates one ready-or-blocked submission against its admitted claim.

@@ -532,6 +532,9 @@ fn stage_persists_requested_row_with_real_store() {
         predecessor_revision: eliot_ors::OpaqueLabel::new(request.predecessor_revision.as_str())
             .expect("pred"),
         resource_envelope_digest,
+        executable_binding_digest: None,
+        executable_binding_record_json: None,
+        executable_binding_projection: None,
         state: NativeWorkerClaimState::Requested,
         receipt_digest: None,
         admitted_at_unix_ms: None,
