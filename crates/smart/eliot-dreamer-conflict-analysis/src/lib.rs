@@ -5069,6 +5069,21 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
             evidence.envelope.assertability
         ));
     }
+    // The derived assessment is committed as well as the inputs it is derived
+    // from: a preimage that binds the committed inputs but not the mapping they
+    // produce does not bind the mapping, so a changed derived state or derived
+    // coverage would otherwise keep one candidate identity. The published
+    // record's own fields are read here rather than re-derived, so this part
+    // cannot disagree with the `CausalClaimRecord` the analysis emits. #2870's
+    // versioned candidate preimage is the consumer that depends on this
+    // binding; it still has to read the published surfaces itself.
+    let derived = owner_causal_record(record);
+    parts.push(format!(
+        "causal_derived:{}:{}:{}",
+        derived.source_handle,
+        derived.effective_state.as_str(),
+        coverage_spelling(derived.coverage)
+    ));
     parts
 }
 
