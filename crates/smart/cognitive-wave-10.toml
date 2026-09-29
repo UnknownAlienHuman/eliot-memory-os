@@ -15,7 +15,7 @@ workspace_rule = "This catalogue is metadata only. It creates no crate, changes 
 authority_rule = "No row here owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
 dependency_rule = "depends_on lists logical contract prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
 order_rule = "No order is created, renumbered or reused by this catalogue. Every [[assignment]] order and every [[assignment_ref]] order below is a value already measured in crates/smart/cognitive-crate-decisions.toml (orders 1-43), crates/smart/cognitive-wave-09.toml (orders 76-86), or a [package.metadata.eliot] agent_order read from the crate's own Cargo.toml."
-label_resolution_rule = "The Issue #262 body names ten crate labels. Six of them (eliot-dreamer-validation, eliot-dreamer-memory-models, eliot-dreamer-procedural, eliot-dreamer-diagnosis, eliot-dreamer-planning, and by extension any function-only package) do not name a physical crate on base cdf4a29. Each such label is resolved to the measured owning crate or crates in [[label_resolution]] and is never realized as a new crate."
+label_resolution_rule = "The Issue #262 body names ten crate labels. Five of them (eliot-dreamer-validation, eliot-dreamer-memory-models, eliot-dreamer-procedural, eliot-dreamer-diagnosis, eliot-dreamer-planning) name no physical crate on base cdf4a29, and [[label_resolution]] carries exactly five physical_crate_found = false rows against exactly five physical_crate_found = true rows. Each unresolved label is resolved to the measured owning crate or crates in [[label_resolution]] and is never realized as a new crate."
 freeze_binding_rule = "crates/smart/cognitive-rev12-contract-schema-freeze.toml is NOT edited by this catalogue. Its exact bytes are pinned by REQUIRED_FREEZE_DIGEST over FREEZE_BYTES in crates/smart/eliot-dreamer-memory-revision/src/lib.rs, enforced by verify_freeze_binding() which propose() calls, and re-read by scripts/read_freeze_digest.py against the CC-W9-REV12-HANDOFF recorded digest and recorded byte length. Per that file's own [readback].rule a byte change is a new freeze candidate, not an edit. Promotion of this index into the freeze is the recorded CC-W2-FREEZE-REPIN handoff."
 disjointness_rule = "This catalogue does not modify bins/, 233 memory-curation/dreamer-cycle files, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, generated indexes, or any other wave file."
 
@@ -749,7 +749,8 @@ consumers = ["dispatch composition owner (candidate only)"]
 [[ownership]]
 public_type = "ProbePlan"
 rust_owner = "eliot-dreamer-probe-plan"
-defining_symbol = "crates/smart/eliot-dreamer-probe-plan/src/lib.rs::ProbePlan"
+defining_symbol = "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbePlan"
+consumer_boundary = "crates/smart/eliot-dreamer-probe-plan/src/lib.rs re-exports ProbePlan from the model module; that re-export is a consumer boundary, not a second owner"
 contract_index = "PlanningCandidateContract"
 functional_cells = ["smart.dreamer.probe_plan"]
 manifest = "crates/smart/eliot-dreamer-probe-plan/module.toml"
@@ -806,6 +807,7 @@ provenance_privacy = "the retained report keeps the exact supplied material, so 
 validation_error = "DreamDraftValidationError; the RejectionCode enum is the semantic reason and stays separate from it"
 compatibility = "adding a variant is a breaking wire change under deny_unknown_fields"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-candidate-validation/src/error.rs::CandidateValidationOutcome"]
 
 [[type_contract]]
 id = "VAL-02"
@@ -824,6 +826,7 @@ provenance_privacy = "detail is bounded diagnostic text and never model authorit
 validation_error = "RejectionCode"
 compatibility = "detail is free text and bounded but not schema-validated; treat its wording as non-contractual"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-candidate-validation/src/error.rs::CandidateRejectionReport"]
 
 [[type_contract]]
 id = "VAL-03"
@@ -842,6 +845,7 @@ provenance_privacy = "not applicable"
 validation_error = "this enum IS the machine-readable rejection class"
 compatibility = "adding a variant breaks every pinned consumer under deny_unknown_fields"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-candidate-validation/src/error.rs::RejectionCode"]
 
 [[type_contract]]
 id = "VAL-04"
@@ -860,6 +864,7 @@ provenance_privacy = "the full supplied A-14b/A-05 carrier is retained without n
 validation_error = "RejectionCode, shared with VAL-03"
 compatibility = "the accepted payload type is owned by eliot-dreamer-contracts, so this row is a consumer boundary, not a second owner"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs::StructuredCandidateValidationOutcome", "crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs::StructuredCandidateRejectionReport"]
 
 [[type_contract]]
 id = "ORI-01"
@@ -878,6 +883,7 @@ provenance_privacy = "privacy_profile and requester_session are carried explicit
 validation_error = "OrientationError from OrientationResult; OrientationDisposition is the terminal class"
 compatibility = "the I9.5 name DreamPacket exists only as a doc comment; there is no typed DreamPacket symbol"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationPacketCandidate"]
 
 [[type_contract]]
 id = "ORI-02"
@@ -896,6 +902,7 @@ provenance_privacy = "not applicable"
 validation_error = "not applicable; a section is validated by digest recomputation"
 compatibility = "adding a section kind is a breaking change for a pinned consumer"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationSectionKind", "crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationSection"]
 
 [[type_contract]]
 id = "ORI-03"
@@ -914,6 +921,7 @@ provenance_privacy = "not applicable"
 validation_error = "not applicable"
 compatibility = "the kind and status discriminants are free String, so an implementation agent can still invent values; this is an open gap, not a closed class"
 disposition = "missing_contract_decision"
+symbol_source = ["crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationResidue", "crates/smart/eliot-dreamer-orientation/src/projection.rs::InertProbe"]
 
 [[type_contract]]
 id = "ORI-04"
@@ -933,6 +941,7 @@ provenance_privacy = "not applicable"
 validation_error = "OrientationError with validate_material and validate_for gates"
 compatibility = "ValidatedOrientationCandidate is a re-exported alias, so the validation owner is the alias source, not this row"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-orientation/src/result.rs::OrientationDisposition", "crates/smart/eliot-dreamer-orientation/src/result.rs::OrientationResult", "crates/smart/eliot-dreamer-orientation/src/input.rs::AdmittedOrientationJob", "crates/smart/eliot-dreamer-orientation/src/input.rs::OrientationCoverageDenominator", "crates/smart/eliot-dreamer-orientation/src/policy.rs::OrientationPolicy", "crates/smart/eliot-dreamer-orientation/src/input.rs::LocalOrientationFrame", "crates/smart/eliot-dreamer-orientation/src/input.rs::CurrentEpistemicPositionHandle"]
 
 [[type_contract]]
 id = "SQ-01"
@@ -951,6 +960,7 @@ provenance_privacy = "cited preserves which sources were checked and authorizes 
 validation_error = "SelfQueryContractError from pose_self_query, pose_with_sources, revalidate and check_citations"
 compatibility = "the receipt is a projection over an owner type; the owner is eliot-dreamer-contracts, not this crate"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-self-query/src/lib.rs::SelfQueryPoseReceipt"]
 
 [[type_contract]]
 id = "SQ-02"
@@ -969,6 +979,7 @@ provenance_privacy = "not applicable"
 validation_error = "SelfQueryContractError from check_citations"
 compatibility = "exact-triple match only; there is no similarity fallback"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-self-query/src/lib.rs::CitedSource"]
 
 [[type_contract]]
 id = "SQ-03"
@@ -987,6 +998,7 @@ provenance_privacy = "not applicable"
 validation_error = "no runtime check; verify_freeze_binding lives in eliot-dreamer-memory-revision, not here"
 compatibility = "a freeze revision bump makes this string stale; it is covered by CC-W2-CONSUMER-REPIN"
 disposition = "corrected_static_description"
+symbol_source = ["crates/smart/eliot-dreamer-self-query/src/lib.rs::FREEZE_ID", "crates/smart/eliot-dreamer-self-query/src/lib.rs::OWNER_CONTRACT"]
 
 [[type_contract]]
 id = "RS-01"
@@ -1005,6 +1017,7 @@ provenance_privacy = "dependence carries source dependence by canonical lineage;
 validation_error = "SynthesisError from synthesize"
 compatibility = "no wire compatibility rule can be stated for a shape with no wire form; the absence is the recorded fact"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ResearchBrief"]
 
 [[type_contract]]
 id = "RS-02"
@@ -1023,6 +1036,7 @@ provenance_privacy = "manifest_digest is the allowed-reference manifest; a refer
 validation_error = "SynthesisError"
 compatibility = "researcher acquires, Dreamer interprets, Governor governs; this crate interprets only"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisRequest", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ResearchPack", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::GroundedDraft", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::InputReceipt", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisPolicy", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisBounds", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::CancellationView", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::JobBinding"]
 
 [[type_contract]]
 id = "RS-03"
@@ -1041,6 +1055,7 @@ provenance_privacy = "RequesterOrigin is the closed I9.4 requester set"
 validation_error = "SynthesisError"
 compatibility = "variant additions are breaking in the absence of a wire boundary only at the Rust source level"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-research-synthesis/src/model.rs::Freshness", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::Precision", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::PrecisionKind", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ClaimKind", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ClaimDisposition", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisDisposition", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::PreservationDimension", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::DenominatorKind", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::CounterSearchStatus", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SourceAuthority", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::RivalStance", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ProbeResidueReason", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::OmissionKind", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ProbeBasis", "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::RequesterOrigin"]
 
 [[type_contract]]
 id = "RS-04"
@@ -1060,6 +1075,7 @@ provenance_privacy = "redact_value and DIAGNOSTIC_VALUE_PREFIX keep diagnostic t
 validation_error = "SynthesisError"
 compatibility = "the agent_order = 6 recorded in this crate's own Cargo metadata collides with eliot-dreamer-orientation and has no cognitive-crate-decisions row; recorded, not repaired"
 disposition = "corrected_static_description"
+symbol_source = []
 
 [[type_contract]]
 id = "MM-01"
@@ -1079,6 +1095,7 @@ provenance_privacy = "EvidenceTrace and EvidenceGradeBinding carry the evidence 
 validation_error = "owned by the defining module"
 compatibility = "adding an outcome variant is breaking for a pinned consumer"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-classification/src/result.rs::ClassificationResult", "crates/smart/eliot-dreamer-classification/src/result.rs::ClassificationDisposition", "crates/smart/eliot-dreamer-classification/src/selection.rs::CriterionResolution", "crates/smart/eliot-dreamer-classification/src/selection.rs::SelectionReport", "crates/smart/eliot-dreamer-classification/src/selection.rs::AlternativeTrace", "crates/smart/eliot-dreamer-classification/src/result.rs::ClassificationConflict", "crates/smart/eliot-dreamer-classification/src/evidence.rs::EvidenceTrace", "crates/smart/eliot-dreamer-classification/src/policy.rs::EvidenceGradeBinding", "crates/smart/eliot-dreamer-classification/src/policy.rs::ClassificationPolicy", "crates/smart/eliot-dreamer-classification/src/policy.rs::BudgetReceipt", "crates/smart/eliot-dreamer-classification/src/evidence.rs::EvidenceQuality"]
 
 [[type_contract]]
 id = "MM-02"
@@ -1098,6 +1115,7 @@ provenance_privacy = "GroundedRelationDraft is re-exported from draft and is not
 validation_error = "owned by the defining module"
 compatibility = "adding an outcome variant is breaking for a pinned consumer"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-relation/src/result.rs::RelationResult", "crates/smart/eliot-dreamer-relation/src/selection.rs::Selection", "crates/smart/eliot-dreamer-relation/src/policy.rs::EvidenceBinding", "crates/smart/eliot-dreamer-relation/src/policy.rs::EvidenceBindingKind", "crates/smart/eliot-dreamer-relation/src/policy.rs::CausalMaterialBinding", "crates/smart/eliot-dreamer-relation/src/policy.rs::CausalPredicateBinding", "crates/smart/eliot-dreamer-relation/src/policy.rs::PathRef", "crates/smart/eliot-dreamer-relation/src/policy.rs::RelationPolicy", "crates/smart/eliot-dreamer-relation/src/policy.rs::EvidenceGradeBinding", "crates/smart/eliot-dreamer-relation/src/draft.rs::GroundedRelationDraft"]
 
 [[type_contract]]
 id = "MM-03"
@@ -1117,6 +1135,7 @@ provenance_privacy = "MaterialPreimage is the immutable pre-transformation mater
 validation_error = "owned by the defining module"
 compatibility = "adding an outcome variant is breaking for a pinned consumer"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeCandidate", "crates/smart/eliot-dreamer-episode/src/input.rs::EpisodeOutcome", "crates/smart/eliot-dreamer-episode/src/result.rs::ChronologyLink", "crates/smart/eliot-dreamer-episode/src/result.rs::ChronologyRelation", "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeBoundary", "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeGap", "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeCoverage", "crates/smart/eliot-dreamer-episode/src/result.rs::OverlapAssessment", "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeRollback", "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeStatus", "crates/smart/eliot-dreamer-episode/src/input.rs::BoundaryRule", "crates/smart/eliot-dreamer-episode/src/input.rs::OverlapRule", "crates/smart/eliot-dreamer-episode/src/result.rs::OverlapDisposition", "crates/smart/eliot-dreamer-episode/src/input.rs::GroundedEventSet", "crates/smart/eliot-dreamer-episode/src/input.rs::GroundedEvent", "crates/smart/eliot-dreamer-episode/src/input.rs::EpisodeParticipant", "crates/smart/eliot-dreamer-episode/src/input.rs::MaterialPreimage", "crates/smart/eliot-dreamer-episode/src/input.rs::ValidatedCurationInput"]
 
 [[type_contract]]
 id = "MM-04"
@@ -1136,6 +1155,7 @@ provenance_privacy = "EvidenceLedger is the provenance surface for this kind"
 validation_error = "owned by the defining module"
 compatibility = "not determinable for a result type that does not exist"
 disposition = "missing_contract_decision"
+symbol_source = ["crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceLedger", "crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceAssessment", "crates/smart/eliot-dreamer-concept/src/policy.rs::ConceptPolicy"]
 
 [[type_contract]]
 id = "MM-05"
@@ -1155,6 +1175,7 @@ provenance_privacy = "FailureCountSummary carries the count with its denominator
 validation_error = "owned by the defining module"
 compatibility = "adding an assessment variant is breaking for a pinned consumer"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-failure/src/assessment.rs::FailureAssessment", "crates/smart/eliot-dreamer-failure/src/result.rs::FailureHandlerDecision", "crates/smart/eliot-dreamer-failure/src/policy.rs::FailurePolicy", "crates/smart/eliot-dreamer-failure/src/assessment.rs::FailureCountSummary", "crates/smart/eliot-dreamer-failure/src/assessment.rs::CausalLimits", "crates/smart/eliot-dreamer-failure/src/assessment.rs::TriggerAssessment", "crates/smart/eliot-dreamer-failure/src/assessment.rs::OutcomeAssessment", "crates/smart/eliot-dreamer-failure/src/assessment.rs::ApplicabilityAssessment"]
 
 [[type_contract]]
 id = "MM-06"
@@ -1173,6 +1194,7 @@ provenance_privacy = "PriorTransition is the lineage surface"
 validation_error = "StructureRepairError"
 compatibility = "merge and split are forward reversible candidates only; no in-place rewrite is representable"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-structure-repair/src/lib.rs::StructureRepairCandidate", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::RepairOutcome", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::RepairSubtype", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::EquivalenceReport", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::RollbackPlan", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::InvalidationPlan", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::MemberDisposition", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::DependentDisposition", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::MemberDispositionKind", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::DependentDispositionKind", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::MemberRecord", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::FrozenBundle", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::PriorTransition", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::StructureRepairPolicy", "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::StructureRepairError"]
 
 [[type_contract]]
 id = "MM-07"
@@ -1191,6 +1213,7 @@ provenance_privacy = "EvidenceIndependence and PreservedSourceBinding keep the s
 validation_error = "ReconsolidationError"
 compatibility = "ReconsolidationOutcome is snake_case on the wire; reconsolidation is a forward reversible candidate only"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationResult", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationOutcome", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationRequest", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationPolicy", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationHandler", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::AddedProposition", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ChildProposition", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ParentRevision", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ParentProposition", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::PropositionDelta", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::PropositionDisposition", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReactivationBinding", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReactivationEvidence", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::EvidenceIndependence", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::DependentOutcome", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::AxisOwnerRefs", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::PreservedSourceBinding", "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ChildAllocationRequest"]
 
 [[type_contract]]
 id = "MM-08"
@@ -1209,6 +1232,7 @@ provenance_privacy = "AdjustmentRequest consumes AttributedMemoryEvaluation from
 validation_error = "AccessibilityError"
 compatibility = "accessibility and influence changes are forward reversible candidates only"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentProposal", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentRequest", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentOutcome", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentPolicy", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::Axis", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AxisStateSnapshot", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::CurrentAxisProjection", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilitySurface", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilityChange", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::InfluenceChange", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::ProtectionAndNegativeMemory", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::NegativeMemoryEntry", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::LocalInfluenceClosure", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AffectedPath", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::PathDisposition", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilityStanding", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::InfluenceStanding", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::LocalClosureStanding", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::LocalRevocationClass", "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilityError"]
 
 [[type_contract]]
 id = "MM-09"
@@ -1227,23 +1251,26 @@ provenance_privacy = "ProvenanceRepairSpec is the provenance surface; hidden rew
 validation_error = "RepairError"
 compatibility = "lineage, influence and derived-view repair are forward reversible candidates only"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemoryRepairCandidate", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemoryRepairRequest", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemoryRepairHandler", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairPolicy", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairOutcome", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairDefectKind", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairOperationKind", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairIdentity", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::TrajectoryEvidence", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ThreatEvidence", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::CurrentMemoryProjection", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::AuthoritativeSourceLink", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ProvenanceRepairSpec", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ContaminationClosure", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ContaminationAction", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::FalseRelationProposal", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::FalseRelationSpec", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::StaleViewSpec", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepresentationProposal", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepresentationSpec", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::AffectedMember", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemberDisposition", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemberDispositionKind", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::SourceAuthorityKind", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::SubjectKind", "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairError"]
 
 [[type_contract]]
 id = "MM-10"
 contract_index = "MemoryModelCandidateContract"
-crate = "eliot-dreamer-curation"
-rust_path = "crates/smart/eliot-dreamer-curation/src/lib.rs"
+crate = "eliot-dreamer-contracts"
+rust_path = "crates/smart/eliot-dreamer-contracts/src/curation_invocation.rs"
 symbol = "NativeCurationHandler"
-kind = "re-export"
-fields = ["eliot_dreamer_contracts::NativeCurationHandler"]
-wire_spelling = "owned by eliot-dreamer-contracts"
-wire_boundary = "owned by eliot-dreamer-contracts"
+symbol_source = ["crates/smart/eliot-dreamer-contracts/src/curation_invocation.rs::NativeCurationHandler"]
+kind = "trait definition"
+fields = ["BoundCurationCall in, ProducedCurationContent out, exactly one handle call per accepted invocation"]
+wire_spelling = "NativeCurationHandler"
+wire_boundary = "the typed handler port crosses the A-31 dispatch boundary in eliot-dreamer-contracts"
 required_optional_none = "not applicable"
 units_bounds = "not applicable"
 identity_scope_fence = "the typed handler registry protocol is owned by eliot-dreamer-contracts (A-31)"
 provenance_privacy = "not applicable"
-validation_error = "owned by eliot-dreamer-contracts"
-compatibility = "this is a re-export and is recorded as the family index owner only because it is the dispatch facade; it is not a second type owner"
+validation_error = "ContractViolation from eliot-dreamer-contracts"
+compatibility = "the single defining site. crates/smart/eliot-dreamer-curation/src/lib.rs re-exports this trait for its dispatch facade and is a consumer boundary, not a second owner; the family index names the facade crate, this row names the definition."
+consumer_boundary = "crates/smart/eliot-dreamer-curation/src/lib.rs re-exports NativeCurationHandler from eliot-dreamer-contracts"
 disposition = "reused_exact"
 
 [[type_contract]]
@@ -1281,6 +1308,7 @@ provenance_privacy = "SHELL_MARKERS, SDK_MARKERS, CREDENTIAL_MARKERS, UNBOUNDED_
 validation_error = "ProcedureError plus ProcedureOutcome as the terminal class"
 compatibility = "no wire compatibility rule can be stated for a shape with no wire form"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureCandidate"]
 
 [[type_contract]]
 id = "PR-02"
@@ -1299,6 +1327,7 @@ provenance_privacy = "existing procedures arrive as an ExistingProcedureSnapshot
 validation_error = "ProcedureError; outcome_rejection_hint maps an error to a bounded hint"
 compatibility = "EffectClass::Unknown blocks every retry path until an external owner reconciles the exact operation"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureStep", "crates/smart/eliot-dreamer-procedure/src/lib.rs::StepDisposition", "crates/smart/eliot-dreamer-procedure/src/lib.rs::EffectClass", "crates/smart/eliot-dreamer-procedure/src/lib.rs::StepDispositionKind", "crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureOutcome", "crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureEvidence", "crates/smart/eliot-dreamer-procedure/src/lib.rs::CapabilityEnvSnapshot", "crates/smart/eliot-dreamer-procedure/src/lib.rs::ExistingProcedureSnapshot", "crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedurePolicy", "crates/smart/eliot-dreamer-procedure/src/lib.rs::TransferPlan"]
 
 [[type_contract]]
 id = "PR-03"
@@ -1336,6 +1365,7 @@ provenance_privacy = "fingerprint is echoed verbatim from the observation"
 validation_error = "RevisionError; a digest mismatch is separate from FreezeVerificationError"
 compatibility = "fingerprint is one opaque String with no structured trigger field, so the exact-trigger versus semantic near-match distinction is not representable in the shipped shape"
 disposition = "corrected_static_description"
+symbol_source = ["crates/smart/eliot-dreamer-memory-revision/src/lib.rs::NegativeMemoryExtinctionCandidate"]
 
 [[type_contract]]
 id = "MR-02"
@@ -1354,6 +1384,7 @@ provenance_privacy = "task and safety arrive as admitted CC-004 projections; que
 validation_error = "RevisionError with ScopeMismatch, FenceMismatch, DigestMismatch, StaleCitation, Bounds, NotDigestible and the three owner-contract error wrappers"
 compatibility = "adding a narrowing operator is a breaking change and would cross the reversible-only boundary"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-memory-revision/src/lib.rs::AdvisoryNarrowing", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::CandidateDisposition", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::CandidateState", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::ClosureDenominator", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::RevisionIntake", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::RevisionError"]
 
 [[type_contract]]
 id = "MR-03"
@@ -1372,6 +1403,7 @@ provenance_privacy = "not applicable"
 validation_error = "FreezeVerificationError with FreezeIdDivergence, FreezeDigestDivergence, FreezeIdUnreadable and FreezeBytesNotUtf8"
 compatibility = "verify_freeze_binding is called from propose, so any freeze byte change fails closed at the candidate boundary. This row is the reason this catalogue does not edit the freeze."
 disposition = "corrected_static_description"
+symbol_source = ["crates/smart/eliot-dreamer-memory-revision/src/lib.rs::FREEZE_ID", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::FREEZE_BYTES", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::REQUIRED_FREEZE_DIGEST", "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::FreezeVerificationError"]
 
 [[type_contract]]
 id = "MR-04"
@@ -1409,6 +1441,7 @@ provenance_privacy = "input_receipt_digest echoes the owner receipt; attempt_den
 validation_error = "DiagnosisError plus DiagnosisOutcome as the terminal class"
 compatibility = "no wire compatibility rule can be stated for a shape with no wire form"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DevelopmentDiagnosisCandidate", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ProductGap", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ProductGapKind", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiscriminatorEvidence", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ControlledRepeat", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RepairAttemptSummary", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RepairHistory", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::FrozenConflictAnalysis", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RivalMechanism", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RivalStatus", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::CommonModeDisclosure", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiscriminatingExperiment", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ExperimentOutcomeKind", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiagnosisPolicy", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RivalAssessment", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RepairRecommendation", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiagnosisOutcome", "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiagnosisError"]
 
 [[type_contract]]
 id = "DX-02"
@@ -1427,6 +1460,7 @@ provenance_privacy = "SuppliedObjection and SuppliedProbe are supplied material,
 validation_error = "ConflictAnalysisError plus ConflictOutcome as the terminal class"
 compatibility = "this crate is an excluded_job_class with wire_kind = false and curation_kind = false; its result is not a curation wire kind"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictAnalysisCandidate", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictAnalysisPolicy", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::LineageAttribution", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::SuppliedObjection", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::SuppliedProbe", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ExternalResolution", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictSupplements", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::PositionAnalysis", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::LineageGroup", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::CommonModeRisk", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::RecommendedProbe", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::DecisionOwnerRecommendation", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::DimensionVerdict", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::PreservationReport", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictOutcome", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::PositionDispositionKind", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::DecisionOwnerKind", "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictAnalysisError"]
 
 [[type_contract]]
 id = "PL-01"
@@ -1445,6 +1479,7 @@ provenance_privacy = "input_receipt_digest echoes the owner receipt; attempt_den
 validation_error = "MaintenancePlanError plus MaintenanceOutcome as the terminal class"
 compatibility = "MaintenanceOpKind admits exactly ten inert verbs; a scheduling, execution, Doctor, tool, provider or configuration verb has no spelling and is rejected as unsupported vocabulary"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenancePlanCandidate", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceObjective", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::TriggerEvidence", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::BudgetSlice", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PlannedOperation", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::ExpectedDelta", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::SemanticVerifier", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceBoundary", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenancePolicy", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::HistoryAttempt", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PriorHistory", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceOpKind", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::DeltaDimension", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::DeltaDirection", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::TriggerKind", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::CancellationHandling", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PriorAttemptDisposition", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PriorEffectState", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::RepeatJustification", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceOutcome", "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenancePlanError"]
 
 [[type_contract]]
 id = "PL-02"
@@ -1463,6 +1498,7 @@ provenance_privacy = "SecretReference carries a reference class, never a secret 
 validation_error = "ConfigurationError plus ConfigurationOutcome as the terminal class"
 compatibility = "this crate proposes a configuration delta and never writes configuration; ConfigurationOutcome::DecisionRequired is not permission"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationChangeCandidate", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldSchema", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationValue", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::SecretReference", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldType", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldMutability", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationUnit", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldConstraint", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationSnapshot", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationSnapshotSet", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationRequest", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedRequestedField", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedOperationIdentity", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationChange", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedImpactClosure", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedImpactMember", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedImpactCompleteness", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedRolloutPlan", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedRollbackPlan", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedApproval", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedApprovalStatus", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationBoundary", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationPolicy", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedCandidateDetails", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationCeiling", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedHistoryDisposition", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedVerifierReading", "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedReplayDisposition"]
 
 [[type_contract]]
 id = "PL-03"
@@ -1481,6 +1517,7 @@ provenance_privacy = "ORACLE_MARKERS and HIDDEN_AUTHORITY_MARKERS gate the suppl
 validation_error = "OrchestrationPlanError plus DecompositionOutcome as the terminal class"
 compatibility = "DecompositionOutcome::Overlapped blocks separation, and ::Challenge routes to a bounded replan instead of an arbitrary file split; planning reserves no route, launch or schedule"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::WorkUnitDecomposition", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::AgentWorkUnitBrief", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::PlanObjective", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::PlanRequirement", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::PlanSurface", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::WorkUnitBudget", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ReadinessEdge", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::RequirementExclusion", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::DecompositionPolicy", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ContextEnvelopeSelectionReceipt", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::SurfaceKind", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::DependencyKind", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ProofStatus", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ContextMeasurementStatus", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::DecompositionOutcome", "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::OrchestrationPlanError"]
 
 [[type_contract]]
 id = "PL-04"
@@ -1499,6 +1536,7 @@ provenance_privacy = "ProbeOmission carries its OmissionKind so an omitted probe
 validation_error = "owned by the defining module"
 compatibility = "the crate declares no wave order in cognitive-crate-decisions.toml; its agent_order 17 is read from its own Cargo metadata"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbePlan", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeProposal", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeDimensions", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeOmission", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeTarget", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeRelationKind", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeObjectiveDispositionKind", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeObjectiveDisposition", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::OmissionKind", "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbePlanParams"]
 
 [[type_contract]]
 id = "CY-01"
@@ -1517,6 +1555,7 @@ provenance_privacy = "not applicable; the state is a bounded controller projecti
 validation_error = "CycleError plus StepDisposition as the terminal class"
 compatibility = "an adjacent phase only: a step advances exactly one phase or replays, and a jump is not representable"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-cycle/src/contract.rs::DreamerCycleState", "crates/smart/eliot-dreamer-cycle/src/contract.rs::CycleStep", "crates/smart/eliot-dreamer-cycle/src/contract.rs::CyclePolicy", "crates/smart/eliot-dreamer-cycle/src/contract.rs::PendingRequest", "crates/smart/eliot-dreamer-cycle/src/contract.rs::ObservedOutcome", "crates/smart/eliot-dreamer-cycle/src/contract.rs::InertOwnerRequest", "crates/smart/eliot-dreamer-cycle/src/contract.rs::ExpectedArtifact", "crates/smart/eliot-dreamer-cycle/src/contract.rs::CandidateEvidence", "crates/smart/eliot-dreamer-cycle/src/contract.rs::PhasePolicyRule", "crates/smart/eliot-dreamer-cycle/src/contract.rs::CyclePhase", "crates/smart/eliot-dreamer-cycle/src/contract.rs::OutcomeDisposition", "crates/smart/eliot-dreamer-cycle/src/contract.rs::RequestKind", "crates/smart/eliot-dreamer-cycle/src/contract.rs::StepDisposition", "crates/smart/eliot-dreamer-cycle/src/contract.rs::CYCLE_SCHEMA_VERSION"]
 
 [[type_contract]]
 id = "CY-02"
@@ -1535,6 +1574,7 @@ provenance_privacy = "not applicable"
 validation_error = "CycleError"
 compatibility = "PlanHorizon has exactly one variant OneCycle, so a multi-cycle or recurring horizon is not representable; ExperimentKind admits only a clarification probe and a reconciliation probe, so self-scheduling is not representable"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-cycle/src/plan.rs::CyclePlan", "crates/smart/eliot-dreamer-cycle/src/plan.rs::ExperimentCandidate", "crates/smart/eliot-dreamer-cycle/src/plan.rs::PlanHorizon", "crates/smart/eliot-dreamer-cycle/src/plan.rs::ExperimentKind"]
 
 [[type_contract]]
 id = "CY-03"
@@ -1553,6 +1593,7 @@ provenance_privacy = "sampled and omitted members are named by identity, so an o
 validation_error = "CycleError"
 compatibility = "complete is true only when the sampled members account for every total and the omitted lists are empty; a bare count never establishes completeness"
 disposition = "reused_exact"
+symbol_source = ["crates/smart/eliot-dreamer-cycle/src/sample.rs::CycleSample", "crates/smart/eliot-dreamer-cycle/src/sample.rs::SampleDenominator", "crates/smart/eliot-dreamer-cycle/src/sample.rs::SampleLimits"]
 
 [[type_contract]]
 id = "CY-04"
@@ -1576,6 +1617,7 @@ disposition = "corrected_static_description"
 # ---------------------------------------------------------------------------
 # The one semantic contract index.
 # ---------------------------------------------------------------------------
+symbol_source = ["crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableJobState", "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableTransition", "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableCommand", "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableEvent", "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageResolution", "crates/smart/eliot-dreamer-cycle/src/durable.rs::OperationOutcome", "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableDisposition", "crates/smart/eliot-dreamer-cycle/src/durable.rs::InFlightOperation", "crates/smart/eliot-dreamer-cycle/src/durable.rs::SettledOperation", "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageRequest", "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageEvidence", "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageReconciled", "crates/smart/eliot-dreamer-cycle/src/durable.rs::RestartEvidence", "crates/smart/eliot-dreamer-cycle/src/durable.rs::FenceEvidence", "crates/smart/eliot-dreamer-cycle/src/durable.rs::DeadlineEvidence", "crates/smart/eliot-dreamer-cycle/src/durable.rs::DeliveryEvidence", "crates/smart/eliot-dreamer-cycle/src/durable.rs::AckEvidence", "crates/smart/eliot-dreamer-cycle/src/durable.rs::ProposedStageTransition", "crates/smart/eliot-dreamer-cycle/src/durable.rs::AdvanceStageCommand", "crates/smart/eliot-dreamer-cycle/src/durable.rs::ReconcileCommand", "crates/smart/eliot-dreamer-cycle/src/durable.rs::EscalateCommand", "crates/smart/eliot-dreamer-cycle/src/durable.rs::DURABLE_SCHEMA_VERSION"]
 
 [[field_contract_index]]
 contract_id = "ValidationGroundingReceiptContract"
@@ -1827,13 +1869,13 @@ evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-NO-INVENTED-SYMBOL"
-rule = "Every rust_path and symbol in every [[type_contract]] and [[ownership]] row resolves to a public item in the named source file on the current base, or the row carries disposition missing_contract_decision. A guessed schema is never presented as frozen."
+rule = "Every rust_path and symbol in every [[type_contract]] and [[ownership]] row resolves to a public item in the named source file on the current base, or the row carries disposition missing_contract_decision. A guessed schema is never presented as frozen. Every multi-symbol row additionally carries symbol_source, one path::symbol per named symbol, so a row that names types from sibling modules resolves each of them instead of only the ones in rust_path. A pub use re-export is never cited as the source of a definition."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-ONE-DISPOSITION-PER-ROW"
-rule = "Every load-bearing row carries exactly one disposition from reused_exact, corrected_static_description, missing_contract_decision, retired_with_successor. No row is both reused and missing."
+rule = "Every load-bearing row carries exactly one disposition from reused_exact, corrected_static_description, missing_contract_decision, retired_with_successor. No row is both reused and missing. Exactly one owner survives per public type: a row whose source is a re-export names the defining crate in rust_path and records the re-exporting site as a consumer_boundary."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
