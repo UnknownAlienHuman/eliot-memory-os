@@ -340,6 +340,18 @@ fn native_worker_catalog_binding(
     Ok((capability_cell, module_catalog_revision))
 }
 
+/// Resolves a worker cell against Kernel's independently generated #13
+/// registry before claim admission and returns the validated source digest.
+fn native_worker_registry_digest(
+    cell: &CapabilityCellId,
+) -> Result<String, NativeWorkerRouteError> {
+    super::composition_bootstrap::native_worker_cell_registry_digest(cell)
+        .map(str::to_owned)
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "capability_cell_registry",
+        })
+}
+
 /// Reads one lowercase SHA-256 digest field.
 pub(crate) fn require_digest(
     value: &serde_json::Value,
@@ -1294,17 +1306,13 @@ impl KernelComposition {
 
     /// Builds the current owner-record expectation for the executable gate.
     ///
-    /// The owner-produced executable fields ride the presented v2 join (the
-    /// only owner-record carrier in these paths; tamper-evident through the
-    /// claim binding digest the gate recomputes). Every currentness anchor
-    /// comes from a live record, never from caller strings: the admitted
-    /// worker-configuration identity from the presenting registration record,
-    /// the generation and immutable fence from the validated registration
-    /// fence, and the authority epoch from the live service epoch record
-    /// (compared inside the gate via `is_same_authority`, never by raw
-    /// sequence). `revoked` stays false: no revocation feed exists in these
-    /// paths, so withdrawal is observed only as digest/currentness
-    /// disagreement (a Governor revocation feed belongs to a later wave).
+    /// The cell and original registry digest are resolved independently from
+    /// the generated #13 source and compared to the v2 join. The worker
+    /// configuration, generation/fence, and epoch come from the validated
+    /// registration and live service. The other W1 lifecycle dimensions are
+    /// still projected from the presented join until their owner records are
+    /// available to this route. `revoked` stays false: no revocation feed
+    /// exists in these paths, so withdrawal is not independently observed.
     ///
     /// Wire v1 carries no owner record: the anchors below still come from the
     /// same live records while the owner-produced strings stay empty by
@@ -1322,10 +1330,12 @@ impl KernelComposition {
         let config_digest = require_digest(registration, "worker_config_digest")?;
         let (capability_cell, module_catalog_revision) =
             native_worker_catalog_binding(registration)?;
+        let registry_digest = native_worker_registry_digest(&capability_cell)?;
         let current = match presented {
             Some(join) => {
                 if join.capability_cell != capability_cell
                     || join.module_catalog_revision != module_catalog_revision
+                    || join.capability_cell_registry_digest != registry_digest
                 {
                     return Err(NativeWorkerRouteError::Fence {
                         field: "native_worker_executable_binding",
@@ -1338,8 +1348,18 @@ impl KernelComposition {
                     config_digest,
                     facet_manifest_ref: join.facet_manifest_ref.clone(),
                     capability_cell: join.capability_cell.clone(),
+                    capability_cell_registry_digest: registry_digest,
                     grant_graph_revision: join.grant_graph_revision,
                     module_catalog_revision: join.module_catalog_revision,
+                    kernel_execution_manifest_digest: join
+                        .kernel_execution_manifest_digest
+                        .clone(),
+                    job_object_lineage_ref: join.job_object_lineage_ref.clone(),
+                    resource_limits_digest: join.resource_limits_digest.clone(),
+                    cancellation_policy_ref: join.cancellation_policy_ref.clone(),
+                    checkpoint_policy_digest: join.checkpoint_policy_digest.clone(),
+                    drain_policy_ref: join.drain_policy_ref.clone(),
+                    restart_policy_digest: join.restart_policy_digest.clone(),
                     replay_stream_id: join.replay_stream_id.clone(),
                     launch_nonce: join.launch_nonce.clone(),
                     process_invocation_digest: join.process_invocation_digest.clone(),
@@ -1359,8 +1379,16 @@ impl KernelComposition {
                 config_digest,
                 facet_manifest_ref: String::new(),
                 capability_cell,
+                capability_cell_registry_digest: String::new(),
                 grant_graph_revision: 0,
                 module_catalog_revision,
+                kernel_execution_manifest_digest: String::new(),
+                job_object_lineage_ref: String::new(),
+                resource_limits_digest: String::new(),
+                cancellation_policy_ref: String::new(),
+                checkpoint_policy_digest: String::new(),
+                drain_policy_ref: String::new(),
+                restart_policy_digest: String::new(),
                 replay_stream_id: String::new(),
                 launch_nonce: String::new(),
                 process_invocation_digest: String::new(),
@@ -1632,6 +1660,8 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
         let (claim, registration) = Self::split_claim_presentation(payload)?;
         Self::validate_native_worker_registration(registration)?;
+        let (registered_cell, _) = native_worker_catalog_binding(registration)?;
+        let registry_digest = native_worker_registry_digest(&registered_cell)?;
         let now = unix_ms();
         let lease_expires_at_unix_ms =
             require_nonzero_u64(registration, "lease_expires_at_unix_ms")?;
@@ -1673,6 +1703,14 @@ impl KernelComposition {
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "registration_binding",
             })?;
+        if let Some(join) = request.executable_binding.as_ref()
+            && (join.capability_cell != registered_cell
+                || join.capability_cell_registry_digest != registry_digest)
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "capability_cell_registry_digest",
+            });
+        }
         let service = self.service_guard()?;
         let live_epoch = service.authority_epoch();
         let decision = service

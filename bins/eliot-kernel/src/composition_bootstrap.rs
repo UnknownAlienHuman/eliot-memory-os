@@ -45,12 +45,14 @@ use super::{
     SupervisionLeaseAuthorityConfig, dispatch_key, load_agent_bridge_declaration,
     observed_session_principal_binding,
 };
-use eliot_contracts::ResourceGeneration;
+use eliot_contracts::{
+    CapabilityCellId, CapabilityCellRegistry, ResourceGeneration, SupportStatus,
+};
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64},
 };
 use std::time::Duration;
@@ -58,6 +60,79 @@ use std::time::Duration;
 use crate::kernel_diagnostics::{
     EntrypointStage, observe_entrypoint, observe_entrypoint_with_detail, observe_terminal_error,
 };
+
+// This is a compiled source record; Kernel validates its typed contents and
+// does not re-read the source checkout or infer support from its provenance.
+// BEGIN GENERATED native-worker capability-cell registry (scripts/gen_capability_cell_registry.py; do not hand-edit)
+const NATIVE_WORKER_CAPABILITY_CELL_ID: &str = "native-worker-core";
+const NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE: &str = "eliot-native-worker-core";
+const NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON: &str = r##"{"cells":[{"affected_edges":[],"allowed_effect_classes":[],"cell":"native-worker-core","cell_revision":{"major":1,"minor":0,"patch":0},"contract_digest":"418bf928930a0ce60690ffa67964ab863a18f637b4b7021561aead29e60f423c","contract_digest_source":"crates/modules/eliot-native-worker-core/capability-cell.contract.toml#contract-surface","execution_contour":"DELEGATED_BUNDLE","freshness":{"current_support":"CURRENT_UNVERIFIED","invalidation":[]},"generation_owner":"A-13","lifecycle_owner":"A-13","maintenance_owner":"A-13","manifest":{"context_capsule":{"owner":"A-13","present":true},"contract_kit":{"owner":"A-13","present":true},"test_capsule":{"owner":"A-13","present":true}},"product_pulse":{"NOT_APPLICABLE":{"reason":"This internal process protocol core has no independent Product Pulse; product behavior is measured at the native-worker bundle contour."}},"proof_ceiling":"STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY","proof_entrypoint":"cargo test -p eliot-native-worker-core --all-targets --all-features","removal_boundary":"Stop claim admission, drain and cancel the exact native-worker process generation through Kernel, then replace the worker bundle.","replacement_class":"isolate_dependency","runtime_bundle":"eliot-native-worker","semantic_owner":"A-13","source_crate":"eliot-native-worker-core","state_owners":[{"owner":"A-13","state":"WorkerCore lifecycle, grant, process binding and start receipt, connection, and last-event sequence"}],"stateless":false}],"generator_version":"1.0.0","pair_key":"sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1","registry_version":1,"source_identity":{"cargo_lock_digest":"ba14d26f4d7b3fc1eeada69ca2d0a89310c0c2af9c14369f542362e505b12bd2","generator_version":"1.0.0","toolchain":"rustc 1.97.1 (8bab26f4f 2026-07-14); binary: rustc; commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452; commit-date: 2026-07-14; host: x86_64-pc-windows-msvc; release: 1.97.1; LLVM version: 22.1.6","tree_digest":"476dd68b6035c581320d909e7c9b204d656e375ba1c3da1d14605efb2ddcc75a"}}"##;
+// END GENERATED native-worker capability-cell registry
+
+struct ValidatedNativeWorkerCellRegistry {
+    registry: CapabilityCellRegistry,
+    original_digest: String,
+}
+
+static NATIVE_WORKER_CELL_REGISTRY: OnceLock<Result<ValidatedNativeWorkerCellRegistry, String>> =
+    OnceLock::new();
+
+fn validated_native_worker_cell_registry(
+) -> Result<&'static ValidatedNativeWorkerCellRegistry, &'static str> {
+    match NATIVE_WORKER_CELL_REGISTRY.get_or_init(|| {
+        let registry: CapabilityCellRegistry =
+            serde_json::from_str(NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON)
+                .map_err(|_| "embedded registry JSON failed typed decoding".to_owned())?;
+        registry
+            .validate()
+            .map_err(|_| "embedded capability-cell registry failed validation".to_owned())?;
+        let original_digest = registry
+            .registry_digest()
+            .map_err(|_| "validated registry digest could not be calculated".to_owned())?;
+        Ok(ValidatedNativeWorkerCellRegistry {
+            registry,
+            original_digest,
+        })
+    }) {
+        Ok(registry) => Ok(registry),
+        Err(_) => Err("embedded native-worker capability-cell registry is invalid"),
+    }
+}
+
+pub(super) fn validate_native_worker_cell_registry() -> Result<(), &'static str> {
+    validated_native_worker_cell_registry().map(|_| ())
+}
+
+/// Resolves the worker's presented cell against the independent generated
+/// registry and returns that validated record-set's original digest.
+pub(super) fn native_worker_cell_registry_digest(
+    selected_cell: &CapabilityCellId,
+) -> Result<&'static str, &'static str> {
+    let loaded = validated_native_worker_cell_registry()?;
+    if selected_cell.as_str() != NATIVE_WORKER_CAPABILITY_CELL_ID {
+        return Err("claim selected a cell outside the native-worker contract");
+    }
+    let mut records = loaded
+        .registry
+        .cells
+        .iter()
+        .filter(|record| record.cell.as_str() == selected_cell.as_str());
+    let record = records
+        .next()
+        .ok_or("selected native-worker cell is absent from registry")?;
+    if records.next().is_some()
+        || record.source_crate.as_str() != NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE
+        || record.proof_entrypoint.is_none()
+        || matches!(
+            record.freshness.current_support,
+            SupportStatus::Stale | SupportStatus::Suspended
+        )
+        || !record.freshness.invalidation.is_empty()
+    {
+        return Err("selected native-worker cell has no current validated proof surface");
+    }
+    Ok(loaded.original_digest.as_str())
+}
 
 /// The single capability this Kernel's server-owned front-door policy grants to
 /// the daemon/operator front-door session class.
@@ -170,6 +245,11 @@ impl KernelComposition {
     /// authenticated handoff. Test-only adapter construction is available
     /// under the test configuration.
     pub fn new(config: KernelConfig) -> Result<Self, KernelBuildError> {
+        validate_native_worker_cell_registry().map_err(|_| {
+            KernelBuildError::Service(
+                "embedded native-worker capability-cell registry is invalid".to_owned(),
+            )
+        })?;
         // F-LOG-KERNEL-2 (#899): composition-build boundary. One terminal per
         // failed build; phase observations correlate by stage order.
         observe_entrypoint_with_detail(
