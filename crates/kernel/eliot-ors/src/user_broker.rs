@@ -24,7 +24,10 @@ impl UserBrokerHeartbeat {
     /// Creates a heartbeat write from a validated opaque operational record.
     pub fn new(record: OperationalRecordInput) -> Result<Self, OrsError> {
         record.validate()?;
-        if matches!(&record.payload, crate::RecoveryPayload::CanonicalRequest { .. }) {
+        if matches!(
+            &record.payload,
+            crate::RecoveryPayload::CanonicalRequest { .. }
+        ) {
             return Err(OrsError::InvalidField {
                 field: "user_broker_payload",
                 reason: "canonical requests are not User Broker records",
