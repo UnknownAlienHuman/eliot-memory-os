@@ -18,7 +18,9 @@ use eliot_watchdog_core::{
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
-use crate::{SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
+use crate::{
+    AdmittedIsolatedDestination, SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms,
+};
 
 pub(crate) mod backup;
 mod codec;
@@ -246,6 +248,58 @@ impl WatchdogSpool {
         })
     }
 
+    /// Opens the spool of one EXTERNALLY ADMITTED isolated destination
+    /// installation.
+    ///
+    /// This is the destination-side counterpart of
+    /// [`Self::open_runtime_binding`]: the same protected path lease, the same
+    /// path-identity verification, and the same initialization/recovery path,
+    /// reached through the destination's own admitted binding instead of this
+    /// owner's. It is the only way an isolated restore import reaches a
+    /// destination database, which is what makes "the import targets the
+    /// admitted destination" structural rather than a matter of a validated
+    /// string.
+    ///
+    /// The destination is a NEW isolated installation, so its spool is normally
+    /// absent; opening it creates and initializes a fresh, empty destination
+    /// spool through the same retained no-follow lease and identity proof as
+    /// the owner's own. No destination lease, heartbeat, supervision
+    /// authority, or epoch is touched, read, or required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the destination's spool path is not the
+    /// canonical protected path, its retained file identity cannot be proved,
+    /// its database cannot be opened, or its header fails initialization or
+    /// recovery.
+    pub(crate) fn open_isolated_destination(
+        destination: &AdmittedIsolatedDestination,
+    ) -> Result<Self, SpoolError> {
+        let _span = tracing::debug_span!("watchdog.destination_spool_open").entered();
+        tracing::debug!(
+            event = "watchdog.destination_spool_open_attempted",
+            observation = "attempted",
+            "opening the admitted isolated destination spool without payload material"
+        );
+        let path = watchdog_spool_path(destination.watchdog_state_root());
+        let path_lease = ProtectedRuntimePathLease::open_or_create_absolute(&path)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        if path_lease.path() != path {
+            return Err(SpoolError::InvalidProtectedRoot);
+        }
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let database = Database::open(path_lease.path())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let spool = Self {
+            database,
+            _path_lease: Some(path_lease),
+        };
+        spool.initialize_or_recover()?;
+        Ok(spool)
+    }
+
     pub(crate) fn readback(&self) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
         let read = self
             .database
@@ -389,13 +443,33 @@ impl WatchdogSpool {
         )
     }
 
-    /// Imports an isolated-restore step chain as quarantined historical evidence.
+    /// Imports an isolated-restore step chain as quarantined historical evidence
+    /// INTO THE EXTERNALLY ADMITTED ISOLATED DESTINATION INSTALLATION.
     ///
-    /// Gates the destination triple through
-    /// [`backup::validate_isolated_destination`] (the destination must differ
-    /// from both the source and the active installation) and the chain through
+    /// The destination is `destination: Option<&AdmittedIsolatedDestination>`,
+    /// and that is the whole point of the signature: an import has exactly one
+    /// admissible target, and it is the destination installation whose registry,
+    /// approved generation, artifact digests, and retained runtime roots were
+    /// proved by [`crate::admit_isolated_destination`] before this call. When no
+    /// destination is admitted there is nothing this owner may write to, and the
+    /// import REFUSES — it never falls back to the currently active
+    /// installation's spool. The refusal names the absent admission.
+    ///
+    /// It is an associated function rather than a method on `&self`, and
+    /// deliberately so. An import is not an operation on the importing owner's
+    /// own spool, and withholding `self` keeps the active installation's
+    /// database out of scope entirely: the destination spool is opened here
+    /// from the admitted binding alone.
+    ///
+    /// With a destination admitted, the destination triple is gated through
+    /// [`backup::validate_isolated_destination`] against the destination's OWN
+    /// owner-issued identity (`AdmittedIsolatedDestination::installation`) — the
+    /// destination identity is never a caller string — and the chain through
     /// [`backup::validate_restore_chain`], rooted at the admitted preparation
-    /// digest carried as the first step's predecessor. Each accepted step is
+    /// digest carried as the first step's predecessor. The destination's own
+    /// spool is opened once through
+    /// [`Self::open_isolated_destination`], and every retained-evidence read and
+    /// every accepted append goes through THAT spool. Each accepted step is
     /// appended through the existing [`append`](Self::append) path as a
     /// `Recovery` record naming the exact source installation with the step
     /// digest as evidence; such records grant no lease, heartbeat, supervision
@@ -408,35 +482,33 @@ impl WatchdogSpool {
     /// admitted, each appended in its own bounded write transaction; no
     /// restart, deletion, overwrite, or cutover is performed.
     ///
-    /// Known limitation (unresolved, not claimed as admission): the accepted
-    /// step is appended to **this** owner spool, which is the currently active
-    /// installation's spool. The destination triple is validated and then
-    /// discarded; no admitted isolated destination spool is opened or written.
-    /// This owner has no constructor that accepts an externally admitted
-    /// destination installation binding, so writing into one would require
-    /// inventing an admission that does not exist here. The consequence is
-    /// bounded and non-authoritative — the rows are quarantined historical
-    /// `Recovery` markers carrying no active lease, heartbeat, supervision, or
-    /// epoch authority — but they are **not** in the isolated destination, and
-    /// this method therefore does not yet perform an isolated-destination
-    /// import. See the #945 final composition for the admitted destination.
+    /// The idempotency evidence is read from the DESTINATION's own retained
+    /// records, not from this owner's: repeated import is a statement about
+    /// what the destination already holds.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError`] when the destination is not isolated, the step
-    /// chain is empty, malformed, non-consecutive, or unlinked, the bounded
-    /// step count is exceeded, or any step conflicts with already quarantined
-    /// evidence.
+    /// Returns [`SpoolError::InvalidLease`] when no externally admitted
+    /// destination installation binding was supplied — the absent admission is
+    /// refused, never substituted. Returns [`SpoolError`] when the destination
+    /// is not isolated from the source and active installations, its spool
+    /// cannot be opened, the step chain is empty, malformed, non-consecutive, or
+    /// unlinked, the bounded step count is exceeded, or any step conflicts with
+    /// already quarantined evidence.
     pub fn import_backup_isolated(
-        &self,
         source_installation: &str,
-        dest_installation: &str,
+        destination: Option<&AdmittedIsolatedDestination>,
         active_installation: &str,
         steps: &[backup::SpoolRestoreStep],
     ) -> Result<backup::SpoolRestoreDisposition, SpoolError> {
+        let Some(destination) = destination else {
+            return Err(SpoolError::InvalidLease(
+                "watchdog spool backup import refuses to run: no externally admitted isolated destination installation binding was supplied, and an import targets only that admitted destination".to_owned(),
+            ));
+        };
         backup::validate_isolated_destination(
             source_installation,
-            dest_installation,
+            destination.installation(),
             active_installation,
         )?;
         let step_count = u64::try_from(steps.len()).map_err(|_| {
@@ -453,7 +525,11 @@ impl WatchdogSpool {
             .first()
             .map_or("", |step| step.predecessor_digest.as_str());
         backup::validate_restore_chain(prepare_digest, steps)?;
-        let retained = self.readback()?;
+        // Every read below and every append inside the loop are against the
+        // admitted destination installation's own spool. The importing owner's
+        // own spool is not even reachable from here: there is no `self`.
+        let destination_spool = WatchdogSpool::open_isolated_destination(destination)?;
+        let retained = destination_spool.readback()?;
         let mut quarantined: Vec<(String, String)> = Vec::new();
         for entry in &retained {
             if let WatchdogSpoolPayload::Recovery {
@@ -500,7 +576,7 @@ impl WatchdogSpool {
                         .to_owned(),
                 ));
             }
-            self.append(
+            destination_spool.append(
                 observed_at_ms,
                 WatchdogSpoolPayload::Recovery {
                     service: SERVICE_NAME.to_owned(),

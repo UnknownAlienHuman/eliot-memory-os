@@ -176,7 +176,10 @@ pub use self_admission::{
     project_service_runtime_inspection,
 };
 use watchdog_admission::validate_runtime_binding;
-pub use watchdog_admission::{FileWatchdogAdmission, WatchdogRuntimeBinding};
+pub use watchdog_admission::{
+    AdmittedIsolatedDestination, FileWatchdogAdmission, WatchdogRuntimeBinding,
+    admit_isolated_destination,
+};
 pub use watchdog_composition::{
     WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,
 };
