@@ -148,7 +148,7 @@ impl fmt::Debug for ProtectedSupervisionLeaseSigner {
                 "expected_public_key_fingerprint",
                 &self.expected_public_key_fingerprint,
             )
-            .field("key_provider", self.authority.key_reference.provider())
+            .field("key_provider", &self.authority.key_reference.provider())
             .finish_non_exhaustive()
     }
 }
@@ -179,7 +179,7 @@ impl ProtectedSupervisionLeaseSigner {
             .map_err(SupervisionLeaseAuthorityError::Configuration)?;
         validate_profile_key_reference(
             installation_profile,
-            portable_dev_repository_root.as_deref(),
+            portable_dev_repository_root.as_ref(),
             &config.authority.key_reference,
         )
         .map_err(SupervisionLeaseAuthorityError::Configuration)?;
@@ -250,15 +250,14 @@ impl ProtectedSupervisionLeaseSigner {
                 InstallationProfile::PortableDev,
                 SupervisionAuthorityKeyReference::PortableDev(reference),
             ) => {
-                let repository_root =
-                    self.portable_dev_repository_root
-                        .as_deref()
-                        .ok_or_else(|| {
-                            SupervisionLeaseError::Signing(
-                                "PortableDev repository root is unavailable".to_owned(),
-                            )
-                        })?;
-                let (repository_root, repository_root_identity) = repository_root;
+                let (repository_root, repository_root_identity) = self
+                    .portable_dev_repository_root
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SupervisionLeaseError::Signing(
+                            "PortableDev repository root is unavailable".to_owned(),
+                        )
+                    })?;
                 self.portable_dev_key_provider
                     .load_signer_for_kernel(
                         reference,
