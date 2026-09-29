@@ -188,7 +188,6 @@ pub(crate) fn init(root: &Path, project: &Path, surreal_exe: &Path) -> Result<()
     config.control_wal.path = slash(&root.join("control").join("control.redb"));
     config.blob_store.root = slash(&root.join("blobs"));
     config.store.surql_dir = slash(&project.join("surql"));
-    config.store.migrations_dir = slash(&project.join("migrations"));
     config.validate()?;
     fs::write(&config_path, toml::to_string_pretty(&config)?)?;
 
