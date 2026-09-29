@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -64,6 +64,13 @@ const DRAIN_STATE_FILE: &str = "kernel-shutdown-drain.json";
 /// unrecognized file would make the Kernel permanently unusable for that work
 /// root, with no path back but a hand-deleted file.
 const DRAIN_STATE_VERSION: u32 = 1;
+
+/// Upper bound on the decoded durable state. The decoded shape is eight phase
+/// evidences, one decision, one terminal and the pending identities, so this is
+/// far above any state a drain can legitimately write. A larger file is
+/// corruption, not an obligation, and is refused as unreadable rather than
+/// decoded into an unbounded allocation.
+const DRAIN_STATE_MAX_BYTES: u64 = 64 * 1024;
 
 /// Poll interval for the bounded receipt-reconciliation wait.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -617,9 +624,23 @@ pub(crate) fn coordinator_for(work_root: &Path) -> Result<Arc<ShutdownDrainCoord
 
 impl ShutdownDrainCoordinator {
     fn load(path: PathBuf) -> Result<Self, String> {
-        let mut state = match fs::read(&path) {
-            Ok(bytes) => {
-                let durable: DurableDrainState = serde_json::from_slice(&bytes)
+        // The durable file is read through a bounded handle, so a corrupt or
+        // hostile file is refused on its size instead of being read into an
+        // unbounded buffer. Absent state is the only case that becomes fresh
+        // state; every other read outcome stays an error the caller sees.
+        let mut bounded = Vec::new();
+        let mut state = match File::open(&path) {
+            Ok(file) => {
+                if let Err(error) = file
+                    .take(DRAIN_STATE_MAX_BYTES + 1)
+                    .read_to_end(&mut bounded)
+                {
+                    return Err(format!("shutdown state cannot be read: {error}"));
+                }
+                if bounded.len() as u64 > DRAIN_STATE_MAX_BYTES {
+                    return Err("shutdown state exceeds the bounded decode limit".to_owned());
+                }
+                let durable: DurableDrainState = serde_json::from_slice(&bounded)
                     .map_err(|error| format!("shutdown state is unreadable: {error}"))?;
                 validate_durable_state(&durable)?;
                 let mut state = CoordinatorState::fresh(durable.generation);
