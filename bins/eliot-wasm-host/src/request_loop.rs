@@ -729,9 +729,13 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
 ///   observation, never as an ad hoc fallback object.
 ///
 /// Consumers must reject mixed versions, duplicate terminal events, sequence
-/// gaps, and contradictory identities; `validate_result_stream` enforces
-/// exactly that where the loop consumes a retained sequence for replay
-/// republish. Absence stays absence per I5.16: `None` serializes absent,
+/// gaps, and contradictory identities. That rejection is not left to a
+/// consumer's own reading of this comment: [`validate_result_stream`] is
+/// exported from this same owner, so a consumer of captured stdout bytes
+/// decodes with this type and rejects with the producer's own validator
+/// instead of re-deriving a weaker local check. The loop itself uses it on
+/// every emission path and on retained-sequence replay republish.
+/// Absence stays absence per I5.16: `None` serializes absent,
 /// measured zero stays numeric zero, Booleans stay Booleans, and no
 /// formatting helper feeds stringified values back into this contract.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1047,7 +1051,15 @@ fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), 
 /// carries its exact phase with no invented engine, usage, or output
 /// evidence, and an unknown outcome stays unknown — local serialization
 /// success upgrades nothing.
-fn validate_frame(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+///
+/// This is the same function the emitter runs through
+/// [`DeliverySetChannel::publish`], so a consumer validates the frame it
+/// decoded with the producer's own rule rather than a re-derived one.
+///
+/// # Errors
+///
+/// Returns [`LoopError::ResultInvalid`] when any checked binding disagrees.
+pub fn validate_frame(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
     if frame.wire_id != WASM_HOST_RESULT_WIRE_ID {
         return Err(invalid("wire-id"));
     }
@@ -1189,7 +1201,22 @@ fn validate_lifecycle_vocabulary(frame: &WasmHostResultFrame) -> Result<(), Loop
 /// consistent parent identity across every event. Mixed versions, duplicate
 /// terminal events, sequence gaps, and contradictory identities fail closed
 /// here, before any event is acted on or republished.
-fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), LoopError> {
+///
+/// This is the consumer entry point of the same neutral owner that emits the
+/// sequence, so a reader of captured stdout bytes decodes with
+/// [`WasmHostResultFrame`] and rejects with THIS function rather than
+/// re-deriving a weaker local check. It is the exact validator the emitter
+/// runs over a retained sequence for replay republish, and the exact one the
+/// disk readback runs; there is no second stream rule.
+///
+/// # Errors
+///
+/// Returns [`LoopError::ResultInvalid`] when any event fails
+/// [`validate_frame`], when the stream mixes wire identities or versions, when
+/// `sequence` values are not gapless from 0, when more than one event is
+/// terminal or none closes the stream, or when the parent identities disagree
+/// across events.
+pub fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), LoopError> {
     let Some(first) = events.first() else {
         return Err(invalid("result-stream"));
     };
