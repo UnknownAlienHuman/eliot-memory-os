@@ -1781,7 +1781,7 @@ fn host_request_observe_submit_frame(
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
 /// | `eliot.observe` | submit frame (tool bytes) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
-/// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch, the Kernel submit gate revalidates the act dispatch binding pre-staging, and the daemon `serve_act_material_admission` gate owns `admit_material_decision` over owner-resolved inputs; the live act claim/flight carrying owner inputs through that gate is the remaining join (#1742 W4) |
+/// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the act dispatch binding pre-staging; the daemon-side `admit_material_decision` invocation over owner-resolved inputs with dispatch-time revalidation through a live act claim/flight is the remaining join (#1742 W4) |
 /// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
 /// | `eliot.coordinate` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; execution-fabric join missing (#1740) |
 /// | `eliot.finish` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded finish decision receipt from the Governor finish owner; a simulated/stale/unbound/unknown-verifier candidate and a caller-supplied proof never yield `VERIFIED_COMPLETE` |
@@ -1809,11 +1809,11 @@ enum CanonicalDispatchEntry {
     /// live session/fence/connection binding, exact payload-digest linkage)
     /// and rides the same `agent_host_request_submit` entry; the Kernel
     /// submit entry revalidates the act dispatch binding pre-staging
-    /// (`check_act_submit_binding`); the daemon `serve_act_material_admission`
-    /// gate owns the `eliot-context-admission::admit_material_decision`
-    /// invocation over owner-resolved inputs with live-fence revalidation.
-    /// The Accepted reply stays an operation handle until the effect owner
-    /// completes it.
+    /// (`check_act_submit_binding`). The daemon-side
+    /// `eliot-context-admission::admit_material_decision` invocation over
+    /// owner-resolved inputs with live-fence revalidation runs at the future
+    /// live act claim/flight, not here. The Accepted reply stays an operation
+    /// handle until the effect owner completes it.
     SubmitActGated { completion_join: &'static str },
     /// Observe submit carrying the exact canonical tool bytes (issue #2565).
     /// Rides the same `agent_host_request_submit` entry as the digest-only
@@ -1848,7 +1848,7 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         | ToolRequest::Finish(_) => CanonicalDispatchEntry::InvokeRead,
         ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitObservePair,
         ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitActGated {
-            completion_join: "live act claim/flight carrying Governor owner inputs through the daemon serve_act_material_admission gate (Kernel submit gate check_act_submit_binding and bridge dispatch revalidation done; #1742 W4)",
+            completion_join: "daemon-side admit_material_decision invocation over Governor owner-resolved inputs with dispatch-time revalidation through a live act claim/flight (Kernel submit gate check_act_submit_binding and bridge dispatch revalidation done; #1742 W4)",
         },
         ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved",
