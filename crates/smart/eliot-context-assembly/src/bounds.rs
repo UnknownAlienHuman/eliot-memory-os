@@ -343,9 +343,24 @@ pub(crate) fn recipe(recipe: &ContextRecipe) -> Result<(), AssemblyError> {
 pub(crate) fn quality(scorecard: &QualityScorecard) -> Result<(), AssemblyError> {
     let mut budget = Budget(0);
     binding(&scorecard.binding, &mut budget)?;
+    count(
+        scorecard.applicability.resolved.len(),
+        6,
+        "quality.applicability.resolved",
+    )?;
+    count(
+        scorecard.applicability.unknown.len(),
+        6,
+        "quality.applicability.unknown",
+    )?;
     count(scorecard.results.len(), 12, "quality.results")?;
     for result in &scorecard.results {
         binding(&result.binding, &mut budget)?;
+        count(
+            result.required_evidence.len(),
+            MAX_REFERENCES,
+            "quality.required_evidence",
+        )?;
         count(result.evidence.len(), MAX_REFERENCES, "quality.evidence")?;
         count(
             result.measurements.len(),
@@ -359,6 +374,12 @@ pub(crate) fn quality(scorecard: &QualityScorecard) -> Result<(), AssemblyError>
         )?;
         for evidence in result.evidence.iter().chain(result.unknown_evidence.iter()) {
             budget.text(evidence.as_str(), "quality.evidence")?;
+        }
+        // The required member set is a caller-supplied list like every other
+        // result vector, so it carries the same bound and the same byte budget
+        // as the observed and unknown sets beside it.
+        for required in &result.required_evidence {
+            budget.text(required.as_str(), "quality.required_evidence")?;
         }
         if let Some(invariant) = &result.failed_invariant {
             budget.text(invariant.as_str(), "quality.failed_invariant")?;

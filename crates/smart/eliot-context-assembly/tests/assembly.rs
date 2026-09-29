@@ -1918,7 +1918,10 @@ fn missing_omission_coverage_evidence_is_rejected() {
         &policy(100_000),
         |_bytes| panic!("missing quality axis must fail"),
     );
-    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_, _))
+    ));
 }
 
 // WORK_UNIT_CASE: 626/33
@@ -2022,7 +2025,7 @@ fn each_quality_dimension_fails_independently() {
             |_bytes| panic!("failed dimension must block before measurement"),
         );
         match result {
-            Err(AssemblyError::QualityIncomplete(scorecard)) => {
+            Err(AssemblyError::QualityIncomplete(scorecard, _)) => {
                 assert_eq!(scorecard.results.len(), 12);
                 assert!(!scorecard.results[index].state.is_pass());
             }
@@ -2047,7 +2050,10 @@ fn unknown_mandatory_quality_blocks_complete() {
         &policy(100_000),
         |_bytes| panic!("unknown evidence must block before measurement"),
     );
-    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_, _))
+    ));
 
     let mut qualified_unknown = quality(&context);
     qualified_unknown.results[1].unknown_evidence = vec![id("unknown-evidence")];
@@ -2058,7 +2064,10 @@ fn unknown_mandatory_quality_blocks_complete() {
         &policy(100_000),
         |_bytes| panic!("passed with unknown evidence must block"),
     );
-    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_, _))
+    ));
 }
 
 // WORK_UNIT_CASE: 626/36
@@ -2084,7 +2093,10 @@ fn no_scalar_weighted_average_compensation() {
         &policy(100_000),
         |_bytes| panic!("compensation must not complete"),
     );
-    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_, _))
+    ));
 }
 
 // WORK_UNIT_CASE: 626/37
@@ -2133,7 +2145,10 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
         &policy(100_000),
         |_| panic!("quality gap precedes measurement"),
     );
-    assert!(matches!(material, Err(AssemblyError::QualityIncomplete(_))));
+    assert!(matches!(
+        material,
+        Err(AssemblyError::QualityIncomplete(_, _))
+    ));
 
     let tight = assemble_active_view(
         &complete_value,

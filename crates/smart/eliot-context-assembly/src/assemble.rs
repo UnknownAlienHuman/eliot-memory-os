@@ -2,7 +2,7 @@
 
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
-    QualityOperation, QualityScorecard, SerializedContextMeasurement,
+    QualityOperation, QualityRefusalKind, QualityScorecard, SerializedContextMeasurement,
 };
 
 use crate::{AssemblyError, bounds, measurement, render};
@@ -116,14 +116,20 @@ where
     if let Some(incomplete) = admitted.floor.incomplete()? {
         return Err(AssemblyError::Incomplete(Box::new(incomplete)));
     }
-    if let Err(error) = quality.validate() {
-        if error == ContextError::QualityIncomplete {
-            return Err(AssemblyError::QualityIncomplete(Box::new(quality)));
+    // One readiness rule for this consumer. The typed refusal is returned, not
+    // discarded: the caller receives the operation it asked for, whether it was
+    // blocked by a dimension result or by an unresolved applicability input, and
+    // the exact blocking results, instead of a generic quality error it would
+    // have to re-derive. A card that is not even structurally valid is still a
+    // contract rejection unless the owner reported it as quality incompleteness.
+    if let Err(refusal) = quality.suitability(QualityOperation::Compile, &[]) {
+        if refusal.kind == QualityRefusalKind::InvalidScorecard {
+            quality.validate().map_err(AssemblyError::Contract)?;
         }
-        return Err(error.into());
-    }
-    if quality.suitability(QualityOperation::Compile, &[]).is_err() {
-        return Err(AssemblyError::QualityIncomplete(Box::new(quality)));
+        return Err(AssemblyError::QualityIncomplete(
+            Box::new(quality),
+            Box::new(refusal),
+        ));
     }
     let expected_fence_digest =
         eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)?;

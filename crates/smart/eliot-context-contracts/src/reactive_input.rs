@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use thiserror::Error;
 
-use crate::{ActiveUnderstandingView, AdmittedContextSet, ContextError};
+use crate::{
+    ActiveUnderstandingView, AdmittedContextSet, ContextError, QualityDimension, QualityOperation,
+};
 
 /// Maximum canonical bytes retained by one immutable planning input.
 pub const MAX_REACTIVE_INPUT_BYTES: usize = 256 * 1024;
@@ -37,6 +39,20 @@ pub enum ReactiveInputError {
     /// A cross-projection identity relation is false.
     #[error("{field} does not match its binding")]
     BindingMismatch { field: &'static str },
+    /// The retained packet's scorecard refused the requested operation.
+    ///
+    /// The typed dimensions and unresolved applicability inputs travel with the
+    /// refusal instead of being collapsed into a generic planning error, so the
+    /// planner learns which dimension still lacks which evidence.
+    #[error("quality refused {operation:?} on {blocking:?}")]
+    QualityRefused {
+        /// The operation the caller requested.
+        operation: QualityOperation,
+        /// Dimensions that blocked it, in canonical order.
+        blocking: Vec<QualityDimension>,
+        /// Applicability inputs that were never resolved.
+        unresolved_applicability: Vec<crate::QualityApplicabilityInput>,
+    },
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
@@ -470,6 +486,22 @@ impl ContextPlanningView {
                 field: "view.admitted_canonical_bytes",
             });
         }
+        // Delivery is a dependent action, not a diagnostic read: this retained
+        // closure is handed to a planner that will act on it. It therefore
+        // applies the one shared readiness rule rather than treating structural
+        // validity as permission, and it names the exact blocking dimensions
+        // instead of returning a bare `Ok(())` or a generic error.
+        self.view
+            .suitability(QualityOperation::DependentAction, &[])
+            .map_err(|refusal| ReactiveInputError::QualityRefused {
+                operation: refusal.operation,
+                blocking: refusal
+                    .blocking
+                    .iter()
+                    .map(|result| result.dimension)
+                    .collect(),
+                unresolved_applicability: refusal.unresolved_applicability,
+            })?;
         Ok(())
     }
 }

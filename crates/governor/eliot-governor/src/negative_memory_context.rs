@@ -1004,9 +1004,13 @@ fn negative_memory_coverage_result(
         );
     }
 
-    let state = if !evidence.is_empty() {
-        QualityDimensionState::Passed
-    } else if !unknown_evidence.is_empty() && !projection.losses.is_empty() {
+    // A named loss means the compared rule set was not completely established,
+    // so the axis is degraded whether or not some governing rules were exposed.
+    // Grading it `Passed` here while the loss handles sit in the missing/stale
+    // set would be a pass carrying unknowns, which the owner's own validation
+    // rejects; the axis would then be ungradeable rather than honestly degraded,
+    // and a partially observed comparison would read as complete coverage.
+    let state = if !projection.losses.is_empty() {
         QualityDimensionState::Degraded {
             reason: std::format!(
                 "negative-memory exposure carries {} named loss(es) against read {}; the unit is represented but its coverage is not established",
@@ -1014,6 +1018,8 @@ fn negative_memory_coverage_result(
                 projection.evidence.read_handle
             ),
         }
+    } else if !evidence.is_empty() {
+        QualityDimensionState::Passed
     } else {
         QualityDimensionState::Unknown
     };
