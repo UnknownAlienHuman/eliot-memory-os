@@ -109,8 +109,9 @@ use crate::operation_parameters::{
 };
 use crate::{
     CONTRACT_NAME, CONTRACT_VERSION, ContractVersion, EffectClass, GENESIS_MANIFEST_NAME,
-    NamedMutationOperation, NamedOperationManifest, NamedReadOperation, NamedReadRequest,
-    OperationManifestDigest, OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION, PreparedTransition,
+    NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, NamedReadOperation,
+    NamedReadRequest, OperationManifestDigest, OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION,
+    PreparedTransition,
     ReadConsistency, StoreError, TransitionClass, canonical_json_bytes,
     maintenance_trigger_decision_owner_key, sha256_hex,
 };
@@ -782,29 +783,7 @@ pub fn validate_read_against_catalogue(
     }
     validate_typed_read_parameters(request.operation, &request.parameters)?;
     if request.operation == NamedReadOperation::GetMaintenanceTriggerDecisionOwner {
-        if request.consistency != ReadConsistency::ExactFence {
-            return Err(StoreError::InvalidField {
-                field: "consistency",
-                reason: "maintenance trigger decision owner read requires exact_fence",
-            });
-        }
-        let trigger_id = request
-            .parameters
-            .get("trigger_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(StoreError::InvalidField {
-                field: "maintenance_trigger_decision.trigger_id",
-                reason: "must be non-empty text",
-            })?;
-        let trigger_revision = request
-            .parameters
-            .get("trigger_revision")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(StoreError::InvalidField {
-                field: "maintenance_trigger_decision.trigger_revision",
-                reason: "must be a positive decimal revision",
-            })?;
-        let _ = maintenance_trigger_decision_owner_key(trigger_id, trigger_revision)?;
+        validate_maintenance_trigger_decision_owner_read(request)?;
     }
     match (entry.requires_scope_id, request.scope_id.as_ref()) {
         (true, None) => {
@@ -913,61 +892,112 @@ pub fn validate_transition_against_catalogue(
         ) {
             return Err(StoreError::TransitionClassExceeded);
         }
-        match command.operation {
-            NamedMutationOperation::CaptureObservation
-            | NamedMutationOperation::AppendAuditEvent
-            | NamedMutationOperation::ApplyLifecyclePolicy
-            | NamedMutationOperation::ReconcileRecovery
-            | NamedMutationOperation::RecordFinishDecision
-            | NamedMutationOperation::RecordFinishEvidence
-            | NamedMutationOperation::UpdateTaskState
-            | NamedMutationOperation::ApplyEpistemicRevision
-            | NamedMutationOperation::ApplyErasure
-            | NamedMutationOperation::ApplySwarmOwnerRevisions
-            | NamedMutationOperation::ApplyInstrumentRegistryState => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::RecordMaintenanceTriggerDecision => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                validate_maintenance_trigger_decision_parameters(&command.parameters)?;
-            }
-            NamedMutationOperation::ApplyNotificationState => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_notification_mutation_params(&command.parameters)?;
-            }
-            NamedMutationOperation::ApplyReactiveInjectionState
-            | NamedMutationOperation::ApplyResourceSnapshot => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_reactive_mutation_params(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::ApplyUserAutomationState => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_automation_mutation_params(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::CommitExperienceBank
-            | NamedMutationOperation::CommitAgentFeedback => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::ApplyBlackboardItem => {
-                validate_blackboard_transition(transition, &command.parameters)?;
-            }
-            NamedMutationOperation::RecordLearningRecord => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::decode_learning_mutation(command.operation, &command.parameters)
-                    .map(|_| ())?;
-            }
-            NamedMutationOperation::RecordCapabilityEvidenceRecord => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::decode_capability_evidence_mutation(command.operation, &command.parameters)
-                    .map(|_| ())?;
-            }
-            NamedMutationOperation::RecordAuthorityRevocation => {
-                return Err(StoreError::UnknownOperation);
-            }
-        }
+        validate_command_parameters_against_catalogue(transition, command)?;
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
     }
+    Ok(())
+}
+
+/// Validates one named mutation command's owner-approved typed parameters.
+///
+/// Each activated operation carries only its owner's typed parameters;
+/// unknown, extra, and control-substitution parameters fail here. The
+/// maintenance-trigger decision command additionally binds the exact trigger
+/// identity/revision and requires at least one durable downstream intent
+/// reference; it records the reference without executing a job or delivering
+/// a recommendation/wake.
+fn validate_command_parameters_against_catalogue(
+    transition: &PreparedTransition,
+    command: &NamedMutationRequest,
+) -> Result<(), StoreError> {
+    match command.operation {
+        NamedMutationOperation::CaptureObservation
+        | NamedMutationOperation::AppendAuditEvent
+        | NamedMutationOperation::ApplyLifecyclePolicy
+        | NamedMutationOperation::ReconcileRecovery
+        | NamedMutationOperation::RecordFinishDecision
+        | NamedMutationOperation::RecordFinishEvidence
+        | NamedMutationOperation::UpdateTaskState
+        | NamedMutationOperation::ApplyEpistemicRevision
+        | NamedMutationOperation::ApplyErasure
+        | NamedMutationOperation::ApplySwarmOwnerRevisions
+        | NamedMutationOperation::ApplyInstrumentRegistryState => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::RecordMaintenanceTriggerDecision => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            validate_maintenance_trigger_decision_parameters(&command.parameters)?;
+        }
+        NamedMutationOperation::ApplyNotificationState => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_notification_mutation_params(&command.parameters)?;
+        }
+        NamedMutationOperation::ApplyReactiveInjectionState
+        | NamedMutationOperation::ApplyResourceSnapshot => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_reactive_mutation_params(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::ApplyUserAutomationState => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_automation_mutation_params(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::CommitExperienceBank
+        | NamedMutationOperation::CommitAgentFeedback => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::ApplyBlackboardItem => {
+            validate_blackboard_transition(transition, &command.parameters)?;
+        }
+        NamedMutationOperation::RecordLearningRecord => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::decode_learning_mutation(command.operation, &command.parameters)
+                .map(|_| ())?;
+        }
+        NamedMutationOperation::RecordCapabilityEvidenceRecord => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::decode_capability_evidence_mutation(command.operation, &command.parameters)
+                .map(|_| ())?;
+        }
+        NamedMutationOperation::RecordAuthorityRevocation => {
+            return Err(StoreError::UnknownOperation);
+        }
+    }
+    Ok(())
+}
+
+/// Validates the maintenance-trigger decision owner read identity.
+///
+/// The owner row is addressed by exact trigger identity plus decimal
+/// revision, so the revision travels as text and is validated here through
+/// the canonical owner-key constructor. The read requires `exact_fence`
+/// because the owner row is fenced canonical state, not a scope projection.
+fn validate_maintenance_trigger_decision_owner_read(
+    request: &NamedReadRequest,
+) -> Result<(), StoreError> {
+    if request.consistency != ReadConsistency::ExactFence {
+        return Err(StoreError::InvalidField {
+            field: "consistency",
+            reason: "maintenance trigger decision owner read requires exact_fence",
+        });
+    }
+    let trigger_id = request
+        .parameters
+        .get("trigger_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_id",
+            reason: "must be non-empty text",
+        })?;
+    let trigger_revision = request
+        .parameters
+        .get("trigger_revision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "maintenance_trigger_decision.trigger_revision",
+            reason: "must be a positive decimal revision",
+        })?;
+    let _ = maintenance_trigger_decision_owner_key(trigger_id, trigger_revision)?;
     Ok(())
 }
 

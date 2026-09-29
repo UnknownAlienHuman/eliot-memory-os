@@ -28,7 +28,8 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
     MaintenanceTriggerPendingSummary, MessageType, ProtocolPayload, ProtocolVersion,
-    RequestIdentity,
+    RequestIdentity, TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
+    host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};

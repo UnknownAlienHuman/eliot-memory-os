@@ -209,9 +209,11 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
 // retained in ORS and the lost generation's consumer authority is revoked
 // through the existing Kernel owner. This seam fixes that disposition
 // exactly; enforcement belongs to the existing session-recovery route
-// (`daemon_request_dispatch::store_recovery_operation` →
-// `StoreGateway::recover_maintenance_trigger_session`), which revokes stale
-// claims, retains every pending row, and surfaces the bounded pending set.
+// (STITCH adopter: `daemon_runtime.rs::record_daemon_failed` observes the
+// loss and fences the old state; replacement startup runs
+// `daemon_request_dispatch::store_recovery_operation` →
+// `StoreGateway::recover_maintenance_trigger_session`, which revokes stale
+// claims, retains every pending row, and surfaces the bounded pending set).
 // Nothing here drops a row, mints a consumer identity, or evaluates a
 // trigger: there is no second supervisor, database, or evaluator.
 
@@ -238,11 +240,13 @@ pub(crate) enum DaemonLossTriggerClaimDisposition {
 /// a terminally expired supervision lease. The positive arm carries the one
 /// subordinate observation; the owning session-recovery route emits the
 /// terminal. Enforcement stays with that existing Kernel owner.
+///
+/// STITCH: the loss-path caller lives in the Kernel replacement-startup
+/// lane (`daemon_runtime.rs::record_daemon_failed` →
+/// `daemon_request_dispatch::store_recovery_operation` →
+/// `StoreGateway::recover_maintenance_trigger_session`); that lane adopts
+/// this classifier when it consumes the disposition.
 #[cfg(windows)]
-#[allow(
-    dead_code,
-    reason = "STITCH: wired by the Kernel replacement-startup lane; seam first"
-)]
 pub(crate) fn classify_daemon_loss_trigger_claims(
     state: &DaemonRuntimeState,
 ) -> DaemonLossTriggerClaimDisposition {

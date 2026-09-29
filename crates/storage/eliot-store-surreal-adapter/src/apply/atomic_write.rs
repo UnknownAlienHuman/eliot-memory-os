@@ -853,6 +853,93 @@ fn append_maintenance_trigger_decision_owner_statement(
     if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
         return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
     }
+    let decoded = decode_maintenance_trigger_decision_params(command)?;
+    let operation_id = transition.identity.operation_id.to_string();
+    let owner_payload = MaintenanceTriggerDecisionOwnerPayload {
+        operation_id: &operation_id,
+        trigger_id: decoded.trigger_id,
+        operation_hash: decoded.operation_hash,
+        trigger_revision: decoded.trigger_revision,
+        evaluation_revision: decoded.evaluation_revision,
+        policy_revision: decoded.policy_revision,
+        scope_ref: decoded.scope_ref,
+        job_ref: decoded.job_ref,
+        recommendation_ref: decoded.recommendation_ref,
+        wake_ref: decoded.wake_ref,
+        decision_json: decoded.decision_json,
+    };
+    let payload = eliot_store_api::canonical_json_bytes(&owner_payload)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if payload.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+
+    // The trigger revision is part of an immutable key, so distinct retained
+    // revisions remain separately addressable without overwriting history.
+    let key_bytes =
+        eliot_store_api::canonical_json_bytes(&(decoded.trigger_id, decoded.trigger_revision))
+            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let key = String::from_utf8(key_bytes)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let owner_key = eliot_store_api::RecoveryRecordKey::new(
+        eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_NAMESPACE,
+        key,
+    )
+    .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&owner_key)?;
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(owner_key.namespace));
+    record.insert("key".to_owned(), json!(owner_key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert("revision".to_owned(), json!(1_u64));
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA),
+    );
+    let value_digest = eliot_store_api::sha256_hex(&payload);
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert("value_digest".to_owned(), json!(value_digest));
+
+    let expected = Value::Object(record.clone());
+    sql.push_str(TX_MAINTENANCE_TRIGGER_DECISION_OWNER);
+    bindings.insert(
+        "maintenance_trigger_decision_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert(
+        "maintenance_trigger_decision_id".to_owned(),
+        json!(owner_id),
+    );
+    bindings.insert("maintenance_trigger_decision_expected".to_owned(), expected);
+    bindings.insert(
+        "maintenance_trigger_decision_record".to_owned(),
+        Value::Object(record),
+    );
+    Ok(())
+}
+
+/// Decoded `RecordMaintenanceTriggerDecision` parameters, borrowed from the
+/// admitted command.
+///
+/// Validates the exact typed fields and the downstream-intent rule (at least
+/// one of `job_ref`, `recommendation_ref`, `wake_ref`) without interpreting
+/// the decision bytes or executing the referenced intents.
+struct DecodedMaintenanceTriggerDecision<'a> {
+    trigger_id: &'a str,
+    operation_hash: &'a str,
+    trigger_revision: u64,
+    evaluation_revision: &'a str,
+    policy_revision: &'a str,
+    scope_ref: &'a str,
+    job_ref: Option<&'a str>,
+    recommendation_ref: Option<&'a str>,
+    wake_ref: Option<&'a str>,
+    decision_json: &'a str,
+}
+
+fn decode_maintenance_trigger_decision_params(
+    command: &eliot_store_api::NamedMutationRequest,
+) -> Result<DecodedMaintenanceTriggerDecision<'_>, AdapterError> {
     let text_param = |name: &'static str| {
         command
             .parameters
@@ -903,9 +990,7 @@ fn append_maintenance_trigger_decision_owner_statement(
         }));
     }
     let decision_json = text_param("decision_json")?;
-    let operation_id = transition.identity.operation_id.to_string();
-    let owner_payload = MaintenanceTriggerDecisionOwnerPayload {
-        operation_id: &operation_id,
+    Ok(DecodedMaintenanceTriggerDecision {
         trigger_id,
         operation_hash,
         trigger_revision,
@@ -916,54 +1001,7 @@ fn append_maintenance_trigger_decision_owner_statement(
         recommendation_ref,
         wake_ref,
         decision_json,
-    };
-    let payload = eliot_store_api::canonical_json_bytes(&owner_payload)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    if payload.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
-        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
-    }
-
-    // The trigger revision is part of an immutable key, so distinct retained
-    // revisions remain separately addressable without overwriting history.
-    let key_bytes = eliot_store_api::canonical_json_bytes(&(trigger_id, trigger_revision))
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    let key = String::from_utf8(key_bytes)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    let owner_key = eliot_store_api::RecoveryRecordKey::new(
-        eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_NAMESPACE,
-        key,
-    )
-    .map_err(AdapterError::Store)?;
-    let owner_id = recovery_owner_id(&owner_key)?;
-    let mut record = Map::new();
-    record.insert("namespace".to_owned(), json!(owner_key.namespace));
-    record.insert("key".to_owned(), json!(owner_key.key));
-    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
-    record.insert("revision".to_owned(), json!(1_u64));
-    record.insert(
-        "schema".to_owned(),
-        json!(eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA),
-    );
-    let value_digest = eliot_store_api::sha256_hex(&payload);
-    record.insert("payload".to_owned(), json!(payload));
-    record.insert("value_digest".to_owned(), json!(value_digest));
-
-    let expected = Value::Object(record.clone());
-    sql.push_str(TX_MAINTENANCE_TRIGGER_DECISION_OWNER);
-    bindings.insert(
-        "maintenance_trigger_decision_table".to_owned(),
-        json!(schema::table::RECOVERY_OWNER),
-    );
-    bindings.insert(
-        "maintenance_trigger_decision_id".to_owned(),
-        json!(owner_id),
-    );
-    bindings.insert("maintenance_trigger_decision_expected".to_owned(), expected);
-    bindings.insert(
-        "maintenance_trigger_decision_record".to_owned(),
-        Value::Object(record),
-    );
-    Ok(())
+    })
 }
 
 fn recovery_owner_id(key: &eliot_store_api::RecoveryRecordKey) -> Result<String, AdapterError> {

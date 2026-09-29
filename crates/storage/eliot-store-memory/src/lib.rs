@@ -4091,6 +4091,52 @@ impl MemoryStore {
         payload.map_err(|error| StoreError::Serialization(error.to_string()))
     }
 
+    /// Reads the immutable maintenance-trigger decision owner row, if present.
+    ///
+    /// Addresses the row by exact trigger identity plus decimal revision and
+    /// refuses a row whose stored key or schema diverges from the requested
+    /// immutable owner identity. Absence is a legitimate `None` payload: the
+    /// decision may not have committed yet, and absence during an outage is
+    /// not proof of non-commit.
+    fn maintenance_trigger_decision_owner_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+    ) -> Result<Option<Value>, StoreError> {
+        let trigger_id = query
+            .parameters
+            .get("trigger_id")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "maintenance_trigger_decision.trigger_id",
+                reason: "must be non-empty text",
+            })?;
+        let trigger_revision = query
+            .parameters
+            .get("trigger_revision")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "maintenance_trigger_decision.trigger_revision",
+                reason: "must be a positive decimal revision",
+            })?;
+        let owner_key =
+            eliot_store_api::maintenance_trigger_decision_owner_key(trigger_id, trigger_revision)?;
+        let record = state.recovery_records.get(&owner_key);
+        if let Some(record) = record {
+            record.validate()?;
+            if record.record_key() != owner_key
+                || record.schema != eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA
+            {
+                return Err(StoreError::InvalidField {
+                    field: "maintenance_trigger_decision.owner_record",
+                    reason: "does not match the requested immutable owner identity",
+                });
+            }
+        }
+        serde_json::to_value(record)
+            .map(Some)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
     fn named_read_core_payload(
         state: &MemoryState,
         query: &NamedReadRequest,
@@ -4098,41 +4144,7 @@ impl MemoryStore {
         revision_heads: &[RevisionHead],
     ) -> Result<Option<Value>, StoreError> {
         if query.operation == NamedReadOperation::GetMaintenanceTriggerDecisionOwner {
-            let trigger_id = query
-                .parameters
-                .get("trigger_id")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "maintenance_trigger_decision.trigger_id",
-                    reason: "must be non-empty text",
-                })?;
-            let trigger_revision = query
-                .parameters
-                .get("trigger_revision")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "maintenance_trigger_decision.trigger_revision",
-                    reason: "must be a positive decimal revision",
-                })?;
-            let owner_key = eliot_store_api::maintenance_trigger_decision_owner_key(
-                trigger_id,
-                trigger_revision,
-            )?;
-            let record = state.recovery_records.get(&owner_key);
-            if let Some(record) = record {
-                record.validate()?;
-                if record.record_key() != owner_key
-                    || record.schema != eliot_store_api::MAINTENANCE_TRIGGER_DECISION_OWNER_SCHEMA
-                {
-                    return Err(StoreError::InvalidField {
-                        field: "maintenance_trigger_decision.owner_record",
-                        reason: "does not match the requested immutable owner identity",
-                    });
-                }
-            }
-            return serde_json::to_value(record)
-                .map(Some)
-                .map_err(|error| StoreError::Serialization(error.to_string()));
+            return Self::maintenance_trigger_decision_owner_payload(state, query);
         }
 
         let payload = match query.operation {
