@@ -2265,8 +2265,8 @@ impl PackageStager {
     }
 
     /// Retains a source and marker root under the explicit installer profile.
-    /// User profiles use a current-user root lease; only SystemService enters
-    /// the ProgramData protected-root lease.
+    /// User profiles use a current-user root lease; only `SystemService` enters
+    /// the `ProgramData` protected-root lease.
     pub fn open_for_profile(
         source: TrustedSourceBundle,
         installation_root: &Path,
@@ -2465,6 +2465,31 @@ impl PackageStager {
         )
     }
 
+    /// Retains the exact destination root this stager was opened for and proves
+    /// it still matches the retained parent identity and canonical path.
+    fn retain_exact_destination_root(
+        &self,
+        destination_root: &Path,
+    ) -> Result<(RetainedDestinationParent, PathBuf), PackageStagingError> {
+        if self.destination_root.as_deref().is_none_or(|retained| {
+            !super::windows_paths_equal(retained, destination_root)
+        }) {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        let (parent, canonical_root) =
+            retain_exact_destination_parent_for_profile(destination_root, self.profile)?;
+        let retained_root = self
+            .destination_root
+            .as_deref()
+            .ok_or(PackageStagingError::IdentityMismatch)?;
+        if Some(parent.identity) != self.destination_parent_identity
+            || !super::windows_paths_equal(&canonical_root, retained_root)
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        Ok((parent, canonical_root))
+    }
+
     fn stage_with_expected_inventory(
         &self,
         manifest: &PackageManifest,
@@ -2473,31 +2498,13 @@ impl PackageStager {
     ) -> Result<StagingReceipt, PackageStagingError> {
         let manifest = manifest.validate()?;
         let generation = validate_relative_text(&manifest.generation)?;
-        let (parent, generation_root) = match exact_destination_root {
-            Some(destination_root) => {
-                if self.destination_root.as_deref().map_or(true, |retained| {
-                    !super::windows_paths_equal(retained, destination_root)
-                }) {
-                    return Err(PackageStagingError::IdentityMismatch);
-                }
-                let (parent, canonical_root) =
-                    retain_exact_destination_parent_for_profile(destination_root, self.profile)?;
-                let retained_root = self
-                    .destination_root
-                    .as_deref()
-                    .ok_or(PackageStagingError::IdentityMismatch)?;
-                if Some(parent.identity) != self.destination_parent_identity
-                    || !super::windows_paths_equal(&canonical_root, retained_root)
-                {
-                    return Err(PackageStagingError::IdentityMismatch);
-                }
-                (parent, canonical_root)
-            }
-            None => {
-                let parent = self.retain_generation_parent(&generation)?;
-                let root = generation.join_to(&parent.path);
-                (parent, root)
-            }
+        let (parent, generation_root) = if let Some(destination_root) = exact_destination_root {
+            let (parent, canonical_root) = self.retain_exact_destination_root(destination_root)?;
+            (parent, canonical_root)
+        } else {
+            let parent = self.retain_generation_parent(&generation)?;
+            let root = generation.join_to(&parent.path);
+            (parent, root)
         };
         self.source.verify_stable()?;
         // Enumerate from the already-retained source root handle instead of
@@ -2701,7 +2708,7 @@ impl PackageStager {
         )
     }
 
-    /// Reconcile a lost StagePackage response using its authenticated marker
+    /// Reconcile a lost `StagePackage` response using its authenticated marker
     /// under the exact profile-owned roots retained by the transaction.
     pub fn reconcile_prepared_profile_destination_only(
         installation_root: &Path,
@@ -3726,27 +3733,7 @@ where
         if depth > MAX_PACKAGE_PATH_DEPTH {
             return Err(PackageStagingError::BoundExceeded);
         }
-        let mut pending = Vec::new();
-        let read_dir = std::fs::read_dir(&directory).map_err(|error| {
-            map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_READ_DIR)
-        })?;
-        for entry in read_dir {
-            let entry = entry.map_err(|error| {
-                map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_ENTRY)
-            })?;
-            let name = entry
-                .file_name()
-                .to_str()
-                .ok_or(PackageStagingError::InvalidRelativePath)?
-                .to_owned();
-            let relative_text = if prefix.is_empty() {
-                name
-            } else {
-                format!("{}/{}", prefix.join("/"), name)
-            };
-            let relative = validate_relative_text(&relative_text)?;
-            pending.push((relative, entry.path()));
-        }
+        let pending = read_trusted_source_pending(&directory, &prefix)?;
         pending.sort_by(|left, right| ordinal_path_cmp(&left.0, &right.0));
         for pair in pending.windows(2) {
             if ordinal_path_eq(&pair[0].0, &pair[1].0) {
@@ -3805,6 +3792,36 @@ where
         stack.extend(child_directories.into_iter().rev());
     }
     Ok(entries)
+}
+
+/// Reads one directory level of the trusted source tree and returns every child
+/// as its validated descriptor-relative path plus its child pathname.
+#[cfg(windows)]
+fn read_trusted_source_pending(
+    directory: &Path,
+    prefix: &[String],
+) -> Result<Vec<(PackageRelativePath, PathBuf)>, PackageStagingError> {
+    let mut pending = Vec::new();
+    let read_dir = std::fs::read_dir(directory).map_err(|error| {
+        map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_READ_DIR)
+    })?;
+    for entry in read_dir {
+        let entry = entry
+            .map_err(|error| map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_ENTRY))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(PackageStagingError::InvalidRelativePath)?
+            .to_owned();
+        let relative_text = if prefix.is_empty() {
+            name
+        } else {
+            format!("{}/{}", prefix.join("/"), name)
+        };
+        let relative = validate_relative_text(&relative_text)?;
+        pending.push((relative, entry.path()));
+    }
+    Ok(pending)
 }
 
 #[cfg(not(windows))]
@@ -5646,7 +5663,7 @@ fn read_file_prefix_handle(
 }
 
 #[cfg(windows)]
-fn rollback_created_tree(mut created: CreatedTree) -> Result<(), PackageStagingError> {
+fn rollback_created_tree(created: CreatedTree) -> Result<(), PackageStagingError> {
     rollback_created_tree_for_profile(created, super::InstallerRootProfile::SystemService)
 }
 
