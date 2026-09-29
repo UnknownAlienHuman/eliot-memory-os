@@ -24,6 +24,26 @@
     "OWNER_BLOCKED",
     "SEPARATE_CAUSAL_ISSUE"
   ],
+  "controls": {
+    "valid_row": {
+      "targets": "row",
+      "accepts": "a well-formed accounting row: complete, owned, reconciled with a concrete reason, a focused proof and a removal condition. The negative set above is only meaningful if this is accepted.",
+      "record": {
+        "key": "current/crates/eliot-app/src/mcp_stdio/task.rs:1280:clippy::too_many_lines",
+        "kind": "current",
+        "path": "crates/eliot-app/src/mcp_stdio/task.rs",
+        "line": 1280,
+        "lint": "clippy::too_many_lines",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "one named ordered end-to-end projection scenario whose step order is the preserved invariant; the line budget is a stand-in for that order, not for size",
+        "removal_condition": "the ordered scenario is extracted into a named helper module and the annotation is deleted",
+        "focused_proof": "test_16_too_many_lines_preserves_named_ordered_scenario",
+        "reachability": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::dispatch"
+      }
+    }
+  },
   "mutations": {
     "row_lint_missing": {
       "targets": "row",
@@ -58,6 +78,24 @@
         "removal_condition": "scenario split",
         "focused_proof": "test_16_too_many_lines_preserves_named_ordered_scenario",
         "reachability": "crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::dispatch"
+      }
+    },
+    "expect_used_swallowed_result": {
+      "targets": "row",
+      "rejects": "an expect/unwrap allowance on a production row whose reason names no assertion boundary; that is a swallowed Result, not a preserved diagnostic assertion",
+      "record": {
+        "key": "mutation/expect-used-swallowed",
+        "kind": "current",
+        "path": "crates/eliot-app/src/host_runtime/event_and_authority.rs",
+        "line": 940,
+        "lint": "clippy::unwrap_used",
+        "target_class": "production",
+        "disposition": "ACCEPTED_NARROW_EXPECTATION",
+        "owner": "838",
+        "reason": "unwrap is convenient here and the value is known to be present",
+        "removal_condition": "the Result is propagated as a typed error instead",
+        "focused_proof": "test_15_assertion_expect_unwrap_still_fails_on_its_negative",
+        "reachability": "crates/eliot-app/src/host_runtime/event_and_authority.rs::prepare_cognitive_external_scope"
       }
     },
     "row_no_focused_proof": {
