@@ -3724,6 +3724,7 @@ fn finish_user_mode_task_activation(
         .zip(durable.effect_progress())
         .any(|(effect, progress)| {
             let registration = progress.current_user_task_receipt.as_ref();
+            let run_intent = progress.current_user_task_run_intent.as_ref();
             matches!(
                 effect,
                 eliot_installation::InstallerEffectPlan::RegisterCurrentUserTask { .. }
@@ -3732,7 +3733,11 @@ fn finish_user_mode_task_activation(
                     registration.request == request
                         && run_receipt.task_name == registration.task_name
                         && run_receipt.sid == registration.sid
-                        && run_receipt.session_id == registration.session_id
+                        && run_receipt.session_id != 0
+                        && run_intent.is_some_and(|intent| {
+                            intent.session_id == run_receipt.session_id
+                                && intent.session_id != 0
+                        })
                         && run_receipt.task_xml_sha256 == registration.task_xml_sha256
                         && run_receipt.engine_process_id != 0
                 })
@@ -4882,10 +4887,14 @@ fn reconcile_host_activation_terminal(
             })?;
         if !user_mode_task_run_receipt_is_durable(&durable) {
             if !complete_user_mode_task {
-                return Err(InstallationError::IncompleteObservation(
-                    "Host committed the UserMode generation, but exact Task registration and RunEx receipts must be completed before activation reconciliation or rollback"
-                        .to_owned(),
-                ));
+                // Recover mode is a read-only terminal query. Keep the exact
+                // Host commit visible as pending while Task receipts remain
+                // incomplete; never convert that live generation into a
+                // rollback attempt.
+                return Ok(Some(InstallationStepOutcome::Applied {
+                    stage: durable.stage(),
+                    evidence_refs: evidence,
+                }));
             }
             let task_outcome = finish_user_mode_task_activation(
                 &mut coordinator,
@@ -4913,6 +4922,9 @@ fn user_mode_task_run_receipt_is_durable(transaction: &InstallationTransaction) 
             let Some(registration) = progress.current_user_task_receipt.as_ref() else {
                 return false;
             };
+            let Some(run_intent) = progress.current_user_task_run_intent.as_ref() else {
+                return false;
+            };
             let Some(run) = progress.current_user_task_run_receipt.as_ref() else {
                 return false;
             };
@@ -4925,7 +4937,8 @@ fn user_mode_task_run_receipt_is_durable(transaction: &InstallationTransaction) 
             ) && request == &registration.request
                 && run.task_name == registration.task_name
                 && run.sid == registration.sid
-                && run.session_id == registration.session_id
+                && run.session_id != 0
+                && run.session_id == run_intent.session_id
                 && run.task_xml_sha256 == registration.task_xml_sha256
                 && run.engine_process_id != 0
         })
@@ -5548,13 +5561,10 @@ fn installation_outcome_status(outcome: &InstallationStepOutcome) -> &'static st
 }
 
 fn installation_command_exit_code(status: &str) -> i32 {
-    if matches!(
-        status,
-        "EFFECTS_APPLIED" | "ROLLED_BACK" | "ACTIVE_VERIFIED"
-    ) {
-        0
-    } else {
-        INVALID_REQUEST_EXIT
+    match status {
+        "EFFECTS_APPLIED" | "ROLLED_BACK" | "ACTIVE_VERIFIED" => 0,
+        "PENDING_RUNTIME" => UNKNOWN_OUTCOME_EXIT,
+        _ => INVALID_REQUEST_EXIT,
     }
 }
 
