@@ -1741,8 +1741,8 @@ pub enum HostError {
 
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, UserOwnedRootLease,
-    WindowsAdapterError, observe_named_pipe_peer_process,
+    JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, WindowsAdapterError,
+    observe_named_pipe_peer_process,
 };
 
 // I16.10 (issue #1837): the last entry carries the installer-owned Watchdog
@@ -6573,7 +6573,7 @@ impl HostComposition {
             .map_err(HostError::Installation)?;
         if startup_manifest.runtime_launch.profile != selected_profile {
             return Err(HostError::ProcessContour(format!(
-                "selected {selected_profile:?} lease mode does not match the approved {} profile",
+                "selected {selected_profile:?} lease mode does not match the approved {:?} profile",
                 startup_manifest.runtime_launch.profile
             )));
         }
