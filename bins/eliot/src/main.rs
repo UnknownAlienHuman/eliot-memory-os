@@ -2851,6 +2851,7 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
                         "gap": report.readiness.age_gap,
                     },
                     "runtime_health": report.runtime_health,
+                    "installation_profile": report.installation_profile,
                     "recovery_command": report.recovery_command,
                     "gaps": report.gaps,
                     "components": report.components,
