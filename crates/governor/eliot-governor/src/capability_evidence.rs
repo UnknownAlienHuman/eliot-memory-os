@@ -781,8 +781,32 @@ impl CapabilityEvidenceRecord {
 
     /// Returns true when this record is a fresh exact-fingerprint positive
     /// that may admit production work: `probe_passed` or `observed` from an
-    /// admissible evidence source, time-fresh at `now`, on a scope the
-    /// registry has not invalidated.
+    /// admissible evidence source, time-fresh at `now`, on a scope **this
+    /// capability** has not been invalidated on.
+    ///
+    /// The invalidation test is the `(scope, skill)` lookup
+    /// ([`invalidation_for`]), not the scope-level rollup
+    /// ([`scope_has_any_invalidation`]), for the reason that rollup's own
+    /// documentation gives: an invalidation is published against the
+    /// `(skill_id, scope_fingerprint)` key it staled, so a sibling
+    /// capability's cause on the same route scope is not evidence about this
+    /// one. I3.4 fixes the direction: "A capability failure is scoped to the
+    /// narrowest observed lifecycle. One bad call or item does not silently
+    /// poison an installation or every future route", and a completed
+    /// requalification must actually restore admission
+    /// ([`CapabilityRegistry::clear_invalidation_by_requalification`] clears
+    /// exactly one key).
+    ///
+    /// Reading the rollup here made both impossible. The rollup answers "is
+    /// this scope invalidated for ANY retained skill", so it stayed true while
+    /// a sibling's cause stood, and a key this capability's own requalification
+    /// had already cleared was still blocked by the sibling's presence — the
+    /// requalification cleared the cause and admission stayed refused. The
+    /// per-capability guarantee is untouched by this: a limited record is
+    /// indexed under its own `(scope, skill)` key by
+    /// [`CapabilityRegistry::rebuild_invalidation_index`], so this
+    /// capability's own cause still refuses it, and an exact-scope positive
+    /// for a capability that was never invalidated is not made to carry one.
     #[must_use]
     pub fn is_fresh_positive_for(
         &self,
@@ -793,7 +817,7 @@ impl CapabilityEvidenceRecord {
     ) -> bool {
         self.skill_id == skill_id
             && self.scope_fingerprint.exact_match(scope)
-            && !invalidated.contains_key(&self.scope_fingerprint)
+            && invalidation_for(invalidated, &self.scope_fingerprint, skill_id).is_none()
             && self.is_time_fresh(now)
             && self.is_qualifying_evidence()
     }
@@ -931,15 +955,15 @@ impl CapabilityRegistry {
     /// authority. Freshness still runs at admission time against the caller's
     /// `now` through [`CapabilityEvidenceRecord::is_time_fresh`].
     ///
-    /// A scope-wide invalidation is cleared only by a fresh requalification
-    /// that names the retained blocking reference exactly and carries a
-    /// strictly newer owner-issued revision — see
-    /// [`CapabilityEvidenceRecord::requalifying`]. Qualifying evidence that
+    /// The cause retained for a `(skill_id, scope_fingerprint)` key is cleared
+    /// only by a fresh requalification that names the retained blocking
+    /// reference exactly and carries a strictly newer owner-issued revision —
+    /// see [`CapabilityEvidenceRecord::requalifying`]. Qualifying evidence that
     /// names no blocking reference, or names a different one, is still retained
     /// as the key's current record but leaves the invalidation standing. An
     /// insertion that opens a new key never revives a scope another capability's
-    /// evidence invalidated, so a scope-wide invalidation is not cleared by an
-    /// unrelated capability insertion on the same fingerprint.
+    /// evidence invalidated, so an invalidation is not cleared by an unrelated
+    /// capability insertion on the same fingerprint.
     ///
     /// A same-key replacement remains possible at capacity. A new key is
     /// refused once the bound is reached, preserving every retained
@@ -996,6 +1020,11 @@ impl CapabilityRegistry {
     /// forever, and `apply_scope_change` applies a change per record rather than
     /// to a scope as a whole. `ScopeInvalidationSet` is therefore the only key
     /// that satisfies both halves — no promotion upward, no capture downward.
+    ///
+    /// The second half is only true if the admission read uses the same key:
+    /// [`CapabilityEvidenceRecord::is_fresh_positive_for`] therefore consults
+    /// [`invalidation_for`] with the exact skill and never
+    /// [`scope_has_any_invalidation`].
     fn clear_invalidation_by_requalification(
         &mut self,
         record: &CapabilityEvidenceRecord,
