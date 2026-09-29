@@ -24,6 +24,44 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXPECTED = REPO_ROOT / "config" / "merge-compile-enforcement.json"
+DEFAULT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+
+def emitted_check_names(workflow: Path) -> set[str]:
+    """Return the job ids a workflow emits as check names.
+
+    GitHub names a check run after the job id. The retained rule must name a
+    check the checked-in workflow still emits, otherwise the rule has drifted
+    from its emitter and can only ever compare as a mismatch. Job ids are the
+    two-space-indented keys directly under ``jobs:``; an unparseable workflow
+    raises rather than silently yielding an empty emitter set.
+    """
+    try:
+        content = workflow.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReadError(f"workflow unreadable: {workflow}: {exc}") from exc
+    names: set[str] = set()
+    inside = False
+    for line in content.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not inside:
+            if line.rstrip() == "jobs:":
+                inside = True
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            # A new top-level key ends the jobs mapping.
+            break
+        if indent != 2:
+            # Job body: runs-on/steps/if and so on.
+            continue
+        key, separator, _ = line.strip().partition(":")
+        if separator and key.strip():
+            names.add(key.strip())
+    if not names:
+        raise ReadError(f"no job ids parsed from {workflow}; the retained rule cannot be bound to an emitter")
+    return names
 
 
 class ReadError(Exception):
@@ -60,9 +98,18 @@ def read_protection(repo: str, branch: str) -> dict:
     checks = raw.get("required_status_checks") or {}
     admins = raw.get("enforce_admins") or {}
     restrictions = raw.get("restrictions") or {}
+    # GitHub reports an app-bound requirement through ``checks`` and a legacy
+    # context-only requirement through ``contexts``. Both are read so the
+    # comparison below can tell an exactly-bound check from a bare context that
+    # any app could satisfy with the same name.
+    bound = {}
+    for check in checks.get("checks") or []:
+        if isinstance(check, dict) and check.get("context"):
+            bound[check["context"]] = check.get("app_id")
     return {
         "protected": True,
         "contexts": list(checks.get("contexts") or []),
+        "bound_checks": bound,
         "strict": bool(checks.get("strict", False)),
         "enforce_admins": bool(admins.get("enabled", False)),
         "bypass_users": sorted(u.get("login", "") for u in restrictions.get("users") or []),
@@ -83,22 +130,62 @@ def read_rulesets(repo: str) -> list:
     return payload if isinstance(payload, list) else []
 
 
-def compare(expected: dict, protection: dict, rulesets: list) -> list[dict]:
+def compare(expected: dict, protection: dict, rulesets: list, emitted: set[str]) -> list[dict]:
     """Compare observed state against the retained rule; return typed findings."""
     findings: list[dict] = []
     want_contexts = list(expected.get("required_contexts") or [])
+    want_app_id = expected.get("required_check_app_id")
+
+    # The retained rule must still name a check the checked-in workflow emits,
+    # or it has drifted from its emitter and no comparison can be meaningful.
+    for context in want_contexts:
+        if emitted and context not in emitted:
+            findings.append({
+                "code": "BP-RULE-UNBOUND",
+                "detail": (
+                    f"retained context {context!r} is not emitted by the checked-in workflow "
+                    f"({sorted(emitted)}); the rule has drifted from its emitter"
+                ),
+            })
+
     if not protection.get("protected"):
         findings.append({
             "code": "BP-UNPROTECTED",
             "detail": f"branch {expected.get('branch')} has no protection rule",
         })
     else:
-        missing = [c for c in want_contexts if c not in protection.get("contexts", [])]
+        observed = list(protection.get("contexts", [])) + list(protection.get("bound_checks", {}))
+        missing = [c for c in want_contexts if c not in observed]
         for context in missing:
             findings.append({
                 "code": "BP-CONTEXT-MISSING",
-                "detail": f"required context {context!r} not in {protection.get('contexts')}",
+                "detail": f"required context {context!r} not in {sorted(set(observed))}",
             })
+        # An exactly-bound requirement names both the check and the app that
+        # emits it. A context-only requirement can be satisfied by any app
+        # posting that name, so an unbound or mis-bound app is a real gap.
+        bound_checks = protection.get("bound_checks", {})
+        if want_app_id is not None:
+            for context in want_contexts:
+                if context not in observed:
+                    continue
+                observed_app = bound_checks.get(context)
+                if observed_app is None:
+                    findings.append({
+                        "code": "BP-APP-UNBOUND",
+                        "detail": (
+                            f"required context {context!r} is not bound to a check app; any app "
+                            f"posting that name would satisfy it (retained app_id {want_app_id})"
+                        ),
+                    })
+                elif int(observed_app) != int(want_app_id):
+                    findings.append({
+                        "code": "BP-APP-MISMATCH",
+                        "detail": (
+                            f"required context {context!r} is bound to app_id {observed_app}, "
+                            f"retained app_id {want_app_id}"
+                        ),
+                    })
         if expected.get("strict", False) and not protection.get("strict", False):
             findings.append({
                 "code": "BP-NOT-STRICT",
@@ -146,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="retained expected-rule JSON (default: config/merge-compile-enforcement.json)")
     parser.add_argument("--readback-out", default=None,
                         help="write the observed+verdict readback JSON to this path")
+    parser.add_argument("--emitter", default=str(DEFAULT_WORKFLOW),
+                        help="workflow whose job ids must still emit the retained context")
     parser.add_argument("--json-out", action="store_true",
                         help="print the full readback JSON instead of the one-line verdict")
     args = parser.parse_args(argv)
@@ -158,11 +247,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         protection = read_protection(args.repo, args.branch)
         rulesets = read_rulesets(args.repo)
+        emitted = emitted_check_names(Path(args.emitter))
     except ReadError as exc:
         print(f"BP-READ-ERROR {exc}", file=sys.stderr)
         return 2
 
-    findings = compare(expected, protection, rulesets)
+    findings = compare(expected, protection, rulesets, emitted)
     verdict = "MATCH" if not findings else "MISMATCH"
     readback = {
         "repo": args.repo,
@@ -173,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         "observed": {
             "protected": protection.get("protected"),
             "contexts": protection.get("contexts", []),
+            "bound_checks": protection.get("bound_checks", {}),
             "strict": protection.get("strict", False),
             "enforce_admins": protection.get("enforce_admins", False),
             "bypass_users": protection.get("bypass_users", []),
@@ -181,6 +272,10 @@ def main(argv: list[str] | None = None) -> int:
                 {"id": r.get("id"), "name": r.get("name"), "enforcement": r.get("enforcement")}
                 for r in rulesets if isinstance(r, dict)
             ],
+        },
+        "emitter": {
+            "workflow": args.emitter,
+            "emitted_check_names": sorted(emitted),
         },
     }
     if args.readback_out:

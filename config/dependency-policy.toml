@@ -11,6 +11,17 @@ executable = "cargo-deny"
 sha256 = "f7292fab58c706638c999e64c4ba82e5128ae628130ba55e3266a768ee431fbf"
 advisory_owner = "cargo-deny"
 checks = ["advisories", "bans", "licenses", "sources"]
+# Exact scanner INPUT provenance (#3004/#1229/#1225). The clean hosted runner
+# materializes these pinned bytes through scripts/provision-dependency-scanner.py
+# before the read-only offline gate, so "the newest cargo-deny" is never a
+# substitute for the admitted identity. The archive digest and the executable
+# digest are separate provenance: the first authenticates the download, the
+# second is the identity the verifier compares against its receipt.
+release_source = "https://github.com/EmbarkStudios/cargo-deny/releases"
+release_asset = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-pc-windows-msvc.tar.gz"
+release_asset_sha256 = "975a22143262fd27476d19ee00c7af67978426e40e1dee94eed6bbade1cf87dc"
+archive_member = "cargo-deny-0.20.2-x86_64-pc-windows-msvc/cargo-deny.exe"
+artifact_path = ".eliot/dependency-policy/cargo-deny/0.20.2/cargo-deny.exe"
 
 [ecosystems.rust]
 manifest = "Cargo.toml"
