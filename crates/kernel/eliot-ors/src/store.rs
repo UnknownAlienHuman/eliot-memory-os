@@ -24240,6 +24240,20 @@ impl RedbRecoveryStore {
             );
         };
         let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        // I1.9 (issue #1884 W1.5): an absent manifest contributes no accepted
+        // Module Catalog revision, so the request built below would fail its own
+        // view validation with a bare `InvalidField` and the caller would see an
+        // opaque field error instead of the typed disposition, the preserved
+        // evidence and the durable escalation item. The absence is asserted here,
+        // from the row this query actually loaded, and the resulting intent is
+        // persisted before this returns, so the refusal is never discarded (W5).
+        let Some(manifest) = manifest else {
+            let decision = crate::deny_effect_replay_without_manifest(&lease, observed_at_ms);
+            if let Some(item) = decision.reconciliation.as_ref() {
+                self.persist_effect_replay_reconciliation(item)?;
+            }
+            return Ok(decision);
+        };
         let request = crate::EffectReplayRequest {
             operation_id: lease.operation_id.clone(),
             manifest_module_id: lease.manifest_module_id.clone(),
@@ -24250,22 +24264,22 @@ impl RedbRecoveryStore {
             current: crate::EffectAuthorizationView {
                 authority_epoch: current_authority_epoch,
                 // Admitting Catalog/Policy revisions of the loaded manifest — the
-                // exact revisions this lease was issued against. Never
-                // defaulted; a receipt-less manifest is refused downstream as
-                // `ManifestReceiptless` and an absent one as `ManifestAbsent`.
-                catalog_revision: manifest
-                    .as_ref()
-                    .map_or(0, |recorded| recorded.admission.catalog_revision),
-                policy_revision: manifest
-                    .as_ref()
-                    .map_or(0, |recorded| recorded.admission.policy_revision),
+                // exact revisions this lease was issued against, never defaulted.
+                // Both are non-zero on any row that loaded: the read path
+                // re-validates each row through `KernelExecutionManifest::validate`,
+                // which requires a non-zero Catalog revision, a non-zero Policy
+                // revision and a non-blank admission receipt, so a receipt-less
+                // row fails closed as corruption here rather than reaching this
+                // query as a usable manifest.
+                catalog_revision: manifest.admission.catalog_revision,
+                policy_revision: manifest.admission.policy_revision,
                 catalog_view: crate::CatalogPolicyView::Unavailable,
                 revocation: crate::RevocationAcknowledgement::None,
                 delivery: lease.delivery,
             },
             observed_at_ms,
         };
-        let decision = crate::authorize_effect_replay(Some(&lease), manifest.as_ref(), &request)?;
+        let decision = crate::authorize_effect_replay(Some(&lease), Some(&manifest), &request)?;
         if let Some(item) = decision.reconciliation.as_ref() {
             self.persist_effect_replay_reconciliation(item)?;
         }
