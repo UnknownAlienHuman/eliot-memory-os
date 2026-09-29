@@ -90,6 +90,9 @@ ADMISSION_WAVE_RE: Final = re.compile(r"admitted via (#966|#967|#968)\b")
 # I2.3 names `/workspace/core` as the root production workspace carrying the daily
 # `default-members`; every contour below is resolved from a real manifest on disk.
 ROOT_CONTOUR: Final = "workspace/core"
+# Fallback gap owner for the A11 reconciliation map: issue #1720's own Scope and
+# owner line names the Workspace topology and C4 composition owners.
+ISSUE_1720_OWNER: Final = "Workspace topology and C4 composition owners (issue #1720)"
 # A `path::symbol` reference, the only proof and consumer form this gate accepts.
 SYMBOL_REF_RE: Final = re.compile(
     r"(?P<path>[A-Za-z0-9_][A-Za-z0-9_./-]*\.rs)::(?P<symbol>[A-Za-z_][A-Za-z0-9_]*)"
@@ -1708,6 +1711,86 @@ def classify_unreachable_packages(
     )
 
 
+def reconciliation_map(inventory: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Map every admission gap to exactly one owner and one bounded issue spec.
+
+    Issue #1720 A11: a reviewed inventory drives bounded Issues/PRs without
+    duplicate ownership. This function emits the gap -> owner map as local
+    evidence (A10): it never files, closes, labels or mutates any issue, PR,
+    branch or workflow, which the governing assignment forbids. Filing remains
+    the human review act; what this guarantees mechanically is that every gap
+    names exactly one owner, so two lanes can never claim the same gap.
+
+    Owner precedence per gap is fixed: the row's own ``owner``, else its
+    ``review_owner`` (or the #1721 ``evidence_status_and_review_owner``), else
+    the issue owner. One gap, one owner, no inference from source statistics.
+    """
+    extraction = inventory.get("extraction_classification") or {}
+    admission = inventory.get("capability_admission") or {}
+    by_package = {item.get("package"): item for item in extraction.get("classifications", [])}
+    items: list[dict[str, Any]] = []
+    for defect in extraction.get("admission_defects", []):
+        name = str(defect.get("package"))
+        row = by_package.get(name, {})
+        record = row.get("record") or {}
+        owner = record.get("owner") or record.get("review_owner") or ISSUE_1720_OWNER
+        if row.get("classification") is None and not record:
+            gap = "UNCLASSIFIED: no decision row"
+        else:
+            gap = "DEFECTIVE_ROW: " + ", ".join(sorted(set(defect.get("defects", []))))
+        items.append(_reconcile_item(name, "1720", gap, owner, record, defect))
+    for orphan in extraction.get("orphan_decisions", []):
+        name = str(orphan.get("package"))
+        items.append(
+            _reconcile_item(
+                name, "1720", "ORPHAN_ROW: " + str(orphan.get("defect")), ISSUE_1720_OWNER, {}, orphan
+            )
+        )
+    for defect in admission.get("admission_defects", []):
+        name = str(defect.get("package"))
+        record = defect.get("record") or {}
+        owner = (
+            record.get("evidence_status_and_review_owner") or ISSUE_1720_OWNER
+        )
+        items.append(
+            _reconcile_item(
+                name,
+                "1721",
+                "ADMISSION_DEFECT: " + ", ".join(sorted(set(defect.get("defects", [])))),
+                owner,
+                record,
+                defect,
+            )
+        )
+    return sorted(items, key=lambda item: (item["layer"], item["package"]))
+
+
+def _reconcile_item(
+    package: str,
+    layer: str,
+    gap: str,
+    owner: str,
+    record: Mapping[str, Any],
+    defect: Mapping[str, Any],
+) -> dict[str, Any]:
+    """One gap, exactly one owner, one bounded issue specification."""
+    disposition = record.get("disposition") or defect.get("classification")
+    return {
+        "package": package,
+        "layer": layer,
+        "gap": gap,
+        "owner": owner,
+        "promised_disposition": disposition,
+        "bounded_issue": {
+            "title": f"[1720-reconcile] {package}: {gap}",
+            "acceptance": (
+                "scripts/crate_reachability_inventory.py re-run shows this "
+                f"package admitted with no defects (layer {layer})"
+            ),
+        },
+    }
+
+
 def _read_toml(root: Path, path: Path) -> dict[str, Any]:
     raw = _read_bytes(root, path, max_bytes=BOUNDS.max_source_file_bytes)
     try:
@@ -2185,6 +2268,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit 0 even when unclassified unreachable packages remain",
     )
+    parser.add_argument(
+        "--reconcile",
+        type=Path,
+        default=None,
+        help=(
+            "write the A11 gap->owner reconciliation map (one owner and one "
+            "bounded issue spec per admission gap) as local evidence; never files anything"
+        ),
+    )
     return parser
 
 
@@ -2212,6 +2304,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         with output.open("xb") as handle:
             handle.write(_canonical_bytes(inventory))
             handle.write(b"\n")
+        reconcile_output = None
+        reconcile_items: list[dict[str, Any]] = []
+        if args.reconcile is not None:
+            # A11 driver output: the gap->owner map as local evidence. Filing the
+            # bounded issues remains the human review act; this file only assigns
+            # exactly one owner per gap so ownership can never duplicate.
+            reconcile_items = reconciliation_map(inventory)
+            reconcile_output = _safe_output(root, args.reconcile, overwrite=args.overwrite)
+            reconcile_output.parent.mkdir(parents=True, exist_ok=True)
+            if args.overwrite and reconcile_output.exists():
+                reconcile_output.unlink()
+            with reconcile_output.open("xb") as handle:
+                handle.write(_canonical_bytes({"gaps": reconcile_items}))
+                handle.write(b"\n")
     except InventoryError as exc:
         print(
             json.dumps(
@@ -2249,6 +2355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ],
                 "aggregate_sha256": inventory["aggregate_sha256"],
                 "proof_ceiling": summary["proof_ceiling"],
+                "reconcile_output": str(reconcile_output) if reconcile_output else None,
+                "reconcile_gaps": len(reconcile_items),
             },
             sort_keys=True,
         )

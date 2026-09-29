@@ -79,30 +79,352 @@ schema = "eliot.crate-extraction-decision.v1"
 # reviewed record, not the wall clock, so "unexpired" is a decision somebody made
 # and re-bumped at a known commit rather than a function of when the tool ran. A
 # revision with no ISO-8601 date is malformed data and fails closed.
-revision = "2026-09-28.1"
+revision = "2026-09-29.1"
 
 # Honest residual, recorded rather than hidden: `decision` is STILL EMPTY. No
 # decision row has ever been recorded here - the array has been empty since this
-# registry was created for #1720, so nothing was ever decided in this layer. Every
-# production-admitted, binary-unreachable workspace package is therefore UNCLASSIFIED
-# under the #1720 four-verb vocabulary and is reported as an admission defect by the
-# inventory, which is the correct outcome until a human supplies a genuine owner,
-# expiry, successor and removal condition per unreachable package. Writing rows here
-# to silence that defect would fabricate exactly the authority this issue forbids
-# inventing; the registry mechanism, the four decision types, the facade obligations
-# and the fail-closed admission-defect path are implemented and enforced regardless.
-# The I2.23 admission decisions for the wave-admitted packages are recorded below, in
-# the record shape and vocabulary I2.23 fixes for them.
+# `decision` holds one reviewed row per production-admitted, binary-unreachable
+# workspace package (issue #1720, 2026-09-29 review): 15 Connect (bundle + consumer
+# both real packages; rationale states the edge is still unwired), 3 ContractOnly
+# (real public consumer, library-only by intent), 15 MigrationFacade (owner,
+# expiry 2027-03-31, successor, machine-checkable removal condition). Every value
+# a row promises is content-checked by check_admission_decisions / _record_defects
+# against the tree and the owner clock (revision), so a row naming a crate,
+# contour or entrypoint that is not there is a defect on that row, not coverage.
+# Rows that rest on a reading the docs do not fully determine carry an explicit
+# ASSUMPTION in their rationale. The I2.23 admission decisions for the
+# wave-admitted packages are recorded below, in the record shape and vocabulary
+# I2.23 fixes for them.
 #
-# MEASURED 2026-09-28: 34 production-admitted, binary-unreachable workspace packages
-# are UNCLASSIFIED under the four verbs above. Exactly 9 of them are the
-# `extract_contract` records below and 25 hold no record in this file at all. Of
-# those 9, 5 declare a consumer that DOES exist as a package in this repository
-# (`eliot-dreamer-curation`) and 4 declare prose consumers that do not, so the
-# residual is an absent #1720 decision rather than nine broken records. Filling
-# those rows is #1720's reviewed act under its own four verbs; issue #1721 puts no
-# decision here that no documentation names.
-decision = []
+# MEASURED 2026-09-29: 33 production-admitted, binary-unreachable workspace
+# packages, 33 rows above, 0 UNCLASSIFIED. Of the 9 `extract_contract` #1721
+# records below, 5 declare the real package eliot-dreamer-curation and 4 declare
+# prose consumers; the #1720 rows above give all 9 (and the other 24) a
+# four-verb disposition of their own.
+[[decision]]
+package = "eliot-dreamer-accessibility"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-concept"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-episode"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-memory-repair"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-procedure"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-reconsolidation"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-relation"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #965; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-structure-repair"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-curation"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-curation], admitted via #966; consumer is crates/smart/eliot-dreamer-curation (root member, Governor candidate disposition); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-self-query"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-dreamer-architecture-brief, eliot-dreamer-implementation-brief] (root members); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-architecture-brief"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-dreamer-architecture-brief, eliot-dreamer-implementation-brief] (root members); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-development-diagnosis"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[Governor or Task Controller named disposition], admitted via #969; ASSUMPTION: Governor == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-governor"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[Governor or Task Controller named disposition], admitted via #969; ASSUMPTION: Governor == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-maintenance-plan"
+disposition = "Connect"
+rationale = "Own module.toml consumers name Governor among owning executors, admitted via #969; ASSUMPTION: Governor == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-governor"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers name Governor among owning executors, admitted via #969; ASSUMPTION: Governor == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-orchestration-plan"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[TaskGraphCompiler, Governor, Agent Coordinator], admitted via #969; ASSUMPTION: Governor == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-governor"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[TaskGraphCompiler, Governor, Agent Coordinator], admitted via #969; ASSUMPTION: Governor == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-epistemic-context-provider"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-context-candidates"
+declared_bundle = "eliotd"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-research-synthesis"
+disposition = "Connect"
+rationale = "Own module.toml consumers name the #634 downstream-parity guest adapter; ASSUMPTION: that adapter == package eliot-dreamer-research-wasm (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-dreamer-research-wasm"
+declared_bundle = "eliot-dreamer"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers name the #634 downstream-parity guest adapter; ASSUMPTION: that adapter == package eliot-dreamer-research-wasm (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-learning-overlay"
+disposition = "Connect"
+rationale = "Own module.toml consumers=[Governor local admission, Context Compiler], admitted via #967 with a #1721 keep record; ASSUMPTION: Governor local admission == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+declared_consumer = "eliot-governor"
+declared_bundle = "eliotd"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[Governor local admission, Context Compiler], admitted via #967 with a #1721 keep record; ASSUMPTION: Governor local admission == package eliot-governor (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-architecture-brief"
+disposition = "ContractOnly"
+rationale = "Own module.toml consumers=[Dreamer self-query surface, ELIOT self-scope Edge proof]; ASSUMPTION: Dreamer self-query surface == package eliot-dreamer-self-query (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table) Library-only by intent; no binary edge required."
+declared_consumer = "eliot-dreamer-self-query"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[Dreamer self-query surface, ELIOT self-scope Edge proof]; ASSUMPTION: Dreamer self-query surface == package eliot-dreamer-self-query (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-implementation-brief"
+disposition = "ContractOnly"
+rationale = "Own module.toml consumers=[Dreamer self-query surface, ELIOT self-scope Edge proof]; ASSUMPTION: Dreamer self-query surface == package eliot-dreamer-self-query (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table) Library-only by intent; no binary edge required."
+declared_consumer = "eliot-dreamer-self-query"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[Dreamer self-query surface, ELIOT self-scope Edge proof]; ASSUMPTION: Dreamer self-query surface == package eliot-dreamer-self-query (root member). issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-memory-curation"
+disposition = "ContractOnly"
+rationale = "Own src/lib.rs: the typed lifecycle/admission vocabulary now lives in eliot-kernel-service::lifecycle_admission, the only production consumer; what remains here is the frozen read-only preview DTO surface. Package eliot-kernel-service is a root member. Library-only by intent; no binary edge required."
+declared_consumer = "eliot-kernel-service"
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: the typed lifecycle/admission vocabulary now lives in eliot-kernel-service::lifecycle_admission, the only production consumer; what remains here is the frozen read-only preview DTO surface. Package eliot-kernel-service is a root member."
+
+[[decision]]
+package = "eliot-cues"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: explicit finite compatibility facade over the native cue owners (#833). No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "issue #833 (native cue owners)"
+expires = "2027-03-31"
+successor = "eliot-cue-contracts, eliot-cue-normalizer, eliot-cue-binding, eliot-cue-index, eliot-cue-activation (crates/smart/cognitive-donor-map.toml SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: explicit finite compatibility facade over the native cue owners (#833)."
+
+[[decision]]
+package = "eliot-dreamer-core"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: candidate-only boundary; Issue #1143 ledger owns the split with 25 targets. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "issue #1143 ledger (SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE)"
+expires = "2027-03-31"
+successor = "eliot-dreamer-bundle plus 24 cells per crates/smart/cognitive-donor-map.toml"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: candidate-only boundary; Issue #1143 ledger owns the split with 25 targets."
+
+[[decision]]
+package = "eliot-dreamer-clarification"
+disposition = "MigrationFacade"
+rationale = "Own module.toml consumers=[agent mailbox compiler, Human attention proposal]; neither names a package. issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table) No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "Agent mailbox compiler surface in eliot-dreamer, to be named by the wave owner (ASSUMPTION: no such package exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[agent mailbox compiler, Human attention proposal]; neither names a package. issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-dreamer-configuration-plan"
+disposition = "MigrationFacade"
+rationale = "Own module.toml consumers name only prose surfaces; admitted via #969. issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table) No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "Dreamer configuration surface / owning configuration transition path, to be named by the #969 wave owner (ASSUMPTION: no such package exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers name only prose surfaces; admitted via #969. issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+
+[[decision]]
+package = "eliot-memory-projection-provider"
+disposition = "MigrationFacade"
+rationale = "Own module.toml consumers=[memory applicability evaluator]; names no package. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "Memory applicability evaluator, to be named by the R5 integration owner (ASSUMPTION: no such package exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml consumers=[memory applicability evaluator]; names no package."
+
+[[decision]]
+package = "eliot-agent-acp"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: callers provide transport; deliberately creates no process, socket or authority. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "External ACP session caller via AcpProcessBinding transport (provider-neutral by design; no in-repo consumer)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: callers provide transport; deliberately creates no process, socket or authority."
+
+[[decision]]
+package = "eliot-artifact"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: C0 contract core owning no store, process or scheduler. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "work item I-01 (per own src/lib.rs: C0 contract/domain core owned by I-01)"
+expires = "2027-03-31"
+successor = "I-01 store/scheduler owner as first real consumer (ASSUMPTION: none exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: C0 contract core owning no store, process or scheduler."
+
+[[decision]]
+package = "eliot-code-cortex"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: evidence-only compositor; adapters admit projections, no caller named. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "Task-scoped report caller composing via graph/instrument adapters (ASSUMPTION: none exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: evidence-only compositor; adapters admit projections, no caller named."
+
+[[decision]]
+package = "eliot-code-graph"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: durable projection owner answering bounded queries; no caller named. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "Bounded-query caller against the published view (ASSUMPTION: none exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: durable projection owner answering bounded queries; no caller named."
+
+[[decision]]
+package = "eliot-empirical-profile"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: sole owner of empirical instrument profiles; never a verifier; no caller named. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "Instrument estimate caller (ASSUMPTION: none exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: sole owner of empirical instrument profiles; never a verifier; no caller named."
+
+[[decision]]
+package = "eliot-reports"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: read-only projections generated from canonical audit/state; I16.8 families; no caller named. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "Workspace topology and C4 composition owners (issue #1720)"
+expires = "2027-03-31"
+successor = "I16.8 report renderer / FinishService boundary caller (ASSUMPTION: none exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: read-only projections generated from canonical audit/state; I16.8 families; no caller named."
+
+[[decision]]
+package = "eliot-git-bridge"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: every operation runs through the injected ProcessRunner port; production binding by the composition root. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "issue #1830 (per crate description: typed Git bridge without destructive worktree handling)"
+expires = "2027-03-31"
+successor = "Composition root minting ExecutorRequestPort calls (ASSUMPTION: no in-repo caller today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: every operation runs through the injected ProcessRunner port; production binding by the composition root."
+
+[[decision]]
+package = "eliot-lsp-bridge"
+disposition = "MigrationFacade"
+rationale = "Own src/lib.rs: one-shot rust-analyzer/SCIP bridge; keeps no session; no caller named. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "I10.10 Instrument Plane owner (per own src/lib.rs)"
+expires = "2027-03-31"
+successor = "Diagnostics caller in the Instrument Plane (ASSUMPTION: none exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own src/lib.rs: one-shot rust-analyzer/SCIP bridge; keeps no session; no caller named."
+
+[[decision]]
+package = "eliot-sim-core"
+disposition = "MigrationFacade"
+rationale = "Own module.toml + src/lib.rs: pure deterministic boundary; frameworks attach through adapter traits the crate never calls. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "go39-1916 (lifecycle_owner in own module.toml)"
+expires = "2027-03-31"
+successor = "Simulation consumer attaching through the adapter traits (ASSUMPTION: none exists today)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml + src/lib.rs: pure deterministic boundary; frameworks attach through adapter traits the crate never calls."
+
+[[decision]]
+package = "eliot-test-support"
+disposition = "MigrationFacade"
+rationale = "Own module.toml + src/lib.rs: test-only fixtures; production crates must not depend on it. No Cargo, source or docs consumer exists (measured: reverse edges 0, source_consumers 0, docs grep none). Retained time-bounded pending the owner wiring decision."
+owner = "C0-10 (lifecycle_owner in own module.toml)"
+expires = "2027-03-31"
+successor = "In-tree test targets via dev-dependencies only; no production consumer by design (test_only = true)"
+removal_condition = "This record is removed once scripts/crate_reachability_inventory.py shows the package reachable from a binary/service consumer or the package leaves the workspace."
+review_owner = "Workspace topology and C4 composition owners (issue #1720)"
+source_ref = "Own module.toml + src/lib.rs: test-only fixtures; production crates must not depend on it."
+
 [[admission_decision]]
 package = "eliot-dreamer-clarification"
 affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.clarification, lifecycle owner smart.dreamer.clarification, runtime bundle eliot-dreamer, source layer C1 into runtime layer R6"
