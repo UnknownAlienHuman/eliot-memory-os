@@ -3,7 +3,7 @@
 //!
 //! The canonical source of the daemon capability cells is
 //! `bins/eliotd/Cargo.toml::[package.metadata.eliot]` (`functional_cell_refs`
-//! plus exactly one `functional_cell_state_owners` row per cell), and the
+/// plus exactly one `functional_cell_state_owners` row per cell), and the
 //! migration-readable projection lives in
 //! `workstreams/core-daemons/capability-cell-registry.contract.toml` as
 //! `[[declared_functional_cell]]` rows. Both files are baked at compile time
@@ -60,35 +60,46 @@ pub fn cell_declaration_guard() -> Result<(), String> {
         .and_then(|metadata| metadata.get("eliot"))
         .ok_or_else(|| missing("[package.metadata.eliot] in bins/eliotd/Cargo.toml"))?;
 
+    let cells = manifest_cells(eliot)?;
+    let owners = manifest_owners(eliot, &cells)?;
+    check_contract_mirror(&contract, &cells, &owners)?;
+    check_residual_markers(&contract)?;
+    Ok(())
+}
+
+/// Reads the declared capability cells: non-empty, all strings, no duplicates.
+fn manifest_cells(eliot: &toml::Value) -> Result<Vec<String>, String> {
     let refs = eliot
         .get("functional_cell_refs")
         .and_then(toml::Value::as_array)
-        .ok_or_else(|| {
-            "baked eliotd declaration carries no functional_cell_refs array".to_owned()
-        })?;
+        .ok_or_else(|| "baked eliotd declaration carries no functional_cell_refs array".to_owned())?;
     if refs.is_empty() {
         return Err("baked eliotd declaration names no capability cell".to_owned());
     }
-    let mut cells: Vec<&str> = Vec::new();
+    let mut cells: Vec<String> = Vec::new();
     for cell in refs {
-        let cell = cell.as_str().ok_or_else(|| {
-            "baked eliotd functional_cell_refs carries a non-string cell".to_owned()
-        })?;
-        if cells.contains(&cell) {
-            return Err(format!(
-                "baked eliotd declaration names capability cell {cell} twice"
-            ));
+        let cell = cell
+            .as_str()
+            .ok_or_else(|| "baked eliotd functional_cell_refs carries a non-string cell".to_owned())?;
+        if cells.iter().any(|known| known == cell) {
+            return Err(format!("baked eliotd declaration names capability cell {cell} twice"));
         }
-        cells.push(cell);
+        cells.push(cell.to_owned());
     }
+    Ok(cells)
+}
 
+/// Reads the mutable-state owners: exactly one owner per declared cell,
+/// every row names a declared cell, no shared owner across cells.
+fn manifest_owners(
+    eliot: &toml::Value,
+    cells: &[String],
+) -> Result<Vec<(String, String)>, String> {
     let owner_rows = eliot
         .get("functional_cell_state_owners")
         .and_then(toml::Value::as_array)
-        .ok_or_else(|| {
-            "baked eliotd declaration carries no functional_cell_state_owners array".to_owned()
-        })?;
-    let mut owners: Vec<(&str, &str)> = Vec::new();
+        .ok_or_else(|| "baked eliotd declaration carries no functional_cell_state_owners array".to_owned())?;
+    let mut owners: Vec<(String, String)> = Vec::new();
     for row in owner_rows {
         let cell = row
             .get("cell")
@@ -98,19 +109,19 @@ pub fn cell_declaration_guard() -> Result<(), String> {
             .get("owner")
             .and_then(toml::Value::as_str)
             .ok_or_else(|| missing(format!("owner for cell {cell}")))?;
-        if !cells.contains(&cell) {
+        if !cells.iter().any(|known| known == cell) {
             return Err(format!(
                 "baked eliotd state-owner row names cell {cell}, which functional_cell_refs does not declare"
             ));
         }
-        if owners.iter().any(|(known, _)| *known == cell) {
+        if owners.iter().any(|(known, _)| known == cell) {
             return Err(format!(
                 "capability cell {cell} carries two mutable-state owners; exactly one owner per state is required"
             ));
         }
-        owners.push((cell, owner));
+        owners.push((cell.to_owned(), owner.to_owned()));
     }
-    for cell in &cells {
+    for cell in cells {
         if !owners.iter().any(|(known, _)| known == cell) {
             return Err(format!(
                 "capability cell {cell} has no mutable-state owner; a cell with an undeclared state owner is a registry defect"
@@ -119,19 +130,30 @@ pub fn cell_declaration_guard() -> Result<(), String> {
     }
     let mut seen_owners: Vec<&str> = Vec::new();
     for (cell, owner) in &owners {
-        if seen_owners.contains(owner) {
+        if seen_owners.contains(&owner.as_str()) {
             return Err(format!(
                 "mutable-state owner {owner} (cell {cell}) owns a second cell state; one owner per state means no shared owner"
             ));
         }
-        seen_owners.push(*owner);
+        seen_owners.push(owner);
     }
+    Ok(owners)
+}
 
+/// Checks the contract projection against the manifest source in both
+/// directions: every manifest cell has exactly one projection row naming the
+/// same owner, every projection row names a manifest cell, and every row
+/// points back at the canonical source instead of duplicating it.
+fn check_contract_mirror(
+    contract: &toml::Value,
+    cells: &[String],
+    owners: &[(String, String)],
+) -> Result<(), String> {
     let declared = contract
         .get("declared_functional_cell")
         .and_then(toml::Value::as_array)
         .ok_or_else(|| "baked cell contract carries no declared_functional_cell rows".to_owned())?;
-    let mut projected: Vec<(&str, &str, &str)> = Vec::new();
+    let mut projected: Vec<(String, String)> = Vec::new();
     for row in declared {
         let cell = row
             .get("cell")
@@ -150,15 +172,13 @@ pub fn cell_declaration_guard() -> Result<(), String> {
                 "baked cell contract row for cell {cell} points at {declared_by} instead of the canonical manifest source"
             ));
         }
-        if projected.iter().any(|(known, _, _)| *known == cell) {
-            return Err(format!(
-                "baked cell contract projects capability cell {cell} twice"
-            ));
+        if projected.iter().any(|(known, _)| known == cell) {
+            return Err(format!("baked cell contract projects capability cell {cell} twice"));
         }
-        projected.push((cell, owner, declared_by));
+        projected.push((cell.to_owned(), owner.to_owned()));
     }
-    for cell in &cells {
-        let Some((_, owner, _)) = projected.iter().find(|(known, _, _)| known == cell) else {
+    for cell in cells {
+        let Some((_, owner)) = projected.iter().find(|(known, _)| known == cell) else {
             return Err(format!(
                 "manifest capability cell {cell} has no contract projection row; the projection fell behind its source"
             ));
@@ -166,22 +186,28 @@ pub fn cell_declaration_guard() -> Result<(), String> {
         let manifest_owner = owners
             .iter()
             .find(|(known, _)| known == cell)
-            .map(|(_, owner)| *owner)
+            .map(|(_, owner)| owner.as_str())
             .unwrap_or_default();
-        if *owner != manifest_owner {
+        if owner != manifest_owner {
             return Err(format!(
                 "contract projection for cell {cell} names mutable-state owner {owner} but the manifest names {manifest_owner}"
             ));
         }
     }
-    for (cell, _, _) in &projected {
+    for (cell, _) in &projected {
         if !cells.contains(cell) {
             return Err(format!(
                 "contract projects capability cell {cell}, which the manifest source does not declare"
             ));
         }
     }
+    Ok(())
+}
 
+/// Refuses a contract that stops declaring its executable-registry residual:
+/// the support, status, and proof-ceiling markers must keep saying that only
+/// a declaration projection exists.
+fn check_residual_markers(contract: &toml::Value) -> Result<(), String> {
     let support = contract
         .get("implementation_support")
         .and_then(toml::Value::as_str)
