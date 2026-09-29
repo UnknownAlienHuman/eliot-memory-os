@@ -27,12 +27,12 @@ use eliot_research_exchange_api::ResearchQueryRequest;
 use thiserror::Error;
 
 use crate::BridgeError;
-use crate::SubmissionRecord;
 use crate::admission::ProviderAdmission;
 use crate::evidence::{CancellationEvidence, RawProviderEvidence, exit_code_of, sha256_hex};
 use crate::protocol::{
     RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope, scan_result_frame,
 };
+use crate::{StartAttemptContext, SubmissionRecord};
 
 /// Compile-time proof that the bound executor implements the shared
 /// [`ProcessExecutor`] contract: if P-04 ever stops implementing P-03, the
@@ -258,12 +258,12 @@ impl ProviderBridge {
         }
     }
 
-    /// Returns the exact submit reconciliation record of the last sealed
-    /// submit, whether or not the attempt reached a terminal outcome.
+    /// Returns the exact submit reconciliation record after a verified start
+    /// receipt passes its identity checks.
     ///
-    /// A failure after the submit was sealed still leaves a reconciliation
-    /// record; reporting it is what lets an unknown outcome be resolved
-    /// byte-for-byte instead of retried.
+    /// A failed start handoff carries this record on its typed error and the
+    /// existing submitted-state owner rather than installing it before the
+    /// executor responds.
     pub fn last_submission(&self) -> Option<crate::SubmissionRecord> {
         self.submission
             .lock()
@@ -271,13 +271,9 @@ impl ProviderBridge {
             .and_then(|record| record.clone())
     }
 
-    /// Returns the stable identity of the operation this runner bound, once one
-    /// was sealed.
+    /// Returns the stable identity of the operation this runner bound after a
+    /// verified start receipt.
     ///
-    /// This is the executor's own durable operation identity, recorded before
-    /// the start handoff precisely so a start-response loss still names the
-    /// operation that may have started. Reporting it is what lets that attempt
-    /// be resolved by identity; it is never permission to submit again.
     pub fn last_bound_operation(&self) -> Option<String> {
         self.bound_identity.lock().ok().and_then(|operation| {
             operation
@@ -382,51 +378,53 @@ impl ProviderBridge {
                 disposition: None,
             });
         }
-        // The sealed submit and the exact operation binding are recorded BEFORE
-        // the executor is asked to start anything. `start` is the handoff: once
-        // it is called the operation may exist in the executor registry, so a
-        // start-response loss or a start-receipt mismatch must still leave the
-        // attempt identifiable and reconcilable by its stable operation
-        // identity. Recording them after the receipt check made a failed check
-        // indistinguishable from an attempt that was never made, which threw
-        // away the only handle on a possibly-started operation.
-        //
-        // The identity reused here is `ProcessExecutor`'s own durable operation
-        // identity, taken from the admitted process request itself. No
-        // Researcher-private execution ledger is introduced: a second record of
-        // "what this process ran" would be a second, unverifiable source of
-        // custody next to the executor's.
-        *self
-            .bound_identity
-            .lock()
-            .map_err(|_| BridgeError::EvidenceIncomplete {
-                reason: "bound operation identity lock poisoned",
-            })? = Some(operation.clone());
-        *self
-            .submission
-            .lock()
-            .map_err(|_| BridgeError::EvidenceIncomplete {
-                reason: "submit reconciliation lock poisoned",
-            })? = Some(crate::SubmissionRecord {
-            submit_binding_sha256: submit_binding_sha256.clone(),
-            envelope_sha256: sha256_hex(&wire_bytes),
-            envelope_bytes: wire_bytes.clone(),
-        });
-        let receipt = block_on(self.executor.start(process_request, self.sink.clone()))
-            .map_err(BridgeError::Process)?;
+        // Preserve the sealed submit and ProcessExecutor identity in the
+        // bounded start result. Runner-wide bound fields are installed only
+        // after the executor answers with a receipt that preserves this exact
+        // request.
+        let attempt = StartAttemptContext {
+            operation_id: operation.clone(),
+            invocation_digest: digest.clone(),
+            process_generation: generation.get(),
+            submission: SubmissionRecord {
+                submit_binding_sha256: submit_binding_sha256.clone(),
+                envelope_sha256: sha256_hex(&wire_bytes),
+                envelope_bytes: wire_bytes.clone(),
+            },
+        };
+        let receipt = block_on(self.executor.start(process_request, self.sink.clone())).map_err(
+            |source| BridgeError::StartFailed {
+                context: Box::new(attempt.clone()),
+                source: Box::new(source),
+            },
+        )?;
         if receipt.operation_id() != &operation
             || receipt.request_digest() != digest
             || receipt.accepted_generation() != generation
         {
-            // The start response did not preserve the bound request, but the
-            // operation may still have started. The bound identity and the
-            // sealed submit recorded above are what let this attempt be
-            // resolved: a failed start-receipt check is not permission to mint a
-            // new attempt or to report that nothing ran.
-            return Err(BridgeError::EvidenceIncomplete {
-                reason: "executor start receipt does not preserve the bound request",
+            // The operation may already exist despite a missing or mismatched
+            // receipt. The same context identifies it for reconciliation; it
+            // does not authorize a fresh start.
+            return Err(BridgeError::StartReceiptMismatch {
+                context: Box::new(attempt),
             });
         }
+        let mut bound_identity =
+            self.bound_identity
+                .lock()
+                .map_err(|_| BridgeError::StartBindingInstallFailed {
+                    context: Box::new(attempt.clone()),
+                    reason: "bound operation identity lock poisoned",
+                })?;
+        let mut submission =
+            self.submission
+                .lock()
+                .map_err(|_| BridgeError::StartBindingInstallFailed {
+                    context: Box::new(attempt.clone()),
+                    reason: "submit reconciliation lock poisoned",
+                })?;
+        *bound_identity = Some(operation.clone());
+        *submission = Some(attempt.submission.clone());
         Ok(BoundOperation {
             operation,
             digest,
@@ -519,9 +517,9 @@ impl ProviderBridge {
     /// crate's only stream readback lives, so the executor's captured streams
     /// are read back here too. The provider's real stdout/stderr therefore
     /// survive a timeout instead of being replaced by
-    /// `RawProviderEvidence::absent`, which reports the digest of zero bytes
-    /// and misstates the omission as `NoHandle` even though the executor held a
-    /// live drain. `stderr` is never discarded on the failure path.
+    /// `RawProviderEvidence::absent`, which has no digest or byte count and
+    /// reports `NoHandle` even though the executor held a live drain. `stderr`
+    /// is never discarded on the failure path.
     ///
     /// The exit and descendant fields are read from the last bounded
     /// observation this wait actually made and are never recomputed or
@@ -533,10 +531,13 @@ impl ProviderBridge {
         bound: &BoundOperation,
         view: &eliot_process::ProcessExecutionView,
     ) -> Result<RawProviderEvidence, BridgeError> {
-        let (stdout, stderr) = self
-            .executor
-            .captured_output(&bound.operation)
-            .map_err(BridgeError::Process)?;
+        let (stdout, stderr) =
+            self.executor
+                .captured_output(&bound.operation)
+                .map_err(|source| BridgeError::StreamReadbackFailed {
+                    disposition: None,
+                    source: Box::new(source),
+                })?;
         let descendants_complete = view
             .descendants()
             .is_some_and(|descendants| descendants.complete() && descendants.tree_terminated());
@@ -573,10 +574,16 @@ impl ProviderBridge {
         let descendants_complete = view
             .descendants()
             .is_some_and(|descendants| descendants.complete() && descendants.tree_terminated());
-        let (stdout, stderr) = self
-            .executor
-            .captured_output(&bound.operation)
-            .map_err(BridgeError::Process)?;
+        // Preserve the process fact independently from a failure to read its
+        // streams: evidence transport is not the process outcome.
+        let outcome = classify_terminal(view.lifecycle(), exit, descendants_complete);
+        let (stdout, stderr) =
+            self.executor
+                .captured_output(&bound.operation)
+                .map_err(|source| BridgeError::StreamReadbackFailed {
+                    disposition: Some(outcome),
+                    source: Box::new(source),
+                })?;
         let evidence = Box::new(RawProviderEvidence::materialize(
             bound.operation.as_str(),
             &bound.digest,
@@ -587,7 +594,6 @@ impl ProviderBridge {
         ));
         // The physical disposition of the process is classified before the wire
         // is decoded, so it is available to every refusal below.
-        let outcome = classify_terminal(view.lifecycle(), exit, descendants_complete);
         if outcome == ProviderOutcome::Unknown {
             return Err(BridgeError::UnknownOutcome {
                 evidence: Some(evidence.clone()),
@@ -644,7 +650,17 @@ impl ProviderBridge {
             .ok_or(BridgeError::NotAdmitted {
                 reason: "no started operation is bound to this bridge",
             })?;
-        block_on(self.executor.inspect(operation)).map_err(BridgeError::Process)
+        self.observe_operation(&operation)
+    }
+
+    /// Observes an exact `ProcessExecutor` operation identity supplied by its
+    /// admitted attempt owner. This also covers a start-response loss, where
+    /// runner binding fields correctly remain uninstalled.
+    pub fn observe_operation(
+        &self,
+        operation: &OperationId,
+    ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
+        block_on(self.executor.inspect(operation.clone())).map_err(BridgeError::Process)
     }
 
     /// Requests cancellation of the bound operation through the executor.
