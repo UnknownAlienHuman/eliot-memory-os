@@ -4205,19 +4205,24 @@ pub struct SecurityContext {
 ///
 /// A transition that records a candidate, a learning record, an experience
 /// entry, a blackboard item, or an audit event writes DATA: derived artifacts
-/// may be stored there while carrying their taint. A transition that writes
-/// task control, a lifecycle policy, a recovery schema, an authority
-/// revocation, a user automation, a reactive/notification record, an
-/// instrument registry, or a canonical erasure writes AUTHORITY: those are the
-/// standing instructions, tool definitions, policies, and effect grants an
-/// untrusted source must never become.
+/// may be stored there while carrying their taint, and an erasure is a removal
+/// rather than a grant, so a tainted source can still be deleted.
+///
+/// A transition that writes task control, a lifecycle policy, a recovery
+/// schema, an authority revocation, a user automation, a reactive or
+/// notification record, or an instrument registry writes AUTHORITY: those are
+/// the standing instructions, tool definitions, policies, credentials, and
+/// effect grants an untrusted source must never become. A reactive or
+/// notification record is AUTHORITY because a tainted source driving an
+/// outbound delivery record is the exfiltration path, not a stored observation.
 const fn transition_source_use_surface(transition_class: TransitionClass) -> SourceUseSurface {
     match transition_class {
-        TransitionClass::CaptureCandidate | TransitionClass::Epistemic => SourceUseSurface::Data,
+        TransitionClass::CaptureCandidate
+        | TransitionClass::Epistemic
+        | TransitionClass::Erasure => SourceUseSurface::Data,
         TransitionClass::TaskControl
         | TransitionClass::LifecyclePolicy
         | TransitionClass::RecoverySchema
-        | TransitionClass::Erasure
         | TransitionClass::NotificationState
         | TransitionClass::ReactiveState
         | TransitionClass::UserAutomation
