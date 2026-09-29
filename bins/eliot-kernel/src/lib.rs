@@ -277,6 +277,8 @@ mod health_view;
 pub use health_view::KernelActivationView;
 #[cfg(windows)]
 mod host_request_route;
+#[cfg(windows)]
+mod hot_path_runtime;
 pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
@@ -730,6 +732,14 @@ pub struct KernelComposition {
     /// `Unknown` without enumerating the store.
     #[cfg(windows)]
     host_request_connection_index: Mutex<BTreeMap<String, Vec<HostRequestOperationRef>>>,
+    /// The live I12.14 hot-spine binding and the queue capacity it enforces
+    /// (issue #1733). Bound once during composition assembly against the
+    /// running build's real registered settings, so a composition that exists
+    /// is one whose hot-path declaration genuinely bound. `#[cfg(windows)]`
+    /// because the bounded local-read queue it enforces is itself the
+    /// Windows-only agent-bridge carrier.
+    #[cfg(windows)]
+    hot_spine: hot_path_runtime::KernelHotSpine,
     /// Boot-unique seed for local-read attempt identities. Minted once per
     /// composition so attempt IDs never repeat across restarts: a capability
     /// serialized before a restart can never match a claim record minted after

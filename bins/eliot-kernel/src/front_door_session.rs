@@ -216,6 +216,22 @@ impl IpcImplementation {
             operation_timeout: Duration::from_secs(30),
         }
     }
+
+    /// Returns the in-flight byte bound this transport actually registers.
+    ///
+    /// The I12.14 hot-spine bind reads it from here rather than from the
+    /// declaration, so the running build stays the authoritative side of the
+    /// comparison: a manifest that names a different byte bound is refused.
+    #[must_use]
+    pub(super) const fn registered_queue_bytes() -> usize {
+        Self::limits().queue_bytes
+    }
+
+    /// Returns the single-frame byte bound this transport actually registers.
+    #[must_use]
+    pub(super) const fn registered_frame_bytes() -> usize {
+        Self::limits().max_frame_bytes
+    }
 }
 
 impl KernelComposition {
