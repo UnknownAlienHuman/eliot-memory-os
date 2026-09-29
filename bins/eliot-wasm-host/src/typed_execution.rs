@@ -406,10 +406,11 @@ impl GovernedAdmission {
 /// carries no admission channel, so the gate denies before any acquisition
 /// could consult a digest.
 ///
-/// Denial order: absent admission yields `KERNEL_ADMISSION_REQUIRED`; a
-/// caller-supplied artifact path on the governed lane is denied the same
-/// way (no arbitrary path/URL acquisition, no fallback to the experimental
-/// mode); a malformed record yields the owned `LIMIT_DENIED` denial (empty,
+/// Denial order: a caller-supplied artifact path on the governed lane is
+/// denied first with `KERNEL_ADMISSION_REQUIRED` (no arbitrary path/URL
+/// acquisition, no fallback to the experimental mode), before any admission
+/// record is consulted; absent admission yields `KERNEL_ADMISSION_REQUIRED`;
+/// a malformed record yields the owned `LIMIT_DENIED` denial (empty,
 /// over-long, control-character, or locator-shaped `://` identity); a
 /// world disagreement or a missing/mismatched artifact-digest binding yields
 /// the owned `ADMISSION_MISMATCH` denial. A well-formed record is still
@@ -422,10 +423,13 @@ pub fn check_governed_admission(
     artifact_source: Option<&Path>,
     admission: Option<&GovernedAdmission>,
 ) -> Result<(), TypedExecutionError> {
-    let admitted = admission.ok_or(TypedExecutionError::GovernedAdmissionRequired)?;
+    // P1.3 (#758): no arbitrary path/URL or fallback to experimental mode.
+    // The untrusted path is refused before any admission record is read,
+    // so a governed path attempt denies even alongside a presented record.
     if artifact_source.is_some() {
         return Err(TypedExecutionError::GovernedAdmissionRequired);
     }
+    let admitted = admission.ok_or(TypedExecutionError::GovernedAdmissionRequired)?;
     admitted.validate()?;
     if admitted.world != world {
         return Err(TypedExecutionError::AdmissionMismatch("world".to_owned()));
