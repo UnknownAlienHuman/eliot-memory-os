@@ -378,7 +378,9 @@ impl GovernedTypedAdmission {
     /// identity fields, and the semantic digest need rebinding. The timing
     /// observation stays the measured one.
     fn stamp_governed_receipt(&self, receipt: &mut TypedReceipt) {
-        receipt.proof = ExecutionMode::Governed.proof().to_owned();
+        ExecutionMode::Governed
+            .proof()
+            .clone_into(&mut receipt.proof);
         receipt.operation_id = Some(self.operation_id.clone());
         receipt.task_id = Some(self.task_id.clone());
         receipt.fence_epoch = Some(self.fence_epoch.clone());
