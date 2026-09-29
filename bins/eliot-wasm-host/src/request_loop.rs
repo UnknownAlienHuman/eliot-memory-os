@@ -5353,7 +5353,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
     let claim = match crate::dispatch_material::acquire_delivery_claim(
         &directory,
         &staged_claim,
-        request_digest.clone(),
+        &request_digest,
         edge_now_ms(),
     )
     .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?
