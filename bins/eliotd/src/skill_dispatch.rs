@@ -150,13 +150,16 @@ pub enum CapabilityRecordRead {
 }
 
 /// What the bounded evidence-owner activation-receipt read established about
-/// one presented receipt's subject identity (issue #2663, audit 5856960648).
+/// one presented receipt's subject identity AND the stage content that read
+/// binds (issue #2663, audit 5856960648).
 ///
 /// The rows come from the existing finite named read
 /// (`GetLearningRecordRange`, closed `activation_receipt` kind); the verdict
 /// below only compares the presented subject legs against those served owner
 /// documents by content. It never invents a record and never treats the
-/// receipt's own shape as provenance.
+/// receipt's own shape as provenance. On an owner-bound subject the bound
+/// owner row travels with the verdict, so the commit publishes the OWNER's
+/// stage content rather than the receipt's self-declared stages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivationSubject {
     /// An owner row binds this exact subject: same Skill identity, same
@@ -172,7 +175,7 @@ enum ActivationSubject {
 }
 
 /// Resolves one presented receipt's subject identity against the served
-/// evidence-owner activation-receipt rows by content.
+/// evidence-owner activation-receipt rows by content, carrying the bound row.
 ///
 /// A row can name a subject only when it carries the owner projection shape
 /// (`record_kind`, `handle`, `record_json`, `record_digest`) and its document
@@ -182,10 +185,21 @@ enum ActivationSubject {
 /// contradiction under a real identity. Rows of any other record shape —
 /// including execution-evidence documents sharing the same closed kind — are
 /// skipped, never half-parsed.
+///
+/// The bound row's own stage content is what the commit may publish: the six
+/// matched legs authenticate the subject, and the row's eligibility,
+/// retrieval, delivery, activation and adherence stages corroborate (or refuse)
+/// the presented claim. A subject no row names carries no bound row and stays
+/// refused as unqualified.
+struct SubjectResolution {
+    subject: ActivationSubject,
+    bound: Option<Box<eliot_skill::SkillHarnessActivationReceipt>>,
+}
+
 fn resolve_activation_subject(
     receipt: &eliot_skill::SkillHarnessActivationReceipt,
     rows: &[Value],
-) -> ActivationSubject {
+) -> SubjectResolution {
     let mut contradicted = false;
     for row in rows {
         if row
@@ -224,14 +238,20 @@ fn resolve_activation_subject(
             && record.packet_position == receipt.packet_position
             && record.state_fence == receipt.state_fence
         {
-            return ActivationSubject::OwnerBound;
+            return SubjectResolution {
+                subject: ActivationSubject::OwnerBound,
+                bound: Some(Box::new(record)),
+            };
         }
         contradicted = true;
     }
-    if contradicted {
-        ActivationSubject::Contradicted
-    } else {
-        ActivationSubject::Unresolved
+    SubjectResolution {
+        subject: if contradicted {
+            ActivationSubject::Contradicted
+        } else {
+            ActivationSubject::Unresolved
+        },
+        bound: None,
     }
 }
 
@@ -263,13 +283,34 @@ pub struct ActivationCandidate {
     /// a subject no row names is refused as unqualified rather than published
     /// from the receipt's own shape.
     subject: ActivationSubject,
+    /// The owner row that bound the subject, when one did. The published
+    /// stage claims are folded from THIS row's stages, never from the
+    /// presented receipt's self-declared stages: a positive stage the bound
+    /// row does not corroborate is refused as unqualified (issue #2663, C3).
+    /// `None` unless `subject` is `OwnerBound`.
+    bound_subject: Option<Box<eliot_skill::SkillHarnessActivationReceipt>>,
 }
 
 impl ActivationCandidate {
-    /// Owner-qualified summary for this attempt: the presented receipt's stage
+    /// Owner-qualified summary for this attempt: the BOUND owner row's stage
     /// claims, with usefulness resolved only from `resolved_outcomes`.
+    ///
+    /// Folding the bound row keeps every published stage corroborated by the
+    /// owner record that named the subject. The `None` arm is fail-closed and
+    /// unreachable past the commit's subject checks: with no bound row there
+    /// is no corroborated stage to publish, so every stage stays negative and
+    /// usefulness stays unknown.
     fn qualified_summary(&self) -> eliot_skill::AttemptLifecycleSummary {
-        eliot_skill::qualify_useful_outcomes(&self.receipt, &self.resolved_outcomes)
+        match &self.bound_subject {
+            Some(bound) => eliot_skill::qualify_useful_outcomes(bound, &self.resolved_outcomes),
+            None => eliot_skill::AttemptLifecycleSummary {
+                delivered: false,
+                retrieved: false,
+                activated: false,
+                adhered: eliot_skill::SkillAdherenceStatus::Unknown,
+                useful: eliot_skill::SkillUsefulness::Unknown,
+            },
+        }
     }
 }
 
@@ -519,7 +560,11 @@ fn commit_execution_candidate(
         });
     }
     match composition
-        .skill_publish_execution_evidence(payload, candidate.historical_binding.as_ref())
+        .skill_publish_execution_evidence(
+            payload,
+            &candidate.ingest_attempt_id,
+            candidate.historical_binding.as_ref(),
+        )
     {
         // The owner accepted the evidence: the assessment is only reported
         // after the owner took it, so a claim never outruns persistence. The
@@ -539,11 +584,20 @@ fn commit_execution_candidate(
                     ));
                 }
             };
+            // The retention proof compares recorded content, not the whole
+            // stored row: the owner stamps each retained record with the
+            // filing binding (Skill, ingest attempt, fence) at record time,
+            // which the presented wire window never carries. Content mismatch
+            // under a retained identity already failed at publish with a
+            // typed conflict, so a missing identity here means the owner lost
+            // the ingest.
             if committed.revision < published.lifecycle_revision
-                || payload
-                    .executions
-                    .iter()
-                    .any(|presented| !committed.retained.contains(presented))
+                || payload.executions.iter().any(|presented| {
+                    !committed
+                        .retained
+                        .iter()
+                        .any(|held| held.same_recorded_content(presented))
+                })
             {
                 return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
                     "execution evidence owner did not retain the published ingest; the assessment stays unqualified"
@@ -936,6 +990,20 @@ fn commit_activation_candidate(
                     .to_owned(),
             ),
         ))
+    } else if candidate.subject == ActivationSubject::OwnerBound
+        && candidate.bound_subject.is_none()
+    {
+        // The subject verdict claims an owner binding but carries no bound
+        // row to corroborate the stages: with nothing owner-backed to fold,
+        // no stage may publish. This arm is unreachable when the plan binds
+        // both together, and it refuses rather than falling back to the
+        // receipt's self-declared stages.
+        Some(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::Surface(
+                "owner-bound activation subject lost its bound owner row; the candidate remains unqualified"
+                    .to_owned(),
+            ),
+        ))
     } else {
         None
     };
@@ -968,10 +1036,13 @@ fn commit_activation_candidate(
     }
     match composition.skill_admit_material_attempt(&candidate.receipt) {
         Ok(_) => {
-            // The stage claims come from the admitted summary; usefulness
-            // is re-decided here from the owner records the plan actually
-            // resolved, never from the admission result and never from the
-            // presented string set. The resolved records stay in the
+            // The stage claims come from the BOUND owner row's admitted
+            // summary; usefulness is re-decided here from the owner records
+            // the plan actually resolved, never from the admission result and
+            // never from the presented string set. The presented receipt's
+            // self-declared stages never reach the published claim: a
+            // positive stage the bound row does not corroborate stays
+            // unqualified. The resolved records stay in the
             // private candidate, so a receiver sees the qualified verdict
             // rather than a raw flag.
             SkillResultEnvelope::attempt(candidate.qualified_summary())
@@ -1363,8 +1434,10 @@ async fn plan_qualified_activation(
     //    Skill/attempt/route/packet/fence legs are compared against the owner
     //    documents by content. A contradicted subject travels with the
     //    candidate so the commit refuses it; an unresolved subject travels as
-    //    unresolved, never as a structural pass.
-    let subject = resolve_activation_subject(&receipt, &rows);
+    //    unresolved, never as a structural pass. An owner-bound subject
+    //    carries the bound row itself, so the commit folds the owner's stage
+    //    content rather than the receipt's self-declared stages.
+    let resolution = resolve_activation_subject(&receipt, &rows);
     let mut source_revisions = revisions;
     source_revisions.push(super::skill_evidence_read::activation_receipt_revision());
     PlannedSkillPair::Activation(ActivationCandidate {
@@ -1373,7 +1446,8 @@ async fn plan_qualified_activation(
         source_revisions,
         resolved_outcomes,
         coverage,
-        subject,
+        subject: resolution.subject,
+        bound_subject: resolution.bound,
     })
 }
 

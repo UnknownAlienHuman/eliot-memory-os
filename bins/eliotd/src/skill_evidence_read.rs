@@ -283,11 +283,15 @@ fn record_document(row: &serde_json::Value) -> Option<&serde_json::Value> {
 /// [`SkillExecutionEvidence`] whose own `execution_ref` equals the exact
 /// string the receipt presented, that names the canonically bound verifier
 /// (`accepting_verifier`, the deciding acceptance row's `verifier_ref`) in
-/// its own `verifier_refs`, and that validates against itself. A record
-/// that merely exists, is well-shaped, carries a handle that resembles the
-/// reference, or names an unrelated verifier never qualifies: a real
-/// verifier record for an unrelated artifact -- or an unrelated verifier --
-/// is insufficient (issue #2663, I12.24). No recursive crawl, no free-text
+/// its own `verifier_refs`, whose owner-stamped observation binding names
+/// this exact Skill, this exact subject attempt and this exact fence, and
+/// that validates against itself. A record that merely exists, is
+/// well-shaped, carries a handle that resembles the reference, names an
+/// unrelated verifier, or was filed for an unrelated attempt, Skill or fence
+/// never qualifies: a real verifier record for an unrelated artifact -- or an
+/// unrelated verifier -- is insufficient (issue #2663, I12.24). A pre-binding
+/// row, which carries no owner stamp, stays unresolved: absence of backing,
+/// never a negative fact. No recursive crawl, no free-text
 /// search and no URL fetch happens here: the page is exactly what the one
 /// bounded read returned, and a reference absent from it stays unresolved.
 pub fn resolve_outcome_records(
@@ -317,6 +321,17 @@ pub fn resolve_outcome_records(
                 .verifier_refs
                 .iter()
                 .any(|name| name == accepting_verifier)
+            {
+                return None;
+            }
+            // Observation binding: the record's owner stamp must name this
+            // exact Skill, this exact subject attempt and this exact fence. A
+            // genuine record filed for another attempt, Skill or fence — or a
+            // pre-binding row carrying no stamp — is real-but-unrelated for
+            // this receipt and stays unresolved (issue #2663, AC1; I7.25).
+            if record.observed_skill_id.as_deref() != Some(receipt.skill_id.as_str())
+                || record.observed_attempt_ref.as_deref() != Some(receipt.attempt_ref.as_str())
+                || record.observed_fence.as_ref() != Some(&receipt.state_fence)
             {
                 return None;
             }

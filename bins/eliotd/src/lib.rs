@@ -2431,6 +2431,13 @@ impl DaemonComposition {
     /// superseded Skill nor re-stamps it with today's fence. A non-current
     /// revision with no such binding is a substituted identity and is refused.
     ///
+    /// `ingest_attempt_id` is this ingest's own authenticated attempt id, from
+    /// the Kernel route. The owner stamps it onto every retained record as the
+    /// observation binding (with the Skill identity and the retained fence),
+    /// so a later usefulness claim can require the exact filing attempt —
+    /// never a wire-carried attempt field, which would be self-declared
+    /// (issue #2663, I15.2).
+    ///
     /// The crate error travels by value here like every neighboring
     /// composition seam feeding the Governor lifecycle API, so the size
     /// lint is allowed for this seam.
@@ -2438,6 +2445,7 @@ impl DaemonComposition {
     pub fn skill_publish_execution_evidence(
         &mut self,
         payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+        ingest_attempt_id: &str,
         historical: Option<&crate::skill_evidence_read::HistoricalPackageBinding>,
     ) -> Result<eliot_skill::SkillLifecycleView, eliot_skill::SkillError> {
         self.skill_reconcile_tool_basis()?;
@@ -2473,6 +2481,7 @@ impl DaemonComposition {
             &payload.skill_id,
             &payload.skill_revision,
             &payload.package_digest,
+            ingest_attempt_id,
             &entry,
             &payload.executions,
         )

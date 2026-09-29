@@ -370,9 +370,41 @@ pub struct SkillExecutionEvidence {
     pub verifier_refs: Vec<String>,
     pub outcome: ExecutionOutcome,
     pub causal_credit: CausalCredit,
+    /// Skill identity this observation was filed under, stamped by the
+    /// lifecycle owner at record time from the carried ingest context (issue
+    /// #2663, I7.25). `None` is a pre-binding row: it can never support a
+    /// usefulness claim, only fail closed to unknown.
+    pub observed_skill_id: Option<String>,
+    /// Ingest attempt that filed this observation, stamped by the lifecycle
+    /// owner at record time from the authenticated ingest context (issue
+    /// #2663, I15.2). Wire-carried values are replaced, never trusted.
+    /// `None` is a pre-binding row: it can never support a usefulness claim.
+    pub observed_attempt_ref: Option<String>,
+    /// Owner-retained fence at record time, stamped by the lifecycle owner
+    /// from its own stored view (issue #2663, I7.25). `None` is a pre-binding
+    /// row: it can never support a usefulness claim.
+    pub observed_fence: Option<StateFence>,
 }
 
 impl SkillExecutionEvidence {
+    /// Content equality excluding the owner-stamped observation binding.
+    ///
+    /// The binding names which ingest filed the record, not what was
+    /// observed: replay and reconciliation compare what was observed, so a
+    /// re-filed identical window stays idempotent and only changed observed
+    /// material conflicts. Binding enforcement lives in
+    /// [`qualify_useful_outcomes`](crate::qualify_useful_outcomes) and the
+    /// evidence-owner read, never in this comparison.
+    #[must_use]
+    pub fn same_recorded_content(&self, other: &Self) -> bool {
+        self.execution_ref == other.execution_ref
+            && self.exact_step_refs == other.exact_step_refs
+            && self.artifact_refs == other.artifact_refs
+            && self.verifier_refs == other.verifier_refs
+            && self.outcome == other.outcome
+            && self.causal_credit == other.causal_credit
+    }
+
     pub fn validate(&self) -> Result<(), SkillError> {
         text(&self.execution_ref, "execution.execution_ref")?;
         for (values, field) in [
@@ -390,6 +422,22 @@ impl SkillExecutionEvidence {
                 field: "execution.exact_step_refs",
                 reason: "observed execution requires exact step evidence",
             });
+        }
+        // The observation binding is stamped by the owner at record time, so
+        // shape validation only checks it when present: a pre-binding row (or
+        // a wire window, which carries no binding) validates on its observed
+        // content, and enforcement of the binding happens at qualification,
+        // never here.
+        if let Some(skill_id) = &self.observed_skill_id {
+            text(skill_id, "execution.observed_skill_id")?;
+        }
+        if let Some(attempt_ref) = &self.observed_attempt_ref {
+            text(attempt_ref, "execution.observed_attempt_ref")?;
+        }
+        if let Some(fence) = &self.observed_fence {
+            fence
+                .validate()
+                .map_err(|error| SkillError::Surface(error.to_string()))?;
         }
         // Causal attribution is never a sole-cause claim: only the
         // distributed/uncertain/associated representations exist, and any
@@ -1115,17 +1163,29 @@ impl SkillRegistry {
     /// Usefulness is never established here: the derived counters consult each
     /// receipt's [`SkillUsefulness`], which only
     /// [`qualify_useful_outcomes`] can raise to `OwnerBacked`.
+    ///
+    /// Every retained record is stamped with the observation binding it was
+    /// filed under: the presented Skill identity, the authenticated ingest
+    /// attempt that carried it, and the owner-retained fence at record time
+    /// (issue #2663, I7.25/I15.2). Any wire-carried binding is replaced,
+    /// never trusted. The stamp names the filing, not the content, so replay
+    /// and conflict compare recorded content only: an identical window
+    /// re-filed under any ingest is idempotent, while changed observed
+    /// material under the same execution identity is a
+    /// [`SkillError::RevisionConflict`].
     pub fn record_execution_evidence(
         &mut self,
         skill_id: &str,
         skill_revision: &str,
         package_digest: &str,
+        ingest_attempt_id: &str,
         entry: &SkillCatalogueEntry,
         executions: &[SkillExecutionEvidence],
     ) -> Result<SkillLifecycleView, SkillError> {
         text(skill_id, "execution.skill_id")?;
         text(skill_revision, "execution.skill_revision")?;
         digest(package_digest, "execution.package_digest")?;
+        text(ingest_attempt_id, "execution.ingest_attempt_id")?;
         for evidence in executions {
             evidence.validate()?;
         }
@@ -1156,15 +1216,30 @@ impl SkillRegistry {
         }
         let mut retained = previous.execution_evidence.clone();
         let mut changed = false;
+        // The owner stamps the filing binding onto its own retained copy: the
+        // presented Skill identity, the authenticated ingest attempt, and the
+        // retained fence. Wire-carried binding values are replaced wholesale,
+        // so a forged stamp on the wire can never reach the store.
+        let observed_fence = previous.state_fence.clone();
+        let mut stamped: Vec<SkillExecutionEvidence> = Vec::with_capacity(executions.len());
         for evidence in executions {
+            let mut bound = evidence.clone();
+            bound.observed_skill_id = Some(skill_id.to_owned());
+            bound.observed_attempt_ref = Some(ingest_attempt_id.to_owned());
+            bound.observed_fence = Some(observed_fence.clone());
+            bound.validate()?;
+            stamped.push(bound);
+        }
+        for evidence in &stamped {
             // Exact replay under the same execution identity is idempotent; a
             // changed record under that identity is a conflict, not an
-            // overwrite.
+            // overwrite. The comparison is over recorded content: the filing
+            // binding names the filing, never the observation.
             match retained
                 .iter()
                 .position(|held| held.execution_ref == evidence.execution_ref)
             {
-                Some(index) if retained[index] != *evidence => {
+                Some(index) if !retained[index].same_recorded_content(evidence) => {
                     return Err(SkillError::RevisionConflict);
                 }
                 Some(_) => {}
