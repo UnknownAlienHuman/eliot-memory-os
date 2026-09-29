@@ -652,7 +652,9 @@ impl BoundedBacklog {
                 .iter()
                 .position(|kept| kept.candidate.candidate_id == entry.candidate.candidate_id);
             match existing {
-                Some(index) if entry.candidate.revision > deduplicated[index].candidate.revision => {
+                Some(index)
+                    if entry.candidate.revision > deduplicated[index].candidate.revision =>
+                {
                     deduplicated[index] = entry;
                 }
                 Some(_) => {}

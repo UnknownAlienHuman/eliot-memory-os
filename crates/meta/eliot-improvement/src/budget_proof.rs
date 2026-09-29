@@ -193,11 +193,9 @@ fn budget_ledger_contract_error(error: EvaluationContractError) -> ImprovementEr
         EvaluationContractError::DuplicateIdentity { .. }
         | EvaluationContractError::InvalidInterval { .. }
         | EvaluationContractError::ReasonTooLong { .. }
-        | EvaluationContractError::ProofOverclaim => {
-            ImprovementError::BudgetGateViolation(
-                "the bound budget-equivalence ledger does not satisfy the I18.47 contract",
-            )
-        }
+        | EvaluationContractError::ProofOverclaim => ImprovementError::BudgetGateViolation(
+            "the bound budget-equivalence ledger does not satisfy the I18.47 contract",
+        ),
     }
 }
 
