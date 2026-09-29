@@ -9,11 +9,11 @@ use eliot_notify::{
     UnsatisfiedObligation, notify_error_code, parse_notify_stdin_request,
 };
 use eliot_notify_core::{
-    NotificationEnvelope, NotificationStateReadRequest, NotificationStateResponse, NotifyError,
-    ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
-    UserAutomationInvocation, UserAutomationPreflightDecision,
+    NotificationEnvelope, NotificationStateReadRequest, NotifyError,
+    SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest, UserAutomationInvocation,
+    UserAutomationPreflightDecision,
 };
-use eliot_platform::{NotificationRequest, PlatformHandle};
+use eliot_platform::NotificationRequest;
 use serde::Serialize;
 
 const REQUEST_INVALID_EXIT: i32 = 2;
@@ -67,15 +67,6 @@ enum Response {
         service: &'static str,
         protocol: &'static str,
         read: Box<eliot_notify_core::NotificationStateReadResponse>,
-    },
-    /// One committed canonical lifecycle transition with the owner's exact
-    /// post-commit record and receipt. The acknowledgement and the authorized
-    /// disposition answer with this same shape, so a caller never has to infer
-    /// closure from a status string.
-    CanonicalState {
-        service: &'static str,
-        protocol: &'static str,
-        state: Box<NotificationStateResponse>,
     },
     WatchdogTaskRegistered {
         service: &'static str,
@@ -252,21 +243,22 @@ fn main() {
                     .to_owned(),
             )
         }
-        Ok(NotifyStdinRequest::Resolve {
-            parent,
-            notification_id,
-            disposition,
-            authorization,
-        }) => match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
-            Ok(mut composition) => dispatch_resolve(
-                &mut composition,
-                &parent,
-                notification_id,
-                disposition,
-                authorization,
-            ),
-            Err(error) => composition_error(error.to_string()),
-        },
+        Ok(NotifyStdinRequest::Resolve { .. }) => {
+            // The resolution leg is owned by `eliotd` (issue #1780, A4):
+            // this broker-spawned adapter is never the canonical owner
+            // (I11.6:19), and its direct frame reaches the store only through
+            // a dead route — the surface selector is admitted by no
+            // `frame_dispatch.rs` predicate, and the serving arm requires the
+            // daemon session. Opening the Kernel front door here would mint a
+            // second ungoverned owner path (A0.3) and let a non-owner close a
+            // critical item only an evidence-backed authorized disposition may
+            // close, so the admitted line is refused with the owner named
+            // instead of attempted.
+            composition_error(
+                "canonical notification resolution is owned by eliotd; this adapter performs no canonical write"
+                    .to_owned(),
+            )
+        }
         Err(error) => Response::Error {
             code: "REQUEST_INVALID",
             detail: error.to_string(),
@@ -527,30 +519,6 @@ fn is_provider_rejection(response: &Response) -> bool {
             *code == NOTIFICATION_PROVIDER_REJECTED
         }
         _ => false,
-    }
-}
-
-/// Records one evidence-backed authorized disposition through the same
-/// authenticated Kernel route. A disposition without the protected authority
-/// receipt is refused, so a critical item cannot be closed from here.
-fn dispatch_resolve(
-    composition: &mut NotificationComposition,
-    parent: &NotificationRequest,
-    notification_id: PlatformHandle,
-    disposition: String,
-    authorization: ResolutionAuthorization,
-) -> Response {
-    match composition.resolve_notification(parent, notification_id, disposition, authorization) {
-        Ok(state) => canonical_state_response(state),
-        Err(error) => notify_error(&error),
-    }
-}
-
-fn canonical_state_response(state: NotificationStateResponse) -> Response {
-    Response::CanonicalState {
-        service: SERVICE_NAME,
-        protocol: PROTOCOL_VERSION,
-        state: Box::new(state),
     }
 }
 
