@@ -23,6 +23,7 @@
 //! the Governor-owned `TaskSelectionEvidence` where they overlap so the
 //! projection stays comparable without duplicating that contract.
 
+use eliot_context_contracts::{MeasurementStatus, SerializedContextMeasurement};
 use eliot_governor::ColdStartSurfaceView;
 use eliot_integration_coverage::{
     EventCompleteness, EventDisposition, GovernanceProfile, IntegrationCoverageProfile,
@@ -413,6 +414,34 @@ pub struct BootstrapContext {
     /// qualifies a route itself.
     #[serde(default)]
     pub route_profile_ref: String,
+    /// Frozen serializer identity carried from the canonical receipt.
+    ///
+    /// Opaque owner values naming the exact serializer (id, version, and
+    /// options digest) the Governor compiler froze for this receipt (I4.4.1
+    /// freeze). The compiled-surface intake copies them verbatim; an older
+    /// host producer that states none carries empty strings, never invented
+    /// values. Bound-checked like every other carried reference.
+    #[serde(default)]
+    pub serializer_id: String,
+    /// Frozen serializer version carried from the canonical receipt.
+    #[serde(default)]
+    pub serializer_version: String,
+    /// Frozen serializer options digest carried from the canonical receipt.
+    #[serde(default)]
+    pub serializer_options_digest: String,
+    /// Frozen tokenizer identity carried from the canonical receipt.
+    ///
+    /// Opaque owner values naming the exact tokenizer (id, version, and
+    /// hash) the Governor compiler froze for this receipt (I4.4.1 freeze).
+    /// Carried verbatim under the same rules as the serializer freeze above.
+    #[serde(default)]
+    pub tokenizer_id: String,
+    /// Frozen tokenizer version carried from the canonical receipt.
+    #[serde(default)]
+    pub tokenizer_version: String,
+    /// Frozen tokenizer hash carried from the canonical receipt.
+    #[serde(default)]
+    pub tokenizer_hash: String,
     /// Decision Safety Floor member handles carried in default output.
     ///
     /// Opaque owner handles (bounded like governance evidence); full floor
@@ -449,7 +478,10 @@ impl BootstrapContext {
     /// values (`smallest_missing_question`, `lease_deadline`,
     /// `receipt_revision`) the Governor compiler delivered for this exact
     /// receipt. It can never invent readiness: the assessment is capped later
-    /// by [`cap_assessment`] in [`get_understanding_bootstrap`]. Fails closed
+    /// by [`cap_assessment`] in [`get_understanding_bootstrap`]. The frozen
+    /// serializer/tokenizer identities stay empty on this host-supplied path:
+    /// only [`BootstrapContext::from_compiled_surface`] may carry them, copied
+    /// verbatim from the Governor surface. Fails closed
     /// via `validate_context` on blank/unbounded refs and handles (reuse of
     /// `non_blank` / `bounded_list` codes such as `READINESS_REF_MISSING`).
     #[allow(clippy::too_many_arguments)]
@@ -497,6 +529,12 @@ impl BootstrapContext {
             state_fence_ref,
             governance,
             route_profile_ref,
+            serializer_id: String::new(),
+            serializer_version: String::new(),
+            serializer_options_digest: String::new(),
+            tokenizer_id: String::new(),
+            tokenizer_version: String::new(),
+            tokenizer_hash: String::new(),
             decision_safety_floor_refs,
             workspace_instance_ref,
             projection_source_ref,
@@ -627,6 +665,33 @@ impl BootstrapContext {
             // so a delta left over from an earlier surface fails closed here
             // instead of being projected against a readiness it never described.
             context.boot_delta = boot_delta;
+            // Freeze the exact serializer/tokenizer identities the Governor
+            // compiler bound into this receipt (I4.4.1 freeze). Copied
+            // verbatim from the owner surface, never parsed or defaulted: the
+            // Governor receipt validation requires every one of them
+            // non-blank, so a surface that states none fails closed here
+            // instead of projecting an unidentified rendering.
+            context.serializer_id.clone_from(&surface.serializer_id);
+            context
+                .serializer_version
+                .clone_from(&surface.serializer_version);
+            context
+                .serializer_options_digest
+                .clone_from(&surface.serializer_options_digest);
+            context.tokenizer_id.clone_from(&surface.tokenizer_id);
+            context
+                .tokenizer_version
+                .clone_from(&surface.tokenizer_version);
+            context.tokenizer_hash.clone_from(&surface.tokenizer_hash);
+            non_blank(&context.serializer_id, "SERIALIZER_ID_MISSING")?;
+            non_blank(&context.serializer_version, "SERIALIZER_VERSION_MISSING")?;
+            non_blank(
+                &context.serializer_options_digest,
+                "SERIALIZER_OPTIONS_MISSING",
+            )?;
+            non_blank(&context.tokenizer_id, "TOKENIZER_ID_MISSING")?;
+            non_blank(&context.tokenizer_version, "TOKENIZER_VERSION_MISSING")?;
+            non_blank(&context.tokenizer_hash, "TOKENIZER_HASH_MISSING")?;
             validate_context(&context)?;
             Ok(context)
         })
@@ -759,6 +824,65 @@ pub struct TaskSelectionView {
     pub contamination_flags: Vec<String>,
 }
 
+/// Route-profiled payload measurement for one delivered default output
+/// (I7.26 reversible payload budget).
+///
+/// Records the exact serialized size of the default bootstrap payload the
+/// agent receives on the owner-selected route, bound to that route profile
+/// reference. The size is an exact UTF-8 byte observation over the rendered
+/// payload ([`SerializedContextMeasurement::utf8_bytes`]), never a tokenizer
+/// estimate: approximate token estimates never prove preservation (I7.11).
+/// No budget is invented here — the bridge neither qualifies routes nor mints
+/// capacities; it observes and reports. Material kept out of the default
+/// output stays reachable through `omitted_behind_handles`, which names the
+/// exact expansion handles carried inline (`next_safe_expansion` plus the
+/// boot-delta expansion handle when the owner produced one), so budgeting the
+/// default output cannot silently drop content: every omission stays
+/// reversible behind a named handle. `status` is `ExactUtf8` while a selected
+/// qualified route profile is carried and `Unavailable` when no route profile
+/// was selected (the byte count stays exact; route qualification is what is
+/// missing).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutePayloadMeasurement {
+    /// Owner-selected route profile this payload was measured under.
+    pub route_profile_ref: String,
+    /// Exact rendered UTF-8 bytes of the default bootstrap payload,
+    /// excluding this measurement envelope itself.
+    pub measured_utf8_bytes: u64,
+    /// Whether the observation is qualified by a selected route profile.
+    pub status: MeasurementStatus,
+    /// Expansion handles behind which omitted material stays reachable.
+    pub omitted_behind_handles: Vec<String>,
+}
+
+/// Measures the rendered default-output payload under the owner-selected
+/// route profile.
+///
+/// Serializes nothing itself: the caller supplies the already-rendered
+/// payload bytes' string form and the expansion handles carried inline, and
+/// this binds the exact byte observation to the route profile. At most the
+/// two inline expansion handles (`next_safe_expansion`, boot-delta expansion)
+/// are named, so the report is bounded by construction.
+#[must_use]
+pub fn measure_route_payload(
+    route_profile_ref: &str,
+    rendered_payload: &str,
+    omitted_behind_handles: Vec<String>,
+) -> RoutePayloadMeasurement {
+    let status = if route_profile_ref.trim().is_empty() {
+        MeasurementStatus::Unavailable
+    } else {
+        MeasurementStatus::ExactUtf8
+    };
+    RoutePayloadMeasurement {
+        route_profile_ref: route_profile_ref.to_owned(),
+        measured_utf8_bytes: SerializedContextMeasurement::utf8_bytes(rendered_payload),
+        status,
+        omitted_behind_handles,
+    }
+}
+
 /// Bounded agent-facing projection of onboarding readiness plus current
 /// cognitive state (I7.17 `UnderstandingBootstrap`).
 ///
@@ -799,6 +923,35 @@ pub struct UnderstandingBootstrap {
     pub route_profile_ref: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_safety_floor_refs: Vec<String>,
+    /// Frozen serializer identity projected from the compiled receipt.
+    ///
+    /// Empty when an older producer stated none; the owner-surface intake
+    /// always carries the exact frozen values.
+    #[serde(default)]
+    pub serializer_id: String,
+    /// Frozen serializer version projected from the compiled receipt.
+    #[serde(default)]
+    pub serializer_version: String,
+    /// Frozen serializer options digest projected from the compiled receipt.
+    #[serde(default)]
+    pub serializer_options_digest: String,
+    /// Frozen tokenizer identity projected from the compiled receipt.
+    #[serde(default)]
+    pub tokenizer_id: String,
+    /// Frozen tokenizer version projected from the compiled receipt.
+    #[serde(default)]
+    pub tokenizer_version: String,
+    /// Frozen tokenizer hash projected from the compiled receipt.
+    #[serde(default)]
+    pub tokenizer_hash: String,
+    /// Route-profiled payload measurement for this default output.
+    ///
+    /// `None` on unsealed compositions; every sealed delivery attaches the
+    /// exact measurement before returning, so each bootstrap the agent
+    /// receives carries its own route-bound size observation plus the
+    /// expansion handles behind which omitted material stays reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_measurement: Option<RoutePayloadMeasurement>,
     pub supported_count: u32,
     pub verified_count: u32,
     pub candidate_count: u32,
@@ -985,6 +1138,27 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
     }
     if !context.route_profile_ref.is_empty() {
         non_blank(&context.route_profile_ref, "ROUTE_PROFILE_MISSING")?;
+    }
+    // Frozen serializer/tokenizer identities: empty only when an older
+    // producer stated none (the host-supplied path never invents them);
+    // present values stay bounded references like every carried identity.
+    for (value, missing) in [
+        (&context.serializer_id, "SERIALIZER_ID_MISSING"),
+        (&context.serializer_version, "SERIALIZER_VERSION_MISSING"),
+        (
+            &context.serializer_options_digest,
+            "SERIALIZER_OPTIONS_MISSING",
+        ),
+        (&context.tokenizer_id, "TOKENIZER_ID_MISSING"),
+        (&context.tokenizer_version, "TOKENIZER_VERSION_MISSING"),
+        (&context.tokenizer_hash, "TOKENIZER_HASH_MISSING"),
+    ] {
+        if value.len() > MAX_HANDLE_LEN {
+            return Err(BootstrapError::new(missing, "reference exceeds bound"));
+        }
+        if !value.is_empty() {
+            non_blank(value, missing)?;
+        }
     }
     if context.workspace_instance_ref.len() > MAX_HANDLE_LEN {
         return Err(BootstrapError::new(
@@ -1346,6 +1520,13 @@ pub fn get_understanding_bootstrap(
         projection_generation: context.projection_generation,
         route_profile_ref: context.route_profile_ref.clone(),
         decision_safety_floor_refs: context.decision_safety_floor_refs.clone(),
+        serializer_id: context.serializer_id.clone(),
+        serializer_version: context.serializer_version.clone(),
+        serializer_options_digest: context.serializer_options_digest.clone(),
+        tokenizer_id: context.tokenizer_id.clone(),
+        tokenizer_version: context.tokenizer_version.clone(),
+        tokenizer_hash: context.tokenizer_hash.clone(),
+        payload_measurement: None,
         supported_count: context.supported_count,
         verified_count: context.verified_count,
         candidate_count: context.candidate_count,
@@ -1468,6 +1649,12 @@ mod tests {
             state_fence_ref: "fence-epoch-3-gen-7".to_owned(),
             governance: fixture_governance(),
             route_profile_ref: "route-profile-constrained-1".to_owned(),
+            serializer_id: "serializer-1".to_owned(),
+            serializer_version: "serializer-version-1".to_owned(),
+            serializer_options_digest: "serializer-options-1".to_owned(),
+            tokenizer_id: "tokenizer-1".to_owned(),
+            tokenizer_version: "tokenizer-version-1".to_owned(),
+            tokenizer_hash: "tokenizer-hash-1".to_owned(),
             decision_safety_floor_refs: vec![
                 "floor:goal-scope-authority".to_owned(),
                 "floor:task-selection-proof".to_owned(),
