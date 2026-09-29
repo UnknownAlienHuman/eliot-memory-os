@@ -705,8 +705,19 @@ impl KernelBackupRestore {
     /// live effect fence
     /// [`restore_with_ors_journal`](Self::restore_with_ors_journal) seals the
     /// journal's rows with, and the journal it proves is the same durable ORS
-    /// journal. Nothing here is a request field: the owner-issued references are
-    /// read out of the ORS stream-binding row the owner already committed, and
+    /// journal.
+    ///
+    /// `identity` is a caller-supplied argument, and that is stated rather than
+    /// hidden: it names the source archive, class, destination and writer the
+    /// caller is restoring against. It is NOT free text in the way a request
+    /// field is — every one of those four is re-compared here and at every
+    /// journal read against the archive, the target and the admitted owner by
+    /// [`check_ors_journal_binding`], and its `installation_ref` is not settable
+    /// at all: [`OrsRestoreBinding::from_composition`] reads it from the live
+    /// composition cell and the two ORS constructors re-compare it, so no
+    /// caller names an installation. The owner-issued references themselves are
+    /// read out of the ORS stream-binding row the owner already committed, plus
+    /// the two composition facts the record's own doc names, and
     /// `fixture_proof_only` is never set.
     ///
     /// The admission is issued against a journal that ALREADY holds `plan`'s
@@ -731,8 +742,9 @@ impl KernelBackupRestore {
     /// ([`KernelRestoreError::TargetFailed`] carrying
     /// [`BackupError::RestoreJournalRequired`]), when the durable record
     /// disagrees with live composition
-    /// ([`KernelRestoreError::JournalBindingConflict`]), or when the
-    /// composition binding names no installation.
+    /// ([`KernelRestoreError::JournalBindingConflict`]), or when the binding's
+    /// installation identity is not the live composition-owned one
+    /// ([`KernelRestoreError::OwnerEvidenceInvalid`]).
     pub fn admit_restore_journal(
         &self,
         ors: &std::sync::Arc<RedbRecoveryStore>,
@@ -2562,17 +2574,26 @@ fn check_ors_journal_binding(
     ports: &RestorePorts<'_>,
     identity: &OrsRestoreBinding,
 ) -> Result<(), KernelRestoreError> {
+    // Conflict resolution (wind-down, 2026-09-29): main added the
+    // `RESTORE_JOURNAL_IDENTITY` equality check and documents it as
+    // "load-bearing, not decorative" (backup_restore_ports.rs:51). This branch's
+    // `admit_restore_journal` derives `journal_identity_ref` from the plan's own
+    // stream key instead. The two guarantees are incompatible; main's is kept
+    // because it is the stricter and the merged one. The consequence is recorded
+    // in the issue REPORT.md: until the issuer is reconciled to name the constant
+    // journal identity, this check refuses every owner-issued admission. That is
+    // fail-closed, never a wrong import.
     if ports.journal_admission.journal_identity_ref != RESTORE_JOURNAL_IDENTITY {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal admission does not name the durable ORS restore journal".to_owned(),
         ));
     }
-    if identity.source_archive_id != bundle.manifest.backup_id {
+    if identity.source_archive_id() != bundle.manifest.backup_id {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal source archive does not name this archive".to_owned(),
         ));
     }
-    if identity.destination_ref != target.target_id {
+    if identity.destination_ref() != target.target_id {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal destination does not name this target".to_owned(),
         ));
@@ -2581,7 +2602,7 @@ fn check_ors_journal_binding(
     // already authenticated for this journal. Without this, an admission for
     // one owner could file its durable rows under a different writer identity
     // while the outcome still reports the admitted owner.
-    if identity.writer_id != ports.journal_admission.persistent_owner.owner_id {
+    if identity.writer_id() != ports.journal_admission.persistent_owner.owner_id {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal writer does not match the admitted journal owner".to_owned(),
         ));
@@ -2593,7 +2614,7 @@ fn check_ors_journal_binding(
         }
         BackupClass::ScopeExport => eliot_ors::RestoreJournalArchiveClass::ScopeExport,
     };
-    if identity.archive_class != declared {
+    if identity.archive_class() != declared {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal archive class does not match the declared class".to_owned(),
         ));
