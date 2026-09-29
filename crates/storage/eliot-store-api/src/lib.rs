@@ -31,9 +31,10 @@ use eliot_receipts::{
 };
 pub use eliot_receipts::{EffectClass, ReceiptEnvelope};
 pub use eliot_security_contracts::{
-    DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, PurgeLedgerEntry,
-    RevocationReason, SelectionChainHead, SelectionChainSeal, SelectionIntegrityReceipt,
-    SourceAssurance, TransformationLineage,
+    DisclosureDependencyClosure, EffectCeiling, EpistemicUse, InfluenceDependencyClosure,
+    InfluenceState, PurgeLedgerEntry, ResolvedSourceUse, RevocationReason, SelectionChainHead,
+    SelectionChainSeal, SelectionIntegrityReceipt, SourceAssurance, SourceUseRequest,
+    SourceUseSurface, TransformationLineage,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -4199,7 +4200,100 @@ pub struct SecurityContext {
     pub selection_chain_seal: Option<SelectionChainSeal>,
 }
 
+/// Maps a store transition class onto the instruction/data surface its writes
+/// land on.
+///
+/// A transition that records a candidate, a learning record, an experience
+/// entry, a blackboard item, or an audit event writes DATA: derived artifacts
+/// may be stored there while carrying their taint. A transition that writes
+/// task control, a lifecycle policy, a recovery schema, an authority
+/// revocation, a user automation, a reactive/notification record, an
+/// instrument registry, or a canonical erasure writes AUTHORITY: those are the
+/// standing instructions, tool definitions, policies, and effect grants an
+/// untrusted source must never become.
+const fn transition_source_use_surface(transition_class: TransitionClass) -> SourceUseSurface {
+    match transition_class {
+        TransitionClass::CaptureCandidate | TransitionClass::Epistemic => SourceUseSurface::Data,
+        TransitionClass::TaskControl
+        | TransitionClass::LifecyclePolicy
+        | TransitionClass::RecoverySchema
+        | TransitionClass::Erasure
+        | TransitionClass::NotificationState
+        | TransitionClass::ReactiveState
+        | TransitionClass::UserAutomation
+        | TransitionClass::InstrumentRegistry => SourceUseSurface::Authority,
+    }
+}
+
+/// Maps a store effect ceiling onto the source effect ceiling a source-derived
+/// consumer may propose under.
+///
+/// This is deliberately the narrowest mapping. A source that may only support a
+/// `ReadOnly` or `CandidateOnly` consumer never resolves a `ReversibleMutation`
+/// or `ExternalEffect` request, so a derived artifact cannot widen into a
+/// mutation by re-reading its own assurance.
+const fn requested_source_effect(effect: EffectClass) -> EffectCeiling {
+    match effect {
+        EffectClass::Read => EffectCeiling::ReadOnly,
+        EffectClass::Candidate => EffectCeiling::CandidateOnly,
+        EffectClass::ReversibleMutation | EffectClass::ExternalEffect => {
+            EffectCeiling::NoExternalEffect
+        }
+    }
+}
+
+/// Maps a store effect ceiling onto the epistemic use a source-derived consumer
+/// may request for it.
+///
+/// A mutation or an external effect is admitted as `VerificationInput`: the
+/// consumer is verified evidence, never a fresh observation the transition may
+/// simply record as trusted.
+const fn requested_epistemic_use(effect: EffectClass) -> EpistemicUse {
+    match effect {
+        EffectClass::Read => EpistemicUse::Observation,
+        EffectClass::Candidate => EpistemicUse::CandidateEvidence,
+        EffectClass::ReversibleMutation | EffectClass::ExternalEffect => {
+            EpistemicUse::VerificationInput
+        }
+    }
+}
+
 impl SecurityContext {
+    /// Resolves the actual source use of this context for one transition.
+    ///
+    /// This is the use-time decision at the source-use/action boundary
+    /// (issue #1760 W4). It reads the CURRENT [`SourceAssurance`] and
+    /// [`TransformationLineage`] records this context carries, recomputes taint
+    /// root-most-first across every derivation, and returns what the current
+    /// state permits. The detector's confidence, a model's interpretation, and
+    /// a `SourceSecurityAssessment` are not inputs, so no confidence value can
+    /// widen what this resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`StoreError::Security`] when a derivation declares an
+    /// input taint weaker than the material it consumed, when a tainted subject
+    /// is aimed at an authority surface, or when the transition's requested use
+    /// or effect is outside what the current evidence permits.
+    pub fn resolve_source_use(
+        &self,
+        subject_ref: &str,
+        transition_class: TransitionClass,
+        requested_effect_ceiling: EffectClass,
+    ) -> Result<ResolvedSourceUse, StoreError> {
+        eliot_security_contracts::authorize_source_use(
+            &SourceUseRequest {
+                subject_ref: subject_ref.to_owned(),
+                surface: transition_source_use_surface(transition_class),
+                requested_use: requested_epistemic_use(requested_effect_ceiling),
+                requested_effect: requested_source_effect(requested_effect_ceiling),
+            },
+            &self.source_assurance,
+            &self.transformation_lineage,
+        )
+        .map_err(StoreError::Security)
+    }
+
     /// Validates the direct C0-12 provider closure and fence alignment.
     pub fn validate(&self, state_fence: &StateFence) -> Result<(), StoreError> {
         for source in &self.source_assurance {
@@ -4735,7 +4829,21 @@ impl PreparedTransition {
                 reason: "erasure records no semantic source revisions",
             });
         }
-        self.security.validate(&self.state_fence)
+        self.security.validate(&self.state_fence)?;
+        // Issue #1760 W4: enforce instruction/data separation at the actual
+        // source-use/action boundary. The resolution below reads only the
+        // transition's own current `SourceAssurance` and `TransformationLineage`
+        // records plus this transition's declared class and effect ceiling, so
+        // an untrusted source field cannot become a standing instruction, tool
+        // definition, policy, credential, or effect grant regardless of any
+        // detector's confidence. It runs unconditionally: a caller cannot skip
+        // it by not presenting a request.
+        self.security.resolve_source_use(
+            self.identity.operation_id.as_str(),
+            self.transition_class,
+            self.requested_effect_ceiling,
+        )?;
+        Ok(())
     }
 
     /// Checks this plan against a closed named-operation manifest.

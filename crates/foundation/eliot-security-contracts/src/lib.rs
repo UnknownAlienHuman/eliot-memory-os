@@ -9,6 +9,7 @@
 mod native_resource_lease;
 mod native_resource_selection;
 mod revocation_digest;
+mod source_use;
 mod surface_types;
 mod validation;
 
@@ -28,6 +29,11 @@ pub use revocation_digest::{
     REVOCATION_DISPOSITION_UNKNOWN, REVOCATION_HISTORY_EVIDENCE_VERSION,
     RevocationClosureDigestBounds, RevocationClosureDigestInput, revocation_affected_members,
     revocation_affected_members_digest, revocation_closure_canonical_digest,
+};
+pub use source_use::{
+    BoundedAnalysisRequest, MAX_ANALYSIS_HANDLES, MAX_ANALYSIS_INPUT_BYTES,
+    MAX_ANALYSIS_OUTPUT_BYTES, MAX_ANALYSIS_TEXT_BYTES, MAX_ANALYSIS_WALL_MS, ResolvedSourceUse,
+    SourceUseRequest, SourceUseSurface, authorize_source_use,
 };
 pub use surface_types::*;
 pub use validation::{

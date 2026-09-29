@@ -25,6 +25,15 @@
 //!   `eliot_context_candidates::construct_context_candidates_with_canonical`;
 //! - packet: `eliot_dreamer_orientation::build_projection`.
 //!
+//! Conflict analysis is the one optional analysis on this path, so its stage
+//! carries a mandatory [`BoundedAnalysisRequest`] (issue #1760 W6) that is
+//! validated before `analyze_conflict` runs. A request that cannot name exact
+//! permitted handles, one recipient disclosure domain, its question, a budget
+//! and time bound, an output contract, and a stop condition is refused, and a
+//! request shape has no field for a reusable credential, a corpus selector, a
+//! standing mutation permission, or a waiting hard gate. Optional analysis
+//! therefore runs only inside its admitted question.
+//!
 //! Fail-closed sequencing (issue #2901): production composes only from the
 //! versioned [`ProductionOrientationInputs`](crate::production_orientation::ProductionOrientationInputs)
 //! carrier, whose CC-002 outcome and CC-004 projection set are mandatory and
@@ -86,6 +95,7 @@ use eliot_epistemic::{
     CurrentEpistemicPosition as ResolvedEpistemicPosition, PositionRequest, resolve,
 };
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
+use eliot_security_contracts::BoundedAnalysisRequest;
 
 use crate::OrientationStageDisposition;
 
@@ -136,6 +146,14 @@ pub(crate) struct RivalStage<'a> {
 }
 
 /// Caller-supplied conflict-analysis stage inputs (owner-built, never inferred).
+///
+/// The bounded request is mandatory and is checked before `analyze_conflict`
+/// runs (issue #1760 W6). A stage that cannot name the exact permitted handles,
+/// the recipient disclosure domain, its question, its budget, its output
+/// contract, and its stop condition does not execute, so no analysis is
+/// reachable except inside an admitted question. A waiting hard gate names no
+/// question, so it cannot produce this request and therefore cannot buy a model
+/// call.
 pub(crate) struct ConflictStage<'a> {
     /// Validated curation item under analysis.
     pub item: &'a ValidatedCurationItem,
@@ -149,6 +167,8 @@ pub(crate) struct ConflictStage<'a> {
     pub supplements: &'a ConflictSupplements,
     /// Conflict-analysis policy.
     pub policy: &'a ConflictAnalysisPolicy,
+    /// Bounded request this analysis is admitted under.
+    pub analysis: &'a BoundedAnalysisRequest,
 }
 
 /// Caller-supplied candidate stage inputs (owner-built, never inferred).
@@ -778,6 +798,17 @@ pub(crate) fn run_conflict_stage(
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Conflict)),
         |inputs| {
+            // Issue #1760 W6: the optional analysis runs only inside its
+            // admitted question. The request must name exact permitted handles,
+            // one recipient disclosure domain, the question, a budget and time
+            // bound, an output contract, and a stop condition; it carries no
+            // reusable credential, no corpus selector, and no standing mutation
+            // permission. The check runs before the owner entry, so a refused
+            // request never reaches `analyze_conflict`.
+            inputs
+                .analysis
+                .validate()
+                .map_err(|_| PulseError::Boundary("bounded analysis request"))?;
             let output = analyze_conflict(
                 inputs.item,
                 inputs.draft,

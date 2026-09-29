@@ -546,6 +546,16 @@ impl CanonicalWriteEnvelope {
             }
         }
         self.security.validate(&self.state_fence())?;
+        // Issue #1760 W4: the Governor-envelope boundary enforces
+        // instruction/data separation before any diagnosis is read, so a
+        // tainted source carried by this envelope cannot become a standing
+        // instruction, tool definition, policy, credential, or effect grant.
+        self.security
+            .resolve_source_use(
+                self.operation_id.as_str(),
+                self.transition_class,
+                self.requested_effect_ceiling,
+            )?;
         Ok(())
     }
 

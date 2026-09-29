@@ -36,6 +36,31 @@ pub enum SecurityContractError {
     DisclosureCoverageGap,
     #[error("taint was cleared without a declassification receipt")]
     TaintLaundering,
+    /// A tainted subject was aimed at a standing instruction, a tool
+    /// definition, a policy, a credential, or an effect grant.
+    ///
+    /// The refusal is decided from the recomputed taint alone, so no detector
+    /// confidence reaches it (issue #1760 W4).
+    #[error(
+        "tainted subject {subject_ref} cannot be used on the {surface:?} surface at taint {taint:?}"
+    )]
+    InstructionDataSeparation {
+        /// Subject the refused use was aimed at.
+        subject_ref: String,
+        /// Authority surface the refused use targeted.
+        surface: crate::SourceUseSurface,
+        /// Recomputed taint of the subject's lineage.
+        taint: crate::InstructionTaint,
+    },
+    /// A requested use, effect, or analysis bound is outside what the current
+    /// evidence or the admitted question permits (issue #1760 W4/W6).
+    #[error("source use refused for {subject_ref} at {field}")]
+    SourceUseRefused {
+        /// Subject the refused use or analysis was for.
+        subject_ref: String,
+        /// The exact bound that was not met.
+        field: &'static str,
+    },
     #[error("revoked influence is still marked active")]
     RevokedInfluenceActive,
     #[error("revoked influence has no invalidation reason")]
