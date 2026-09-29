@@ -527,8 +527,7 @@ fn install_document_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> 
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| format!("{} has no file name", path.display()))?;
     let staging = directory.join(format!("{name}.new"));
-    std::fs::write(&staging, bytes)
-        .map_err(|error| format!("write staged {name}: {error}"))?;
+    std::fs::write(&staging, bytes).map_err(|error| format!("write staged {name}: {error}"))?;
     std::fs::rename(&staging, path).map_err(|error| format!("install {name}: {error}"))
 }
 

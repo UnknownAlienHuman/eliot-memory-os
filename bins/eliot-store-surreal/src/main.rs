@@ -12,9 +12,9 @@ use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
 use eliot_protocol::MessageType;
 use eliot_store_surreal::diagnostics::{
-    BoundedEventLog, BridgeBoundary, BridgeIdentity, CompatibilityDecision,
-    emit_dispatch_outcome, emit_lifecycle, emit_received, emit_validation_rejected,
-    install_startup_subscriber, project_compatibility_health, report_events,
+    BoundedEventLog, BridgeBoundary, BridgeIdentity, CompatibilityDecision, emit_dispatch_outcome,
+    emit_lifecycle, emit_received, emit_validation_rejected, install_startup_subscriber,
+    project_compatibility_health, report_events,
 };
 use eliot_store_surreal::{
     CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity,
