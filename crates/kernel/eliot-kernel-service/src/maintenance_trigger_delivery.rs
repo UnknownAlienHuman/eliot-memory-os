@@ -344,7 +344,10 @@ impl MaintenanceTriggerDeliveryLedger {
     /// An exact retry (same revision, delivery identity, fence, session)
     /// returns the live claim without minting a competing one; a concurrent
     /// claim under another identity is refused. Expired eligibility blocks
-    /// stale execution: the caller must record terminal expiry first.
+    /// stale execution: the caller must record terminal expiry first. A claim
+    /// against an acknowledged or terminal row conflicts with the settled
+    /// identity: it reconciles through the recorded receipt or terminal
+    /// disposition, never through a fresh claim.
     /// Claim timeout does not rename the trigger: the owner releases the
     /// expired claim back to `Pending` through [`Self::release_expired`]
     /// and reissues under the same identity.
@@ -366,6 +369,18 @@ impl MaintenanceTriggerDeliveryLedger {
             .rows
             .get_mut(&trigger_id)
             .ok_or(MaintenanceTriggerDeliveryError::UnknownTrigger)?;
+        // A settled identity never re-opens for a fresh claim: an exact
+        // retry or a competing claim against an acknowledged or terminal
+        // row conflicts with the recorded outcome and reconciles through
+        // the stored receipt or terminal disposition instead.
+        if matches!(
+            row.disposition,
+            MaintenanceTriggerDisposition::Acknowledged
+                | MaintenanceTriggerDisposition::Expired
+                | MaintenanceTriggerDisposition::Superseded
+        ) {
+            return Err(ProtocolError::ReplayConflict.into());
+        }
         row.record
             .validate_at(now_unix_ms)
             .map_err(|_| MaintenanceTriggerDeliveryError::ExpiredEligibility)?;
