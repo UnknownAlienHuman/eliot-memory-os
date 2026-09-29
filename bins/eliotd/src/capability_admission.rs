@@ -47,11 +47,13 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::AttemptId;
+use eliot_agent_api::LowercaseSha256;
 use eliot_agent_api::RouteFingerprint;
 use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelRole};
 
 use crate::route_receipts::{
     GovernorRouteAttempt, RouteAdmissionVisibility, RouteReceiptError, RuntimeObservedFacts,
+    effective_route_key,
 };
 
 /// Canonical required capability set for one model invoke (R2, I1.11 step 9).
@@ -293,18 +295,50 @@ pub struct ProductionEvidenceBundle<'a> {
     pub pulse: Option<&'a DynamicCapabilityPulse>,
 }
 
-/// Production route admission decision: the funnel outcome plus the Governor
-/// attempt receipt recording requested versus observed routing.
+/// Production route admission decision: the funnel outcome, the Governor
+/// attempt receipt recording requested versus observed routing, the effective
+/// fingerprint key, the retained evidence the decision was evaluated over, and
+/// the behaviour-bearing dimensions on which the observed execution identity
+/// diverges from the requested one.
 ///
 /// The receipt is minted for admitted and denied attempts alike so blocked
 /// production work stays visible exactly where it happened. Visibility never
 /// implies admission: only [`AdmissionOutcome::admitted`] admits.
+///
+/// The five facts are deliberately SEPARATE FIELDS rather than one collapsed
+/// value. I3.4 requires configured intent, observed capability and current
+/// capacity to stay apart: `attempt.requested_route` is the policy
+/// selection, `attempt.actual.observed_route` is built exclusively from
+/// runtime-observed facts, `observed_route_key` is the digest of the observed
+/// identity, `evidence` is the retained record slice verbatim, and `outcome`
+/// is the derived decision. Folding any of them into another is what would
+/// let a requested value stand in for an observation.
 #[derive(Clone, Debug)]
-pub struct RouteAdmissionDecision {
-    /// The funnel disposition for the requested operation.
+pub struct RouteAdmissionDecision<'a> {
+    /// The funnel disposition for the requested operation, after the
+    /// observed-identity staleness rule in [`admit_production_route`] is
+    /// applied.
     pub outcome: AdmissionOutcome,
     /// Attempt receipt binding the requested route to the observed route.
     pub attempt: GovernorRouteAttempt,
+    /// Canonical effective key of the OBSERVED fingerprint: the digest every
+    /// capability and outcome lookup must key off, so a serializer- or
+    /// adapter-rotated sibling never shares this evidence.
+    pub observed_route_key: LowercaseSha256,
+    /// The retained capability evidence records this decision was evaluated
+    /// over, borrowed verbatim. Not re-derived, not filtered to the admitted
+    /// subset: a reader sees the record that was weighed, including the ones
+    /// that refused.
+    pub evidence: &'a [CapabilityEvidenceRecord],
+    /// Behaviour-bearing execution-identity dimensions (`adapter`,
+    /// `adapter_hash`, `serializer_hash`) on which the observed route
+    /// differs from the requested route. Non-empty means the retained
+    /// evidence was taken against a route this attempt did not execute, so
+    /// the route is stale until it is requalified on the observed identity.
+    ///
+    /// This is derived, never recomputed from configuration: it is the
+    /// requested-versus-observed comparison the receipt already proves.
+    pub stale_dimensions: Vec<&'static str>,
 }
 
 /// Admits one production route and records its attempt receipt.
@@ -316,25 +350,84 @@ pub struct RouteAdmissionDecision {
 /// fail closed with [`RouteReceiptError`] before any admission decision is
 /// produced.
 ///
+/// # Observed-identity staleness, and why it is here
+///
+/// The funnel above matches evidence against the REQUESTED route, because
+/// that is the identity policy selected and the identity the evidence was
+/// qualified against. I3.4 separately requires that the requested and the
+/// observed route stay apart, and that a behaviour-bearing change between
+/// them stales the dependent evidence. Neither fact is enough alone: matching
+/// the requested route exactly is not a claim that the runtime executed it.
+///
+/// So the comparison the receipt already carries is CONSUMED here.
+/// [`RouteAdmissionVisibility::stale_dimensions`] — the exact function that
+/// compares `adapter`, `adapter_hash` and `serializer_hash` between the two
+/// retained fingerprints — is evaluated, and a non-empty result downgrades an
+/// otherwise-admitting disposition to
+/// [`AdmissionDisposition::Defer`], which is the disposition that names
+/// requalification. That is the whole of "changing adapter or serializer
+/// invalidates affected admission until fresh evidence is admitted": the
+/// evidence was qualified for a route the attempt did not run, so it no
+/// longer authorizes this work.
+///
+/// The downgrade is deliberately narrow. It applies only to a disposition
+/// that was going to admit, so it can never soften an existing
+/// [`AdmissionDisposition::Block`], `ObserveOnly` or `RequireAuthority` into
+/// something weaker. It covers only the adapter and serializer dimensions,
+/// never `provider`/`model`/`auth_billing`: an unexposed or account-scoped
+/// difference is reported by `diverged_fields` and must not poison an
+/// unrelated route's evidence. Requalification restores admission through
+/// the ordinary funnel, which re-evaluates the observed route's own
+/// fingerprint; nothing here caches, mints or records a restriction.
+///
 /// # Errors
 ///
 /// Returns [`RouteReceiptError`] when the requested route, the observed
 /// facts, or the attempt linkage is malformed.
-pub fn admit_production_route(
+pub fn admit_production_route<'a>(
     request: &ProductionAdmissionRequest,
-    evidence: &ProductionEvidenceBundle<'_>,
+    evidence: &ProductionEvidenceBundle<'a>,
     attempt_id: AttemptId,
     observed_facts: &RuntimeObservedFacts,
-) -> Result<RouteAdmissionDecision, RouteReceiptError> {
+) -> Result<RouteAdmissionDecision<'a>, RouteReceiptError> {
     let receipt = RouteAdmissionVisibility::observe(request.route.clone(), observed_facts)?;
     let attempt = GovernorRouteAttempt::new(attempt_id, request.route.clone(), receipt)?;
+    let stale_dimensions = attempt.actual.stale_dimensions();
+    let observed_route_key = effective_route_key(&attempt.actual.observed_route)?;
     let outcome = evaluate_production_admission(
         request,
         evidence.records,
         evidence.static_attestation,
         evidence.pulse,
     );
-    Ok(RouteAdmissionDecision { outcome, attempt })
+    Ok(RouteAdmissionDecision {
+        outcome: refuse_stale_observed_identity(outcome, &stale_dimensions),
+        attempt,
+        observed_route_key,
+        evidence: evidence.records,
+        stale_dimensions,
+    })
+}
+
+/// Downgrades an admitting disposition when the observed execution identity
+/// differs from the requested one on a behaviour-bearing dimension.
+///
+/// Returns the outcome unchanged unless it was about to admit, so this can
+/// only ever remove admission, never grant or soften it. The reason names the
+/// rule rather than the concrete dimensions, because the dimensions are
+/// already carried separately on
+/// [`RouteAdmissionDecision::stale_dimensions`].
+fn refuse_stale_observed_identity(
+    outcome: AdmissionOutcome,
+    stale_dimensions: &[&'static str],
+) -> AdmissionOutcome {
+    if stale_dimensions.is_empty() || !outcome.admitted() {
+        return outcome;
+    }
+    AdmissionOutcome::new(
+        AdmissionDisposition::Defer,
+        "the observed adapter or serializer identity differs from the requested fingerprint, so the retained evidence is stale until requalified on the observed route",
+    )
 }
 
 /// Collects the evidence records scoped to the exact requested capability and
