@@ -19,6 +19,18 @@ pub enum AssemblyError {
     #[error("admitted context is incomplete")]
     Incomplete(Box<DecisionContextIncomplete>),
     /// Quality evidence cannot support a complete projection.
+    ///
+    /// Both halves are retained and neither replaces the other: the card is the
+    /// complete twelve-dimension accounting, including every failed, unknown,
+    /// degraded and not-applicable result, and the refusal is the typed
+    /// operation-scoped answer - which operation was requested, whether it was
+    /// blocked by a dimension or by an unresolved applicability input, and the
+    /// exact blocking results with the evidence each still lacks. A consumer
+    /// that only saw the card would have to re-derive the refusal; a consumer
+    /// that only saw the refusal would lose the dimensions that did not block.
     #[error("quality evidence cannot support a complete projection")]
-    QualityIncomplete(Box<eliot_context_contracts::QualityScorecard>),
+    QualityIncomplete(
+        Box<eliot_context_contracts::QualityScorecard>,
+        Box<eliot_context_contracts::QualityRefusal>,
+    ),
 }

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmittedAtom, AdmittedContextSet, AtomAvailability, AuthorityClass, ContextBinding,
-    ContextError, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, QualityScorecard,
+    ContextError, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, QualityDimension,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, QualitySuitability,
     SerializedContextMeasurement,
 };
 
@@ -294,6 +295,30 @@ impl ActiveUnderstandingView {
             }
         }
         Ok(())
+    }
+
+    /// Check this exact view's readiness for one requested dependent decision
+    /// or effect, using the one shared rule.
+    ///
+    /// [`ActiveUnderstandingView::validate`] stays structural integrity. This is
+    /// the separate, operation-scoped readiness fact a direct View consumer
+    /// reads, so a deserialized view cannot reach an effect by satisfying
+    /// structure alone. The view is validated first, so a refusal names a view
+    /// that describes no gradeable packet as
+    /// [`QualityRefusalKind::InvalidScorecard`] instead of quietly returning a
+    /// grade from a mutated view.
+    pub fn suitability(
+        &self,
+        operation: QualityOperation,
+        additional_required: &[QualityDimension],
+    ) -> Result<QualitySuitability, QualityRefusal> {
+        self.validate().map_err(|_| QualityRefusal {
+            kind: QualityRefusalKind::InvalidScorecard,
+            operation,
+            blocking: Vec::new(),
+            unresolved_applicability: Vec::new(),
+        })?;
+        self.quality.suitability(operation, additional_required)
     }
 
     /// Detect any post-assembly mutation or injected non-admitted content.
