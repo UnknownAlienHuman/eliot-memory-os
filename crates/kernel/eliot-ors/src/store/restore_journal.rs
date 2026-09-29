@@ -44,14 +44,20 @@ use crate::restore_journal::{
     RestoreJournalRetentionReport, RestoreJournalStreamBinding,
 };
 
+// #953 (A5): the backup row family census names a table by referencing the
+// store's OWN `TableDefinition`, never by restating its wire name, so that a
+// renamed table cannot drift from its census entry. These three are redb tables
+// in this file like every other one, and the census has to be able to say so
+// rather than declare them table-less. `pub(super)` is the narrowest visibility
+// that reaches `store::backup_snapshot`; no writer, reader or schema changes.
 /// Versioned intent table: owner-neutral restore intent rows.
-const RESTORE_JOURNAL_INTENTS: TableDefinition<'static, &'static str, &'static str> =
+pub(super) const RESTORE_JOURNAL_INTENTS: TableDefinition<'static, &'static str, &'static str> =
     TableDefinition::new("ors_restore_journal_intents_v1");
 /// Versioned result table: receipts answering exact committed intents.
-const RESTORE_JOURNAL_RESULTS: TableDefinition<'static, &'static str, &'static str> =
+pub(super) const RESTORE_JOURNAL_RESULTS: TableDefinition<'static, &'static str, &'static str> =
     TableDefinition::new("ors_restore_journal_results_v1");
 /// Dedicated journal meta table: schema, bindings, fences and unique indexes.
-const RESTORE_JOURNAL_META: TableDefinition<'static, &'static str, &'static str> =
+pub(super) const RESTORE_JOURNAL_META: TableDefinition<'static, &'static str, &'static str> =
     TableDefinition::new("ors_restore_journal_meta_v1");
 /// Schema marker row inside the meta table.
 const RESTORE_JOURNAL_SCHEMA_ROW: &str = "schema";
