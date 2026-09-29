@@ -355,9 +355,15 @@ pub enum UserModeSupervisionAuthorityCredentialObservation {
         target: PlatformHandle,
     },
     /// The current value derives the key pinned by the persisted public anchor.
+    ///
+    /// The receipt is boxed because it is far larger than the SID/target pairs
+    /// carried by the sibling variants. Boxing changes storage only: the
+    /// retained receipt, and therefore the evidence, is byte-for-byte the same
+    /// original transaction receipt and is never reconstructed from observed
+    /// bytes.
     Matching {
         /// Original transaction receipt, never reconstructed from observed bytes.
-        receipt: UserModeSupervisionAuthorityCredentialReceipt,
+        receipt: Box<UserModeSupervisionAuthorityCredentialReceipt>,
     },
     /// A present target differs from the original public key or owner binding.
     Mismatch {
@@ -455,9 +461,7 @@ impl WindowsUserModeSupervisionAuthorityCredentialProvider {
     ) -> Result<UserModeSupervisionAuthorityCredentialTargetObservation, SupervisionAuthorityKeyError>
     {
         request.validate()?;
-        let owner_sid = self
-            .primitive
-            .principal_sid()
+        let owner_sid = WindowsCurrentUserSupervisionCredentialProvider::principal_sid()
             .map_err(map_current_user_credential_error)?;
         if owner_sid.as_str() != request.owner_sid {
             return Err(SupervisionAuthorityKeyError::AccessDenied);
@@ -614,7 +618,7 @@ impl WindowsUserModeSupervisionAuthorityCredentialProvider {
                 match self.load_signer(receipt) {
                     Ok(_) => Ok(
                         UserModeSupervisionAuthorityCredentialObservation::Matching {
-                            receipt: receipt.clone(),
+                            receipt: Box::new(receipt.clone()),
                         },
                     ),
                     Err(
@@ -712,9 +716,7 @@ impl WindowsUserModeSupervisionAuthorityCredentialProvider {
     ) -> Result<Ed25519SupervisionLeaseSigner, SupervisionAuthorityKeyError> {
         reference.validate().map_err(map_contract_error)?;
         trust_anchor.validate().map_err(map_contract_error)?;
-        let owner_sid = self
-            .primitive
-            .principal_sid()
+        let owner_sid = WindowsCurrentUserSupervisionCredentialProvider::principal_sid()
             .map_err(map_current_user_credential_error)?;
         if owner_sid.as_str() != reference.owner_sid_receipt.owner_sid {
             return Err(SupervisionAuthorityKeyError::AccessDenied);
