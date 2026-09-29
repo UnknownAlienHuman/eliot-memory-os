@@ -2018,6 +2018,13 @@ fn decode_reconciliation_outcome(
         identity.live_generation,
         identity.connection_echo,
     )? {
+        ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
+            value,
+            reconciliation,
+            window_status,
+            &unresolved,
+        )?;
+        check_expected_continuation(reconciliation, &[], expected)?;
         return Ok(legacy_denial);
     }
     ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
