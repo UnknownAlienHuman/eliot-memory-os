@@ -584,10 +584,7 @@ fn close_floor_dependencies(
         } else {
             missing.insert(atom_id.clone());
         }
-        for policy in policies
-            .iter()
-            .filter(|policy| policy.atom_id == atom_id)
-        {
+        for policy in policies.iter().filter(|policy| policy.atom_id == atom_id) {
             queue.extend(policy.required_dependencies.iter().cloned());
         }
     }
@@ -753,8 +750,7 @@ pub fn admit_material_decision(
             references,
         ));
     }
-    let effective =
-        prepared_floor_closure(closure).map_err(MaterialDecisionRefusal::Boundary)?;
+    let effective = prepared_floor_closure(closure).map_err(MaterialDecisionRefusal::Boundary)?;
     let uncovered: Vec<ArtifactId> = floor
         .required
         .iter()
@@ -878,16 +874,11 @@ impl FloorDeliveryGaps {
             && self.partial.is_empty()
     }
 
-    fn push(
-        &mut self,
-        atom_id: ArtifactId,
-        availability: Option<AtomAvailability>,
-        omitted: bool,
-    ) {
+    fn push(&mut self, atom_id: ArtifactId, availability: Option<AtomAvailability>, omitted: bool) {
         match availability {
             Some(AtomAvailability::Stale) => self.stale.push(atom_id),
             Some(AtomAvailability::Blocked) => self.blocked.push(atom_id),
-            Some(AtomAvailability::Unavailable) | Some(AtomAvailability::Missing) => {
+            Some(AtomAvailability::Unavailable | AtomAvailability::Missing) => {
                 self.unavailable.push(atom_id);
             }
             Some(AtomAvailability::Omitted) => self.omitted.push(atom_id),
@@ -965,16 +956,17 @@ fn check_floor_delivery(
                 gaps.unavailable.push(required.atom_id.clone());
             }
             _ => {
-                let availability = record
-                    .map(|record| record.candidate.availability)
-                    .or_else(|| {
-                        closure
-                            .candidates
-                            .candidates
-                            .iter()
-                            .find(|candidate| candidate.atom_id == required.atom_id)
-                            .map(|candidate| candidate.availability)
-                    });
+                let availability =
+                    record
+                        .map(|record| record.candidate.availability)
+                        .or_else(|| {
+                            closure
+                                .candidates
+                                .candidates
+                                .iter()
+                                .find(|candidate| candidate.atom_id == required.atom_id)
+                                .map(|candidate| candidate.availability)
+                        });
                 gaps.push(required.atom_id.clone(), availability, omitted);
             }
         }
@@ -1000,11 +992,15 @@ fn delivery_refusal(
     incomplete.missing.extend(gaps.missing.iter().cloned());
     incomplete.stale.extend(gaps.stale.iter().cloned());
     incomplete.blocked.extend(gaps.blocked.iter().cloned());
-    incomplete.unavailable.extend(gaps.unavailable.iter().cloned());
+    incomplete
+        .unavailable
+        .extend(gaps.unavailable.iter().cloned());
     incomplete.omitted.extend(gaps.omitted.iter().cloned());
     incomplete.exhausted.extend(gaps.exhausted.iter().cloned());
     incomplete.unknown.extend(gaps.unknown.iter().cloned());
-    incomplete.known_empty.extend(gaps.known_empty.iter().cloned());
+    incomplete
+        .known_empty
+        .extend(gaps.known_empty.iter().cloned());
     incomplete.partial.extend(gaps.partial.iter().cloned());
     let allowed_action = if gaps.stale.len() == gaps_count(gaps) {
         AllowedFloorAction::Refresh
