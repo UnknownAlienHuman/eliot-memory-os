@@ -2167,13 +2167,21 @@ fn validate_disposition_record(
                 _ => {}
             }
             if let WasmDeliveryDisposition::Acknowledged {
+                result_sequence,
                 receiver_ack_identity,
                 receiver_ack_digest,
+                receiver_ack_sequence,
                 process_settlement_digest,
                 material_settlement_digest,
                 ..
             } = &record.disposition
             {
+                // An ACK that names a different stream position does not
+                // settle this delivery's terminal result and cannot authorize
+                // reclamation of its retained bytes.
+                if receiver_ack_sequence != result_sequence {
+                    return Err(WasmDispatchError::DeliveryUnavailable);
+                }
                 require_disposition_text(receiver_ack_identity)?;
                 require_disposition_digest(receiver_ack_digest)?;
                 require_disposition_digest(process_settlement_digest)?;
