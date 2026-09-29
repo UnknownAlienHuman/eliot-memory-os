@@ -456,8 +456,16 @@ jobs:
               if 'continue-' + 'on-error' in text:
                   fail('WIRING', f'{name} must not soften gate failure')
 
-          # Cache safety: key binds OS, toolchain, lockfile, profile, and
-          # event class; fork PRs restore without saving; one ungated run.
+          # Cache safety: every workflow key binds OS, toolchain, lockfile,
+          # profile, source manifests, and event/fork trust class; fork PRs restore without saving.
+          for cache_name, cache_text in (('ci.yml', ci), ('source-candidate.yml', sc_text), ('integration.yml', int_text)):
+              file_keys = [line for line in cache_text.splitlines() if 'hashFiles' in line and 'Cargo.lock' in line]
+              if not file_keys:
+                  fail('CACHE', f'{cache_name} restores no Cargo.lock-bound cache key')
+              for key_line in file_keys:
+                  for dimension, marker in (('OS', 'runner.os'), ('toolchain', 'rust-toolchain.toml'), ('source manifests', 'Cargo.toml'), ('profile', cache_name), ('event class', 'event_name'), ('fork trust class', 'fork')):
+                      if marker not in key_line:
+                          fail('CACHE', f'{cache_name} cache key must bind the {dimension} dimension')
           key_lines = [line for line in ci.splitlines() if 'hashFiles' in line and 'Cargo.lock' in line]
           if len(key_lines) != 1 or 'runner.os' not in key_lines[0] or 'mergecompile' not in key_lines[0].lower():
               fail('CACHE', 'ci cache key must bind OS, lockfile, and profile')

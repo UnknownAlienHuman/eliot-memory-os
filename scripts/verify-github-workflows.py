@@ -48,6 +48,14 @@ Enforces that:
 11. Workflow dotnet restores run with --locked-mode against the checked-in
     packages.lock.json files, so graph drift or a lock-mutating restore fails
     instead of silently resolving a new graph.
+12. Permissions, credentials and secrets stay fail-closed on every workflow:
+    no elevated write/admin grant, no secrets interpolation, no OIDC
+    id-token authority, and every checkout step disables persisted
+    credentials in its own step block.
+13. Every `actions/cache` key binds runner platform/architecture, dependency
+    lock, toolchain, source manifests, and event/fork trust class on every
+    cache step of every workflow, so a cache hit never crosses a trust,
+    source or toolchain boundary (AC10).
 """
 
 from __future__ import annotations
@@ -82,6 +90,17 @@ USES_VALUE_RE = re.compile(
 # owner-shape test, so neither can silently reach the pin decision.
 ACTION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9._-]+)+$")
 PERMISSION_WRITE_ALL_RE = re.compile(r"^\s*permissions:\s*(?:write-all|read-all)", re.MULTILINE)
+# Fail-closed privilege and secret handling (issue #1225 step 8). Fork and
+# untrusted candidate code must never receive protected material: no elevated
+# `write`/`admin` permission grant on any code line, no `secrets.*`
+# interpolation a run could observe, no OIDC `id-token` authority, and every
+# `actions/checkout` step carries `persist-credentials: false` in its own step
+# block. Quoted prose and `#` comments are stripped before matching
+# (workflow_code_line), so a checker asserting on a marker string is never
+# itself a violation.
+ELEVATED_PERMISSION_RE = re.compile(r":\s*(write|admin)\b")
+SECRET_REF_RE = re.compile(r"secrets\b")
+OIDC_TOKEN_RE = re.compile(r"id-token\s*:")
 
 # Closed approved action owner set (issue #1225 step 2, Wave D "unapproved
 # owners"). Evidence-derived, not aspirational: `actions` is the only owner any
@@ -1575,9 +1594,78 @@ def check_dotnet_restore_lock(root: Path) -> list[Finding]:
     return findings
 
 
+def check_fail_closed_privilege(root: Path) -> list[Finding]:
+    """Permissions, credentials and secrets stay fail-closed on every workflow.
+
+    Least privilege (issue #1225 step 8, AC9): an elevated `write`/`admin`
+    grant, a `secrets.*` interpolation, or an OIDC `id-token` authority fails
+    wherever it is written, and a checkout step without
+    `persist-credentials: false` in its own step block fails so credentials
+    cannot reach candidate processes, logs, summaries, caches or artifacts.
+    The checkout verdict is block-scoped, so one conforming step never covers
+    a sibling that persists credentials.
+    """
+    findings: list[Finding] = []
+    for wf_path in iter_workflow_files(root):
+        rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
+        try:
+            lines = wf_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line_no, line in enumerate(lines, start=1):
+            code = workflow_code_line(line)
+            if ELEVATED_PERMISSION_RE.search(code):
+                findings.append(
+                    Finding(
+                        "GWF-021",
+                        rel_path,
+                        line_no,
+                        "elevated permission grant forbidden; workflows run least-privilege read-only",
+                    )
+                )
+            if SECRET_REF_RE.search(code):
+                findings.append(
+                    Finding(
+                        "GWF-021",
+                        rel_path,
+                        line_no,
+                        "secret material forbidden in workflow text; fork/untrusted code must never receive it",
+                    )
+                )
+            if OIDC_TOKEN_RE.search(code):
+                findings.append(
+                    Finding(
+                        "GWF-021",
+                        rel_path,
+                        line_no,
+                        "OIDC id-token authority forbidden without a separately accepted workflow owner",
+                    )
+                )
+        for index, line in enumerate(lines):
+            if "actions/checkout@" not in workflow_code_line(line):
+                continue
+            item = _nearest_list_item(lines, index)
+            block = _own_block(lines, item) if item is not None else [index]
+            if not any(
+                _yaml_key(lines[owned]) == "persist-credentials"
+                and _yaml_value(lines[owned]) == "false"
+                for owned in block
+            ):
+                findings.append(
+                    Finding(
+                        "GWF-021",
+                        rel_path,
+                        index + 1,
+                        "actions/checkout step must carry persist-credentials: false in its own step block",
+                    )
+                )
+    return findings
+
+
 def verify_all(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(check_workflows(root))
+    findings.extend(check_fail_closed_privilege(root))
     findings.extend(check_action_pin_divergence(root))
     findings.extend(check_cache_key_fingerprints(root))
     findings.extend(check_python_requirements(root))
