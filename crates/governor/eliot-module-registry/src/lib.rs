@@ -911,9 +911,10 @@ impl ModuleCatalog {
                     module_id: request.module_id.clone(),
                     desired_state: *desired_state,
                     manifest: manifest.clone(),
-                    restart_policy_disposition:
-                        dispose_restart_policy(manifest.restart_policy.as_ref())
-                            .map_err(|error| ModuleError::Contract(error.to_string()))?,
+                    restart_policy_disposition: dispose_restart_policy(
+                        manifest.restart_policy.as_ref(),
+                    )
+                    .map_err(|error| ModuleError::Contract(error.to_string()))?,
                     catalog_revision: self.revision + 1,
                     state_fence: self.state_fence.clone(),
                     accepted_generation: entry
@@ -944,7 +945,10 @@ impl ModuleCatalog {
                 // under it: accepting one would put a running child under an
                 // unadmitted restart policy, which is precisely the wider
                 // authority the disposition refuses.
-                if !current.restart_policy_disposition.permits_automatic_restart() {
+                if !current
+                    .restart_policy_disposition
+                    .permits_automatic_restart()
+                {
                     return Err(ModuleError::IdentityConflict);
                 }
                 let expected_policy_digest = current
