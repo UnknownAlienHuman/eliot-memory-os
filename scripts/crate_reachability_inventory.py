@@ -8,6 +8,15 @@ tracked manifests and bounded Rust source below one repository root.
 
 Issue: https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1133
 
+The workspace denominator is reconciled against the root `members`/`exclude` arrays
+read from the root manifest and the member manifests on disk, never against this
+tool's own package rows, so a package that was never scanned is a fail-closed
+`INCOMPLETE_DENOMINATOR` error rather than a row this tool silently omits.
+
+A disposition expiry is compared against the registry's own owner evaluation date
+(`revision`), not against the wall clock, so "non-expired" depends on a reviewed
+owner record instead of when the tool happened to run.
+
 The same checked-in registry also carries the second, disjoint CrateExtractionDecision
 denominator (issue #1721): the I2.23 "Canonical extraction decision" for every package
 an admission wave promoted out of the root `exclude` list, with `disposition` drawn from
@@ -36,7 +45,7 @@ import time
 import tomllib
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import date, datetime as datetime_now, timezone
+from datetime import date
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -81,6 +90,9 @@ ADMISSION_WAVE_RE: Final = re.compile(r"admitted via (#966|#967|#968)\b")
 # I2.3 names `/workspace/core` as the root production workspace carrying the daily
 # `default-members`; every contour below is resolved from a real manifest on disk.
 ROOT_CONTOUR: Final = "workspace/core"
+# Fallback gap owner for the A11 reconciliation map: issue #1720's own Scope and
+# owner line names the Workspace topology and C4 composition owners.
+ISSUE_1720_OWNER: Final = "Workspace topology and C4 composition owners (issue #1720)"
 # A `path::symbol` reference, the only proof and consumer form this gate accepts.
 SYMBOL_REF_RE: Final = re.compile(
     r"(?P<path>[A-Za-z0-9_][A-Za-z0-9_./-]*\.rs)::(?P<symbol>[A-Za-z_][A-Za-z0-9_]*)"
@@ -182,6 +194,7 @@ class AdmissionDefect(str, enum.Enum):
     DECLARED_CONSUMER_ABSENT = "DECLARED_CONSUMER_ABSENT"
     DECLARED_BUNDLE_ABSENT = "DECLARED_BUNDLE_ABSENT"
     DECLARED_CONTOUR_ABSENT = "DECLARED_CONTOUR_ABSENT"
+    DECLARED_ENTRYPOINT_ABSENT = "DECLARED_ENTRYPOINT_ABSENT"
     DUPLICATE_DECISION_IDENTITY = "DUPLICATE_DECISION_IDENTITY"
     DECISION_FOR_UNKNOWN_PACKAGE = "DECISION_FOR_UNKNOWN_PACKAGE"
     ADMISSION_RECORD_MISSING = "ADMISSION_RECORD_MISSING"
@@ -508,6 +521,21 @@ def _parse_iso_date(value: str, field: str, package: str) -> date:
         raise InventoryError("MALFORMED_DECISION_DATA", f"{package}: field '{field}' is not a real date: {value!r}") from exc
 
 
+def revision_date(revision: str) -> date:
+    """The owner evaluation date carried by the registry's own ``revision``.
+
+    "Non-expired" is only a claim when the expiry is compared against a date a
+    named owner chose. The registry revision is that choice: the owner writes and
+    bumps it whenever the dispositions are re-reviewed, its bytes are already bound
+    into the aggregate digest, and it is the date the registry's own MEASURED notes
+    are written against. A revision that carries no ISO-8601 date fails closed
+    instead of degrading to the wall clock, which would make a facade's expiry
+    depend on when this tool happened to be run and would make "unexpired"
+    unprovable rather than merely unreviewed.
+    """
+    return _parse_iso_date(revision.split(".", 1)[0].strip(), "revision", DECISION_DATA_RELPATH)
+
+
 def _decision_document(root: Path) -> tuple[str, dict[str, Any]]:
     """Read and parse the one canonical registry file, once, for both layers."""
     data_path = _inside(root, root / DECISION_DATA_RELPATH)
@@ -728,6 +756,102 @@ def _load_root_workspace(root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if not isinstance(members, list) or not isinstance(exclude, list):
         raise InventoryError("MALFORMED_MANIFEST", "workspace members/exclude must be arrays")
     return tuple(str(item) for item in members), tuple(str(item) for item in exclude)
+
+
+def _member_package_name(root: Path, member: str) -> str:
+    """The package name one root ``members`` entry declares, read from its manifest.
+
+    The name is read from the member's own ``Cargo.toml`` on disk, never from the
+    metadata graph this tool built. A member that was never scanned therefore cannot
+    be satisfied by the scanner's own output, which is the whole point of comparing
+    the denominator against the manifest.
+    """
+    if any(char in member for char in "*?["):
+        raise InventoryError(
+            "MALFORMED_MANIFEST",
+            f"root workspace member is a pattern, not a literal package path: {member!r}",
+        )
+    manifest = _inside(root, _inside(root, root / member) / "Cargo.toml")
+    name = str((_read_toml(root, manifest).get("package") or {}).get("name") or "")
+    if not name:
+        raise InventoryError(
+            "MALFORMED_MANIFEST",
+            f"root workspace member declares no package name: {member}",
+        )
+    return name
+
+
+def workspace_denominator(
+    root: Path,
+    member_paths: Sequence[str],
+    exclude_patterns: Sequence[str],
+    tracked_manifests: Sequence[str],
+    packages: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Reconcile the scanned package set against the root manifest's own arrays.
+
+    The expected member set comes from the root ``members`` array and each member's
+    own manifest on disk. The observed set comes from the cargo-metadata rows this
+    run produced. They are compared against each other, so a member the scan never
+    reached, a duplicate entry, a member/exclusion overlap, or an ``exclude`` entry
+    that excludes nothing are all discrepancies instead of a clean row.
+
+    Returns a report whose ``complete`` field is the computed comparison result, and
+    whose ``discrepancies`` are the exact reasons it is not. A caller that wants an
+    empty clean inventory must fail closed on a non-empty ``discrepancies`` list.
+    """
+    discrepancies: list[str] = []
+    for label, entries in (("member", member_paths), ("exclusion", exclude_patterns)):
+        duplicates = sorted({item for item in entries if list(entries).count(item) > 1})
+        if duplicates:
+            discrepancies.append(f"duplicate root workspace {label} entries: {duplicates}")
+    overlap = sorted(set(member_paths) & set(exclude_patterns))
+    if overlap:
+        discrepancies.append(f"root workspace member/exclusion overlap: {overlap}")
+
+    expected_members: dict[str, str] = {}
+    for member in member_paths:
+        name = _member_package_name(root, member)
+        if name in expected_members:
+            discrepancies.append(
+                f"two root workspace members declare the package {name!r}: "
+                f"{expected_members[name]!r} and {member!r}"
+            )
+        expected_members[name] = member
+
+    # An `exclude` entry that matches no tracked manifest excludes nothing, so the
+    # array claims an exclusion the tree does not have.
+    unmatched_exclude = [
+        pattern
+        for pattern in exclude_patterns
+        if not any(_matches_pattern(manifest, (pattern,)) for manifest in tracked_manifests)
+    ]
+    for pattern in sorted(unmatched_exclude):
+        discrepancies.append(f"root workspace exclusion matches no tracked manifest: {pattern!r}")
+
+    observed = {
+        str(item["name"])
+        for item in packages
+        if item.get("workspace_member") and item.get("source") is None
+    }
+    for name in sorted(set(expected_members) - observed):
+        discrepancies.append(
+            f"root workspace member was never scanned as a package: {name!r} ({expected_members[name]})"
+        )
+    for name in sorted(observed - set(expected_members)):
+        discrepancies.append(f"scanned workspace member is absent from the root members array: {name!r}")
+
+    return {
+        "root_workspace_members": len(member_paths),
+        "root_workspace_exclusions": len(exclude_patterns),
+        "expected_member_packages": len(expected_members),
+        "scanned_member_packages": len(observed),
+        "expected_member_names_sha256": _sha256(_canonical_bytes(sorted(expected_members))),
+        "scanned_member_names_sha256": _sha256(_canonical_bytes(sorted(observed))),
+        "unmatched_exclude_patterns": sorted(unmatched_exclude),
+        "discrepancies": discrepancies,
+        "complete": not discrepancies,
+    }
 
 
 def _matches_pattern(manifest: str, patterns: Sequence[str]) -> bool:
@@ -1387,6 +1511,7 @@ def _name_set(values: Iterable[str | None]) -> set[str]:
 
 
 def classify_unreachable_packages(
+    root: Path,
     packages: Sequence[dict[str, Any]],
     records: Sequence[DecisionRecord],
     *,
@@ -1397,6 +1522,11 @@ def classify_unreachable_packages(
     Returns ``(classifications, admission_defects, orphan_decisions)``. A package
     that is both production-admitted and unreachable from every binary/service
     consumer and has no valid, non-expired disposition is an admission defect.
+
+    ``root`` is required rather than optional: every name a disposition promises is
+    checked against the packages this run actually scanned and against the contours
+    and symbols that exist on disk, so a record cannot be discharged by naming a
+    crate, a contour or an entrypoint that is not there.
     """
     name_by_key = _package_names_by_key(packages)
     workspace_names = set(_workspace_package_names(packages))
@@ -1404,6 +1534,13 @@ def classify_unreachable_packages(
     for item in packages:
         packages_by_name[str(item["name"])].append(item)
     known_names = set(packages_by_name)
+    package_dir = {
+        str(item["name"]): str(Path(str(item["manifest_path"])).parent.as_posix())
+        for item in packages
+        if item.get("workspace_member")
+    }
+    contours = _named_contours(root)
+    contour_names = {name: _contour_package_names(root, manifest) for name, manifest in contours.items()}
 
     unreachable_names = {
         str(item["name"])
@@ -1462,14 +1599,24 @@ def classify_unreachable_packages(
             defects.extend(_record_defects(record, as_of))
             if record.disposition is CrateExtractionDecision.CONNECT:
                 # A Connect disposition names the owning bundle/binary the package
-                # will be wired into. An unnamed target is an unowned promise.
+                # will be wired into, and the consumer that will construct it. Both
+                # names are checked against the packages this run actually scanned,
+                # so the promise cannot be discharged by naming a crate that does
+                # not exist here.
                 if record.declared_bundle is None:
                     defects.append(AdmissionDefect.DECLARED_BUNDLE_ABSENT.value)
                 elif record.declared_bundle not in known_names:
                     defects.append(AdmissionDefect.DECLARED_BUNDLE_ABSENT.value)
-                elif declared_consumer is None and not row["source_consumers"]:
+                if declared_consumer is not None and declared_consumer not in known_names:
+                    defects.append(AdmissionDefect.DECLARED_CONSUMER_ABSENT.value)
+                elif declared_consumer is None and not any(
+                    item.get("scope") == SourceScope.PRODUCTION.value
+                    for item in row["source_consumers"]
+                ):
                     # The bundle exists but nothing constructs the capability yet:
-                    # the promised edge is still unwired.
+                    # the promised edge is still unwired. A test, bench or example
+                    # mention is not the production construction this verb claims,
+                    # so a fixture cannot stand in for the wire.
                     defects.append(AdmissionDefect.DECLARED_CONSUMER_ABSENT.value)
             elif record.disposition is CrateExtractionDecision.CONTRACT_ONLY:
                 if record.declared_consumer is None:
@@ -1479,17 +1626,45 @@ def classify_unreachable_packages(
             elif record.disposition is CrateExtractionDecision.OPTIONAL_CONTOUR:
                 if record.declared_contour is None:
                     defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
-                if record.proof_entrypoint is None:
+                elif name not in contour_names.get(record.declared_contour, set()):
+                    # The record claims the package was moved to a federated
+                    # contour. The contour must exist on disk and really hold this
+                    # package, not merely be spelled plausibly.
                     defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
+                if record.proof_entrypoint is None:
+                    defects.append(AdmissionDefect.DECLARED_ENTRYPOINT_ABSENT.value)
+                else:
+                    proof = _declared_symbols(record.proof_entrypoint)
+                    if len(proof) != 1:
+                        defects.append(AdmissionDefect.DECLARED_ENTRYPOINT_ABSENT.value)
+                    else:
+                        proof_path, proof_symbol = proof[0]
+                        own_dir = package_dir.get(name, "")
+                        proof_file = root / proof_path
+                        if (
+                            # The entrypoint must be a real file inside the package
+                            # that really defines the symbol. Existence is checked
+                            # here so a record naming a path that is not there is a
+                            # defect on that record, not a run-wide path error.
+                            not (proof_path == own_dir or proof_path.startswith(own_dir + "/"))
+                            or proof_file.is_symlink()
+                            or not proof_file.is_file()
+                            or not _defines_function(root, proof_path, proof_symbol)
+                        ):
+                            defects.append(AdmissionDefect.DECLARED_ENTRYPOINT_ABSENT.value)
                 if row.get("workspace_default_member"):
                     # The disposition claims exclusion from the root daily path, but
                     # declared workspace metadata puts the package on it.
                     defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
-                if record.contour_excluded_from_default_path is False:
+                if record.contour_excluded_from_default_path is not True:
+                    # Absent is not true: an omitted field is not an assertion that
+                    # the package left the root daily path.
                     defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
             elif record.disposition is CrateExtractionDecision.MIGRATION_FACADE:
                 # A facade is admitted only while it is still unexpired; an expired
-                # facade is exactly the admission defect the issue describes.
+                # facade is exactly the admission defect the issue describes. The
+                # expiry is compared in `_record_defects` against the owner
+                # evaluation date, never against a wall clock.
                 pass
 
         if record is not None:
@@ -1534,6 +1709,86 @@ def classify_unreachable_packages(
         sorted(admission_defects, key=lambda item: item["package"]),
         sorted(orphan_decisions, key=lambda item: item["package"]),
     )
+
+
+def reconciliation_map(inventory: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Map every admission gap to exactly one owner and one bounded issue spec.
+
+    Issue #1720 A11: a reviewed inventory drives bounded Issues/PRs without
+    duplicate ownership. This function emits the gap -> owner map as local
+    evidence (A10): it never files, closes, labels or mutates any issue, PR,
+    branch or workflow, which the governing assignment forbids. Filing remains
+    the human review act; what this guarantees mechanically is that every gap
+    names exactly one owner, so two lanes can never claim the same gap.
+
+    Owner precedence per gap is fixed: the row's own ``owner``, else its
+    ``review_owner`` (or the #1721 ``evidence_status_and_review_owner``), else
+    the issue owner. One gap, one owner, no inference from source statistics.
+    """
+    extraction = inventory.get("extraction_classification") or {}
+    admission = inventory.get("capability_admission") or {}
+    by_package = {item.get("package"): item for item in extraction.get("classifications", [])}
+    items: list[dict[str, Any]] = []
+    for defect in extraction.get("admission_defects", []):
+        name = str(defect.get("package"))
+        row = by_package.get(name, {})
+        record = row.get("record") or {}
+        owner = record.get("owner") or record.get("review_owner") or ISSUE_1720_OWNER
+        if row.get("classification") is None and not record:
+            gap = "UNCLASSIFIED: no decision row"
+        else:
+            gap = "DEFECTIVE_ROW: " + ", ".join(sorted(set(defect.get("defects", []))))
+        items.append(_reconcile_item(name, "1720", gap, owner, record, defect))
+    for orphan in extraction.get("orphan_decisions", []):
+        name = str(orphan.get("package"))
+        items.append(
+            _reconcile_item(
+                name, "1720", "ORPHAN_ROW: " + str(orphan.get("defect")), ISSUE_1720_OWNER, {}, orphan
+            )
+        )
+    for defect in admission.get("admission_defects", []):
+        name = str(defect.get("package"))
+        record = defect.get("record") or {}
+        owner = (
+            record.get("evidence_status_and_review_owner") or ISSUE_1720_OWNER
+        )
+        items.append(
+            _reconcile_item(
+                name,
+                "1721",
+                "ADMISSION_DEFECT: " + ", ".join(sorted(set(defect.get("defects", [])))),
+                owner,
+                record,
+                defect,
+            )
+        )
+    return sorted(items, key=lambda item: (item["layer"], item["package"]))
+
+
+def _reconcile_item(
+    package: str,
+    layer: str,
+    gap: str,
+    owner: str,
+    record: Mapping[str, Any],
+    defect: Mapping[str, Any],
+) -> dict[str, Any]:
+    """One gap, exactly one owner, one bounded issue specification."""
+    disposition = record.get("disposition") or defect.get("classification")
+    return {
+        "package": package,
+        "layer": layer,
+        "gap": gap,
+        "owner": owner,
+        "promised_disposition": disposition,
+        "bounded_issue": {
+            "title": f"[1720-reconcile] {package}: {gap}",
+            "acceptance": (
+                "scripts/crate_reachability_inventory.py re-run shows this "
+                f"package admitted with no defects (layer {layer})"
+            ),
+        },
+    }
 
 
 def _read_toml(root: Path, path: Path) -> dict[str, Any]:
@@ -1787,7 +2042,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
     runner = runner or SubprocessRunner()
     started = time.monotonic()
     tracked_manifests = _tracked_manifests(root, runner)
-    _, excluded_patterns = _load_root_workspace(root)
+    member_paths, excluded_patterns = _load_root_workspace(root)
     graphs = _collect_graphs(root, runner, tracked_manifests)
     packages, manifests, source_files, findings = _package_rows(
         root,
@@ -1795,6 +2050,22 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
         tracked_manifests,
         excluded_patterns,
     )
+    # The workspace denominator is reconciled before anything is classified, against
+    # the root manifest's own `members`/`exclude` arrays. A discrepancy is fail-closed:
+    # an inventory that cannot name every workspace package is incomplete output, not
+    # a clean inventory with fewer rows (issue #1720 A1, I0.5).
+    denominator = workspace_denominator(
+        root,
+        member_paths,
+        excluded_patterns,
+        tracked_manifests,
+        packages,
+    )
+    if denominator["discrepancies"]:
+        raise InventoryError(
+            "INCOMPLETE_DENOMINATOR",
+            "workspace denominator is incomplete: " + "; ".join(denominator["discrepancies"][:20]),
+        )
     head = runner.run(root, ("git", "rev-parse", "HEAD")).decode("ascii", errors="strict").strip()
     status = runner.run(root, ("git", "status", "--porcelain=v1", "--untracked-files=no"))
     cargo_version = runner.run(root, ("cargo", "-Vv")).decode("utf-8", errors="replace").strip()
@@ -1806,10 +2077,14 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
     # The decision registry is part of the evidence surface: binding its hash into
     # the aggregate means any edit to a disposition invalidates every row.
     decision_sha, decision_document = _decision_document(root)
-    _, decision_revision, records = load_decision_records(decision_document, decision_sha)
+    decision_sha, decision_revision, records = load_decision_records(decision_document, decision_sha)
     admission_records = load_admission_records(decision_document)
-    as_of = as_of or datetime_now.now(timezone.utc).date()
+    # The expiry comparison runs against the owner evaluation date carried by the
+    # registry revision, not the wall clock. `revision_date` fails closed when the
+    # owner has written no date, so a facade expiry is never silently uncompared.
+    as_of = as_of or revision_date(decision_revision)
     classifications, admission_defects, orphan_decisions = classify_unreachable_packages(
+        root,
         packages,
         records,
         as_of=as_of,
@@ -1834,6 +2109,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
         },
         "bounds": dataclasses.asdict(BOUNDS),
         "manifest_rows": manifests,
+        "workspace_denominator": denominator,
         "metadata_graphs": [
             {
                 "graph_id": graph.graph_id,
@@ -1884,7 +2160,9 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
             "packages_without_consumer": sum(item["reachability"] == Reachability.NO_CONSUMER.value for item in packages),
             "packages_with_binary_entrypoint": sum(item["reachability"] == Reachability.BINARY_ENTRYPOINT.value for item in packages),
             "packages_requiring_review": sum(item["review_state"] == "REVIEW_REQUIRED" for item in packages),
-            "complete_denominator": True,
+            # Computed by comparing the scanned package set against the root
+            # manifest's own `members`/`exclude` arrays, never a literal.
+            "complete_denominator": denominator["complete"],
             "unreachable_classified": sum(item["admitted"] for item in classifications),
             "admission_defects": len(admission_defects),
             "unclassified_unreachable": sum(
@@ -1980,12 +2258,24 @@ def _parser() -> argparse.ArgumentParser:
         "--as-of",
         type=str,
         default=None,
-        help="evaluate disposition expiry as of this ISO-8601 date (default: today, UTC)",
+        help=(
+            "evaluate disposition expiry as of this ISO-8601 date; the default is the "
+            "owner evaluation date in the registry's own 'revision' field"
+        ),
     )
     parser.add_argument(
         "--allow-admission-defects",
         action="store_true",
         help="exit 0 even when unclassified unreachable packages remain",
+    )
+    parser.add_argument(
+        "--reconcile",
+        type=Path,
+        default=None,
+        help=(
+            "write the A11 gap->owner reconciliation map (one owner and one "
+            "bounded issue spec per admission gap) as local evidence; never files anything"
+        ),
     )
     return parser
 
@@ -2014,6 +2304,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         with output.open("xb") as handle:
             handle.write(_canonical_bytes(inventory))
             handle.write(b"\n")
+        reconcile_output = None
+        reconcile_items: list[dict[str, Any]] = []
+        if args.reconcile is not None:
+            # A11 driver output: the gap->owner map as local evidence. Filing the
+            # bounded issues remains the human review act; this file only assigns
+            # exactly one owner per gap so ownership can never duplicate.
+            reconcile_items = reconciliation_map(inventory)
+            reconcile_output = _safe_output(root, args.reconcile, overwrite=args.overwrite)
+            reconcile_output.parent.mkdir(parents=True, exist_ok=True)
+            if args.overwrite and reconcile_output.exists():
+                reconcile_output.unlink()
+            with reconcile_output.open("xb") as handle:
+                handle.write(_canonical_bytes({"gaps": reconcile_items}))
+                handle.write(b"\n")
     except InventoryError as exc:
         print(
             json.dumps(
@@ -2051,6 +2355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ],
                 "aggregate_sha256": inventory["aggregate_sha256"],
                 "proof_ceiling": summary["proof_ceiling"],
+                "reconcile_output": str(reconcile_output) if reconcile_output else None,
+                "reconcile_gaps": len(reconcile_items),
             },
             sort_keys=True,
         )
