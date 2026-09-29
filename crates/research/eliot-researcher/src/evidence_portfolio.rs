@@ -7462,7 +7462,8 @@ fn record_dimension_evaluations(
     requirements: &[ClaimRequirement],
 ) -> Vec<DimensionEvaluation> {
     let excerpt_established = requirements.iter().any(|requirement| {
-        requirement.name == CLAIM_REQUIREMENTS[1] && requirement.outcome == RequirementOutcome::Satisfied
+        requirement.name == CLAIM_REQUIREMENTS[1]
+            && requirement.outcome == RequirementOutcome::Satisfied
     });
     let citations = verdict.evidence_map.clone();
     let all_cited: Vec<String> = verdict
@@ -7497,9 +7498,10 @@ fn record_dimension_evaluations(
                                 .find(|requirement| {
                                     requirement.name == CLAIM_REQUIREMENTS[1]
                                 })
-                                .map_or(RequirementOutcome::Unknown, |requirement| {
-                                    requirement.outcome.wire_name()
-                                })
+                                .map_or_else(
+                                    || RequirementOutcome::Unknown.wire_name().to_owned(),
+                                    |requirement| requirement.outcome.wire_name().to_owned(),
+                                )
                         )
                     },
                 ),
