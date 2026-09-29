@@ -3701,7 +3701,8 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
                 if let Err(error) = request.validate() {
                     return Ok(Self::user_automation_runtime_error_response(
                         UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -3745,7 +3746,8 @@ impl KernelComposition {
                         .await,
                 )
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_cancellation(session, request)
                         .await,
@@ -3804,7 +3806,8 @@ impl KernelComposition {
                         .await,
                 )
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_cancellation(session, request)
                         .await,
@@ -3857,6 +3860,19 @@ impl KernelComposition {
                         "value": {
                             "outcome": "cancelled",
                             "wake_ids": wake_ids,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+                match Box::pin(client.read_cancellation_batch(request)).await {
+                    Ok(readback) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "cancellation_batch_readback",
+                            "readback": readback,
                         },
                         "recovery": null,
                     })),
