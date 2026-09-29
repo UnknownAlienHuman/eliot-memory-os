@@ -5330,12 +5330,6 @@ impl KernelComposition {
         // is unavailable: the event stages as the deterministic redacted
         // representation plus its redaction receipt and never as verbatim raw.
         // The ORS deny scan stays a conservative detector that can only deny.
-        let privacy_authorization =
-            self.bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
-        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
-            &envelope_bytes,
-            privacy_authorization.as_ref(),
-        );
         let now = unix_ms();
         let expired = activation_deadline_expired(now, deadline_unix_ms);
         // `Ready` admits delivery; `Degraded` keeps only recovery (gap and
@@ -5354,6 +5348,16 @@ impl KernelComposition {
                         eliot_ipc::BACKPRESSURE_KERNEL_DEGRADED,
                     ));
                 }
+                let privacy_authorization = self.bridge_event_privacy_authorization(
+                    session,
+                    frame_fence,
+                    event,
+                    &envelope_bytes,
+                )?;
+                let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
+                    &envelope_bytes,
+                    privacy_authorization.as_ref(),
+                );
                 let evidence = bridge_owner_evidence(session, frame_fence)?;
                 self.stage_bridge_event_durable(
                     session,
