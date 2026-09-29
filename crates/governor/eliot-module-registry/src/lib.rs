@@ -1007,9 +1007,9 @@ impl ModuleCatalog {
         // state and invalidate nothing that is already running.
         let mut invalidated_dependents = Vec::new();
         let mut invalidation_trigger = None;
-        // The expected set is derived from the pre-transition graph, before the
-        // accepted generation is recorded. It is an independent derivation from
-        // the recorded one, so the verification below compares two answers
+        // The expected set is re-derived from the graph after the transition is
+        // applied, independently of the selection recorded above. The two must
+        // agree, so the check compares two derivations of the declared edges
         // rather than comparing the selection with itself.
         let mut expected_dependents: Option<Vec<ModuleId>> = None;
         match &request.mutation {
