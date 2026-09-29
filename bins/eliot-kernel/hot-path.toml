@@ -34,21 +34,6 @@ crate_closure = [
   "eliot-protocol",
 ]
 
-# The claim is a read of the retained admission index, so it depends on the
-# session fence and the resource generation the claim was admitted under.
-[[supported_operations.immutable_snapshot_dependencies]]
-snapshot_id = "session_state_fence"
-revision_key = "session_state_fence.authority_epoch"
-
-[[supported_operations.immutable_snapshot_dependencies]]
-snapshot_id = "session_state_fence"
-revision_key = "session_state_fence.resource_generation"
-
-[[supported_operations.queues_and_capacity]]
-queue_id = "local_read_claim"
-# An empty poll is a null result, not a wait, and not an error.
-bounds = { max_items = 64, max_bytes = 8388608, max_deadline_ms = 30000 }
-
 # No synchronous external call is declared on the claim leg. The optional
 # semantics work and the Context projection-input read are cold work and stay
 # in unsupported_operations below.
@@ -56,6 +41,21 @@ synchronous_external_calls = []
 fallback_or_degradation = { Unknown = {} }
 # #1734 owns profile production; no profile exists for this operation yet.
 hot_path_profile_ref = {}
+
+# The claim is a read of the retained admission index, so it depends on the
+# session fence and the resource generation the claim was admitted under.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "session_state_fence.authority_epoch"
+revision_key = "session_state_fence.authority_epoch"
+
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "session_state_fence.resource_generation"
+revision_key = "session_state_fence.resource_generation"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_read_claim"
+# An empty poll is a null result, not a wait, and not an error.
+bounds = { max_items = 64, max_bytes = 8388608, max_deadline_ms = 30000 }
 
 [[supported_operations]]
 operation = "local_read"
@@ -69,6 +69,11 @@ crate_closure = [
   "eliot-protocol",
   "eliot-store-api",
 ]
+
+# A late, duplicate or revoked attempt is a known stale outcome carried by the
+# typed host-request result, never a fabricated bound result.
+fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
+hot_path_profile_ref = {}
 
 # The read is bound to the fence carried by the admitted envelope and to the
 # Store named-read response revisions. I5.20: no cache invents freshness, so
@@ -92,11 +97,6 @@ call_id = "eliot-kernel-service.execute_named"
 optional = false
 deadline_ms = 30000
 
-# A late, duplicate or revoked attempt is a known stale outcome carried by the
-# typed host-request result, never a fabricated bound result.
-fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
-hot_path_profile_ref = {}
-
 [[supported_operations]]
 operation = "local_read_result"
 operation_version = "1.0.0"
@@ -107,6 +107,12 @@ crate_closure = [
   "eliot-contracts",
   "eliot-protocol",
 ]
+
+synchronous_external_calls = []
+# A timeout after possible work stays an unknown outcome in the diagnostic
+# stream next to the folded expired response; the caller retains liveness.
+fallback_or_degradation = { RecoveryDirective = { directive_ref = "eliot_runtime_contracts::RecoveryDirective" } }
+hot_path_profile_ref = {}
 
 # The submit leg validates and fence-checks the result body and binds it to the
 # waiting host request through the ORS result path.
@@ -119,12 +125,6 @@ queue_id = "local_read_result"
 # The retained queued attempts bound both the claim and the result leg; the
 # in-flight item dimension is not separately enforced on main, so it is absent.
 bounds = { max_items = 64, max_bytes = 4194304, max_deadline_ms = 30000 }
-
-synchronous_external_calls = []
-# A timeout after possible work stays an unknown outcome in the diagnostic
-# stream next to the folded expired response; the caller retains liveness.
-fallback_or_degradation = { RecoveryDirective = { directive_ref = "eliot_runtime_contracts::RecoveryDirective" } }
-hot_path_profile_ref = {}
 
 [[unsupported_operations]]
 operation = "eliot.query.packet"

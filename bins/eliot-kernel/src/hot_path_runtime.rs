@@ -267,6 +267,17 @@ fn kernel_running_registration() -> RunningBuildRegistration {
                     max_bytes: IpcImplementation::registered_queue_bytes() as u64,
                 },
             },
+            // The read leg uses the same retained-attempt bound and the
+            // single-frame limit enforced by the front-door transport. Do not
+            // derive these settings from the declaration being checked.
+            RegisteredOperation {
+                operation: "local_read".to_owned(),
+                queue: RegisteredQueueSettings {
+                    queue_id: "local_read".to_owned(),
+                    max_items: queued_items,
+                    max_bytes: IpcImplementation::registered_frame_bytes() as u64,
+                },
+            },
             RegisteredOperation {
                 operation: "local_read_result".to_owned(),
                 queue: RegisteredQueueSettings {
@@ -327,5 +338,44 @@ impl super::KernelComposition {
             "kernel.hot_spine.bound",
         );
         Ok(hot_spine)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_declaration_binds_to_running_kernel() -> Result<(), String> {
+        let spine = KernelHotSpine::bind().map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            spine.bound_operations(),
+            ["local_read_claim", "local_read", "local_read_result"],
+        );
+        assert_eq!(
+            spine.manifest_digest(),
+            eliot_contracts::sha256_hex(KERNEL_HOT_PATH_MANIFEST.as_bytes()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_changed_runtime_registration_remains_refused() -> Result<(), String> {
+        let spine = KernelHotSpine::bind().map_err(|error| format!("{error:?}"))?;
+        let mut missing = kernel_running_registration();
+        missing
+            .operations
+            .retain(|row| row.operation != "local_read");
+        assert!(bind_hot_path_manifest_set(&spine.admitted.set, &missing).is_err());
+        for row in kernel_running_registration().operations {
+            let mut changed = kernel_running_registration();
+            for changed_row in &mut changed.operations {
+                if changed_row.operation == row.operation {
+                    changed_row.queue.max_bytes += 1;
+                }
+            }
+            assert!(bind_hot_path_manifest_set(&spine.admitted.set, &changed).is_err());
+        }
+        Ok(())
     }
 }

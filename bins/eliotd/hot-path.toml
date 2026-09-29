@@ -40,6 +40,13 @@ crate_closure = [
   "eliot-protocol",
 ]
 
+synchronous_external_calls = []
+# An empty poll is a null result and leaves the flight idle; the daemon is never
+# blocked on an optional module here.
+fallback_or_degradation = { Unknown = {} }
+# #1734 owns profile production; no profile exists for this operation yet.
+hot_path_profile_ref = {}
+
 # The poll is driven by the retained startup-readiness projection, not by a
 # freshly discovered module, so its dependency is that immutable projection.
 [[supported_operations.immutable_snapshot_dependencies]]
@@ -49,13 +56,6 @@ revision_key = "startup_readiness_projection.source_revision_heads"
 [[supported_operations.queues_and_capacity]]
 queue_id = "local_read_claim"
 bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
-
-synchronous_external_calls = []
-# An empty poll is a null result and leaves the flight idle; the daemon is never
-# blocked on an optional module here.
-fallback_or_degradation = { Unknown = {} }
-# #1734 owns profile production; no profile exists for this operation yet.
-hot_path_profile_ref = {}
 
 [[supported_operations]]
 operation = "local_read"
@@ -70,6 +70,12 @@ crate_closure = [
   "eliot-read",
   "eliot-store-api",
 ]
+
+# Kernel returns the typed host-request result body, including its known stale
+# and expired outcomes; the daemon forwards it verbatim rather than inventing a
+# result.
+fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
+hot_path_profile_ref = {}
 
 # The admitted pair proves its closed linkage and fence binding before any
 # transport. A wrong fence or malformed pair fails closed before the forward.
@@ -88,12 +94,6 @@ call_id = "eliot-kernel.local_read"
 optional = false
 deadline_ms = 30000
 
-# Kernel returns the typed host-request result body, including its known stale
-# and expired outcomes; the daemon forwards it verbatim rather than inventing a
-# result.
-fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
-hot_path_profile_ref = {}
-
 [[supported_operations]]
 operation = "local_read_result"
 operation_version = "1.0.0"
@@ -105,6 +105,10 @@ crate_closure = [
   "eliot-protocol",
 ]
 
+synchronous_external_calls = []
+fallback_or_degradation = { RecoveryDirective = { directive_ref = "eliot_runtime_contracts::RecoveryDirective" } }
+hot_path_profile_ref = {}
+
 # The submit leg is bound to the attempt identity and the fence it was claimed
 # under; a stale or expired attempt is reported, not retried.
 [[supported_operations.immutable_snapshot_dependencies]]
@@ -114,10 +118,6 @@ revision_key = "claimed_attempt_state_fence.authority_epoch"
 [[supported_operations.queues_and_capacity]]
 queue_id = "local_read_result"
 bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
-
-synchronous_external_calls = []
-fallback_or_degradation = { RecoveryDirective = { directive_ref = "eliot_runtime_contracts::RecoveryDirective" } }
-hot_path_profile_ref = {}
 
 [[unsupported_operations]]
 operation = "eliot.query.packet"
