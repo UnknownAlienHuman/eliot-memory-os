@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 
+use eliot_contracts::sha256_hex;
 use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -96,13 +97,20 @@ pub struct EventCounts {
 }
 
 impl EventCounts {
+    /// Checked applied+rejected+unknown total. A saturating sum must not hide
+    /// contradictory counts, so arithmetic overflow is a typed rejection.
+    fn accounted(&self) -> Result<u64, EvaluationContractError> {
+        self.applied
+            .checked_add(self.rejected)
+            .and_then(|sum| sum.checked_add(self.unknown))
+            .ok_or(EvaluationContractError::EvidenceState {
+                field: "counts.received/applied/rejected/unknown",
+                reason: "applied, rejected and unknown counters overflow",
+            })
+    }
+
     fn validate(&self) -> Result<(), EvaluationContractError> {
-        if self
-            .applied
-            .saturating_add(self.rejected)
-            .saturating_add(self.unknown)
-            > self.received
-        {
+        if self.accounted()? > self.received {
             return Err(EvaluationContractError::EvidenceState {
                 field: "counts.received/applied/rejected/unknown",
                 reason: "applied, rejected and unknown cannot exceed received",
@@ -259,6 +267,44 @@ impl ObservationCoverageManifest {
         self.counts.validate()?;
         for blind in &self.blind_intervals_and_missing_source_reasons {
             blind.validate()?;
+            let range = self
+                .first_and_last_expected_cursors_by_stream
+                .iter()
+                .find(|range| range.stream == blind.stream)
+                .ok_or(EvaluationContractError::EvidenceState {
+                    field: "manifest.blind_intervals_and_missing_source_reasons",
+                    reason: "blind interval names a stream outside the declared cursor denominator",
+                })?;
+            if blind.first_missing_cursor < range.first_expected_cursor
+                || blind.last_missing_cursor > range.last_expected_cursor
+            {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.blind_intervals_and_missing_source_reasons",
+                    reason: "blind interval lies outside its stream cursor range",
+                });
+            }
+        }
+        {
+            let mut ordered: Vec<(&str, u64, u64)> = self
+                .blind_intervals_and_missing_source_reasons
+                .iter()
+                .map(|blind| {
+                    (
+                        blind.stream.as_str(),
+                        blind.first_missing_cursor,
+                        blind.last_missing_cursor,
+                    )
+                })
+                .collect();
+            ordered.sort();
+            for pair in ordered.windows(2) {
+                if pair[0].0 == pair[1].0 && pair[1].1 <= pair[0].2 {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "manifest.blind_intervals_and_missing_source_reasons",
+                        reason: "blind intervals overlap and double-count one cursor",
+                    });
+                }
+            }
         }
         unique_texts(
             &self.missing_source_reasons,
@@ -269,17 +315,53 @@ impl ObservationCoverageManifest {
                 field: "manifest.coverage_by_material_action_and_effect_route",
             });
         }
-        for entry in &self.coverage_by_material_action_and_effect_route {
-            entry.validate()?;
+        {
+            let mut seen = BTreeSet::new();
+            for entry in &self.coverage_by_material_action_and_effect_route {
+                entry.validate()?;
+                if !seen.insert(entry.action_or_effect_route.clone()) {
+                    return Err(EvaluationContractError::DuplicateIdentity {
+                        field: "manifest.coverage_by_material_action_and_effect_route",
+                    });
+                }
+            }
         }
         self.denominator_origin_and_sampling_policy.validate()?;
-        if self.completeness == CoverageCompleteness::Complete
-            && !self.blind_intervals_and_missing_source_reasons.is_empty()
-        {
-            return Err(EvaluationContractError::EvidenceState {
-                field: "manifest.completeness",
-                reason: "complete denominator cannot carry blind intervals",
-            });
+        if self.completeness == CoverageCompleteness::Complete {
+            if !self.blind_intervals_and_missing_source_reasons.is_empty() {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.completeness",
+                    reason: "complete denominator cannot carry blind intervals",
+                });
+            }
+            if !self.missing_source_reasons.is_empty() {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.completeness",
+                    reason: "complete denominator cannot carry missing-source reasons",
+                });
+            }
+            if self
+                .coverage_by_material_action_and_effect_route
+                .iter()
+                .any(|entry| !entry.covered)
+            {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.completeness",
+                    reason: "complete denominator cannot carry uncovered material actions",
+                });
+            }
+            if self.counts.unknown > 0 {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.completeness",
+                    reason: "complete denominator cannot carry received-but-unclassified events",
+                });
+            }
+            if self.counts.accounted()? != self.counts.received {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.completeness",
+                    reason: "complete denominator must fully account received events",
+                });
+            }
         }
         if self.proof_ceiling > ProofCeiling::Observation {
             return Err(EvaluationContractError::ProofOverclaim);
@@ -305,6 +387,16 @@ impl ObservationCoverageManifest {
         self.expected_event_sources_and_event_classes
             .iter()
             .any(|entry| entry == source_class)
+    }
+
+    /// Revision identity of this denominator: `sha256` over its JSON
+    /// encoding. The checked trace builder binds evidence to a manifest only
+    /// through this digest, so a manifest and its evidence must resolve the
+    /// same allowed Tool/Facet manifest revision before any disposition.
+    #[must_use]
+    pub fn manifest_digest(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        sha256_hex(&bytes)
     }
 }
 
@@ -458,21 +550,101 @@ impl HostObservedComplianceTrace {
     }
 }
 
+/// Manifest and evidence bound to one allowed Tool/Facet manifest revision.
+///
+/// The binding carries the independently resolved allowed-manifest digest
+/// alongside the two objects and verifies, in one place, that both validate
+/// and that both reference that exact revision for this run/attempt/route.
+/// Validating two independent objects separately is not this join: only
+/// [`derive_compliance_trace_checked`] derives a disposition from a bound
+/// input, and an unbound manifest plus evidence pair cannot produce a trace
+/// through it.
+pub struct BoundComplianceInputs<'a> {
+    manifest: &'a ObservationCoverageManifest,
+    evidence: &'a ImmutableHostEvidence,
+    allowed_manifest_digest: &'a str,
+}
+
+impl<'a> BoundComplianceInputs<'a> {
+    /// Validates the manifest and the evidence and verifies their common
+    /// run/attempt/route/allowed-manifest binding: the manifest must be the
+    /// allowed revision (by [`ObservationCoverageManifest::manifest_digest`])
+    /// and the evidence must reference that same revision.
+    pub fn bind(
+        manifest: &'a ObservationCoverageManifest,
+        evidence: &'a ImmutableHostEvidence,
+        allowed_manifest_digest: &'a str,
+    ) -> Result<Self, EvaluationContractError> {
+        manifest.validate()?;
+        evidence.validate()?;
+        text(
+            allowed_manifest_digest,
+            "inputs.allowed_manifest_digest",
+        )?;
+        if manifest.manifest_digest() != allowed_manifest_digest {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "inputs.allowed_manifest_digest",
+                reason: "coverage manifest is not the allowed manifest revision",
+            });
+        }
+        if evidence.manifest_digest != allowed_manifest_digest {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "evidence.manifest_digest",
+                reason: "host evidence does not bind the allowed manifest revision",
+            });
+        }
+        Ok(Self {
+            manifest,
+            evidence,
+            allowed_manifest_digest,
+        })
+    }
+}
+
+/// Derives a [`HostObservedComplianceTrace`] from bound manifest and
+/// evidence only. The binding is verified by
+/// [`BoundComplianceInputs::bind`]; the derived trace is re-validated before
+/// it is returned, so an invalid or unbound pair fails typed instead of
+/// producing a valid `PASS`.
+pub fn derive_compliance_trace_checked(
+    inputs: &BoundComplianceInputs<'_>,
+) -> Result<HostObservedComplianceTrace, EvaluationContractError> {
+    let trace = derive_core(inputs.manifest, inputs.evidence);
+    trace.validate()?;
+    debug_assert_eq!(
+        trace.permitted_manifest_digest, inputs.allowed_manifest_digest,
+        "bound derivation must carry the allowed manifest revision",
+    );
+    Ok(trace)
+}
+
 /// Derives a [`HostObservedComplianceTrace`] only from immutable host/runtime
 /// records joined to the permitted denominator.
 ///
 /// Classification, in order: forbidden tool action yields `FAIL`;
 /// undeclared or hidden access, out-of-namespace write, blind interval, or
-/// cursor gap (sequence gaps and payload mutations) yields `TAINTED`; a
+/// cursor gap (sequence gaps and payload mutations) yields `TAINTED`;
+/// received-but-unclassified events, uncovered material actions, or
+/// missing-source reasons lower the denominator and yield `UNKNOWN`; a
 /// non-complete denominator without a concrete taint signal yields `UNKNOWN`;
-/// only a complete denominator with no taint signal yields `PASS`. The result
-/// always carries the explicit denominator including its completeness and can
-/// never present a gapped or undeclared run as compliant `PASS`. Callers join
-/// a validated manifest: sequence faults without localized blind intervals are
-/// rejected by [`ObservationCoverageManifest::validate`], so a trace derived
-/// from a valid manifest always satisfies [`HostObservedComplianceTrace::validate`].
+/// only a fully accounted complete denominator with no taint signal yields
+/// `PASS`. The result always carries the explicit denominator including its
+/// completeness and can never present a gapped or undeclared run as compliant
+/// `PASS`. Callers join a validated manifest: sequence faults without
+/// localized blind intervals are rejected by
+/// [`ObservationCoverageManifest::validate`], so a trace derived from a valid
+/// manifest always satisfies [`HostObservedComplianceTrace::validate`].
+/// Production callers prefer [`derive_compliance_trace_checked`], which
+/// additionally verifies the common allowed-manifest binding and fails typed.
 #[must_use]
 pub fn derive_compliance_trace(
+    manifest: &ObservationCoverageManifest,
+    evidence: &ImmutableHostEvidence,
+) -> HostObservedComplianceTrace {
+    derive_core(manifest, evidence)
+}
+
+fn derive_core(
     manifest: &ObservationCoverageManifest,
     evidence: &ImmutableHostEvidence,
 ) -> HostObservedComplianceTrace {
@@ -520,15 +692,29 @@ pub fn derive_compliance_trace(
     let has_blind = !manifest
         .blind_intervals_and_missing_source_reasons
         .is_empty();
+    let denominator_gap = manifest.counts.unknown > 0
+        || !manifest.missing_source_reasons.is_empty()
+        || manifest
+            .coverage_by_material_action_and_effect_route
+            .iter()
+            .any(|entry| !entry.covered);
 
     let disposition = if forbidden_seen {
         ComplianceDisposition::Fail
     } else if !undeclared.is_empty() || has_blind || cursor_gap {
         ComplianceDisposition::Tainted
-    } else if manifest.completeness != CoverageCompleteness::Complete {
+    } else if manifest.completeness != CoverageCompleteness::Complete || denominator_gap {
         ComplianceDisposition::Unknown
     } else {
         ComplianceDisposition::Pass
+    };
+    let denominator_completeness = if disposition == ComplianceDisposition::Unknown
+        && manifest.completeness == CoverageCompleteness::Complete
+        && denominator_gap
+    {
+        CoverageCompleteness::Partial
+    } else {
+        manifest.completeness
     };
 
     let (blind_intervals, undeclared_accesses) = match disposition {
@@ -555,7 +741,7 @@ pub fn derive_compliance_trace(
         received_applied_rejected_and_unknown_counts: manifest.counts,
         blind_intervals,
         undeclared_accesses,
-        denominator_completeness: manifest.completeness,
+        denominator_completeness,
         disposition,
         proof_ceiling: ProofCeiling::Observation,
     }
@@ -587,10 +773,93 @@ fn complete_source_class_denominator_admissible(
         && manifest.sequence_faults.payload_mutations == 0
 }
 
+/// Typed numerator proof linked to one exact declared source/class and cursor
+/// interval. The denominator is never caller-chosen: it resolves from the
+/// checked manifest stream range (`last - first + 1`), so `covered <= total`
+/// alone cannot establish a percentage.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageDenominatorProof {
+    /// Declared source/class the numerator claims.
+    pub source_class: String,
+    /// Declared stream carrying the claimed interval.
+    pub stream: String,
+    /// First cursor of the claimed interval.
+    pub first_cursor: u64,
+    /// Last cursor of the claimed interval.
+    pub last_cursor: u64,
+    /// Covered events within the claimed interval.
+    pub covered: u64,
+}
+
+impl CoverageDenominatorProof {
+    /// Binds this proof to the checked denominator and resolves its exact
+    /// total: the source/class must be admissible, the stream must declare
+    /// exactly this cursor interval, and `covered` must not exceed the
+    /// resolved span. Returns the resolved total.
+    pub fn resolve_against(
+        &self,
+        manifest: &ObservationCoverageManifest,
+    ) -> Result<u64, EvaluationContractError> {
+        if !complete_source_class_denominator_admissible(manifest, &self.source_class) {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "denominator_proof.source_class",
+                reason: "source class is not in a declared complete gap-free denominator",
+            });
+        }
+        let range = manifest
+            .first_and_last_expected_cursors_by_stream
+            .iter()
+            .find(|range| range.stream == self.stream)
+            .ok_or(EvaluationContractError::EvidenceState {
+                field: "denominator_proof.stream",
+                reason: "proof stream is outside the declared cursor denominator",
+            })?;
+        if range.first_expected_cursor != self.first_cursor
+            || range.last_expected_cursor != self.last_cursor
+        {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "denominator_proof.first/last_cursor",
+                reason: "proof interval does not match the declared stream range",
+            });
+        }
+        let total = self
+            .last_cursor
+            .checked_sub(self.first_cursor)
+            .and_then(|span| span.checked_add(1))
+            .ok_or(EvaluationContractError::InvalidInterval {
+                field: "denominator_proof.first/last_cursor",
+            })?;
+        if self.covered > total {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "denominator_proof.covered",
+                reason: "covered events cannot exceed the resolved denominator",
+            });
+        }
+        Ok(total)
+    }
+}
+
+/// Returns a coverage percentage for a typed denominator proof bound to one
+/// exact source/class and cursor interval; otherwise returns `None`.
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+pub fn coverage_percentage_for_proof(
+    manifest: &ObservationCoverageManifest,
+    proof: &CoverageDenominatorProof,
+) -> Option<f64> {
+    match proof.resolve_against(manifest) {
+        Ok(total) if total > 0 => Some((proof.covered as f64 / total as f64) * 100.0),
+        _ => None,
+    }
+}
+
 /// Returns a coverage percentage only for `source_class` in a valid, declared
-/// complete denominator with continuous cursors and a consistent numerator;
-/// otherwise returns `None`. A numerator above the denominator is
-/// inconsistent evidence, never a valid claim above 100 %.
+/// complete denominator with continuous cursors, a consistent numerator, and
+/// a caller total that equals the checked manifest received count; otherwise
+/// returns `None`. A numerator above the denominator is inconsistent
+/// evidence, never a valid claim above 100 %, and an arbitrary denominator
+/// is refused even when `covered <= total` holds.
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn coverage_percentage(
@@ -602,10 +871,161 @@ pub fn coverage_percentage(
     if !complete_source_class_denominator_admissible(manifest, source_class) || total == 0 {
         return None;
     }
+    if total != manifest.counts.received {
+        return None;
+    }
     if covered > total {
         return None;
     }
     Some((covered as f64 / total as f64) * 100.0)
+}
+
+/// One retained compliance trace version with its source dependencies.
+///
+/// The record carries the exact invalidation handles the trace depends on
+/// (manifest `invalidation_dependencies`, the allowed-manifest digest, and
+/// the journal stream cursors bound at derivation). `superseded` marks an
+/// older version replaced by a newer trace for the same fingerprint;
+/// `applicable` is lowered only by source invalidation, reparse, or
+/// revocation through [`ComplianceTraceLedger::invalidate_source`]. The
+/// ledger is pure and opens no database: retention is an in-memory
+/// append-only record owned by the evaluation-evidence writer.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionedComplianceTrace {
+    /// Ledger-assigned version, contiguous from one.
+    pub trace_version: u64,
+    /// Retained trace at this version.
+    pub trace: HostObservedComplianceTrace,
+    /// Exact invalidation handles this version depends on.
+    pub source_dependencies: Vec<String>,
+    /// True once a newer version of the same fingerprint is appended.
+    pub superseded: bool,
+    /// False once a depended source is invalidated, reparsed, or revoked.
+    pub applicable: bool,
+}
+
+impl VersionedComplianceTrace {
+    /// Validates version presence, trace coherence, and dependency handles.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        if self.trace_version == 0 {
+            return Err(EvaluationContractError::InvalidInterval {
+                field: "versioned_trace.trace_version",
+            });
+        }
+        self.trace.validate()?;
+        unique_texts(
+            &self.source_dependencies,
+            "versioned_trace.source_dependencies",
+        )
+    }
+}
+
+/// Append-only retention for compliance traces with revalidation rules.
+///
+/// Appending a trace for a fingerprint supersedes older versions of that
+/// same fingerprint without deleting them; source invalidation lowers
+/// `applicable` on every dependent version. [`Self::current_for`] serves the
+/// latest applicable version for the requested fingerprint only: a
+/// historical `PASS` on another fingerprint never becomes current, and an
+/// invalidated trace never silently recovers.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComplianceTraceLedger {
+    /// Ledger identity.
+    pub ledger_id: String,
+    /// Retained versions in append order.
+    pub records: Vec<VersionedComplianceTrace>,
+}
+
+impl ComplianceTraceLedger {
+    /// Creates an empty ledger under `ledger_id`.
+    #[must_use]
+    pub fn new(ledger_id: String) -> Self {
+        Self {
+            ledger_id,
+            records: Vec::new(),
+        }
+    }
+
+    /// Validates the ledger identity, every retained version, and version
+    /// contiguity.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.ledger_id, "trace_ledger.ledger_id")?;
+        for (index, record) in self.records.iter().enumerate() {
+            record.validate()?;
+            let expected = (index as u64).checked_add(1).ok_or(
+                EvaluationContractError::InvalidInterval {
+                    field: "trace_ledger.records.trace_version",
+                },
+            )?;
+            if record.trace_version != expected {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "trace_ledger.records.trace_version",
+                    reason: "trace versions must be contiguous from one",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Retains one validated trace with its source dependencies, supersedes
+    /// older versions of the same fingerprint, and returns the assigned
+    /// version. An invalid trace is refused typed and retained nowhere.
+    pub fn append(
+        &mut self,
+        trace: HostObservedComplianceTrace,
+        source_dependencies: Vec<String>,
+    ) -> Result<u64, EvaluationContractError> {
+        trace.validate()?;
+        unique_texts(&source_dependencies, "versioned_trace.source_dependencies")?;
+        let version = (self.records.len() as u64).checked_add(1).ok_or(
+            EvaluationContractError::InvalidInterval {
+                field: "trace_ledger.records.trace_version",
+            },
+        )?;
+        for record in &mut self.records {
+            if record.trace.fingerprint == trace.fingerprint {
+                record.superseded = true;
+            }
+        }
+        self.records.push(VersionedComplianceTrace {
+            trace_version: version,
+            trace,
+            source_dependencies,
+            superseded: false,
+            applicable: true,
+        });
+        Ok(version)
+    }
+
+    /// Lowers `applicable` on every retained version depending on `source`
+    /// (invalidation, reparse, or revocation of that source). Returns the
+    /// number of versions lowered. Lowered versions never silently recover:
+    /// only a new append for the fingerprint becomes current.
+    pub fn invalidate_source(&mut self, source: &str) -> usize {
+        let mut lowered = 0;
+        for record in &mut self.records {
+            if record.applicable && record.source_dependencies.iter().any(|dep| dep == source) {
+                record.applicable = false;
+                lowered += 1;
+            }
+        }
+        lowered
+    }
+
+    /// Returns the latest applicable version for `fingerprint`, or `None`
+    /// when no applicable version exists for it.
+    #[must_use]
+    pub fn current_for(
+        &self,
+        fingerprint: &RunFingerprint,
+    ) -> Option<&VersionedComplianceTrace> {
+        self.records
+            .iter()
+            .rev()
+            .find(|record| record.applicable && record.trace.fingerprint == *fingerprint)
+    }
 }
 
 #[cfg(test)]

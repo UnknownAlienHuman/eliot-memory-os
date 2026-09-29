@@ -46,9 +46,9 @@ use eliot_agent_api::{
     AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventCursor, EventId,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
     HostEventPrivacyClass, LowercaseSha256, NormalizedHostEventEnvelope,
-    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
-    QualifiedSourceDigest, host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
-    route_fingerprint_digest_for,
+    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ProviderObservationLineage, QualifiedSourceDigest,
+    host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, route_fingerprint_digest_for,
 };
 use eliot_contracts::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -491,6 +491,62 @@ pub struct BestEffortDropGap {
     pub reason: BestEffortDropReason,
 }
 
+/// Caller-resolved view of the allowed Tool/Facet manifest revision used by
+/// [`DurableHostEventJournal::resolve_host_compliance_facts`]. The view
+/// carries the revision-pinned digest every resolved fact binds plus the
+/// declared and forbidden tool sets that decision resolves against; the
+/// journal never invents permission facts from model output.
+#[derive(Clone, Debug)]
+pub struct AllowedHostManifestView<'a> {
+    /// Revision-pinned allowed-manifest digest bound into resolved facts.
+    pub manifest_digest: &'a str,
+    /// Human revision label carried into the retained facts.
+    pub manifest_revision: &'a str,
+    /// Tool names the revision declares.
+    pub declared_tool_names: &'a [String],
+    /// Tool names the revision forbids.
+    pub forbidden_tool_names: &'a [String],
+}
+
+/// One committed record resolved to host-observed compliance facts: retained
+/// event identity, normalized envelope digest, bound transformation version,
+/// and the tool or non-tool action identity with its declared/forbidden
+/// decision resolved against the allowed revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedHostRecord {
+    /// Sequence within the owning stream.
+    pub sequence: u64,
+    /// Retained normalized event identity.
+    pub event_id: String,
+    /// Canonical digest of the retained normalized envelope.
+    pub envelope_digest: String,
+    /// Transformation pipeline version bound into the retained record.
+    pub transformation_version: String,
+    /// Retained tool identity for tool payloads; `None` for non-tool actions.
+    pub tool_name: Option<String>,
+    /// Stable payload tag for non-tool actions; `None` for tool payloads.
+    pub non_tool_action: Option<String>,
+    /// True when the allowed revision declares this tool.
+    pub declared: bool,
+    /// True when the allowed revision forbids this tool.
+    pub forbidden: bool,
+}
+
+/// Compliance facts resolved from retained journal records for one stream:
+/// the bound allowed-manifest revision, the exact stream cursor, and one row
+/// per committed record in sequence order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedHostComplianceFacts {
+    /// Allowed-manifest digest every row binds.
+    pub manifest_digest: String,
+    /// Allowed-manifest revision label.
+    pub manifest_revision: String,
+    /// Exact stream cursor at resolution time.
+    pub stream: StreamCursorState,
+    /// One row per committed record, in sequence order.
+    pub records: Vec<ResolvedHostRecord>,
+}
+
 /// Admissible-raw staging request: the exact transport bytes plus the
 /// normalized envelope that must bind them.
 #[derive(Clone, Debug)]
@@ -769,6 +825,96 @@ impl DurableHostEventJournal {
             .filter(|gap| gap.stream_id == stream_id)
             .cloned()
             .collect()
+    }
+
+    /// Resolves host-observed compliance facts for one stream from retained
+    /// immutable records only (issue #1936, I7.23).
+    ///
+    /// Every returned fact comes from a committed journal record: the
+    /// retained event identity, the normalized envelope digest, the bound
+    /// transformation version, and the exact stream cursor. Declared and
+    /// forbidden tool facts resolve against the caller-supplied allowed
+    /// Tool/Facet manifest revision (`allowed`); tool names are the retained
+    /// normalized payload identities, never caller-supplied model JSON. A
+    /// stream holding any staged-but-uncommitted record reports
+    /// [`IngestError::NotCommitted`]: uncommitted facts might contain the
+    /// prohibited action, so they are never silently treated as absent.
+    /// Exact replays need no extra pass: storage is keyed by source-event
+    /// identity `(stream_id, sequence)`, so one stored record yields exactly
+    /// one resolved row.
+    ///
+    /// Retained envelopes carry no filesystem path, URL, or effect-route
+    /// facts, so this resolution emits no access, write, or external-effect
+    /// rows. That host-access coverage stays unobservable on the
+    /// `ObservationCoverageManifest` (unobservable actions and material
+    /// coverage), which forces the derived trace to `UNKNOWN` or `TAINTED`
+    /// instead of a self-reported `PASS`.
+    pub fn resolve_host_compliance_facts(
+        &self,
+        stream_id: &str,
+        allowed: &AllowedHostManifestView<'_>,
+    ) -> Result<ResolvedHostComplianceFacts, IngestError> {
+        validate_stream_id(stream_id)?;
+        if allowed.manifest_digest.trim().is_empty() {
+            return Err(IngestError::InvalidInput("allowed.manifest_digest"));
+        }
+        if allowed.manifest_revision.trim().is_empty() {
+            return Err(IngestError::InvalidInput("allowed.manifest_revision"));
+        }
+        for tool in allowed
+            .declared_tool_names
+            .iter()
+            .chain(allowed.forbidden_tool_names.iter())
+        {
+            if tool.trim().is_empty() {
+                return Err(IngestError::InvalidInput("allowed.tool_names"));
+            }
+        }
+        let mut stored: Vec<&DurableHostEventRecord> = self
+            .records
+            .iter()
+            .filter(|((record_stream, _), _)| record_stream == stream_id)
+            .map(|(_, record)| record)
+            .collect();
+        stored.sort_by_key(|record| record.sequence);
+        let mut records = Vec::with_capacity(stored.len());
+        for record in stored {
+            if !record.disposition.committed {
+                return Err(IngestError::NotCommitted);
+            }
+            let (tool_name, non_tool_action) = match &record.envelope.payload {
+                NormalizedHostEventPayload::ToolInvocation(observation) => {
+                    (Some(observation.tool_name.clone()), None)
+                }
+                NormalizedHostEventPayload::ToolOutcome(observation) => {
+                    (Some(observation.tool_name.clone()), None)
+                }
+                payload => (None, Some(payload.payload_type_tag().to_owned())),
+            };
+            let (declared, forbidden) = match &tool_name {
+                Some(name) => (
+                    allowed.declared_tool_names.iter().any(|entry| entry == name),
+                    allowed.forbidden_tool_names.iter().any(|entry| entry == name),
+                ),
+                None => (false, false),
+            };
+            records.push(ResolvedHostRecord {
+                sequence: record.sequence,
+                event_id: record.envelope.event_id.as_str().to_owned(),
+                envelope_digest: record.envelope_digest.as_str().to_owned(),
+                transformation_version: record.transformation_version.clone(),
+                tool_name,
+                non_tool_action,
+                declared,
+                forbidden,
+            });
+        }
+        Ok(ResolvedHostComplianceFacts {
+            manifest_digest: allowed.manifest_digest.to_owned(),
+            manifest_revision: allowed.manifest_revision.to_owned(),
+            stream: self.cursor(stream_id),
+            records,
+        })
     }
 
     /// Stages admissible raw bytes plus their normalized envelope.
