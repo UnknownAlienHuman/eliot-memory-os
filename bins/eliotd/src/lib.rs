@@ -2421,10 +2421,22 @@ impl DaemonComposition {
     /// the updated view in the existing in-process Skill owner before the
     /// caller assesses it. This owner update is not durable restart storage.
     ///
-    /// Evidence is historical. It keeps the Skill revision, package digest and
-    /// attempt it was observed at, so ingesting it now never reactivates a
-    /// superseded Skill: the owner binds it to the stored view's exact
-    /// revision and package and refuses a mismatch.
+    /// Evidence is historical and stays historical. A presented revision the
+    /// live catalogue still names files on the current path. A presented
+    /// revision the catalogue no longer names files ONLY with the plan-resolved
+    /// retained-history binding — a committed accept-row for this exact
+    /// skill/package from retained lifecycle-policy rows — as a linked
+    /// revision that keeps the stored view's current Skill revision/package,
+    /// scope, fence and status, so ingesting it now never reactivates a
+    /// superseded Skill nor re-stamps it with today's fence. A non-current
+    /// revision with no such binding is a substituted identity and is refused.
+    ///
+    /// `ingest_attempt_id` is this ingest's own authenticated attempt id, from
+    /// the Kernel route. The owner stamps it onto every retained record as the
+    /// observation binding (with the Skill identity and the retained fence),
+    /// so a later usefulness claim can require the exact filing attempt —
+    /// never a wire-carried attempt field, which would be self-declared
+    /// (issue #2663, I15.2).
     ///
     /// The crate error travels by value here like every neighboring
     /// composition seam feeding the Governor lifecycle API, so the size
@@ -2433,6 +2445,8 @@ impl DaemonComposition {
     pub fn skill_publish_execution_evidence(
         &mut self,
         payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+        ingest_attempt_id: &str,
+        historical: Option<&crate::skill_evidence_read::HistoricalPackageBinding>,
     ) -> Result<eliot_skill::SkillLifecycleView, eliot_skill::SkillError> {
         self.skill_reconcile_tool_basis()?;
         let entry = {
@@ -2444,18 +2458,30 @@ impl DaemonComposition {
                 .get(&payload.skill_id)
                 .ok_or(eliot_skill::SkillError::NotFound)?;
             entry.validate()?;
-            // The evidence is bound to the exact identity the retained
-            // catalogue entry names, so a substituted revision or package
-            // cannot be filed under the stored view's identity.
-            if entry.body.body_version != payload.skill_revision {
-                return Err(eliot_skill::SkillError::IdentityMismatch);
-            }
             entry.clone()
         };
+        // The evidence is bound to an owner-held identity, never to a bare
+        // revision string. The live entry names the current identity; a
+        // differing presented revision must arrive with the retained-history
+        // binding the plan resolved, holding this exact skill/package —
+        // otherwise it is refused here, before the owner, as a substituted
+        // binding.
+        if entry.body.body_version != payload.skill_revision {
+            let Some(binding) = historical else {
+                return Err(eliot_skill::SkillError::IdentityMismatch);
+            };
+            if !binding.holds()
+                || binding.skill_id != payload.skill_id
+                || binding.package_digest != payload.package_digest
+            {
+                return Err(eliot_skill::SkillError::IdentityMismatch);
+            }
+        }
         self.governor.record_skill_execution_evidence(
             &payload.skill_id,
             &payload.skill_revision,
             &payload.package_digest,
+            ingest_attempt_id,
             &entry,
             &payload.executions,
         )

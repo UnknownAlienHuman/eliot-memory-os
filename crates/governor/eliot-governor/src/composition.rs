@@ -4465,6 +4465,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         skill_id: &str,
         skill_revision: &str,
         package_digest: &str,
+        ingest_attempt_id: &str,
         entry: &eliot_skill::SkillCatalogueEntry,
         executions: &[eliot_skill::SkillExecutionEvidence],
     ) -> Result<SkillLifecycleView, eliot_skill::SkillError> {
@@ -4472,6 +4473,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             skill_id,
             skill_revision,
             package_digest,
+            ingest_attempt_id,
             entry,
             executions,
         )
