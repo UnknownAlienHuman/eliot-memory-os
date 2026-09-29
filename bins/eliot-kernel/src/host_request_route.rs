@@ -539,6 +539,7 @@ impl KernelComposition {
                     ))
                     .map_err(|_| TransportError::SessionFenced)?,
                     generation,
+                    claim_expires_at_unix_ms: None,
                     fence_digest: stored.fence_digest.clone(),
                     owner_connection_ref: OpaqueLabel::new(session.connection_id.clone())
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -546,6 +547,9 @@ impl KernelComposition {
                         .map_err(|_| TransportError::SessionFenced)?,
                     owner_session_epoch: session.session_epoch,
                     phase: eliot_ors::HostRequestAttemptPhase::Claimed,
+                    channel_binding_sha256: None,
+                    transport_observations: Vec::new(),
+                    owner_readback: None,
                 }
             }
         };
@@ -4728,6 +4732,8 @@ pub(crate) fn requested_host_request_record(
     let optional_label = |value: Option<&String>| value.map(|identity| label(identity)).transpose();
     Ok(HostRequestRecord {
         contract_version: ORS_CONTRACT_VERSION,
+        send_claim_protocol_version: 0,
+        transport_channel_binding_sha256: None,
         operation_id: OperationIdentity::new(host_request_operation_id(envelope))
             .map_err(|_| TransportError::SessionFenced)?,
         kind: match envelope.kind {
@@ -4756,6 +4762,7 @@ pub(crate) fn requested_host_request_record(
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        attempt_history: Vec::new(),
         cancellation_target: None,
         result_digest: None,
         result_response: None,
@@ -6470,6 +6477,8 @@ fn watchdog_intent_projection_record(
     let submitted_fence = eliot_contracts::StateFence::new(authority_epoch, resource_generation);
     Ok(HostRequestRecord {
         contract_version: ORS_CONTRACT_VERSION,
+        send_claim_protocol_version: 0,
+        transport_channel_binding_sha256: None,
         operation_id: operation_id.clone(),
         kind: OrsHostRequestKind::Reconciliation,
         // The request identity is the derived reconciliation key: one spool
@@ -6495,6 +6504,7 @@ fn watchdog_intent_projection_record(
         deadline_unix_ms: payload.expires_at_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        attempt_history: Vec::new(),
         cancellation_target: None,
         result_digest: None,
         result_response: None,

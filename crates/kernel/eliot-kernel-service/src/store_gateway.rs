@@ -31,8 +31,12 @@ use eliot_kernel_core::user_automation::{
 };
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestAttemptPhase,
-    HostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel, RedbRecoveryStore,
-    ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord, WriterReservationToken,
+    HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof, HostRequestRecord,
+    HostRequestOwnerReadbackEvidence, HostRequestResponseSource, HostRequestState,
+    HostRequestTransportBoundary,
+    HostRequestTransportObservation, OpaqueLabel, RedbRecoveryStore, ReservationRecord,
+    HOST_REQUEST_SEND_CLAIM_LEASE_MS, UnknownCommitOutcome, UnknownCommitRecord,
+    WriterReservationToken,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 use eliot_store_api::{
@@ -62,11 +66,17 @@ use crate::store_write_reservation::{
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
-    UserAutomationRemovalResult, UserAutomationWakeCancellationTarget,
+    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationExecutionError,
+    UserAutomationExecutionOutcome, UserAutomationExecutionRequest, UserAutomationRemovalResult,
+    UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationTarget,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakePublication,
     UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
     retirement_wake_enumeration_request,
+};
+use crate::user_automation_execution_client::{
+    UserAutomationHostExecutionObserver, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
 };
 use crate::user_automation_orchestration::{
     USER_AUTOMATION_RUNTIME_CHANNEL, UserAutomationOrchestrationRecord,
@@ -99,6 +109,212 @@ const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 /// when they are the same attempt. It is process-local identity for a durable
 /// record; it grants no authority and carries no decision of its own.
 static USER_AUTOMATION_SEND_CLAIM_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// ORS-backed observer for one exact UserAutomation cancellation claim.
+///
+/// The expected typed cancellation, staged row, and acquired claim are
+/// immutable snapshots. Every callback revalidates the actual authenticated
+/// carrier against those snapshots before advancing ORS.
+struct UserAutomationCancellationCustodyObserver<'a> {
+    ors: &'a RedbRecoveryStore,
+    record: HostRequestRecord,
+    attempt: HostRequestAttempt,
+    expected_cancellation: UserAutomationWakeCancellation,
+}
+
+impl UserAutomationCancellationCustodyObserver<'_> {
+    fn validate_carrier(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request.validate()?;
+        let authenticated_channel = request.channel.authenticated_evidence_digest()?;
+        let exact_cancellation = matches!(
+            &request.operation,
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request: actual }
+                if actual.as_ref() == &self.expected_cancellation
+        );
+        if !exact_cancellation
+            || request.request_sha256 != request.compute_digest()?
+            || self.record.send_claim_protocol_version
+                != eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            || self.record.attempt.as_ref() != Some(&self.attempt)
+            || self.record.transport_channel_binding_sha256.as_deref()
+                != Some(authenticated_channel.as_str())
+            || self.attempt.channel_binding_sha256.as_deref()
+                != Some(authenticated_channel.as_str())
+            || self
+                .expected_cancellation
+                .enumeration_receipt
+                .as_deref()
+                .is_none_or(|receipt| {
+                    receipt.authenticated_channel_binding_sha256 != authenticated_channel
+                })
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn persist_observation(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+        boundary: HostRequestTransportBoundary,
+        delivery_receipt: Option<HostRequestDeliveryReceipt>,
+        response_commitment_sha256: Option<String>,
+        no_send_proof: Option<HostRequestNoSendProof>,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        self.validate_carrier(request)?;
+        let channel_binding_sha256 = request.channel.authenticated_evidence_digest()?;
+        let observation = HostRequestTransportObservation {
+            operation_id: self.record.operation_id.clone(),
+            request_digest: self.record.request_digest.clone(),
+            attempt_id: self.attempt.attempt_id.clone(),
+            attempt_generation: self.attempt.generation,
+            boundary,
+            channel_binding_sha256,
+            transport_request_sha256: request.request_sha256.clone(),
+            request_commitment_sha256: self.record.request_digest.clone(),
+            payload_commitment_sha256: self.record.payload_digest.clone(),
+            delivery_receipt,
+            response_commitment_sha256,
+            response_source: (boundary == HostRequestTransportBoundary::ResponseReceived)
+                .then_some(HostRequestResponseSource::AuthenticatedTransport),
+            no_send_proof,
+        };
+        let persisted = if boundary == HostRequestTransportBoundary::DispatchStarted {
+            self.ors.begin_host_request_transport_dispatch(
+                &self.record.operation_id,
+                &self.record.request_digest,
+                &self.attempt,
+                &observation,
+            )
+        } else {
+            self.ors.observe_host_request_transport_custody(
+                &self.record.operation_id,
+                &self.record.request_digest,
+                &self.attempt,
+                &observation,
+            )
+        }
+        .map_err(|error| match error {
+            eliot_ors::OrsError::HostRequestAttemptExpired => {
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "the retained send claim expired before dispatch and remains in reconciliation"
+                        .to_owned(),
+                )
+            }
+            _ => UserAutomationRuntimeError::UnknownOutcome(
+                "the typed transport boundary could not be persisted under its exact claim"
+                    .to_owned(),
+            ),
+        })?;
+        if persisted.is_none() {
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "the retained cancellation claim disappeared while recording transport custody"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl UserAutomationHostExecutionObserver for UserAutomationCancellationCustodyObserver<'_> {
+    fn dispatch_started(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        self.persist_observation(
+            request,
+            HostRequestTransportBoundary::DispatchStarted,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn definitely_not_sent(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+        proof: HostRequestNoSendProof,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        self.persist_observation(
+            request,
+            HostRequestTransportBoundary::DefinitelyNotSent,
+            None,
+            None,
+            Some(proof),
+        )
+    }
+
+    fn delivery_outcome(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+        receipt: HostRequestDeliveryReceipt,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        let boundary = match receipt {
+            HostRequestDeliveryReceipt::Delivered => {
+                HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+            }
+            HostRequestDeliveryReceipt::UnknownOutcome => {
+                HostRequestTransportBoundary::DeliveryOutcomeUnknown
+            }
+        };
+        self.persist_observation(request, boundary, Some(receipt), None, None)
+    }
+
+    fn response_received(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+        response: &UserAutomationHostExecutionResponse,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        self.validate_carrier(request)?;
+        response.validate_for(request)?;
+        let result_response = serde_json::to_value(response).map_err(|_| {
+            UserAutomationRuntimeError::UnknownOutcome(
+                "the validated Host response could not be encoded for durable retention".to_owned(),
+            )
+        })?;
+        let result_digest = canonical_json_bytes(&result_response)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| {
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "the validated Host response could not be committed for durable retention"
+                        .to_owned(),
+                )
+            })?;
+        self.persist_observation(
+            request,
+            HostRequestTransportBoundary::ResponseReceived,
+            None,
+            Some(result_digest.clone()),
+            None,
+        )?;
+        let persisted = self
+            .ors
+            .persist_claimed_host_request_result(
+                &self.record.operation_id,
+                &self.record.request_digest,
+                &self.attempt,
+                &result_digest,
+                &result_response,
+                None,
+            )
+            .map_err(|_| {
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "the validated Host response was observed but its exact result body could not be terminalized"
+                        .to_owned(),
+                )
+            })?;
+        if persisted.is_none() {
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "the validated Host response was observed but its retained claim disappeared before terminalization"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 fn user_automation_gateway_unknown(error: impl std::fmt::Display) -> UserAutomationExecutionError {
     UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::UnknownOutcome(
@@ -1678,6 +1894,37 @@ impl KernelStoreGateway {
         };
         match ors.load_host_request(&operation_id, &obligation.request_digest) {
             Ok(Some(existing)) => {
+                let expiry_attempt = (existing.send_claim_protocol_version
+                    == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION)
+                    .then(|| existing.attempt.clone())
+                    .flatten();
+                let existing = if let Some(attempt) = expiry_attempt {
+                    match ors.reconcile_expired_host_request_claim(
+                        &operation_id,
+                        &obligation.request_digest,
+                        &attempt,
+                    ) {
+                        Ok(Some(reconciled)) => reconciled,
+                        Ok(None) => {
+                            return RetainedObligationLookup::unreadable(
+                                unretained_obligation_reason(
+                                    obligation,
+                                    "the retained send claim disappeared during expiry reconciliation",
+                                ),
+                            );
+                        }
+                        Err(_) => {
+                            return RetainedObligationLookup::unreadable(
+                                unretained_obligation_reason(
+                                    obligation,
+                                    "the retained send claim could not be revalidated for expiry",
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    existing
+                };
                 RetainedObligationLookup::Held(classify_retained_obligation(obligation, existing))
             }
             Ok(None) => RetainedObligationLookup::Absent,
@@ -1685,6 +1932,170 @@ impl KernelStoreGateway {
                 obligation,
                 format!("the retained obligation could not be read back: {error}"),
             )),
+        }
+    }
+
+    /// Reconciles a v1 cancellation only after dispatch was durably observed.
+    /// The Host readback is bound to the exact original typed request and the
+    /// active ORS claim; its result and owner receipt are terminalized in one
+    /// ORS transaction. A missing, legacy, or inaccessible Host batch leaves
+    /// the obligation reconciling and never authorizes a resend.
+    async fn reconcile_cancellation_owner_readback<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+        revision: &UserAutomationRevision,
+        targets: &[UserAutomationWakeCancellationTarget],
+        enumeration_receipt: &UserAutomationWakeEnumerationReceipt,
+        runtime: &R,
+    ) -> RetainedObligationLookup
+    where
+        R: UserAutomationWakePort + ?Sized,
+    {
+        let retained = self.retain_user_automation_obligation(sealed, obligation);
+        if !matches!(
+            &retained,
+            RetainedObligationLookup::Held(RetainedUserAutomationObligation::Reconciling { .. })
+        ) {
+            return retained;
+        }
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return retained;
+        };
+        let Ok(operation_id) = user_automation_obligation_operation_id(obligation) else {
+            return retained;
+        };
+        let record = match ors.load_host_request(&operation_id, &obligation.request_digest) {
+            Ok(Some(record)) => record,
+            _ => return retained,
+        };
+        let Some(attempt) = record.attempt.clone() else {
+            return retained;
+        };
+        let expected_payload_digest = match runtime_obligation_payload_digest(&obligation.subject_ids)
+        {
+            Ok(digest) => digest,
+            Err(_) => return retained,
+        };
+        let expected_fence_digest = match user_automation_obligation_fence_digest(sealed, obligation)
+        {
+            Ok(digest) => digest,
+            Err(_) => return retained,
+        };
+        let exact_request = UserAutomationWakeCancellation {
+            context: sealed.context.clone(),
+            authenticated_principal: sealed.authenticated_principal.clone(),
+            identity: sealed.identity.clone(),
+            automation_id: revision.automation_id.clone(),
+            automation_revision: revision.revision.clone(),
+            state_fence: sealed.context.state_fence.clone(),
+            only_unadmitted: true,
+            targets: targets.to_vec(),
+            enumeration_receipt: Some(Box::new(enumeration_receipt.clone())),
+        };
+        let request_valid = exact_request.validate().is_ok();
+        let original_channel = enumeration_receipt.authenticated_channel_binding_sha256.as_str();
+        let crossed_dispatch = attempt
+            .transport_observations
+            .first()
+            .is_some_and(|observation| {
+                observation.boundary == HostRequestTransportBoundary::DispatchStarted
+            })
+            && attempt.transport_observations.last().is_some_and(|observation| {
+                matches!(
+                    observation.boundary,
+                    HostRequestTransportBoundary::DispatchStarted
+                        | HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                        | HostRequestTransportBoundary::ResponseReceived
+                )
+            });
+        if !request_valid
+            || !crossed_dispatch
+            || record.send_claim_protocol_version
+                != eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            || record.kind != HostRequestKind::Cancellation
+            || record.operation_id != operation_id
+            || record.request_digest != obligation.request_digest
+            || record.connection_ref.as_str() != USER_AUTOMATION_RUNTIME_CHANNEL
+            || record.parent_operation_id.as_ref().map(OpaqueLabel::as_str)
+                != Some(sealed.identity.operation_id.as_str())
+            || record.payload_digest != expected_payload_digest
+            || record.fence_digest != expected_fence_digest
+            || record.transport_channel_binding_sha256.as_deref() != Some(original_channel)
+            || attempt.channel_binding_sha256.as_deref() != Some(original_channel)
+            || attempt.phase == HostRequestAttemptPhase::DefinitelyNotSent
+            || attempt.phase == HostRequestAttemptPhase::DeferredNoEffect
+        {
+            return retained;
+        }
+        let authenticated_readback = match runtime
+            .read_cancellation_batch(exact_request.clone())
+            .await
+        {
+            Ok(readback) => readback,
+            Err(_) => return retained,
+        };
+        if authenticated_readback
+            .readback
+            .validate_for(&exact_request)
+            .is_err()
+            || authenticated_readback
+                .validate_for(
+                    &exact_request,
+                    &authenticated_readback.authenticated_channel_binding_sha256,
+                )
+                .is_err()
+        {
+            return retained;
+        }
+        let Some(original_observation) = attempt.transport_observations.first() else {
+            return retained;
+        };
+        let response = UserAutomationHostExecutionResponse::Cancelled {
+            request_sha256: original_observation.transport_request_sha256.clone(),
+            state_fence: exact_request.state_fence.clone(),
+            wake_ids: authenticated_readback.readback.cancelled_wake_ids.clone(),
+        };
+        let result_response = match serde_json::to_value(&response) {
+            Ok(response) => response,
+            Err(_) => return retained,
+        };
+        let result_digest = match canonical_json_bytes(&result_response) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(_) => return retained,
+        };
+        let owner_receipt_commitment_sha256 = match authenticated_readback
+            .readback
+            .owner_receipt_commitment_sha256()
+        {
+            Ok(digest) => digest,
+            Err(_) => return retained,
+        };
+        let evidence = HostRequestOwnerReadbackEvidence {
+            operation_id: record.operation_id.clone(),
+            request_digest: record.request_digest.clone(),
+            payload_digest: record.payload_digest.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            attempt_generation: attempt.generation,
+            readback_channel_binding_sha256: authenticated_readback
+                .authenticated_channel_binding_sha256
+                .clone(),
+            owner_receipt_commitment_sha256,
+            result_commitment_sha256: result_digest.clone(),
+        };
+        match ors.persist_claimed_host_request_result(
+            &operation_id,
+            &obligation.request_digest,
+            &attempt,
+            &result_digest,
+            &result_response,
+            Some(&evidence),
+        ) {
+            Ok(Some(answered)) => RetainedObligationLookup::Held(
+                classify_retained_obligation(obligation, answered),
+            ),
+            Ok(None) | Err(_) => retained,
         }
     }
 
@@ -1765,6 +2176,100 @@ impl KernelStoreGateway {
             ));
         };
         let operation_id = user_automation_obligation_operation_id(obligation)?;
+        if obligation.kind == UserAutomationRuntimeObligationKind::WakeCancellation {
+            let retained = ors
+                .load_host_request(&operation_id, &obligation.request_digest)
+                .map_err(|error| {
+                    unretained_answer_reason(
+                        obligation,
+                        format!("the observed cancellation result could not be read: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    unretained_answer_reason(
+                        obligation,
+                        "the observed cancellation result row disappeared before answer projection",
+                    )
+                })?;
+            if retained.send_claim_protocol_version
+                == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            {
+                let UserAutomationRuntimeObligationAnswer::WakeCancellation {
+                    cancelled_wake_ids,
+                    enumeration_receipt: Some(receipt),
+                } = answer
+                else {
+                    return Err(unretained_answer_reason(
+                        obligation,
+                        "the returned v1 cancellation answer has no exact enumeration receipt",
+                    ));
+                };
+                let expected_receipt = obligation
+                    .wake_enumeration_receipt
+                    .as_deref()
+                    .ok_or_else(|| {
+                        unretained_answer_reason(
+                            obligation,
+                            "the retained v1 cancellation has no exact enumeration receipt",
+                        )
+                    })?;
+                let attempt = retained.attempt.as_ref().ok_or_else(|| {
+                    unretained_answer_reason(
+                        obligation,
+                        "the retained cancellation result has no claimed attempt",
+                    )
+                })?;
+                let observation = attempt
+                    .transport_observations
+                    .last()
+                    .filter(|observation| {
+                        observation.boundary == HostRequestTransportBoundary::ResponseReceived
+                    })
+                    .ok_or_else(|| {
+                        unretained_answer_reason(
+                            obligation,
+                            "the retained cancellation result has no response-received custody event",
+                        )
+                    })?;
+                let response = UserAutomationHostExecutionResponse::Cancelled {
+                    request_sha256: observation.transport_request_sha256.clone(),
+                    state_fence: expected_receipt.state_fence.clone(),
+                    wake_ids: cancelled_wake_ids.clone(),
+                };
+                let response_value = serde_json::to_value(&response).map_err(|_| {
+                    unretained_answer_reason(
+                        obligation,
+                        "the exact Host cancellation response could not be projected for comparison",
+                    )
+                })?;
+                let response_digest = canonical_json_bytes(&response_value)
+                    .map(|bytes| sha256_hex(&bytes))
+                    .map_err(|_| {
+                        unretained_answer_reason(
+                            obligation,
+                            "the exact Host cancellation response could not be committed for comparison",
+                        )
+                    })?;
+                if receipt.as_ref() != expected_receipt
+                    || retained.state != HostRequestState::ResultReceived
+                    || attempt.phase != HostRequestAttemptPhase::ResponseReceived
+                    || retained.result_response.as_ref() != Some(&response_value)
+                    || retained.result_digest.as_deref() != Some(response_digest.as_str())
+                    || observation.response_commitment_sha256.as_deref()
+                        != Some(response_digest.as_str())
+                    || observation.request_digest != obligation.request_digest
+                    || observation.operation_id != operation_id
+                    || retained.transport_channel_binding_sha256.as_deref()
+                        != Some(receipt.authenticated_channel_binding_sha256.as_str())
+                {
+                    return Err(unretained_answer_reason(
+                        obligation,
+                        "the retained Host response does not match the exact cancellation answer, channel, request, and claim",
+                    ));
+                }
+                return Ok(());
+            }
+        }
         let result_response = serde_json::to_value(answer).map_err(|error| {
             unretained_answer_reason(
                 obligation,
@@ -1851,14 +2356,12 @@ impl KernelStoreGateway {
     /// Prepares one retained wake cancellation for its single owner handoff,
     /// and reports the unresolved phases to return when it cannot.
     ///
-    /// The durable advance to `Admitted` and the exclusive send claim are two
-    /// separate steps on purpose. The advance is a mechanical, idempotent
-    /// projection that still proves the owner was never handed the request;
-    /// the claim is what actually grants ownership, and it persists the
-    /// monotonic `Routed` state in the same ORS transaction. Issuing the
-    /// request requires both, and neither failure may issue an owner effect,
-    /// so both are reported as an unresolved handoff of the already committed
-    /// retirement under the original owner operation identity.
+    /// A first attempt is durably advanced to `Admitted` before claiming. A
+    /// retry after retained typed definitely-not-sent evidence already has the
+    /// monotonic `Routed` state, so it skips that backward state edge and
+    /// acquires the next bounded claim directly. The claim transaction is the
+    /// only step that grants send ownership. Any failure issues no owner
+    /// effect and is reported under the original operation identity.
     ///
     /// Returns the phases the caller must return instead, or `None` when the
     /// cancellation now holds its claim and may reach the owner.
@@ -1868,18 +2371,20 @@ impl KernelStoreGateway {
         settled: &mut UserAutomationRuntimeObligation,
         obligations: &mut Vec<UserAutomationRuntimeObligation>,
         execution: &UserAutomationExecutionPhase,
+        retry_after_proven_no_send: bool,
     ) -> Option<(UserAutomationWakePhase, UserAutomationExecutionPhase)> {
-        // The retained record is admitted durably before the request leaves this
-        // boundary. The retirement replayed inside the join is a read of an
-        // already committed fact, so the only effect that request can carry is
-        // the cancellation, and it is the one the record now tracks.
-        if let Err(reason) = self.mark_user_automation_obligation_admitted(settled) {
-            return Some(unresolved_wake_cancellation(
-                settled,
-                obligations,
-                execution,
-                reason,
-            ));
+        if !retry_after_proven_no_send {
+            // The first attempt is admitted durably before it leaves this
+            // boundary. A retry already has a retained Routed row and may
+            // advance only through the next claim, never back to Admitted.
+            if let Err(reason) = self.mark_user_automation_obligation_admitted(settled) {
+                return Some(unresolved_wake_cancellation(
+                    settled,
+                    obligations,
+                    execution,
+                    reason,
+                ));
+            }
         }
         // Exactly one caller may hand this cancellation to the owner. The claim
         // is acquired before the first transport await and, in the same durable
@@ -1902,17 +2407,17 @@ impl KernelStoreGateway {
     /// from that single transaction rather than from this caller:
     ///
     /// - Acquisition is first-writer-wins. `Admitted` is the last state that
-    ///   still proves the owner was never handed the request, and exactly one
-    ///   caller can move the row out of it with a claimed attempt. A second
-    ///   caller's presented attempt never matches the durable one, so ORS
-    ///   retains the first attempt and fences the operation as `Unknown`
-    ///   instead of reissuing.
+    ///   proves the owner was never handed the request, and exactly one caller
+    ///   can move the row out of it with a claimed attempt. A second caller's
+    ///   presented attempt never matches the durable one, so ORS returns the
+    ///   first attempt unchanged and this caller refuses to issue anything.
     /// - The monotonic non-reissuable `Routed` state is persisted in that same
     ///   transaction, before this function returns and therefore before the
     ///   first transport await. A process death after this point reloads as a
-    ///   reconciling record, never as ordinary `Retained` work, and nothing is
-    ///   ever written between the claim and the routed state because they are
-    ///   one write.
+    ///   reconciling record unless the retained attempt contains typed
+    ///   definitely-not-sent evidence, which permits the single bounded retry
+    ///   under the same operation identity. Nothing is written between the
+    ///   claim and the routed state because they are one write.
     ///
     /// Ownership is then confirmed by CONTENT, not by the mere existence of a
     /// claimed attempt or by a same-target `Routed` replay: the durable attempt
@@ -1984,6 +2489,69 @@ impl KernelStoreGateway {
         obligation: &UserAutomationRuntimeObligation,
     ) -> Result<HostRequestAttempt, String> {
         let fence_digest = user_automation_obligation_fence_digest(sealed, obligation)?;
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "no durable ORS owner is bound for send-attempt generation lookup",
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        let record = ors
+            .load_host_request(&operation_id, &obligation.request_digest)
+            .map_err(|_| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the retained send-attempt generation could not be read",
+                )
+            })?
+            .ok_or_else(|| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the retained obligation disappeared before attempt generation lookup",
+                )
+            })?;
+        if record.send_claim_protocol_version
+            != eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "a legacy send-claim record requires reconciliation before dispatch",
+            ));
+        }
+        let attempt_generation = match record.attempt.as_ref() {
+            None if record.state == HostRequestState::Admitted
+                && record.attempt_history.is_empty() =>
+            {
+                1
+            }
+            Some(previous)
+                if previous.phase == HostRequestAttemptPhase::DefinitelyNotSent
+                    && record.state == HostRequestState::Routed
+                    && record.attempt_history.len() < 1 =>
+            {
+                previous.generation.checked_add(1).ok_or_else(|| {
+                    unretained_obligation_reason(
+                        obligation,
+                        "the durable send-attempt generation is exhausted",
+                    )
+                })?
+            }
+            Some(previous)
+                if previous.phase == HostRequestAttemptPhase::DefinitelyNotSent
+                    && record.attempt_history.len() >= 1 =>
+            {
+                return Err(unretained_obligation_reason(
+                    obligation,
+                    "the same operation already used its bounded no-send retry and requires reconciliation",
+                ));
+            }
+            _ => {
+                return Err(unretained_obligation_reason(
+                    obligation,
+                    "the retained operation is not eligible for a new send attempt",
+                ));
+            }
+        };
         let claim_nonce = USER_AUTOMATION_SEND_CLAIM_NONCE
             .fetch_add(1, AtomicOrdering::Relaxed)
             .checked_add(1)
@@ -2007,29 +2575,67 @@ impl KernelStoreGateway {
             obligation,
             format!("{USER_AUTOMATION_RUNTIME_CHANNEL}:{claim_nonce:016x}"),
         )?;
+        let claim_expires_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the system clock is before the Unix epoch, so the send claim cannot be bounded",
+                )
+            })
+            .and_then(|duration| {
+                u64::try_from(duration.as_millis())
+                    .map_err(|_| {
+                        unretained_obligation_reason(
+                            obligation,
+                            "the system clock exceeds the send-claim timestamp range",
+                        )
+                    })?
+                    .checked_add(HOST_REQUEST_SEND_CLAIM_LEASE_MS)
+                    .ok_or_else(|| {
+                        unretained_obligation_reason(
+                            obligation,
+                            "the bounded send-claim expiry exceeds the timestamp range",
+                        )
+                    })
+            })?;
         Ok(HostRequestAttempt {
             attempt_id: obligation_label(
                 obligation,
                 format!(
-                    "ua-obligation-send-claim:{}:{}:{claim_nonce:016x}",
-                    obligation.owner_operation_id, obligation.request_digest
+                    "ua-obligation-send-claim:{}:{}:attempt-{}:{claim_nonce:016x}",
+                    obligation.owner_operation_id, obligation.request_digest, attempt_generation
                 ),
             )?,
-            generation: sealed.context.state_fence.resource_generation.value(),
+            generation: attempt_generation,
+            claim_expires_at_unix_ms: Some(claim_expires_at_unix_ms),
             fence_digest,
             owner_connection_ref,
             owner_launch_nonce,
             owner_session_epoch: self.route.authority_epoch().sequence.get(),
             phase: HostRequestAttemptPhase::Claimed,
+            channel_binding_sha256: Some(
+                record
+                    .transport_channel_binding_sha256
+                    .clone()
+                    .ok_or_else(|| {
+                        unretained_obligation_reason(
+                            obligation,
+                            "the versioned cancellation record has no staged authenticated channel binding",
+                        )
+                    })?,
+            ),
+            transport_observations: Vec::new(),
+            owner_readback: None,
         })
     }
 
-    /// Arms the anti-blind-retry fence of one retained obligation after its owner
-    /// effect may already have been issued and its answer was lost.
+    /// Checks that a typed transport observation already armed the
+    /// anti-blind-retry fence of one retained obligation.
     ///
-    /// The durable state is the outbox's own `Unknown`, which can only move
-    /// forward to an answer or a terminal disposition through reconciliation
-    /// evidence; it can never return to a state that would re-issue the effect.
+    /// This is deliberately read-only. A generic runtime error cannot create
+    /// possible-effect evidence or advance the outbox; only the authenticated
+    /// transport observer may persist that transition under the exact claim.
     fn mark_user_automation_obligation_unknown(
         &self,
         obligation: &UserAutomationRuntimeObligation,
@@ -2043,23 +2649,56 @@ impl KernelStoreGateway {
             ));
         };
         let operation_id = user_automation_obligation_operation_id(obligation)?;
-        match ors.advance_host_request(
-            &operation_id,
-            &obligation.request_digest,
-            HostRequestState::Unknown,
-            None,
-        ) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(unretained_obligation_reason(
+        let record = ors
+            .load_host_request(&operation_id, &obligation.request_digest)
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the retained custody evidence could not be read: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the retained obligation record disappeared before its possible owner effect could \
+                     be reconciled",
+                )
+            })?;
+        let possible_effect_is_retained = record.send_claim_protocol_version
+            == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            && record.connection_ref.as_str() == USER_AUTOMATION_RUNTIME_CHANNEL
+            && matches!(
+                record.state,
+                HostRequestState::Submitted
+                    | HostRequestState::Unknown
+                    | HostRequestState::Reconciling
+                    | HostRequestState::ResultReceived
+                    | HostRequestState::Terminal
+            )
+            && record.attempt.as_ref().is_some_and(|attempt| {
+                matches!(
+                    attempt.phase,
+                    HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                        | HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                        | HostRequestAttemptPhase::ResponseReceived
+                ) && (attempt.owner_readback.is_some()
+                    || attempt.transport_observations.last().is_some_and(|observation| {
+                        matches!(
+                            observation.boundary,
+                            eliot_ors::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                                | eliot_ors::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                                | eliot_ors::HostRequestTransportBoundary::ResponseReceived
+                        )
+                    }))
+            });
+        if possible_effect_is_retained {
+            Ok(())
+        } else {
+            Err(unretained_obligation_reason(
                 obligation,
-                "the retained obligation record disappeared before its possible owner effect could \
-                 be retained"
-                    .to_owned(),
-            )),
-            Err(error) => Err(unretained_obligation_reason(
-                obligation,
-                format!("the possible owner effect could not be retained: {error}"),
-            )),
+                "no typed transport observation under this exact UserAutomation claim proves a \
+                 possible owner effect; the outbox state was left unchanged",
+            ))
         }
     }
 
@@ -2107,8 +2746,49 @@ impl KernelStoreGateway {
             ),
         )?;
         let request_label = request_id.as_str().to_owned();
+        let (send_claim_protocol_version, transport_channel_binding_sha256) =
+            if obligation.kind == UserAutomationRuntimeObligationKind::WakeCancellation {
+                let receipt = obligation
+                    .wake_enumeration_receipt
+                    .as_deref()
+                    .ok_or_else(|| {
+                        unretained_obligation_reason(
+                            obligation,
+                            "a versioned cancellation requires the retained authenticated owner enumeration receipt",
+                        )
+                    })?;
+                receipt.validate_integrity().map_err(|error| {
+                    unretained_obligation_reason(
+                        obligation,
+                        format!("the retained cancellation enumeration receipt is invalid: {error}"),
+                    )
+                })?;
+                let receipt_subject_ids = receipt
+                    .denominator
+                    .iter()
+                    .map(|identity| identity.occurrence_id.clone())
+                    .collect::<Vec<_>>();
+                if receipt.parent_operation_identity != sealed.identity
+                    || receipt.state_fence != sealed.context.state_fence
+                    || receipt.authenticated_owner_identity != sealed.authenticated_principal
+                    || receipt_subject_ids != obligation.subject_ids
+                {
+                    return Err(unretained_obligation_reason(
+                        obligation,
+                        "the retained cancellation receipt does not bind the exact parent, fence, owner, and denominator",
+                    ));
+                }
+                (
+                    eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION,
+                    Some(receipt.authenticated_channel_binding_sha256.clone()),
+                )
+            } else {
+                (0, None)
+            };
         Ok(HostRequestRecord {
             contract_version: ORS_CONTRACT_VERSION,
+            send_claim_protocol_version,
+            transport_channel_binding_sha256,
             operation_id: user_automation_obligation_operation_id(obligation)?,
             kind: match obligation.kind {
                 UserAutomationRuntimeObligationKind::WakeHorizonPublication
@@ -2162,6 +2842,7 @@ impl KernelStoreGateway {
             deadline_unix_ms: observed_unix_ms,
             state: HostRequestState::Requested,
             attempt: None,
+            attempt_history: Vec::new(),
             cancellation_target: None,
             result_digest: None,
             result_response: None,
@@ -3174,6 +3855,7 @@ impl KernelStoreGateway {
         match self.read_user_automation_obligation(obligation) {
             RetainedObligationLookup::Held(RetainedUserAutomationObligation::Answered {
                 result_response,
+                ..
             }) => {
                 let receipt = match decode_retained_wake_enumeration_receipt(
                     result_response,
@@ -3200,6 +3882,16 @@ impl KernelStoreGateway {
                 };
                 Err(reason)
             }
+            RetainedObligationLookup::Held(
+                RetainedUserAutomationObligation::RetryAfterProvenNoSend,
+            ) => {
+                let reason = "a cancellation retry claim cannot satisfy a wake-enumeration read"
+                    .to_owned();
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                    reason: reason.clone(),
+                };
+                Err(reason)
+            }
             RetainedObligationLookup::Unreadable { reason } => {
                 obligation.disposition = UserAutomationRuntimeObligationDisposition::Unavailable {
                     reason: reason.clone(),
@@ -3210,7 +3902,9 @@ impl KernelStoreGateway {
             | RetainedObligationLookup::Held(RetainedUserAutomationObligation::Retained) => {
                 match self.retain_user_automation_obligation(sealed, obligation) {
                     RetainedObligationLookup::Held(
-                        RetainedUserAutomationObligation::Answered { result_response },
+                        RetainedUserAutomationObligation::Answered {
+                            result_response, ..
+                        },
                     ) => {
                         let receipt = match decode_retained_wake_enumeration_receipt(
                             result_response,
@@ -3238,6 +3932,18 @@ impl KernelStoreGateway {
                     RetainedObligationLookup::Held(
                         RetainedUserAutomationObligation::Reconciling { reason },
                     ) => {
+                        obligation.disposition =
+                            UserAutomationRuntimeObligationDisposition::Reconciling {
+                                reason: reason.clone(),
+                        };
+                        Err(reason)
+                    }
+                    RetainedObligationLookup::Held(
+                        RetainedUserAutomationObligation::RetryAfterProvenNoSend,
+                    ) => {
+                        let reason =
+                            "a cancellation retry claim cannot satisfy a wake-enumeration read"
+                                .to_owned();
                         obligation.disposition =
                             UserAutomationRuntimeObligationDisposition::Reconciling {
                                 reason: reason.clone(),
@@ -3412,6 +4118,110 @@ impl KernelStoreGateway {
         .map_err(|error| unretained_cancellation_reason(&revision.revision, error.to_string()))
     }
 
+    fn user_automation_cancellation_custody_observer<'a>(
+        &'a self,
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+        revision: &UserAutomationRevision,
+        targets: &[UserAutomationWakeCancellationTarget],
+        enumeration_receipt: &UserAutomationWakeEnumerationReceipt,
+    ) -> Result<UserAutomationCancellationCustodyObserver<'a>, String> {
+        let ors = self.commit_ors.as_deref().ok_or_else(|| {
+            unretained_obligation_reason(
+                obligation,
+                "no durable ORS owner is bound for observing cancellation transport custody",
+            )
+        })?;
+        enumeration_receipt
+            .validate_integrity()
+            .map_err(|error| error.to_string())?;
+        if obligation.kind != UserAutomationRuntimeObligationKind::WakeCancellation
+            || obligation.wake_enumeration_receipt.as_deref() != Some(enumeration_receipt)
+            || enumeration_receipt.parent_operation_identity != sealed.identity
+            || enumeration_receipt.state_fence != sealed.context.state_fence
+            || enumeration_receipt.authenticated_owner_identity != sealed.authenticated_principal
+            || enumeration_receipt.automation_id != revision.automation_id
+            || enumeration_receipt.automation_revision != revision.revision
+            || enumeration_receipt.revision_digest != revision.digest().map_err(|e| e.to_string())?
+        {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "the exact parent, revision, owner, or receipt changed before cancellation custody was bound",
+            ));
+        }
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        let record = ors
+            .load_host_request(&operation_id, &obligation.request_digest)
+            .map_err(|_| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the claimed cancellation record could not be read for transport custody",
+                )
+            })?
+            .ok_or_else(|| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the claimed cancellation record disappeared before transport custody",
+                )
+            })?;
+        let attempt = record.attempt.clone().ok_or_else(|| {
+            unretained_obligation_reason(
+                obligation,
+                "the claimed cancellation record has no active transport attempt",
+            )
+        })?;
+        let expected_payload_digest = runtime_obligation_payload_digest(&obligation.subject_ids)
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the exact cancellation denominator could not be committed: {error}"),
+                )
+            })?;
+        let expected_fence_digest = user_automation_obligation_fence_digest(sealed, obligation)?;
+        if record.send_claim_protocol_version != eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            || record.state != HostRequestState::Routed
+            || record.kind != HostRequestKind::Cancellation
+            || record.operation_id != operation_id
+            || record.request_digest != obligation.request_digest
+            || record.connection_ref.as_str() != USER_AUTOMATION_RUNTIME_CHANNEL
+            || record.parent_operation_id.as_ref().map(OpaqueLabel::as_str)
+                != Some(sealed.identity.operation_id.as_str())
+            || record.payload_digest != expected_payload_digest
+            || record.fence_digest != expected_fence_digest
+            || record.transport_channel_binding_sha256.as_deref()
+                != Some(enumeration_receipt.authenticated_channel_binding_sha256.as_str())
+            || attempt.phase != HostRequestAttemptPhase::Claimed
+            || !attempt.transport_observations.is_empty()
+            || attempt.channel_binding_sha256.as_deref()
+                != Some(enumeration_receipt.authenticated_channel_binding_sha256.as_str())
+        {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "the current ORS row is not the exact unobserved v1 cancellation claim for this parent and receipt",
+            ));
+        }
+        let expected_cancellation = UserAutomationWakeCancellation {
+            context: sealed.context.clone(),
+            authenticated_principal: sealed.authenticated_principal.clone(),
+            identity: sealed.identity.clone(),
+            automation_id: revision.automation_id.clone(),
+            automation_revision: revision.revision.clone(),
+            state_fence: sealed.context.state_fence.clone(),
+            only_unadmitted: true,
+            targets: targets.to_vec(),
+            enumeration_receipt: Some(Box::new(enumeration_receipt.clone())),
+        };
+        expected_cancellation
+            .validate()
+            .map_err(|error| error.to_string())?;
+        Ok(UserAutomationCancellationCustodyObserver {
+            ors,
+            record,
+            attempt,
+            expected_cancellation,
+        })
+    }
+
     /// Retains, claims, routes and issues the wake cancellation of one
     /// committed retirement under its durable owner operation identity, and
     /// returns the wake phase the owner produced.
@@ -3454,20 +4264,64 @@ impl KernelStoreGateway {
         let execution = not_applicable_execution();
         let noun = handoff.noun();
         let mut settled = obligation.clone();
+        let retained_lookup = self
+            .reconcile_cancellation_owner_readback(
+                sealed,
+                &settled,
+                &revision,
+                &targets,
+                &enumeration_receipt,
+                runtime,
+            )
+            .await;
         let retained = classify_retained_cancellation(
             &settled,
             &revision.revision,
-            self.retain_user_automation_obligation(sealed, &settled),
+            retained_lookup,
+        );
+        let retry_after_proven_no_send = matches!(
+            &retained,
+            RetainedCancellation::RetryAfterProvenNoSend
         );
         if let Some(phases) = retained_cancellation_phases(retained, &mut settled, &execution) {
             obligations.push(settled);
             return Ok(phases);
         }
         if let Some(phases) =
-            self.claim_wake_cancellation_send(sealed, &mut settled, obligations, &execution)
+            self.claim_wake_cancellation_send(
+                sealed,
+                &mut settled,
+                obligations,
+                &execution,
+                retry_after_proven_no_send,
+            )
         {
             return Ok(phases);
         }
+        let observer = match self.user_automation_cancellation_custody_observer(
+            sealed,
+            &settled,
+            &revision,
+            &targets,
+            &enumeration_receipt,
+        ) {
+            Ok(observer) => observer,
+            Err(reason) => {
+                return Ok(self.refused_claimed_cancellation(
+                    (
+                        UserAutomationExecutionError::Runtime(
+                            UserAutomationRuntimeError::Unavailable(reason),
+                        ),
+                        false,
+                    ),
+                    &revision,
+                    noun,
+                    &mut settled,
+                    obligations,
+                    &execution,
+                ));
+            }
+        };
         let removal = match self
             .cancel_retirement_wakes(
                 handoff,
@@ -3476,6 +4330,7 @@ impl KernelStoreGateway {
                 targets,
                 enumeration_receipt.clone(),
                 runtime,
+                &observer,
             )
             .await
         {
@@ -3610,6 +4465,7 @@ impl KernelStoreGateway {
         targets: Vec<UserAutomationWakeCancellationTarget>,
         enumeration_receipt: UserAutomationWakeEnumerationReceipt,
         runtime: &R,
+        observer: &dyn UserAutomationHostExecutionObserver,
     ) -> Result<UserAutomationRemovalResult, (UserAutomationExecutionError, bool)>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
@@ -3620,30 +4476,33 @@ impl KernelStoreGateway {
         // future types, so they cannot share one match value.
         let result = match handoff {
             OwnerWakeHandoffKind::Remove => {
-                Box::pin(service.remove_and_cancel_with_targets(
+                Box::pin(service.remove_and_cancel_with_targets_observed(
                     sealed.clone(),
                     targets,
                     enumeration_receipt,
                     runtime,
+                    observer,
                 ))
                 .await
             }
             OwnerWakeHandoffKind::Pause => {
-                Box::pin(service.pause_and_cancel_with_targets(
+                Box::pin(service.pause_and_cancel_with_targets_observed(
                     sealed.clone(),
                     targets,
                     enumeration_receipt,
                     runtime,
+                    observer,
                 ))
                 .await
             }
             OwnerWakeHandoffKind::SupersedingEdit => {
-                Box::pin(service.edit_and_cancel_with_targets(
+                Box::pin(service.edit_and_cancel_with_targets_observed(
                     sealed.clone(),
                     affected,
                     targets,
                     enumeration_receipt,
                     runtime,
+                    observer,
                 ))
                 .await
             }
@@ -5467,19 +6326,26 @@ fn unresolved_wake_cancellation(
 /// What the composition-bound durable outbox already holds for one runtime
 /// obligation of the current parent operator operation.
 ///
-/// It is the durable answer to "may this effect be issued?": only `Retained`
-/// may, because only that state proves the owner was never handed the request.
-/// Every other state is either already answered, or a possible effect that must
-/// be reconciled by its original owner operation identity.
+/// It answers whether this effect may be issued: `Retained` allows the first
+/// send, while `RetryAfterProvenNoSend` allows only the same operation's
+/// bounded retry. Every other state is answered or must be reconciled by its
+/// original owner operation identity.
 enum RetainedUserAutomationObligation {
     /// The obligation is durably retained and its owner effect has not been
     /// issued, so it may be issued now under the retained identity.
     Retained,
+    /// The first attempt was durably proven not to have sent any request bytes;
+    /// the one permitted retry can acquire generation two without regressing
+    /// the parent row from `Routed` to `Admitted`.
+    RetryAfterProvenNoSend,
     /// The durable record already holds this obligation's exact owner answer as
     /// its bounded response body.
     Answered {
         /// The retained bounded owner answer body, served verbatim on replay.
         result_response: serde_json::Value,
+        /// Actual carrier request commitment retained by the v1 response event.
+        /// Absent on the legacy wrapped-answer contract.
+        transport_request_sha256: Option<String>,
     },
     /// The durable record proves the owner effect was issued and its answer is
     /// not durably known, so repeating it is not safe.
@@ -5491,12 +6357,11 @@ enum RetainedUserAutomationObligation {
 
 /// Classifies one durable outbox record into what this boundary may do next.
 ///
-/// The mapping is mechanical over the outbox's own states: `Requested` and
-/// `Admitted` still prove the owner was never handed the request, the result
-/// states carry the retained answer, and every state at or past `Routed` proves
-/// the request left this boundary. Nothing here interprets owner meaning, and an
-/// unowned or unrecognised state fails closed as reconciling rather than as a
-/// permission.
+/// The mapping is mechanical over the outbox's own state and custody evidence:
+/// `Requested` and current-protocol `Admitted` rows with no attempt still prove
+/// the owner was never handed the request; the only `Routed` retry is backed by
+/// a retained first-attempt `DefinitelyNotSent` proof. Legacy `Admitted` rows
+/// and every other routed or possible-effect state remain reconciling.
 fn classify_retained_obligation(
     obligation: &UserAutomationRuntimeObligation,
     record: HostRequestRecord,
@@ -5510,12 +6375,47 @@ fn classify_retained_obligation(
             obligation.owner_operation_id
         ),
     };
+    let transport_request_sha256 = (record.send_claim_protocol_version
+        == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION)
+        .then(|| {
+            record.attempt.as_ref().and_then(|attempt| {
+                attempt
+                    .transport_observations
+                    .last()
+                    .filter(|observation| {
+                        observation.boundary == HostRequestTransportBoundary::ResponseReceived
+                    })
+                    .map(|observation| observation.transport_request_sha256.clone())
+            })
+        })
+        .flatten();
+    let is_current_protocol = record.send_claim_protocol_version
+        == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION;
+    let has_no_attempt = record.attempt.is_none();
+    let retry_after_proven_no_send = is_current_protocol
+        && record.state == HostRequestState::Routed
+        && record.attempt_history.is_empty()
+        && matches!(
+            record.attempt.as_ref(),
+            Some(attempt)
+                if attempt.phase == HostRequestAttemptPhase::DefinitelyNotSent
+        );
     match (record.state, record.result_response) {
-        (HostRequestState::Requested | HostRequestState::Admitted, None) => {
+        (HostRequestState::Requested, None) if has_no_attempt => {
             RetainedUserAutomationObligation::Retained
         }
+        (HostRequestState::Admitted, None) if is_current_protocol && has_no_attempt => {
+            RetainedUserAutomationObligation::Retained
+        }
+        (HostRequestState::Admitted, None) => reconciling(HostRequestState::Admitted),
+        (HostRequestState::Routed, None) if retry_after_proven_no_send => {
+            RetainedUserAutomationObligation::RetryAfterProvenNoSend
+        }
         (HostRequestState::ResultReceived | HostRequestState::Terminal, Some(result_response)) => {
-            RetainedUserAutomationObligation::Answered { result_response }
+            RetainedUserAutomationObligation::Answered {
+                result_response,
+                transport_request_sha256,
+            }
         }
         (state, _) => reconciling(state),
     }
@@ -5550,12 +6450,15 @@ impl RetainedObligationLookup {
 /// What the durable outbox already holds for the wake-cancellation obligation of
 /// one committed retirement.
 ///
-/// It is the answer to "may this cancellation be issued?": only `Issue` may,
-/// because only that state proves the owner was never handed the request.
+/// It answers whether this cancellation may be issued: `Issue` permits the
+/// first send and `RetryAfterProvenNoSend` permits its single proven-safe retry.
 enum RetainedCancellation {
     /// The cancellation may be issued now under the retained owner operation
     /// identity, because the durable record proves the owner never received it.
     Issue,
+    /// The first retained attempt is proven not to have sent request bytes, so
+    /// the same operation may acquire its single bounded retry claim.
+    RetryAfterProvenNoSend,
     /// The retirement is already answered by the owner's retained answer, which
     /// is served verbatim instead of issuing the cancellation again.
     Answered {
@@ -5589,6 +6492,9 @@ fn classify_retained_cancellation(
         | RetainedObligationLookup::Held(RetainedUserAutomationObligation::Retained) => {
             RetainedCancellation::Issue
         }
+        RetainedObligationLookup::Held(
+            RetainedUserAutomationObligation::RetryAfterProvenNoSend,
+        ) => RetainedCancellation::RetryAfterProvenNoSend,
         RetainedObligationLookup::Unreadable { reason } => {
             RetainedCancellation::Unavailable { reason }
         }
@@ -5597,11 +6503,13 @@ fn classify_retained_cancellation(
         }) => RetainedCancellation::Unresolved { reason },
         RetainedObligationLookup::Held(RetainedUserAutomationObligation::Answered {
             result_response,
+            transport_request_sha256,
         }) => match decode_retained_cancellation_answer(
             result_response,
             automation_revision,
             &obligation.owner_operation_id,
             obligation.wake_enumeration_receipt.as_deref(),
+            transport_request_sha256.as_deref(),
         ) {
             Ok((cancelled_wake_ids, enumeration_receipt)) => RetainedCancellation::Answered {
                 cancelled_wake_ids,
@@ -5620,7 +6528,7 @@ fn retained_cancellation_phases(
     execution: &UserAutomationExecutionPhase,
 ) -> Option<(UserAutomationWakePhase, UserAutomationExecutionPhase)> {
     match classification {
-        RetainedCancellation::Issue => None,
+        RetainedCancellation::Issue | RetainedCancellation::RetryAfterProvenNoSend => None,
         RetainedCancellation::Answered {
             cancelled_wake_ids,
             enumeration_receipt,
@@ -5699,8 +6607,15 @@ fn classify_retained_horizon_publication(
         RetainedObligationLookup::Held(RetainedUserAutomationObligation::Reconciling {
             reason,
         }) => RetainedHorizonPublication::Unresolved { reason },
+        RetainedObligationLookup::Held(
+            RetainedUserAutomationObligation::RetryAfterProvenNoSend,
+        ) => RetainedHorizonPublication::Unresolved {
+            reason: "a cancellation retry claim cannot satisfy a wake-horizon publication"
+                .to_owned(),
+        },
         RetainedObligationLookup::Held(RetainedUserAutomationObligation::Answered {
             result_response,
+            ..
         }) => match decode_retained_horizon_answer(
             result_response,
             publication,
@@ -5896,33 +6811,68 @@ fn decode_retained_cancellation_answer(
     automation_revision: &str,
     owner_operation_id: &str,
     expected_receipt: Option<&UserAutomationWakeEnumerationReceipt>,
+    expected_transport_request_sha256: Option<&str>,
 ) -> Result<(Vec<String>, UserAutomationWakeEnumerationReceipt), String> {
-    let Ok(UserAutomationRuntimeObligationAnswer::WakeCancellation {
-        cancelled_wake_ids,
-        enumeration_receipt: Some(enumeration_receipt),
-    }) = serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response)
-    else {
-        return Err(unretained_cancellation_answer_reason(
-            automation_revision,
-            owner_operation_id,
-        ));
-    };
     let Some(expected_receipt) = expected_receipt else {
         return Err(unretained_cancellation_answer_reason(
             automation_revision,
             owner_operation_id,
         ));
     };
-    enumeration_receipt.validate_integrity().map_err(|_| {
+    if let Ok(UserAutomationRuntimeObligationAnswer::WakeCancellation {
+        cancelled_wake_ids,
+        enumeration_receipt: Some(enumeration_receipt),
+    }) = serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response.clone())
+    {
+        enumeration_receipt.validate_integrity().map_err(|_| {
+            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
+        })?;
+        if enumeration_receipt.as_ref() != expected_receipt {
+            return Err(unretained_cancellation_answer_reason(
+                automation_revision,
+                owner_operation_id,
+            ));
+        }
+        return Ok((cancelled_wake_ids, *enumeration_receipt));
+    }
+    let Some(expected_transport_request_sha256) = expected_transport_request_sha256 else {
+        return Err(unretained_cancellation_answer_reason(
+            automation_revision,
+            owner_operation_id,
+        ));
+    };
+    let Ok(UserAutomationHostExecutionResponse::Cancelled {
+        request_sha256,
+        state_fence,
+        wake_ids,
+    }) = serde_json::from_value::<UserAutomationHostExecutionResponse>(result_response)
+    else {
+        return Err(unretained_cancellation_answer_reason(
+            automation_revision,
+            owner_operation_id,
+        ));
+    };
+    expected_receipt.validate_integrity().map_err(|_| {
         unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
     })?;
-    if enumeration_receipt.as_ref() != expected_receipt {
+    let expected_wake_ids = expected_receipt
+        .cancellation_targets()
+        .map_err(|_| {
+            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
+        })?
+        .into_iter()
+        .map(|target| target.wake_id)
+        .collect::<Vec<_>>();
+    if request_sha256 != expected_transport_request_sha256
+        || state_fence != expected_receipt.state_fence
+        || wake_ids != expected_wake_ids
+    {
         return Err(unretained_cancellation_answer_reason(
             automation_revision,
             owner_operation_id,
         ));
     }
-    Ok((cancelled_wake_ids, *enumeration_receipt))
+    Ok((wake_ids, expected_receipt.clone()))
 }
 
 /// Decodes and re-validates the retained schedule-owner acknowledgement of one
