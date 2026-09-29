@@ -559,13 +559,11 @@ fn commit_execution_candidate(
             reason: "execution evidence must name the exact Skill revision and package digest",
         });
     }
-    match composition
-        .skill_publish_execution_evidence(
-            payload,
-            &candidate.ingest_attempt_id,
-            candidate.historical_binding.as_ref(),
-        )
-    {
+    match composition.skill_publish_execution_evidence(
+        payload,
+        &candidate.ingest_attempt_id,
+        candidate.historical_binding.as_ref(),
+    ) {
         // The owner accepted the evidence: the assessment is only reported
         // after the owner took it, so a claim never outruns persistence. The
         // returned view IS the owner's result — the commit must observe it,
