@@ -1,4 +1,5 @@
 using Eliot.Operator.Protocol;
+using Eliot.Operator.Services;
 using Microsoft.UI.Xaml;
 
 namespace Eliot.Operator;
@@ -32,6 +33,12 @@ public partial class App : Application
         WriteAdapterDiagnostic(LegacyOperatorAdapter.Describe());
         try
         {
+            // The UI is a broker-owned user-session child (I1.3): it launches
+            // only inside an authenticated interactive Windows user session.
+            // The identity proof runs eagerly at launch so a sessionless
+            // process fails closed before any window opens, instead of opening
+            // a window whose every request then fails at the transport.
+            ProveInteractiveSession();
             _window = new MainWindow();
             WriteStartupDiagnostic("launch:window-created");
             _window.Activate();
@@ -42,6 +49,14 @@ public partial class App : Application
             WriteStartupDiagnostic("launch:failed", exception);
             throw;
         }
+    }
+
+    private static void ProveInteractiveSession()
+    {
+        // Fail-closed: without a proven installation, user SID and logon
+        // session there is no handoff binding and therefore no UI. The
+        // exception carries a closed reason, never identity values.
+        _ = OperatorProcessIdentityProvider.Current;
     }
 
     private static void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs args)

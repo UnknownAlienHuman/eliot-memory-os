@@ -106,6 +106,34 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     private readonly List<Task> _retainedCompletions = [];
     private int _lifecycle = LifecycleOpen;
     private int _gateHolders;
+    // Lifecycle latch for the broker session binding. The inherited handoff is
+    // single-use and the environment value is cleared on first read, so once
+    // establishment proves the binding is gone (no handoff, expired handoff,
+    // refused transport, rejected handshake) this process can never
+    // re-authenticate: only a process restart under a fresh broker-issued
+    // handoff restores it. The latch refuses new work at admission instead of
+    // touching the pipe again, and the client holds no credential, endpoint or
+    // nonce that could bypass it.
+    private int _bindingLost;
+
+    /// Refuses new work once the session binding is proven lost. A fresh
+    /// broker handoff arrives only with a fresh process, never in-process.
+    private void RequireLiveBinding()
+    {
+        if (Volatile.Read(ref _bindingLost) != 0)
+        {
+            throw new OperatorRestartRequiredException(OperatorHandoff.ReacquisitionRequirement);
+        }
+    }
+
+    /// Marks the session binding terminally lost and reports the typed
+    /// restart-required disposition. Every site that proves the binding is
+    /// gone funnels through here so the latch cannot be skipped.
+    private OperatorRestartRequiredException BindingLost(string reason)
+    {
+        Interlocked.Exchange(ref _bindingLost, 1);
+        return new OperatorRestartRequiredException(reason);
+    }
 
     public async Task<OperatorSnapshot> SnapshotAsync(string? projectId = null, string? taskId = null, CancellationToken cancellationToken = default)
     {
@@ -276,6 +304,10 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             throw new OperatorNotAttemptedException(
                 operationScope, tool, OperatorFaultReason.ClientClosing, OperatorExchangeStages.Admission);
         }
+        // The broker session binding is the lifecycle: once it is proven lost,
+        // no new work is admitted in this process, only a restart under a
+        // fresh owner handoff restores it.
+        RequireLiveBinding();
 
         var acquired = false;
         try
@@ -464,11 +496,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
         catch (RuntimeDiscoveryException)
         {
-            throw new OperatorRestartRequiredException(OperatorHandoff.ReacquisitionRequirement);
+            throw BindingLost(OperatorHandoff.ReacquisitionRequirement);
         }
         catch (OperatorProcessIdentityException)
         {
-            throw new OperatorRestartRequiredException(OperatorFaultReason.ProcessIdentityUnproven);
+            throw BindingLost(OperatorFaultReason.ProcessIdentityUnproven);
         }
 
         var ownerRemaining = handoff.RemainingLifetime(DateTimeOffset.UtcNow);
@@ -476,7 +508,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         {
             // A handoff that cannot be consumed in time is refused, not burned.
             handoff.Invalidate(OperatorHandoffInvalidation.Expired);
-            throw new OperatorRestartRequiredException(OperatorHandoff.ReacquisitionRequirement);
+            throw BindingLost(OperatorHandoff.ReacquisitionRequirement);
         }
         var connectCeiling = TimeSpan.FromSeconds(OperatorProtocol.ConnectTimeoutSeconds);
         var establishmentAllowance = ownerRemaining < connectCeiling
@@ -526,7 +558,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 {
                     throw EstablishmentRefusal(budget, establishment, operationScope, tool, OperatorExchangeStages.Connect);
                 }
-                throw new OperatorRestartRequiredException(
+                throw BindingLost(
                     error is TimeoutException
                         ? $"{OperatorFaultReason.ConnectionTimeout} at broker registration generation {handoff.BrokerRegistrationEpoch}"
                         : $"{OperatorFaultReason.ConnectionRefused} at broker registration generation {handoff.BrokerRegistrationEpoch}");
@@ -621,7 +653,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         catch (Exception error) when (error is IOException or OperatorProtocolException or InvalidOperationException or JsonException)
         {
             await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Establishment).ConfigureAwait(false);
-            throw new OperatorRestartRequiredException(
+            throw BindingLost(
                 $"{OperatorFaultReason.HandshakeShapeRefused} at broker registration generation {handoff.BrokerRegistrationEpoch}");
         }
         return connection;

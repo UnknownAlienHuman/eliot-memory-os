@@ -108,15 +108,23 @@ public sealed class RuntimeDiscoveryService
 
     public static void ValidateEndpoint(OperatorEndpoint endpoint)
     {
+        // The role is exact and the capabilities are a non-empty subset of the
+        // closed two-capability vocabulary. A narrower owner grant (for
+        // example read-only) is accepted and rendered under: per-view and
+        // per-action gating reads the granted binding, so withheld
+        // capabilities withhold their views and mutations instead of failing
+        // endpoint validation. An empty, unknown or wider set is refused.
         if (string.IsNullOrWhiteSpace(endpoint.PipeName)
             || !endpoint.PipeName.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)
             || endpoint.BrokerEpoch == 0
             || string.IsNullOrWhiteSpace(endpoint.InteractiveSessionId)
             || string.IsNullOrWhiteSpace(endpoint.HandoffNonce)
             || !string.Equals(endpoint.Role, OperatorCapabilityNames.HumanOperatorRole, StringComparison.Ordinal)
-            || !endpoint.Capabilities.SequenceEqual(
-                [OperatorCapabilityNames.ControlboardRead, OperatorCapabilityNames.OperatorCommand],
-                StringComparer.Ordinal))
+            || endpoint.Capabilities.Count == 0
+            || endpoint.Capabilities.Any(capability =>
+                !string.Equals(capability, OperatorCapabilityNames.ControlboardRead, StringComparison.Ordinal)
+                && !string.Equals(capability, OperatorCapabilityNames.OperatorCommand, StringComparison.Ordinal))
+            || endpoint.Capabilities.Distinct(StringComparer.Ordinal).Count() != endpoint.Capabilities.Count)
         {
             throw new RuntimeDiscoveryException("endpoint_invalid", OperatorFaultReason.EndpointInvalid);
         }

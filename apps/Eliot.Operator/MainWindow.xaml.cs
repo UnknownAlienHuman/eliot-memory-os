@@ -27,9 +27,16 @@ public sealed partial class MainWindow : Window
         {
             if (args.PropertyName == nameof(MainViewModel.StatusSeverity)) SyncBannerSeverity();
             if (args.PropertyName == nameof(MainViewModel.HasUnknownOperations)) SyncReconcileVisibility();
+            if (args.PropertyName is nameof(MainViewModel.CanReadProjection)
+                or nameof(MainViewModel.CanIssueCommands)
+                or nameof(MainViewModel.IsUserAutomationOperable)) SyncNavigationAvailability();
+            if (args.PropertyName is nameof(MainViewModel.IsUserAutomationOperable)
+                or nameof(MainViewModel.IsQueryPage)
+                or nameof(MainViewModel.IsGraphPage)) RenderGraph();
         };
         SyncBannerSeverity();
         SyncReconcileVisibility();
+        SyncNavigationAvailability();
         Navigation.SelectedItem = Navigation.MenuItems[0];
         Closed += MainWindow_OnClosed;
         _ = RefreshProjectionAsync();
@@ -136,10 +143,35 @@ public sealed partial class MainWindow : Window
             .FirstOrDefault(item => Equals(item.Tag, ViewModel.CurrentPage.Tag));
     }
 
+    /// Role-filtered navigation over the required views. Every required view
+    /// stays displayed; a KNOWN granted binding that withholds a capability
+    /// disables the sections it cannot lawfully serve instead of letting the
+    /// operator invoke them: query sections need the read capability, the
+    /// command-only UserAutomation section needs the command capability. An
+    /// unknown (never-established) binding disables nothing because the
+    /// transport authenticates every request. The selection is never stranded
+    /// on a disabled item.
+    private void SyncNavigationAvailability()
+    {
+        foreach (var item in Navigation.MenuItems.OfType<NavigationViewItem>())
+        {
+            if (item.Tag is not string tag) continue;
+            item.IsEnabled = string.Equals(tag, "user_automation", StringComparison.Ordinal)
+                ? ViewModel.CanIssueCommands
+                : ViewModel.CanReadProjection;
+        }
+        if (Navigation.SelectedItem is NavigationViewItem selected && !selected.IsEnabled)
+        {
+            Navigation.SelectedItem = Navigation.MenuItems
+                .OfType<NavigationViewItem>()
+                .FirstOrDefault(item => item.IsEnabled);
+        }
+    }
+
     private void RenderGraph()
     {
         QueryLabPanel.Visibility = ViewModel.IsQueryPage ? Visibility.Visible : Visibility.Collapsed;
-        UserAutomationPanel.Visibility = ViewModel.IsUserAutomationPage ? Visibility.Visible : Visibility.Collapsed;
+        UserAutomationPanel.Visibility = ViewModel.IsUserAutomationOperable ? Visibility.Visible : Visibility.Collapsed;
         RunControls.Visibility = ViewModel.CurrentPage.Tag == "autonomy"
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -266,6 +298,13 @@ public sealed partial class MainWindow : Window
             OperatorBannerSeverity.Error => InfoBarSeverity.Error,
             _ => InfoBarSeverity.Informational
         };
+        if (ViewModel.StatusSeverity == OperatorBannerSeverity.Error)
+        {
+            // Screen-reader announcement: an error banner outside the tab order
+            // is never read, so keyboard and screen-reader focus moves to it.
+            // Success, warning and informational banners stay non-intrusive.
+            StatusBanner.Focus(FocusState.Programmatic);
+        }
     }
 
     private void SyncReconcileVisibility()

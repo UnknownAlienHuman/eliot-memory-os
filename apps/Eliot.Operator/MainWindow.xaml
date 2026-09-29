@@ -102,10 +102,14 @@
                              Text="{Binding TaskId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                              AutomationProperties.Name="Canonical task ID" />
                     <TextBox Grid.Column="2" Header="Search" PlaceholderText="Title, handle, evidence or field"
-                             Text="{Binding FilterText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                    <TextBox Grid.Column="3" Header="Kind" Text="{Binding KindFilter, Mode=TwoWay}" />
-                    <TextBox Grid.Column="4" Header="Status" Text="{Binding StatusFilter, Mode=TwoWay}" />
-                    <TextBox Grid.Column="5" Header="Authority" Text="{Binding AuthorityFilter, Mode=TwoWay}" />
+                             Text="{Binding FilterText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="Filter Governor projection records by text" />
+                    <TextBox Grid.Column="3" Header="Kind" Text="{Binding KindFilter, Mode=TwoWay}"
+                             AutomationProperties.Name="Filter Governor projection records by kind" />
+                    <TextBox Grid.Column="4" Header="Status" Text="{Binding StatusFilter, Mode=TwoWay}"
+                             AutomationProperties.Name="Filter Governor projection records by status" />
+                    <TextBox Grid.Column="5" Header="Authority" Text="{Binding AuthorityFilter, Mode=TwoWay}"
+                             AutomationProperties.Name="Filter Governor projection records by authority" />
                     <Button Grid.Column="6" Content="Apply" Click="ApplyFilter_OnClick" VerticalAlignment="Bottom"
                             AutomationProperties.Name="Apply filters to current Governor projection" />
 
@@ -148,7 +152,8 @@
                               SelectedItem="{Binding ResultMode, Mode=TwoWay}"
                               AutomationProperties.Name="Query result mode" />
                     <NumberBox Grid.Column="3" Header="Graph depth" Minimum="1" Maximum="3"
-                               Value="{Binding GraphDepth, Mode=TwoWay}" SpinButtonPlacementMode="Compact" />
+                               Value="{Binding GraphDepth, Mode=TwoWay}" SpinButtonPlacementMode="Compact"
+                               AutomationProperties.Name="Causal graph expansion depth, 1 to 3" />
                     <Button Grid.Column="4" Content="Execute query" Click="ExecuteQuery_OnClick" VerticalAlignment="Bottom"
                             AutomationProperties.Name="Execute bounded typed query" />
                     <TextBox Grid.Row="1" Grid.ColumnSpan="5" Header="JSON result" Text="{Binding ResultPayloadText}"
@@ -305,7 +310,8 @@
                                       AutomationProperties.Name="Candidate disposition" />
                             <TextBox Header="Reason or exact evidence/source reference"
                                      Text="{Binding ActionInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                     TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56" />
+                                     TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56"
+                                     AutomationProperties.Name="Reason or exact evidence reference for the selected governed action" />
                             <Button Content="Submit typed action" Click="ExecuteAction_OnClick"
                                     IsEnabled="{Binding CanIssueCommands}"
                                     AutomationProperties.Name="Submit selected typed action through Governor" />
