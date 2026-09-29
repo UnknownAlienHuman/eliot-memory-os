@@ -936,17 +936,29 @@ pub fn route_rollback(
     request: &RollbackRouteRequest,
 ) -> Result<RollbackRouteProposal, LifecycleError> {
     // The canonical record is the authority for identity and epoch lineage.
-    // Its own `validate()` is the existing owner check: it refuses a blank
-    // identity, a non-distinct generation, a foreign-lineage epoch, and any
-    // epoch that is not the exact one-step direct child of the old epoch. That
-    // last rule is what makes "never reactivate an old epoch" structural — an
-    // epoch tuple that merely happens to be numerically larger, or that belongs
-    // to another lineage, is refused here instead of being compared as two
-    // loose counters this module would then trust.
-    request
-        .cutover
-        .validate()
-        .map_err(|_| LifecycleError::RollbackEpochNotNewer)?;
+    // Its own `validate()` is the existing owner check, applied to the ORIGINAL
+    // recorded value: it refuses a blank or control-bearing identity, a
+    // non-distinct generation, a foreign-lineage epoch, and any epoch that is
+    // not the exact one-step direct child of the old epoch. That last rule is
+    // what makes "never reactivate an old epoch" structural — an epoch tuple
+    // that merely happens to be numerically larger, or that belongs to another
+    // lineage, is refused here instead of being compared as two loose counters
+    // this module would then trust. Each refusal keeps its own cause: a
+    // malformed identity is never reported as an epoch failure.
+    if let Err(error) = request.cutover.validate() {
+        return Err(match error {
+            RuntimeContractError::InvalidField {
+                field: "new_epoch", ..
+            } => LifecycleError::RollbackEpochNotNewer,
+            RuntimeContractError::InvalidField {
+                field: "new_generation",
+                ..
+            } => LifecycleError::RollbackNotPriorCompatible,
+            _ => LifecycleError::InvalidField {
+                field: "rollback.cutover",
+            },
+        });
+    }
     // Rollback routes back to a strict prior generation. The record's own
     // generation pair is the independent expected set: a target that is not a
     // distinct earlier generation is refused.
