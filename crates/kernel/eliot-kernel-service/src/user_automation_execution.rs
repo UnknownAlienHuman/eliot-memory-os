@@ -2750,7 +2750,7 @@ impl CancellingCommit {
                         "edit-and-cancel requires edit",
                     ));
                 };
-                if superseded.as_ref() != previous_revision {
+                if superseded.as_ref() != previous_revision.as_ref() {
                     return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                         "superseded predecessor is not the edit intent previous revision",
                     ));
