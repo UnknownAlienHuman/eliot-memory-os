@@ -68,6 +68,19 @@
 //! owners either name a decision owner or they do not, and where they do not,
 //! the recommendation stays unnamed instead of adopting a kind-derived default.
 //!
+//! A fourth rule bounds the position denominator itself. Fewer than
+//! [`MINIMUM_CONFLICT_POSITIONS`] positions is not a conflict, and a position
+//! the set declares as an unresolved owner but does not supply has left the
+//! denominator rather than been decided in it, so it is refused instead of
+//! counted away. Both legs are read from the set's own declaration: a bare count
+//! of the supplied `positions` would let a caller drop a declared member and
+//! receive a clean analysis of a narrower conflict than the one that exists.
+//! There is no typed missing-rival exception here yet, and the reason is
+//! structural rather than an oversight: a `ConflictPosition` carries no
+//! availability axis, and the crate's one omission type,
+//! [`RivalDenominator`], is scoped to a causal claim's rival/confounder models
+//! and says nothing about how many conflict positions exist.
+//!
 //! Absence note: this file contains no persistence, identifier allocation,
 //! graph traversal beyond the bounded member lists, source acquisition, probe
 //! execution, route or budget reservation, peer transport, Concilium planning,
@@ -236,6 +249,15 @@ use eliot_evidence::{
 
 /// Maximum positions admitted in one analysis.
 pub const MAX_POSITIONS: usize = 32;
+/// Minimum positions admitted in one analysis.
+///
+/// I13.1 and I13.2 type a conflict as a disagreement between distinct claims,
+/// so a set of zero or one position holds no disagreement to analyze. This is
+/// the same minimum the canonical `ConflictSet` contract enforces when the set
+/// is constructed; it is named here because the denominator this cell actually
+/// reads is the one it restates, and because a rule that can only be found by
+/// re-reading a bare literal is a rule nobody can check.
+pub const MINIMUM_CONFLICT_POSITIONS: usize = 2;
 /// Maximum sources admitted in one analysis.
 pub const MAX_SOURCES: usize = 64;
 /// Maximum objections admitted in one analysis.
@@ -2861,6 +2883,26 @@ fn validate_supplement_shapes(
 }
 
 /// Validates `ConflictSet` denominator shapes without judging semantics.
+///
+/// The position denominator is checked as CONTENT, not as a count of the
+/// supplied `positions` vector. A count alone is defeated by suppression: a
+/// caller can hand over two positions while the set itself declares a third
+/// unresolved owner, and the analysis would then report a clean two-sided
+/// conflict over a denominator that is really three members wide. The set's own
+/// `unresolved_owners` declaration is what makes that suppression visible, so
+/// every declared member must be present as a position and the refused member is
+/// named rather than counted away.
+///
+/// A declared member with no position is refused here rather than preserved as
+/// a withheld or unavailable disposition. [`PositionDispositionKind::Withheld`]
+/// and [`PositionDispositionKind::Unavailable`] name that outcome, but this cell
+/// has no typed INPUT that can carry one: a `ConflictPosition` is stance text
+/// plus its assumptions, counters, and minority flag, with no availability axis,
+/// and the closest existing omission type, [`RivalDenominator`], is scoped to a
+/// causal claim's rival/confounder models and says nothing about how many
+/// conflict positions exist. Admitting the exception on a caller-set flag would
+/// hand back exactly the power this check removes, so the refusal stands until
+/// a typed missing-position declaration exists to carry it.
 fn validate_conflict_denominators(
     conflict_set: &ConflictSet,
     policy: &ConflictAnalysisPolicy,
@@ -2872,9 +2914,9 @@ fn validate_conflict_denominators(
         conflict_set.positions.len(),
         policy.max_positions.min(MAX_POSITIONS),
     )?;
-    if conflict_set.positions.len() < 2 {
+    if conflict_set.positions.len() < MINIMUM_CONFLICT_POSITIONS {
         return Err(ConflictAnalysisError::Denominator {
-            detail: "conflict requires at least two positions".to_owned(),
+            detail: format!("conflict requires at least {MINIMUM_CONFLICT_POSITIONS} positions"),
         });
     }
     let mut seen_sources: Vec<String> = Vec::with_capacity(conflict_set.positions.len());
@@ -2899,6 +2941,19 @@ fn validate_conflict_denominators(
         return Err(ConflictAnalysisError::Denominator {
             detail: "duplicate position source identity".to_owned(),
         });
+    }
+    for owner in &conflict_set.unresolved_owners {
+        if !seen_sources
+            .iter()
+            .any(|source| source.as_str() == owner.as_str())
+        {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "a declared unresolved owner has no position and would leave the denominator: {}",
+                    redact(owner.as_str())
+                ),
+            });
+        }
     }
     Ok(())
 }
