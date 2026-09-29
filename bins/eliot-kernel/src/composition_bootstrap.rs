@@ -1510,7 +1510,6 @@ impl KernelComposition {
             eliotd_descriptor_artifact_sha256,
             wasm_host_executable_path,
             wasm_host_artifact_sha256,
-            wasm_join_table: Mutex::new(eliot_kernel_service::WasmJoinTable::default()),
             pre_stage_identity_cache: Mutex::new(
                 eliot_kernel_service::PreStageIdentityCache::default(),
             ),
