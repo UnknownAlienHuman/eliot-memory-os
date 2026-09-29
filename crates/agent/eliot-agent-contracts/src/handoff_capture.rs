@@ -25,6 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ContractVersion, OperationId, ResourceGeneration, StateFence, TaskId};
 use schemars::JsonSchema;
+
+use crate::handoff_checkpoint::HandoffCheckpointError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -49,7 +51,9 @@ pub const HANDOFF_CAPTURE_CONTRACT_VERSION: ContractVersion = ContractVersion::n
 /// against, so the registration is a fact about real callers rather than a
 /// claim that some caller exists. A boundary that is not an arm here has no
 /// capture operation and must not present a checkpoint as its own.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HandoffCaptureBoundary {
     /// The host plugin pre-compaction hook, the boundary Claude Code fires
@@ -313,7 +317,9 @@ impl HandoffCaptureSource {
         }
         self.source_cursors
             .validate()
-            .map_err(HandoffCaptureError::Capture)?;
+            .map_err(|_| HandoffCaptureError::SnapshotIsNotCoherent {
+                field: "source_cursors",
+            })?;
         Ok(())
     }
 }
@@ -423,14 +429,14 @@ impl HandoffCapture {
     pub fn source(&self) -> HandoffCaptureSource {
         HandoffCaptureSource {
             capture_id: self.capture_id.clone(),
-            operation_id: self.operation_id,
+            operation_id: self.operation_id.clone(),
             boundary: self.boundary,
-            source_task_id: self.source_task_id,
+            source_task_id: self.source_task_id.clone(),
             source_attempt_id: self.source_attempt_id.clone(),
             source_session_ref: self.source_session_ref.clone(),
             source_plan_revision: self.source_plan_revision.clone(),
             source_acceptance_revision: self.source_acceptance_revision.clone(),
-            source_fence: self.source_fence,
+            source_fence: self.source_fence.clone(),
             source_generations: self.source_generations,
             source_cursors: self.source_cursors.clone(),
             frozen_diff: self.frozen_diff.clone(),
@@ -478,7 +484,8 @@ impl HandoffCapture {
         validate_text(&cause, "capture.cause")?;
         if matches!(
             self.state,
-            HandoffCaptureState::CommitResponseUnknown { .. } | HandoffCaptureState::ReadBack { .. }
+            HandoffCaptureState::CommitResponseUnknown { .. }
+                | HandoffCaptureState::ReadBack { .. }
         ) {
             return Err(HandoffCaptureError::IllegalCaptureTransition {
                 from: self.state_name(),
@@ -524,7 +531,9 @@ impl HandoffCapture {
         &self,
         checkpoint: &HandoffCheckpoint,
     ) -> Result<(), HandoffCaptureError> {
-        checkpoint.validate()?;
+        checkpoint
+            .validate()
+            .map_err(|error| HandoffCaptureError::Snapshot(Box::new(error)))?;
         if self.capture_id != checkpoint.checkpoint_id {
             return Err(HandoffCaptureError::CaptureIdentityMismatch {
                 expected: self.capture_id.as_str().to_owned(),
@@ -583,7 +592,7 @@ impl HandoffCapture {
             .iter()
             .map(|effect| {
                 (
-                    effect.operation_id.value().to_string(),
+                    effect.operation_id.as_str().to_owned(),
                     effect.disposition.revision_text().to_owned(),
                 )
             })
@@ -733,8 +742,7 @@ impl HandoffCapture {
         if self.artifact_leases.is_empty() {
             return Err(ContractError::EmptyCollection("capture.artifact_leases").into());
         }
-        let mut seen: BTreeSet<(String, String, String)> =
-            BTreeSet::new();
+        let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
         for lease in &self.artifact_leases {
             lease.validate()?;
             if lease.retained_by_capture != self.capture_id {
@@ -880,15 +888,17 @@ impl HandoffCaptureLedger {
         boundary: HandoffCaptureBoundary,
         source_attempt_id: &AgentAttemptId,
     ) -> Option<&HandoffCapture> {
-        self.captures
-            .get(&(boundary, source_attempt_id.clone()))
+        self.captures.get(&(boundary, source_attempt_id.clone()))
     }
 
     /// The boundaries that currently have a registered capture.
     #[must_use]
     pub fn registered_boundaries(&self) -> Vec<HandoffCaptureBoundary> {
-        let mut boundaries: Vec<HandoffCaptureBoundary> =
-            self.captures.keys().map(|(boundary, _)| *boundary).collect();
+        let mut boundaries: Vec<HandoffCaptureBoundary> = self
+            .captures
+            .keys()
+            .map(|(boundary, _)| *boundary)
+            .collect();
         boundaries.dedup();
         boundaries
     }
@@ -942,14 +952,11 @@ impl HandoffCapture {
 }
 
 /// Validates a reference stream and rejects repeated exact units.
-fn validate_artifacts(
-    references: &[PublicReference],
-) -> Result<(), HandoffCaptureError> {
+fn validate_artifacts(references: &[PublicReference]) -> Result<(), HandoffCaptureError> {
     for reference in references {
         reference.validate()?;
     }
-    let mut seen: BTreeSet<(String, String, String)> =
-        BTreeSet::new();
+    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
     for reference in references {
         if !seen.insert(reference_key(reference)) {
             return Err(ContractError::DuplicateItem("capture.references").into());
@@ -1026,6 +1033,13 @@ pub enum HandoffCaptureError {
     /// A shared agent-contract rejection, already typed by the owner crate.
     #[error(transparent)]
     Contract(#[from] ContractError),
+    /// The source snapshot's own record did not validate.
+    ///
+    /// The typed `HandoffCheckpointError` travels intact: a capture must not
+    /// restate a checkpoint refusal in its own vocabulary, because the
+    /// checkpoint is the owner of that rejection.
+    #[error("the captured source snapshot is not a valid handoff: {0}")]
+    Snapshot(#[from] Box<HandoffCheckpointError>),
     /// The capture record was written against another contract revision.
     #[error("handoff capture contract version {version} is not the current revision")]
     UnsupportedContractVersion {

@@ -30,8 +30,7 @@ use thiserror::Error;
 use crate::{
     AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCaptureBoundary,
     HandoffCaptureError, HandoffCaptureLedger, HandoffCausalLink, HandoffCheckpointId,
-    HandoffContinuity, PublicReference, RevisionId, WorkItemId, validate_collection,
-    validate_text,
+    HandoffContinuity, PublicReference, RevisionId, WorkItemId, validate_collection, validate_text,
 };
 
 /// Stable contract name of the pre-compaction handoff checkpoint payload.
