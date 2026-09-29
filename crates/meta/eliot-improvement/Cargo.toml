@@ -9,6 +9,14 @@ license = "MIT"
 blake3 = "1.8.5"
 eliot-contracts.workspace = true
 eliot-context-contracts = { path = "../../smart/eliot-context-contracts", version = "0.1.0" }
+# I12.24:76 binds the single canonical I18.47 `BudgetEquivalenceLedger` by
+# value, and its own `validate()` is the only admissible check. Naming that
+# type here is what lets the matched-budget gate read the ledger's recorded
+# `equivalence` class instead of a caller-set Boolean. Direction is the
+# A2.03:40-49 `contract` layer beneath a Meta plane cell, the same edge
+# `eliot-budget` (crates/governor/eliot-budget/Cargo.toml:12) and
+# `eliot-governor` (crates/governor/eliot-governor/Cargo.toml:42) already take.
+eliot-evaluation-contracts.workspace = true
 eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
 eliot-governor.workspace = true
 eliot-learning-contracts.workspace = true
