@@ -9,21 +9,270 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ArtifactId, ReceiptId, RequestMetadata, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+};
 use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    AutomationCapabilityProfile, AutomationExecutionReference, AutomationOccurrenceIdentity,
-    AutomationReconciliationCause, AutomationReconciliationReference, AutomationWorkClass,
-    ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
-    UserAutomationExecutionMode, UserAutomationExecutionProjection,
-    UserAutomationFailureProjection, UserAutomationInvocation, UserAutomationPreflightContext,
-    UserAutomationPreflightDecision, UserAutomationPreflightProjection,
-    UserAutomationPreflightReceipt, UserAutomationRevision, UserAutomationTrigger,
-    UserAutomationTriggerOrigin,
+    AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,
+    AutomationOccurrenceIdentity, AutomationReconciliationCause, AutomationReconciliationReference,
+    AutomationResourceCeiling, AutomationWorkClass, DeliveryChannel, ProviderFingerprintPolicy,
+    UserAutomationConfigurationState, UserAutomationError, UserAutomationExecutionMode,
+    UserAutomationExecutionProjection, UserAutomationFailureProjection, UserAutomationInvocation,
+    UserAutomationPreflightContext, UserAutomationPreflightDecision,
+    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
+    UserAutomationTrigger, UserAutomationTriggerOrigin,
 };
-use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
+use eliot_protocol::RequestIdentity as ProtocolRequestIdentity;
+use eliot_protocol::dreamer_job::{
+    AdmissionRef, DurableJobRequest, DurableRequestIdentity, JobOperation, JobOperationKind,
+    JobRole, JobSubmission, OpaqueContentRef, durable_job_contract_identity,
+};
+use eliot_receipts::{OperationBinding, RequestBinding, WorkScopeBinding};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
-use eliot_store_api::{OperationId, OperationIdentity, WriteReceipt};
+use eliot_store_api::{
+    CAPABILITY_DREAMER_JOB_SUBMIT, OperationId, OperationIdentity, WriteReceipt,
+};
+
+/// Domain separator of the closed semantic-input document one admitted
+/// occurrence submits to the Durable Job owner.
+const USER_AUTOMATION_SEMANTIC_INPUT_DOMAIN: &str =
+    "eliot.kernel.user-automation.durable-job.semantic-input.v1";
+
+/// Domain separator of the declared output envelope one admitted occurrence
+/// submits to the Durable Job owner.
+const USER_AUTOMATION_OUTPUT_ENVELOPE_DOMAIN: &str =
+    "eliot.kernel.user-automation.durable-job.output-envelope.v1";
+
+/// Output disposition inside the declared byte ceiling (I11.12:49).
+const USER_AUTOMATION_OUTPUT_VERBATIM: &str = "exact_stdout_stderr_verbatim";
+
+/// Output disposition beyond the declared byte ceiling (I11.12:49).
+const USER_AUTOMATION_OUTPUT_REVERSIBLE: &str = "reversible_payload_contract";
+
+/// The exact semantic input one admitted occurrence submits.
+///
+/// Every member is already admitted: the qualified artifact identity and its
+/// certified capability profile, the declared Skill/Tool closure, the bound
+/// work scope and workdir, the declared resource ceiling and delivery target,
+/// the preflight contract revision, the admitted config snapshot, and the
+/// request fence. Nothing here is a model, provider, or scheduler decision.
+#[derive(Serialize)]
+struct UserAutomationSemanticInput<'a> {
+    domain: &'static str,
+    automation_id: &'a str,
+    automation_revision: &'a str,
+    occurrence_id: &'a str,
+    mode: UserAutomationExecutionMode,
+    qualified_ref: &'a str,
+    capability_profile: &'a AutomationCapabilityProfile,
+    skill_package_revision_refs: &'a [String],
+    tool_definition_refs: &'a [String],
+    work_scope: &'a WorkScopeBinding,
+    workdir_ref: &'a str,
+    resource_ceiling: &'a AutomationResourceCeiling,
+    delivery_target: &'a AutomationDeliveryTarget,
+    preflight_contract_revision: &'a str,
+    config_snapshot_id: &'a str,
+    state_fence: &'a StateFence,
+}
+
+/// The exact output envelope one admitted occurrence declares.
+#[derive(Serialize)]
+struct UserAutomationOutputEnvelope<'a> {
+    domain: &'static str,
+    within_limits: &'static str,
+    beyond_limits: &'static str,
+    max_output_bytes: u64,
+    target_ref: &'a str,
+    channels: &'a [DeliveryChannel],
+    recipient_refs: &'a [String],
+    preflight_contract_revision: &'a str,
+}
+
+/// Content-addresses one closed submission document.
+///
+/// The digest is computed over the exact canonical bytes this call submits, so
+/// any reader can recompute it from the same admitted members, and the artifact
+/// handle is that digest: the reference names the bytes it certifies rather
+/// than a blob this boundary never wrote. The contract identity is the
+/// existing Durable Job wire identity, not a new contract surface.
+fn content_address<T: Serialize>(
+    document: T,
+    source_revision: &str,
+) -> Result<OpaqueContentRef, UserAutomationExecutionError> {
+    let bytes = canonical_json_bytes(&document).map_err(|error| {
+        UserAutomationExecutionError::Metadata(format!(
+            "the Durable Job submission document could not be canonically encoded: {error}"
+        ))
+    })?;
+    let sha256 = sha256_hex(&bytes);
+    Ok(OpaqueContentRef {
+        contract: durable_job_contract_identity().map_err(|error| {
+            UserAutomationExecutionError::Metadata(format!(
+                "the existing Durable Job contract identity could not be read: {error}"
+            ))
+        })?,
+        source_revision: source_revision.to_owned(),
+        byte_length: bytes.len() as u64,
+        artifact_id: Some(ArtifactId::new(sha256.clone()).map_err(|error| {
+            UserAutomationExecutionError::Metadata(format!(
+                "the Durable Job submission content address is not a valid artifact handle: \
+                 {error}"
+            ))
+        })?),
+        sha256,
+    })
+}
+
+/// Derives the admitted submission deadline from the authenticated clock.
+///
+/// The deadline is the revision's own declared runtime ceiling added to the
+/// authenticated request's observed clock reading, so it is bounded by a value
+/// the owner declared rather than by a wall clock read at submission time. A
+/// request that carries no observed time, or a ceiling that does not fit it,
+/// has no derivable deadline and is refused instead of being padded.
+fn admitted_deadline(
+    context: &RequestMetadata,
+    ceiling: &AutomationResourceCeiling,
+) -> Result<u64, UserAutomationExecutionError> {
+    let observed_ms = context
+        .clock
+        .known_time_ms
+        .or(context.clock.valid_time_ms)
+        .ok_or(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "the authenticated request carries no observed clock reading, so the Durable Job \
+             admission has no derivable deadline",
+        ))?;
+    u64::try_from(observed_ms)
+        .ok()
+        .and_then(|observed| observed.checked_add(ceiling.max_runtime_ms))
+        .ok_or(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "the declared runtime ceiling does not fit the authenticated clock reading",
+        ))
+}
+
+/// Content-addresses the exact semantic input one occurrence submits.
+///
+/// The document names the qualified artifact and its certified capability
+/// profile, the declared Skill/Tool closure, the bound work scope and workdir,
+/// the declared resource ceiling and delivery target, the preflight contract
+/// revision, the admitted config snapshot, and the request fence. Every member
+/// is already admitted, and the digest is taken over the exact bytes submitted,
+/// so a reader recomputes it from the same members.
+fn admitted_semantic_input<'a>(
+    admission: &'a UserAutomationRuntimeAdmission,
+    occurrence_id: &'a str,
+    work_scope: &'a WorkScopeBinding,
+) -> Result<OpaqueContentRef, UserAutomationExecutionError> {
+    let revision = &admission.revision;
+    content_address(
+        UserAutomationSemanticInput {
+            domain: USER_AUTOMATION_SEMANTIC_INPUT_DOMAIN,
+            automation_id: &revision.automation_id,
+            automation_revision: &revision.revision,
+            occurrence_id,
+            mode: revision.mode,
+            qualified_ref: &revision.task.qualified_ref,
+            capability_profile: &revision.task.capability_profile,
+            skill_package_revision_refs: &revision.portable_skill_package_revision_refs,
+            tool_definition_refs: &revision.trusted_tool_definition_refs,
+            work_scope,
+            workdir_ref: &revision.workdir_ref,
+            resource_ceiling: &revision.resource_ceiling,
+            delivery_target: &revision.delivery_target,
+            preflight_contract_revision: &revision.preflight_contract_revision,
+            config_snapshot_id: &admission.preflight.config_snapshot_id,
+            state_fence: &admission.context.state_fence,
+        },
+        &revision.revision,
+    )
+}
+
+/// Content-addresses the declared output envelope one occurrence submits.
+///
+/// I11.12:49 requires exact stdout/stderr to be delivered verbatim within
+/// policy and size limits and the reversible payload contract of I7.26 beyond
+/// them, with neither path summarized by a model. The envelope declares both
+/// dispositions, the byte ceiling that separates them, and the delivery target
+/// they are delivered through.
+fn admitted_output_envelope(
+    admission: &UserAutomationRuntimeAdmission,
+) -> Result<OpaqueContentRef, UserAutomationExecutionError> {
+    let revision = &admission.revision;
+    content_address(
+        UserAutomationOutputEnvelope {
+            domain: USER_AUTOMATION_OUTPUT_ENVELOPE_DOMAIN,
+            within_limits: USER_AUTOMATION_OUTPUT_VERBATIM,
+            beyond_limits: USER_AUTOMATION_OUTPUT_REVERSIBLE,
+            max_output_bytes: revision.resource_ceiling.max_output_bytes,
+            target_ref: &revision.delivery_target.target_ref,
+            channels: &revision.delivery_target.channels,
+            recipient_refs: &revision.delivery_target.recipient_refs,
+            preflight_contract_revision: &revision.preflight_contract_revision,
+        },
+        &admission.preflight.config_snapshot_id,
+    )
+}
+
+/// Reads the job admission reference from the committed source receipt.
+///
+/// Every binding here is copied from a value the admitted occurrence already
+/// carries: the authority, session and epoch are the committed receipt's own
+/// bindings, the requester is the authenticated principal, the route class and
+/// cost ceiling are the revision's declared ones, and the admission receipt is
+/// the committed source receipt's own identity — the receipt whose commit
+/// admitted this occurrence. Nothing is minted for the admission, so the
+/// reference can only ever name work the canonical Store already committed.
+fn admitted_job_ref(
+    admission: &UserAutomationRuntimeAdmission,
+    scope: &WorkScopeBinding,
+    budget_units: u64,
+    deadline_unix_ms: u64,
+) -> Result<AdmissionRef, UserAutomationExecutionError> {
+    let core = &admission.preflight.source_receipt.core;
+    let revision = &admission.revision;
+    Ok(AdmissionRef {
+        authority: core.authority.clone(),
+        requester_principal: admission.authenticated_principal.clone(),
+        session: core.session.clone(),
+        scope: scope.clone(),
+        capability: CAPABILITY_DREAMER_JOB_SUBMIT.to_owned(),
+        route_class: revision.route_cost_policy.route_ref.clone(),
+        budget_units,
+        deadline_unix_ms,
+        validity_epoch: core.authority.authority_epoch.clone(),
+        resource_generation: admission.context.state_fence.resource_generation,
+        admission_receipt: ReceiptId::new(
+            admission
+                .preflight
+                .source_receipt
+                .identity
+                .receipt_id
+                .as_str(),
+        )
+        .map_err(|_| {
+            UserAutomationExecutionError::RuntimeResponseMismatch(
+                "the committed source receipt identity is not a valid admission receipt",
+            )
+        })?,
+    })
+}
+
+/// Builds one contract identity value, reporting which member was refused.
+fn typed_id<T>(
+    build: fn(String) -> Result<T, eliot_contracts::ContractError>,
+    value: &str,
+) -> Result<T, UserAutomationExecutionError>
+where
+    T: Clone,
+{
+    build(value.to_owned()).map_err(|error| {
+        UserAutomationExecutionError::Metadata(format!(
+            "the Durable Job submission identity {value} was refused: {error}"
+        ))
+    })
+}
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -124,12 +373,14 @@ pub enum UserAutomationExecutionError {
 /// Owner-issued Durable Job material for one admitted UserAutomation
 /// occurrence.
 ///
-/// The service cannot derive this request from an automation revision. The
-/// existing Durable Job owner supplies the complete K0 submission, including
-/// its job/attempt identities, content references, admission receipt, and
-/// canonical request hash. The occurrence binding is carried beside that
-/// request so the runtime adapter can prove which automation occurrence the
-/// owner material belongs to.
+/// The complete K0 submission travels with the occurrence binding so the
+/// runtime adapter can prove which automation occurrence the owner material
+/// belongs to. [`UserAutomationDurableJobMaterial::from_admitted_occurrence`]
+/// compiles that submission from members the admitted revision and its
+/// committed source receipt already carry; a caller that holds a submission
+/// from the Durable Job owner may still supply it directly, and both shapes go
+/// through the same [`Self::validate_for`] and
+/// [`Self::validate_for_revision`] checks.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserAutomationDurableJobMaterial {
@@ -166,6 +417,138 @@ pub struct UserAutomationDurableJobMaterial {
 }
 
 impl UserAutomationDurableJobMaterial {
+    /// Compiles the complete Durable Job submission for one admitted
+    /// occurrence.
+    ///
+    /// Every member is read from an owner the admitted occurrence already
+    /// carries; nothing is asserted on the owner's behalf:
+    ///
+    /// - the job identity and the idempotency key are the stable occurrence
+    ///   identity, so re-admitting the same occurrence replays the same
+    ///   mutation instead of minting a second one, and a different occurrence
+    ///   can never reuse this one;
+    /// - the attempt identity and the semantic-input artifact handle are the
+    ///   content address of the exact closed semantic-input document below, so
+    ///   the digest a reviewer recomputes is the digest the submission carries;
+    /// - the output envelope is the declared envelope of this revision — the
+    ///   verbatim stdout/stderr bound with its declared byte ceiling, and the
+    ///   reversible payload contract that takes over beyond it (I11.12:49);
+    /// - the work scope, authority, session, validity epoch, resource
+    ///   generation, effect class and admission receipt are the committed
+    ///   source receipt's own bindings, which `UserAutomationRuntimeAdmission`
+    ///   has already bound to this request fence and product;
+    /// - the requester principal is the authenticated principal, the capability
+    ///   is the Store's own closed name for a `SUBMIT_JOB`, the route class is
+    ///   the revision's declared route, the budget is its declared cost
+    ///   ceiling, and the deadline is its declared runtime ceiling added to
+    ///   the authenticated clock reading.
+    ///
+    /// A revision with no declared cost ceiling, a request whose authenticated
+    /// clock reading carries no time, or an identity the contract types reject
+    /// is refused here with the exact member, so a submission is never padded
+    /// with a value no owner declared.
+    pub fn from_admitted_occurrence(
+        admission: &UserAutomationRuntimeAdmission,
+    ) -> Result<Self, UserAutomationExecutionError> {
+        let revision = &admission.revision;
+        let context = &admission.context;
+        let core = &admission.preflight.source_receipt.core;
+        let occurrence_id = admission.invocation.occurrence_identity()?;
+        let budget_units = revision.route_cost_policy.max_cost_units;
+        if budget_units == 0 {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "the revision declares no route cost ceiling, so the Durable Job admission has \
+                 no admitted budget",
+            ));
+        }
+        let deadline_unix_ms = admitted_deadline(context, &revision.resource_ceiling)?;
+        let work_scope = WorkScopeBinding {
+            scope_id: core.work_scope.scope_id.clone(),
+            product_id: core.work_scope.product_id.clone(),
+            resource_generation: core.work_scope.resource_generation,
+            state_fence: core.work_scope.state_fence.clone(),
+        };
+        let semantic_input = admitted_semantic_input(admission, &occurrence_id, &work_scope)?;
+        let output_envelope = admitted_output_envelope(admission)?;
+        let job_id = typed_id(TaskId::new, &format!("user-automation:{occurrence_id}"))?;
+        let attempt_id = typed_id(ArtifactId::new, &semantic_input.sha256)?;
+        let submission = JobSubmission {
+            job_id: job_id.clone(),
+            attempt_id,
+            work_scope: work_scope.clone(),
+            semantic_input,
+            output_contract: output_envelope,
+            admission: admitted_job_ref(admission, &work_scope, budget_units, deadline_unix_ms)?,
+            cancellation_id: format!("user-automation:{occurrence_id}:cancellation"),
+        };
+        let operation = JobOperation::Submit {
+            submission: Box::new(submission.clone()),
+        };
+        let operation_binding = OperationBinding {
+            operation_id: typed_id(
+                OperationId::new,
+                &format!(
+                    "user-automation:{occurrence_id}:{}",
+                    JobOperationKind::Submit.as_str()
+                ),
+            )?,
+            request_id: context.request_id.clone(),
+            idempotency_key: format!("user-automation:{occurrence_id}:durable-job-submit"),
+            operation_kind: JobOperationKind::Submit.as_str().to_owned(),
+            effect: core.operation.effect,
+            state_fence: context.state_fence.clone(),
+        };
+        let request = ProtocolRequestIdentity {
+            request: RequestBinding {
+                metadata: context.clone(),
+                state_fence: context.state_fence.clone(),
+            },
+            idempotency_key: operation_binding.idempotency_key.clone(),
+            deadline_unix_ms,
+            cancellation_id: submission.cancellation_id.clone(),
+        };
+        let canonical_request_hash = DurableRequestIdentity::digest_for(
+            &operation_binding,
+            &request,
+            &operation,
+            JobRole::Requester,
+        )
+        .map_err(|error| {
+            UserAutomationExecutionError::Metadata(format!(
+                "the Durable Job submission digest could not be computed: {error}"
+            ))
+        })?;
+        let material = Self {
+            occurrence_id,
+            qualified_ref: revision.task.qualified_ref.clone(),
+            mode: revision.mode,
+            capability_profile: revision.task.capability_profile.clone(),
+            skill_package_revision_refs: revision.portable_skill_package_revision_refs.clone(),
+            tool_definition_refs: revision.trusted_tool_definition_refs.clone(),
+            request: DurableJobRequest {
+                request_identity: DurableRequestIdentity {
+                    request,
+                    operation: operation_binding,
+                    canonical_request_hash,
+                },
+                role: JobRole::Requester,
+                operation,
+            },
+        };
+        material.validate_for(
+            &admission.context,
+            &admission.authenticated_principal,
+            &admission.invocation,
+        )?;
+        material.validate_for_revision(
+            &admission.context,
+            &admission.authenticated_principal,
+            &admission.invocation,
+            revision,
+        )?;
+        Ok(material)
+    }
+
     /// Validates the complete owner material against the authenticated
     /// occurrence that is about to be admitted.
     ///
@@ -481,8 +864,10 @@ pub struct UserAutomationRuntimeAdmission {
     pub preflight: UserAutomationPreflightReceipt,
     /// Existing pending WakeIntent bound to this occurrence.
     pub wake_intent: WakeIntent,
-    /// Complete owner-issued Durable Job material. Concrete production
-    /// adapters reject an admission that omits this material.
+    /// Complete Durable Job material. A caller that holds a submission from the
+    /// Durable Job owner supplies it here; when it is absent, the concrete
+    /// production adapter compiles it from this admission and revalidates the
+    /// whole request before calling the owner.
     #[serde(default)]
     pub durable_job: Option<UserAutomationDurableJobMaterial>,
 }
@@ -4104,6 +4489,7 @@ mod tests {
                 },
             },
             portable_skill_package_revision_refs: vec!["skill-package@1".to_owned()],
+            trusted_tool_definition_refs: vec!["skill-package@1".to_owned()],
             workdir_ref: "workdir-1".to_owned(),
             route_cost_policy: RouteCostPolicy {
                 route_ref: "deterministic-local".to_owned(),

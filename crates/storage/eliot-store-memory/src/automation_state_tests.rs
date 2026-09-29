@@ -119,6 +119,7 @@ fn valid_revision(
             },
         },
         portable_skill_package_revision_refs: Vec::new(),
+        trusted_tool_definition_refs: Vec::new(),
         workdir_ref: "workdir-1".to_owned(),
         route_cost_policy: RouteCostPolicy {
             route_ref: "local".to_owned(),
