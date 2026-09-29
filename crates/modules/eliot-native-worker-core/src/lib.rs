@@ -257,7 +257,7 @@ where
     /// a valid owner record passes, while a changed route, adapter, config,
     /// facet, grant revision, nonce, stream, invocation digest, or owner
     /// digest, a stale or revoked authority, an epoch/fence/generation
-    /// mismatch, or an expired window is refused with a typed
+    /// mismatch, an expired registration lease, or an expired window is refused with a typed
     /// [`WorkerError`] before P-03 starts anything.
     ///
     /// # Errors
@@ -1539,6 +1539,19 @@ fn validate_grant(
     }
     if let Some(presented) = claim {
         validate_grant_claim_binding(grant, presented)?;
+        // Registration-lease currentness (Implements #22 AC5 lease scope
+        // and the W1 admitted-lease dimension): the presenting registration
+        // states the exact lease window this generation was admitted under,
+        // and expiry ends authority without renewal. A start observed at or
+        // past the lease end is refused with the typed stale-lease refusal,
+        // so broker/session/lease loss revokes credential/resource scope
+        // here, before P-03 starts anything. This runs after the executable
+        // currentness check so an expired binding window keeps its exact
+        // `DeadlineExpired` dimension. The owner restores authority through
+        // a new admission, never a local repair in the worker.
+        if grant.observed_at_unix_ms() >= presented.registration().lease_expires_at_unix_ms {
+            return Err(WorkerError::StaleLease);
+        }
     }
     Ok(())
 }
