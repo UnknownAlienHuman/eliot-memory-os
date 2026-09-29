@@ -47,9 +47,9 @@
 //! - **Emission and cleanup are bounded.** Each result event is validated
 //!   and gets a bounded caller wait on stdout; a caller timeout retains
 //!   the helper for tracked termination and never reuses the contended
-//!   stream while it runs, and the staged set is consumed only while it
-//!   still names the served generation, so a replacement staged mid-run is
-//!   never deleted. Control spool files and acks are owner-reclaimed;
+//!   stream while it runs, and the staged set remains under owner custody
+//!   after terminal publication until an exact owner acknowledgement permits
+//!   retirement. Control spool files and acks are owner-reclaimed;
 //!   cleanup deletes none of them, so a stale operation can never remove
 //!   a newer control.
 //!
@@ -263,20 +263,18 @@ enum WorkerState {
 /// is retained as history by the result-event sequence
 /// ([`BoundedRequestLoop::retained`]), not here (issue #2785 audit,
 /// defect 1).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CommandDelivery {
     /// Admission produced the command; it has not been handed to the
     /// worker yet. The bounded command channel admits exactly one, so this
-    /// slot can hold one pending command and never a queue. `owner` is true
-    /// only for a command admitted from an owner-staged control delivery,
-    /// and it is what lets a real enqueue be confirmed against that exact
-    /// delivery while a loop-derived follow-up confirms nothing (issue #2896
-    /// A2).
+    /// slot can hold one pending command and never a queue. The opaque token
+    /// is present only for an owner-staged control; loop-derived follow-ups
+    /// carry none and cannot confirm a spool delivery (issue #2896 A2).
     Requested {
         /// Command the command channel is about to be asked to take.
         command: WorkerCommand,
-        /// Whether an owner-staged control delivery produced this command.
-        owner: bool,
+        /// Exact owner delivery this command came from, if any.
+        control: Option<ControlDeliveryToken>,
     },
     /// `try_send` succeeded: the worker received the command and exactly
     /// this correlated reply is owed.
@@ -285,8 +283,8 @@ enum CommandDelivery {
         command: WorkerCommand,
         /// Process-local correlation token for this handover.
         token: u64,
-        /// Whether an owner-staged control delivery produced this command.
-        owner: bool,
+        /// Exact owner delivery this command came from, if any.
+        control: Option<ControlDeliveryToken>,
     },
 }
 
@@ -1446,6 +1444,16 @@ pub trait WasmHostRequestChannel {
         Ok(None)
     }
 
+    /// Polls an owner control with the exact delivery token that was read
+    /// beside it. Implementations without an owner spool inherit the frame
+    /// poll and carry no token; the production spool overrides this method so
+    /// the token follows the command through enqueue and outcome accounting.
+    fn poll_control_with_token(
+        &mut self,
+    ) -> Result<Option<(WasmHostRequestFrame, Option<ControlDeliveryToken>)>, LoopError> {
+        Ok(self.poll_control()?.map(|frame| (frame, None)))
+    }
+
     /// Non-blocking poll for one staged Cancel/Shutdown naming this
     /// operation (#2568 A3). Unlike [`Self::poll_control`], this runs before
     /// the single-gate intake check, so an admitted Cancel/Shutdown
@@ -1462,12 +1470,17 @@ pub trait WasmHostRequestChannel {
         Ok(None)
     }
 
-    /// Confirms that the last polled control delivery for `operation` was
-    /// admitted **and** handed to the worker owner. The caller must invoke
-    /// this only immediately after the command channel actually took that
-    /// command: an acknowledgement written for a demand the loop merely
-    /// recorded would report an enqueue that never happened (issue #2896
-    /// W5/A2). The default has no external source and confirms nothing.
+    /// Urgent counterpart of [`Self::poll_control_with_token`].
+    fn poll_control_urgent_with_token(
+        &mut self,
+    ) -> Result<Option<(WasmHostRequestFrame, Option<ControlDeliveryToken>)>, LoopError> {
+        Ok(self.poll_control_urgent()?.map(|frame| (frame, None)))
+    }
+
+    /// Compatibility hook for channels without delivery tokens. The
+    /// production spool deliberately does not confirm by operation name;
+    /// callers must use [`Self::confirm_control_enqueued_for`] so the exact
+    /// selected delivery remains in custody through the real enqueue.
     ///
     /// # Errors
     ///
@@ -1477,9 +1490,25 @@ pub trait WasmHostRequestChannel {
         Ok(())
     }
 
-    /// Confirms that the exact worker outcome of the accepted control for
-    /// `operation` was observed, carrying the outcome digest when the loop
-    /// reports one. The default has no external source and confirms nothing.
+    /// Confirms enqueue for the exact polled delivery. The operation-only
+    /// hook remains the default compatibility surface for non-spool test or
+    /// embedding channels; the production reader validates this opaque token
+    /// against its still-held slot before writing any acknowledgement.
+    fn confirm_control_enqueued_for(
+        &mut self,
+        token: Option<&ControlDeliveryToken>,
+    ) -> Result<(), LoopError> {
+        if let Some(token) = token {
+            self.confirm_control_enqueued(token.operation())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Compatibility hook for channels without delivery tokens. The
+    /// production spool deliberately does not complete by operation name;
+    /// callers must use [`Self::confirm_control_completed_for`] so the exact
+    /// accepted delivery remains in custody through its observed outcome.
     ///
     /// # Errors
     ///
@@ -1493,22 +1522,45 @@ pub trait WasmHostRequestChannel {
         Ok(())
     }
 
-    /// Releases the last polled frame back to staged without admitting it.
-    /// Called only when the single command slot is occupied, so a control
-    /// step that cannot run yet is re-offered on a later tick instead of
-    /// being dropped or admitted twice (issue #2785 P1/W2). The default has
-    /// no external source and has nothing to release.
+    /// Confirms completion against the exact delivery token retained when
+    /// the worker accepted the command, carrying its observed outcome
+    /// digest when one exists.
+    fn confirm_control_completed_for(
+        &mut self,
+        token: Option<&ControlDeliveryToken>,
+        outcome_digest: Option<&str>,
+    ) -> Result<(), LoopError> {
+        if let Some(token) = token {
+            self.confirm_control_completed(token.operation(), outcome_digest)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Compatibility hook for channels without delivery tokens. The
+    /// production spool releases only through [`Self::release_control_for`],
+    /// when the exact polled delivery could not take the single command
+    /// slot.
     fn release_control(&mut self) {}
 
-    /// Dispositions the last polled frame as refused for `detail`: the child
-    /// itself could not admit it. This is the terminal typed disposition,
-    /// never the enqueue acknowledgement — a control that never reached the
-    /// worker must not read as enqueued — and the delivery itself is left in
-    /// place so the same owner operation stays retained. Temporary slot
-    /// pressure is not a refusal: that delivery stays pending and replayable
-    /// (issue #2896 W5/A2). The default has no external source and
-    /// dispositions nothing.
+    /// Releases only the exact delivery token whose request could not take
+    /// the single worker slot. The default delegates to the old single-slot
+    /// hook; the production spool compares the token before clearing custody.
+    fn release_control_for(&mut self, _token: Option<&ControlDeliveryToken>) {
+        self.release_control();
+    }
+
+    /// Compatibility hook for channels without delivery tokens. The
+    /// production spool refuses only through [`Self::refuse_control_for`],
+    /// which names the exact delivery whose admission failed.
     fn refuse_control(&mut self, _detail: &'static str) {}
+
+    /// Refuses only the exact frame token whose admission failed. The
+    /// production spool never writes a refusal over a different same-slot
+    /// identity; channels without external delivery keep their default no-op.
+    fn refuse_control_for(&mut self, _token: Option<&ControlDeliveryToken>, detail: &'static str) {
+        self.refuse_control(detail);
+    }
 
     /// Publishes one correlated result frame: the one stdout emission
     /// owner for the ordinary result stream (#2787 step 2).
@@ -1587,7 +1639,7 @@ fn refused_ack(
 /// read from its validated bytes, so an acknowledgement written from it is
 /// bound to that delivery's content and not to an operation name two
 /// controls can share (issue #2896 A2).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingControl {
     /// A versioned spool delivery at its exact generation/sequence slot.
     Spool {
@@ -1624,6 +1676,22 @@ impl PendingControl {
     /// Returns the loop operation of the pending delivery.
     fn operation(&self) -> &'static str {
         control_operation(self.kind())
+    }
+}
+
+/// Opaque identity of one polled owner-control delivery. Its private payload
+/// is the immutable spool token (kind, operation, generation, sequence,
+/// replay key and delivery digest) or the exact legacy-file digest; only the
+/// reader that issued it can use it to advance or refuse that slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlDeliveryToken {
+    pending: PendingControl,
+}
+
+impl ControlDeliveryToken {
+    /// Operation vocabulary associated with this exact delivery.
+    fn operation(&self) -> &'static str {
+        self.pending.operation()
     }
 }
 
@@ -1702,6 +1770,100 @@ enum AckSlot {
     Reoffer(WasmControlAck),
 }
 
+/// Closed result of checking the delivery immediately before one spool slot.
+/// Missing or unreadable predecessor bytes are not evidence that the owner
+/// retired them, and exhausting this poll's read budget is not a refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviousAssessment {
+    /// The predecessor link is proven by a retained, self-validating delivery.
+    Verified,
+    /// The predecessor cannot currently be read, and no owner-issued
+    /// retirement commitment is available to prove a compacted prefix.
+    AwaitingEvidence,
+    /// This poll has no remaining read budget to assess the predecessor.
+    BudgetDeferred,
+    /// Retained predecessor evidence contradicts the current delivery.
+    Conflict,
+}
+
+/// Whether an acknowledgement is a closed, bounded record for the exact
+/// delivery selected by the spool scan. The delivery digest commits every
+/// identity field, while the explicit comparisons make the ack's custody
+/// coordinates independently visible and checked.
+fn control_ack_names_delivery(ack: &WasmControlAck, delivery: &WasmControlDelivery) -> bool {
+    let identity = &delivery.identity;
+    if ack.wire_id != WASM_CONTROL_ACK_WIRE_ID
+        || ack.wire_version != WASM_CONTROL_ACK_WIRE_VERSION
+        || ack.operation_id != identity.operation_id
+        || ack.replay_key != identity.replay_key
+        || ack.generation != identity.generation
+        || ack.owner_sequence != identity.owner_sequence
+        || ack.delivery_digest != delivery.delivery_digest
+    {
+        return false;
+    }
+
+    control_ack_shape_valid(ack)
+}
+
+/// Whether an ack has a closed phase shape and bounded field values.
+fn control_ack_shape_valid(ack: &WasmControlAck) -> bool {
+    let valid_detail =
+        |detail: &str| !detail.trim().is_empty() && detail.len() <= WASM_CONTROL_MAX_DETAIL_BYTES;
+    let valid_digest = |digest: &str| control_digest_is_valid(digest);
+    match (&ack.phase, &ack.detail, &ack.outcome_digest) {
+        (ControlAckPhase::Enqueued, detail, None) => detail.as_deref().is_none_or(valid_detail),
+        (ControlAckPhase::Completed, detail, outcome) => {
+            detail.as_deref().is_none_or(valid_detail)
+                && outcome.as_deref().is_none_or(valid_digest)
+        }
+        (ControlAckPhase::Refused, Some(detail), None) => valid_detail(detail),
+        (ControlAckPhase::Refused, None, _) | (_, _, Some(_)) => false,
+    }
+}
+
+/// Whether two ack records name the same complete child-visible delivery
+/// custody tuple. Phase advancement may change only these same bytes.
+fn control_acks_name_same_delivery(left: &WasmControlAck, right: &WasmControlAck) -> bool {
+    left.wire_id == right.wire_id
+        && left.wire_version == right.wire_version
+        && left.operation_id == right.operation_id
+        && left.replay_key == right.replay_key
+        && left.generation == right.generation
+        && left.owner_sequence == right.owner_sequence
+        && left.delivery_digest == right.delivery_digest
+}
+
+/// Lowercase hexadecimal SHA-256 spelling used by control ack digests.
+fn control_digest_is_valid(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Whether one locally accepted spool control is the exact pending token.
+fn accepted_control_matches(accepted: &AcceptedControl, pending: &PendingControl) -> bool {
+    match pending {
+        PendingControl::Spool {
+            kind,
+            operation_id,
+            generation,
+            sequence,
+            replay_key,
+            delivery_digest,
+        } => {
+            accepted.kind == *kind
+                && accepted.operation_id == *operation_id
+                && accepted.generation == *generation
+                && accepted.sequence == *sequence
+                && accepted.replay_key == *replay_key
+                && accepted.delivery_digest == *delivery_digest
+        }
+        PendingControl::Legacy { .. } => false,
+    }
+}
+
 /// Installed Kernel control reader: the external control intake of the
 /// ordinary loop.
 ///
@@ -1743,7 +1905,7 @@ type ControlSlotList = Vec<ControlSlot>;
 /// never admitted externally: the one admitted invoke comes from the
 /// delivery set only, so a second execution path cannot open through the
 /// control lane. A delivery is acknowledged only through
-/// [`Self::confirm_enqueued`], which the loop calls immediately after the
+/// [`Self::confirm_enqueued_for`], which the loop calls immediately after the
 /// command channel actually took that delivery's command: `follow_up`
 /// advances only when the command was really handed to the worker (issue
 /// #2785 P1/I2), so a delivery the command channel refuses stays staged and
@@ -1774,9 +1936,10 @@ pub struct KernelControlReader {
     accepted: Option<AcceptedControl>,
     /// Whether the legacy file was consumed this run.
     legacy_consumed: bool,
-    /// Whether any same-generation spool delivery or ack was observed this
-    /// run: the versioned stream permanently closes the legacy join, even if
-    /// the owner reclaims its terminal files mid-run.
+    /// Whether a same-generation spool delivery or ack was observed, or a
+    /// bounded scan failed before proving the spool absent: the versioned
+    /// stream permanently closes the legacy join, even if the owner reclaims
+    /// its terminal files mid-run.
     versioned_seen: bool,
     /// Directory cursor retained across polls so unrelated names cannot
     /// consume every scan budget before this operation's control slots.
@@ -1825,6 +1988,16 @@ impl KernelControlReader {
     /// degrades to nothing pending, and the staged delivery stays replayable
     /// until the loop confirms it after worker enqueue.
     fn poll(&mut self, class: ControlPollClass) -> Option<WasmHostRequestFrame> {
+        self.poll_with_token(class).map(|(frame, _)| frame)
+    }
+
+    /// Returns the frame with the exact reader-issued token that owns its
+    /// pending slot. The public frame remains the worker protocol; this
+    /// token is local custody carried beside it through command accounting.
+    fn poll_with_token(
+        &mut self,
+        class: ControlPollClass,
+    ) -> Option<(WasmHostRequestFrame, ControlDeliveryToken)> {
         // An enqueue-confirmed delivery whose `enqueued` ack could not be
         // staged keeps its custody, and the write is retried here before any
         // new scan: a command already handed to the worker must never be
@@ -1847,9 +2020,12 @@ impl KernelControlReader {
             self.versioned_seen = true;
         }
         if let Some(frame) = self.poll_spool(&deliveries, &acks, class) {
-            return Some(frame);
+            let pending = self.pending.clone()?;
+            return Some((frame, ControlDeliveryToken { pending }));
         }
-        self.poll_legacy(&deliveries, &acks, class)
+        let frame = self.poll_legacy(&deliveries, &acks, class)?;
+        let pending = self.pending.clone()?;
+        Some((frame, ControlDeliveryToken { pending }))
     }
 
     /// Lists this generation's delivery and ack slots in bounded steps over
@@ -1858,9 +2034,15 @@ impl KernelControlReader {
     /// No file is read during enumeration.
     fn scan_spool(&mut self) -> Option<(ControlSlotList, ControlSlotList)> {
         if self.scan_entries.is_none() {
-            self.scan_entries = std::fs::read_dir(&self.directory).ok();
-            if self.scan_entries.is_none() {
-                return Some((Vec::new(), Vec::new()));
+            match std::fs::read_dir(&self.directory) {
+                Ok(entries) => self.scan_entries = Some(entries),
+                Err(_) => {
+                    // An unreadable directory does not prove that the
+                    // versioned stream is absent, so it cannot open the
+                    // legacy fixed-file fallback.
+                    self.versioned_seen = true;
+                    return Some((Vec::new(), Vec::new()));
+                }
             }
         }
         for _ in 0..WASM_CONTROL_SPOOL_SCAN_CAP {
@@ -1872,6 +2054,9 @@ impl KernelControlReader {
                 return Some((deliveries, acks));
             };
             let Ok(entry) = entry else {
+                // The skipped entry could have been a versioned slot; do not
+                // claim the legacy join is safe after an incomplete scan.
+                self.versioned_seen = true;
                 continue;
             };
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -1900,14 +2085,13 @@ impl KernelControlReader {
     }
 
     /// Walks the staged deliveries lowest-first and yields the first
-    /// admittable one of `class`. Terminal acks make exact replays
-    /// idempotent skips; changed same-sequence content conflicts by leaving
-    /// both files for the owner; our-generation refusals stage one typed
-    /// refused ack each; foreign generations are skipped without touching
-    /// their slots, which belong to their own stream. A delivery the
-    /// class does not admit is walked past, not claimed: the interruption
-    /// lane must reach the `Cancel` behind an unplaceable `Reconcile`
-    /// instead of stopping at it.
+    /// admittable one of `class`. Acks are joined to the exact parsed
+    /// delivery before they can skip or re-offer its slot; changed
+    /// same-sequence content conflicts by leaving both files for the owner.
+    /// A delivery the class does not admit is walked past, not claimed: the
+    /// interruption lane may reach a later `Cancel` behind an unplaceable
+    /// `Reconcile`, while retaining both exact identities and leaving the
+    /// predecessor staged for the ordinary lane.
     fn poll_spool(
         &mut self,
         deliveries: &[ControlSlot],
@@ -1916,11 +2100,6 @@ impl KernelControlReader {
     ) -> Option<WasmHostRequestFrame> {
         let mut reads = 0usize;
         for &(generation, sequence) in deliveries {
-            let slot = self.open_ack(generation, sequence, acks, &mut reads);
-            if matches!(slot, AckSlot::Skip) {
-                continue;
-            }
-            let slot_taken = matches!(slot, AckSlot::Reoffer(_));
             if reads >= CONTROL_POLL_READ_BUDGET {
                 return None;
             }
@@ -1937,6 +2116,19 @@ impl KernelControlReader {
                 // on — a poisoned file cannot wedge intake.
                 continue;
             };
+            let identity = &delivery.identity;
+            // Filename coordinates are the ack path's custody address. A
+            // delivery whose own coordinates disagree with that address is
+            // left as evidence; the child cannot write a refusal that would
+            // falsely name different delivery coordinates.
+            if identity.generation != generation || identity.owner_sequence != sequence {
+                continue;
+            }
+            let slot = self.open_ack(generation, sequence, acks, &delivery, &mut reads);
+            if matches!(slot, AckSlot::Skip) {
+                continue;
+            }
+            let slot_taken = matches!(slot, AckSlot::Reoffer(_));
             // A re-offered open delivery must still carry its accepted
             // bytes: changed same-sequence content is an identity conflict,
             // left as the two mismatching files for the owner, never
@@ -1944,11 +2136,6 @@ impl KernelControlReader {
             if let AckSlot::Reoffer(ack) = &slot
                 && ack.delivery_digest != delivery.delivery_digest
             {
-                continue;
-            }
-            let identity = &delivery.identity;
-            if identity.generation != generation || identity.owner_sequence != sequence {
-                self.refuse_slot(generation, sequence, &delivery, "control-slot", slot_taken);
                 continue;
             }
             if identity.generation != self.binding.generation {
@@ -1961,15 +2148,25 @@ impl KernelControlReader {
                 self.refuse_slot(generation, sequence, &delivery, refusal.field, slot_taken);
                 continue;
             }
-            if !self.check_previous(generation, sequence, &delivery, &mut reads) {
-                self.refuse_slot(
-                    generation,
-                    sequence,
-                    &delivery,
-                    "control-previous",
-                    slot_taken,
-                );
-                continue;
+            match self.check_previous(generation, sequence, &delivery, &mut reads) {
+                PreviousAssessment::Verified => {}
+                PreviousAssessment::AwaitingEvidence | PreviousAssessment::BudgetDeferred => {
+                    // Missing bytes and bounded-work exhaustion are not
+                    // proof of retirement or identity conflict. Leave this
+                    // delivery replayable and keep scanning for an urgent
+                    // successor that may interrupt the occupied command.
+                    continue;
+                }
+                PreviousAssessment::Conflict => {
+                    self.refuse_slot(
+                        generation,
+                        sequence,
+                        &delivery,
+                        "control-previous",
+                        slot_taken,
+                    );
+                    continue;
+                }
             }
             let kind = identity.control_kind;
             if !class.admits(kind) {
@@ -2003,6 +2200,7 @@ impl KernelControlReader {
         generation: u64,
         sequence: u64,
         acks: &[(u64, u64)],
+        delivery: &WasmControlDelivery,
         reads: &mut usize,
     ) -> AckSlot {
         if !acks.contains(&(generation, sequence)) {
@@ -2019,20 +2217,16 @@ impl KernelControlReader {
         let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
             return AckSlot::Skip;
         };
-        if ack.wire_id != WASM_CONTROL_ACK_WIRE_ID
-            || ack.wire_version != WASM_CONTROL_ACK_WIRE_VERSION
-            || ack.generation != generation
-            || ack.owner_sequence != sequence
-            || ack
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.len() > WASM_CONTROL_MAX_DETAIL_BYTES)
-        {
+        if !control_ack_names_delivery(&ack, delivery) {
             return AckSlot::Skip;
         }
         match ack.phase {
             ControlAckPhase::Completed | ControlAckPhase::Refused => AckSlot::Skip,
             ControlAckPhase::Enqueued => {
+                // Even a same-slot ack cannot displace custody of a command
+                // this process already handed to the worker. Exact matching
+                // identifies its own ack; a changed same-slot identity stays
+                // a conflict and is likewise never re-offered.
                 let mine = self.accepted.as_ref().is_some_and(|accepted| {
                     accepted.generation == generation && accepted.sequence == sequence
                 });
@@ -2045,35 +2239,68 @@ impl KernelControlReader {
         }
     }
 
-    /// Checks the previous-delivery link: sequence zero must open the stream,
-    /// and a later sequence must chain to its retained predecessor. A retired
-    /// predecessor (no ack to check against) cannot wedge the stream: the
-    /// delivery is accepted without the link.
+    /// Checks the previous-delivery link against its retained predecessor.
+    /// An absent predecessor is not proof that the owner retired it: until
+    /// an owner-issued prefix/retirement commitment exists, the delivery
+    /// remains replayable and is reconsidered on a later bounded poll.
     fn check_previous(
         &self,
         generation: u64,
         sequence: u64,
         delivery: &WasmControlDelivery,
         reads: &mut usize,
-    ) -> bool {
-        let previous = delivery.identity.previous_delivery_digest.as_ref();
+    ) -> PreviousAssessment {
+        let identity = &delivery.identity;
         if sequence == 0 {
-            return previous.is_none();
+            return if identity.previous_delivery_digest.is_none() {
+                PreviousAssessment::Verified
+            } else {
+                PreviousAssessment::Conflict
+            };
         }
         if *reads >= CONTROL_POLL_READ_BUDGET {
-            return false;
+            return PreviousAssessment::BudgetDeferred;
         }
         *reads += 1;
         let path = self
             .directory
-            .join(control_ack_name(generation, sequence - 1));
-        let Ok(bytes) = read_control_bytes(&path) else {
-            return true;
+            .join(control_delivery_name(generation, sequence - 1));
+        let bytes = match read_control_bytes(&path) {
+            Ok(bytes) => bytes,
+            Err(
+                MaterialError::Missing | MaterialError::Unreadable(_) | MaterialError::TooLarge,
+            ) => {
+                return PreviousAssessment::AwaitingEvidence;
+            }
+            Err(
+                MaterialError::Malformed
+                | MaterialError::DigestMismatch
+                | MaterialError::InvalidRecord { .. },
+            ) => {
+                return PreviousAssessment::Conflict;
+            }
         };
-        let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
-            return true;
+        let Ok(previous) = parse_control_delivery(&bytes) else {
+            return PreviousAssessment::Conflict;
         };
-        previous.is_some_and(|digest| *digest == ack.delivery_digest)
+        let previous_identity = &previous.identity;
+        let same_binding = previous_identity.operation_id == identity.operation_id
+            && previous_identity.invocation_id == identity.invocation_id
+            && previous_identity.claim_id == identity.claim_id
+            && previous_identity.generation == generation
+            && previous_identity.dispatch_grant_digest == identity.dispatch_grant_digest
+            && previous_identity.work_scope == identity.work_scope
+            && serde_json::to_value(&previous_identity.authority_epoch).ok()
+                == Some(self.binding.authority_epoch.clone());
+        if previous_identity.generation != generation
+            || previous_identity.owner_sequence != sequence - 1
+            || !same_binding
+            || identity.previous_delivery_digest.as_deref()
+                != Some(previous.delivery_digest.as_str())
+        {
+            return PreviousAssessment::Conflict;
+        }
+        PreviousAssessment::Verified
     }
 
     /// Stages one typed refused ack at an exact free slot. Best-effort: a
@@ -2210,7 +2437,7 @@ impl KernelControlReader {
     /// cannot be acknowledged from it: its demand is recorded while a
     /// command may still be accepted, and the drain is what finally hands
     /// `WorkerCommand::Shutdown` to the worker. Retaining the delivery
-    /// identity here is what lets [`Self::confirm_enqueued`] write the
+    /// identity here is what lets [`Self::confirm_enqueued_for`] write the
     /// `enqueued` ack at the real enqueue and not one tick earlier
     /// (issue #2896 W5/A2).
     ///
@@ -2240,40 +2467,40 @@ impl KernelControlReader {
         self.poll(ControlPollClass::Urgent)
     }
 
-    /// Confirms admission plus successful worker enqueue for the pending
-    /// delivery of `operation`: a spool delivery stages its `enqueued` ack at
-    /// the exact slot, a legacy delivery retires by exact-name byte-verified
-    /// delete. An owner `Shutdown` is confirmed from the delivery retained
-    /// by [`Self::retain_shutdown`], because its worker enqueue happens in
-    /// the drain and not on the tick that yielded it. Any other operation —
-    /// or no pending delivery — is a no-op, so internal commands confirm
-    /// nothing.
-    fn confirm_enqueued(&mut self, operation: &str) -> Result<(), LoopError> {
-        // The retained `Shutdown` delivery outranks the transient slot for
-        // its own operation: it is the only delivery whose enqueue is
-        // confirmed after the control lane has moved on.
-        if let Some(retained) = self
-            .shutdown
-            .clone()
-            .filter(|shutdown| shutdown.operation() == operation)
+    /// Confirms only the exact reader-issued delivery token retained with the
+    /// command. A stale token cannot confirm a newer delivery of the same
+    /// operation or kind.
+    fn confirm_enqueued_for(&mut self, token: &ControlDeliveryToken) -> Result<(), LoopError> {
+        if self.shutdown.as_ref() == Some(&token.pending)
+            || self.pending.as_ref() == Some(&token.pending)
         {
-            return self.confirm_delivery_enqueued(retained);
+            return self.confirm_delivery_enqueued(token.pending.clone());
         }
-        let Some(pending) = self.pending.clone() else {
-            return Ok(());
-        };
-        if pending.operation() != operation {
-            return Ok(());
+        if self
+            .accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted_control_matches(accepted, &token.pending))
+        {
+            // The worker already took this exact command. If its first ack
+            // write failed, preserve custody and retry the same slot.
+            return self.retry_pending_ack();
         }
-        self.confirm_delivery_enqueued(pending)
+        Err(LoopError::ChannelUnavailable)
     }
 
     /// Stages the enqueue acknowledgement for one delivery whose worker
     /// enqueue is already proven, then advances this reader's own slot
-    /// accounting. Split out of [`Self::confirm_enqueued`] so the retained
+    /// accounting. Split out of [`Self::confirm_enqueued_for`] so the retained
     /// and the transient delivery resolve to exactly one acknowledgement
     /// body, with no branch that could write it twice.
     fn confirm_delivery_enqueued(&mut self, pending: PendingControl) -> Result<(), LoopError> {
+        if let Some(accepted) = self.accepted.as_ref() {
+            return if accepted_control_matches(accepted, &pending) {
+                self.retry_pending_ack()
+            } else {
+                Err(LoopError::ChannelUnavailable)
+            };
+        }
         let operation = pending.operation();
         match pending {
             PendingControl::Spool {
@@ -2355,36 +2582,26 @@ impl KernelControlReader {
         Ok(())
     }
 
-    /// Confirms the exact observed worker outcome of the accepted delivery
-    /// for `operation` by staging its `completed` ack over the exact slot.
-    /// Any other operation — including internal commands and legacy
-    /// deliveries, which carry no ack slot — is a no-op.
-    fn confirm_completed(
+    /// Completes the accepted control only when the outcome token is the one
+    /// the reader recorded at enqueue time.
+    fn confirm_completed_for(
         &mut self,
-        operation: &str,
+        token: &ControlDeliveryToken,
         outcome_digest: Option<&str>,
     ) -> Result<(), LoopError> {
-        // Only the delivery whose own worker outcome was observed completes.
-        // `accepted` is set by the enqueue confirmation and cleared here, so
-        // this cannot complete a delivery the worker never received, and the
-        // kind check additionally keeps an internal command from completing
-        // an owner delivery of the same name.
         let Some(accepted) = self.accepted.clone() else {
-            return Ok(());
+            // Legacy fixed-file controls have no versioned ack protocol.
+            return if matches!(token.pending, PendingControl::Legacy { .. }) {
+                Ok(())
+            } else {
+                Err(LoopError::ChannelUnavailable)
+            };
         };
-        if control_operation(accepted.kind) != operation {
-            return Ok(());
+        if !accepted_control_matches(&accepted, &token.pending) {
+            return Err(LoopError::ChannelUnavailable);
         }
-        // A `completed` ack supersedes any still-unstaged `enqueued` ack for
-        // the same slot, so the completion path clears the pending write
-        // rather than leaving it to overwrite a terminal phase.
         let outcome_digest = outcome_digest
-            .filter(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            })
+            .filter(|digest| control_digest_is_valid(digest))
             .map(str::to_owned);
         let ack = WasmControlAck {
             wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
@@ -2399,11 +2616,27 @@ impl KernelControlReader {
             outcome_digest,
         };
         self.stage_ack(accepted.generation, accepted.sequence, &ack)?;
-        // The delivery is terminal: its exact outcome is recorded, so the
-        // custody slot and any un-staged `enqueued` write it still owed are
-        // both released.
         self.accepted = None;
+        if self.shutdown.as_ref() == Some(&token.pending) {
+            self.shutdown = None;
+        }
         Ok(())
+    }
+
+    /// Clears the pending slot only when the caller returns the exact token
+    /// that poll yielded. The retained Shutdown custody remains separate.
+    fn release_control_for(&mut self, token: &ControlDeliveryToken) {
+        if self.pending.as_ref() == Some(&token.pending) {
+            self.pending = None;
+        }
+    }
+
+    /// Stages a refusal only for the exact unaccepted delivery token. A stale
+    /// or substituted same-slot token leaves all owner evidence untouched.
+    fn refuse_control_for(&mut self, token: &ControlDeliveryToken, detail: &'static str) {
+        if self.pending.as_ref() == Some(&token.pending) {
+            self.refuse_pending(detail);
+        }
     }
 
     /// Stages one ack at its exact generation/sequence name.
@@ -2414,11 +2647,30 @@ impl KernelControlReader {
         ack: &WasmControlAck,
     ) -> Result<(), LoopError> {
         let bytes = serde_json::to_vec(ack).map_err(|_| LoopError::ChannelUnavailable)?;
-        stage_control_bytes(
-            &self.directory.join(control_ack_name(generation, sequence)),
-            &bytes,
-        )
-        .map_err(|_| LoopError::ChannelUnavailable)
+        let path = self.directory.join(control_ack_name(generation, sequence));
+        match read_control_bytes(&path) {
+            Ok(existing_bytes) => {
+                let existing: WasmControlAck = serde_json::from_slice(&existing_bytes)
+                    .map_err(|_| LoopError::ChannelUnavailable)?;
+                if existing == *ack {
+                    return Ok(());
+                }
+                // The only legal replacement is this exact accepted
+                // delivery moving from Enqueued to Completed. A refusal,
+                // terminal ack, malformed record, or different identity is
+                // durable evidence that this writer does not own the slot.
+                if !control_acks_name_same_delivery(&existing, ack)
+                    || !control_ack_shape_valid(&existing)
+                    || existing.phase != ControlAckPhase::Enqueued
+                    || ack.phase != ControlAckPhase::Completed
+                {
+                    return Err(LoopError::ChannelUnavailable);
+                }
+            }
+            Err(MaterialError::Missing) => {}
+            Err(_) => return Err(LoopError::ChannelUnavailable),
+        }
+        stage_control_bytes(&path, &bytes).map_err(|_| LoopError::ChannelUnavailable)
     }
 
     /// Pins a legacy Shutdown frame to this operation. The parse carries its
@@ -2643,15 +2895,26 @@ impl WasmHostRequestChannel for DeliverySetChannel {
         }
     }
 
-    fn release_control(&mut self) {
-        if let Some(control) = self.control.as_mut() {
-            control.pending = None;
+    fn poll_control_with_token(
+        &mut self,
+    ) -> Result<Option<(WasmHostRequestFrame, Option<ControlDeliveryToken>)>, LoopError> {
+        match self.control.as_mut() {
+            Some(reader) => Ok(reader
+                .poll_with_token(ControlPollClass::Any)
+                .map(|(frame, token)| (frame, Some(token)))),
+            None => Ok(None),
         }
     }
 
-    fn refuse_control(&mut self, detail: &'static str) {
-        if let Some(control) = self.control.as_mut() {
-            control.refuse_pending(detail);
+    fn release_control_for(&mut self, token: Option<&ControlDeliveryToken>) {
+        if let (Some(control), Some(token)) = (self.control.as_mut(), token) {
+            control.release_control_for(token);
+        }
+    }
+
+    fn refuse_control_for(&mut self, token: Option<&ControlDeliveryToken>, detail: &'static str) {
+        if let (Some(control), Some(token)) = (self.control.as_mut(), token) {
+            control.refuse_control_for(token, detail);
         }
     }
 
@@ -2662,21 +2925,35 @@ impl WasmHostRequestChannel for DeliverySetChannel {
         }
     }
 
-    fn confirm_control_enqueued(&mut self, operation: &str) -> Result<(), LoopError> {
+    fn poll_control_urgent_with_token(
+        &mut self,
+    ) -> Result<Option<(WasmHostRequestFrame, Option<ControlDeliveryToken>)>, LoopError> {
         match self.control.as_mut() {
-            Some(reader) => reader.confirm_enqueued(operation),
-            None => Ok(()),
+            Some(reader) => Ok(reader
+                .poll_with_token(ControlPollClass::Urgent)
+                .map(|(frame, token)| (frame, Some(token)))),
+            None => Ok(None),
         }
     }
 
-    fn confirm_control_completed(
+    fn confirm_control_enqueued_for(
         &mut self,
-        operation: &str,
+        token: Option<&ControlDeliveryToken>,
+    ) -> Result<(), LoopError> {
+        match (self.control.as_mut(), token) {
+            (Some(reader), Some(token)) => reader.confirm_enqueued_for(token),
+            _ => Ok(()),
+        }
+    }
+
+    fn confirm_control_completed_for(
+        &mut self,
+        token: Option<&ControlDeliveryToken>,
         outcome_digest: Option<&str>,
     ) -> Result<(), LoopError> {
-        match self.control.as_mut() {
-            Some(reader) => reader.confirm_completed(operation, outcome_digest),
-            None => Ok(()),
+        match (self.control.as_mut(), token) {
+            (Some(reader), Some(token)) => reader.confirm_completed_for(token, outcome_digest),
+            _ => Ok(()),
         }
     }
 
@@ -3027,6 +3304,9 @@ pub struct BoundedRequestLoop {
     /// Exact observed P-11 request disposition of the tracked `Shutdown`
     /// command, distinct from worker exit and from `join`.
     shutdown_request_won: Option<bool>,
+    /// Exact owner `Shutdown` delivery retained until its tracked worker
+    /// enqueue and joined outcome are both observed.
+    shutdown_control: Option<ControlDeliveryToken>,
     /// First bounded residual the drain produced. Kept rather than
     /// returned immediately so the drain itself always runs to its own
     /// terminal state (issue #2785 A4).
@@ -3078,6 +3358,7 @@ impl BoundedRequestLoop {
             published: None,
             denial: None,
             shutdown_request_won: None,
+            shutdown_control: None,
             residual: None,
             interrupt: None,
         }
@@ -3226,12 +3507,15 @@ impl BoundedRequestLoop {
     /// travel through this same frame shape, parse, and validation, so the
     /// loop has one admission path rather than two.
     ///
-    /// `owner` records that this frame came from an owner-staged control
-    /// delivery rather than the delivery set or this loop's own follow-up, and
-    /// is the only thing that lets a later real enqueue be confirmed against
-    /// that exact delivery. It is a parameter rather than retained state so it
-    /// cannot leak into the next frame's command slot (issue #2896 A2).
-    fn admit(&mut self, frame: &WasmHostRequestFrame, owner: bool) -> Result<(), LoopError> {
+    /// `control` is the opaque token issued beside an external control frame.
+    /// It follows a requested command into the worker slot and cannot be
+    /// replaced by another control with the same operation name. Loop-derived
+    /// requests pass no token (issue #2896 A2).
+    fn admit(
+        &mut self,
+        frame: &WasmHostRequestFrame,
+        token: Option<ControlDeliveryToken>,
+    ) -> Result<(), LoopError> {
         let request = WasmHostRequestFrame::parse(frame)?;
         // Drain gate (#2785): once admission closed, new invoke demand is
         // refused with the typed drain-closed denial; already-admitted
@@ -3243,6 +3527,9 @@ impl BoundedRequestLoop {
         self.replay = None;
         match &request {
             WasmHostRequest::Invoke(invoke) => {
+                if token.is_some() {
+                    return Err(denied("control-invoke"));
+                }
                 check_invoke(&self.binding, &self.live, invoke)?;
                 if let Some(retained) = self.retained.get(&invoke.request_digest) {
                     // Exact retained-sequence replay: legitimate result
@@ -3258,19 +3545,19 @@ impl BoundedRequestLoop {
                     // delivery set carries exactly one.
                     return Err(denied("one-shot-authority"));
                 }
-                self.request(WorkerCommand::Execute, false);
+                self.request(WorkerCommand::Execute, None);
             }
-            WasmHostRequest::Cancel(control) => {
-                check_control(&self.binding, control)?;
+            WasmHostRequest::Cancel(request) => {
+                check_control(&self.binding, request)?;
                 // Admission only validates and requests: the follow-up is
                 // spent by `send` after the worker accepts the enqueue, so
                 // a full/disconnected channel never advances containment
                 // truthfully owed to an accepted command.
-                self.request(WorkerCommand::Cancel, owner);
+                self.request(WorkerCommand::Cancel, token);
             }
-            WasmHostRequest::Reconcile(control) => {
-                check_control(&self.binding, control)?;
-                self.request(WorkerCommand::Reconcile, owner);
+            WasmHostRequest::Reconcile(request) => {
+                check_control(&self.binding, request)?;
+                self.request(WorkerCommand::Reconcile, token);
             }
             // An owner Shutdown is not a queued worker command: it closes
             // `Execute` admission and demands typed shutdown. The loop's own
@@ -3280,6 +3567,9 @@ impl BoundedRequestLoop {
             // reader's retained delivery — not this arm — is what the drain's
             // real enqueue later confirms.
             WasmHostRequest::Shutdown => {
+                if self.shutdown_control.is_none() {
+                    self.shutdown_control = token;
+                }
                 self.admission.shutdown_demanded = true;
                 self.close_admission();
             }
@@ -3293,37 +3583,40 @@ impl BoundedRequestLoop {
     /// owner-sourced and never confirms one.
     fn queue_control(&mut self, operation: &str) -> Result<(), LoopError> {
         let frame = WasmHostRequestFrame::control(operation, &self.binding);
-        self.admit(&frame, false)
+        self.admit(&frame, None)
     }
 
     /// Takes the one command slot for a requested command. The slot is
     /// bounded by the bound-1 command channel, so this is only ever called
-    /// when [`Self::command_slot_free`] holds. `owner` records whether an
-    /// owner-staged control delivery produced this command, which is what
-    /// binds a later enqueue confirmation to that exact delivery instead of
-    /// to an operation name two controls can share.
-    fn request(&mut self, command: WorkerCommand, owner: bool) {
-        self.delivery = Some(CommandDelivery::Requested { command, owner });
+    /// when [`Self::command_slot_free`] holds. `control` binds a later
+    /// enqueue confirmation to the exact owner delivery, rather than to an
+    /// operation name two controls can share.
+    fn request(&mut self, command: WorkerCommand, control: Option<ControlDeliveryToken>) {
+        self.delivery = Some(CommandDelivery::Requested { command, control });
     }
 
     /// The requested command waiting to be handed to the worker, or `None`
     /// when the slot is free or the slot holds an already-accepted command.
     fn requested_command(&self) -> Option<WorkerCommand> {
-        match self.delivery {
-            Some(CommandDelivery::Requested { command, .. }) => Some(command),
+        match &self.delivery {
+            Some(CommandDelivery::Requested { command, .. }) => Some(*command),
             _ => None,
         }
     }
 
-    /// Whether the accepted command was admitted from an owner-staged control
-    /// delivery, and therefore may be confirmed against that delivery once
-    /// the command channel really took it. A loop-derived follow-up is never
-    /// owner-sourced and confirms nothing (issue #2896 A2).
-    fn accepted_owner_delivery(&self) -> bool {
-        matches!(
-            self.delivery,
-            Some(CommandDelivery::Accepted { owner: true, .. })
-        )
+    /// Exact owner token for the command the worker accepted. Loop-derived
+    /// follow-ups carry none and can never confirm a spool slot.
+    fn accepted_control_token(&self) -> Option<ControlDeliveryToken> {
+        match &self.delivery {
+            Some(CommandDelivery::Accepted { control, .. }) => control.clone(),
+            _ => None,
+        }
+    }
+
+    /// Retained owner Shutdown token, if one was admitted before the tracked
+    /// worker termination protocol.
+    fn shutdown_control_token(&self) -> Option<ControlDeliveryToken> {
+        self.shutdown_control.clone()
     }
 
     /// The command the command channel accepted and whose exact reply is
@@ -3332,8 +3625,8 @@ impl BoundedRequestLoop {
     /// single-slot worker can only ever reply to the command it was handed,
     /// so the slot itself is the correlation.
     fn accepted_command(&self) -> Option<WorkerCommand> {
-        match self.delivery {
-            Some(CommandDelivery::Accepted { command, .. }) => Some(command),
+        match &self.delivery {
+            Some(CommandDelivery::Accepted { command, .. }) => Some(*command),
             _ => None,
         }
     }
@@ -3478,9 +3771,9 @@ impl BoundedRequestLoop {
         command: WorkerCommand,
         sender: &SyncSender<WorkerCommand>,
     ) -> Result<(), LoopError> {
-        let owner = match self.delivery {
-            Some(CommandDelivery::Requested { owner, .. }) => owner,
-            _ => false,
+        let control = match &self.delivery {
+            Some(CommandDelivery::Requested { control, .. }) => control.clone(),
+            _ => None,
         };
         match sender.try_send(command) {
             Ok(()) => {}
@@ -3498,7 +3791,7 @@ impl BoundedRequestLoop {
         self.delivery = Some(CommandDelivery::Accepted {
             command,
             token: COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-            owner,
+            control,
         });
         match command {
             WorkerCommand::Cancel => {
@@ -3631,7 +3924,7 @@ fn install_interrupt_handle(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedResultRetention {
     directory: PathBuf,
-    identity: crate::dispatch_material::StagedDeliveryIdentity,
+    claim: crate::dispatch_material::DeliveryClaim,
 }
 
 impl ObservedResultRetention {
@@ -3643,7 +3936,7 @@ impl ObservedResultRetention {
     pub fn new(directory: &Path, claim: &crate::dispatch_material::DeliveryClaim) -> Self {
         Self {
             directory: directory.to_path_buf(),
-            identity: claim.identity().clone(),
+            claim: claim.clone(),
         }
     }
 
@@ -3659,7 +3952,7 @@ impl ObservedResultRetention {
         let stream = build_retained_result_stream(events)?;
         crate::dispatch_material::write_served_result(
             &self.directory,
-            &self.identity,
+            &self.claim,
             crate::dispatch_material::ServedResultPayload::Stream(stream),
             edge_now_ms(),
         )
@@ -3877,7 +4170,7 @@ fn drain_and_shutdown_request_worker(
     // makes the acknowledgement below prove an enqueue for that exact
     // delivery instead of merely a demand that was recorded.
     let shutdown_sent = if state.command_slot_free() {
-        state.request(WorkerCommand::Shutdown, false);
+        state.request(WorkerCommand::Shutdown, None);
         match state.send(WorkerCommand::Shutdown, &worker.commands) {
             Ok(()) => true,
             Err(error) => {
@@ -3898,8 +4191,11 @@ fn drain_and_shutdown_request_worker(
     // worker did not take (issue #2896 W5/A2). An ack that cannot be staged
     // fails the loop honestly once the worker is joined.
     let mut confirm_error: Option<LoopError> = None;
-    if shutdown_sent && let Err(error) = channel.confirm_control_enqueued(OP_SHUTDOWN) {
-        confirm_error = Some(error);
+    if shutdown_sent {
+        let token = state.shutdown_control_token();
+        if let Err(error) = channel.confirm_control_enqueued_for(token.as_ref()) {
+            confirm_error = Some(error);
+        }
     }
     if shutdown_sent {
         drain_to_settlement(
@@ -4030,7 +4326,8 @@ fn join_shutdown_worker(
         // Termination observed: the accepted Shutdown's exact outcome is the
         // joined worker (its reply stays unread by #2785 design), so the
         // delivery completes here with no outcome digest.
-        if let Err(error) = channel.confirm_control_completed(OP_SHUTDOWN, None)
+        let token = state.shutdown_control_token();
+        if let Err(error) = channel.confirm_control_completed_for(token.as_ref(), None)
             && confirm_error.is_none()
         {
             *confirm_error = Some(error);
@@ -4073,13 +4370,13 @@ fn admit_external_control(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
 ) -> Result<ExternalIntake, LoopError> {
-    let Some(frame) = channel.poll_control()? else {
+    let Some((frame, token)) = channel.poll_control_with_token()? else {
         return Ok(ExternalIntake::None);
     };
-    if let Err(error) = state.admit(&frame, true) {
+    if let Err(error) = state.admit(&frame, token.clone()) {
         let detail = error.code();
         state.denial = Some(error);
-        channel.refuse_control(detail);
+        channel.refuse_control_for(token.as_ref(), detail);
         return Err(error);
     }
     match state.requested_command() {
@@ -4100,10 +4397,10 @@ fn contained_failure(
     channel: &mut DeliverySetChannel,
 ) -> LoopError {
     state.worker = WorkerState::Contained;
-    let executing = match state.delivery {
+    let executing = match state.delivery.as_ref() {
         Some(
             CommandDelivery::Requested { command, .. } | CommandDelivery::Accepted { command, .. },
-        ) => command_name(command),
+        ) => command_name(*command),
         None => EXECUTE_COMMAND,
     };
     let _cleanup = channel.cleanup_output_helper();
@@ -4144,13 +4441,8 @@ fn confirm_owner_enqueue(
     state: &BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
 ) -> Result<(), LoopError> {
-    if !state.accepted_owner_delivery() {
-        return Ok(());
-    }
-    let Some(command) = state.accepted_command() else {
-        return Ok(());
-    };
-    channel.confirm_control_enqueued(command_operation(command))
+    let token = state.accepted_control_token();
+    channel.confirm_control_enqueued_for(token.as_ref())
 }
 
 /// Whether the staged frame needs the single command slot to be admitted.
@@ -4182,7 +4474,7 @@ fn frame_needs_command_slot(frame: &WasmHostRequestFrame) -> bool {
 /// needs no command slot, so recording its demand is all this step can do,
 /// and the command that proves the delivery reached the worker is only sent
 /// by the tracked drain. The delivery therefore stays staged and
-/// replayable, and the drain's `confirm_control_enqueued(OP_SHUTDOWN)` after
+/// replayable, and the drain's `confirm_control_enqueued_for` after
 /// that real enqueue is what writes the `enqueued` ack — a demand recorded
 /// is not a command the worker took (issue #2896 W5/A2).
 fn service_control_lane(
@@ -4190,14 +4482,14 @@ fn service_control_lane(
     channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
 ) -> Result<(), LoopError> {
-    let Some(frame) = channel.poll_control()? else {
+    let Some((frame, token)) = channel.poll_control_with_token()? else {
         return Ok(());
     };
     if !state.command_slot_free() && frame_needs_command_slot(&frame) {
-        channel.release_control();
+        channel.release_control_for(token.as_ref());
         return Ok(());
     }
-    match state.admit(&frame, true) {
+    match state.admit(&frame, token.clone()) {
         Err(error) => {
             // The frame never reached the loop's own binding, so the
             // admitted operation itself is not refused by it. The exact
@@ -4207,7 +4499,7 @@ fn service_control_lane(
             // written for it (issue #2896 W5).
             let detail = error.code();
             state.record_residual(error);
-            channel.refuse_control(detail);
+            channel.refuse_control_for(token.as_ref(), detail);
         }
         // Enqueued: the command channel took the command, so the delivery is
         // acknowledged and the follow-up accounting advanced. The
@@ -4266,15 +4558,15 @@ fn admit_external_control_urgent(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
 ) {
-    let Ok(Some(frame)) = channel.poll_control_urgent() else {
+    let Ok(Some((frame, token))) = channel.poll_control_urgent_with_token() else {
         return;
     };
     match WasmHostRequestFrame::parse(&frame) {
         Ok(WasmHostRequest::Shutdown) => {
-            if let Err(error) = state.admit(&frame, false) {
+            if let Err(error) = state.admit(&frame, token.clone()) {
                 let detail = error.code();
                 state.record_residual(error);
-                channel.refuse_control(detail);
+                channel.refuse_control_for(token.as_ref(), detail);
             }
         }
         Ok(WasmHostRequest::Cancel(control)) => match check_control(&state.binding, &control) {
@@ -4282,7 +4574,7 @@ fn admit_external_control_urgent(
             Err(error) => {
                 let detail = error.code();
                 state.record_residual(error);
-                channel.refuse_control(detail);
+                channel.refuse_control_for(token.as_ref(), detail);
             }
         },
         // Reconcile, Invoke and unparseable bytes never surface here: the
@@ -4303,7 +4595,7 @@ fn drive_loop(
 ) -> Result<(), LoopError> {
     while state.admission_open() {
         state.tick();
-        if let Some(CommandDelivery::Accepted { .. }) = state.delivery {
+        if let Some(CommandDelivery::Accepted { .. }) = state.delivery.as_ref() {
             poll_pending(state, channel, commands, outcomes, handle)?;
             continue;
         }
@@ -4342,7 +4634,7 @@ fn drive_loop(
             state.close_admission();
             break;
         };
-        if let Err(error) = state.admit(&frame, false) {
+        if let Err(error) = state.admit(&frame, None) {
             // Record the exact admission denial before it surfaces as a
             // transport-level refusal, so the receipt names the field that
             // actually broke the binding. The delivery-set invoke carries no
@@ -4453,7 +4745,7 @@ fn consume_worker_outcome(
     // Whether the command now being settled came from an owner delivery. Read
     // before the accepted slot is retired, because only an owner-sourced
     // command may be completed against one (issue #2896 A2/A3).
-    let owner = state.accepted_owner_delivery();
+    let control_token = state.accepted_control_token();
     // The accepted command's own reply settled, so that accepted slot is
     // retired BEFORE the outcome is observed (issue #2785 audit, defect 1).
     // `on_outcome` may run `settle_uncertain -> request_follow_up`, and that
@@ -4483,9 +4775,7 @@ fn consume_worker_outcome(
         let digest = serde_json::to_vec(frame)
             .ok()
             .map(|bytes| sha256_hex(&bytes));
-        if owner {
-            channel.confirm_control_completed(command_operation(command), digest.as_deref())?;
-        }
+        channel.confirm_control_completed_for(control_token.as_ref(), digest.as_deref())?;
         if channel.publish(frame).is_err() {
             // Execution evidence and cleanup evidence stay separate (issue #2785
             // I6): the observation is retained inside the loop, and only its
@@ -4517,7 +4807,7 @@ fn drain_to_settlement(
     handle: &std::thread::JoinHandle<()>,
 ) {
     while !state.drain_complete() {
-        if let Some(CommandDelivery::Accepted { .. }) = state.delivery {
+        if let Some(CommandDelivery::Accepted { .. }) = state.delivery.as_ref() {
             if let Err(error) = poll_pending(state, channel, commands, outcomes, handle) {
                 // The reply was consumed but its delivery failed, or the
                 // worker ended without it: keep draining, and report the
@@ -4611,10 +4901,10 @@ fn supervise_to_worker_exit(
     // response is projected best-effort and the loss itself is recorded as
     // this loop's bounded residual, so the projection never becomes the
     // drain verdict.
-    if let Some(delivery) = state.delivery {
+    if let Some(delivery) = state.delivery.as_ref() {
         let command = match delivery {
             CommandDelivery::Requested { command, .. }
-            | CommandDelivery::Accepted { command, .. } => command,
+            | CommandDelivery::Accepted { command, .. } => *command,
         };
         let error = LoopError::WorkerTerminatedWithoutOutcome {
             command: command_name(command),
@@ -4646,6 +4936,7 @@ fn observe_residual_outcome(
         return;
     }
     // The preceding equality check must remain before this mutation.
+    let control_token = state.accepted_control_token();
     state.delivery = None;
     let frame = state.on_outcome(outcome);
     // The observation's follow-up is only reachable through a command
@@ -4676,6 +4967,14 @@ fn observe_residual_outcome(
             state.record_residual(error);
             return;
         }
+        let digest = serde_json::to_vec(frame)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        if let Err(error) =
+            channel.confirm_control_completed_for(control_token.as_ref(), digest.as_deref())
+        {
+            state.record_residual(error);
+        }
         // A publication failure is recorded against the observation that
         // lost its delivery; the exact stream fault is the loop's channel
         // fault, and what matters here is which observation never reached
@@ -4697,30 +4996,20 @@ pub type OrdinaryOutcome = WasmHostResultFrame;
 pub enum OrdinaryDriveError {
     /// No owner delivery set is staged beside this installation.
     NoDeliverySet,
-    /// A staged delivery this drive already served — or its spent grant
-    /// re-staged — is still present: terminal-unacknowledged across
-    /// restart, with no retained result in this process. Explicit
-    /// in-progress, never mistaken for absence.
+    /// An exact delivery is already in flight, conflicts with retained
+    /// owner state, or has no complete claim-bound result to replay. Explicit
+    /// in-progress, never mistaken for absence or permission to execute.
     DeliveryInProgress {
-        /// Served operation identity.
+        /// Exact delivery operation identity.
         operation_id: String,
-        /// Served generation.
+        /// Exact delivery generation.
         generation: u64,
-        /// Served claim identity.
+        /// Exact delivery claim identity.
         claim_id: String,
     },
     /// The delivery set, installation binding, permit, or admitted world
     /// failed closed before the loop could start.
     Drive(DriveError),
-    /// The owner has not published this exact generation as a ready,
-    /// recoverable delivery: its generation slot records a pending or
-    /// failed publication, or names another delivery. Nothing executes
-    /// and nothing is deleted — the staged set stays for the owner.
-    Publication {
-        /// Stable owner publication code: `DELIVERY_PENDING`,
-        /// `DELIVERY_FAILED`, or `DELIVERY_IDENTITY_MISMATCH`.
-        code: &'static str,
-    },
     /// The bounded request loop failed closed.
     Loop(LoopError),
 }
@@ -4731,7 +5020,6 @@ impl fmt::Display for OrdinaryDriveError {
             Self::NoDeliverySet => formatter.write_str("ORDINARY_NO_ADMITTED_DELIVERY_SET"),
             Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
             Self::Drive(error) => write!(formatter, "{error}"),
-            Self::Publication { code } => write!(formatter, "ORDINARY_{code}"),
             Self::Loop(error) => write!(formatter, "{error}"),
         }
     }
@@ -4739,38 +5027,9 @@ impl fmt::Display for OrdinaryDriveError {
 
 impl std::error::Error for OrdinaryDriveError {}
 
-/// Bound on distinct delivery identities one ordinary drive serves.
-///
-/// Each entry is one consumed generation this process executed to a
-/// published terminal; the classifier fences every entry's grant against
-/// re-staging, so the set never evicts — past the bound a fresh identity
-/// fails closed as in-progress with the staged set left for the owner.
-const MAX_SERVED_DELIVERIES_PER_DRIVE: usize = 8;
-
-/// Seals the durable pre-execution `InFlight` claim after admission and
-/// before any guest effect (#2786 step 7). A write failure fails closed
-/// without executing — admission alone started no guest, so the staged set
-/// stays for the owner to re-drive, and a denied delivery leaves no marker.
-fn seal_inflight_claim(
-    directory: &std::path::Path,
-    claim: &crate::dispatch_material::DeliveryClaim,
-    now_ms: u64,
-) -> Result<(), OrdinaryDriveError> {
-    crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms).map_err(
-        |_| {
-            let identity = claim.identity();
-            OrdinaryDriveError::DeliveryInProgress {
-                operation_id: identity.operation_id.clone(),
-                generation: identity.generation,
-                claim_id: identity.claim_id.clone(),
-            }
-        },
-    )
-}
-
-/// Seals the durable served evidence for one terminal outcome (#2786 step
-/// 7): the served marker first, then the exact retained result-event
-/// sequence, both before physical reclaim.
+/// Reaffirms the exact durable terminal result for one served outcome
+/// (#2786/#2787): the complete retained result-event sequence remains bound
+/// to the exact acquired claim and terminal-unacknowledged slot.
 ///
 /// This is a finalization, not a first write, and that is now structural
 /// rather than incidental: every observed event is written through the same
@@ -4778,15 +5037,12 @@ fn seal_inflight_claim(
 /// publication gates refuse to emit when that write did not land — the drain
 /// path in [`consume_worker_outcome`] and the shutdown-supervisor path in
 /// [`observe_residual_outcome`] and [`BoundedRequestLoop::publish_lost_response`].
-/// A stream that reaches this function has therefore already been persisted,
-/// and the write below re-affirms that exact sequence under the served
-/// marker; it never records a guest result for the first time. The sequence
-/// must be a closed, valid stream first: sealing a prefix would advertise as
-/// complete a record whose predecessors were never retained. The
-/// pre-execution `InFlight` marker is already durable, so a failed seal
-/// still replays on restart instead of re-executing. Any failure preserves
-/// the claimed set and reports its original identity as unresolved instead
-/// of claiming success.
+/// A stream that reaches this function has already been persisted, and the
+/// claim-scoped writer accepts the exact terminal sequence idempotently and
+/// keeps its terminal-unacknowledged disposition. The sequence must be closed
+/// and valid first; sealing a prefix would advertise a result whose
+/// predecessors were never retained. Any failure preserves the claim for
+/// recovery instead of claiming success.
 fn seal_served_outcome(
     directory: &std::path::Path,
     claim: &crate::dispatch_material::DeliveryClaim,
@@ -4795,17 +5051,9 @@ fn seal_served_outcome(
 ) -> Result<(), OrdinaryDriveError> {
     validate_result_stream(events).map_err(OrdinaryDriveError::Loop)?;
     let stream = build_retained_result_stream(events).map_err(OrdinaryDriveError::Loop)?;
-    if crate::dispatch_material::write_served_marker(directory, claim.identity(), now_ms).is_err() {
-        let identity = claim.identity();
-        return Err(OrdinaryDriveError::DeliveryInProgress {
-            operation_id: identity.operation_id.clone(),
-            generation: identity.generation,
-            claim_id: identity.claim_id.clone(),
-        });
-    }
     if crate::dispatch_material::write_served_result(
         directory,
-        claim.identity(),
+        claim,
         crate::dispatch_material::ServedResultPayload::Stream(stream),
         now_ms,
     )
@@ -4879,17 +5127,18 @@ pub enum ServedResultReadback {
 /// place of what is on disk. Never executes, never deletes.
 fn read_back_served_result(
     directory: &std::path::Path,
-    identity: &crate::dispatch_material::StagedDeliveryIdentity,
+    claim: &crate::dispatch_material::DeliveryClaim,
 ) -> ServedResultReadback {
     // An absent record, an unreadable or oversize one, and a malformed one
     // all answer the same typed state: this identity has no usable retained
     // result. That mapping is unchanged by reading it as a `let ... else`.
-    let Ok(Some(record)) = crate::dispatch_material::read_served_result(directory) else {
+    let Ok(Some(record)) = crate::dispatch_material::read_served_result(directory, claim) else {
         return ServedResultReadback::Unavailable;
     };
-    if !record.names(identity) {
+    if !record.names(claim) {
         return ServedResultReadback::Conflict;
     }
+    let identity = claim.identity();
     let crate::dispatch_material::ServedResultRecord { frame, stream, .. } = record;
     match stream {
         // The legacy terminal-only payload is reconstructed into the very
@@ -5014,20 +5263,13 @@ fn frame_binds_to_identity(
         && frame.input_digest == identity.input_digest
 }
 
-/// Runs the ordinary governed path for this process: binds the owner
-/// delivery set, resolves the authenticated grant into a local admitted port
-/// set, and serves the bounded request loop to its correlated terminal
-/// frame.
-///
-/// Generation replacement closes here. After the current set is consumed,
-/// the staged path is re-read through the same validated loader: a
-/// replacement set — one naming a grant this process has not served — is
-/// revalidated through the identical full admission path with fresh
-/// authority, while the previous generation's binding, permit, and
-/// authority cell are dropped, never reused. A re-staged copy of the grant
-/// this process already served ends the chain without a second execution:
-/// spent one-shot authority is never revived, and the completed outcome —
-/// whose terminal frame was already published — stands.
+/// Runs one exact owner delivery through the durable per-slot disposition,
+/// resolves the authenticated grant into a local admitted port set only for
+/// a newly acquired claim, and serves the bounded request loop to its
+/// correlated terminal frame. Exact in-flight claims remain in progress;
+/// complete terminal results are replayed through the ordinary emitter. The
+/// staged set remains until the owner records a matching acknowledgement,
+/// and there is no legacy fixed-name fallthrough for a missing disposition.
 ///
 /// # Errors
 ///
@@ -5035,278 +5277,108 @@ fn frame_binds_to_identity(
 /// binding, the one-shot permit, the admitted world, the request source,
 /// the result sink, or a request binding fails closed.
 pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError> {
-    let mut served: Vec<crate::dispatch_material::StagedDeliveryIdentity> = Vec::new();
-    let mut outcome: Option<OrdinaryOutcome> = None;
-    let mut replayed: Option<crate::dispatch_material::StagedDeliveryIdentity> = None;
-    // The staged path is the owner's only route into this process, and the
-    // previous set was consumed, so any set observed here is either a
-    // replacement generation or a same-grant re-stage. Nothing is carried
-    // across iterations except the bounded served delivery set below, so no
-    // unbounded accumulation is possible.
-    while let Some((claim, material)) =
+    let Some((staged_claim, material)) =
         read_admitted_material().map_err(OrdinaryDriveError::Drive)?
+    else {
+        return Err(OrdinaryDriveError::NoDeliverySet);
+    };
+    let directory = crate::dispatch_material::admitted_material_path()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .ok_or(OrdinaryDriveError::Drive(DriveError::NoMaterial))?;
+
+    // Assemble the exact request commitment without touching authority,
+    // resolving a permit, or starting a guest. The durable per-slot claim is
+    // the first admission decision; no marker, publication classifier, or
+    // compatibility path authorizes execution on its own.
+    let (unseated_invocation, _) =
+        crate::dispatch_drive::drive_admission(&material).map_err(OrdinaryDriveError::Drive)?;
+    let request_digest = unseated_invocation.request_digest().clone();
+    let claim = match crate::dispatch_material::acquire_delivery_claim(
+        &directory,
+        &staged_claim,
+        request_digest.clone(),
+        edge_now_ms(),
+    )
+    .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?
     {
-        // The claim arrives with the material from one claim-first read:
-        // the pre-read envelope identity selected this operation before
-        // the payload files were trusted, so the claim below is that
-        // selection — never a copy derived after the fact. Durable
-        // retention extends in-memory state across restart: a staged set
-        // the served marker names is terminal-unacknowledged (a crash
-        // between publish and reclaim), and a staged set the InFlight
-        // marker names was claimed for execution (a crash between claim
-        // and served durability), so both replay below instead of
-        // re-executing.
-        let directory = crate::dispatch_material::admitted_material_path()
-            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-            .ok_or(OrdinaryDriveError::Drive(DriveError::NoMaterial))?;
-        let served_marker = crate::dispatch_material::read_served_marker(&directory)
-            .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
-        let inflight_marker = crate::dispatch_material::read_inflight_marker(&directory)
-            .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
-        match crate::dispatch_material::classify_staged_delivery(
-            claim.identity(),
-            served.as_slice(),
-            served_marker.as_ref(),
-            inflight_marker.as_ref(),
-        ) {
-            crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
-                // Terminal-unacknowledged read-back: a fresh drive (no
-                // in-process outcome) returns the original retained result
-                // for exactly this identity when one is durably retained,
-                // before any evidence is touched — the replay path deletes
-                // nothing. A retained stream that is complete, and that the
-                // real per-frame and stream validators accepted over the
-                // recorded values themselves, is republished through the
-                // ordinary result owner's own serializer and emitter: the
-                // original events, in order, on this process's new
-                // transport. That path admits no request, issues no permit,
-                // spawns no worker, and touches no staged evidence.
-                // Anything else — absent, unreadable, foreign, malformed, or
-                // a prefix whose missing events are not known — falls
-                // through to the identity-only in-progress report below;
-                // same-drive replays keep the in-process projection, never a
-                // file read-back.
-                if outcome.is_none()
-                    && let ServedResultReadback::Complete { events } =
-                        read_back_served_result(&directory, &identity)
-                {
+        crate::dispatch_material::DeliveryClaimOutcome::Acquired(claim) => claim,
+        crate::dispatch_material::DeliveryClaimOutcome::ExistingInFlight(claim) => {
+            return Err(delivery_in_progress(claim.identity()));
+        }
+        crate::dispatch_material::DeliveryClaimOutcome::RetainedResult(claim) => {
+            match read_back_served_result(&directory, &claim) {
+                ServedResultReadback::Complete { events } => {
                     let mut replay_owner = DeliverySetChannel::replay_only();
                     let terminal = replay_owner
                         .publish_retained_sequence(&events)
                         .map_err(OrdinaryDriveError::Loop)?;
-                    // Tracked termination of the replay emission: a helper
-                    // still holding stdout is reported to the process owner
-                    // rather than reported as a clean republication.
                     replay_owner
                         .cleanup_output_helper()
                         .map_err(OrdinaryDriveError::Loop)?;
                     return Ok(terminal);
                 }
-                // The classifier also treats a differing identity under the
-                // same spent grant as Replay, and an InFlight-named set as
-                // Replay whether or not its effect settled. Preserve the
-                // staged identity; the final projection may reuse an outcome
-                // only when this identity exactly matches the latest one
-                // served in this process. A replay without a retained
-                // result has no acknowledgement to authorize reclamation.
-                // Keep the claimed set and durable markers as local
-                // identity evidence; the projection below reports
-                // DeliveryInProgress with this exact identity until an
-                // owner can reconcile it.
-                replayed = Some(identity);
-                break;
-            }
-            crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { identity } => {
-                // Explicit v1 compatibility: full admission under the staged
-                // identity verbatim, never reinterpreted as a fresh
-                // generation with new identity. Bounded served retention:
-                // past the bound a fresh identity fails closed as
-                // in-progress — the staged set stays for the owner — rather
-                // than evicting a spent grant the classifier must remember.
-                if served.len() >= MAX_SERVED_DELIVERIES_PER_DRIVE {
-                    return Err(OrdinaryDriveError::DeliveryInProgress {
-                        operation_id: identity.operation_id,
-                        generation: identity.generation,
-                        claim_id: identity.claim_id,
-                    });
+                ServedResultReadback::Incomplete
+                | ServedResultReadback::Conflict
+                | ServedResultReadback::Unavailable => {
+                    return Err(delivery_in_progress(claim.identity()));
                 }
-                let _admitted_operation = identity.operation_id.len();
             }
         }
-        // Owner publication state gate (#2786 steps 3/7/8): the claim may
-        // execute only against the generation the owner itself published
-        // as ready. A staged set with no owner record at all is the
-        // explicit legacy v1 compatibility state the classifier above
-        // admitted; anything the owner did record must name this claim.
-        require_ready_publication(&directory, &claim)?;
-        let runtime =
-            build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
-        seal_inflight_claim(&directory, &claim, edge_now_ms())?;
-        // The claim-bound result owner is threaded into the loop itself, so
-        // each observed event is durable before it can be exposed and the
-        // whole observed sequence comes back with the loop's disposition. The
-        // sequence is borrowed from that report for the whole arm below, so
-        // the drive never seals or returns a copy that could differ from the
-        // one the loop actually observed.
-        let report = run_request_loop(
-            runtime,
-            &material,
-            ObservedResultRetention::new(&directory, &claim),
-        );
-        // The delivery set is one-shot: a published terminal outcome reclaims
-        // exactly the claimed generation, so a leftover is a fresh-drive
-        // signal rather than a silent reuse. Unknown execution, failed
-        // publication, lost response, or failed drain retains the exact
-        // operation/generation evidence for recovery and never reclaims. The
-        // in-memory retention of the sequence below is the readback path,
-        // not a second execution.
-        match report.completion() {
-            LoopCompletion::Served => {
-                // The served terminal is the last event of the sequence this
-                // same report carries, so the frame sealed below and the frame
-                // returned below cannot be a different observation. A served
-                // report without one is the exact refusal the loop has always
-                // reported for a terminal it cannot name.
-                let Some(terminal) = report.served_terminal() else {
-                    return Err(OrdinaryDriveError::Loop(denied("no-request")));
-                };
-                // Containment evidence is the loop's own terminal condition:
-                // it only reports served once the operation's effect is
-                // attested as settled, so reclaiming here never races an
-                // unresolved guest child.
-                //
-                // The served marker and the exact retained sequence seal
-                // durably before physical reclaim, so restart reconciles
-                // terminal-unacknowledged state by republishing the original
-                // sequence instead of re-executing.
-                seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
-                let reclamation = consume_delivery_set(&claim);
-                // The served marker is now durable, so the pre-execution
-                // InFlight evidence is redundant: drop it best-effort. A
-                // leftover only replays, never re-executes.
-                let _ =
-                    crate::dispatch_material::clear_inflight_marker(&directory, claim.identity());
-                // Bounded residual only: a partial reclamation never
-                // overwrites the primary result; retained files stay for
-                // maintenance under the exact claimed identity.
-                let _residual_complete = match &reclamation {
-                    crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
-                        let _reclaimed_operation = detail.identity.operation_id.len();
-                        detail.fully_reclaimed()
-                    }
-                    crate::dispatch_material::ClaimedReclamation::ReplacementPreserved {
-                        claimed,
-                    }
-                    | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
-                    | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
-                        claimed,
-                    } => {
-                        let _preserved_operation = claimed.operation_id.len();
-                        false
-                    }
-                };
-                served.push(claim.into_identity());
-                outcome = Some(terminal.clone());
-            }
-            LoopCompletion::Failed { failure } => {
-                // Nothing about the observation is lost here and nothing is
-                // reclaimed: every event this loop observed is already
-                // durable through the claim-bound owner, written before it
-                // could be exposed, so restart replays the exact retained
-                // sequence under the still-live InFlight marker instead of
-                // re-executing the guest. The failure is reported as itself,
-                // never as a safe refusal of the operation.
-                hand_off_observed_sequence(&directory, &claim, report.retained());
-                return Err(OrdinaryDriveError::Loop(*failure));
-            }
+        crate::dispatch_material::DeliveryClaimOutcome::Conflict => {
+            return Err(delivery_in_progress(staged_claim.identity()));
         }
-    }
-    // Only an exact in-process replay of the latest served identity may
-    // return the retained terminal frame: the drive holds one terminal, so
-    // an older served identity re-staged after a newer serve reports
-    // in-progress with its exact identity instead of borrowing the newer
-    // result or re-executing under its spent grant. A same-grant replay for
-    // another identity cannot borrow that result. Cross-restart
-    // terminal-unacknowledged state with a durably retained result already
-    // republished that original sequence from the replay arm above; only a
-    // replay whose retained record is absent, incomplete, or conflicting
-    // reports in-progress with its exact identity.
-    // Only a drive that observed nothing staged reports absence.
-    match (outcome, replayed) {
-        (Some(frame), None) => Ok(frame),
-        (Some(frame), Some(identity)) if served.last() == Some(&identity) => Ok(frame),
-        (_, Some(identity)) => Err(OrdinaryDriveError::DeliveryInProgress {
-            operation_id: identity.operation_id,
-            generation: identity.generation,
-            claim_id: identity.claim_id,
-        }),
-        (None, None) => Err(OrdinaryDriveError::NoDeliverySet),
-    }
-}
-
-/// Consumes the staged delivery set beside this installation — but only
-/// while it still names the exact claimed generation this loop served.
-///
-/// The publisher stages replacements under the same fixed filenames, so a
-/// replacement published while this loop ran now owns those paths: the
-/// claimed identity (claim, operation, generation, nonce, grant/fence,
-/// digests, window, epoch) is re-read and compared, preserving the #2895
-/// grant/artifact/input digest comparison as a subset, and each removal
-/// re-verifies after a claim-by-rename move. Anything else — a
-/// replacement, an unreadable envelope, or an already-consumed set — is
-/// left untouched; a leftover is a fresh-drive signal, never silent reuse.
-/// Derived from the loader path only — never from argv, stdin, or
-/// environment. Returns the typed claimed reclamation; a partial outcome is
-/// a bounded residual, never a primary-result overwrite.
-fn consume_delivery_set(
-    claim: &crate::dispatch_material::DeliveryClaim,
-) -> crate::dispatch_material::ClaimedReclamation {
-    use crate::dispatch_material::admitted_material_path;
-    let Some(directory) =
-        admitted_material_path().and_then(|path| path.parent().map(Path::to_path_buf))
-    else {
-        return crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
-            claimed: claim.identity().clone(),
-        };
+        crate::dispatch_material::DeliveryClaimOutcome::Unavailable => {
+            return Err(OrdinaryDriveError::Drive(DriveError::Material(
+                MaterialError::Unreadable("delivery-claim-unavailable".to_owned()),
+            )));
+        }
     };
-    crate::dispatch_material::reclaim_claimed_delivery(claim, &directory)
+
+    // The per-slot launch reservation is durable before this full build can
+    // resolve/seal the one-shot permit. Re-check that the invocation the
+    // runtime actually seats is exactly the request commitment already
+    // attached to the acquired claim.
+    let runtime =
+        build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
+    if runtime.invocation.request_digest() != &request_digest {
+        return Err(OrdinaryDriveError::Drive(DriveError::Admission {
+            field: "request-commitment",
+        }));
+    }
+
+    let report = run_request_loop(
+        runtime,
+        &material,
+        ObservedResultRetention::new(&directory, &claim),
+    );
+    match report.completion() {
+        LoopCompletion::Served => {
+            let Some(terminal) = report.served_terminal() else {
+                return Err(OrdinaryDriveError::Loop(denied("no-request")));
+            };
+            // The complete stream was retained by the same ordinary result
+            // owner before its terminal event reached stdout. Reaffirm that
+            // exact sequence as terminal-unacknowledged, but leave both the
+            // owner slot and staged delivery intact until an owner ACK exists.
+            seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
+            Ok(terminal.clone())
+        }
+        LoopCompletion::Failed { failure } => {
+            hand_off_observed_sequence(&directory, &claim, report.retained());
+            Err(OrdinaryDriveError::Loop(*failure))
+        }
+    }
 }
 
-/// Requires the owner's own publication state to name this exact
-/// generation as ready before the claim executes (#2786 steps 3/7/8).
-///
-/// The owner slot is located by the claim's own generation and
-/// material-set digest, and every owner-recorded field is compared against
-/// the claim: a matching pathname, a well-formed token, or a matching
-/// grant digest is not a match. A pending or failed owner publication, and
-/// a ready record naming another delivery, both fail closed here — nothing
-/// executes and nothing is deleted, so the staged set stays for the owner
-/// under its exact identity. No owner record at all is the legacy v1
-/// fixed-name compatibility state, which stays admissible under full
-/// admission with the staged identity verbatim.
-///
-/// # Errors
-///
-/// Returns [`OrdinaryDriveError::Publication`] when the owner recorded a
-/// state that is not a ready publication of this claim, and
-/// [`OrdinaryDriveError::Drive`] when the owner marker is unreadable,
-/// malformed, or carries an unsupported identity version.
-fn require_ready_publication(
-    directory: &Path,
-    claim: &crate::dispatch_material::DeliveryClaim,
-) -> Result<(), OrdinaryDriveError> {
-    let identity = claim.identity();
-    match crate::dispatch_material::read_delivery_publication(directory, identity)
-        .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?
-    {
-        Some(state) if state.is_ready() && state.names(identity) => Ok(()),
-        Some(state) if !state.is_ready() => {
-            Err(OrdinaryDriveError::Publication { code: state.code() })
-        }
-        Some(_) => Err(OrdinaryDriveError::Publication {
-            code: "DELIVERY_IDENTITY_MISMATCH",
-        }),
-        None => Ok(()),
+/// Projects the exact staged or acquired claim identity as bounded
+/// in-progress evidence. This never authorizes replay or execution.
+fn delivery_in_progress(
+    identity: &crate::dispatch_material::StagedDeliveryIdentity,
+) -> OrdinaryDriveError {
+    OrdinaryDriveError::DeliveryInProgress {
+        operation_id: identity.operation_id.clone(),
+        generation: identity.generation,
+        claim_id: identity.claim_id.clone(),
     }
 }
 

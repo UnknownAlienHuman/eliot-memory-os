@@ -1234,32 +1234,6 @@ impl std::fmt::Display for ReclaimOutcome {
     }
 }
 
-/// Removes one claimed staging file, reporting the exact platform outcome.
-/// Callers present the exact claimed identity before calling: this removes
-/// only the path the claim bound, never a generic current pathname. The
-/// caller's parent installation root is locked across the removal.
-pub fn consume_staged(path: &std::path::Path) -> ReclaimOutcome {
-    let Some(root) = path.parent() else {
-        return ReclaimOutcome::Other("installation-root-unavailable".to_owned());
-    };
-    match with_installation_root_lock(root, || Ok(consume_staged_unlocked(path))) {
-        Ok(outcome) => outcome,
-        Err(_) => ReclaimOutcome::Other("installation-root-lock-unavailable".to_owned()),
-    }
-}
-
-fn consume_staged_unlocked(path: &std::path::Path) -> ReclaimOutcome {
-    match std::fs::remove_file(path) {
-        Ok(()) => ReclaimOutcome::Reclaimed,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReclaimOutcome::NotFound,
-        Err(error) if error.raw_os_error() == Some(32) => ReclaimOutcome::SharingViolation,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            ReclaimOutcome::AccessDenied
-        }
-        Err(error) => ReclaimOutcome::Other(error.kind().to_string()),
-    }
-}
-
 /// Owner-issued delivery identity bound at claim time (#2786 steps 1/3).
 ///
 /// Derived verbatim from the staged envelope plus re-proven digests against
