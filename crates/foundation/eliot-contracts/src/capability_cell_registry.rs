@@ -28,14 +28,16 @@
 //!   never establishes a runnable selector; resolution takes only the typed
 //!   capsule revision plus actual discovery.
 
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+use crate::cell_effective_manifest::is_development_classified;
 use crate::{
-    CellCapsuleBinding, ContractError, ContractVersion, ModuleCatalog, ModuleCatalogError,
-    ModuleCatalogRecord, ModuleTestCapsuleError, canonical_json_bytes, sha256_hex,
+    CapsuleDisposition, CellCapsuleBinding, ContractError, ContractVersion, ModuleCatalog,
+    ModuleCatalogError, ModuleCatalogRecord, ModuleTestCapsuleError, canonical_json_bytes,
+    sha256_hex,
 };
 
 /// Stable contract name for the owner-neutral capability-cell registry family.
@@ -700,6 +702,22 @@ pub enum CellClassificationError {
         /// Declared functional cell that no catalog record classifies.
         cell: String,
     },
+    /// A cell classified `development_only` or `development_tool` is reachable
+    /// from an admitted production target through this registry's own
+    /// dependency edges.
+    ///
+    /// `I2.10` admits both development classes only for capabilities that are
+    /// never required by the production runtime. Reachability is measured over
+    /// the closure of [`CapabilityCellRecord::affected_edges`] seeded from the
+    /// declared executable dispositions, so a self-declared
+    /// `production_required = false` cannot make a production-reachable cell
+    /// development-classified.
+    DevelopmentReachableFromProduction {
+        /// Development-classified cell an admitted production target reaches.
+        cell: String,
+        /// Admitted production target whose edge closure reaches the cell.
+        reachable_from: String,
+    },
 }
 
 impl fmt::Display for CellClassificationError {
@@ -715,6 +733,13 @@ impl fmt::Display for CellClassificationError {
             Self::IncompleteCatalog { cell } => write!(
                 formatter,
                 "Module Catalog carries no classification record for declared functional cell '{cell}'"
+            ),
+            Self::DevelopmentReachableFromProduction {
+                cell,
+                reachable_from,
+            } => write!(
+                formatter,
+                "cell '{cell}' is classified as development tooling but admitted production target '{reachable_from}' reaches it"
             ),
         }
     }
@@ -790,11 +815,14 @@ impl CapabilityCellRegistry {
     /// this registry's own declared cells rather than against the catalog's
     /// records: an unregistered cell is refused with
     /// [`CellClassificationError::UnknownCell`], an invalid catalog is refused
-    /// with [`CellClassificationError::InvalidCatalog`], and a declared
-    /// functional cell the catalog does not classify is refused with
+    /// with [`CellClassificationError::InvalidCatalog`], a declared functional
+    /// cell the catalog does not classify is refused with
     /// [`CellClassificationError::IncompleteCatalog`] no matter which cell was
-    /// queried. No value is derived from a crate, bundle, source-layer, or
-    /// runtime-layer name.
+    /// queried, and a development-classified cell an admitted production target
+    /// reaches is refused with
+    /// [`CellClassificationError::DevelopmentReachableFromProduction`]. No
+    /// value is derived from a crate, bundle, source-layer, or runtime-layer
+    /// name.
     pub fn cell_classification<'a>(
         &self,
         catalog: &'a ModuleCatalog,
@@ -808,6 +836,22 @@ impl CapabilityCellRegistry {
         catalog
             .validate()
             .map_err(CellClassificationError::InvalidCatalog)?;
+        self.require_complete_catalog(catalog)?;
+        self.check_development_reachability(catalog)?;
+        catalog
+            .record(cell)
+            .map_err(CellClassificationError::InvalidCatalog)
+    }
+
+    /// Refuses a catalog that classifies no record for a declared cell.
+    ///
+    /// The expected set is `self.cells`, the registry's own declared roster,
+    /// and never the catalog's own record list, so dropping a declared cell
+    /// from the catalog cannot make an incomplete catalog look complete.
+    fn require_complete_catalog(
+        &self,
+        catalog: &ModuleCatalog,
+    ) -> Result<(), CellClassificationError> {
         for record in &self.cells {
             if catalog.record(&record.cell).is_err() {
                 return Err(CellClassificationError::IncompleteCatalog {
@@ -815,9 +859,114 @@ impl CapabilityCellRegistry {
                 });
             }
         }
-        catalog
-            .record(cell)
-            .map_err(CellClassificationError::InvalidCatalog)
+        Ok(())
+    }
+
+    /// Refuses a development-classified cell an admitted production target
+    /// reaches.
+    ///
+    /// `I2.10` admits `development_only` and `development_tool` only for
+    /// capabilities that are never required by the production runtime, so the
+    /// classification is compared with the production reachability derived from
+    /// this registry's own declared edges rather than being accepted on the
+    /// cell's own `production_required` declaration.
+    fn check_development_reachability(
+        &self,
+        catalog: &ModuleCatalog,
+    ) -> Result<(), CellClassificationError> {
+        let production = self.production_reachable_cells();
+        for record in &self.cells {
+            let Ok(classification) = catalog.record(&record.cell) else {
+                continue;
+            };
+            if !is_development_classified(
+                classification.execution_contour,
+                classification.runtime_class,
+            ) {
+                continue;
+            }
+            if let Some(origin) = production.get(record.cell.as_str()) {
+                return Err(CellClassificationError::DevelopmentReachableFromProduction {
+                    cell: record.cell.as_str().to_owned(),
+                    reachable_from: (*origin).to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns, for every declared cell, the admitted production target that
+    /// reaches it, mapped to that target's cell id.
+    ///
+    /// The seeds are the declared cells whose own capsule binding admits
+    /// production execution ([`CapsuleDisposition::Production`]), and the
+    /// closure follows [`CapabilityCellRecord::affected_edges`] in both
+    /// directions, because a dependency edge names a provider or a consumer
+    /// without recording which. A cell no admitted production target reaches is
+    /// absent from the map. The population is this registry's own declared
+    /// roster; no crate, bundle, source-layer, or runtime-layer name decides
+    /// reachability, and a cell that declares itself non-production-required
+    /// gains no exemption from the walk.
+    fn production_reachable_cells<'a>(&'a self) -> BTreeMap<&'a str, &'a str> {
+        let seeds: Vec<&str> = self
+            .cells
+            .iter()
+            .filter(|record| {
+                record
+                    .executable_capsule
+                    .as_ref()
+                    .is_some_and(|binding| binding.disposition == CapsuleDisposition::Production)
+            })
+            .map(|record| record.cell.as_str())
+            .collect();
+        let mut origins: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut frontier: Vec<&str> = Vec::new();
+        for seed in seeds {
+            origins.insert(seed, seed);
+            frontier.push(seed);
+        }
+        while let Some(current) = frontier.pop() {
+            for neighbour in self.edge_neighbours(current) {
+                if !origins.contains_key(neighbour) {
+                    origins.insert(neighbour, current);
+                    frontier.push(neighbour);
+                }
+            }
+        }
+        origins
+    }
+
+    /// Returns the declared cells one-hop adjacent to `cell` in either
+    /// direction of the recorded dependency edges.
+    ///
+    /// `affected_edges` records a cell's providers and consumers without
+    /// recording which is which, so the walk treats the edge as undirected
+    /// rather than guessing a direction that the registry does not state. An
+    /// edge naming a cell this registry does not declare is not a neighbour:
+    /// the returned population is the declared roster, so a dangling edge can
+    /// never introduce a name the registry does not own.
+    fn edge_neighbours<'a>(&'a self, cell: &str) -> Vec<&'a str> {
+        let mut neighbours: Vec<&str> = Vec::new();
+        for record in &self.cells {
+            if record
+                .affected_edges
+                .iter()
+                .any(|edge| edge.as_str() == cell)
+                && !neighbours.contains(&record.cell.as_str())
+            {
+                neighbours.push(record.cell.as_str());
+            }
+            if cell == record.cell.as_str() {
+                for edge in &record.affected_edges {
+                    if self.cells.iter().any(|peer| peer.cell.as_str() == edge.as_str())
+                        && !neighbours.contains(&edge.as_str())
+                    {
+                        neighbours.push(edge.as_str());
+                    }
+                }
+            }
+        }
+        neighbours
     }
 }
 
