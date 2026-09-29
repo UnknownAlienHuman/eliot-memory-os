@@ -35578,6 +35578,21 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 if existing_record.record_identity != claim_record.record_identity {
                     return Err(OrsError::DuplicateConflict);
                 }
+                // A revoked or terminal delivery identity stays dead even
+                // when its bytes replay exactly: revocation returns a live
+                // claim to Pending and terminal dispositions close the
+                // lifecycle, so answering success here would let a stale
+                // generation observe authority past revocation or ack.
+                // Only a live claim phase may answer an exact retry;
+                // owner-mediated redelivery mints a new delivery identity.
+                if !matches!(
+                    lifecycle.phase,
+                    MaintenanceTriggerLifecyclePhase::Claimed
+                        | MaintenanceTriggerLifecyclePhase::DecisionRecorded
+                        | MaintenanceTriggerLifecyclePhase::Reconciling
+                ) {
+                    return Err(OrsError::DuplicateConflict);
+                }
                 // The caller may have rebuilt a finite deadline on retry.
                 // Return the original claim and exact bytes; never extend or
                 // replace the durable lease under one delivery identity.
