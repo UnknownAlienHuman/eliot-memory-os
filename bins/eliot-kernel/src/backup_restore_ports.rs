@@ -288,7 +288,7 @@ fn is_hex64(value: &str) -> bool {
 /// is provably material a committed phase receipt attests, which is a stronger
 /// reason to keep it than any of the reasons above. It is a refusal to unlink,
 /// never a claim that the sweep failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StagedCleanupRefusal {
     /// The destination was reopened for resume rather than constructed for
     /// this execution, so its contents may carry another process's reconciled
@@ -326,11 +326,26 @@ pub enum StagedCleanupRefusal {
     /// unbounded output channel or a directory scan.
     PublishedPhaseMaterialRetained {
         /// Published paths left on disk, each either attested by a committed
-        /// phase receipt or not provably unattested.
-        members: u64,
-        /// Bytes left on disk, summed from the lengths the writes admitted.
-        bytes: u64,
+        /// phase receipt or not provably unattested, and the bytes left on
+        /// disk summed from the lengths the writes admitted.
+        ///
+        /// Boxed so this variant's two counters do not enlarge
+        /// [`KernelRestoreError`], which is returned by value from many more
+        /// functions than the sweep. An inline pair pushed that error past
+        /// `clippy::result_large_err` in 28 places that have nothing to do with
+        /// cleanup; boxing keeps the payload and removes the churn.
+        retained: Box<RetainedPublishedMaterial>,
     },
+}
+
+/// Bounded counts of published restore material the cleanup refused to unlink.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedPublishedMaterial {
+    /// Published paths left on disk, each either attested by a committed phase
+    /// receipt or not provably unattested.
+    pub members: u64,
+    /// Bytes left on disk, summed from the lengths the writes admitted.
+    pub bytes: u64,
 }
 
 impl std::fmt::Display for StagedCleanupRefusal {
@@ -342,7 +357,8 @@ impl std::fmt::Display for StagedCleanupRefusal {
             Self::PathNotOurs => "a staged path is not a plain file under the destination",
             Self::BudgetReached => "the derived removal budget was reached",
             Self::RemovalFailed => "a staged path could not be removed",
-            Self::PublishedPhaseMaterialRetained { members, bytes } => {
+            Self::PublishedPhaseMaterialRetained { retained } => {
+                let RetainedPublishedMaterial { members, bytes } = **retained;
                 return write!(
                     formatter,
                     "published phase material attested by a committed receipt was preserved \
@@ -406,7 +422,13 @@ pub enum KernelRestoreError {
         /// The engine's typed failure, unchanged.
         primary: BackupError,
         /// Why the bounded cleanup preserved what it could not attribute.
-        cleanup: StagedCleanupRefusal,
+        ///
+        /// Boxed because this enum is returned by value from many more
+        /// functions than the sweep, and `BackupError` already places it within
+        /// a few bytes of `clippy::result_large_err`'s threshold. An inline
+        /// cleanup reason pushed this type over the limit and raised the lint in
+        /// 29 places across the crate, none of which are about cleanup.
+        cleanup: Box<StagedCleanupRefusal>,
     },
 }
 

@@ -126,8 +126,9 @@ use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, OrsRestoreJournalOwner,
     PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
-    backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
+    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts,
+    RetainedPublishedMaterial, StagedCleanupRefusal, backup_to_kernel, check_kernel_effect_fence,
+    ors_to_backup, require_production_admitted,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -1535,6 +1536,17 @@ enum ObservedEffect {
     Undecidable,
 }
 
+/// Outcome of proving the destination root resolves inside this execution's
+/// isolated area. `Gone` and `Outside` are kept distinct because they mean
+/// different things to the sweep: `Gone` means nothing of this execution
+/// remains to remove, `Outside` means the path could not be trusted to be the
+/// one this execution wrote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootConfinement {
+    Gone,
+    Outside,
+}
+
 /// Bounded removal disposition for the output one restore execution staged.
 ///
 /// A disposition, not an error: the primary engine failure is returned either
@@ -1545,7 +1557,7 @@ enum ObservedEffect {
 /// output of this execution; `PublishedMaterialPreserved` means it does, and
 /// that fact is the one a caller cannot reconstruct from the primary failure
 /// alone.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum StagedCleanup {
     /// This execution staged no removable file; nothing was removed and
     /// nothing is owed.
@@ -1569,15 +1581,30 @@ enum StagedCleanup {
     /// become an unbounded output channel.
     PublishedMaterialPreserved {
         /// Published paths retained, each either attested by a committed phase
-        /// receipt or not provably unattested.
-        members: u64,
-        /// Bytes retained, summed from the lengths the writes actually
-        /// admitted.
-        bytes: u64,
+        /// receipt or not provably unattested, and the bytes retained summed
+        /// from the lengths the writes actually admitted.
+        ///
+        /// Boxed for the same reason as
+        /// [`StagedCleanupRefusal::PublishedPhaseMaterialRetained`]: this enum
+        /// is carried inside `KernelRestoreError`, which is returned by value
+        /// from far more functions than the cleanup, and an inline pair of
+        /// counters pushed it past `clippy::result_large_err` across the crate.
+        retained: Box<RetainedPublishedMaterial>,
     },
     /// Cleanup preserved what it could not attribute to this execution, for
     /// the exact typed reason.
     Refused(StagedCleanupRefusal),
+}
+
+impl StagedCleanup {
+    /// The one way this module builds a "published material survived"
+    /// disposition, so the two call sites cannot drift on which counts travel
+    /// with it.
+    fn published_material_preserved(members: u64, bytes: u64) -> Self {
+        Self::PublishedMaterialPreserved {
+            retained: Box::new(RetainedPublishedMaterial { members, bytes }),
+        }
+    }
 }
 
 /// Whether a phase receipt on disk proves a published path is this
@@ -2033,18 +2060,19 @@ impl<'a> KernelRestoreTarget<'a> {
             StagedCleanup::NothingStaged | StagedCleanup::Removed => {
                 KernelRestoreError::TargetFailed(primary)
             }
-            StagedCleanup::PublishedMaterialPreserved { members, bytes } => {
+            StagedCleanup::PublishedMaterialPreserved { retained } => {
+                let RetainedPublishedMaterial { members, bytes } = *retained;
                 KernelRestoreError::StagedCleanupIncomplete {
                     primary,
-                    cleanup: StagedCleanupRefusal::PublishedPhaseMaterialRetained {
-                        members,
-                        bytes,
-                    },
+                    cleanup: Box::new(StagedCleanupRefusal::PublishedPhaseMaterialRetained {
+                        retained: Box::new(RetainedPublishedMaterial { members, bytes }),
+                    }),
                 }
             }
-            StagedCleanup::Refused(cleanup) => {
-                KernelRestoreError::StagedCleanupIncomplete { primary, cleanup }
-            }
+            StagedCleanup::Refused(cleanup) => KernelRestoreError::StagedCleanupIncomplete {
+                primary,
+                cleanup: Box::new(cleanup),
+            },
         }
     }
 
@@ -2147,6 +2175,32 @@ impl<'a> KernelRestoreTarget<'a> {
     /// them. Empty directories left behind are reclaimed with
     /// [`std::fs::remove_dir`], which cannot remove a non-empty directory, so
     /// a directory this pass did not empty always survives — which is now the
+    /// Re-canonicalises this execution's destination root and the isolated area
+    /// that must contain it, and proves containment by comparing the resolved
+    /// paths.
+    ///
+    /// Both resolutions are fallible and both outcomes are distinguished, so the
+    /// caller can tell "the area is already gone, nothing of mine remains" from
+    /// "the path could not be resolved or does not live inside the area". A
+    /// resolved-name comparison is the whole proof; nothing here trusts the
+    /// name it was handed.
+    fn prove_roots_inside_isolated_area(&self, isolated: &Path) -> Result<(), RootConfinement> {
+        let resolve = |path: &Path| match std::fs::canonicalize(path) {
+            Ok(resolved) => Ok(resolved),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(RootConfinement::Gone)
+            }
+            Err(_) => Err(RootConfinement::Outside),
+        };
+        let area = resolve(&isolated.join(&self.label))?;
+        let root = resolve(&self.root)?;
+        if root.starts_with(&area) {
+            Ok(())
+        } else {
+            Err(RootConfinement::Outside)
+        }
+    }
+
     /// common case, because retained material keeps its directory alive.
     fn cleanup_staged_output(
         &self,
@@ -2186,10 +2240,7 @@ impl<'a> KernelRestoreTarget<'a> {
                 // Nothing was removable, and published material survived. That
                 // is not a no-op: the caller must be able to tell this
                 // destination apart from one that was emptied.
-                StagedCleanup::PublishedMaterialPreserved {
-                    members: preserved_members,
-                    bytes: preserved_bytes,
-                }
+                StagedCleanup::published_material_preserved(preserved_members, preserved_bytes)
             };
         }
         if destination.is_resumed() {
@@ -2207,24 +2258,14 @@ impl<'a> KernelRestoreTarget<'a> {
             return StagedCleanup::Refused(StagedCleanupRefusal::ForeignAdmission);
         }
         let isolated = self.work_root.join(".eliot").join(RESTORE_ISOLATED_AREA);
-        let area = match std::fs::canonicalize(isolated.join(&self.label)) {
-            Ok(area) => area,
-            // The isolated area is already gone, so none of the staged output
-            // this execution produced is still on disk.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return StagedCleanup::Removed;
+        // `Gone` means the isolated area is already absent, so none of the
+        // staged output this execution produced is still on disk.
+        match self.prove_roots_inside_isolated_area(&isolated) {
+            Ok(()) => {}
+            Err(RootConfinement::Gone) => return StagedCleanup::Removed,
+            Err(RootConfinement::Outside) => {
+                return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea);
             }
-            Err(_) => return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea),
-        };
-        let root = match std::fs::canonicalize(&self.root) {
-            Ok(root) => root,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return StagedCleanup::Removed;
-            }
-            Err(_) => return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea),
-        };
-        if !root.starts_with(&area) {
-            return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea);
         }
         let mut refusal: Option<StagedCleanupRefusal> = None;
         let mut removed_bytes = 0usize;
@@ -2275,10 +2316,7 @@ impl<'a> KernelRestoreTarget<'a> {
             // retained counts.
             Some(refusal) => StagedCleanup::Refused(refusal),
             None if preserved_members == 0 => StagedCleanup::Removed,
-            None => StagedCleanup::PublishedMaterialPreserved {
-                members: preserved_members,
-                bytes: preserved_bytes,
-            },
+            None => StagedCleanup::published_material_preserved(preserved_members, preserved_bytes),
         }
     }
 
