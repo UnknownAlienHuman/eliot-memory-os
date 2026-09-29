@@ -5238,24 +5238,58 @@ impl KernelComposition {
         let value = match operation {
             AGENT_BRIDGE_EVENT_FORWARD_OPERATION => {
                 let event = bridge_event_envelope_from_payload(&payload)?;
-                self.admit_bridge_event_envelope(
-                    session,
-                    &event,
-                    &identity.request.state_fence,
-                    identity.deadline_unix_ms,
-                )?
+                if event.delivery_class == DeliveryClass::BestEffortTelemetry {
+                    let _transition = self.agent_bridge_transition_read()?;
+                    self.admit_bridge_event_envelope(
+                        session,
+                        &event,
+                        &identity.request.state_fence,
+                        identity.deadline_unix_ms,
+                    )?
+                } else {
+                    self.with_live_bridge_application_binding(
+                        session,
+                        &identity.request.state_fence,
+                        || {
+                            self.admit_bridge_event_envelope(
+                                session,
+                                &event,
+                                &identity.request.state_fence,
+                                identity.deadline_unix_ms,
+                            )
+                        },
+                    )?
+                }
             }
             AGENT_BRIDGE_HOOK_FORWARD_OPERATION => {
+                // A hook is a digest-only transport observation with no ORS
+                // mutation; preserve this cold observation lane without
+                // fabricating an application binding.
+                let _transition = self.agent_bridge_transition_read()?;
                 let hook = bridge_hook_from_payload(&payload)?;
                 self.admit_bridge_hook_observation(session, &hook)?
             }
             AGENT_BRIDGE_EVENT_GAP_OPERATION => {
                 let gap = bridge_gap_from_payload(&payload, &session.connection_id)?;
-                self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence)?
+                self.with_live_bridge_application_binding(
+                    session,
+                    &identity.request.state_fence,
+                    || self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
+                )?
             }
             AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
                 let scope = bridge_reconcile_scope_from_payload(&payload)?;
-                self.answer_bridge_event_reconcile(session, &scope, &identity.request.state_fence)?
+                self.with_live_bridge_application_binding(
+                    session,
+                    &identity.request.state_fence,
+                    || {
+                        self.answer_bridge_event_reconcile_under_transition(
+                            session,
+                            &scope,
+                            &identity.request.state_fence,
+                        )
+                    },
+                )?
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -5265,6 +5299,142 @@ impl KernelComposition {
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(KernelFrameAction::Reply(reply))
+    }
+
+    /// Keeps the exact retained activation, live application Session, and
+    /// presenting transport continuously valid across a synchronous bridge
+    /// event operation.
+    ///
+    /// The order is the bridge transition read lock, activation-result
+    /// readback, the pending-result owner, the retained connection and the
+    /// application-session owner. Holding pending-result ownership through the
+    /// ORS operation prevents a concurrent accepted result from evicting the
+    /// exact activation result between its currentness check and this commit.
+    /// Disconnect/profile transitions and explicit application-session
+    /// revocation therefore linearize before or after the operation rather
+    /// than between a check and commit.
+    /// The installation value is only the identity composed from the
+    /// authenticated Host startup binding; ORS namespace persistence still
+    /// requires its own typed installation/session fields.
+    fn with_live_bridge_application_binding<T>(
+        &self,
+        session: &Session,
+        frame_fence: &eliot_contracts::StateFence,
+        operation: impl FnOnce() -> Result<T, TransportError>,
+    ) -> Result<T, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        let (retained, _pending) =
+            self.bridge_event_activation_binding_under_transition(session, frame_fence)?;
+
+        let connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let current = connections
+            .get(&session.connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if !current.activation_completed
+            || current.session.as_ref() != Some(session)
+            || current.activated_binding.as_ref() != Some(&retained)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let application_sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        let application_session = application_sessions
+            .get(retained.session_id.as_str())
+            .ok_or(TransportError::SessionFenced)?;
+        let current_transport =
+            application_session
+                .transport_bindings()
+                .last()
+                .is_some_and(|binding| {
+                    binding.binding_id == session.connection_id
+                        && binding.session_epoch == session.session_epoch
+                        && binding.observed_at_unix_ms <= now
+                });
+        let live = application_session.session_id() == retained.session_id
+            && application_session.state() == eliot_ipc::ApplicationSessionState::Active
+            && application_session
+                .authority_epoch()
+                .is_same_authority(&retained.authority_epoch)
+            && current_transport
+            && application_session.bound_leases().values().all(|lease| {
+                !lease.revoked && lease.issued_at_unix_ms <= now && now < lease.expires_at_unix_ms
+            });
+        if !live {
+            return Err(TransportError::SessionFenced);
+        }
+
+        operation()
+    }
+
+    /// Reads the exact accepted activation and proves its fence is still
+    /// current. The caller holds the bridge transition read lock. The returned
+    /// pending-result guard stays held while the caller rechecks the retained
+    /// connection and application session and performs the ORS operation, so
+    /// accepted-result eviction cannot race that currentness proof.
+    fn bridge_event_activation_binding_under_transition(
+        &self,
+        session: &Session,
+        frame_fence: &eliot_contracts::StateFence,
+    ) -> Result<
+        (
+            super::ActivatedApplicationBinding,
+            std::sync::MutexGuard<'_, super::AgentActivationPendingState>,
+        ),
+        TransportError,
+    > {
+        if super::dispatch_contour()
+            .is_none_or(|contour| contour.installation_id().trim().is_empty())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(&session.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if !state.activation_completed || state.session.as_ref() != Some(session) {
+                return Err(TransportError::SessionFenced);
+            }
+            state
+                .activated_binding
+                .clone()
+                .ok_or(TransportError::SessionFenced)?
+        };
+        if retained.principal_id.trim().is_empty()
+            || retained.session_id.trim().is_empty()
+            || !frame_fence
+                .authority_epoch
+                .is_same_authority(&retained.authority_epoch)
+            || frame_fence.resource_generation != retained.activation_generation
+            || !session
+                .authority_epoch
+                .is_same_authority(&retained.authority_epoch)
+            || session.module_generation.state_fence.resource_generation
+                != retained.activation_generation
+            || session.state != eliot_ipc::SessionState::Open
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.activation_result_still_retained(&pending, &retained, &session.connection_id) {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok((retained, pending))
     }
 
     /// Admits one durable/control event envelope for bridge-event delivery.
@@ -5872,18 +6042,16 @@ impl KernelComposition {
         clippy::too_many_lines,
         reason = "owner resolution, atomic ack, pure read, and keyed answer share one serialization guard"
     )]
-    fn answer_bridge_event_reconcile(
+    fn answer_bridge_event_reconcile_under_transition(
         &self,
         session: &Session,
         scope: &BridgeReconcileScope,
         frame_fence: &eliot_contracts::StateFence,
     ) -> Result<serde_json::Value, TransportError> {
-        // Existing transition serialization first: the read guard is held
-        // across the owner read and any consumed-frontier batch commit, so
-        // bridge profile fencing (the revocation path) cannot interleave
-        // unnoticed. No caller above holds this guard; the service-state
-        // read inside takes only its own short-lived lock.
-        let _transition = self.agent_bridge_transition_read()?;
+        // The bridge event dispatcher holds the transition read guard across
+        // this owner read and any consumed-frontier batch commit; profile
+        // fencing and the active application-session guard therefore share
+        // one linearization boundary.
         if !matches!(
             self.service_state()
                 .map_err(|_| TransportError::SessionFenced)?,

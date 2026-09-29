@@ -760,7 +760,7 @@ struct LaunchRecords {
     by_identity: BTreeMap<String, LaunchRecord>,
 }
 
-/// The composed dispatch contour: the Kernel-owned principal owner, the
+/// The composed dispatch contour: the Kernel-owned installation identity, the
 /// Doctor front-door state once its production ledger lands, the installed
 /// testd/native-worker digests once their production sides compose, and the
 /// retained launch records.
@@ -770,6 +770,19 @@ pub struct ComposedDispatchContour {
     testd_installed_digest: Mutex<Option<String>>,
     native_worker_installed_digest: Mutex<Option<String>>,
     launches: Mutex<LaunchRecords>,
+}
+
+impl ComposedDispatchContour {
+    /// Returns the installation identity supplied by the authenticated Host
+    /// startup binding when this contour was composed.
+    ///
+    /// The existing `principal_owner` is that exact installation identity in
+    /// the production composition path; keeping one stored value avoids a
+    /// second, independently mutable identity source.
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        &self.principal_owner
+    }
 }
 
 static DISPATCH_CONTOUR: OnceLock<ComposedDispatchContour> = OnceLock::new();
@@ -852,36 +865,36 @@ fn gate_error(error: impl std::fmt::Display) -> DispatchLaunchError {
 /// material. Mirrors the kernel-service wire-text rule
 /// (`validate_text`: non-blank, no controls, at most 1024 UTF-8 bytes) so
 /// composition rejects the same principals admission would refuse.
-fn validate_principal_owner(value: &str) -> Result<(), DispatchLaunchError> {
+fn validate_installation_id(value: &str) -> Result<(), DispatchLaunchError> {
     if value.trim().is_empty() {
         return Err(DispatchLaunchError::InvalidMaterial(
-            "dispatch principal owner must be non-blank".to_owned(),
+            "dispatch installation identity must be non-blank".to_owned(),
         ));
     }
     if value.chars().any(char::is_control) {
         return Err(DispatchLaunchError::InvalidMaterial(
-            "dispatch principal owner must not contain control characters".to_owned(),
+            "dispatch installation identity must not contain control characters".to_owned(),
         ));
     }
     if value.len() > 1024 {
         return Err(DispatchLaunchError::InvalidMaterial(
-            "dispatch principal owner must not exceed 1024 UTF-8 bytes".to_owned(),
+            "dispatch installation identity must not exceed 1024 UTF-8 bytes".to_owned(),
         ));
     }
     Ok(())
 }
 
-/// Composes the dispatch contour with its Kernel-owned principal owner.
+/// Composes the dispatch contour with the installation identity supplied by
+/// the authenticated Host startup binding.
 ///
-/// The principal is the authenticated composition-boundary reference the
-/// Doctor and testd session binds use — never a request-envelope value.
-/// Set-once: a second composition is refused instead of replacing live
-/// authority.
-pub fn compose_dispatch_contour(principal_owner: String) -> Result<(), DispatchLaunchError> {
-    validate_principal_owner(&principal_owner)?;
+/// Downstream launch/session bindings use this retained identity as their
+/// composition owner; it is never taken from a request envelope. Set-once: a
+/// second composition is refused instead of replacing live authority.
+pub fn compose_dispatch_contour(installation_id: String) -> Result<(), DispatchLaunchError> {
+    validate_installation_id(&installation_id)?;
     DISPATCH_CONTOUR
         .set(ComposedDispatchContour {
-            principal_owner,
+            principal_owner: installation_id,
             doctor: Mutex::new(None),
             testd_installed_digest: Mutex::new(None),
             native_worker_installed_digest: Mutex::new(None),
