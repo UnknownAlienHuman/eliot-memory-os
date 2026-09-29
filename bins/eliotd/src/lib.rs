@@ -2417,9 +2417,9 @@ impl DaemonComposition {
     /// returned "accepted" on that basis, discarding the very
     /// [`SkillExecutionEvidence`](eliot_skill::SkillExecutionEvidence) slice
     /// the ingest was admitted to carry. This seam binds the evidence to the
-    /// exact Skill identity the retained catalogue entry names and hands the
-    /// updated view back, so the caller returns the OWNER's result verbatim: a
-    /// claim never outruns persistence.
+    /// exact Skill identity the retained catalogue entry names and installs
+    /// the updated view in the existing in-process Skill owner before the
+    /// caller assesses it. This owner update is not durable restart storage.
     ///
     /// Evidence is historical. It keeps the Skill revision, package digest and
     /// attempt it was observed at, so ingesting it now never reactivates a
@@ -2431,7 +2431,7 @@ impl DaemonComposition {
     /// lint is allowed for this seam.
     #[allow(clippy::result_large_err)]
     pub fn skill_publish_execution_evidence(
-        &self,
+        &mut self,
         payload: &eliot_agent_bridge_core::SkillExecutionPayload,
     ) -> Result<eliot_skill::SkillLifecycleView, eliot_skill::SkillError> {
         self.skill_reconcile_tool_basis()?;
@@ -2452,7 +2452,7 @@ impl DaemonComposition {
             }
             entry.clone()
         };
-        self.governor.owners().skill.record_execution_evidence(
+        self.governor.record_skill_execution_evidence(
             &payload.skill_id,
             &payload.skill_revision,
             &payload.package_digest,

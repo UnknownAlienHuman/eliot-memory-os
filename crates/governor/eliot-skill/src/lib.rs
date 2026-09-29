@@ -1099,7 +1099,7 @@ impl SkillRegistry {
     /// receipt's [`SkillUsefulness`], which only
     /// [`qualify_useful_outcomes`] can raise to `OwnerBacked`.
     pub fn record_execution_evidence(
-        &self,
+        &mut self,
         skill_id: &str,
         skill_revision: &str,
         package_digest: &str,
@@ -1123,6 +1123,7 @@ impl SkillRegistry {
             return Err(SkillError::IdentityMismatch);
         }
         let mut retained = previous.execution_evidence.clone();
+        let mut changed = false;
         for evidence in executions {
             // Exact replay under the same execution identity is idempotent; a
             // changed record under that identity is a conflict, not an
@@ -1135,8 +1136,17 @@ impl SkillRegistry {
                     return Err(SkillError::RevisionConflict);
                 }
                 Some(_) => {}
-                None => retained.push(evidence.clone()),
+                None => {
+                    retained.push(evidence.clone());
+                    changed = true;
+                }
             }
+        }
+        // Exact replay is a read of the same owner position, not a new
+        // revision. In particular, an empty or duplicate-only page cannot
+        // advance the lifecycle frontier.
+        if !changed {
+            return Ok(previous);
         }
         let mut view = derive_lifecycle_view(LifecycleEvidence {
             skill_ref: previous.skill_ref.clone(),
@@ -1154,8 +1164,12 @@ impl SkillRegistry {
         })?;
         // Later evidence is a LINKED revision, never a silent rewrite: the
         // revision advances so the owner can order the observations.
-        view.lifecycle_revision = previous.lifecycle_revision.saturating_add(1);
+        view.lifecycle_revision = previous
+            .lifecycle_revision
+            .checked_add(1)
+            .ok_or(SkillError::RevisionConflict)?;
         view.validate()?;
+        self.record_view(view.clone())?;
         Ok(view)
     }
 
