@@ -243,6 +243,19 @@ pub struct SealedChildLaunch {
     pub identities: SealedChildIdentities,
 }
 
+/// Child slot plus registry-adjudicated launch inputs for one sealed launch.
+#[derive(Clone, Copy, Debug)]
+pub struct SealedChildInputs<'a> {
+    /// Plan work item to launch; must sit in the sealed denominator.
+    pub item: &'a WorkItem,
+    /// Registry launch request projected by the caller.
+    pub request: &'a RegistryLaunchRequest<'a>,
+    /// Registry route adjudication projected by the caller.
+    pub registry: &'a RegistryRouteAdjudication<'a>,
+    /// Prior dispatch for exact-replay reconciliation, if any.
+    pub prior: Option<&'a DispatchedLaunch>,
+}
+
 /// Launches one child of a sealed plan through the admitted registry path
 /// and binds the sealed identities.
 ///
@@ -260,19 +273,23 @@ pub fn launch_sealed_child(
     executor: &dyn WorkExecutor,
     plan: &AdmittedSwarmPlan,
     attachment: &DurableJobAttachment,
-    item: &WorkItem,
-    request: &RegistryLaunchRequest<'_>,
-    registry: &RegistryRouteAdjudication<'_>,
-    prior: Option<&DispatchedLaunch>,
+    inputs: SealedChildInputs<'_>,
 ) -> Result<SealedChildLaunch, SwarmError> {
-    plan.check_child_slot(&item.work_item_id)?;
+    plan.check_child_slot(&inputs.item.work_item_id)?;
     if plan.revision() != attachment.plan_revision()
         || plan.provider_binding().state_fence_digest.as_str() != attachment.state_fence_digest()
     {
         return Err(SwarmError::StaleLineage);
     }
-    let launch =
-        launch_admitted_child(store, executor, attachment, item, request, registry, prior)?;
+    let launch = launch_admitted_child(
+        store,
+        executor,
+        attachment,
+        inputs.item,
+        inputs.request,
+        inputs.registry,
+        inputs.prior,
+    )?;
     let identities = verify_sealed_dispatch(plan, attachment, &launch.launch)?;
     Ok(SealedChildLaunch { launch, identities })
 }
@@ -345,21 +362,9 @@ impl<'a, P: SwarmPlanAttachmentConsumerPort> SwarmLaunchContour<'a, P> {
         &self,
         plan: &AdmittedSwarmPlan,
         attachment: &DurableJobAttachment,
-        item: &WorkItem,
-        request: &RegistryLaunchRequest<'_>,
-        registry: &RegistryRouteAdjudication<'_>,
-        prior: Option<&DispatchedLaunch>,
+        inputs: SealedChildInputs<'_>,
     ) -> Result<SealedChildLaunch, SwarmError> {
-        launch_sealed_child(
-            self.store,
-            self.executor,
-            plan,
-            attachment,
-            item,
-            request,
-            registry,
-            prior,
-        )
+        launch_sealed_child(self.store, self.executor, plan, attachment, inputs)
     }
 }
 
