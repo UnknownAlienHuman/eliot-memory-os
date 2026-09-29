@@ -16,9 +16,11 @@ use eliot_installation::{
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass,
+    ProfileRootAnchors, ProfileSelectionInput, ProfileSelectionResolution,
     RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
     parse_installation_transaction_id, post_bootstrap_rejection_pending_ref,
     require_published_source_bundle_journal, validate_installation_transaction_json,
+    current_user_local_app_data_root, protected_program_data_root,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_live_canary::{
@@ -246,6 +248,25 @@ enum InstallationCommand {
         /// Optional exact transaction store to create from this planner output.
         #[arg(long, value_parser = absolute_path)]
         store: Option<PathBuf>,
+    },
+    /// Resolve the I3.1 four-root profile binding without mutating the selected roots.
+    ResolveProfile {
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        #[arg(long)]
+        installation_key: Option<String>,
+        #[arg(long)]
+        component: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        generation: Option<String>,
+        #[arg(long, value_parser = absolute_path)]
+        source_root: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        staging_root: PathBuf,
     },
     /// Validate an immutable v8 installation plan JSON without applying it (untrusted import/validation only).
     Plan {
@@ -2042,6 +2063,25 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             );
             Ok(INVALID_REQUEST_EXIT)
         }
+        InstallationCommand::ResolveProfile {
+            profile,
+            profile_anchor_root,
+            installation_key,
+            component,
+            version,
+            generation,
+            source_root,
+            staging_root,
+        } => run_installation_resolve_profile(ResolveProfileRequest {
+            profile,
+            profile_anchor_root,
+            installation_key,
+            component,
+            version,
+            generation,
+            source_root,
+            staging_root,
+        }),
         InstallationCommand::Plan { input } => {
             let bytes = match load_input(&input) {
                 Ok(bytes) => bytes,
@@ -2406,6 +2446,8 @@ fn run_installation_generate(
     output: PathBuf,
     store_path: PathBuf,
     source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
+    profile_selection: ProfileSelectionInput,
+    profile_resolution: ProfileSelectionResolution,
     agent_bridge_source: Option<Box<eliot_installation::AgentBridgeSourceMaterializationPlan>>,
 ) -> Result<InstallationGenerationOutcome> {
     run_installation_generate_with_output_writer(
@@ -2431,6 +2473,8 @@ fn run_installation_generate(
         output,
         store_path,
         source_publication,
+        profile_selection,
+        profile_resolution,
         write_transaction_artifact,
     )
 }
@@ -2440,13 +2484,17 @@ fn run_installation_generate_with_output_writer<F>(
     output: PathBuf,
     store_path: PathBuf,
     source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
+    profile_selection: ProfileSelectionInput,
+    profile_resolution: ProfileSelectionResolution,
     write_output: F,
 ) -> Result<InstallationGenerationOutcome>
 where
     F: FnOnce(&Path, &InstallationTransaction) -> Result<(), std::io::Error>,
 {
-    let transaction = match GenerationPackagePlanner::plan_with_source_publication_binding(
+    let transaction = match GenerationPackagePlanner::plan_with_published_profile_binding(
         input,
+        &profile_selection,
+        &source_publication.profile_governed_roots,
         source_publication.source_identity,
         source_publication.files,
         source_publication.evidence_digest,
@@ -2510,6 +2558,7 @@ where
             "generation": transaction.candidate_manifest.generation,
             "profile": transaction.profile,
             "effect_count": transaction.effect_progress().len(),
+            "profile_governance": installation_profile_governance_projection(&transaction),
             "package_file_count": transaction
                 .installer_effects
                 .iter()
@@ -2644,6 +2693,24 @@ fn run_installation_materialize_source_bundle(
     agent_bridge_exe: Option<PathBuf>,
     agent_bridge_account: Option<String>,
 ) -> Result<i32> {
+    let profile_selection = profile_selection_input(ResolveProfileRequest {
+        profile,
+        profile_anchor_root: profile_anchor_root.clone(),
+        installation_key: installation_key.clone(),
+        component: "eliot".to_owned(),
+        version: VERSION.to_owned(),
+        generation: Some(generation.clone()),
+        source_root: output_bundle.clone(),
+        staging_root: staging_root.clone(),
+    })?;
+    let profile_resolution = GenerationPackagePlanner::resolve_profile_selection(&profile_selection)?;
+    for (path, field) in [(&store, "store"), (&output, "output")] {
+        let target = path.to_string_lossy();
+        profile_resolution
+            .roots
+            .admits_write_target(target.as_ref())
+            .map_err(|error| anyhow::anyhow!("{field} is outside the selected profile write contour: {error}"))?;
+    }
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
         eliot_watchdog_exe: eliot_watchdog,
@@ -2666,12 +2733,7 @@ fn run_installation_materialize_source_bundle(
             lineage_id: cli_handle(lineage_id.clone(), "lineage_id")?,
             sequence,
         },
-        profile,
-        profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
-        installation_key: installation_key
-            .clone()
-            .map(|value| cli_handle(value, "installation_key"))
-            .transpose()?,
+        profile_selection: profile_selection.clone(),
         transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
         staging_root: cli_path_handle(&staging_root, "staging_root")?,
     };
@@ -2712,6 +2774,13 @@ fn run_installation_materialize_source_bundle(
             }
         };
     let source_publication = receipt.planner_binding()?;
+    if source_publication.profile_governed_roots != profile_resolution.roots {
+        write_installation_error(
+            "INSTALLATION_GENERATION_PROFILE_BINDING_REJECTED",
+            "source publication retained roots differ from the CLI's pre-effect profile selection",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
     let agent_bridge_source =
         source_bundle_materializer::bridge_source_plan_for_receipt(&materialize_input, &receipt)?;
     let generated = run_installation_generate(
@@ -2730,6 +2799,8 @@ fn run_installation_materialize_source_bundle(
         output,
         store,
         source_publication,
+        profile_selection,
+        profile_resolution,
         agent_bridge_source,
     )?;
     match generated {
@@ -3961,6 +4032,7 @@ fn print_transaction_projection(
         .or_else(|| outcome.map(installation_outcome_status))
         .unwrap_or(status);
     let completed = installation_projection_completed(transaction.stage());
+    let profile_governance = installation_profile_governance_projection(transaction);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -3973,6 +4045,7 @@ fn print_transaction_projection(
             "stage": transaction.stage(),
             "revision": transaction.revision(),
             "completed": completed,
+            "profile_governance": profile_governance,
             "outcome": outcome_value,
             "staging": staging.map(|value| {
                 json!({
@@ -4127,6 +4200,166 @@ fn cli_path_handle(path: &Path, field: &str) -> Result<PlatformHandle> {
         anyhow::bail!("{field} must be absolute");
     }
     cli_handle(path.to_string_lossy().into_owned(), field)
+}
+
+struct ResolveProfileRequest {
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    installation_key: Option<String>,
+    component: String,
+    version: String,
+    generation: Option<String>,
+    source_root: PathBuf,
+    staging_root: PathBuf,
+}
+
+fn profile_selection_input(
+    request: ResolveProfileRequest,
+) -> Result<ProfileSelectionInput, InstallationError> {
+    let path_handle = |path: &Path, field: &'static str| {
+        cli_path_handle(path, field).map_err(|error| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        })
+    };
+    let anchor_handle = |path: &Path, field: &'static str| {
+        path_handle(path, field)
+    };
+    let local_app_data_path = current_user_local_app_data_root()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let local_app_data = anchor_handle(&local_app_data_path, "local_app_data")?;
+    let named_anchor = anchor_handle(&request.profile_anchor_root, "profile_anchor_root")?;
+    let (anchors, profile_anchor_root) = match request.profile {
+        InstallationProfile::SystemService => {
+            let program_data_path = protected_program_data_root()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            if !eliot_platform_windows::windows_paths_equal(
+                &request.profile_anchor_root,
+                &program_data_path,
+            ) {
+                return Err(InstallationError::ProfileViolation(
+                    "system_service profile_anchor_root must equal the OS-resolved ProgramData contour"
+                        .to_owned(),
+                ));
+            }
+            let program_files_path = eliot_platform_windows::program_files_root()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            (
+                ProfileRootAnchors {
+                    program_files: Some(anchor_handle(&program_files_path, "program_files")?),
+                    program_data: Some(anchor_handle(&program_data_path, "program_data")?),
+                    local_app_data,
+                    repository_root: None,
+                },
+                named_anchor,
+            )
+        }
+        InstallationProfile::UserMode => {
+            if !eliot_platform_windows::windows_paths_equal(
+                &request.profile_anchor_root,
+                &local_app_data_path,
+            ) {
+                return Err(InstallationError::ProfileViolation(
+                    "user_mode profile_anchor_root must equal the OS-resolved current-user LocalAppData contour"
+                        .to_owned(),
+                ));
+            }
+            (
+                ProfileRootAnchors {
+                    program_files: None,
+                    program_data: None,
+                    local_app_data,
+                    repository_root: None,
+                },
+                named_anchor,
+            )
+        }
+        InstallationProfile::PortableDev => (
+            ProfileRootAnchors {
+                program_files: None,
+                program_data: None,
+                local_app_data,
+                repository_root: Some(named_anchor.clone()),
+            },
+            named_anchor,
+        ),
+    };
+    let installation_key = request
+        .installation_key
+        .map(|value| {
+            PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+                field: "installation_key".to_owned(),
+                reason: error.to_string(),
+            })
+        })
+        .transpose()?;
+    Ok(ProfileSelectionInput {
+        profile: request.profile,
+        anchors,
+        profile_anchor_root,
+        installation_key,
+        component: request.component,
+        version: request.version,
+        generation: request.generation,
+        source_root: path_handle(&request.source_root, "source_root")?,
+        staging_root: path_handle(&request.staging_root, "staging_root")?,
+    })
+}
+
+fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i32> {
+    let selection = match profile_selection_input(request) {
+        Ok(selection) => selection,
+        Err(error) => {
+            write_installation_error("INSTALLATION_PROFILE_RESOLUTION_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let resolution = match GenerationPackagePlanner::resolve_profile_selection(&selection) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            write_installation_error("INSTALLATION_PROFILE_RESOLUTION_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "PROFILE_RESOLVED",
+            "profile": resolution.governance.profile,
+            "supervision": resolution.governance.supervision,
+            "root_roles": resolution.governance.roots,
+            "profile_roots": resolution.roots,
+            "enforced_guarantees": resolution.governance.enforced_guarantees,
+            "unsupported_guarantees": resolution.governance.unsupported_guarantees,
+            "no_service_authority_proof": resolution.no_service_authority_proof,
+            "scope": INSTALLATION_SCOPE,
+            "mutated": false,
+        }))?
+    );
+    Ok(0)
+}
+
+fn installation_profile_governance_projection(
+    transaction: &InstallationTransaction,
+) -> serde_json::Value {
+    match transaction.rehydrate_profile_binding() {
+        Ok(resolution) => json!({
+            "state": "REHYDRATED",
+            "profile": resolution.governance.profile,
+            "supervision": resolution.governance.supervision,
+            "root_roles": resolution.governance.roots,
+            "profile_roots": resolution.roots,
+            "enforced_guarantees": resolution.governance.enforced_guarantees,
+            "unsupported_guarantees": resolution.governance.unsupported_guarantees,
+            "no_service_authority_proof": resolution.no_service_authority_proof,
+        }),
+        Err(error) => json!({
+            "state": "REHYDRATION_REFUSED",
+            "reason": error.to_string(),
+        }),
+    }
 }
 
 /// Writes a create-new diagnostic projection of the already committed plan.
