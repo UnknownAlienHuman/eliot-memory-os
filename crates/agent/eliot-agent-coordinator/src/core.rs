@@ -553,11 +553,11 @@ fn offer_class_head(
     // the item keeps its canonical enqueue ordinal, and this pull publishes no
     // disposition for it.
     let mut owed = 0usize;
-    for (_, attempt) in view.ready.iter() {
+    for (_, attempt) in &view.ready {
         let block = item_block(view, attempt, context.profile);
-        let over_age = block.as_ref().is_some_and(|block| {
-            block.reason == ReadyItemSkipReason::ClassDeadlineCeiling
-        });
+        let over_age = block
+            .as_ref()
+            .is_some_and(|block| block.reason == ReadyItemSkipReason::ClassDeadlineCeiling);
         if over_age && context.profile.age_rule == WorkClassAgeRule::Rebuildable {
             view.scanned += 1;
             view.skipped += 1;

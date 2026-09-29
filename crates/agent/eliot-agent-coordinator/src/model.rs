@@ -1458,12 +1458,10 @@ impl SchedulingProfile {
     /// silently inheriting a rule.
     fn fixed_age_rule(work_class: WorkClass) -> Option<WorkClassAgeRule> {
         match work_class {
-            WorkClass::Normal(NormalWorkClass::NormalBackground)
-            | WorkClass::Normal(NormalWorkClass::Reporting) => {
+            WorkClass::Normal(NormalWorkClass::NormalBackground | NormalWorkClass::Reporting) => {
                 Some(WorkClassAgeRule::Rebuildable)
             }
-            WorkClass::Control
-            | WorkClass::Normal(
+            WorkClass::Normal(
                 NormalWorkClass::Interactive
                 | NormalWorkClass::Verification
                 | NormalWorkClass::CanonicalWrite
@@ -1471,6 +1469,7 @@ impl SchedulingProfile {
                 | NormalWorkClass::Swarm,
             ) => Some(WorkClassAgeRule::Preserve),
             WorkClass::Normal(NormalWorkClass::Maintenance) => None,
+            WorkClass::Control => Some(WorkClassAgeRule::Preserve),
         }
     }
 
