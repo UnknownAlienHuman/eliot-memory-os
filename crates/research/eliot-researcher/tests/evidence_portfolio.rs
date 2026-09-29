@@ -230,7 +230,13 @@ fn issued_evaluation(
     })
     .expect("owner issuer");
     issuer
-        .issue_for(account, records, manifest, frozen_scope_digest, ASSESSMENT_MS)
+        .issue_for(
+            account,
+            records,
+            manifest,
+            frozen_scope_digest,
+            ASSESSMENT_MS,
+        )
         .expect("owner-issued evaluation")
 }
 
@@ -309,12 +315,8 @@ fn proven_absence() -> (
         revision: 1,
     })
     .expect("authorized manifest");
-    let evaluation = issued_evaluation(
-        &account,
-        &records,
-        &manifest,
-        &inquiry.denominator_digest(),
-    );
+    let evaluation =
+        issued_evaluation(&account, &records, &manifest, &inquiry.denominator_digest());
     (account, records, manifest, evaluation)
 }
 

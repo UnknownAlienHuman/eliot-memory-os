@@ -2887,7 +2887,7 @@ fn vetted_records(records: &[SourceAdmissibilityRecord]) -> BTreeMap<String, Sou
 ///
 /// # Which owner values this seam still needs, and why they are absent
 ///
-/// #2893 item 12 asks that final NO_MATCH/closure be connected here once the
+/// #2893 item 12 asks that final `NO_MATCH`/closure be connected here once the
 /// evidence record exists. The closure gate is already in place and is not what
 /// blocks it: `terminal_disposition` refuses any closing disposition unless
 /// `all_closed` and `denominator_kind.supports_scoped_absence()`, and
