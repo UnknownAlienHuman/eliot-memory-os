@@ -143,6 +143,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eliot_bootstrap::capture::{WorkspaceInstanceFacts, observe_workspace_instance};
 use eliot_contracts::sha256_hex;
@@ -152,6 +153,10 @@ use eliot_governor::{
     WorkScopeDescriptor, derive_observed_resources,
 };
 use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
+use eliot_ors::{
+    OrsError, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner,
+    ScanDisclosureStageOutcome,
+};
 use eliot_observation::TaskSelectionEvidence;
 use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
@@ -175,6 +180,331 @@ pub struct ColdStartDiscoveryInput {
     pub lease: DiscoveryReadLease,
     pub key: DiscoveryLeaseKey,
     pub discovery: BootstrapDiscoveryInputs,
+}
+
+const SCAN_DISCLOSURE_OWNER_OPERATION: &str = "scan_disclosure_owner";
+const SCAN_DISCLOSURE_OWNER_WIRE_VERSION: u16 = 1;
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScanDisclosureOwnerRpcRequest<'a> {
+    wire_version: u16,
+    application_connection_id: &'a str,
+    activation_ticket_id: &'a str,
+    #[serde(flatten)]
+    action: ScanDisclosureOwnerRpcAction<'a>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum ScanDisclosureOwnerRpcAction<'a> {
+    IssueContour,
+    IssueBinding,
+    Stage {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        record: &'a ScanDisclosureOrsRecord,
+    },
+    Commit {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        operation_key: &'a str,
+        request_hash: &'a str,
+        writer_receipt: &'a str,
+    },
+    Load {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        operation_key: &'a str,
+    },
+    Retire {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        operation_key: &'a str,
+        request_hash: &'a str,
+        policy_revision: u64,
+        successor_ref: Option<&'a str>,
+    },
+    List {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        limit: u16,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanDisclosureOwnerRpcResponse {
+    wire_version: u16,
+    #[serde(flatten)]
+    result: ScanDisclosureOwnerRpcResult,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+enum ScanDisclosureOwnerRpcResult {
+    Contour {
+        contour: KernelScanDisclosureContour,
+    },
+    Binding {
+        binding: eliot_workscope::ScanDisclosureOwnerBinding,
+    },
+    Staged {
+        stored: bool,
+        record: Option<ScanDisclosureOrsRecord>,
+    },
+    Record {
+        record: Option<ScanDisclosureOrsRecord>,
+    },
+    Records {
+        records: Vec<ScanDisclosureOrsRecord>,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelScanDisclosureContour {
+    installation_id: String,
+    ors_object_ref: String,
+    ors_generation: u64,
+}
+
+/// Daemon-side `ScanDisclosureRecordOwner` adapter. Every method crosses the
+/// existing authenticated Kernel client; no ORS object or in-process trait
+/// handle is passed into eliotd.
+pub(crate) struct KernelScanDisclosureRecordOwner {
+    kernel: Arc<super::DaemonKernelClient>,
+    application_connection_id: String,
+    activation_ticket_id: String,
+    binding: eliot_workscope::ScanDisclosureOwnerBinding,
+}
+
+impl KernelScanDisclosureRecordOwner {
+    pub(crate) fn new(
+        kernel: Arc<super::DaemonKernelClient>,
+        application_connection_id: String,
+        activation_ticket_id: String,
+        binding: eliot_workscope::ScanDisclosureOwnerBinding,
+    ) -> Self {
+        Self {
+            kernel,
+            application_connection_id,
+            activation_ticket_id,
+            binding,
+        }
+    }
+
+    fn request(
+        &self,
+        action: ScanDisclosureOwnerRpcAction<'_>,
+    ) -> Result<ScanDisclosureOwnerRpcResult, OrsError> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id: &self.application_connection_id,
+            activation_ticket_id: &self.activation_ticket_id,
+            action,
+        })
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let value = self
+            .kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let response: ScanDisclosureOwnerRpcResponse = serde_json::from_value(value)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err(OrsError::Contract(
+                "unsupported scan-disclosure owner response version".to_owned(),
+            ));
+        }
+        Ok(response.result)
+    }
+
+    /// Obtains the installation contour through the authenticated Kernel
+    /// route. ORS generation is never supplied by this daemon call.
+    pub(crate) fn issue_contour(
+        kernel: &super::DaemonKernelClient,
+        application_connection_id: &str,
+        activation_ticket_id: &str,
+    ) -> Result<eliot_governor::InstallationScanContour, String> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id,
+            activation_ticket_id,
+            action: ScanDisclosureOwnerRpcAction::IssueContour,
+        })
+        .map_err(|error| error.to_string())?;
+        let value = kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| error.to_string())?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err("unsupported scan-disclosure owner response version".to_owned());
+        }
+        match response.result {
+            ScanDisclosureOwnerRpcResult::Contour { contour } => {
+                eliot_governor::InstallationScanContour::bind(
+                    contour.installation_id,
+                    contour.ors_object_ref,
+                    contour.ors_generation,
+                )
+                .map_err(|error| error.to_string())
+            }
+            _ => Err("Kernel returned the wrong scan-disclosure owner result".to_owned()),
+        }
+    }
+
+    /// Requests a Kernel-issued scan binding. The caller supplies no binding
+    /// fields; the authenticated Kernel route must derive them from current
+    /// retained owners or return its typed missing-owner refusal.
+    pub(crate) fn issue_binding(
+        kernel: &super::DaemonKernelClient,
+        application_connection_id: &str,
+        activation_ticket_id: &str,
+    ) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, String> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id,
+            activation_ticket_id,
+            action: ScanDisclosureOwnerRpcAction::IssueBinding,
+        })
+        .map_err(|error| error.to_string())?;
+        let value = kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| error.to_string())?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err("unsupported scan-disclosure owner response version".to_owned());
+        }
+        match response.result {
+            ScanDisclosureOwnerRpcResult::Binding { binding } => Ok(binding),
+            _ => Err("Kernel returned the wrong scan-disclosure owner result".to_owned()),
+        }
+    }
+}
+
+impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
+    fn stage_scan_disclosure(
+        &self,
+        record: &ScanDisclosureOrsRecord,
+    ) -> Result<ScanDisclosureStageOutcome, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Stage {
+            binding: &self.binding,
+            record,
+        })? {
+            ScanDisclosureOwnerRpcResult::Staged {
+                stored: true,
+                record: None,
+            } => Ok(ScanDisclosureStageOutcome::Stored),
+            ScanDisclosureOwnerRpcResult::Staged {
+                stored: false,
+                record: Some(record),
+            } => Ok(ScanDisclosureStageOutcome::AlreadyBound(Box::new(record))),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure stage result".to_owned(),
+            )),
+        }
+    }
+
+    fn commit_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        writer_receipt: &str,
+    ) -> Result<Option<ScanDisclosureOrsRecord>, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Commit {
+            binding: &self.binding,
+            operation_key,
+            request_hash,
+            writer_receipt,
+        })? {
+            ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure commit result".to_owned(),
+            )),
+        }
+    }
+
+    fn load_scan_disclosure(
+        &self,
+        operation_key: &str,
+    ) -> Result<Option<ScanDisclosureOrsRecord>, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Load {
+            binding: &self.binding,
+            operation_key,
+        })? {
+            ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure load result".to_owned(),
+            )),
+        }
+    }
+
+    fn retire_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        policy_revision: u64,
+        successor_ref: Option<&str>,
+    ) -> Result<Option<ScanDisclosureOrsRecord>, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Retire {
+            binding: &self.binding,
+            operation_key,
+            request_hash,
+            policy_revision,
+            successor_ref,
+        })? {
+            ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure retire result".to_owned(),
+            )),
+        }
+    }
+
+    fn list_scan_disclosures(
+        &self,
+        installation_id: &str,
+        limit: u16,
+    ) -> Result<Vec<ScanDisclosureOrsRecord>, OrsError> {
+        if installation_id != self.binding.installation_id {
+            return Err(OrsError::Contract(
+                "scan-disclosure list installation conflicts with its owner binding".to_owned(),
+            ));
+        }
+        match self.request(ScanDisclosureOwnerRpcAction::List {
+            binding: &self.binding,
+            limit,
+        })? {
+            ScanDisclosureOwnerRpcResult::Records { records } => Ok(records),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure list result".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Requests a current contour through the same authenticated Kernel owner
+/// route used by the durable record adapter.
+pub(crate) fn request_scan_disclosure_contour(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+) -> Result<eliot_governor::InstallationScanContour, String> {
+    KernelScanDisclosureRecordOwner::issue_contour(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+    )
+}
+
+/// Requests the authenticated Kernel owner to derive the scan binding from
+/// retained session, workspace, privacy, lease and task-selection evidence.
+pub(crate) fn request_scan_disclosure_binding(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, String> {
+    KernelScanDisclosureRecordOwner::issue_binding(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+    )
 }
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
