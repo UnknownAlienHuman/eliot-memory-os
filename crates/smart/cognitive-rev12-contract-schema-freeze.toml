@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r8"
-revision = 8
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7"
-supersedes_freeze_digest = "sha256:cab58a4cd3536ee407b1655c07a3a122fe2ae0f45e3ccabf447eb9a606b675c5"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r9"
+revision = 9
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r8"
+supersedes_freeze_digest = "sha256:154f56c186eb2353bb907e1c15fcbc7b8d50a104cf8757022a9bd40ae4abade0"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -40,6 +40,35 @@ changed = "one denominator_note: eliot-memory-projection-contracts::ProjectionCo
 reason = "r7 stated a lower bound that omitted the resume frontier and was therefore not a completeness proof; the delivered owner code already enforced the exact disjoint three-way accounting this note now states."
 unchanged = "all frozen_type field lists, all enums, all denominator ids, all cell bindings, all [[bound]] rows, proof_ceiling, implementation_support, and evidence_execution_status"
 issue = "#196"
+
+# r9 is the eliot-cue-contracts field-level contract. It was authored on a branch
+# whose merge base predated the r8 above, so it was first written as a candidate
+# also numbered r8. On rebase onto current main that numbering collided with the
+# already-published r8, and the honest resolution is what this note records: r9
+# supersedes the published r8 above, and the r8 that was drafted in parallel is
+# retired in favour of it rather than published under a duplicate identity. The
+# r8 [revision_note] block above is left in place because it is a true statement
+# about a candidate that really was published on main; nothing here edits it.
+#
+# r9 adds no new Rust owner and invents no type. It states, field by field, what
+# crates/smart/eliot-cue-contracts already declares: the exact defining owner,
+# the wire spelling the current serde attributes produce, requiredness and the
+# meaning of an absent optional, the numeric bound or closed variant set the
+# owner crate itself checks, the identity/scope/fence/revision binding, a
+# path.rs::symbol validator anchor, a typed error variant, and the
+# compatibility/invalidation rule. Every expected set a completeness claim names
+# is declared by the owner crate, so this file states no Complete claim of its
+# own. The seven cue concerns stay seven distinct types: observed source,
+# canonical identity, comparison key, admitted binding, snapshot membership,
+# direct match and relation-derived activation.
+[revision_note_r9]
+revision = 9
+supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r8"
+changed = "adds the field-level contract for the eliot-cue-contracts family: 19 [[field_contract]] type rows, 103 [[field_contract_field]] field rows and 5 [[completeness_rule]] rows, plus [[field_contract_rule]]"
+reason = "The seven cue concerns were frozen at type level only, so a downstream implementation agent received function names rather than field semantics. r9 states the field contract over the types the crate already defines, and names no new owner."
+unchanged = "every [[frozen_type]] row, every enum list, every [[denominator]] id, every [[cell_binding]] order, every [[bound]] row, proof_ceiling, implementation_support and evidence_execution_status. The r8 denominator_note correction is preserved verbatim, not re-derived."
+retired_parallel_candidate = "A candidate also numbered r8 was drafted on a branch whose merge base predated the published r8. It is superseded by this r9 and is not published under a duplicate revision identity."
+issue = "#261"
 
 # Historical cell numbers 69, 70, 72, 73, 75 (original #223 record) have no
 # referent in the current topology: cognitive-crate-decisions.toml assigns
@@ -699,6 +728,1565 @@ crate = "eliot-memory-curation-contracts"
 rust_path = "eliot_memory_curation_contracts enums"
 fields = ["CurationDimension{Existence, Support, Lifecycle, Accessibility, PermittedInfluence}", "DimensionOutcome{Clear, Flagged, Protected, Unknown, Reference}", "MemberDisposition{Eligible, Protected, Blocked, PreservedReference, Unprocessed}", "ResultState{Complete, Partial, Blocked, Unknown}", "ProtectionClass{CurrentTruth, MinorityDissent, Counterexample, UnresolvedConflict, NegativeMemory, AuditHistory, RetentionErasure, ProtectedDependency}"]
 denominator_note = "The five curation dimensions are separate verdicts on separate axes and no one of them implies another: existence, support, lifecycle, accessibility and permitted influence each carry their own DimensionOutcome per member, and Clear on one axis never stands in for Unknown on another."
+
+# ---------------------------------------------------------------------------
+# r8 field contract for the eliot-cue-contracts family.
+#
+# Every row below is a field-level statement read from the current defining
+# struct in the named crate. Nothing is invented here: `type_rust_path` is the
+# one defining owner, `wire_name` is the spelling the current serde attributes
+# produce, `validator` and `validation_error` are `path.rs::symbol` anchors
+# that resolve on this freeze's base commit, and `bound_or_variants` names a
+# `[[bound]]` row in this same file or a closed enum declared by the owner.
+#
+# `provenance_privacy` and `invalidation_rule` are declared once per type
+# rather than repeated per field, because in this family every field of a
+# record shares the record's provenance owner and the record's revision
+# invalidation rule. That is a stated scope decision, not an omission:
+# a field that does NOT share its type's rule carries its own
+# `invalidation_rule` key on the field row instead.
+#
+# Rows whose `disposition` is `REFERENCED_NOT_FROZEN` are owner types the r7
+# `[[frozen_type]]` list reaches but does not itself freeze. They are listed
+# here so the gap is visible and countable, never silently omitted.
+# ---------------------------------------------------------------------------
+[field_contract_rule]
+admitted_in_revision = 9
+applies_to = ["eliot-cue-contracts"]
+row_shape = ["field_id", "type_rust_path", "wire_name", "owner_rust_type", "requiredness", "none_meaning", "bound_or_variants", "identity_binding", "validator", "validation_error"]
+type_level_shape = ["type_id", "crate", "type_rust_path", "wire_naming", "validator", "error_family", "provenance_privacy", "invalidation_rule", "disposition"]
+validator_column = "A `path.rs::symbol` anchor naming the real validating function in the defining crate. A row without a resolving validator anchor is a gap and is not counted as frozen."
+validation_error_column = "A variant of the named `error_family`, never a formatted string. A typed failure is never collapsed into a code or a message between layers."
+requiredness_vocabulary = ["REQUIRED", "OPTIONAL_NONE_<meaning>", "EMPTY_SET_ALLOWED", "NOT_APPLICABLE"]
+independent_set_rule = "Every expected set named by bound_or_variants, identity_binding or a completeness claim is declared by the OWNER CRATE, never re-derived here. A completeness check compares an independently declared expected set, never a second copy of the caller's own list."
+no_derived_completeness_rule = "This file states no Complete claim. A Complete claim is reachable only through the validator anchor named on the row, over the denominator named by `denominator_ref`."
+
+# --- eliot_cue_contracts::ObservedCue -------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-OBSERVED"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::ObservedCue"
+disposition = "FROZEN_EXACT"
+wire_naming = "observation.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all, so every wire_name below is byte-identical to the Rust field name and an unknown key is a decode failure."
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::ObservedCue::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Provenance is owned by the nested `source` field only; ObservedCue itself declares no provenance of its own and cannot be read as an authority statement. Disclosure is not widened here: the record carries a handle, a digest and a text value, never target bytes."
+invalidation_rule = "A record written against any retired schema_revision is rejected at decode by VR-CUE-SCHEMA-REVISION; equality only, no range and no negotiation. The `source.digest` shape is 64 lowercase hex and is revalidated, not recomputed, on every read."
+
+[[field_contract_field]]
+field_id = "FC-CUE-OBSERVED.schema_revision"
+type_rust_path = "eliot_cue_contracts::ObservedCue"
+wire_name = "schema_revision"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a missing key fails deserialization because the field is not Option and the struct is deny_unknown_fields"
+bound_or_variants = "string equality against CONTRACT_REVISION 2.0.0 through crates/smart/eliot-cue-contracts/src/lib.rs::is_supported_schema_revision; text bound MAX_TEXT_BYTES 8192 through crates/smart/eliot-cue-contracts/src/bounds.rs::text"
+identity_binding = "record revision binding; it is the only revision field this record carries"
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::ObservedCue::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-OBSERVED.observed_cue_id"
+type_rust_path = "eliot_cue_contracts::ObservedCue"
+wire_name = "observed_cue_id"
+owner_rust_type = "ObservedCueId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the newtype is a validated transparent String, not a nullable identity"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512 as enforced on construction by crates/smart/eliot-cue-contracts/src/identity.rs::validate"
+identity_binding = "identity of THIS observation, and deliberately not interchangeable with CanonicalCueId: existence of an observed identity is not canonical identity and not a match"
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::ObservedCue::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-OBSERVED.kind"
+type_rust_path = "eliot_cue_contracts::ObservedCue"
+wire_name = "kind"
+owner_rust_type = "CueKind"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed enum has no unclassified member"
+bound_or_variants = "closed set serialized as snake_case: file_path, dir_path, symbol, error_signature, command_pattern, dependency, api_surface, task_class, subsystem, concept"
+identity_binding = "no identity; a kind classifies the observation and grants no authority over any target"
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::ObservedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-OBSERVED.original_value"
+type_rust_path = "eliot_cue_contracts::ObservedCue"
+wire_name = "original_value"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; empty text is rejected, so None is never a way to say 'no observed value'"
+bound_or_variants = "MAX_OBSERVED_BYTES 8192, a bound local to ObservedCue::validate and deliberately distinct from the crate-wide MAX_TEXT_BYTES; non-blank and control-character-free"
+identity_binding = "no identity; this is the captured text BEFORE normalization and is never a match result or a normalized spelling"
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::ObservedCue::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-OBSERVED.source"
+type_rust_path = "eliot_cue_contracts::ObservedCue"
+wire_name = "source"
+owner_rust_type = "SourceHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an observation with no source material is not an observation and is not expressible"
+bound_or_variants = "nested target text bound MAX_TEXT_BYTES 8192 and a 64-character digest; the provenance leaves are bounded before the foundation owner validates them"
+identity_binding = "target handle plus content digest of the observed revision; the handle is never the bytes"
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::SourceHandle::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-OBSERVED.context"
+type_rust_path = "eliot_cue_contracts::ObservedCue"
+wire_name = "context"
+owner_rust_type = "CueContext"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an observation with no task, scope, fence, privacy and proof closure is not admitted"
+bound_or_variants = "closed by the nested owner; StateFence and EvidenceEnvelope validate through their own foundation owners"
+identity_binding = "binds task_id, scope_id and state_fence, and the enclosing record is rejected when its source provenance differs from the context evidence provenance"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::Foundation"
+
+# --- eliot_cue_contracts::SourceHandle -------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-SOURCE-HANDLE"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::SourceHandle"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["FC-CUE-OBSERVED.source", "RebuildIdentity.source_denominator"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner through ObservedCue.source and through the snapshot rebuild denominator but does not freeze it as a row of its own, so a consumer reading only the [[frozen_type]] list has no wire contract for it. Recorded, not invented."
+wire_naming = "observation.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::SourceHandle::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "This is the family's only provenance owner on the observed side. It carries a target handle and a content digest, never the observed bytes, so a source reference cannot leak material across the boundary."
+invalidation_rule = "A source whose content digest is not 64 lowercase hexadecimal characters is rejected rather than refreshed. The digest is validated against the recorded value; it is never recomputed from bytes this crate does not hold."
+
+[[field_contract_field]]
+field_id = "FC-CUE-SOURCE-HANDLE.target"
+type_rust_path = "eliot_cue_contracts::SourceHandle"
+wire_name = "target"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unaddressable observation source is not representable"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512; text bound MAX_TEXT_BYTES 8192 rechecked by SourceHandle::validate"
+identity_binding = "immutable handle to the thing the cue points at. The vocabulary never carries target bytes, so accessibility of the target is not implied by holding this handle."
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::SourceHandle::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SOURCE-HANDLE.digest"
+type_rust_path = "eliot_cue_contracts::SourceHandle"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested source is rejected rather than read as current"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, checked against the recorded value and not recomputed"
+identity_binding = "content identity of the observed revision this handle names"
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::SourceHandle::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SOURCE-HANDLE.provenance"
+type_rust_path = "eliot_cue_contracts::SourceHandle"
+wire_name = "provenance"
+owner_rust_type = "Provenance"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unattributed observation source is not admitted"
+bound_or_variants = "each variable leaf bounded by MAX_TEXT_BYTES 8192 through crates/smart/eliot-cue-contracts/src/bounds.rs::provenance before the foundation owner scans it; raw_handle and revision are the two optional leaves"
+identity_binding = "capture route, scope and optional revision for the observation; the enclosing ObservedCue is rejected when this differs from the context evidence provenance"
+validator = "crates/smart/eliot-cue-contracts/src/observation.rs::SourceHandle::validate"
+validation_error = "CueContractError::Foundation"
+
+# --- eliot_cue_contracts::CueContext ---------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-CONTEXT"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::CueContext"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["FC-CUE-OBSERVED.context"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner only as a nested field and does not freeze it as a row of its own. Recorded, not invented."
+wire_naming = "context.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "PrivacyClass and ProofCeiling are declared here once for the whole family, so a cue record cannot widen its own disclosure class or its own proof interpretation. The context is validated without promoting the record."
+invalidation_rule = "The context evidence state_fence must equal the context state_fence; a mismatch is a typed failure, not a silent refresh. An evidence envelope that its own owner rejects is surfaced as CueContractError::Foundation rather than being reinterpreted."
+
+[[field_contract_field]]
+field_id = "FC-CUE-CONTEXT.task_id"
+type_rust_path = "eliot_cue_contracts::CueContext"
+wire_name = "task_id"
+owner_rust_type = "TaskId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a cue with no owning task has no scope to be valid in"
+bound_or_variants = "text bound MAX_TEXT_BYTES 8192 and non-blank"
+identity_binding = "task identity; the cue is usable only inside this task"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CONTEXT.scope_id"
+type_rust_path = "eliot_cue_contracts::CueContext"
+wire_name = "scope_id"
+owner_rust_type = "WorkScopeId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unscoped cue is not admissible"
+bound_or_variants = "text bound MAX_TEXT_BYTES 8192 and non-blank"
+identity_binding = "work scope; distinct from task identity and from the state fence"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CONTEXT.state_fence"
+type_rust_path = "eliot_cue_contracts::CueContext"
+wire_name = "state_fence"
+owner_rust_type = "StateFence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unfenced cue is not admissible"
+bound_or_variants = "closed by the foundation fence owner; validated through crates/smart/eliot-contracts (StateFence::validate), never re-implemented here"
+identity_binding = "the state fence the observation was captured at; cross-record acceptance goes through VR-FENCE-GATE and nothing else"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CONTEXT.evidence"
+type_rust_path = "eliot_cue_contracts::CueContext"
+wire_name = "evidence"
+owner_rust_type = "EvidenceEnvelope"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a cue whose evidence envelope is absent is not representable"
+bound_or_variants = "provenance leaves bounded by MAX_TEXT_BYTES 8192; the optional verification block is bounded when present and absent means no verification was performed, not that verification passed"
+identity_binding = "authority, freshness, coverage, epistemic and provenance closure; its state_fence must equal the sibling state_fence"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CONTEXT.lifecycle"
+type_rust_path = "eliot_cue_contracts::CueContext"
+wire_name = "lifecycle"
+owner_rust_type = "LifecycleState"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the physical lifecycle of the referenced material is always stated"
+bound_or_variants = "closed set owned by eliot-evidence; existence of a lifecycle label is not authority to change it"
+identity_binding = "physical lifecycle of the referenced material only; it names no permitted influence and grants none"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CONTEXT.privacy"
+type_rust_path = "eliot_cue_contracts::CueContext"
+wire_name = "privacy"
+owner_rust_type = "PrivacyClass"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unclassified disclosure cannot cross this boundary"
+bound_or_variants = "closed set owned by eliot-security-contracts"
+identity_binding = "disclosure class of the referenced material; it constrains what may leave and never widens it"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CONTEXT.proof_ceiling"
+type_rust_path = "eliot_cue_contracts::CueContext"
+wire_name = "proof_ceiling"
+owner_rust_type = "ProofCeiling"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unbounded proof ceiling is not representable"
+bound_or_variants = "closed set owned by eliot-receipts"
+identity_binding = "maximum proof interpretation available at this boundary; a record cannot raise its own ceiling"
+validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
+validation_error = "CueContractError::Foundation"
+
+# --- eliot_cue_contracts::NormalizedCue ------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-NORMALIZED"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+disposition = "FROZEN_EXACT"
+wire_naming = "normalization.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Provenance is inherited from the nested `observed` record and is not restated here, so a normalized cue cannot claim a different source than the observation it came from."
+invalidation_rule = "The nested profile revision is part of the record: a change to profile_revision invalidates every comparison key derived under it, and the record is rejected rather than re-keyed silently. Schema revision equality is VR-CUE-SCHEMA-REVISION."
+
+[[field_contract_field]]
+field_id = "FC-CUE-NORMALIZED.schema_revision"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+wire_name = "schema_revision"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a missing key is a decode failure"
+bound_or_variants = "string equality against CONTRACT_REVISION 2.0.0 through crates/smart/eliot-cue-contracts/src/lib.rs::is_supported_schema_revision"
+identity_binding = "record revision binding for the normalized form"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-NORMALIZED.observed"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+wire_name = "observed"
+owner_rust_type = "ObservedCue"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a normalization with no observed input is not expressible"
+bound_or_variants = "closed by the nested owner; validated in full, not summarized"
+identity_binding = "the source material this normalization consumed; keeps the observed and canonical seams in separate fields"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-NORMALIZED.profile"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+wire_name = "profile"
+owner_rust_type = "NormalizationProfile"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a normalization with no named policy has no authorized loss to point at"
+bound_or_variants = "profile_revision is a u32 and profile_digest is a 64-character lowercase digest, both validated by the nested owner"
+identity_binding = "the exact versioned policy the normalization ran under; every comparison key on this record must carry an equal profile, and a key under a different profile is rejected"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-NORMALIZED.canonical"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+wire_name = "canonical"
+owner_rust_type = "Option<CanonicalCueIdentity>"
+requiredness = "OPTIONAL_NONE_OUTCOME_COUPLED"
+none_meaning = "None means this observation produced NO single canonical identity. It is admitted only when outcome is Ambiguous or Unsupported, and it is rejected against Lossless or AuthorizedLoss, so an absent identity can never be read as a found one."
+bound_or_variants = "when Some, the nested identity is validated and its kind must equal the observed kind"
+identity_binding = "canonical identity only. It names no target handle and no comparison key, so existence of a canonical identity is not accessibility of a target and not a match."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-NORMALIZED.comparison_keys"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+wire_name = "comparison_keys"
+owner_rust_type = "Vec<ComparisonKey>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means this profile produced no comparable key, which is distinct from having keys that matched nothing"
+bound_or_variants = "MAX_COMPARISON_KEYS 8, a [[bound]] row in this file; comparison_key_id values must be unique within the record and every key's match_mode must be admissible for the canonical kind"
+identity_binding = "comparison keys, which are comparable spellings under one profile and are not identities and not direct matches. Key count is never match count and never reachability."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::DuplicateIdentity"
+
+[[field_contract_field]]
+field_id = "FC-CUE-NORMALIZED.outcome"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+wire_name = "outcome"
+owner_rust_type = "NormalizationOutcome"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the enum has no unclassified member, so an unclassifiable normalization is Unsupported with a reason and never an absent outcome"
+bound_or_variants = "closed set serialized with tag \"code\" as snake_case: lossless, authorized_loss, ambiguous, unsupported. AuthorizedLoss carries a policy_ref String, Ambiguous carries a rivals Vec<CanonicalCueIdentity>, Unsupported carries a reason String"
+identity_binding = "no identity of its own; it constrains the sibling canonical field and is validated against it"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-NORMALIZED.transformation_evidence"
+type_rust_path = "eliot_cue_contracts::NormalizedCue"
+wire_name = "transformation_evidence"
+owner_rust_type = "Vec<TransformationStep>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means the recorded path was lossless and is not the same as an unrecorded path"
+bound_or_variants = "MAX_TRANSFORMATION_STEPS 16, a [[bound]] row in this file; the ordered steps are bounded and are checked against the outcome, so an AuthorizedLoss outcome cannot carry an empty evidence list"
+identity_binding = "ordered evidence of how the observed value became the canonical one; it is provenance of the transformation, not provenance of the source, which stays on `observed`"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+# --- eliot_cue_contracts::NormalizationProfile -----------------------------
+[[field_contract]]
+type_id = "FC-CUE-PROFILE"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::NormalizationProfile"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["FC-CUE-NORMALIZED.profile", "FC-CUE-COMPARISON-KEY.profile", "ActivationRequest.normalization_profile", "ActivationResult.normalization_profile", "RebuildIdentity.normalization_profile"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner as a nested field on three frozen types and on the snapshot rebuild identity, but does not freeze it as a row of its own. Recorded, not invented."
+wire_naming = "normalization.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizationProfile::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries a policy digest and no producer identity beyond it, so a profile reference cannot stand in for evidence of who ran the normalization."
+invalidation_rule = "profile_revision is the invalidation axis: a snapshot built under an earlier profile_revision is not comparable with one built under a later one, and the equality check on the sibling profile fields is what enforces it. There is no migration and no range acceptance."
+
+[[field_contract_field]]
+field_id = "FC-CUE-PROFILE.profile_id"
+type_rust_path = "eliot_cue_contracts::NormalizationProfile"
+wire_name = "profile_id"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unnamed profile has no policy to authorize anything"
+bound_or_variants = "text bound MAX_TEXT_BYTES 8192 and non-blank"
+identity_binding = "stable profile name; the name alone carries no revision meaning, the sibling revision does"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizationProfile::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-PROFILE.profile_revision"
+type_rust_path = "eliot_cue_contracts::NormalizationProfile"
+wire_name = "profile_revision"
+owner_rust_type = "u32"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unrevisioned profile is not representable"
+bound_or_variants = "u32, compared by exact equality between a record and its keys; no range and no negotiation"
+identity_binding = "the revision that invalidates every comparison key and every snapshot derived under an earlier value"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizationProfile::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-PROFILE.digest"
+type_rust_path = "eliot_cue_contracts::NormalizationProfile"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested policy definition is rejected"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, validated against the recorded value"
+identity_binding = "content identity of the policy definition the revision names"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizationProfile::validate"
+validation_error = "CueContractError::InvalidText"
+
+# --- eliot_cue_contracts::CanonicalCueIdentity ----------------------------
+[[field_contract]]
+type_id = "FC-CUE-CANONICAL"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::CanonicalCueIdentity"
+disposition = "FROZEN_EXACT"
+wire_naming = "normalization.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::CanonicalCueIdentity::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries no provenance of its own. A canonical identity is a naming artifact: it is not evidence that anything exists, is supported, is accessible or may be influenced."
+invalidation_rule = "A change to canonical_value changes the identity content and invalidates every comparison key, binding candidate and snapshot member that referenced the earlier digest. The digest is validated against the recorded value, never recomputed from a caller-supplied list."
+
+[[field_contract_field]]
+field_id = "FC-CUE-CANONICAL.canonical_cue_id"
+type_rust_path = "eliot_cue_contracts::CanonicalCueIdentity"
+wire_name = "canonical_cue_id"
+owner_rust_type = "CanonicalCueId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the newtype is validated on construction, not nullable"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512"
+identity_binding = "canonical identity, distinct by type from ObservedCueId; the two are never interchangeable"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::CanonicalCueIdentity::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CANONICAL.kind"
+type_rust_path = "eliot_cue_contracts::CanonicalCueIdentity"
+wire_name = "kind"
+owner_rust_type = "CueKind"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no unclassified member"
+bound_or_variants = "closed set serialized as snake_case with the same ten members as the observed kind; the enclosing NormalizedCue rejects a canonical kind that differs from the observed kind"
+identity_binding = "classification of the identity, not a claim about any target"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CANONICAL.canonical_value"
+type_rust_path = "eliot_cue_contracts::CanonicalCueIdentity"
+wire_name = "canonical_value"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an identity with no canonical value is not representable"
+bound_or_variants = "text bound MAX_TEXT_BYTES 8192 and non-blank; it is the profile-normalized spelling, retained exactly and never replaced by a comparison key"
+identity_binding = "the exact canonical spelling this identity names; it is not a match and not a target"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::CanonicalCueIdentity::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-CANONICAL.digest"
+type_rust_path = "eliot_cue_contracts::CanonicalCueIdentity"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested identity is rejected"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, validated against the recorded value and not recomputed here"
+identity_binding = "content identity of the canonical value, used for invalidation of derived records"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::CanonicalCueIdentity::validate"
+validation_error = "CueContractError::InvalidText"
+
+# --- eliot_cue_contracts::ComparisonKey ------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-COMPARISON-KEY"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::ComparisonKey"
+disposition = "FROZEN_EXACT"
+wire_naming = "normalization.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::ComparisonKey::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries the profile that produced it and no independent provenance. A key is a spelling, so it can neither disclose nor attest anything on its own."
+invalidation_rule = "Bound to exactly one NormalizationProfile. A key whose profile differs from its record's profile is rejected, and a key whose canonical identity digest changed is stale by the identity invalidation rule above."
+
+[[field_contract_field]]
+field_id = "FC-CUE-COMPARISON-KEY.comparison_key_id"
+type_rust_path = "eliot_cue_contracts::ComparisonKey"
+wire_name = "comparison_key_id"
+owner_rust_type = "ComparisonKeyId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the newtype is validated on construction"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512; unique within the enclosing record"
+identity_binding = "identity of one comparable spelling, distinct by type from CanonicalCueId"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::ComparisonKey::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-COMPARISON-KEY.profile"
+type_rust_path = "eliot_cue_contracts::ComparisonKey"
+wire_name = "profile"
+owner_rust_type = "NormalizationProfile"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a key with no policy is not comparable with anything"
+bound_or_variants = "exact equality against the enclosing record's profile, including profile_revision and digest"
+identity_binding = "the policy revision that produced and constrains this key; the invalidation axis for every key"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-COMPARISON-KEY.key_value"
+type_rust_path = "eliot_cue_contracts::ComparisonKey"
+wire_name = "key_value"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a key with no value is not representable"
+bound_or_variants = "text bound MAX_TEXT_BYTES 8192 and non-blank"
+identity_binding = "the comparable spelling itself. It is not an identity, not a match result and not a target handle."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::ComparisonKey::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-COMPARISON-KEY.form"
+type_rust_path = "eliot_cue_contracts::ComparisonKey"
+wire_name = "form"
+owner_rust_type = "ComparisonForm"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no default form"
+bound_or_variants = "closed set serialized as snake_case: exact, case_insensitive, path_normalized, symbol_qualified"
+identity_binding = "how the value was normalized; it changes what the key can match and is never a confidence or quality value"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::ComparisonKey::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-COMPARISON-KEY.match_mode"
+type_rust_path = "eliot_cue_contracts::ComparisonKey"
+wire_name = "match_mode"
+owner_rust_type = "MatchMode"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no default mode"
+bound_or_variants = "closed set serialized as snake_case: exact, prefix, signature. Admissibility is checked against the canonical kind, so a mode the kind does not admit is rejected."
+identity_binding = "the comparison semantics of the key; a mode is not a permission and grants no influence"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+# --- eliot_cue_contracts::CueBindingCandidate ------------------------------
+[[field_contract]]
+type_id = "FC-CUE-BINDING-CANDIDATE"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+disposition = "FROZEN_EXACT"
+wire_naming = "binding.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries EvidenceFreshness only. It names no producer, no disclosure class and no proof ceiling of its own, so a proposal cannot widen the evidence envelope of the thing it points at."
+invalidation_rule = "This record is a proposal and admits nothing. Admission is carried separately by AdmittedCueBindingProjection with its admission receipt, so a Withheld or Rejected disposition never becomes snapshot membership, and a stale canonical digest invalidates the candidate."
+
+[[field_contract_field]]
+field_id = "FC-CUE-BINDING-CANDIDATE.binding_candidate_id"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+wire_name = "binding_candidate_id"
+owner_rust_type = "BindingCandidateId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the newtype is validated on construction"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512"
+identity_binding = "identity of this proposal, not of any admitted binding"
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-BINDING-CANDIDATE.canonical"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+wire_name = "canonical"
+owner_rust_type = "CanonicalCueIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a binding to no canonical identity is not expressible"
+bound_or_variants = "closed by the nested identity owner, which is validated in full"
+identity_binding = "the canonical side of the proposed binding; validating it proves the spelling is well formed, not that the binding is admitted"
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-BINDING-CANDIDATE.target"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+wire_name = "target"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the target is always a handle, so an unaddressable binding is not representable"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512; text bound MAX_TEXT_BYTES 8192 rechecked here"
+identity_binding = "immutable handle to the proposed target. Holding a proposed handle confers no accessibility and no influence."
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-BINDING-CANDIDATE.role"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+wire_name = "role"
+owner_rust_type = "BindingRole"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no default role"
+bound_or_variants = "closed set serialized as snake_case: names, touched, expected_reuse. ExpectedReuse is a caller expectation and is not evidence of reuse."
+identity_binding = "why the two sides are proposed together; a role is not a permission"
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-BINDING-CANDIDATE.freshness"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+wire_name = "freshness"
+owner_rust_type = "EvidenceFreshness"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unstated freshness is rejected rather than assumed fresh"
+bound_or_variants = "closed set owned by eliot-evidence; it states how fresh the evidence is, not how good the binding is"
+identity_binding = "evidence freshness only. It is separate from existence, support and permitted influence and substitutes for none of them."
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-BINDING-CANDIDATE.disposition"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+wire_name = "disposition"
+owner_rust_type = "BindingDisposition"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no 'undecided' member, so an undecided proposal must state one of the three and cannot pass as pending"
+bound_or_variants = "closed set serialized as snake_case: admitted, withheld, rejected. Admitted here is caller-supplied and is NOT snapshot membership; membership requires the separate AdmittedCueBindingProjection and its admission receipt."
+identity_binding = "the proposal's own decision field; it names no authority and confers none, and the external Governor owns admission"
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-BINDING-CANDIDATE.digest"
+type_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested candidate is rejected"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, validated against the recorded value; the length is rechecked here independently of the Digest newtype"
+identity_binding = "content identity over the candidate's identity-bearing fields, used to detect later change"
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::InvalidText"
+
+# --- eliot_cue_contracts::AdmittedCueBindingProjection ---------------------
+[[field_contract]]
+type_id = "FC-CUE-ADMITTED-BINDING"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::AdmittedCueBindingProjection"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["CueSnapshotBuildCandidate.admitted_bindings", "FC-CUE-BINDING-CANDIDATE.invalidation_rule"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner only as a nested field of the index build candidate and does not freeze it as a row of its own, even though it is the record that actually carries admission. Recorded, not invented."
+wire_naming = "index_projection.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/index_projection.rs::AdmittedCueBindingProjection::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "This is the family's admission record and the only place the admission receipt appears. It carries a ReceiptIdentity, so the admitted state is attributable, and it adds no disclosure class of its own."
+invalidation_rule = "The admission ref pins candidate_id and candidate_digest against the nested candidate. A candidate whose digest changed after admission is rejected rather than silently re-admitted, and a fence mismatch against task_id, scope_id or state_fence is a typed failure."
+
+[[field_contract_field]]
+field_id = "FC-CUE-ADMITTED-BINDING.candidate"
+type_rust_path = "eliot_cue_contracts::AdmittedCueBindingProjection"
+wire_name = "candidate"
+owner_rust_type = "CueBindingCandidate"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an admitted binding with no candidate is not representable"
+bound_or_variants = "closed by the nested owner, validated in full"
+identity_binding = "the exact proposal this admission refers to; the receipt pins its digest, so a later change is detectable"
+validator = "crates/smart/eliot-cue-contracts/src/index_projection.rs::AdmittedCueBindingProjection::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ADMITTED-BINDING.normalized"
+type_rust_path = "eliot_cue_contracts::AdmittedCueBindingProjection"
+wire_name = "normalized"
+owner_rust_type = "NormalizedCue"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an admission with no normalized cue is not representable"
+bound_or_variants = "closed by the nested owner, including the MAX_COMPARISON_KEYS and MAX_TRANSFORMATION_STEPS bounds"
+identity_binding = "the normalized form the admission was decided over, retained so the decision can be rechecked rather than taken on trust"
+validator = "crates/smart/eliot-cue-contracts/src/index_projection.rs::AdmittedCueBindingProjection::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ADMITTED-BINDING.admission"
+type_rust_path = "eliot_cue_contracts::AdmittedCueBindingProjection"
+wire_name = "admission"
+owner_rust_type = "CueBindingAdmissionRef"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; this is the field that makes the record an admission rather than a proposal, and it cannot be absent"
+bound_or_variants = "receipt identity, candidate_id, candidate_digest, task_id, scope_id and state_fence; all bounded and non-blank, and the digest is 64 lowercase hexadecimal characters"
+identity_binding = "the external admission receipt with the exact task, scope and fence the admission was granted under"
+validator = "crates/smart/eliot-cue-contracts/src/index_projection.rs::AdmittedCueBindingProjection::validate"
+validation_error = "CueContractError::Foundation"
+
+# --- eliot_cue_contracts::CueSnapshot --------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-SNAPSHOT"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+disposition = "FROZEN_EXACT"
+wire_naming = "snapshot.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Provenance reaches this record only through RebuildIdentity.source_denominator and through the nested member identities. The snapshot is not editable in place, so a widened disclosure class cannot be written into an existing snapshot."
+invalidation_rule = "Self-validating closure: a snapshot is valid only when its closure reconciles with its members, its source revision and its rebuild inputs. A missing closure, a nonzero or mismatched source_revision, or a drifted source handle is rejected as SnapshotNotRebuildable rather than repaired."
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT.schema_revision"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+wire_name = "schema_revision"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a missing key is a decode failure"
+bound_or_variants = "string equality against CONTRACT_REVISION 2.0.0 through crates/smart/eliot-cue-contracts/src/lib.rs::is_supported_schema_revision"
+identity_binding = "record revision binding for the snapshot shape"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT.snapshot_id"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+wire_name = "snapshot_id"
+owner_rust_type = "SnapshotId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the newtype is validated on construction"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512"
+identity_binding = "identity of this immutable snapshot, distinct by type from every cue identity"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT.members"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+wire_name = "members"
+owner_rust_type = "Vec<SnapshotMember>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty member list is a real empty snapshot and is not the same as an absent snapshot, which is not representable"
+bound_or_variants = "MAX_SNAPSHOT_MEMBERS 65536, a [[bound]] row in this file; every closed row must join to a member at the declared source revision, and relation endpoints must resolve to members"
+identity_binding = "stored canonical identities paired with target handles. Membership is neither a direct match nor a relation-derived activation, and a member count is never a match count."
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT.rebuild"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+wire_name = "rebuild"
+owner_rust_type = "RebuildIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a snapshot whose rebuild inputs are unknown is rejected as not rebuildable"
+bound_or_variants = "closed by the nested owner: normalization profile plus the source denominator the rows were built from"
+identity_binding = "the exact inputs a rebuild would need, so projection state stays rebuildable from evidence rather than from trust"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_rebuild"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT.state_fence"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+wire_name = "state_fence"
+owner_rust_type = "StateFence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unfenced snapshot is not admissible and cannot be compared under VR-FENCE-GATE"
+bound_or_variants = "closed by the foundation fence owner"
+identity_binding = "the state fence the snapshot was built at; a result issued against a later fence reports Completeness::Stale rather than reading this snapshot as current"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT.source_revision"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+wire_name = "source_revision"
+owner_rust_type = "u64"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; zero is explicitly rejected, so 'unknown revision' is not encodable as 0"
+bound_or_variants = "must be nonzero and must equal the closure denominator source_revision; every rebuild source handle and every relation edge revision marker must match it"
+identity_binding = "the immutable source revision cursor every row in this snapshot is valid at"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT.closure"
+type_rust_path = "eliot_cue_contracts::CueSnapshot"
+wire_name = "closure"
+owner_rust_type = "Option<CueSnapshotClosure>"
+requiredness = "OPTIONAL_NONE_NOT_REBUILDABLE"
+none_meaning = "None means the snapshot is NOT self-closing. It is admitted as an open compatibility record and rejected by validate_self_closed and by validate_published as SnapshotNotRebuildable, so None can never be read as a closed snapshot."
+bound_or_variants = "when Some, the closure's declared expected rows and edges are reconciled against the members actually present, weights and fanout are bounded, and every omitted row and edge is named"
+identity_binding = "the member denominator, omitted set, frontier and weight/fanout closure that make the snapshot recheckable rather than merely populated"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+# --- eliot_cue_contracts::CueSnapshotClosure -------------------------------
+[[field_contract]]
+type_id = "FC-CUE-SNAPSHOT-CLOSURE"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::CueSnapshotClosure"
+disposition = "FROZEN_EXACT"
+wire_naming = "version.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/version.rs::CueSnapshotClosure::validate_shape"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries no provenance of its own beyond the member rows it closes over. It is an accounting record, so it cannot be used as an evidence substitute for anything it counts."
+invalidation_rule = "Reconciled against the parent snapshot rather than self-asserted. A drift between the declared denominator and the observed rows or edges invalidates the closure and therefore the snapshot, and the source revision it records must equal the parent."
+denominator_ref = "DEN-CUE-SNAPSHOT-CLOSURE"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT-CLOSURE.denominator"
+type_rust_path = "eliot_cue_contracts::CueSnapshotClosure"
+wire_name = "denominator"
+owner_rust_type = "CueProjectionDenominator"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undeclared denominator cannot be reconciled, so it is not representable"
+bound_or_variants = "expected_rows, expected_edges, omitted_rows, omitted_edges, row_omissions, edge_omissions and source_revision; every omission is a named CueProjectionOmission with an identity, a kind and a reason drawn from the closed omission set"
+identity_binding = "the declared member denominator. Counts alone never establish closure: the omission identities must reconcile against the actual omitted rows and edges."
+validator = "crates/smart/eliot-cue-contracts/src/version.rs::CueProjectionDenominator::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT-CLOSURE.rows"
+type_rust_path = "eliot_cue_contracts::CueSnapshotClosure"
+wire_name = "rows"
+owner_rust_type = "Vec<ClosedSnapshotRow>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty row list with a nonzero expected_rows is a reconciliation failure, not an empty snapshot"
+bound_or_variants = "count must equal expected_rows minus omitted_rows; every row joins to a member at the declared source revision and to the source denominator"
+identity_binding = "the exact row-to-comparison-key joins the snapshot claims; it is the recheckable evidence behind the member count"
+validator = "crates/smart/eliot-cue-contracts/src/version.rs::validate_closed_rows_at_revision"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT-CLOSURE.relation_edges"
+type_rust_path = "eliot_cue_contracts::CueSnapshotClosure"
+wire_name = "relation_edges"
+owner_rust_type = "Vec<RelationEdge>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty edge list is a real graph with no relations and is exactly the state in which exact cues must still fire, per the frozen exact-cue independence invariant"
+bound_or_variants = "count must equal expected_edges minus omitted_edges; endpoints must resolve to snapshot members, uniform scope is checked across rows, sources and edges, and MAX_RELATION_EDGES 4096 bounds the traversal input"
+identity_binding = "the exact typed relation edges retained, with their registry revision and evidence envelope; they are a separate seam from membership"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT-CLOSURE.edge_weights"
+type_rust_path = "eliot_cue_contracts::CueSnapshotClosure"
+wire_name = "edge_weights"
+owner_rust_type = "Vec<SnapshotEdgeWeight>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; a retained edge with no declared weight fails the closure check, so an unweighted edge is not a silent zero"
+bound_or_variants = "one weight per retained edge, each at most MAX_EDGE_WEIGHT_MILLI, and every weight must match the edge it names at the declared source revision"
+identity_binding = "the exact policy weight for each retained edge. A weight is a traversal policy input, not a quality score and not a usefulness judgment."
+validator = "crates/smart/eliot-cue-contracts/src/version.rs::validate_closed_weights_at_revision"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT-CLOSURE.fanout"
+type_rust_path = "eliot_cue_contracts::CueSnapshotClosure"
+wire_name = "fanout"
+owner_rust_type = "CueSnapshotFanout"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unbounded fanout is not representable, so traversal is always bounded"
+bound_or_variants = "CueSnapshotFanout::validate_for_graph against the actual members and edges; it bounds traversal only and is never a precondition for a direct match"
+identity_binding = "the activation fanout closure the snapshot permits; it constrains relation traversal and says nothing about exact-cue reachability"
+validator = "crates/smart/eliot-cue-contracts/src/version.rs::CueSnapshotFanout::validate_for_graph"
+validation_error = "CueContractError::BoundExceeded"
+
+# --- eliot_cue_contracts::RebuildIdentity ----------------------------------
+[[field_contract]]
+type_id = "FC-CUE-REBUILD-IDENTITY"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::RebuildIdentity"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["FC-CUE-SNAPSHOT.rebuild"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner only as a nested field of CueSnapshot. Recorded, not invented."
+wire_naming = "snapshot.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_rebuild"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "source_denominator is a list of SourceHandle values, so the rebuild inputs are handles and digests only and never observed material."
+invalidation_rule = "Every source handle's revision must match the snapshot source revision. A mismatch invalidates the snapshot rather than triggering a silent refresh, which is the difference between a rebuildable projection and a drifting one."
+
+[[field_contract_field]]
+field_id = "FC-CUE-REBUILD-IDENTITY.normalization_profile"
+type_rust_path = "eliot_cue_contracts::RebuildIdentity"
+wire_name = "normalization_profile"
+owner_rust_type = "NormalizationProfile"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a rebuild under an unknown profile is not reproducible"
+bound_or_variants = "exact equality with the profile named on the snapshot build candidate and with the profile of every closed row"
+identity_binding = "the policy revision a rebuild must reproduce"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_rebuild"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+[[field_contract_field]]
+field_id = "FC-CUE-REBUILD-IDENTITY.source_denominator"
+type_rust_path = "eliot_cue_contracts::RebuildIdentity"
+wire_name = "source_denominator"
+owner_rust_type = "Vec<SourceHandle>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty source denominator means the snapshot was built from no declared source and is rejected by the rebuild check"
+bound_or_variants = "each handle's provenance revision must match the snapshot source revision, and the handles must share one uniform scope with the closed rows and edges"
+identity_binding = "the independent declared source set the snapshot was built from. This is the set a completeness check compares against, not a copy of the member list."
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-REBUILD-IDENTITY.digest"
+type_rust_path = "eliot_cue_contracts::RebuildIdentity"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested rebuild input set is rejected"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters over the rebuild inputs, validated against the recorded value"
+identity_binding = "content identity of the rebuild inputs, so a later edit to them is detectable"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_rebuild"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+# --- eliot_cue_contracts::SnapshotMember -----------------------------------
+[[field_contract]]
+type_id = "FC-CUE-SNAPSHOT-MEMBER"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::SnapshotMember"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["FC-CUE-SNAPSHOT.members", "CueSnapshotClosure.relation_edges endpoint resolution"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner only as the element type of CueSnapshot.members. Recorded, not invented."
+wire_naming = "snapshot.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::SnapshotMember::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "A stored canonical identity plus a target handle. It carries no evidence, no privacy class and no authority, so membership is a fact about the snapshot and not a permission."
+invalidation_rule = "A member whose canonical identity digest no longer matches the identity it names is a reconciliation failure, not a silently updated row."
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT-MEMBER.canonical"
+type_rust_path = "eliot_cue_contracts::SnapshotMember"
+wire_name = "canonical"
+owner_rust_type = "CanonicalCueIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a member with no canonical identity is not representable"
+bound_or_variants = "closed by the nested identity owner, validated in full"
+identity_binding = "the stored canonical identity; it must equal the identity a closed row joins to"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::SnapshotMember::validate"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+[[field_contract_field]]
+field_id = "FC-CUE-SNAPSHOT-MEMBER.target"
+type_rust_path = "eliot_cue_contracts::SnapshotMember"
+wire_name = "target"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the target is always a handle and never bytes"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512"
+identity_binding = "the handle the stored identity points at. Membership records that this pairing exists; it does not make the target accessible or influenceable."
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::SnapshotMember::validate"
+validation_error = "CueContractError::InvalidText"
+
+# --- eliot_cue_contracts::RelationEdge -------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-RELATION-EDGE"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["CueSnapshotClosure.relation_edges", "ActivationRequest.relation_edges", "FC-CUE-ACTIVATION-DERIVED.path"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner through the closure and the activation request but does not freeze it as a row of its own. Recorded, not invented."
+wire_naming = "relation.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/relation.rs::RelationEdge::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries the full EvidenceEnvelope for the edge, so an edge is attributable and fence-bound. It is the one place in this family where a relation carries its own provenance rather than inheriting it."
+invalidation_rule = "The edge revision marker must match the snapshot source revision, and the edge digest is validated against the recorded value. An edge whose registry revision or evidence revision drifts invalidates the closure that retained it."
+
+[[field_contract_field]]
+field_id = "FC-CUE-RELATION-EDGE.relation_edge_id"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+wire_name = "relation_edge_id"
+owner_rust_type = "RelationEdgeId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the newtype is validated on construction"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512; it is the element type of DerivedActivation.path, so it is what makes a derived path resolvable"
+identity_binding = "registry identity of the edge, distinct by type from every handle"
+validator = "crates/smart/eliot-cue-contracts/src/relation.rs::RelationEdge::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-RELATION-EDGE.kind"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+wire_name = "kind"
+owner_rust_type = "RelationKind"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an untyped relation is not representable"
+bound_or_variants = "closed set owned by eliot-evidence and supplied by the relation-registry owner"
+identity_binding = "the canonical relation family; it names a direction and a family, never a permission to traverse"
+validator = "crates/smart/eliot-cue-contracts/src/relation.rs::RelationEdge::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-RELATION-EDGE.from"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+wire_name = "from"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a half-edge is not representable"
+bound_or_variants = "non-blank, text bound MAX_TEXT_BYTES 8192; the endpoint must resolve to a snapshot member when the edge is retained in a closure"
+identity_binding = "edge source endpoint; the relation is directed, so from and to are not interchangeable"
+validator = "crates/smart/eliot-cue-contracts/src/relation.rs::RelationEdge::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-RELATION-EDGE.to"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+wire_name = "to"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a half-edge is not representable"
+bound_or_variants = "non-blank, text bound MAX_TEXT_BYTES 8192; the endpoint must resolve to a snapshot member when the edge is retained in a closure"
+identity_binding = "edge destination endpoint"
+validator = "crates/smart/eliot-cue-contracts/src/relation.rs::RelationEdge::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-RELATION-EDGE.registry_revision"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+wire_name = "registry_revision"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an edge whose direction and kind were resolved under an unknown revision is rejected"
+bound_or_variants = "non-blank, text bound MAX_TEXT_BYTES 8192; its evidence provenance revision marker must match the snapshot source revision"
+identity_binding = "the registry revision under which direction and kind were resolved; the invalidation axis for the edge"
+validator = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-RELATION-EDGE.edge_digest"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+wire_name = "edge_digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested edge is rejected"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, length rechecked here independently of the Digest newtype, and validated against the recorded value"
+identity_binding = "content identity of the immutable edge record"
+validator = "crates/smart/eliot-cue-contracts/src/relation.rs::RelationEdge::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-RELATION-EDGE.evidence"
+type_rust_path = "eliot_cue_contracts::RelationEdge"
+wire_name = "evidence"
+owner_rust_type = "EvidenceEnvelope"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a relation without evidence lineage is not representable"
+bound_or_variants = "provenance leaves bounded by MAX_TEXT_BYTES 8192; the optional verification block is bounded when present"
+identity_binding = "evidence lineage, epistemic position and proof ceiling for the edge, plus the state fence the edge was observed at"
+validator = "crates/smart/eliot-cue-contracts/src/relation.rs::RelationEdge::validate"
+validation_error = "CueContractError::Foundation"
+
+# --- eliot_cue_contracts::DirectActivation ---------------------------------
+[[field_contract]]
+type_id = "FC-CUE-ACTIVATION-DIRECT"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::DirectActivation"
+disposition = "FROZEN_EXACT"
+wire_naming = "activation.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all. It carries NO activation path field at all, and that absence is the frozen statement of exact-cue independence."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DirectActivation::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries the matched key rather than any independent evidence, so a direct activation is traceable to the spelling that produced it and cannot borrow authority from a relation."
+invalidation_rule = "A direct activation is valid only inside the result that carries it and only under the snapshot and fence that result names. It is never persisted as membership, so a later snapshot change cannot leave a stale direct activation behind."
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DIRECT.target"
+type_rust_path = "eliot_cue_contracts::DirectActivation"
+wire_name = "target"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a direct activation with no target is not representable"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512; the result bounds the list at MAX_DIRECT 256"
+identity_binding = "the matched target handle. A direct activation states a match occurred; it does not state the target is accessible or may be influenced."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DirectActivation::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DIRECT.matched_key"
+type_rust_path = "eliot_cue_contracts::DirectActivation"
+wire_name = "matched_key"
+owner_rust_type = "ComparisonKey"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a direct activation with no matched key has no evidence of what matched and is not representable"
+bound_or_variants = "closed by the nested key owner; its profile must equal the result's normalization profile"
+identity_binding = "the exact comparison key that fired, retained so the match is recheckable rather than asserted"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DirectActivation::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DIRECT.strength"
+type_rust_path = "eliot_cue_contracts::DirectActivation"
+wire_name = "strength"
+owner_rust_type = "ActivationStrength"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unmeasured strength is rejected rather than defaulted to zero or to full"
+bound_or_variants = "u16 wrapper compared against the result's ActivationBounds.activation_threshold, which is the only place the number is used"
+identity_binding = "a threshold-comparable magnitude, not a score of usefulness. Crossing the threshold admits the activation; it grants no authority, no scheduling and no external effect."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DirectActivation::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+# --- eliot_cue_contracts::DerivedActivation --------------------------------
+[[field_contract]]
+type_id = "FC-CUE-ACTIVATION-DERIVED"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::DerivedActivation"
+disposition = "FROZEN_EXACT"
+wire_naming = "activation.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DerivedActivation::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries the seed and the path, not an independent evidence envelope, so a derived activation is always traceable to a direct one and can never be the sole basis for a claim."
+invalidation_rule = "Always names the direct seed it descends from and always carries a nonempty contiguous path beginning at one of the result's direct activations. An empty, broken or non-seeding path is rejected as BrokenActivationPath, and the result as a whole is bounded by MAX_DERIVED 512 and MAX_PATH_LEN 8."
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DERIVED.target"
+type_rust_path = "eliot_cue_contracts::DerivedActivation"
+wire_name = "target"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a derived activation with no target is not representable"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512; the result bounds the list at MAX_DERIVED 512"
+identity_binding = "the reached target handle, reached by traversal rather than by an exact key"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DerivedActivation::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DERIVED.direct_seed"
+type_rust_path = "eliot_cue_contracts::DerivedActivation"
+wire_name = "direct_seed"
+owner_rust_type = "TargetHandle"
+requiredness = "REQUIRED"
+none_meaning = "no Option and no None: a derived activation without a resolvable direct seed is rejected, so relation spreading can never be the sole source of an activation"
+bound_or_variants = "must equal the target of one of the enclosing result's direct activations"
+identity_binding = "the direct activation this one descends from; this is the field that keeps direct match and relation spreading distinct"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DerivedActivation::validate"
+validation_error = "CueContractError::BrokenActivationPath"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DERIVED.path"
+type_rust_path = "eliot_cue_contracts::DerivedActivation"
+wire_name = "path"
+owner_rust_type = "Vec<RelationEdgeId>"
+requiredness = "REQUIRED_EMPTY_REJECTED"
+none_meaning = "not optional and an empty list is rejected; there is no way to state a derived activation without naming the edges it traversed"
+bound_or_variants = "MAX_PATH_LEN 8, a [[bound]] row in this file; the edges must be contiguous and the first must begin at the direct seed"
+identity_binding = "the ordered relation edges traversed. The path is what makes a derived activation recheckable, and it is why a derived activation can never stand in for a direct one."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DerivedActivation::validate"
+validation_error = "CueContractError::BrokenActivationPath"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DERIVED.depth"
+type_rust_path = "eliot_cue_contracts::DerivedActivation"
+wire_name = "depth"
+owner_rust_type = "u8"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; depth is always stated, and a depth of zero with a nonempty path is a reconciliation failure rather than a direct match in disguise"
+bound_or_variants = "u8 bounded by the result's ActivationBounds.max_depth, and the same bound that raises Completeness::Truncated with BoundKind::Depth"
+identity_binding = "hop count from the direct seed; it bounds traversal only and is never a quality measure"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DerivedActivation::validate"
+validation_error = "CueContractError::BrokenActivationPath"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-DERIVED.strength"
+type_rust_path = "eliot_cue_contracts::DerivedActivation"
+wire_name = "strength"
+owner_rust_type = "ActivationStrength"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unmeasured strength is rejected rather than defaulted"
+bound_or_variants = "u16 wrapper compared against the result's ActivationBounds.activation_threshold; the bound that drops everything below it is BoundKind::Threshold"
+identity_binding = "a threshold-comparable magnitude, not a score of usefulness, and a derived activation is never stronger than the direct seed it descends from by construction of the path check"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::DerivedActivation::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+# --- eliot_cue_contracts::ActivationResult ---------------------------------
+[[field_contract]]
+type_id = "FC-CUE-ACTIVATION-RESULT"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+disposition = "FROZEN_EXACT"
+wire_naming = "activation.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Inherits privacy and proof posture from the snapshot and the request it is validated against. The result introduces no producer identity of its own and cannot widen disclosure."
+invalidation_rule = "Validated against the issuing request and snapshot. A result whose snapshot, profile, fence, request id or observed_at disagrees with the request is rejected, and Completeness is checked against the frontier and the bound that was hit, so a truncated search can never be recorded as Complete."
+denominator_ref = "DEN-CUE-SNAPSHOT-CLOSURE"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.schema_revision"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "schema_revision"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a missing key is a decode failure"
+bound_or_variants = "string equality against CONTRACT_REVISION 2.0.0 through crates/smart/eliot-cue-contracts/src/lib.rs::is_supported_schema_revision"
+identity_binding = "record revision binding for the result shape"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.request_id"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "request_id"
+owner_rust_type = "ActivationRequestId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an anonymous result cannot be bound to the request that produced it"
+bound_or_variants = "non-blank, control-character-free, at most MAX_ID_BYTES 512; must equal the issuing request's id"
+identity_binding = "binds the result to exactly one activation request"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.snapshot_id"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "snapshot_id"
+owner_rust_type = "SnapshotId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a result that names no snapshot has no denominator and cannot claim completeness"
+bound_or_variants = "non-blank, at most MAX_ID_BYTES 512; must equal the request's snapshot"
+identity_binding = "the snapshot whose membership and edges were searched; it is the denominator this result is measured against"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.normalization_profile"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "normalization_profile"
+owner_rust_type = "NormalizationProfile"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a result that names no policy cannot say which spelling space it searched"
+bound_or_variants = "exact equality with the request's profile and with the profile of every matched key"
+identity_binding = "the policy revision whose keys were matched; a profile change invalidates the result"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.state_fence"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "state_fence"
+owner_rust_type = "StateFence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unfenced result cannot be compared with any other record"
+bound_or_variants = "closed by the foundation fence owner; must equal the request's fence and is compared to the snapshot's fence"
+identity_binding = "the fence the request was issued against; a snapshot older than it yields Completeness::Stale rather than a quiet read"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.observed_at"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "observed_at"
+owner_rust_type = "ClockReading"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unclocked observation cannot be ordered against a deadline"
+bound_or_variants = "closed set owned by eliot-contracts; must equal the request's reading"
+identity_binding = "the clock reading the request was issued under, and the point the deadline is measured from"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.deadline_ms"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "deadline_ms"
+owner_rust_type = "Option<i64>"
+requiredness = "OPTIONAL_NONE_NO_DEADLINE"
+none_meaning = "None means NO deadline was set for this request. It is distinct from a deadline of zero, which is a deadline already expired, and it is never read as 'unbounded work' because the ActivationBounds still apply."
+bound_or_variants = "i64 milliseconds relative to observed_at; negative values are rejected by the nested owner"
+identity_binding = "the request's deadline, echoed so the result can be checked for having finished inside it"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.cancelled"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "cancelled"
+owner_rust_type = "bool"
+requiredness = "REQUIRED"
+none_meaning = "not optional; the field is always stated, so 'cancellation unknown' is not expressible. A true value means the search stopped because cancellation was requested, and a cancelled result cannot claim Complete."
+bound_or_variants = "bool; must equal the request's cancellation state and is checked together with completeness"
+identity_binding = "the cancellation state the result was produced under"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.direct"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "direct"
+owner_rust_type = "Vec<DirectActivation>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means no exact key fired, which is a positive statement about the search and is not the same as Completeness::NoDirectMatch or an unreadable source"
+bound_or_variants = "MAX_DIRECT 256, a [[bound]] row in this file; every entry's matched_key profile must equal the result's normalization_profile"
+identity_binding = "the exact-key result set. It is a separate collection from `derived` and the two are never merged into one ranked list, so a direct hit is never reordered behind a stronger derived one."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.derived"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "derived"
+owner_rust_type = "Vec<DerivedActivation>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means no relation traversal produced anything. An empty `derived` list never invalidates a nonempty `direct` list, which is the frozen exact-cue independence invariant."
+bound_or_variants = "MAX_DERIVED 512 and MAX_PATH_LEN 8, both [[bound]] rows in this file; traversal itself is separately bounded by MAX_RELATION_EDGES 4096 on the request"
+identity_binding = "the relation-derived result set. Optional by construction: it is never a precondition for the direct set and never a substitute for it."
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+validation_error = "CueContractError::BrokenActivationPath"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.completeness"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "completeness"
+owner_rust_type = "Completeness"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the enum has no unclassified member. There is no default: a result that cannot classify the search must say Blocked, Unavailable, Unknown or SourceUnavailable, and none of them can be read as Complete."
+bound_or_variants = "closed set serialized with tag \"completeness\" as snake_case: complete, truncated{frontier,bound_hit}, partial{frontier}, blocked{reason}, unknown{reason}, source_unavailable{reason}, no_direct_match{reason}, stale{snapshot_fence}. Complete with a nonempty frontier is rejected as CompleteWithFrontier; a truncated result with no bound_hit is rejected as TruncationWithoutBound."
+identity_binding = "how much of the declared denominator was searched, and it is the only field that can carry a completeness claim"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_completeness"
+validation_error = "CueContractError::CompleteWithFrontier"
+
+[[field_contract_field]]
+field_id = "FC-CUE-ACTIVATION-RESULT.trace"
+type_rust_path = "eliot_cue_contracts::ActivationResult"
+wire_name = "trace"
+owner_rust_type = "ActivationTrace"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a result with no trace record is not representable"
+bound_or_variants = "MAX_TRACE_STEPS 1024, a [[bound]] row in this file, applied to the nested steps; each step's edge is None exactly for a direct match, which is how a direct step is distinguished from a traversal step"
+identity_binding = "the recorded traversal and direct-match steps, so the result is recheckable step by step rather than being an unordered list"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+# --- eliot_cue_contracts::CueSnapshotBuildCandidate -----------------------
+[[field_contract]]
+type_id = "FC-CUE-INDEX-CANDIDATE"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+disposition = "FROZEN_EXACT"
+wire_naming = "index_candidate.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "Carries no producer identity beyond the nested admitted bindings' admission receipts, so a built index cannot claim an authority its members do not carry."
+invalidation_rule = "Validated against INDEX_CONTRACT_REVISION 1.0.0 by exact string equality, a different revision axis from the cue vocabulary's CONTRACT_REVISION 2.0.0. A published candidate additionally requires proof_ceiling CandidateArtifact, so a built index stays a candidate artifact and never becomes the canonical cue index on its own."
+
+[[field_contract_field]]
+field_id = "FC-CUE-INDEX-CANDIDATE.schema_revision"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+wire_name = "schema_revision"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a missing key is a decode failure"
+bound_or_variants = "string equality against INDEX_CONTRACT_REVISION 1.0.0 declared in crates/smart/eliot-cue-contracts/src/index_candidate.rs, NOT against CONTRACT_REVISION 2.0.0. The two revision axes are deliberately separate."
+identity_binding = "revision binding for the index envelope, independent of the cue vocabulary revision its members carry"
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-INDEX-CANDIDATE.scope_id"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+wire_name = "scope_id"
+owner_rust_type = "WorkScopeId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unscoped index build is not representable"
+bound_or_variants = "non-blank, text bound MAX_TEXT_BYTES 8192"
+identity_binding = "the work scope the built index is proposed for; it does not by itself authorize publication"
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate"
+validation_error = "CueContractError::InvalidText"
+
+[[field_contract_field]]
+field_id = "FC-CUE-INDEX-CANDIDATE.snapshot"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+wire_name = "snapshot"
+owner_rust_type = "CueSnapshot"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a build candidate with no snapshot has nothing to build from"
+bound_or_variants = "the nested snapshot must pass validate_self_closed, so a candidate cannot carry an open or unreconcilable snapshot"
+identity_binding = "the self-closing snapshot the index is proposed over; its state_fence and source_revision are the candidate's binding axes"
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate"
+validation_error = "CueContractError::SnapshotNotRebuildable"
+
+[[field_contract_field]]
+field_id = "FC-CUE-INDEX-CANDIDATE.admitted_bindings"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+wire_name = "admitted_bindings"
+owner_rust_type = "Vec<AdmittedCueBindingProjection>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means the build admitted no binding, and it is explicitly not a way to smuggle an unadmitted CueBindingCandidate into the index"
+bound_or_variants = "each element must validate, and its admission receipt's candidate_digest must match the nested candidate digest; the task, scope and fence on the receipt are checked against the snapshot"
+identity_binding = "the bindings that carry an external admission receipt. Only admitted bindings may enter the index, so a proposal alone never becomes membership."
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-INDEX-CANDIDATE.relation_edges"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+wire_name = "relation_edges"
+owner_rust_type = "Vec<RelationEdge>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list is a real index with no relations, and it is exactly the state in which exact cues must still fire"
+bound_or_variants = "MAX_RELATION_EDGES 4096, a [[bound]] row in this file; each edge's provenance revision marker must match the snapshot source revision"
+identity_binding = "the relation inputs the index retains; they are bounded and separate from direct matching, so they can never be a precondition for it"
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate"
+validation_error = "CueContractError::BoundExceeded"
+
+[[field_contract_field]]
+field_id = "FC-CUE-INDEX-CANDIDATE.proof_ceiling"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+wire_name = "proof_ceiling"
+owner_rust_type = "ProofCeiling"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unlabelled build candidate is not representable"
+bound_or_variants = "closed set owned by eliot-receipts; validate_published requires exactly CandidateArtifact. A candidate asserting a higher ceiling is rejected rather than downgraded silently."
+identity_binding = "the maximum proof interpretation available for this built index. It is the field that stops a built index from becoming the canonical cue index on its own."
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate_published"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-INDEX-CANDIDATE.build_digest"
+type_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+wire_name = "build_digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested build is rejected"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, validated against the recorded value"
+identity_binding = "content identity of the build inputs, so a later change to the snapshot, bindings or edges is detectable"
+validator = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate"
+validation_error = "CueContractError::InvalidText"
+
+# --- closed vocabularies ----------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUE-VOCABULARIES"
+crate = "eliot-cue-contracts"
+type_rust_path = "eliot_cue_contracts::CueKind"
+disposition = "FROZEN_EXACT"
+wire_naming = "Every closed enum in this family serializes with #[serde(rename_all = \"snake_case\", deny_unknown_fields)], so the wire spelling of each member is the snake_case form and the Rust member name is NOT the wire spelling. Naming the Rust member instead of the wire spelling is a decode failure at the boundary."
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::CueKind"
+error_family = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+provenance_privacy = "None of these vocabularies carries provenance, evidence, a privacy class or a score. They are closed sets and add no field in which a judgment could hide."
+invalidation_rule = "Adding or removing a member changes CONTRACT_REVISION, and every record carrying the affected field is then rejected by VR-CUE-SCHEMA-REVISION equality rather than being reinterpreted under the new shape."
+
+[[field_contract_field]]
+field_id = "FC-CUE-VOCABULARIES.CueKind"
+type_rust_path = "eliot_cue_contracts::CueKind"
+wire_name = "kind"
+owner_rust_type = "CueKind"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no unclassified cue"
+bound_or_variants = "wire members: file_path, dir_path, symbol, error_signature, command_pattern, dependency, api_surface, task_class, subsystem, concept"
+identity_binding = "classification of the cue kind, used to admit or refuse a comparison match_mode; it is not a statement about any target"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-VOCABULARIES.ComparisonForm"
+type_rust_path = "eliot_cue_contracts::ComparisonForm"
+wire_name = "form"
+owner_rust_type = "ComparisonForm"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no default normalization form"
+bound_or_variants = "wire members: exact, case_insensitive, path_normalized, symbol_qualified"
+identity_binding = "how the key value was produced; it determines what the key can match and is not a confidence value"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::ComparisonKey::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-VOCABULARIES.MatchMode"
+type_rust_path = "eliot_cue_contracts::MatchMode"
+wire_name = "match_mode"
+owner_rust_type = "MatchMode"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no default match mode"
+bound_or_variants = "wire members: exact, prefix, signature. Admissibility is checked against the canonical kind, so an inadmissible pairing is rejected rather than silently downgraded to exact."
+identity_binding = "the comparison semantics of the key; a mode is not a permission and grants no influence"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-VOCABULARIES.NormalizationOutcome"
+type_rust_path = "eliot_cue_contracts::NormalizationOutcome"
+wire_name = "outcome"
+owner_rust_type = "NormalizationOutcome"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unclassifiable normalization is unsupported with a reason, never an absent outcome"
+bound_or_variants = "wire members, serialized with tag \"code\": lossless, authorized_loss{policy_ref}, ambiguous{rivals}, unsupported{reason}"
+identity_binding = "constrains the sibling canonical field: Lossless and AuthorizedLoss require Some, Ambiguous and Unsupported require None"
+validator = "crates/smart/eliot-cue-contracts/src/normalization.rs::NormalizedCue::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-VOCABULARIES.BindingRole"
+type_rust_path = "eliot_cue_contracts::BindingRole"
+wire_name = "role"
+owner_rust_type = "BindingRole"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no default reason for a binding"
+bound_or_variants = "wire members: names, touched, expected_reuse"
+identity_binding = "why the two sides are proposed together; it is not a permission and not evidence that the relation holds"
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-VOCABULARIES.BindingDisposition"
+type_rust_path = "eliot_cue_contracts::BindingDisposition"
+wire_name = "disposition"
+owner_rust_type = "BindingDisposition"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no undecided member, so a pending proposal must say which of the three it is"
+bound_or_variants = "wire members: admitted, withheld, rejected. The Admitted member is caller-supplied and is NOT snapshot membership; membership requires AdmittedCueBindingProjection."
+identity_binding = "the proposal's own decision field; it confers no authority, and the external Governor owns admission"
+validator = "crates/smart/eliot-cue-contracts/src/binding.rs::CueBindingCandidate::validate"
+validation_error = "CueContractError::Foundation"
+
+[[field_contract_field]]
+field_id = "FC-CUE-VOCABULARIES.Completeness"
+type_rust_path = "eliot_cue_contracts::Completeness"
+wire_name = "completeness"
+owner_rust_type = "Completeness"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the enum has no unclassified member. Unknown, Blocked, Unavailable, SourceUnavailable and Partial are all distinct values and none of them may be read as Complete; there is no default that yields Complete."
+bound_or_variants = "wire members, serialized with tag \"completeness\": complete, truncated{frontier,bound_hit}, partial{frontier}, blocked{reason}, unknown{reason}, source_unavailable{reason}, no_direct_match{reason}, stale{snapshot_fence}. BoundKind wire members: depth, fanout, results, threshold."
+identity_binding = "the only field family in this crate that can carry a completeness claim, and each member carries its own frontier or reason so the claim is always recheckable"
+validator = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_completeness"
+validation_error = "CueContractError::TruncationWithoutBound"
+
+# --- completeness accounting ----------------------------------------------
+[[completeness_rule]]
+id = "CR-CUE-DIRECT-INDEPENDENCE"
+family = "eliot-cue-contracts"
+applies_to = ["FC-CUE-ACTIVATION-RESULT.direct", "FC-CUE-ACTIVATION-RESULT.derived", "FC-CUE-SNAPSHOT-CLOSURE.relation_edges"]
+rule = "A result with an empty derived list and an empty retained-edge set must still fire on exact keys. Relation traversal is optional and is never a precondition for a direct match, so no completeness rule may make a derived result a precondition of a direct one."
+enforced_by = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_against"
+independent_expected_set = "the snapshot's own member and edge sets, declared by the snapshot owner and compared against the result, never the result's own direct list"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUE-COMPLETE-NO-FRONTIER"
+family = "eliot-cue-contracts"
+applies_to = ["FC-CUE-ACTIVATION-RESULT.completeness"]
+rule = "Completeness::Complete is accepted only when the whole declared denominator was searched and no frontier remains. Pairing Complete with a nonempty frontier is rejected as CompleteWithFrontier, and a truncated search that does not name the bound it hit is rejected as TruncationWithoutBound. No other member may be read as Complete."
+enforced_by = "crates/smart/eliot-cue-contracts/src/activation.rs::ActivationResult::validate_completeness"
+independent_expected_set = "CueProjectionDenominator on the snapshot closure, compared against the traversed rows and edges"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUE-CLOSURE-ACCOUNTING"
+family = "eliot-cue-contracts"
+applies_to = ["FC-CUE-SNAPSHOT-CLOSURE.denominator", "FC-CUE-SNAPSHOT-CLOSURE.rows", "FC-CUE-SNAPSHOT-CLOSURE.relation_edges"]
+rule = "A closed snapshot reconciles expected_rows against observed rows plus named row omissions, and expected_edges against observed edges plus named edge omissions. Every omission is a CueProjectionOmission drawn from the closed omission-kind and reason sets, so an omission is a value. A count alone is not closure and a truncation with no stated bound is not closure."
+enforced_by = "crates/smart/eliot-cue-contracts/src/snapshot.rs::CueSnapshot::validate_self_closed"
+independent_expected_set = "CueProjectionDenominator declared by the snapshot owner, compared against the member list the snapshot actually carries"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUE-UNKNOWN-NOT-COMPLETE"
+family = "eliot-cue-contracts"
+applies_to = ["FC-CUE-ACTIVATION-RESULT.completeness", "FC-CUE-SNAPSHOT.closure", "FC-CUE-NORMALIZED.canonical"]
+rule = "Unknown and incomplete evidence cannot become Complete by default anywhere in this family. An absent closure is SnapshotNotRebuildable, an unclassifiable normalization is Unsupported with no canonical identity, an unreadable source is SourceUnavailable rather than an empty result, and no seed hitting is NoDirectMatch rather than an empty snapshot. Each of those is a distinct value and none of them is Complete."
+enforced_by = "crates/smart/eliot-cue-contracts/src/error.rs::CueContractError"
+independent_expected_set = "not applicable; this rule is a default prohibition, not a count"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUE-CANDIDATE-NO-PROMOTION"
+family = "eliot-cue-contracts"
+applies_to = ["FC-CUE-INDEX-CANDIDATE.proof_ceiling", "FC-CUE-BINDING-CANDIDATE.disposition"]
+rule = "No candidate in this family creates canonical truth, authority, scheduling, an external effect, task completion or its own promotion. A built index is admitted only as a CandidateArtifact under INDEX_CONTRACT_REVISION, and a caller-supplied Admitted disposition on a proposal is not snapshot membership."
+enforced_by = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate_published"
+independent_expected_set = "not applicable; this rule is a default prohibition, not a count"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
 
 [[version_rule]]
 id = "VR-EXACT-CONTRACT-VERSION"
