@@ -1697,10 +1697,71 @@ pub struct CoverageAccount {
     exclusions: BTreeMap<String, String>,
     frontier: Option<String>,
     observed: BTreeMap<String, ObservedOutsideScope>,
+    closed_empty_scope: Option<ClosedEmptyScope>,
 }
 
 impl CoverageAccount {
     /// Opens accounting over the exact expected denominator members.
+    ///
+    /// A non-empty denominator is opened directly. An **empty** one is the
+    /// interesting case and is refused unless the owner attests the scope closed
+    /// and empty: an account over no member is otherwise indistinguishable from
+    /// an enumeration that never ran, and refusing it outright made a genuinely
+    /// empty eligible scope unrepresentable, which I21.6 forbids. The
+    /// attestation is read back before it is believed, so an account cannot be
+    /// opened empty on a rewritten or foreign one.
+    ///
+    /// This is the independent expected set the empty case rests on. It is never
+    /// derived by comparing the empty `expected` set to itself, and no member is
+    /// ever inserted to make a helper satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::IncompleteDenominator`] for an empty
+    /// denominator with no attestation, [`PortfolioError::InvalidDigest`] when
+    /// the presented attestation no longer re-proves its own identity, and
+    /// [`PortfolioError::Conflict`] when the attestation covers a different
+    /// inquiry, a different denominator, or a window that has already closed.
+    pub fn open_verified_empty(
+        expected: BTreeSet<String>,
+        closed_empty_scope: ClosedEmptyScope,
+        inquiry_digest: &str,
+        now_ms: i64,
+    ) -> Result<Self, PortfolioError> {
+        if !expected.is_empty() {
+            return Err(PortfolioError::Conflict {
+                field: "coverage.expected",
+            });
+        }
+        closed_empty_scope.verify_integrity()?;
+        if closed_empty_scope.denominator_digest() != Self::empty_denominator_digest() {
+            return Err(PortfolioError::Conflict {
+                field: "coverage.closed_empty_scope.denominator_digest",
+            });
+        }
+        if !closed_empty_scope.covers(inquiry_digest, now_ms) {
+            return Err(PortfolioError::Conflict {
+                field: "coverage.closed_empty_scope.covers",
+            });
+        }
+        Ok(Self {
+            expected,
+            outcomes: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
+            frontier: None,
+            observed: BTreeMap::new(),
+            closed_empty_scope: Some(closed_empty_scope),
+        })
+    }
+
+    /// Opens accounting over the exact expected denominator members.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::IncompleteDenominator`] when `expected` has no
+    /// member. A genuinely empty eligible scope is opened through
+    /// [`Self::open_verified_empty`] with its owner's attestation, never through
+    /// this entry point.
     pub fn open(expected: BTreeSet<String>) -> Result<Self, PortfolioError> {
         if expected.is_empty() {
             return Err(PortfolioError::IncompleteDenominator {
@@ -1713,7 +1774,39 @@ impl CoverageAccount {
             exclusions: BTreeMap::new(),
             frontier: None,
             observed: BTreeMap::new(),
+            closed_empty_scope: None,
         })
+    }
+
+    /// Canonical digest of the *empty* denominator, over the same encoding
+    /// [`Self::canonical_into`] applies to a populated one.
+    ///
+    /// This is the one value an empty scope's attestation has to name. It is
+    /// computed from the shape and not supplied by the caller, so an attestation
+    /// over a populated scope cannot be presented for an empty one and still
+    /// match.
+    pub fn empty_denominator_digest() -> String {
+        let empty = Self {
+            expected: BTreeSet::new(),
+            outcomes: BTreeMap::new(),
+            exclusions: BTreeMap::new(),
+            frontier: None,
+            observed: BTreeMap::new(),
+            closed_empty_scope: None,
+        };
+        empty.digest()
+    }
+
+    /// The owner's closed-empty attestation, when this account was opened over a
+    /// genuinely empty eligible scope.
+    pub fn closed_empty_scope(&self) -> Option<&ClosedEmptyScope> {
+        self.closed_empty_scope.as_ref()
+    }
+
+    /// Whether this account was opened over a scope the owner attested closed and
+    /// empty.
+    pub fn is_verified_empty(&self) -> bool {
+        self.closed_empty_scope.is_some()
     }
 
     /// Records one disposition for one expected member, with the acquiring
@@ -2066,17 +2159,42 @@ impl CoverageAccount {
         if let Some(frontier) = &self.frontier {
             push_field(preimage, "frontier", frontier);
         }
+        // The attestation is bound in, so an account opened over a genuinely
+        // empty eligible scope never hashes the same as one that never
+        // enumerated. That is the whole difference the two states must preserve.
+        if let Some(attestation) = &self.closed_empty_scope {
+            push_field(
+                preimage,
+                "closed_empty_scope.denominator_digest",
+                attestation.denominator_digest(),
+            );
+            push_field(
+                preimage,
+                "closed_empty_scope.denominator_revision",
+                attestation.denominator_revision(),
+            );
+            push_field(
+                preimage,
+                "closed_empty_scope.closure_method",
+                attestation.closure_method(),
+            );
+        }
     }
 
     /// Canonical digest of the frozen accounting shape.
     ///
-    /// The declared identity domain is `coverage/v2`. Bumped from `v1` by
-    /// #1767 because the preimage's *field set* changed: a member's accounting
-    /// is now the full ordered attempt chain with the evidence identity of each
-    /// attempt, where `v1` pushed one disposition and one handle. The same name
-    /// covering two different field sets is exactly the defect the bumps on
-    /// `source-record`, `frozen-inquiry` and `absence-preconditions` exist to
-    /// prevent.
+    /// The declared identity domain is `coverage/v3`, reached in two steps. `v2`
+    /// was published by #1767 and changed the preimage's *field set*: a member's
+    /// accounting became the full ordered attempt chain with the evidence
+    /// identity of each attempt, where `v1` pushed one disposition and one
+    /// handle. The attestation carried here changes the field set again, by one
+    /// more group of pushed fields, so it cannot join `v2` under the same name.
+    ///
+    /// The `v2` -> `v3` step is the defect the bumps on `source-record`,
+    /// `frozen-inquiry` and `absence-preconditions` exist to prevent: one name
+    /// covering two different field sets. `v3` is reached rather than `v4`
+    /// because the two field-set changes were authored for the same issue and
+    /// neither had been published on its own.
     ///
     /// Transitively `absence-preconditions/v2` binds this digest through
     /// `account_digest` and `coverage-receipt/v2` through `account_digest` and
@@ -2086,7 +2204,7 @@ impl CoverageAccount {
     /// as declared rather than a new shape — the same reasoning
     /// `coverage-receipt/v1` -> `v2` records, and it applies here unchanged.
     pub fn digest(&self) -> String {
-        let mut preimage = String::from("coverage/v2;");
+        let mut preimage = String::from("coverage/v3;");
         self.canonical_into(&mut preimage);
         freeze(&preimage)
     }
@@ -3099,10 +3217,10 @@ impl NoMatchEvaluationIssuer {
     ///
     /// No member is ever inserted: results are built only from members a
     /// closing disposition closed, and an account with no closed member is
-    /// refused rather than completed with a fictitious one. An empty
-    /// authoritative scope cannot reach here either, because
-    /// [`CoverageAccount::open`] refuses an empty denominator before accounting
-    /// starts.
+    /// refused rather than completed with a fictitious one. An owner-attested
+    /// closed-empty scope reaches here with zero closed members too, and is
+    /// refused by the same rule: an empty eligible population is a measurement,
+    /// but it is not one that answers a predicate, so it yields no evaluation.
     ///
     /// # Errors
     ///
@@ -3232,6 +3350,19 @@ impl NoMatchEvaluationIssuer {
         if !account.open_members().is_empty() {
             return Err(PortfolioError::IncompleteDenominator {
                 field: "no_match_issuer.open_members",
+            });
+        }
+        // An owner-attested closed-empty scope satisfies the open-member check
+        // above vacuously — there is no open member — so without this arm it
+        // would reach the result loop and be answered by the
+        // `results.is_empty()` refusal further down. That refusal is the right
+        // answer, but it arrives as a consequence of producing nothing; it is
+        // named here as the fact it is, because the question this issuer was
+        // handed is "does the predicate match?", and an empty population never
+        // gets that question asked.
+        if account.is_verified_empty() {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "no_match_issuer.closed_empty_scope",
             });
         }
         if !account.exclusions.is_empty() {
@@ -3972,6 +4103,18 @@ pub fn assess_absence(
     if let Some(verdict) = rebound_account(preconditions, account) {
         return verdict;
     }
+    // A verified empty eligible scope is a real measurement, and it is
+    // deliberately NOT an exact negative. "The eligible population is closed
+    // and has no member in it" says nothing about whether the requested
+    // predicate would have matched something outside that population, and I21.6
+    // requires a complete-scope claim to rest on a bounded exhaustive predicate
+    // evaluation — which an empty population has no member to carry. This arm
+    // makes that structural rather than incidental: the claim is refused here
+    // whatever the evaluation bound says, so widening the empty case into a
+    // proof would take a change to this function and not a coincidence.
+    if let Some(verdict) = empty_population_absence(account) {
+        return verdict;
+    }
     if let Some(verdict) = rewritten_evaluation(preconditions) {
         return verdict;
     }
@@ -4046,6 +4189,33 @@ fn rebound_account(
         reason: format!(
             "absence: the preconditions are bound to coverage account {account_digest}, not to \
              the account presented with them, so the two cannot be swapped"
+        ),
+    })
+}
+
+/// Refuses an exact negative over a population that is established as empty.
+///
+/// This is deliberately separate from the "no evaluation bound" arm. Over an
+/// empty population that arm happens to fire too, but only because
+/// [`NoMatchEvaluationIssuer::issue_for`] refuses to build results from zero
+/// closed members — an accident of the issuer, not a guarantee of the negative
+/// path. The population carries no member to evaluate, so there is nothing the
+/// predicate could have been run against and nothing its answer would have
+/// covered. Emptiness of the eligible set and absence of a match for a
+/// requested predicate are different facts, and only the first is established
+/// here.
+fn empty_population_absence(account: &CoverageAccount) -> Option<AbsenceVerdict> {
+    if !account.is_verified_empty() {
+        return None;
+    }
+    let attestation = account.closed_empty_scope()?;
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "absence: the eligible scope is closed and empty under method {} at denominator \
+             revision {}, which establishes that no eligible source exists and does not \
+             establish that the requested predicate has no match",
+            attestation.closure_method(),
+            attestation.denominator_revision()
         ),
     })
 }
@@ -5933,6 +6103,196 @@ pub struct ManifestSource {
     pub transformed_from: Option<String>,
 }
 
+/// An owner's frozen attestation that one eligible scope is closed and empty
+/// (I21.6).
+///
+/// I21.6 requires a complete-scope claim to rest on "an authoritative closed
+/// population", and it requires a genuinely empty eligible scope to be
+/// *representable* and distinguishable from an enumeration that never ran. Before
+/// this type existed, both entry points refused a zero-member denominator
+/// ([`CoverageAccount::open`] and [`CoverageReceipt::compute`]), so an empty
+/// scope was indistinguishable from a missing one — an absence of measurement
+/// that read as an absence of sources.
+///
+/// The attestation is the independent expected set the empty case is proven
+/// against, and that is the whole point of it: emptiness is established by an
+/// owner-attested *closed population*, never by the absence of items in a
+/// caller-supplied list. Two copies of the same empty `BTreeSet` compared to
+/// each other would prove only that the caller was consistent with itself.
+///
+/// Every field is private, so the only way to obtain a value is
+/// [`ClosedEmptyScope::attest`], and the commitments are read back through
+/// [`Self::verify_integrity`] at every consume site. Because the value carries
+/// its own digest over the exact scope it covers, an attestation frozen for one
+/// scope cannot authorize another: a caller cannot hold a valid attestation over
+/// a populated scope and present it for an empty one, nor the reverse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClosedEmptyScope {
+    /// Digest of the inquiry whose eligible scope is being attested empty.
+    inquiry_digest: String,
+    /// Canonical digest of the empty denominator itself, so the attestation
+    /// names the exact population it covers rather than only its size.
+    denominator_digest: String,
+    /// Explicit revision of that empty denominator snapshot.
+    denominator_revision: String,
+    /// Method whose execution establishes the population is *closed*: the bound
+    /// query was run exhaustively over the scope and returned zero eligible
+    /// members. A sampling method does not close a population, so a method
+    /// naming sampling cannot produce this value.
+    closure_method: String,
+    /// Owner-recorded instant the closure was observed, in Unix milliseconds.
+    observed_at_ms: i64,
+    /// Owner-declared last instant, in Unix milliseconds, at which this
+    /// attestation is still current.
+    current_until_ms: i64,
+    /// Frozen digest over the attestation shape.
+    #[serde(skip)]
+    digest: String,
+}
+
+/// Declared identity domain of [`ClosedEmptyScope`].
+///
+/// `v1` is the first shape: the commitments above, and nothing derived from the
+/// caller's own list.
+pub const CLOSED_EMPTY_SCOPE_DIGEST_DOMAIN: &str = "closed-empty-scope/v1";
+
+impl ClosedEmptyScope {
+    /// Frozen attestation of one closed and empty eligible scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::InvalidDigest`] for a malformed inquiry or
+    /// denominator digest, [`PortfolioError::Blank`] for a blank revision, a
+    /// non-positive observation time, or a closure method that is blank or does
+    /// not close a population (see [`method_closes_population`]), and
+    /// [`PortfolioError::Conflict`] for an inverted currentness window.
+    pub fn attest(
+        inquiry_digest: String,
+        denominator_digest: String,
+        denominator_revision: String,
+        closure_method: String,
+        observed_at_ms: i64,
+        current_until_ms: i64,
+    ) -> Result<Self, PortfolioError> {
+        if !method_closes_population(&closure_method) {
+            return Err(PortfolioError::Conflict {
+                field: "closed_empty_scope.closure_method",
+            });
+        }
+        digest(&inquiry_digest, "closed_empty_scope.inquiry_digest")?;
+        digest(
+            &denominator_digest,
+            "closed_empty_scope.denominator_digest",
+        )?;
+        text(
+            &denominator_revision,
+            "closed_empty_scope.denominator_revision",
+        )?;
+        text(&closure_method, "closed_empty_scope.closure_method")?;
+        if observed_at_ms <= 0 {
+            return Err(PortfolioError::Blank {
+                field: "closed_empty_scope.observed_at_ms",
+            });
+        }
+        if current_until_ms < observed_at_ms {
+            return Err(PortfolioError::Conflict {
+                field: "closed_empty_scope.current_until_ms",
+            });
+        }
+        let mut attestation = Self {
+            inquiry_digest,
+            denominator_digest,
+            denominator_revision,
+            closure_method,
+            observed_at_ms,
+            current_until_ms,
+            digest: String::new(),
+        };
+        attestation.digest = attestation.canonical_digest()?;
+        Ok(attestation)
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(
+            &canonical_json_bytes(&ClosedEmptyScopeDigestInput {
+                domain: CLOSED_EMPTY_SCOPE_DIGEST_DOMAIN,
+                attestation: self,
+            })
+            .map_err(|_| PortfolioError::Unencodable {
+                field: "closed_empty_scope.canonical_body",
+            })?,
+        ))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// An attestation whose bytes were rewritten after the freeze no longer
+    /// proves what it claims, so readback refuses it before any of its content
+    /// is believed.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "closed_empty_scope.digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether this attestation covers `scope_digest` and is still current at
+    /// `now_ms`.
+    ///
+    /// Both halves are load-bearing and neither is inferred: an attestation
+    /// frozen for one scope must not authorize another, and an expired one must
+    /// not read as a current closure. The clock is the caller's `now_ms`; see the
+    /// limitation note on [`NoMatchEvaluation`] for the trust boundary that
+    /// carries.
+    pub fn covers(&self, inquiry_digest: &str, now_ms: i64) -> bool {
+        self.inquiry_digest == inquiry_digest
+            && self.observed_at_ms <= now_ms
+            && now_ms <= self.current_until_ms
+    }
+
+    /// The exact empty denominator digest this attestation covers.
+    pub fn denominator_digest(&self) -> &str {
+        &self.denominator_digest
+    }
+
+    /// Explicit revision of the empty denominator snapshot this covers.
+    pub fn denominator_revision(&self) -> &str {
+        &self.denominator_revision
+    }
+
+    /// Method whose execution established the population is closed.
+    pub fn closure_method(&self) -> &str {
+        &self.closure_method
+    }
+}
+
+/// The single canonical encoder input for [`ClosedEmptyScope`].
+///
+/// The attestation is borrowed whole; its `digest` field is excluded by
+/// `#[serde(skip)]` on the field itself, so the exclusion is declared next to
+/// the field it excludes.
+#[derive(Serialize)]
+struct ClosedEmptyScopeDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole frozen attestation, minus its own digest.
+    attestation: &'a ClosedEmptyScope,
+}
+
+/// Whether a named closure method establishes a *closed* population.
+///
+/// A sampling method bounds an enumeration without closing it, so a name
+/// carrying `sampled` cannot produce a [`ClosedEmptyScope`]: admitting one would
+/// let a bounded sample stand in for the exhaustive predicate evaluation
+/// I21.6 requires, and would let a sampled result read as a complete scope.
+fn method_closes_population(method: &str) -> bool {
+    let lowered = method.to_ascii_lowercase();
+    !lowered.is_empty() && !lowered.contains("sampled") && !lowered.contains("top_k")
+}
+
 /// One immutable authorized manifest over the exact inquiry, denominator,
 /// source and evidence identities, raw and transform digests, dependence
 /// graph, coverage, grade limits, counterevidence, conflicts, unknowns, the
@@ -5978,6 +6338,15 @@ pub struct AuthorizedManifest {
     expires_ms: i64,
     /// Manifest revision; a revision invalidates older audits.
     revision: u64,
+    /// Owner's frozen attestation that the eligible scope is closed and empty.
+    ///
+    /// `Some` exactly when `sources` and `allowlist` are both empty, so the
+    /// manifest can represent a genuinely empty eligible scope instead of
+    /// refusing it. It is the independent expected set that emptiness is proven
+    /// against: without it a manifest over no member cannot exist, which is what
+    /// made a verified empty scope indistinguishable from an enumeration that
+    /// never ran.
+    closed_empty_scope: Option<ClosedEmptyScope>,
     /// Frozen digest over the whole manifest shape.
     ///
     /// Excluded from its own preimage by `#[serde(skip)]`.
@@ -5990,7 +6359,13 @@ pub struct AuthorizedManifest {
 /// Bumped `v1` -> `v2` with the per-source record commitment. The `v1`
 /// preimage named two subfields per source where a manifest now names three, so
 /// the same name would have covered two different field sets.
-pub const AUTHORIZED_MANIFEST_DIGEST_DOMAIN: &str = "authorized-manifest/v2";
+///
+/// Bumped `v2` -> `v3` with `closed_empty_scope`. The preimage gained a
+/// carried field, so a manifest over a genuinely empty eligible scope and a
+/// manifest over no member for want of an attestation would otherwise hash to
+/// the same value under one name — the exact defect the declared-domain rule
+/// exists to prevent.
+pub const AUTHORIZED_MANIFEST_DIGEST_DOMAIN: &str = "authorized-manifest/v3";
 
 /// Named constructor arguments for [`AuthorizedManifest::freeze`].
 #[derive(Clone, Debug)]
@@ -6023,18 +6398,60 @@ pub struct AuthorizedManifestParams {
     pub expires_ms: i64,
     /// Revision.
     pub revision: u64,
+    /// Owner's frozen attestation that the eligible scope is closed and empty.
+    ///
+    /// Required exactly when `sources` and `allowlist` are both empty, and
+    /// refused when either is populated: an attestation over a closed-empty
+    /// population cannot also describe a populated one.
+    pub closed_empty_scope: Option<ClosedEmptyScope>,
 }
 
 impl AuthorizedManifest {
     /// Validates and freezes one authorized manifest. No new source may enter
     /// a later audit without a new manifest: the allowlist is exactly the
     /// frozen set.
+    ///
+    /// A manifest over **no** member is representable, and only with an owner's
+    /// [`ClosedEmptyScope`] attestation: `sources` and `allowlist` are both
+    /// refused as empty unless `closed_empty_scope` is present, and the
+    /// attestation is refused outright when either collection has a member in
+    /// it. That is what makes a genuinely empty eligible scope a *measurement*
+    /// rather than a gap, and it is deliberately not reachable by omitting a
+    /// list — the independent evidence has to be named and has to re-prove.
     #[allow(clippy::too_many_lines)]
     pub fn freeze(mut params: AuthorizedManifestParams) -> Result<Self, PortfolioError> {
         digest(&params.inquiry_digest, "manifest.inquiry_digest")?;
         digest(&params.denominator_digest, "manifest.denominator_digest")?;
         digest(&params.coverage_digest, "manifest.coverage_digest")?;
-        if params.sources.is_empty() {
+        // The three gates that used to refuse a manifest over no member are now
+        // one condition, because a genuinely empty eligible scope is
+        // representable exactly when the owner attested it closed and empty
+        // (I21.6). The attestation is read back before it is believed, and it
+        // must be the only thing making the population empty: a manifest with
+        // any member and an attestation is a conflict, not an empty scope.
+        let attested_empty = params.closed_empty_scope.is_some();
+        if let Some(attestation) = &params.closed_empty_scope {
+            attestation.verify_integrity()?;
+            if attestation.denominator_digest() != params.denominator_digest {
+                return Err(PortfolioError::Conflict {
+                    field: "manifest.closed_empty_scope.denominator_digest",
+                });
+            }
+            // The manifest must not outlive the attestation, and the
+            // attestation must be this inquiry's. A manifest whose expiry runs
+            // past the moment the empty closure stops being current would carry
+            // a closed-empty claim over a window its owner never attested.
+            if !attestation.covers(&params.inquiry_digest, params.expires_ms) {
+                return Err(PortfolioError::Conflict {
+                    field: "manifest.closed_empty_scope.currentness",
+                });
+            }
+            if !params.sources.is_empty() || !params.allowlist.is_empty() {
+                return Err(PortfolioError::Conflict {
+                    field: "manifest.closed_empty_scope.sources",
+                });
+            }
+        } else if params.sources.is_empty() {
             return Err(PortfolioError::Blank {
                 field: "manifest.sources",
             });
@@ -6065,7 +6482,7 @@ impl AuthorizedManifest {
         {
             text(item, "manifest.preserved")?;
         }
-        if params.allowlist.is_empty() {
+        if params.allowlist.is_empty() && !attested_empty {
             return Err(PortfolioError::Blank {
                 field: "manifest.allowlist",
             });
@@ -6125,6 +6542,7 @@ impl AuthorizedManifest {
             disclosure: params.disclosure,
             expires_ms: params.expires_ms,
             revision: params.revision,
+            closed_empty_scope: params.closed_empty_scope,
             digest: String::new(),
         };
         manifest.digest = manifest.canonical_digest()?;
@@ -6151,6 +6569,17 @@ impl AuthorizedManifest {
     pub fn binds_source_record(&self, record: &SourceRecord) -> bool {
         self.source_commitment(&record.handle)
             .is_some_and(|source| record.verify_identity(&source.record_digest).is_ok())
+    }
+
+    /// The owner's closed-empty attestation, when this manifest carries one.
+    ///
+    /// This is the evidence a genuinely empty eligible scope is read back
+    /// through. A consumer that needs to know whether the population is empty
+    /// *as established* reads this rather than reading `sources.is_empty()`,
+    /// because an empty `sources` is a measurement here precisely when the
+    /// attestation is present and re-proves its own digest.
+    pub fn closed_empty_scope(&self) -> Option<&ClosedEmptyScope> {
+        self.closed_empty_scope.as_ref()
     }
 
     /// Deterministic canonical bytes of the frozen manifest shape, with the

@@ -197,6 +197,7 @@ fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> Audit
         disclosure: DisclosureClass::ProjectBound,
         expires_ms: 1_900_000_000_000,
         revision: 1,
+        closed_empty_scope: None,
     })
     .expect("manifest");
     // The audit job's run-bound allowlist admits exactly the handles the

@@ -51,12 +51,12 @@ use eliot_research_exchange_api::{
 
 use crate::evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, AuditedClaim,
-    AuthorizedManifest, AuthorizedManifestParams, ClaimCoverageMap, ClaimVerdict, CoverageAccount,
-    EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, ObservedOutsideScope,
-    PortfolioError, PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
-    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, audit_claim, bool_text,
-    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
-    push_field, reject_vague, text,
+    AuthorizedManifest, AuthorizedManifestParams, ClaimCoverageMap, ClaimVerdict, ClosedEmptyScope,
+    CoverageAccount, EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster,
+    ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
+    SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
+    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank,
+    push_count, push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -677,12 +677,16 @@ pub enum CounterSearchStatus {
 /// ran over a closed population; when nothing was enumerated the same empty
 /// eligible set is an absent measurement and stays `Uninitialised`.
 ///
-/// A *verified empty* eligible scope is a state this vocabulary cannot
-/// currently express, and no placeholder member is invented to close that gap:
-/// [`crate::evidence_portfolio::CoverageAccount::open`] refuses a zero-member
-/// denominator and [`CoverageReceipt::compute`] refuses a zero expected-member
-/// count, so an inquiry whose admitted manifest declares no member produces no
-/// record at all rather than a record stating that the eligible scope is empty.
+/// A genuinely empty eligible scope is representable, and no placeholder member
+/// is invented to reach it. The owner freezes a
+/// [`crate::evidence_portfolio::ClosedEmptyScope`] over the empty denominator,
+/// the manifest carries it, and
+/// [`crate::evidence_portfolio::CoverageAccount::open_verified_empty`] opens
+/// accounting over the attested empty population. That attestation is the
+/// independent evidence: emptiness is never concluded from the absence of items
+/// in a caller-supplied list, and the state reads as `VerifiedEmpty` only when
+/// the attestation re-proves its own digest. Without one, a zero-member
+/// denominator is still refused and no record is produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnumerationState {
     /// Nothing was observed against the frozen scope, so an empty eligible set
@@ -692,6 +696,16 @@ pub enum EnumerationState {
     Incomplete,
     /// The enumeration ran and every declared member closed intact.
     Complete,
+    /// The enumeration ran exhaustively over the frozen scope and the owner
+    /// attested the eligible population is closed with no member in it.
+    ///
+    /// This is the only state in which an empty denominator is a measurement.
+    /// It is distinct from [`Self::Uninitialised`] — no member was ever examined
+    /// under either, but here the owner *proved* there was nothing to examine,
+    /// and that proof is the independent evidence. It is also distinct from
+    /// [`Self::Complete`], which requires members to close and is therefore
+    /// unreachable over an empty population.
+    VerifiedEmpty,
 }
 
 impl EnumerationState {
@@ -702,6 +716,7 @@ impl EnumerationState {
             Self::Uninitialised => "uninitialised",
             Self::Incomplete => "incomplete",
             Self::Complete => "complete",
+            Self::VerifiedEmpty => "verified_empty",
         }
     }
 }
@@ -723,6 +738,15 @@ fn enumeration_state(
     account: &CoverageAccount,
     observed_outside_scope: &[ObservedOutsideScope],
 ) -> EnumerationState {
+    // An owner-attested closed-empty scope is checked first because it is the
+    // only evidence an empty denominator is a measurement, and
+    // `all_closed()` is vacuously true over an empty population: without this
+    // arm an attested empty scope would read as `Complete` and an unattested
+    // empty one would read as `Complete` too, which is the confusion this whole
+    // state exists to prevent.
+    if account.is_verified_empty() {
+        return EnumerationState::VerifiedEmpty;
+    }
     if account.all_closed() {
         return EnumerationState::Complete;
     }
@@ -2882,7 +2906,13 @@ impl CoverageReceipt {
         require_scope(requested_scope, "coverage.requested_scope")?;
         require_digest(frozen_scope_digest, "coverage.frozen_scope_digest")?;
         let expected_members = account.denominator_size();
-        if expected_members == 0 {
+        // A zero-member denominator is refused unless the owner attested the
+        // scope closed and empty. Refusing it unconditionally is what made a
+        // genuinely empty eligible scope unrepresentable, so the record could
+        // never state "the enumeration ran and found nothing" — only the
+        // absence of any record at all. The attestation is the independent
+        // evidence, and it is carried on the account rather than supplied here.
+        if expected_members == 0 && !account.is_verified_empty() {
             return Err(InquiryError::IncompleteDenominator {
                 field: "coverage.expected_members",
             });
@@ -5080,6 +5110,42 @@ impl InquiryGovernance {
     /// fabricates a closing disposition, a coverage claim, or an evidence
     /// reference.
     pub fn record(observation: InquiryObservation) -> Result<Self, InquiryError> {
+        Self::record_over(observation, None)
+    }
+
+    /// Records the complete `R6` governance view of an inquiry whose owner
+    /// attested the eligible scope closed and empty.
+    ///
+    /// This is the production route for a genuinely empty eligible scope
+    /// (I21.6). Before it existed, a run whose admitted manifest declared no
+    /// member produced **no record at all** — `CoverageAccount::open` and
+    /// `CoverageReceipt::compute` both refused a zero-member denominator — so
+    /// "the enumeration ran and the eligible population is closed with nothing
+    /// in it" and "the run never got far enough to say" were the same outcome.
+    ///
+    /// The attestation is the independent expected set, and it is required: a
+    /// run with no attestation and no admitted member still refuses, exactly as
+    /// it did before. It is never synthesized, defaulted or inferred from the
+    /// absence of members, and an attestation presented alongside a *populated*
+    /// scope is a conflict rather than a silent widening.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record`], plus a portfolio conflict (carried as
+    /// [`InquiryError::Portfolio`]) when the attestation covers a different
+    /// inquiry, a different denominator, a window that has closed, or a scope
+    /// the admitted manifest populated after all.
+    pub fn record_over_verified_empty_scope(
+        observation: InquiryObservation,
+        closed_empty_scope: ClosedEmptyScope,
+    ) -> Result<Self, InquiryError> {
+        Self::record_over(observation, Some(closed_empty_scope))
+    }
+
+    fn record_over(
+        observation: InquiryObservation,
+        closed_empty_scope: Option<ClosedEmptyScope>,
+    ) -> Result<Self, InquiryError> {
         // I21.7 reference firewall, before candidate promotion and on the live
         // path: the run-bound allowlist is a mandatory input, so it is validated
         // and its digest is re-proved against its own content first. A manifest
@@ -5102,7 +5168,7 @@ impl InquiryGovernance {
         let unadmitted_references = reference_firewall(&observation, &admissibility)?;
         let portfolio =
             SourcePortfolio::assemble(&observation.inquiry_id, &profile, &admissibility)?;
-        let account = coverage_account(&observation, &admissibility)?;
+        let account = coverage_account(&observation, &admissibility, closed_empty_scope)?;
         let degradation = degradation(&observation, &account);
         let coverage_receipt = CoverageReceipt::compute(
             &profile,
@@ -6888,6 +6954,7 @@ fn line_span_reason(shape: LineSpanShape) -> String {
 fn coverage_account(
     observation: &InquiryObservation,
     admissibility: &[SourceAdmissibilityRecord],
+    closed_empty_scope: Option<ClosedEmptyScope>,
 ) -> Result<CoverageAccount, InquiryError> {
     let manifest = &observation.reference_manifest;
     let mut members: BTreeSet<String> = BTreeSet::new();
@@ -6899,7 +6966,35 @@ fn coverage_account(
     {
         members.insert(handle.clone());
     }
-    let mut account = CoverageAccount::open(members).map_err(InquiryError::from)?;
+    // An admitted manifest that declares no member is a legitimately empty
+    // eligible scope only when the owner also attested it closed and empty.
+    // Without that attestation `CoverageAccount::open` refuses, and the refusal
+    // is the honest answer: "the manifest admitted nothing" is not "there is
+    // nothing", and the run prints its own refusal rather than inventing a
+    // record. The attestation is never synthesized here — it is the owner's
+    // evidence, and a run that has one produces the missing measurement.
+    //
+    // The populated-scope arm raises the same conflict
+    // `AuthorizedManifest::freeze` names for `manifest.closed_empty_scope.sources`
+    // — the attestation and the population disagree about whether the scope
+    // holds anything — and raises it in the portfolio domain, which is where
+    // that variant lives. The trailing `map_err` then lifts it losslessly into
+    // `InquiryError::Portfolio` rather than restating the refusal in this
+    // file's own vocabulary, which would name a duplicate where no identity is
+    // bound twice.
+    let mut account = match closed_empty_scope {
+        Some(attestation) if members.is_empty() => CoverageAccount::open_verified_empty(
+            members,
+            attestation,
+            &observation.inquiry_digest,
+            observation.assessment_time_ms,
+        ),
+        Some(_) => Err(PortfolioError::Conflict {
+            field: "coverage.closed_empty_scope.populated",
+        }),
+        None => CoverageAccount::open(members),
+    }
+    .map_err(InquiryError::from)?;
     for record in admissibility {
         account.observe(
             &record.record.handle,
@@ -7065,18 +7160,34 @@ fn audit_binding(
             },
         );
     }
-    if allowlist.is_empty() {
-        // `AuthorizedManifest::freeze` refuses an empty allowlist, and an
-        // unadmitted run has no citable material to audit. Refusing the whole
-        // projection here is the honest answer: this is not a failed audit of a
-        // release, it is a release with nothing released.
+    // An owner-attested closed-empty scope has no citable material, and the
+    // manifest that authorizes the audit is then a manifest over no member. That
+    // manifest exists precisely because the attestation is carried on it: without
+    // one, `AuthorizedManifest::freeze` refuses an empty source set and this
+    // refusal below is still the answer — an unadmitted run cannot say whether
+    // its scope is empty or merely unenumerated, and that difference is the whole
+    // point. With one, the same empty manifest is a statement that the eligible
+    // population was closed and found empty, and the audit of zero claims is
+    // complete over a roster of zero.
+    if allowlist.is_empty() && account.closed_empty_scope().is_none() {
         return Err(InquiryError::UnknownHandle {
             field: "claim_audit.allowlist",
         });
     }
+    // On an attested closed-empty scope the manifest's denominator is the *empty*
+    // one the attestation names, not the run's requested denominator: the
+    // manifest describes the population the audit ran over, and that population
+    // is empty. Substituting the run's denominator here would produce a
+    // manifest whose declared denominator and attested population disagree, which
+    // is the same contradiction the freeze refuses.
+    let closed_empty_scope = account.closed_empty_scope().cloned();
+    let denominator_digest = match &closed_empty_scope {
+        Some(attestation) => attestation.denominator_digest().to_owned(),
+        None => observation.denominator_digest.clone(),
+    };
     let authorized = AuthorizedManifest::freeze(AuthorizedManifestParams {
         inquiry_digest: observation.inquiry_digest.clone(),
-        denominator_digest: observation.denominator_digest.clone(),
+        denominator_digest,
         sources,
         dependence_edges: BTreeSet::new(),
         coverage_digest: account.digest(),
@@ -7091,6 +7202,7 @@ fn audit_binding(
         // closed, so the authorization cannot outlive the evidence it covers.
         expires_ms: observation.assessment_time_ms.saturating_add(1).max(1),
         revision: 1,
+        closed_empty_scope,
     })
     .map_err(InquiryError::from)?;
     AuditReferenceBinding::bind(
