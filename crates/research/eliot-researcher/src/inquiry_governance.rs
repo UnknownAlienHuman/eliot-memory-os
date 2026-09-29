@@ -6008,6 +6008,7 @@ fn run_lane_discipline(
         .filter(|record| record.eligibility == SourceEligibility::Eligible)
         .map(|record| record.record.handle.clone())
         .collect();
+    revalidate_lane_discipline(&discipline, observation)?;
     let current_fence = &profile.state_fence;
     let release = discipline.release_outcome_material(
         &evidence_freeze.digest,
@@ -6087,6 +6088,38 @@ fn run_lane_discipline(
     };
     outcome.digest = outcome.compute_digest();
     Ok(outcome)
+}
+
+/// Revalidates the current fence and profile on the release edge (I21.4 item 6).
+///
+/// I21.4 requires that queued execution and a resume present the fence and the
+/// profile revision the work was admitted under, and that a restart cannot
+/// create a fresh registration with a backdated claim. This is that check, on
+/// the edge that actually authorises a release, so it is reached by every run
+/// rather than by a caller that may skip it.
+///
+/// `revalidate` re-proves the profile's own integrity preimage and the exposure
+/// ledger's, refuses a fence other than the one this profile revision was frozen
+/// under, and re-checks that the active registration, when there is one, still
+/// binds this revision. The fence presented is the run-bound allowlist's own
+/// sealed State Fence: it was sealed by the requester at submission and is a
+/// separate object from the profile that names it, so this compares the
+/// submitted binding against the revision resolved from it rather than a value
+/// against itself. It reads no clock, and the registration history is
+/// append-only, so no restart can substitute a newer registration for an older
+/// one.
+///
+/// # Errors
+///
+/// Returns the [`LaneRegistrationError`]-derived [`InquiryError`] when the
+/// presented fence is stale, the profile or ledger fails its own integrity
+/// re-proof, or the active registration binds another profile revision.
+fn revalidate_lane_discipline(
+    discipline: &InquiryLaneDiscipline,
+    observation: &InquiryObservation,
+) -> Result<(), InquiryError> {
+    discipline.revalidate(&observation.reference_manifest.state_fence)?;
+    Ok(())
 }
 
 /// The contract owner that commits lane registrations into the ordering journal
