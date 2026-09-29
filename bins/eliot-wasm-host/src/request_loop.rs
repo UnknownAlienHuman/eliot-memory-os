@@ -4741,7 +4741,6 @@ fn consume_worker_outcome(
     if state.accepted_command() != Some(outcome.command) {
         return Err(denied("uncorrelated-outcome"));
     }
-    let command = outcome.command;
     // Whether the command now being settled came from an owner delivery. Read
     // before the accepted slot is retired, because only an owner-sourced
     // command may be completed against one (issue #2896 A2/A3).
