@@ -4388,7 +4388,9 @@ pub fn classify_maintenance_trigger_handoff(
         }
         MaintenanceTriggerLifecyclePhase::Acknowledged
         | MaintenanceTriggerLifecyclePhase::Expired
-        | MaintenanceTriggerLifecyclePhase::Superseded => MaintenanceTriggerHandoffDirective::Settled,
+        | MaintenanceTriggerLifecyclePhase::Superseded => {
+            MaintenanceTriggerHandoffDirective::Settled
+        }
     })
 }
 
