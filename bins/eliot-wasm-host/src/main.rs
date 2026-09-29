@@ -4,8 +4,8 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use eliot_wasm_host::{
-    CliError, ContourGateError, OrdinaryDriveError, PrototypeContourDecision, TypedWorld,
-    admit_generation, admit_prototype, default_experimental_limits,
+    CliError, ContourGateError, LoopError, OrdinaryDriveError, PrototypeContourDecision,
+    TypedWorld, admit_generation, admit_prototype, default_experimental_limits,
     execute_describe_experimental, experimental_manifest, parse_args, read_bounded_artifact,
     run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
 };
@@ -162,6 +162,12 @@ fn main() {
             claim_id,
         }) => {
             emit_delivery_in_progress(&operation_id, generation, &claim_id);
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
+        Err(OrdinaryDriveError::Loop(error @ LoopError::ResultRetentionFailed { .. })) => {
+            // The main process can classify this failure, but the current
+            // loop API does not return its retained observation sequence.
+            emit_error(error.code(), &error.to_string());
             std::process::exit(ADMISSION_REQUIRED_EXIT);
         }
         Err(error) => {
