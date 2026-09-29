@@ -55,6 +55,18 @@ use super::{
 /// outgrow the ledger it protects; oldest keys rotate out first.
 pub const MAX_TRANSPORT_REPLAY_KEYS: usize = 512;
 
+/// A transport replay is the same only while the owner inputs and the exact
+/// Governor assessment remain the same. In particular, the plan cannot know
+/// Governor risk when it mints `dedup_key`, so risk belongs in this identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReplayIdentity {
+    session_id: String,
+    dedup_key: String,
+    source: String,
+    source_revision: String,
+    assessed_risk: RiskTier,
+}
+
 /// One admitted plan item, in batch order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedPlanItem {
@@ -230,7 +242,7 @@ fn is_duplicate_suppressed(error: &BridgeError) -> bool {
 /// ([`MAX_TRANSPORT_REPLAY_KEYS`]); oldest keys rotate out first. The bridge
 /// ALSO deduplicates delivered normals — defense in depth, not reliance.
 pub struct SettledPlanAdmission {
-    seen: VecDeque<String>,
+    seen: VecDeque<ReplayIdentity>,
 }
 
 impl SettledPlanAdmission {
@@ -251,15 +263,26 @@ impl SettledPlanAdmission {
     /// Whether a replay key is currently retained in the window.
     #[must_use]
     pub fn replay_contains(&self, dedup_key: &str) -> bool {
-        self.seen.contains(&dedup_key.to_string())
+        self.seen.iter().any(|seen| seen.dedup_key == dedup_key)
     }
 
-    /// Records one presented key, rotating the oldest out at the bound.
-    fn note_presented(&mut self, dedup_key: &str) {
+    /// Whether this exact owner and Governor evidence tuple was presented.
+    fn replay_contains_identity(&self, identity: &ReplayIdentity) -> bool {
+        self.seen.contains(identity)
+    }
+
+    /// Removes only replay entries invalidated by the exact source owner.
+    fn invalidate_source(&mut self, session_id: &str, source: &str) {
+        self.seen
+            .retain(|seen| seen.session_id != session_id || seen.source != source);
+    }
+
+    /// Records one presented evidence tuple, rotating the oldest out at the bound.
+    fn note_presented(&mut self, identity: ReplayIdentity) {
         if self.seen.len() >= MAX_TRANSPORT_REPLAY_KEYS {
             self.seen.pop_front();
         }
-        self.seen.push_back(dedup_key.to_owned());
+        self.seen.push_back(identity);
     }
 
     /// Drives one settled plan through production and admission.
@@ -308,6 +331,7 @@ impl SettledPlanAdmission {
         let mut invalidations_applied = 0;
         for source in &batch.invalidations {
             invalidations_applied += runner.invalidate_reactive_source(source);
+            self.invalidate_source(&live_session, source);
         }
         let mut report = PlanAdmissionReport {
             session_id: live_session,
@@ -320,10 +344,6 @@ impl SettledPlanAdmission {
             skipped_ineligible: batch.skipped_ineligible,
         };
         for item in &batch.items {
-            if self.replay_contains(&item.dedup_key) {
-                report.replay_suppressed += 1;
-                continue;
-            }
             // The SAME owner-stickiness bit feeds assessment and severity:
             // the tier and the stickiness can never disagree about an item.
             let critical = item.severity == BridgeAdmissionSeverity::Critical;
@@ -337,6 +357,17 @@ impl SettledPlanAdmission {
                     continue;
                 }
             };
+            let replay_identity = ReplayIdentity {
+                session_id: live_session.clone(),
+                dedup_key: item.dedup_key.clone(),
+                source: item.cue_source.clone(),
+                source_revision: item.cue_source_revision.clone(),
+                assessed_risk: view.risk,
+            };
+            if self.replay_contains_identity(&replay_identity) {
+                report.replay_suppressed += 1;
+                continue;
+            }
             let admitted_severity = if critical {
                 Severity::Critical
             } else {
@@ -368,14 +399,14 @@ impl SettledPlanAdmission {
             );
             match outcome {
                 Ok(item_id) => {
-                    self.note_presented(&item.dedup_key);
+                    self.note_presented(replay_identity);
                     report.admitted.push(AdmittedPlanItem {
                         dedup_key: item.dedup_key.clone(),
                         item_id,
                     });
                 }
                 Err(error) if is_duplicate_suppressed(&error) => {
-                    self.note_presented(&item.dedup_key);
+                    self.note_presented(replay_identity);
                     report.duplicate_suppressed += 1;
                 }
                 Err(error) => {
