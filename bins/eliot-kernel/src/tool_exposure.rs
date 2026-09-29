@@ -136,7 +136,7 @@ pub(crate) fn requires_intent(name: &str) -> bool {
 /// `None` for non-expensive tools, unreconstructible pairs, or fresh
 /// inputs/routes/deltas. Pure and total: reads only, never stages, never fails.
 pub(crate) fn staged_repeat_without_progress<'a>(
-    retained: impl Iterator<
+    mut retained: impl Iterator<
         Item = (
             &'a eliot_protocol::HostRequestEnvelope,
             &'a serde_json::Value,
