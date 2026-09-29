@@ -21,6 +21,7 @@ required-features = ["test-support"]
 
 [dependencies]
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 windows-sys.workspace = true
 
