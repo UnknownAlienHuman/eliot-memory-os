@@ -67,11 +67,14 @@ pub fn admit_bridge_route_launch(
 ///
 /// The fingerprints are the complete W3 material, so any local/managed
 /// adapter move, any service/interactive identity move, and any distinct
-/// account-mode move diverge them. An unchanged fingerprint keeps native
-/// resume; any divergence is an explicit
+/// account-mode move presented here diverge them. An unchanged fingerprint
+/// keeps native resume; any divergence is an explicit
 /// [`ContinuityKind::Rehydrated`](eliot_protocol::ContinuityKind) new
 /// attempt — I10.5's "it becomes a `Rehydrated` attempt" — never silent
-/// continuity under the previous session identity.
+/// continuity under the previous session identity. The bound is the
+/// session's launch fingerprint compared with the material presented for this
+/// operation: a move the caller never presents is the caller's join (see
+/// [`classify_bridge_route_reconnect`]), never continuity granted here.
 #[must_use]
 pub fn classify_bridge_route_resume(
     prior: &RouteBehaviorFingerprint,
@@ -84,25 +87,31 @@ pub fn classify_bridge_route_resume(
     }
 }
 
-/// Classifies a reconnect against the Governor-retained route definition (W4).
+/// Classifies a reconnect against the Governor-retained receipt (W4).
 ///
-/// The `prior` fingerprint is the launch admission retained at attach; the
-/// live side is re-derived from the route definition the registry retains
-/// under the same `route_id` — the `derive_admission`
-/// (`route_registry.rs:1268`) pattern of comparing against the earlier
-/// retained receipt (`:1249-1252`) instead of recomputing over one
-/// constructor-fixed field pair. A revised retained definition — a
-/// local/managed adapter move, a service/interactive identity move, or a
-/// distinct account-mode move — diverges the fingerprints, so the resume
-/// classifies as an explicit
+/// The `prior` fingerprint is the launch admission retained at attach and is
+/// the bound for this resume operation; the live side fingerprints the
+/// presented `route`/`installation` material exactly once, validating the
+/// original through [`RouteBehaviorFingerprint::of`] rather than digesting a
+/// digest. Any local/managed adapter move, any service/interactive identity
+/// move, and any distinct account-mode move presented here diverge the
+/// complete W3 material, so the resume classifies as an explicit
 /// [`ContinuityKind::Rehydrated`](eliot_protocol::ContinuityKind) new
 /// attempt — I10.5's "it becomes a `Rehydrated` attempt" — never silent
-/// continuity under the previous session identity. A retained definition
-/// identical to launch keeps native resume, which stays only the
-/// single-compatible-fingerprint optimization. When the registry retains no
-/// definition for the route, the live declaration itself is fingerprinted,
-/// preserving the launch-equality comparison without inventing retained
-/// content.
+/// continuity under the previous session identity.
+///
+/// Completeness is judged against the registry's independent receipt set:
+/// the retained `ActualRouteReceipt::requested_fingerprint` for this
+/// `route_id` — the `derive_admission` (`route_registry.rs:1268`) pattern of
+/// comparing against the earlier retained receipt (`:1249-1252`) — never
+/// against the defined route intent under the same `route_id`, which the
+/// launch itself defined from these same caller fields and so cannot witness
+/// a move. A retained receipt that disagrees with either the launch bound or
+/// the presented material breaks native resume exactly like a moved live
+/// fingerprint does. When the registry retains no receipt for the route, the
+/// launch-equality comparison alone applies; retaining receipts from genuine
+/// runtime-observation evidence, and presenting genuine resume-time route
+/// material to this gate, are caller joins outside this module.
 #[must_use]
 pub fn classify_bridge_route_reconnect(
     registry: &CapabilityRouteRegistry,
@@ -110,9 +119,15 @@ pub fn classify_bridge_route_reconnect(
     route: &RuntimeRoute,
     installation: &RouteInstallationIdentity,
 ) -> ContinuityKind {
-    let next = match registry.route(&route.route_id) {
-        Some(retained) => RouteBehaviorFingerprint::of(retained, installation),
-        None => RouteBehaviorFingerprint::of(route, installation),
-    };
-    classify_bridge_route_resume(prior, &next)
+    let live = RouteBehaviorFingerprint::of(route, installation);
+    let retained_diverged = registry.receipt(&route.route_id).is_some_and(|receipt| {
+        receipt.requested_fingerprint != *prior || receipt.requested_fingerprint != live
+    });
+    if retained_diverged
+        || classify_bridge_route_resume(prior, &live) == ContinuityKind::Rehydrated
+    {
+        ContinuityKind::Rehydrated
+    } else {
+        ContinuityKind::NativeResume
+    }
 }
