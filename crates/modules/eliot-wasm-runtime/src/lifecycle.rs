@@ -909,9 +909,12 @@ pub struct RollbackRouteRequest {
 pub struct RollbackRouteProposal {
     pub cutover_id: String,
     pub route_scope: String,
-    /// The validated canonical cutover record, carried through unchanged so the
-    /// receipt that later commits this route is checked against the original
-    /// recorded epoch lineage rather than a re-derived scalar.
+    /// The validated canonical cutover record, carried through unchanged. The
+    /// proposal therefore cannot present an epoch pair other than the one
+    /// [`GenerationCutoverRecord::validate`] admitted, and the sealing digest
+    /// below covers the record as validated rather than a re-derived scalar.
+    /// Committing it, and re-checking the authority epoch against the currently
+    /// active tuple, stays with the Kernel cutover path.
     pub cutover: GenerationCutoverRecord,
     pub in_flight_count: u64,
     pub snapshot_strategy: SnapshotStrategy,
