@@ -7,15 +7,16 @@
 //! This module mints no installer/grant/source-DB/restore-engine authority
 //! and adds no mutation to Kernel rehearsal.
 //!
-//! External ingress is the one owner still missing, and it is not this
-//! module's: the admitted command that would reach
-//! `HostComposition::backup_dispatch_cutover` (the Host console protocol, the
-//! Host runtime-control endpoint, the CLI `CommandId`) is owned by #962 (no
-//! transport) and #945 (no public command surface). Nothing here adds a
-//! transport, an adapter or a startup probe for it, and nothing here claims an
-//! operator command can reach that port.
+//! External ingress to the port above is the admitted command surface that
+//! #962 (transport) and #945 (public command) own: it presents a separately
+//! admitted cutover body to `HostComposition::backup_dispatch_cutover` and
+//! returns that owner's own two-owner disposition, unchanged, to the operator.
+//! This module adds no transport, no adapter and no startup probe for it, and
+//! it grants that surface nothing of its own: the port re-proves the retained
+//! body against the admitted envelope at every effect boundary, so a presented
+//! command is admitted by its owners, never by its transport.
 //!
-//! What IS reachable in production, and what #983 observes, is the registered
+//! What is reachable in production, and what #983 observes, is the registered
 //! backup owner's cutover DISPATCH arm
 //! (`HostBackupDispatchOwner::dispatch_backup_operation`, host `lib.rs`):
 //! `HostComposition::backup_owner_registration` registers it on the control
@@ -23,8 +24,9 @@
 //! that registration on the canonical runtime-control pipe, so `eliot-kernel`'s
 //! `HostBackupOwnerClient` dispatches a cutover through it across the process
 //! boundary. That arm is a real cutover decision and is observed on its own
-//! `op` token by `observe_live_cutover_dispatch`; it routes and refuses, and it
-//! does not yet hand an admitted body to the port above.
+//! `op` token by `observe_live_cutover_dispatch`; it routes and refuses, and the
+//! admitted cutover body reaches the owner port through the separately admitted
+//! command surface, never through this arm's routing decision.
 //!
 //! Actual-owner integration (read from current main, no substitutes):
 //! - Admission: `eliot_protocol::{HostRequestEnvelope,
@@ -197,10 +199,17 @@
 //! - Process contour of the destination generation
 //!   (`HostComposition::cutover_generation_contour`, host `lib.rs`, the
 //!   ordered sequence extracted from `HostComposition::cutover_generation`
-//!   under the same owner): `activate_cutover_contour` below dispatches it
-//!   once this module's own durable cutover intent is `Pending` and before the
-//!   registry CAS, so the cutover moves the live process contour and not only
-//!   the registry generation. It resolves the candidate/prior generations and
+//!   under the same owner). The production chain is
+//!   `HostComposition::backup_dispatch_cutover` (the admitted command port) ->
+//!   `execute_cutover` -> `execute_cutover_inner` ->
+//!   `commit_with_durable_intent` -> `activate_cutover_contour` -> that
+//!   contour, so the ordered candidate launch, the rollback reactivation, the
+//!   process-observation persistence and the fail-closed arms are the SAME
+//!   owner methods the installer cutover runs, reached by one admitted port
+//!   rather than by a second state machine. `activate_cutover_contour` dispatches
+//!   it once this module's own durable cutover intent is `Pending` and before the
+//!   registry CAS, so the cutover moves the live process contour and not only the
+//!   registry generation. It resolves the candidate/prior generations and
 //!   their child artifact digests and approved child paths from the same
 //!   owner-validated registry projection the CAS fences on, and the four
 //!   executables are those approved child paths — the same derivation the
@@ -209,7 +218,11 @@
 //!   installer pending activation: this module's failure evidence is its own
 //!   durable cutover-intent record plus its own residual vocabulary, and a
 //!   failure after a possible activation is reported as the bounded
-//!   reconciliation state rather than as a clean `Failed`.
+//!   reconciliation state rather than as a clean `Failed`. That is also why
+//!   `HostComposition::cutover_generation` keeps its own `dead_code` allowance:
+//!   its staged-pending-activation precondition and its trailing
+//!   `commit_pending_durable` are the installer's, and admitting this path to it
+//!   would mean a second recovery owner (A12.3), not a live cutover route.
 //!
 //! Normative anchors: A12.3 one governed write path; A13.7 separate cutover
 //! authority, old authority never revives; I5.13 isolated restore, new
