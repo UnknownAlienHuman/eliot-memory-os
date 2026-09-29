@@ -1,5 +1,4 @@
 name: Automatic PR Merge Compile Gate
-
 on:
   workflow_dispatch:
   pull_request:
@@ -71,9 +70,9 @@ jobs:
         run: |
           Add-Content $env:GITHUB_STEP_SUMMARY 'Temporary bounded repair run. The unchanged MergeCompile profile is a separate result; diagnostic success does not replace it. Canonical workflow will be restored. No installed-product claim.'
   post-merge-repair:
-    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run bounded post-merge queue repair proof') }}
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run exact post-merge repair patch proof') }}
     runs-on: windows-latest
-    timeout-minutes: 70
+    timeout-minutes: 55
     permissions:
       contents: write
     steps:
@@ -82,35 +81,25 @@ jobs:
           ref: f4e05bc50117e47382d9e1e666d89934443b5b25
           fetch-depth: 1
           persist-credentials: false
-      - name: Acquire the exact reviewed repair scripts
+      - name: Acquire the exact patch and finite runner
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git switch -C main
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
-          $inputs = @{'repair.py'='970e4c23ab40f944adae70852eb12693f44c4e5e';'augment.py'='3f42d7f358371e450737b33774af0ae68eac45a8'}
+          $inputs = @{'exact-repair.py'='f977dbf137ec70fc1de443855a183d0dff25c8b1';'exact.patch.gz'='9831b1145d2028837d5c2a49f7607bc9a7b23015'}
           foreach ($name in $inputs.Keys) {
             $blob=$inputs[$name]
             $data=Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$blob" -Headers $headers
             $path=Join-Path $env:RUNNER_TEMP $name
             [IO.File]::WriteAllBytes($path,[Convert]::FromBase64String($data.content))
-            if ((((git hash-object $path)|Out-String).Trim()) -ne $blob) { throw 'Script digest mismatch' }
+            if ((((git hash-object --no-filters $path)|Out-String).Trim()) -ne $blob) { throw 'Input digest mismatch' }
           }
-      - name: Run the bounded source repairs and compile checks without credentials
+      - name: Apply verified bytes and execute scoped compilation without credentials
         shell: pwsh
         run: |
-          $repair=Join-Path $env:RUNNER_TEMP 'repair.py'
-          python (Join-Path $env:RUNNER_TEMP 'augment.py') $repair
-          if ($LASTEXITCODE -ne 0) { throw 'Augmentation failed' }
-          # Audited failure: the real fixture ends in one newline, not two.
-          # Normalize only whitespace outside its closing braces; keep the
-          # exact closing-brace guard, all source matches and all test oracles.
-          python -c "from pathlib import Path; p=Path(r'$repair'); s=p.read_text(); needle='if not block.endswith(ending):'; assert s.count(needle)==1; s=s.replace(needle,'block = block.rstrip() + chr(10) + chr(10)' + chr(10) + needle); p.write_bytes(s.encode('utf-8'))"
-          if ($LASTEXITCODE -ne 0) { throw 'Suffix repair failed' }
-          python -m py_compile $repair
-          if ($LASTEXITCODE -ne 0) { throw 'Repair syntax failed' }
-          python $repair
+          python (Join-Path $env:RUNNER_TEMP 'exact-repair.py') (Join-Path $env:RUNNER_TEMP 'exact.patch.gz')
           exit $LASTEXITCODE
       - name: Retain candidate source blobs without updating any ref
         if: ${{ always() }}
