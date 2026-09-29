@@ -850,8 +850,8 @@ impl BoundedRevocationOutcome {
     /// origin, repeating one, or omitting the origin itself refuses. The check
     /// is a superset test, so a paged or bound-truncated outcome is never
     /// refused for being short. `frontier` and `omissions` are deliberately
-    /// excluded, since an omitted dependent is retained in the frontier exactly
-    /// when its edge was never propagated.
+    /// excluded, since an omitted dependent is retained in the frontier
+    /// exactly when its edge was never propagated.
     pub fn verify_binding(
         &self,
         request: &BoundedRevocationRequest,
