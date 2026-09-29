@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use eliot_blob::BlobRootOwner;
 use eliot_contracts::StateFence;
 use eliot_installation::{
-    InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
-    WindowsRuntimeRootLeaseProvider,
+    InstallationProfile, RedbInstallationRegistry, RuntimeRootLease, RuntimeStateRoots,
+    ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
+    profile_selection_receipts_match_retained_roots,
 };
 #[cfg(test)]
 use eliot_installation::{PHASE_B_PENDING_SCM_DIGEST, RuntimeLaunchDescriptor};
@@ -26,7 +27,10 @@ use eliot_kernel_service::{
     HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY, STORE_ROUTE_IDENTITY,
 };
 use eliot_platform::{ClockObservation, PlatformHandle};
-use eliot_platform_windows::WindowsPlatform;
+use eliot_platform_windows::{UserOwnedRootLease, WindowsPlatform};
+use eliot_platform_windows::profile_supervision::{
+    ProfileRootLeaseSet, ProfileRootRequest, ProfileSelectionReceipt, open_profile_root_leases,
+};
 use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, ServerHello,
@@ -75,6 +79,7 @@ pub use boundary_map::{
 pub(crate) use launch_config::{LEGACY_PHASE_B_ZERO_DIGEST, parse_config_bytes};
 pub use launch_config::{
     StoreLaunchConfig, launch_config_digest, load_config, load_portable_dev_config,
+    load_user_mode_config,
 };
 pub(crate) use launch_config::{validate_digest, validate_launch_text};
 mod compatibility;
@@ -303,7 +308,19 @@ pub struct StoreComposition {
     /// decision and its I0.5 evidence snapshot as siblings of THIS config; it
     /// carries no decision of its own.
     store_config_path: PathBuf,
+    runtime_state_roots: RuntimeStateRoots,
+    profile_root_request: Option<ProfileRootRequest>,
+    profile_selection_receipt: Option<ProfileSelectionReceipt>,
+    _profile_root_leases: Option<ProfileRootLeaseSet>,
+    _user_mode_launch_root: Option<UserOwnedRootLease>,
     _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
+}
+
+/// Retained profile leases that keep the selected user-owned roots alive for
+/// the duration of one Store operation.
+#[must_use]
+pub struct StoreRootUseLease {
+    _profile_roots: Option<ProfileRootLeaseSet>,
 }
 
 impl std::fmt::Debug for StoreComposition {
@@ -326,8 +343,134 @@ impl StoreComposition {
     /// Windows Credential Manager reference and are retained only by the
     /// adapter's redacted `SecretString` configuration.
     pub fn new(config: &StoreLaunchConfig) -> Result<Self, String> {
+        Self::new_with_user_mode_launch_root(config, None)
+    }
+
+    /// Composes a selected UserMode launch while retaining the exact
+    /// immutable-binaries root lease used to read its config. Other profiles
+    /// pass no launch root and retain their existing profile-specific path
+    /// contract.
+    pub fn new_with_user_mode_launch_root(
+        config: &StoreLaunchConfig,
+        user_mode_launch_root: Option<UserOwnedRootLease>,
+    ) -> Result<Self, String> {
         config.validate()?;
         let schema_bootstrap_binding = StoreSchemaBootstrapBinding::from_config(config);
+        let roots = &config.runtime_launch.runtime_state_roots;
+        let mut root_lease_provider = WindowsRuntimeRootLeaseProvider::for_roots(roots)
+            .map_err(|error| format!("validate runtime-root provider: {error}"))?;
+        let runtime_root_leases = roots
+            .retain_and_validate(&mut root_lease_provider)
+            .map_err(|error| format!("retain canonical runtime roots: {error}"))?;
+        let (profile_root_request, profile_root_leases, profile_selection_receipt) =
+            match roots.profile {
+                InstallationProfile::SystemService => {
+                    if user_mode_launch_root.is_some() {
+                        return Err(
+                            "SystemService launch cannot retain a UserMode config root".to_owned(),
+                        );
+                    }
+                    validate_runtime_leases_without_profile_receipt(
+                        roots,
+                        &runtime_root_leases,
+                    )?;
+                    (None, None, None)
+                }
+                InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                    let host_state = UserOwnedRootLease::open_existing(Path::new(
+                        roots.host_state_root.as_str(),
+                    ))
+                    .map_err(|error| format!("retain profile registry Host root: {error}"))?;
+                    let (receipt, activation_fence) =
+                        RedbInstallationRegistry::inspect_profile_selection_and_activation_fence_user_owned_at(
+                            host_state,
+                            roots.profile,
+                            &config.runtime_launch.generation,
+                        )
+                        .map_err(|error| {
+                            format!("read persisted profile selection and activation fence: {error}")
+                        })?;
+                    if activation_fence.generation != config.runtime_launch.generation {
+                        return Err(
+                            "committed activation fence does not match the selected Store generation"
+                                .to_owned(),
+                        );
+                    }
+                    let phase_b_live_binding = activation_fence
+                        .phase_b_live_binding
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "committed activation fence has no Phase-B live binding".to_owned()
+                        })?;
+                    let request = profile_root_request_for_live_activation(
+                        &config.runtime_launch,
+                        &phase_b_live_binding.authority_descriptor_digest,
+                        phase_b_live_binding
+                            .provisioned_supervision_authority
+                            .authority_generation
+                            .value(),
+                    )?;
+                    let live_roots = open_profile_root_leases(&request)
+                        .map_err(|error| format!("retain selected profile roots: {error}"))?;
+                    if !profile_selection_receipts_match_retained_roots(
+                        &receipt,
+                        live_roots.selection(),
+                    )
+                    .map_err(|error| {
+                        format!("validate persisted profile root identities: {error}")
+                    })? {
+                        return Err(
+                            "persisted profile selection does not match live no-follow roots"
+                                .to_owned(),
+                        );
+                    }
+                    validate_runtime_leases_against_selection(
+                        roots,
+                        &runtime_root_leases,
+                        live_roots.selection(),
+                    )?;
+                    validate_runtime_leases_against_selection(
+                        roots,
+                        &runtime_root_leases,
+                        &receipt,
+                    )?;
+                    match (roots.profile, user_mode_launch_root.as_ref()) {
+                        (InstallationProfile::UserMode, Some(launch_root)) => {
+                            launch_config::validate_user_mode_launch_root_binding(
+                                launch_root,
+                                config,
+                            )?;
+                            validate_user_owned_root_observation(
+                                launch_root,
+                                live_roots.selection(),
+                                "immutable_binaries",
+                            )?;
+                            validate_user_owned_root_observation(
+                                launch_root,
+                                &receipt,
+                                "immutable_binaries",
+                            )?;
+                        }
+                        (InstallationProfile::UserMode, None) => {
+                            return Err(
+                                "UserMode Store launch requires its explicit retained config root"
+                                    .to_owned(),
+                            );
+                        }
+                        (InstallationProfile::PortableDev, Some(_)) => {
+                            return Err(
+                                "PortableDev launch cannot consume a UserMode config root"
+                                    .to_owned(),
+                            );
+                        }
+                        (InstallationProfile::PortableDev, None) => {}
+                        (InstallationProfile::SystemService, _) => unreachable!(),
+                    }
+                    (Some(request), Some(live_roots), Some(receipt))
+                }
+            };
+        // Root admission and persisted selection comparison happen before any
+        // Store/Blob owner, credential lookup, or provider path is composed.
         let blob = BlobRootOwner::claim(
             config.blob_root.clone(),
             format!("store-composition:{}", config.instance_id),
@@ -345,12 +488,6 @@ impl StoreComposition {
             &platform,
             &config.provider_bootstrap_credential_ref,
         )?;
-        let roots = &config.runtime_launch.runtime_state_roots;
-        let mut root_lease_provider = WindowsRuntimeRootLeaseProvider::for_roots(roots)
-            .map_err(|error| format!("validate runtime-root provider: {error}"))?;
-        let runtime_root_leases = roots
-            .retain_and_validate(&mut root_lease_provider)
-            .map_err(|error| format!("retain canonical runtime roots: {error}"))?;
         let provider_platform = WindowsPlatform::new(roots.profile_anchor_root.as_str().to_owned())
             .map_err(|error| format!("validate provider launch contour: {error}"))?;
         let provider_process_lease = provider_platform
@@ -402,8 +539,84 @@ impl StoreComposition {
             connections,
             health_admission: HealthAdminAdmission::bridge_default(),
             store_config_path: PathBuf::from(config.runtime_launch.store_config_path.as_str()),
+            runtime_state_roots: roots.clone(),
+            profile_root_request,
+            profile_selection_receipt,
+            _profile_root_leases: profile_root_leases,
+            _user_mode_launch_root: user_mode_launch_root,
             _runtime_root_leases: runtime_root_leases,
         })
+    }
+
+    /// Reopens the selected profile roots without following reparse points,
+    /// compares their identities with the persisted generation receipt and
+    /// Store's retained `RuntimeStateRoots` leases, and returns a guard to hold
+    /// through one provider operation.
+    pub fn retain_roots_for_use(&self) -> Result<StoreRootUseLease, StoreError> {
+        match (
+            self.profile_root_request.as_ref(),
+            self.profile_selection_receipt.as_ref(),
+            self._profile_root_leases.as_ref(),
+        ) {
+            (None, None, None) => {
+                validate_runtime_leases_without_profile_receipt(
+                    &self.runtime_state_roots,
+                    &self._runtime_root_leases,
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+                Ok(StoreRootUseLease {
+                    _profile_roots: None,
+                })
+            }
+            (Some(request), Some(original), Some(retained)) => {
+                retained
+                    .verify_stable_identity()
+                    .map_err(|_| StoreError::Unavailable)?;
+                let current =
+                    open_profile_root_leases(request).map_err(|_| StoreError::Unavailable)?;
+                if !profile_selection_receipts_match_retained_roots(original, current.selection())
+                    .map_err(|_| StoreError::Unavailable)?
+                {
+                    return Err(StoreError::Unavailable);
+                }
+                validate_runtime_leases_against_selection(
+                    &self.runtime_state_roots,
+                    &self._runtime_root_leases,
+                    current.selection(),
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+                match (
+                    self.runtime_state_roots.profile,
+                    self._user_mode_launch_root.as_ref(),
+                ) {
+                    (InstallationProfile::UserMode, Some(launch_root)) => {
+                        validate_user_owned_root_observation(
+                            launch_root,
+                            current.selection(),
+                            "immutable_binaries",
+                        )
+                        .map_err(|_| StoreError::Unavailable)?;
+                        validate_user_owned_root_observation(
+                            launch_root,
+                            original,
+                            "immutable_binaries",
+                        )
+                        .map_err(|_| StoreError::Unavailable)?;
+                    }
+                    (InstallationProfile::UserMode, None)
+                    | (InstallationProfile::PortableDev, Some(_))
+                    | (InstallationProfile::SystemService, Some(_)) => {
+                        return Err(StoreError::Unavailable);
+                    }
+                    (InstallationProfile::PortableDev, None)
+                    | (InstallationProfile::SystemService, None) => {}
+                }
+                Ok(StoreRootUseLease {
+                    _profile_roots: Some(current),
+                })
+            }
+            _ => Err(StoreError::Unavailable),
+        }
     }
 
     /// Resolves the installation-visible I5.9 compatibility decision for this
@@ -418,6 +631,16 @@ impl StoreComposition {
     /// runs is visible on the next observation.
     #[must_use]
     pub fn compatibility_verdict(&self) -> CompatibilityVerdict {
+        let root_use = match self.retain_roots_for_use() {
+            Ok(lease) => lease,
+            Err(_) => {
+                return CompatibilityVerdict::Maintenance {
+                    reason: "profile_root_identity_unavailable".to_owned(),
+                    report: "selected Store roots are unavailable".to_owned(),
+                };
+            }
+        };
+        let _root_use = root_use;
         let adapter = self.store.config();
         resolve_compatibility_verdict(
             &self.store_config_path,
@@ -436,6 +659,9 @@ impl StoreComposition {
     /// in-crate writer are gated by the same installation decision as the
     /// authenticated pipe.
     pub fn require_canonical_writer(&self) -> Result<(), String> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(|_| "selected Store roots are unavailable".to_owned())?;
         let adapter = self.store.config();
         require_installation_writer(
             &self.store_config_path,
@@ -477,6 +703,7 @@ impl StoreComposition {
     /// transport failure marks the health generation broken until it is
     /// explicitly replaced.
     pub async fn health(&self) -> Result<StoreHealth, StoreError> {
+        let _root_use = self.retain_roots_for_use()?;
         self.health_admission.require_admitted("store.health")?;
         let lease = self.connections.try_acquire(ClientClass::Health)?;
         let _access = self.connections.validate_lease(&lease)?;
@@ -490,6 +717,9 @@ impl StoreComposition {
     /// Starts the one retained canonical provider child and proves authenticated
     /// version readiness before the Store pipe accepts requests.
     pub async fn connect(&self) -> Result<(), String> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(|_| "selected Store roots are unavailable".to_owned())?;
         self.store
             .connect()
             .await
@@ -502,6 +732,7 @@ impl StoreComposition {
     /// Like [`Self::health`], readiness runs on the isolated health/admin
     /// path under exact-operation admission, never on a write slot.
     pub async fn readiness(&self) -> Result<ReadinessReceipt, StoreError> {
+        let _root_use = self.retain_roots_for_use()?;
         self.health_admission.require_admitted("store.readiness")?;
         let lease = self.connections.try_acquire(ClientClass::Health)?;
         let _access = self.connections.validate_lease(&lease)?;
@@ -543,6 +774,9 @@ impl StoreComposition {
         &self,
         observed_clock: &ClockObservation,
     ) -> Result<MigrationReceipt, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         let outcome = self
             .apply_initial_schema_migration_inner(observed_clock)
             .await;
@@ -614,6 +848,9 @@ impl StoreComposition {
         &self,
         command: StoreSchemaBootstrapCommand,
     ) -> Result<StoreSchemaBootstrapReceipt, StoreSchemaBootstrapError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreSchemaBootstrapError::Store)?;
         let generation = self.store.config().expected_schema_generation.clone();
         let migration = SurrealStoreAdapter::initial_schema_migration(generation);
         self.schema_bootstrap_binding
@@ -656,6 +893,7 @@ impl StoreComposition {
         &self,
         request: NamedReadRequest,
     ) -> Result<NamedReadResponse, eliot_store_api::StoreError> {
+        let _root_use = self.retain_roots_for_use()?;
         StoreConnectionManager::admit_named_read(request.operation)?;
         let lease = self.connections.try_acquire(ClientClass::Read)?;
         let _access = self.connections.validate_lease(&lease)?;
@@ -703,6 +941,9 @@ impl StoreComposition {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         authorities: &[Option<ExactJsonBytes>],
     ) -> Result<WriteReceipt, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         admit_prepared_for_execution(
             context,
             &transition,
@@ -774,6 +1015,9 @@ impl StoreComposition {
         &self,
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         request.validate().map_err(StoreCompositionError::Store)?;
         if request.context.state_fence != self.state_fence {
             return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
@@ -811,6 +1055,9 @@ impl StoreComposition {
         context: &RequestMeta,
         request: SnapshotBeginRequest,
     ) -> Result<SnapshotHandle, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -849,6 +1096,9 @@ impl StoreComposition {
         handle: SnapshotHandle,
         cursor: SnapshotCursor,
     ) -> Result<SnapshotPage, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -887,6 +1137,9 @@ impl StoreComposition {
         context: &RequestMeta,
         handle: SnapshotHandle,
     ) -> Result<SnapshotEndReceipt, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -928,6 +1181,9 @@ impl StoreComposition {
         destination: IsolatedDestination,
         operation: OperationIdentity,
     ) -> Result<IsolatedDestinationReceipt, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -972,6 +1228,9 @@ impl StoreComposition {
         context: &RequestMeta,
         batch: CanonicalRestoreBatch,
     ) -> Result<RestoreValidationReceipt, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -1008,6 +1267,9 @@ impl StoreComposition {
         context: &RequestMeta,
         batch: CanonicalRestoreBatch,
     ) -> Result<RestoreValidationReceipt, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -1050,6 +1312,9 @@ impl StoreComposition {
         &self,
         operation_id: OperationId,
     ) -> Result<StoreBackupStatus, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         let lease = self
             .connections
             .try_acquire(ClientClass::Read)
@@ -1094,6 +1359,9 @@ impl StoreComposition {
         first: OperationIdentity,
         second: OperationIdentity,
     ) -> Result<BackupOperationReconciliation, StoreCompositionError> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(StoreCompositionError::Store)?;
         first.validate().map_err(StoreCompositionError::Store)?;
         second.validate().map_err(StoreCompositionError::Store)?;
         let lease = self
@@ -1118,6 +1386,7 @@ impl StoreComposition {
         &self,
         operation_id: OperationId,
     ) -> Result<Option<WriteReceipt>, StoreError> {
+        let _root_use = self.retain_roots_for_use()?;
         self.store
             .reconcile(operation_id)
             .await
@@ -1195,6 +1464,9 @@ impl StoreComposition {
         class: ClientClass,
         dial: impl AsyncFnOnce() -> Result<(), StoreError>,
     ) -> Result<u64, String> {
+        let _root_use = self
+            .retain_roots_for_use()
+            .map_err(|_| "selected Store roots are unavailable".to_owned())?;
         let outcome = self.replace_client_generation_inner(class, dial).await;
         let mut events = BoundedEventLog::new();
         match &outcome {
@@ -1296,11 +1568,13 @@ impl StoreComposition {
         &self,
         keys: Vec<RevisionKey>,
     ) -> Result<Vec<RevisionHead>, StoreError> {
+        let _root_use = self.retain_roots_for_use()?;
         self.store.revision_heads(keys).await
     }
 
     /// Reads one coherent canonical validation snapshot.
     pub async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        let _root_use = self.retain_roots_for_use()?;
         self.store.validation_snapshot().await
     }
 
@@ -1309,6 +1583,7 @@ impl StoreComposition {
         &self,
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError> {
+        let _root_use = self.retain_roots_for_use()?;
         self.store.ordering_heads(scopes).await
     }
 
@@ -1350,6 +1625,149 @@ impl StoreComposition {
             artifact_digest: proved.artifact_digest,
         })
     }
+}
+
+fn profile_root_request_for_live_activation(
+    runtime_launch: &eliot_installation::RuntimeLaunchDescriptor,
+    authority_descriptor_digest: &eliot_platform::PlatformHandle,
+    authority_generation: u64,
+) -> Result<ProfileRootRequest, String> {
+    eliot_installation::profile_root_request_for_live_launch(
+        runtime_launch,
+        authority_descriptor_digest,
+        authority_generation,
+    )
+    .map_err(|error| format!("derive committed live profile root request: {error}"))
+}
+
+fn validate_user_owned_root_observation(
+    root: &UserOwnedRootLease,
+    selection: &ProfileSelectionReceipt,
+    role: &str,
+) -> Result<(), String> {
+    let observation = unique_profile_root_observation(selection, role)?;
+    root.verify_stable_identity()
+        .and_then(|()| root.verify_path_identity())
+        .map_err(|error| format!("revalidate selected {role} root: {error}"))?;
+    let canonical_path = root
+        .canonical_path()
+        .map_err(|error| format!("resolve retained {role} root: {error}"))?;
+    if root.identity() != observation.identity
+        || root.current_user_sid() != selection.owner_sid
+        || !same_windows_root_text(
+            &canonical_path.to_string_lossy(),
+            &observation.canonical_path.to_string_lossy(),
+        )
+    {
+        return Err(format!(
+            "live {role} lease differs from the retained profile selection"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_leases_against_selection(
+    roots: &RuntimeStateRoots,
+    leases: &ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
+    selection: &ProfileSelectionReceipt,
+) -> Result<(), String> {
+    let selected_roots = [
+        ("host_state_root", roots.host_state_root.as_str()),
+        ("kernel_ors_root", roots.kernel_ors_root.as_str()),
+        ("kernel_work_root", roots.kernel_work_root.as_str()),
+        ("store_data_root", roots.store_data_root.as_str()),
+        ("store_work_root", roots.store_work_root.as_str()),
+        ("store_temp_root", roots.store_temp_root.as_str()),
+        ("watchdog_state_root", roots.watchdog_state_root.as_str()),
+    ];
+    if leases.leases().len() != selected_roots.len() {
+        return Err("retained RuntimeStateRoots lease count changed".to_owned());
+    }
+    for (index, (role, declared_path)) in selected_roots.into_iter().enumerate() {
+        let observation = unique_profile_root_observation(
+            selection,
+            &format!("runtime_state_roots.{role}"),
+        )?;
+        let lease = &leases.leases()[index];
+        verify_runtime_root_lease(lease)?;
+        if lease.file_identity()
+            != format!(
+                "volume:{}:file:{}",
+                observation.identity.volume_serial_number, observation.identity.file_index
+            )
+            || !same_windows_root_text(lease.declared_path(), declared_path)
+            || !same_windows_root_text(
+                lease.canonical_path(),
+                &observation.canonical_path.to_string_lossy(),
+            )
+        {
+            return Err(format!(
+                "live runtime root {role} differs from the retained profile selection"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_leases_without_profile_receipt(
+    roots: &RuntimeStateRoots,
+    leases: &ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
+) -> Result<(), String> {
+    let selected_roots = [
+        ("host_state_root", roots.host_state_root.as_str()),
+        ("kernel_ors_root", roots.kernel_ors_root.as_str()),
+        ("kernel_work_root", roots.kernel_work_root.as_str()),
+        ("store_data_root", roots.store_data_root.as_str()),
+        ("store_work_root", roots.store_work_root.as_str()),
+        ("store_temp_root", roots.store_temp_root.as_str()),
+        ("watchdog_state_root", roots.watchdog_state_root.as_str()),
+    ];
+    if leases.leases().len() != selected_roots.len() {
+        return Err("retained RuntimeStateRoots lease count changed".to_owned());
+    }
+    for (index, (role, declared_path)) in selected_roots.into_iter().enumerate() {
+        let lease = &leases.leases()[index];
+        verify_runtime_root_lease(lease)?;
+        if !same_windows_root_text(lease.declared_path(), declared_path)
+            || !same_windows_root_text(lease.canonical_path(), declared_path)
+        {
+            return Err(format!(
+                "live protected runtime root {role} differs from its descriptor"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_runtime_root_lease(lease: &WindowsRuntimeRootLease) -> Result<(), String> {
+    match lease {
+        WindowsRuntimeRootLease::Protected { lease, .. } => lease
+            .verify_stable_identity()
+            .and_then(|()| lease.verify_path_identity())
+            .map_err(|error| format!("revalidate protected runtime root: {error}")),
+        WindowsRuntimeRootLease::UserOwned { lease, .. } => lease
+            .verify_stable_identity()
+            .and_then(|()| lease.verify_path_identity())
+            .map_err(|error| format!("revalidate user-owned runtime root: {error}")),
+    }
+}
+
+fn unique_profile_root_observation<'a>(
+    selection: &'a ProfileSelectionReceipt,
+    role: &str,
+) -> Result<&'a eliot_platform_windows::profile_supervision::ProfileRootObservation, String> {
+    let mut matches = selection.roots.iter().filter(|root| root.role == role);
+    let Some(observation) = matches.next() else {
+        return Err(format!("persisted profile selection omits root role {role}"));
+    };
+    if matches.next().is_some() {
+        return Err(format!("persisted profile selection duplicates root role {role}"));
+    }
+    Ok(observation)
+}
+
+fn same_windows_root_text(left: &str, right: &str) -> bool {
+    eliot_platform_windows::windows_paths_equal(Path::new(left), Path::new(right))
 }
 
 /// Requires the complete semantic-ready receipt for the exact configured
