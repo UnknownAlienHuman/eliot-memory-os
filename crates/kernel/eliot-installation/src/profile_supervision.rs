@@ -233,9 +233,17 @@ impl ProfileGovernedRoots {
 ///
 /// 1. the selected current-user or repository anchor is revalidated through
 ///    the existing OS adapter;
-/// 2. all four I3.1 root roles exactly match the layout derived from that
-///    anchor; and
-/// 3. the profile does not claim SCM supervision or administrative authority.
+/// 2. the anchor is *retained* as a live no-follow OS root object wherever the
+///    OS lease contract admits it, and the retained lease is proven to bind
+///    that same root object rather than merely repeat its name;
+/// 3. all four I3.1 root roles exactly match the layout derived from the
+///    retained anchor and lie strictly beneath it; and
+/// 4. the profile does not claim SCM supervision or administrative authority.
+///
+/// [`NoServiceProfileAuthorityProof::verified_root_roles`] counts only the roles
+/// whose layout was verified against a retained root object. A role derived from
+/// a path that no OS lease holds is not counted, because a predictable name is
+/// not ownership.
 ///
 /// This proof does not claim lexical exclusion from a hypothetical
 /// `ProgramData` path. Non-service selection receives no `ProgramData` anchor and
@@ -244,10 +252,11 @@ impl ProfileGovernedRoots {
 /// # Errors
 ///
 /// Returns [`InstallationError::ProfileViolation`] when the profile claims
-/// service authority or a root differs from its exact profile layout,
-/// [`InstallationError::InvalidField`] when a selected root is not a usable
-/// absolute path, and [`InstallationError::Platform`] when OS anchor
-/// revalidation fails.
+/// service authority, a retained lease does not bind its declared root, or a
+/// root differs from its exact profile layout; [`InstallationError::InvalidField`]
+/// when a selected root is not a usable absolute path; and
+/// [`InstallationError::Platform`] when OS anchor revalidation or retention
+/// fails.
 pub fn prove_no_service_profile_authority_dependency(
     governed: &ProfileGovernedRoots,
     runtime_state_roots: &RuntimeStateRoots,
@@ -267,9 +276,50 @@ pub fn prove_no_service_profile_authority_dependency(
         ));
     }
     runtime_state_roots.validate()?;
-    let _anchor_proof = WindowsRuntimeRootLeaseProvider::for_roots(runtime_state_roots)?;
+    let mut anchor_provider = WindowsRuntimeRootLeaseProvider::for_roots(runtime_state_roots)?;
 
-    let anchor = runtime_state_roots.profile_anchor_root.as_str();
+    // The profile anchor is the only root in this selection the OS lease
+    // contract admits as a retainable object. `portable_dev` names an already
+    // retained current-user directory, so the provider opens and holds a real
+    // no-follow handle to it for the whole proof. `user_mode` anchors on the
+    // OS-known-folder `LocalAppData` contour, which the adapter proves by
+    // known-folder lookup and reparse rejection rather than by a user-owned
+    // lease, so no lease is retained for it and no role is counted as verified
+    // against a retained object for that profile.
+    let retained_anchor = match governed.profile {
+        InstallationProfile::SystemService => unreachable!("service profile rejected above"),
+        InstallationProfile::PortableDev => Some(
+            anchor_provider.retain_root(&runtime_state_roots.profile_anchor_root)?,
+        ),
+        InstallationProfile::UserMode => None,
+    };
+    let declared_anchor = runtime_state_roots.profile_anchor_root.as_str();
+    if let Some(lease) = &retained_anchor {
+        if !lease.is_reparse_free() {
+            return Err(InstallationError::ProfileViolation(
+                "retained profile anchor contains a reparse point".to_owned(),
+            ));
+        }
+        if !same_windows_root(lease.declared_path(), declared_anchor)?
+            || !same_windows_root(lease.canonical_path(), declared_anchor)?
+        {
+            return Err(InstallationError::ProfileViolation(
+                "retained profile anchor lease does not bind the declared profile anchor"
+                    .to_owned(),
+            ));
+        }
+        text(lease.file_identity(), "profile_supervision.anchor_lease.file_identity")?;
+    }
+
+    // The layout is derived from the retained lease's OS-resolved canonical
+    // path when one exists, so the expected side of every comparison is a value
+    // the OS reported about a held object rather than an echo of the caller's
+    // own anchor string.
+    let anchor = match &retained_anchor {
+        Some(lease) => lease.canonical_path(),
+        None => declared_anchor,
+    };
+    let anchor_identity = WindowsPathIdentity::parse_root(anchor, "profile_supervision.anchor")?;
     let expected = match governed.profile {
         InstallationProfile::SystemService => unreachable!("service profile rejected above"),
         InstallationProfile::UserMode => {
@@ -328,17 +378,34 @@ pub fn prove_no_service_profile_authority_dependency(
         ("user_config", governed.user_config.as_str()),
         ("user_cache", governed.user_cache.as_str()),
     ];
+    // A role counts as verified only when the anchor it was derived from is a
+    // retained OS root object. Without a retained lease this loop is still a
+    // required refusal check -- a role that is not the exact layout under the
+    // selected anchor is refused either way -- but it is a lexical check, and
+    // nothing it agrees with is counted.
+    let anchor_is_retained = retained_anchor.is_some();
+    let mut verified_root_roles = 0_u32;
     for ((expected_field, expected_path), (actual_field, actual_path)) in
         expected.into_iter().zip(actual)
     {
-        if expected_field != actual_field
-            || WindowsPathIdentity::parse_root(&expected_path, expected_field)?
-                != WindowsPathIdentity::parse_root(actual_path, actual_field)?
-        {
+        let expected_identity = WindowsPathIdentity::parse_root(&expected_path, expected_field)?;
+        let actual_identity = WindowsPathIdentity::parse_root(actual_path, actual_field)?;
+        if expected_field != actual_field || expected_identity != actual_identity {
             return Err(InstallationError::ProfileViolation(format!(
                 "{actual_field} differs from the exact {:?} root derived from its retained profile anchor",
                 governed.profile
             )));
+        }
+        // The role must be strictly inside the anchor, so a role can never
+        // satisfy its own layout by collapsing onto the anchor itself.
+        if expected_identity == anchor_identity || !anchor_identity.contains(&expected_identity) {
+            return Err(InstallationError::ProfileViolation(format!(
+                "{expected_field} is not strictly below the {:?} profile anchor",
+                governed.profile
+            )));
+        }
+        if anchor_is_retained {
+            verified_root_roles += 1;
         }
     }
 
@@ -347,6 +414,6 @@ pub fn prove_no_service_profile_authority_dependency(
         selects_scm_supervision: false,
         requires_admin: false,
         requires_program_data_anchor: false,
-        verified_root_roles: 4,
+        verified_root_roles,
     })
 }
