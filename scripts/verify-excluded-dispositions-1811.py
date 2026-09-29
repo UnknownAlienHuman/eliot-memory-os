@@ -53,11 +53,36 @@ inventoried package is admitted; every other edge, and any inventoried package
 present in the root `Cargo.lock`, still fails closed — membership in the root
 workspace deletes the row instead of qualifying it.
 
-Discovery never trusts the inventory: the denominator is derived from the tree
-with the same rule as scripts/verify-standalone-crates.py. The declared
+Discovery never trusts the inventory. The denominator is not re-derived here: it
+is read from the accepted Cargo/package discovery owner
+`scripts/verify-standalone-crates.py`, whose `workspace_paths` and
+`standalone_crates` own root workspace members, root excludes and the
+independently rooted package set. An owner that is missing, unloadable or
+API-changed refuses the gate, because an empty denominator reads as "no
+standalone packages" and is a false proof. The declared
 `standalone_package_count` is checked against both the unique inventory rows
 and the discovered set, so a stale count fails closed instead of passing
 silently.
+
+The owner returns raw `workspace.members`/`workspace.exclude` SELECTOR strings,
+not the paths they stand for. A selector text that resolved to nothing and a
+selector that was never read are indistinguishable downstream, and only one of
+them is true, so every selector is resolved here and recorded: the raw string,
+its literal/glob kind, every canonical path it resolves to, that canonical
+`Cargo.toml` path's digest, and whether it names a package or a config-only
+`[workspace]` table. An explicit non-glob selector that resolves to no package
+manifest, a glob selector that matches no directory, a resolved member/exclude
+path that declares no `[package]`, an unreadable or malformed manifest and a
+selector that leaves the repository all fail closed. A test fixture or a
+config-only `[workspace]` table is recorded as such and is never counted as a
+production package.
+
+The receipt also binds the generator that produced it: `generator_version`
+carries the SHA-256 of this gate's own bytes, taken from the same
+`sha256_file`/`file_evidence` digest the receipt already records for
+`GATE_REL`, so a receipt from a different generator is distinguishable from
+one from this generator instead of sharing an unbound label. Generator bytes
+that cannot be digested refuse the run.
 
 The decision is emitted as a retained, versioned receipt
 (`--receipt-out`, default `.eliot/excluded-dispositions/gate-receipt.json`,
@@ -77,7 +102,9 @@ refused.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -85,9 +112,12 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 ALLOWED = {"KEEP", "WRAP", "EXTRACT", "REWORK", "REPLACE", "RETIRE", "UNKNOWN"}
-# Denominator discovery, identical to scripts/verify-standalone-crates.py.
+# Consumer-scan manifest enumeration only. The DENOMINATOR is no longer derived
+# from a local re-parse of these parts: it is read from the accepted discovery
+# owner (see `owner_denominator`).
 IGNORED_PARTS = {"target", "testdata", "fixtures"}
 # The consumer scan never skips test/fixture inputs on principle: a real build
 # can run a build script or a packaging script from either location. Only
@@ -98,7 +128,32 @@ DOCUMENTATION_SUFFIXES = {".md", ".txt", ".rst", ".adoc"}
 INVENTORY_REL = Path("workstreams/security/standalone-crate-dispositions.toml")
 GATE_REL = Path("scripts/verify-excluded-dispositions-1811.py")
 DISCOVERY_OWNER_REL = Path("scripts/verify-standalone-crates.py")
+# The exact owner entry points the denominator is read through: root workspace
+# members/excludes, and the independently rooted package set. Their absence is a
+# refusal, never a locally recomputed fallback.
+DISCOVERY_OWNER_SYMBOLS = ("workspace_paths", "standalone_crates")
 ROOT_MANIFEST_REL = Path("Cargo.toml")
+# Cargo selector syntax as this gate resolves it. A `workspace.members` or
+# `workspace.exclude` string carrying any of these is a glob selector expanded
+# against the tree; anything else is a literal path selector. `**` as a whole
+# path segment means "zero or more segments", matching Cargo's own member-glob
+# intent; inside one segment `fnmatch` applies its per-segment rules, so `*`
+# never crosses a `/`.
+SELECTOR_GLOB_CHARS = "*?["
+SELECTOR_DEEP_SEGMENT = "**"
+# How a resolved selector path is classified, read structurally from its own
+# manifest. A config-only `[workspace]` table and a fixture manifest are NOT
+# production packages; the text `[workspace]` occurring is not evidence of a
+# package.
+MANIFEST_KIND_PACKAGE = "package"
+MANIFEST_KIND_CONFIG_ONLY = "config-only-workspace"
+MANIFEST_KIND_NO_WORKSPACE = "no-workspace-table"
+# The selector resolution outcomes the receipt records. Every one is stated;
+# none is ever dropped, because "resolved to nothing" and "never read" look
+# identical downstream and only one of them is true.
+SELECTION_RESOLVED = "resolved"
+SELECTION_EMPTY = "resolved-empty"
+SELECTION_INVALID = "invalid-selector"
 LOCK_REL = Path("Cargo.lock")
 TOOLCHAIN_REL = Path("rust-toolchain.toml")
 RECEIPT_SCHEMA = "eliot.excluded-disposition-gate-receipt.v1"
@@ -258,30 +313,279 @@ def load_inventory(root: Path) -> dict:
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
-def workspace_sets(root: Path) -> tuple[set[str], set[str]]:
-    data = tomllib.loads((root / ROOT_MANIFEST_REL).read_text(encoding="utf-8"))["workspace"]
-    return set(data.get("members", [])), set(data.get("exclude", []))
+def load_discovery_owner(root: Path) -> Any:
+    """The accepted Cargo/package discovery owner, loaded or refused.
+
+    `scripts/verify-standalone-crates.py` is the one accepted owner of root
+    workspace members, root `workspace.exclude` and the tree-derived
+    independently rooted package set (its own docstring names Cargo the owner of
+    `[workspace] members` and refuses an empty set when Cargo cannot resolve it).
+    This gate reads the denominator from that owner instead of re-parsing the root
+    manifest here, because a second in-tool re-parse is a denominator that can
+    silently disagree with the owner it claims to reflect.
+
+    A missing, unloadable or API-changed owner is a refusal, never an empty set:
+    an empty denominator reads as "there are no standalone packages", which is a
+    false proof, not a measurement.
+    """
+    script = root / DISCOVERY_OWNER_REL
+    if not script.is_file():
+        raise SystemExit(
+            "EXCLUDED_DISPOSITIONS: FAIL missing the Cargo/package discovery owner "
+            f"{DISCOVERY_OWNER_REL.as_posix()}; the denominator cannot be derived"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "verify_standalone_crates", script
+    )
+    if spec is None or spec.loader is None:
+        raise SystemExit(
+            "EXCLUDED_DISPOSITIONS: FAIL discovery owner "
+            f"{DISCOVERY_OWNER_REL.as_posix()} is not importable; the denominator "
+            "cannot be derived"
+        )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # a broken owner is a refusal, not an empty set
+        raise SystemExit(
+            "EXCLUDED_DISPOSITIONS: FAIL discovery owner "
+            f"{DISCOVERY_OWNER_REL.as_posix()} failed to load ({error}); the "
+            "denominator cannot be derived"
+        ) from error
+    for symbol in DISCOVERY_OWNER_SYMBOLS:
+        if not callable(getattr(module, symbol, None)):
+            raise SystemExit(
+                "EXCLUDED_DISPOSITIONS: FAIL discovery owner "
+                f"{DISCOVERY_OWNER_REL.as_posix()} exposes no callable "
+                f"{symbol}(root); the denominator cannot be derived"
+            )
+    return module
 
 
-def discover_standalone(root: Path) -> dict[str, str]:
-    """Tree-derived denominator, identical to scripts/verify-standalone-crates.py."""
-    members, exclude = workspace_sets(root)
-    found: dict[str, str] = {}
+def owner_denominator(root: Path) -> tuple[set[str], set[str], dict[str, str]]:
+    """The one current denominator, read from the accepted discovery owner.
+
+    Root workspace members and root `workspace.exclude` come from the owner's
+    `workspace_paths`, and the independently rooted package set comes from its
+    `standalone_crates`. The package NAME of each selected crate is then read from
+    that crate's own manifest, because the owner returns crate directories and a
+    package identity is a property of the package, not of this gate.
+    """
+    owner = load_discovery_owner(root)
+    members, exclude = owner.workspace_paths(root)
+    discovered: dict[str, str] = {}
+    for crate in owner.standalone_crates(root):
+        relative = crate.relative_to(root).as_posix()
+        manifest = crate / ROOT_MANIFEST_REL.name
+        try:
+            parsed = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise SystemExit(
+                "EXCLUDED_DISPOSITIONS: FAIL discovery owner selected "
+                f"{relative} but its own manifest is unreadable ({error}); the "
+                "denominator cannot be derived"
+            ) from error
+        package = parsed.get("package")
+        if not isinstance(package, dict) or not str(package.get("name", "")).strip():
+            raise SystemExit(
+                "EXCLUDED_DISPOSITIONS: FAIL discovery owner selected "
+                f"{relative} but its own manifest declares no package name; the "
+                "denominator cannot be derived"
+            )
+        discovered[relative] = str(package["name"])
+    return set(members), set(exclude), discovered
+
+
+def read_manifest(root: Path, rel_dir: str) -> tuple[dict[str, Any] | None, str]:
+    """Read one canonical manifest structurally, or state why it cannot be read.
+
+    Structural only: the manifest is decoded by `tomllib` and the caller decides
+    what its tables mean. No manifest text is ever matched against.
+    """
+    manifest = root / rel_dir / ROOT_MANIFEST_REL.name
+    try:
+        with manifest.open("rb") as handle:
+            parsed = tomllib.load(handle)
+    except FileNotFoundError:
+        return None, "absent"
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        return None, f"unreadable ({error})"
+    return parsed, "read"
+
+
+def manifest_classification(parsed: dict[str, Any] | None, state: str) -> str:
+    """Classify a manifest as a package or as NOT a production package.
+
+    A `[workspace]` table alone is not a package. A config-only workspace (or a
+    manifest with no workspace table at all) is recorded as such so it is never
+    counted as a production package merely because the text occurs.
+    """
+    if parsed is None:
+        return state if state != "read" else MANIFEST_KIND_NO_WORKSPACE
+    package = parsed.get("package")
+    if isinstance(package, dict) and str(package.get("name", "")).strip():
+        return MANIFEST_KIND_PACKAGE
+    if isinstance(parsed.get("workspace"), dict):
+        return MANIFEST_KIND_CONFIG_ONLY
+    return MANIFEST_KIND_NO_WORKSPACE
+
+
+def selector_segments(selector: str) -> list[str] | None:
+    """Canonicalise one selector's path segments, or None if it is unusable.
+
+    A selector is repository-relative by definition. An absolute path, a drive
+    letter, an empty selector or one that climbs out of the tree has no
+    repository-relative resolution and is refused rather than guessed.
+    """
+    text = selector.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return None
+    segments: list[str] = []
+    for segment in text.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            return None
+        segments.append(segment)
+    return segments or None
+
+
+def selector_matches(pattern: list[str], candidate: list[str]) -> bool:
+    """Match canonical path segments against selector segments.
+
+    `**` as a whole segment spans zero or more segments. Within one segment
+    `fnmatch` applies its usual rules, so `*` never crosses a `/`.
+    """
+    if not pattern:
+        return not candidate
+    head = pattern[0]
+    if head == SELECTOR_DEEP_SEGMENT:
+        return selector_matches(pattern[1:], candidate) or (
+            bool(candidate) and selector_matches(pattern, candidate[1:])
+        )
+    if not candidate:
+        return False
+    return fnmatch.fnmatchcase(candidate[0], head) and selector_matches(
+        pattern[1:], candidate[1:]
+    )
+
+
+def manifest_directories(root: Path) -> list[str]:
+    """Every in-tree directory carrying a manifest, on the owner's own boundary.
+
+    `IGNORED_PARTS` is the same set the discovery owner applies to its tree
+    walk, so a selector cannot resolve into a build-output, fixture or testdata
+    directory that the owner itself refuses to classify.
+    """
+    found: list[str] = []
     for manifest in sorted(root.rglob(ROOT_MANIFEST_REL.name)):
         if any(part in IGNORED_PARTS for part in manifest.parts):
             continue
-        if manifest == root / ROOT_MANIFEST_REL:
-            continue
-        if "[workspace]" not in manifest.read_text(encoding="utf-8"):
-            continue
-        relative = manifest.parent.relative_to(root).as_posix()
-        if relative in members or relative in exclude:
-            continue
-        parsed = tomllib.loads(manifest.read_text(encoding="utf-8"))
-        if "package" not in parsed:
-            continue
-        found[relative] = str(parsed["package"]["name"])
+        found.append(manifest.parent.relative_to(root).as_posix())
     return found
+
+
+def resolve_selector(
+    root: Path, field: str, selector: str, directories: list[str]
+) -> dict:
+    """Resolve one raw member/exclude selector into canonical paths.
+
+    `directories` is the candidate universe every glob selector is matched
+    against, enumerated once by the caller. The returned record always states
+    the raw selector text, its kind and its resolution outcome, so a selector
+    that resolved to nothing is visibly different from a selector that was
+    never read.
+    """
+    record: dict[str, Any] = {
+        "field": field,
+        "selector": selector,
+        "kind": "glob"
+        if any(char in selector for char in SELECTOR_GLOB_CHARS)
+        else "literal",
+    }
+    segments = selector_segments(selector)
+    if segments is None:
+        record["resolution"] = SELECTION_INVALID
+        record["paths"] = []
+        record["resolved_packages"] = []
+        record["manifests"] = []
+        record["reason"] = "selector is not a repository-relative path or glob"
+        return record
+    if record["kind"] == "literal":
+        literal = "/".join(segments)
+        record["paths"] = (
+            [literal] if (root / literal / ROOT_MANIFEST_REL.name).is_file() else []
+        )
+    else:
+        record["paths"] = [
+            directory
+            for directory in directories
+            if selector_matches(segments, directory.split("/"))
+        ]
+    record["manifests"] = []
+    resolved_packages: list[str] = []
+    for directory in record["paths"]:
+        parsed, state = read_manifest(root, directory)
+        entry = file_evidence(root, Path(directory) / ROOT_MANIFEST_REL.name)
+        entry["directory"] = directory
+        entry["classification"] = manifest_classification(parsed, state)
+        record["manifests"].append(entry)
+        if entry["classification"] == MANIFEST_KIND_PACKAGE:
+            resolved_packages.append(directory)
+    record["resolved_packages"] = sorted(resolved_packages)
+    if not record["paths"]:
+        record["resolution"] = SELECTION_EMPTY
+        record["reason"] = (
+            f"{field} selector {selector!r} resolved to no manifest directory"
+        )
+    else:
+        record["resolution"] = SELECTION_RESOLVED
+        record["reason"] = ""
+    return record
+
+
+def resolved_workspace_sets(selectors: list[dict]) -> tuple[set[str], set[str]]:
+    """The canonical member and excluded-package paths the selectors resolve to.
+
+    Derived from the selector records themselves, so the gate's decisions and
+    the receipt's numbers cannot come from two different resolutions.
+    """
+    members: set[str] = set()
+    excluded: set[str] = set()
+    for record in selectors:
+        if record["resolution"] != SELECTION_RESOLVED:
+            continue
+        if record["field"] == "workspace.members":
+            members.update(record["resolved_packages"])
+        else:
+            excluded.update(record["resolved_packages"])
+    return members, excluded
+
+
+def expand_workspace_selectors(
+    root: Path, members: set[str], exclude: set[str]
+) -> list[dict]:
+    """Expand every member/exclude selector the owner returned, in declaration order.
+
+    `workspace_paths` hands back the selector strings exactly as the root
+    manifest declares them. Each one is resolved here so the receipt binds the
+    selector text to the paths it stands for; an owner that silently stopped
+    honouring a selector, or a selector that matched nothing, both leave a
+    stated record rather than no trace.
+    """
+    records: list[dict] = []
+    directories = manifest_directories(root)
+    for field, selectors in (
+        ("workspace.members", members),
+        ("workspace.exclude", exclude),
+    ):
+        for selector in sorted(selectors):
+            records.append(
+                resolve_selector(root, field, str(selector), directories)
+            )
+    return records
 
 
 def is_proc_macro(root: Path, rel_dir: str) -> bool:
@@ -947,8 +1251,10 @@ def build_receipt(
     states: list[str],
     evidence_state: str,
     decisions: list[dict],
+    members: set[str],
+    exclude: set[str],
+    selectors: list[dict],
 ) -> dict:
-    members, exclude = workspace_sets(root)
     rows = {str(row.get("path")): row for row in data.get("crate", [])}
     packages = [
         {
@@ -965,6 +1271,7 @@ def build_receipt(
         for path in sorted(inventory)
     ]
     admission = build_admission_block(states, evidence_state, decisions)
+    resolved_member_paths, resolved_exclude_packages = resolved_workspace_sets(selectors)
     inputs = {
         "source": source_identity(root),
         "root_manifest": file_evidence(root, ROOT_MANIFEST_REL),
@@ -974,14 +1281,44 @@ def build_receipt(
         "verifier": file_evidence(root, GATE_REL),
         "discovery_owner": file_evidence(root, DISCOVERY_OWNER_REL),
     }
+    # The generator version is bound to this gate's own bytes through the SAME
+    # digest the receipt already records for `inputs.verifier`: `sha256_file`
+    # through `file_evidence`. A second digest scheme would be a second owner of
+    # the same fact, so the field reads that digest rather than recomputing it.
+    generator_version = {
+        "generator": GATE_REL.as_posix(),
+        "receipt_schema": RECEIPT_SCHEMA,
+        "script_sha256": inputs["verifier"]["sha256"],
+        "script_state": inputs["verifier"]["state"],
+        "digest_source": "inputs.verifier.sha256",
+    }
+    denominator = {
+        "rule": (
+            "own [workspace] [package] manifest, neither a root workspace member "
+            "nor a root workspace.exclude entry"
+        ),
+        "discovery_owner": DISCOVERY_OWNER_REL.as_posix(),
+        "discovery_owner_symbols": list(DISCOVERY_OWNER_SYMBOLS),
+        "standalone_package_count": len(packages),
+        "member_selector_count": len(members),
+        "exclude_selector_count": len(exclude),
+        # Resolved canonical paths, not the raw selector text: a selector that
+        # changed what it matches changes this count and invalidates the receipt.
+        "workspace_member_count": len(resolved_member_paths),
+        "root_exclude_count": len(resolved_exclude_packages),
+        "selector_expansion": selectors,
+        "packages": packages,
+    }
     identity = json.dumps(
         {
             "trust_class": trust_class,
+            "generator_version": generator_version,
             "inputs": inputs,
             "denominator": {
                 "standalone_package_count": len(packages),
-                "workspace_member_count": len(members),
-                "root_exclude_count": len(exclude),
+                "workspace_member_count": denominator["workspace_member_count"],
+                "root_exclude_count": denominator["root_exclude_count"],
+                "selector_expansion": selectors,
                 "packages": packages,
             },
             "consumer_edges": edges,
@@ -999,21 +1336,12 @@ def build_receipt(
         "component": "eliot_excluded_disposition_gate_receipt",
         "issue": 1811,
         "generator": GATE_REL.as_posix(),
+        "generator_version": generator_version,
         "trust_class": trust_class,
         "admission_policy": admission["policy"],
         "admission": admission,
         "inputs": inputs,
-        "denominator": {
-            "rule": (
-                "own [workspace] [package] manifest, neither a root workspace member "
-                "nor a root workspace.exclude entry"
-            ),
-            "discovery_owner": DISCOVERY_OWNER_REL.as_posix(),
-            "standalone_package_count": len(packages),
-            "workspace_member_count": len(members),
-            "root_exclude_count": len(exclude),
-            "packages": packages,
-        },
+        "denominator": denominator,
         "consumer_edges": edges,
         "locked_standalone_packages": locked,
         "coverage": {
@@ -1104,6 +1432,15 @@ def recheck_receipt(root: Path, prior_path: Path, receipt: dict, failures: list[
                 f"(retained {summarize_admission_field(prior_admission.get(field))} vs current "
                 f"{summarize_admission_field(receipt['admission'][field])})"
             )
+    # The generator that produced a receipt is refused when it is not this
+    # generator: a receipt produced by different bytes is not the same decision,
+    # even when its numbers happen to agree.
+    if prior.get("generator_version") != receipt["generator_version"]:
+        failures.append(
+            "retained gate receipt generator version differs from this generator "
+            f"(retained {prior.get('generator_version')} vs current "
+            f"{receipt['generator_version']})"
+        )
     for field in ("inputs", "denominator", "consumer_edges", "locked_standalone_packages"):
         if prior.get(field) != receipt[field]:
             failures.append(f"retained gate receipt {field} differs from the current decision")
@@ -1163,18 +1500,55 @@ def main() -> int:
             f"duplicate inventory package identities: {sorted({n for n in declared_names if declared_names.count(n) > 1})}"
         )
 
-    discovered = discover_standalone(root)
-    members, exclude = workspace_sets(root)
+    members, exclude, discovered = owner_denominator(root)
+    # 0. every member/exclude SELECTOR is resolved against the tree. The owner
+    #    returns the raw strings, so without this the selector text is never
+    #    bound to the receipt: an owner that stopped honouring a selector, or a
+    #    selector that matched nothing, would leave no trace at all.
+    selectors = expand_workspace_selectors(root, members, exclude)
+    resolved_members, resolved_exclude_packages = resolved_workspace_sets(selectors)
+    for record in selectors:
+        if record["resolution"] == SELECTION_INVALID:
+            failures.append(f"invalid workspace selector: {record['reason']}")
+        elif record["resolution"] == SELECTION_EMPTY:
+            failures.append(
+                "workspace selector resolved to nothing: "
+                f"{record['field']} {record['selector']!r} ({record['reason']})"
+            )
+        elif not record["resolved_packages"]:
+            # The selector matched directories, but none of them is a package.
+            # A config-only `[workspace]` table or a fixture manifest is not a
+            # production package; the receipt says so instead of counting it.
+            failures.append(
+                f"{record['field']} selector {record['selector']!r} resolves to no "
+                "package manifest: "
+                + ", ".join(
+                    f"{entry['path']}={entry['classification']}"
+                    for entry in record["manifests"]
+                )
+            )
+    # The gate's own bytes are the generator version. Bytes it cannot digest
+    # leave the version unbound, which would make a receipt indistinguishable
+    # from one no generator produced.
+    if file_evidence(root, GATE_REL)["sha256"] is None:
+        failures.append(
+            f"generator bytes are unreadable: {GATE_REL.as_posix()}; the receipt "
+            "cannot bind a generator version"
+        )
 
     # 1. denominator: inventory must equal tree discovery
     if set(by_path) != set(discovered):
         missing = sorted(set(discovered) - set(by_path))
         stale = sorted(set(by_path) - set(discovered))
         failures.append(f"inventory/tree drift missing={missing} stale={stale}")
-    for path in sorted(set(by_path) & set(members)):
+    # Raw selectors stay in the overlap check as well as their resolved paths:
+    # a selector text equal to an inventory path is still a member row, whether
+    # or not it resolved.
+    member_paths = resolved_members | {str(selector) for selector in members}
+    for path in sorted(set(by_path) & member_paths):
         failures.append(f"inventory row is a root workspace member: {path}")
     # 2. every root exclude entry must be declared
-    for entry in sorted(exclude):
+    for entry in sorted(resolved_exclude_packages):
         if entry not in by_path:
             failures.append(f"undeclared excluded input: {entry}")
     # 2b. declared count must equal the unique current rows and tree discovery
@@ -1261,6 +1635,9 @@ def main() -> int:
         states,
         evidence_state,
         decisions,
+        members,
+        exclude,
+        selectors,
     )
     if args.receipt is not None:
         recheck_receipt(root, args.receipt, receipt, failures)
