@@ -3378,7 +3378,7 @@ impl KernelStoreGateway {
                         "owner failure read does not bind to the current owner revision".to_owned(),
                     ));
                 }
-                Ok(failure)
+                Ok(failure.map(|failure| *failure))
             }
             _ => Err(RunNowPreflightAssembly::Unknown(
                 "owner failure read did not return a failure projection".to_owned(),
