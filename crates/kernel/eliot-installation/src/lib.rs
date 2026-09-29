@@ -4453,6 +4453,23 @@ pub(crate) trait InstallationEffectPort: Send {
 
 /// Sealed production Windows adapter. Only [`WindowsInstallationCoordinator`]
 /// can construct or mutably use this capability.
+struct CredentialHostConnection {
+    pipe_name: String,
+    expectation: eliot_platform_windows::NamedPipePeerExpectation,
+    selected_session: Option<(String, u32)>,
+    retained_user_image: Option<RetainedUserHostImage>,
+}
+
+struct RetainedUserHostRoots {
+    root: UserOwnedRootLease,
+    host_root: UserOwnedRootLease,
+}
+
+struct RetainedUserHostImage {
+    roots: RetainedUserHostRoots,
+    executable: UserOwnedPathLease,
+}
+
 struct WindowsInstallationEffectPort {
     primitive: WindowsInstallerRootPrimitive,
     secrets: WindowsInstallerSecretProvider,
@@ -5694,246 +5711,315 @@ impl WindowsInstallationEffectPort {
         effect: &InstallationEffectRequest,
         request: &HostCredentialControlRequest,
     ) -> Result<HostCredentialControlResponse, PortError> {
-        let provision = &request.intent.provision;
-        let (pipe_name, expectation, selected_session, retained_user_image) = match effect.profile {
-            InstallationProfile::SystemService => {
-                if effect.profile_selection_receipt.is_some()
-                    || provision.scope != StoreCredentialScope::LocalService
-                {
-                    return Err(PortError::IdentityConflict);
-                }
-                let binding = observe_running_eliot_host_process().map_err(secret_port_error)?;
-                if !eliot_platform_windows::windows_paths_equal(
-                    Path::new(provision.expected_host_executable.as_str()),
-                    Path::new(binding.image_path()),
-                ) {
-                    return Err(PortError::IdentityConflict);
-                }
-                let expectation =
-                    eliot_platform_windows::NamedPipePeerExpectation::new_with_process_binding(
-                        LOCAL_SERVICE_SID,
-                        0,
-                        binding,
-                    )
-                    .map_err(secret_port_error)?;
-                (
-                    HOST_CREDENTIAL_CONTROL_PIPE.to_owned(),
-                    expectation,
-                    None,
-                    None,
-                )
-            }
-            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
-                let selection = effect
-                    .profile_selection_receipt
-                    .as_ref()
-                    .ok_or(PortError::InvalidRequestMetadata)?;
-                let expected_profile = match effect.profile {
-                    InstallationProfile::UserMode => ProfileSelection::UserMode,
-                    InstallationProfile::PortableDev => ProfileSelection::PortableDev,
-                    InstallationProfile::SystemService => unreachable!(),
-                };
-                if selection.profile != expected_profile
-                    || provision.scope != StoreCredentialScope::CurrentUser
-                    || provision.expected_principal_sid.as_str() != selection.owner_sid
-                {
-                    return Err(PortError::IdentityConflict);
-                }
-                let observed_root = selection
-                    .roots
-                    .iter()
-                    .find(|root| root.role == "immutable_binaries")
-                    .ok_or(PortError::InvalidRequestMetadata)?;
-                let root = UserOwnedRootLease::open_existing(&observed_root.canonical_path)
-                    .map_err(|_| PortError::IdentityConflict)?;
-                if root.current_user_sid() != selection.owner_sid
-                    || root.identity() != observed_root.identity
-                    || !eliot_platform_windows::windows_paths_equal(
-                        &root
-                            .canonical_path()
-                            .map_err(|_| PortError::IdentityConflict)?,
-                        &observed_root.canonical_path,
-                    )
-                {
-                    return Err(PortError::IdentityConflict);
-                }
-                let observed_host_root = selection
-                    .roots
-                    .iter()
-                    .find(|candidate| candidate.role == "runtime_state_roots.host_state_root")
-                    .ok_or(PortError::InvalidRequestMetadata)?;
-                let host_root = UserOwnedRootLease::open_existing(Path::new(
-                    provision.host_state_root.as_str(),
-                ))
-                .map_err(|_| PortError::IdentityConflict)?;
-                if host_root.current_user_sid() != selection.owner_sid
-                    || host_root.identity() != observed_host_root.identity
-                    || !eliot_platform_windows::windows_paths_equal(
-                        &host_root
-                            .canonical_path()
-                            .map_err(|_| PortError::IdentityConflict)?,
-                        &observed_host_root.canonical_path,
-                    )
-                {
-                    return Err(PortError::IdentityConflict);
-                }
-                let live_client =
-                    eliot_platform_windows::current_process_named_pipe_expectation()
-                        .map_err(secret_port_error)?;
-                let live_session_id = live_client.expected_session_id();
-                if live_client.expected_sid() != selection.owner_sid || live_session_id == 0 {
-                    return Err(PortError::IdentityConflict);
-                }
-                let executable = UserOwnedPathLease::open_existing(
-                    &root,
-                    Path::new(provision.expected_host_executable.as_str()),
-                )
-                .map_err(|_| PortError::IdentityConflict)?;
-                let bytes = executable
-                    .read_bounded(512 * 1024 * 1024)
-                    .map_err(|_| PortError::IdentityConflict)?;
-                if sha256_hex(&bytes) != provision.expected_host_executable_sha256.as_str() {
-                    return Err(PortError::IdentityConflict);
-                }
-                root.verify_stable_identity()
-                    .and_then(|()| root.verify_path_identity())
-                    .and_then(|()| host_root.verify_stable_identity())
-                    .and_then(|()| host_root.verify_path_identity())
-                    .and_then(|()| executable.verify_stable_identity())
-                    .and_then(|()| executable.verify_path_identity())
-                    .map_err(|_| PortError::IdentityConflict)?;
-                let expectation =
-                    eliot_platform_windows::NamedPipePeerExpectation::new_for_dynamic_process(
-                        &selection.owner_sid,
-                        provision.expected_host_executable.as_str(),
-                        executable.identity(),
-                    )
-                    .map_err(secret_port_error)?;
-                let installation_id = PlatformHandle::new(&selection.installation_id)
-                    .map_err(|_| PortError::InvalidRequestMetadata)?;
-                let owner_sid = PlatformHandle::new(&selection.owner_sid)
-                    .map_err(|_| PortError::InvalidRequestMetadata)?;
-                let pipe_name = current_user_credential_control_pipe(
-                    effect.profile,
-                    &installation_id,
-                    &owner_sid,
-                )
-                .map_err(|_| PortError::InvalidRequestMetadata)?;
-                (
-                    pipe_name,
-                    expectation,
-                    Some((selection.owner_sid.clone(), live_session_id)),
-                    Some((root, host_root, executable)),
-                )
-            }
-        };
+        let connection = Self::prepare_credential_host_connection(effect, request)?;
         std::thread::scope(|scope| {
             scope
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_io()
-                        .enable_time()
-                        .build()
-                        .map_err(|_| host_port_error())?;
-                    runtime.block_on(async {
-                        let timeout = std::time::Duration::from_secs(5);
-                        let mut transport = NamedPipeTransport::connect_authenticated(
-                            &pipe_name,
-                            timeout,
-                            &expectation,
-                        )
-                        .await
-                        .map_err(|_| host_port_error())?;
-                        let peer = transport.peer_identity();
-                        let peer_process =
-                            peer.process_binding().ok_or(PortError::IdentityConflict)?;
-                        if !eliot_platform_windows::windows_paths_equal(
-                            Path::new(peer_process.image_path()),
-                            Path::new(provision.expected_host_executable.as_str()),
-                        ) {
-                            return Err(PortError::IdentityConflict);
-                        }
-                        if let Some((selected_sid, selected_session_id)) = &selected_session {
-                            let eliot_ipc::PeerIdentity::Authenticated {
-                                user_identity,
-                                session_identity,
-                                ..
-                            } = peer
-                            else {
-                                return Err(PortError::IdentityConflict);
-                            };
-                            if user_identity != selected_sid
-                                || session_identity != &selected_session_id.to_string()
-                            {
-                                return Err(PortError::IdentityConflict);
-                            }
-                        }
-                        let host_process_digest = PlatformHandle::new(sha256_hex(
-                            format!(
-                                "windows-pid:{}:start:{}:image:{}",
-                                peer_process.process_id(),
-                                peer_process.start_time_100ns(),
-                                peer_process.image_path(),
-                            )
-                            .as_bytes(),
-                        ))
-                        .map_err(|_| PortError::InvalidRequestMetadata)?;
-                        let frame = credential_control_request_frame(
-                            request.intent.request_digest.as_str(),
-                            request,
-                        )
-                        .map_err(|_| PortError::InvalidRequestMetadata)?;
-                        transport
-                            .send_frame(&frame, TransportLimits::default())
-                            .await
-                            .map_err(|_| host_port_error())?;
-                        let response = transport
-                            .receive_frame(TransportLimits::default())
-                            .await
-                            .map_err(|_| host_port_error())?;
-                        if response.connection_id != request.intent.request_digest.as_str() {
-                            return Err(PortError::IdentityConflict);
-                        }
-                        let response = decode_credential_control_response_frame(&response)
-                            .map_err(|_| PortError::IdentityConflict)?;
-                        let process_matches = match &response {
-                            HostCredentialControlResponse::Absent { snapshot, .. } => {
-                                snapshot.host_process_identity == host_process_digest
-                            }
-                            HostCredentialControlResponse::Matching { receipt } => {
-                                receipt.host_process_identity == host_process_digest
-                            }
-                            HostCredentialControlResponse::PhaseBPrepared { receipt } => {
-                                receipt.host_process_identity == host_process_digest
-                            }
-                            HostCredentialControlResponse::PhaseBReady { receipt } => {
-                                receipt.host_process_identity == host_process_digest
-                            }
-                            HostCredentialControlResponse::Deleted { .. } => {
-                                request.expected_receipt.as_ref().is_some_and(|receipt| {
-                                    receipt.host_process_identity == host_process_digest
-                                })
-                            }
-                            HostCredentialControlResponse::Unknown { .. } => true,
-                        };
-                        if !process_matches {
-                            return Err(PortError::IdentityConflict);
-                        }
-                        if let Some((root, host_root, executable)) = &retained_user_image {
-                            root.verify_stable_identity()
-                                .and_then(|()| root.verify_path_identity())
-                                .and_then(|()| host_root.verify_stable_identity())
-                                .and_then(|()| host_root.verify_path_identity())
-                                .and_then(|()| executable.verify_stable_identity())
-                                .and_then(|()| executable.verify_path_identity())
-                                .map_err(|_| PortError::IdentityConflict)?;
-                        }
-                        Ok(response)
-                    })
-                })
+                .spawn(move || Self::run_credential_host_call(request, connection))
                 .join()
                 .map_err(|_| host_port_error())?
         })
+    }
+
+    fn prepare_credential_host_connection(
+        effect: &InstallationEffectRequest,
+        request: &HostCredentialControlRequest,
+    ) -> Result<CredentialHostConnection, PortError> {
+        match effect.profile {
+            InstallationProfile::SystemService => {
+                Self::system_service_credential_host_connection(effect, request)
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                Self::current_user_credential_host_connection(effect, request)
+            }
+        }
+    }
+
+    fn system_service_credential_host_connection(
+        effect: &InstallationEffectRequest,
+        request: &HostCredentialControlRequest,
+    ) -> Result<CredentialHostConnection, PortError> {
+        let provision = &request.intent.provision;
+        if effect.profile_selection_receipt.is_some()
+            || provision.scope != StoreCredentialScope::LocalService
+        {
+            return Err(PortError::IdentityConflict);
+        }
+        let binding = observe_running_eliot_host_process().map_err(secret_port_error)?;
+        if !eliot_platform_windows::windows_paths_equal(
+            Path::new(provision.expected_host_executable.as_str()),
+            Path::new(binding.image_path()),
+        ) {
+            return Err(PortError::IdentityConflict);
+        }
+        let expectation =
+            eliot_platform_windows::NamedPipePeerExpectation::new_with_process_binding(
+                LOCAL_SERVICE_SID,
+                0,
+                binding,
+            )
+            .map_err(secret_port_error)?;
+        Ok(CredentialHostConnection {
+            pipe_name: HOST_CREDENTIAL_CONTROL_PIPE.to_owned(),
+            expectation,
+            selected_session: None,
+            retained_user_image: None,
+        })
+    }
+
+    fn current_user_credential_host_connection(
+        effect: &InstallationEffectRequest,
+        request: &HostCredentialControlRequest,
+    ) -> Result<CredentialHostConnection, PortError> {
+        let selection = Self::validated_current_user_profile_selection(effect, request)?;
+        let roots = Self::open_current_user_host_roots(selection, request)?;
+        let live_client = eliot_platform_windows::current_process_named_pipe_expectation()
+            .map_err(secret_port_error)?;
+        let live_session_id = live_client.expected_session_id();
+        if live_client.expected_sid() != selection.owner_sid || live_session_id == 0 {
+            return Err(PortError::IdentityConflict);
+        }
+        let executable = Self::open_expected_current_user_host_executable(&roots, request)?;
+        let retained_user_image = RetainedUserHostImage { roots, executable };
+        Self::verify_current_user_host_image(&retained_user_image)?;
+        let expectation =
+            eliot_platform_windows::NamedPipePeerExpectation::new_for_dynamic_process(
+                &selection.owner_sid,
+                request.intent.provision.expected_host_executable.as_str(),
+                retained_user_image.executable.identity(),
+            )
+            .map_err(secret_port_error)?;
+        let installation_id = PlatformHandle::new(&selection.installation_id)
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let owner_sid = PlatformHandle::new(&selection.owner_sid)
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let pipe_name =
+            current_user_credential_control_pipe(effect.profile, &installation_id, &owner_sid)
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+        Ok(CredentialHostConnection {
+            pipe_name,
+            expectation,
+            selected_session: Some((selection.owner_sid.clone(), live_session_id)),
+            retained_user_image: Some(retained_user_image),
+        })
+    }
+
+    fn validated_current_user_profile_selection<'a>(
+        effect: &'a InstallationEffectRequest,
+        request: &HostCredentialControlRequest,
+    ) -> Result<&'a ProfileSelectionReceipt, PortError> {
+        let selection = effect
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or(PortError::InvalidRequestMetadata)?;
+        let expected_profile = match effect.profile {
+            InstallationProfile::UserMode => ProfileSelection::UserMode,
+            InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+            InstallationProfile::SystemService => unreachable!(),
+        };
+        if selection.profile != expected_profile
+            || request.intent.provision.scope != StoreCredentialScope::CurrentUser
+            || request.intent.provision.expected_principal_sid.as_str() != selection.owner_sid
+        {
+            return Err(PortError::IdentityConflict);
+        }
+        Ok(selection)
+    }
+
+    fn open_current_user_host_roots(
+        selection: &ProfileSelectionReceipt,
+        request: &HostCredentialControlRequest,
+    ) -> Result<RetainedUserHostRoots, PortError> {
+        let observed_root = selection
+            .roots
+            .iter()
+            .find(|root| root.role == "immutable_binaries")
+            .ok_or(PortError::InvalidRequestMetadata)?;
+        let root = UserOwnedRootLease::open_existing(&observed_root.canonical_path)
+            .map_err(|_| PortError::IdentityConflict)?;
+        if root.current_user_sid() != selection.owner_sid
+            || root.identity() != observed_root.identity
+            || !eliot_platform_windows::windows_paths_equal(
+                &root
+                    .canonical_path()
+                    .map_err(|_| PortError::IdentityConflict)?,
+                &observed_root.canonical_path,
+            )
+        {
+            return Err(PortError::IdentityConflict);
+        }
+        let observed_host_root = selection
+            .roots
+            .iter()
+            .find(|candidate| candidate.role == "runtime_state_roots.host_state_root")
+            .ok_or(PortError::InvalidRequestMetadata)?;
+        let host_root = UserOwnedRootLease::open_existing(Path::new(
+            request.intent.provision.host_state_root.as_str(),
+        ))
+        .map_err(|_| PortError::IdentityConflict)?;
+        if host_root.current_user_sid() != selection.owner_sid
+            || host_root.identity() != observed_host_root.identity
+            || !eliot_platform_windows::windows_paths_equal(
+                &host_root
+                    .canonical_path()
+                    .map_err(|_| PortError::IdentityConflict)?,
+                &observed_host_root.canonical_path,
+            )
+        {
+            return Err(PortError::IdentityConflict);
+        }
+        Ok(RetainedUserHostRoots { root, host_root })
+    }
+
+    fn open_expected_current_user_host_executable(
+        roots: &RetainedUserHostRoots,
+        request: &HostCredentialControlRequest,
+    ) -> Result<UserOwnedPathLease, PortError> {
+        let executable = UserOwnedPathLease::open_existing(
+            &roots.root,
+            Path::new(request.intent.provision.expected_host_executable.as_str()),
+        )
+        .map_err(|_| PortError::IdentityConflict)?;
+        let bytes = executable
+            .read_bounded(512 * 1024 * 1024)
+            .map_err(|_| PortError::IdentityConflict)?;
+        if sha256_hex(&bytes)
+            != request
+                .intent
+                .provision
+                .expected_host_executable_sha256
+                .as_str()
+        {
+            return Err(PortError::IdentityConflict);
+        }
+        Ok(executable)
+    }
+
+    fn verify_current_user_host_image(image: &RetainedUserHostImage) -> Result<(), PortError> {
+        image
+            .roots
+            .root
+            .verify_stable_identity()
+            .and_then(|()| image.roots.root.verify_path_identity())
+            .and_then(|()| image.roots.host_root.verify_stable_identity())
+            .and_then(|()| image.roots.host_root.verify_path_identity())
+            .and_then(|()| image.executable.verify_stable_identity())
+            .and_then(|()| image.executable.verify_path_identity())
+            .map_err(|_| PortError::IdentityConflict)
+    }
+
+    fn run_credential_host_call(
+        request: &HostCredentialControlRequest,
+        connection: CredentialHostConnection,
+    ) -> Result<HostCredentialControlResponse, PortError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| host_port_error())?;
+        runtime.block_on(Self::exchange_credential_host(request, connection))
+    }
+
+    async fn exchange_credential_host(
+        request: &HostCredentialControlRequest,
+        connection: CredentialHostConnection,
+    ) -> Result<HostCredentialControlResponse, PortError> {
+        let timeout = std::time::Duration::from_secs(5);
+        let mut transport = NamedPipeTransport::connect_authenticated(
+            &connection.pipe_name,
+            timeout,
+            &connection.expectation,
+        )
+        .await
+        .map_err(|_| host_port_error())?;
+        let host_process_digest = Self::credential_host_process_digest(
+            transport.peer_identity(),
+            request.intent.provision.expected_host_executable.as_str(),
+            connection.selected_session.as_ref(),
+        )?;
+        let frame =
+            credential_control_request_frame(request.intent.request_digest.as_str(), request)
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+        transport
+            .send_frame(&frame, TransportLimits::default())
+            .await
+            .map_err(|_| host_port_error())?;
+        let response = transport
+            .receive_frame(TransportLimits::default())
+            .await
+            .map_err(|_| host_port_error())?;
+        if response.connection_id != request.intent.request_digest.as_str() {
+            return Err(PortError::IdentityConflict);
+        }
+        let response = decode_credential_control_response_frame(&response)
+            .map_err(|_| PortError::IdentityConflict)?;
+        if !Self::credential_host_response_matches_process(&response, request, &host_process_digest)
+        {
+            return Err(PortError::IdentityConflict);
+        }
+        if let Some(image) = &connection.retained_user_image {
+            Self::verify_current_user_host_image(image)?;
+        }
+        Ok(response)
+    }
+
+    fn credential_host_process_digest(
+        peer: &eliot_ipc::PeerIdentity,
+        expected_host_executable: &str,
+        selected_session: Option<&(String, u32)>,
+    ) -> Result<PlatformHandle, PortError> {
+        let peer_process = peer.process_binding().ok_or(PortError::IdentityConflict)?;
+        if !eliot_platform_windows::windows_paths_equal(
+            Path::new(peer_process.image_path()),
+            Path::new(expected_host_executable),
+        ) {
+            return Err(PortError::IdentityConflict);
+        }
+        if let Some((selected_sid, selected_session_id)) = selected_session {
+            let eliot_ipc::PeerIdentity::Authenticated {
+                user_identity,
+                session_identity,
+                ..
+            } = peer
+            else {
+                return Err(PortError::IdentityConflict);
+            };
+            if user_identity != selected_sid || session_identity != &selected_session_id.to_string()
+            {
+                return Err(PortError::IdentityConflict);
+            }
+        }
+        PlatformHandle::new(sha256_hex(
+            format!(
+                "windows-pid:{}:start:{}:image:{}",
+                peer_process.process_id(),
+                peer_process.start_time_100ns(),
+                peer_process.image_path(),
+            )
+            .as_bytes(),
+        ))
+        .map_err(|_| PortError::InvalidRequestMetadata)
+    }
+
+    fn credential_host_response_matches_process(
+        response: &HostCredentialControlResponse,
+        request: &HostCredentialControlRequest,
+        host_process_digest: &PlatformHandle,
+    ) -> bool {
+        match response {
+            HostCredentialControlResponse::Absent { snapshot, .. } => {
+                snapshot.host_process_identity == *host_process_digest
+            }
+            HostCredentialControlResponse::Matching { receipt }
+            | HostCredentialControlResponse::PhaseBPrepared { receipt }
+            | HostCredentialControlResponse::PhaseBReady { receipt } => {
+                receipt.host_process_identity == *host_process_digest
+            }
+            HostCredentialControlResponse::Deleted { .. } => request
+                .expected_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.host_process_identity == *host_process_digest),
+            HostCredentialControlResponse::Unknown { .. } => true,
+        }
     }
 
     fn credential_secret(&self, request: &InstallationEffectRequest) -> Result<Vec<u8>, PortError> {
@@ -9773,24 +9859,10 @@ where
         transaction_id: &PlatformHandle,
         task_request: &CurrentUserTaskRequest,
     ) -> Result<CurrentUserTaskReceipt, InstallationError> {
-        let mut transaction = self.load_transaction(transaction_id)?;
+        let transaction = self.load_transaction(transaction_id)?;
         transaction.require_user_mode_task_registration_ready()?;
-        let task_index = task_effect_index(&transaction)?;
-        match transaction.effect_progress[task_index]
-            .current_user_task_request
-            .as_ref()
-        {
-            Some(retained) if retained == task_request => {}
-            Some(_) => return Err(InstallationError::IdentityConflict),
-            None => {
-                let expected = TransactionVersion::of(&transaction)?;
-                transaction.record_current_user_task_request(task_request.clone())?;
-                self.store.compare_and_save(expected, &transaction)?;
-                transaction = self.load_transaction(transaction_id)?;
-                transaction.require_user_mode_task_registration_ready()?;
-            }
-        }
-
+        let transaction =
+            self.retain_current_user_task_request(transaction_id, transaction, task_request)?;
         let task_index = task_effect_index(&transaction)?;
         if let Some(receipt) = transaction.effect_progress[task_index]
             .current_user_task_receipt
@@ -9803,11 +9875,56 @@ where
             return Ok(receipt.clone());
         }
 
-        let state = transaction.effect_progress[task_index].state.clone();
         let unknown_cleanup = transaction.effect_progress[task_index]
             .current_user_task_unknown
             .as_ref()
             .is_some_and(|unknown| unknown.kind == CurrentUserTaskUnknownKind::CleanupRequired);
+        let transaction = self.commit_pending_current_user_task_intent(
+            transaction_id,
+            transaction,
+            task_request,
+        )?;
+        transaction.require_user_mode_task_registration_ready()?;
+        self.resume_current_user_task_registration(
+            transaction_id,
+            transaction,
+            task_request,
+            unknown_cleanup,
+        )
+    }
+
+    fn retain_current_user_task_request(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        mut transaction: InstallationTransaction,
+        task_request: &CurrentUserTaskRequest,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let task_index = task_effect_index(&transaction)?;
+        match transaction.effect_progress[task_index]
+            .current_user_task_request
+            .as_ref()
+        {
+            Some(retained) if retained == task_request => Ok(transaction),
+            Some(_) => Err(InstallationError::IdentityConflict),
+            None => {
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.record_current_user_task_request(task_request.clone())?;
+                self.store.compare_and_save(expected, &transaction)?;
+                let transaction = self.load_transaction(transaction_id)?;
+                transaction.require_user_mode_task_registration_ready()?;
+                Ok(transaction)
+            }
+        }
+    }
+
+    fn commit_pending_current_user_task_intent(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        mut transaction: InstallationTransaction,
+        task_request: &CurrentUserTaskRequest,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let task_index = task_effect_index(&transaction)?;
+        let state = transaction.effect_progress[task_index].state.clone();
         let attempt = match &state {
             InstallationEffectProgressState::Pending
             | InstallationEffectProgressState::Unknown { .. } => 1,
@@ -9817,91 +9934,71 @@ where
                 return Err(InstallationError::IdentityConflict);
             }
         };
-        if matches!(state, InstallationEffectProgressState::Pending) {
-            let probe = effect_request(
-                &transaction,
-                task_index,
-                attempt,
-                InstallationEffectAction::Apply,
-                None,
-            )?;
-            match self
-                .port
-                .inspect_current_user_task(task_request, None)
-                .map_err(|error| InstallationError::Platform(error.to_string()))?
-            {
-                CurrentUserTaskObservation::Absent {
-                    task_name,
-                    sid,
-                    session_id,
-                } => {
-                    let precondition = current_user_task_absence_precondition(
-                        &probe.precondition,
-                        task_request,
-                        &transaction
-                            .profile_selection_receipt()
-                            .ok_or_else(|| InstallationError::MigrationRequired {
-                                reason: "UserMode Task registration requires the original profile selection receipt"
-                                    .to_owned(),
-                            })?
-                            .owner_sid,
-                        task_name,
-                        sid,
-                        session_id,
-                    )?;
-                    let expected = TransactionVersion::of(&transaction)?;
-                    transaction.effect_progress[task_index].admitted_precondition =
-                        Some(precondition);
-                    commit_current_user_task_intent(
-                        &mut transaction,
-                        task_index,
-                        attempt,
-                    )?;
-                    self.store.compare_and_save(expected, &transaction)?;
-                    transaction = self.load_transaction(transaction_id)?;
-                }
-                CurrentUserTaskObservation::Matching { .. }
-                | CurrentUserTaskObservation::Mismatch { .. } => {
-                    return Err(InstallationError::IdentityConflict);
-                }
-            }
+        if !matches!(state, InstallationEffectProgressState::Pending) {
+            return Ok(transaction);
         }
 
-        transaction.require_user_mode_task_registration_ready()?;
-        let task_index = task_effect_index(&transaction)?;
-        let (attempt, committed_digest) = match &transaction.effect_progress[task_index].state {
-            InstallationEffectProgressState::IntentCommitted {
-                attempt,
-                intent_digest,
-            } => (*attempt, Some(intent_digest.clone())),
-            InstallationEffectProgressState::Unknown { .. } => (1, None),
-            _ => return Err(InstallationError::IdentityConflict),
-        };
-        let request = effect_request(
+        let probe = effect_request(
             &transaction,
             task_index,
             attempt,
             InstallationEffectAction::Apply,
             None,
         )?;
-        if let Some(digest) = committed_digest
-            && request.intent_digest()? != digest
-        {
-            return Err(InstallationError::IdentityConflict);
-        }
-        let snapshot = transaction.effect_progress[task_index]
-            .admitted_precondition
-            .as_ref()
-            .and_then(|precondition| precondition.current_user_task_snapshot.as_ref())
-            .ok_or_else(|| InstallationError::MigrationRequired {
-                reason: "UserMode Task intent lacks its exact pre-write absence observation"
-                    .to_owned(),
-            })?;
-        let observation = self
+        match self
             .port
             .inspect_current_user_task(task_request, None)
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        match observation {
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        {
+            CurrentUserTaskObservation::Absent {
+                task_name,
+                sid,
+                session_id,
+            } => {
+                let owner_sid = &transaction
+                    .profile_selection_receipt()
+                    .ok_or_else(|| InstallationError::MigrationRequired {
+                        reason: "UserMode Task registration requires the original profile selection receipt"
+                            .to_owned(),
+                    })?
+                    .owner_sid;
+                let precondition = current_user_task_absence_precondition(
+                    &probe.precondition,
+                    task_request,
+                    owner_sid,
+                    task_name,
+                    sid,
+                    session_id,
+                )?;
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.effect_progress[task_index].admitted_precondition = Some(precondition);
+                commit_current_user_task_intent(&mut transaction, task_index, attempt)?;
+                self.store.compare_and_save(expected, &transaction)?;
+                self.load_transaction(transaction_id)
+            }
+            CurrentUserTaskObservation::Matching { .. }
+            | CurrentUserTaskObservation::Mismatch { .. } => {
+                Err(InstallationError::IdentityConflict)
+            }
+        }
+    }
+
+    fn resume_current_user_task_registration(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        transaction: InstallationTransaction,
+        task_request: &CurrentUserTaskRequest,
+        unknown_cleanup: bool,
+    ) -> Result<CurrentUserTaskReceipt, InstallationError> {
+        let task_index = task_effect_index(&transaction)?;
+        Self::validate_current_user_task_intent(&transaction, task_index)?;
+        let snapshot = Self::retained_current_user_task_absence_snapshot(&transaction, task_index)?;
+
+        match self
+            .port
+            .inspect_current_user_task(task_request, None)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        {
             CurrentUserTaskObservation::Matching { receipt, .. } => {
                 if unknown_cleanup {
                     return Err(InstallationError::IncompleteObservation(
@@ -9909,7 +10006,7 @@ where
                             .to_owned(),
                     ));
                 }
-                if !current_user_task_receipt_matches_absence(snapshot, &receipt)
+                if !current_user_task_receipt_matches_absence(&snapshot, &receipt)
                     || receipt.request != *task_request
                 {
                     return Err(InstallationError::IdentityConflict);
@@ -9931,7 +10028,13 @@ where
                 session_id,
             } => {
                 if unknown_cleanup
-                    || !current_user_task_absence_matches(snapshot, task_request, &task_name, &sid, session_id)
+                    || !current_user_task_absence_matches(
+                        &snapshot,
+                        task_request,
+                        &task_name,
+                        &sid,
+                        session_id,
+                    )
                 {
                     return Err(InstallationError::IncompleteObservation(
                         "UserMode Task absence did not resolve the retained registration outcome"
@@ -9944,6 +10047,63 @@ where
             }
         }
 
+        self.register_current_user_task_after_absence(
+            transaction,
+            task_index,
+            task_request,
+            &snapshot,
+        )
+    }
+
+    fn validate_current_user_task_intent(
+        transaction: &InstallationTransaction,
+        task_index: usize,
+    ) -> Result<(), InstallationError> {
+        let (attempt, committed_digest) = match &transaction.effect_progress[task_index].state {
+            InstallationEffectProgressState::IntentCommitted {
+                attempt,
+                intent_digest,
+            } => (*attempt, Some(intent_digest.clone())),
+            InstallationEffectProgressState::Unknown { .. } => (1, None),
+            _ => return Err(InstallationError::IdentityConflict),
+        };
+        let request = effect_request(
+            transaction,
+            task_index,
+            attempt,
+            InstallationEffectAction::Apply,
+            None,
+        )?;
+        if let Some(digest) = committed_digest
+            && request.intent_digest()? != digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn retained_current_user_task_absence_snapshot(
+        transaction: &InstallationTransaction,
+        task_index: usize,
+    ) -> Result<CurrentUserTaskAbsentSnapshot, InstallationError> {
+        transaction.effect_progress[task_index]
+            .admitted_precondition
+            .as_ref()
+            .and_then(|precondition| precondition.current_user_task_snapshot.as_ref())
+            .cloned()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "UserMode Task intent lacks its exact pre-write absence observation"
+                    .to_owned(),
+            })
+    }
+
+    fn register_current_user_task_after_absence(
+        &mut self,
+        transaction: InstallationTransaction,
+        task_index: usize,
+        task_request: &CurrentUserTaskRequest,
+        snapshot: &CurrentUserTaskAbsentSnapshot,
+    ) -> Result<CurrentUserTaskReceipt, InstallationError> {
         match self.port.register_current_user_task(task_request) {
             Ok(receipt) => {
                 if receipt.request != *task_request
@@ -9957,8 +10117,10 @@ where
             Err(CurrentUserTaskRegistrationError::Rejected(error)) => {
                 Err(InstallationError::Platform(error.to_string()))
             }
-            Err(error @ (CurrentUserTaskRegistrationError::CommittedUnknown { .. }
-            | CurrentUserTaskRegistrationError::CleanupRequired { .. })) => {
+            Err(
+                error @ (CurrentUserTaskRegistrationError::CommittedUnknown { .. }
+                | CurrentUserTaskRegistrationError::CleanupRequired { .. }),
+            ) => {
                 self.persist_current_user_task_unknown(transaction, task_index, &error)?;
                 Err(InstallationError::IncompleteObservation(
                     "UserMode Task registration has a retained unknown outcome and requires exact readback reconciliation"
@@ -12665,9 +12827,10 @@ pub struct WindowsInstallationCoordinator<S> {
 }
 
 /// Re-reads the original profile root and immutable package effects before the
-/// first current-user root selection is retained. The caller holds the live
-/// no-follow profile leases across this readback and the transaction CAS, so a
-/// replacement at the same path cannot become the original selection.
+/// first current-user root selection is retained. The caller holds no-follow
+/// profile-root leases across this readback and the transaction CAS, retaining
+/// the original root object and path identity. Package child-file integrity is
+/// revalidated by launch/use consumers.
 pub fn verify_profile_effect_identities_before_selection(
     transaction: &InstallationTransaction,
 ) -> Result<(), InstallationError> {
