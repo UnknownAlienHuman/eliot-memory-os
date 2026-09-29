@@ -346,6 +346,7 @@ impl SourceVerificationPort for SourceMock {
         }
         Ok(SourceVerification {
             assurance,
+            security_assessment: None,
             verification_revision: must(Revision::new(1)),
             verification_receipt_digest: digest('4'),
         })

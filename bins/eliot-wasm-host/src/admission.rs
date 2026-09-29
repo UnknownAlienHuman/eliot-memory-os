@@ -664,6 +664,11 @@ impl SourceVerificationPort for AdmittedOwnerPorts {
         request.validate().map_err(|_| PortError::Denied)?;
         Ok(SourceVerification {
             assurance: self.assurance.clone(),
+            // This port admits owner-authored source assurance only. It never
+            // manufactures a security assessment; the neutral runtime resolves
+            // one against this same assurance at the use boundary when the
+            // security owner has recorded it.
+            security_assessment: None,
             verification_revision: self.verification_revision,
             verification_receipt_digest: self.source_receipt.clone(),
         })

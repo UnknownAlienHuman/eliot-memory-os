@@ -301,6 +301,38 @@ fn validate_assessment_value(value: &AssessmentValue) -> Result<(), crate::Secur
     }
 }
 
+/// Narrowed use authority one action may take from an assessed source.
+///
+/// Every field is a subset of the assurance the current source owner resolved
+/// for the operation being admitted. The record carries no standing
+/// instruction, tool definition, policy, or credential value, so untrusted
+/// source content has no field in which to change them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceUseAuthority {
+    /// Source revision and digest this narrowing is bound to, so the decision
+    /// names the assessed revision rather than the source in the abstract.
+    pub assessed_source: AssessedSourceRevision,
+    /// Allowed epistemic uses, intersected with the current assurance.
+    pub permitted_uses: Vec<EpistemicUse>,
+    /// Allowed effect ceilings, intersected with the current assurance.
+    pub permitted_effects: Vec<EffectCeiling>,
+    /// Instruction taint carried unchanged from the current assurance, so a
+    /// summary, a second model, or a re-diagnosis cannot clear it.
+    pub instruction_taint: InstructionTaint,
+    /// Fence this narrowing is bound to for the current operation.
+    pub state_fence: StateFence,
+}
+
+fn assessment_intersection<T: Copy + PartialEq>(left: &[T], right: &[T]) -> Vec<T> {
+    let mut narrowed: Vec<T> = Vec::new();
+    for value in left {
+        if right.contains(value) && !narrowed.contains(value) {
+            narrowed.push(*value);
+        }
+    }
+    narrowed
+}
+
 fn assessment_value_dimension(value: &AssessmentValue) -> AssessmentDimension {
     match value {
         AssessmentValue::Identity(_) => AssessmentDimension::Identity,
@@ -428,6 +460,54 @@ impl SourceSecurityAssessment {
             });
         }
         Ok(())
+    }
+
+    /// Resolves what one action may take from this assessed source right now.
+    ///
+    /// The current source owner supplies the assurance and the fence for the
+    /// exact operation; this assessment only ever narrows them. A source, a
+    /// profile, or a fence that moved between diagnosis and use is refused
+    /// instead of being ignored, so a diagnosis cannot authorize a later
+    /// revision. `model_interpretations` is never read here: a model claim
+    /// narrows nothing and widens nothing, however confident it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assessment shape is malformed, when the fence
+    /// in force is not the fence it was taken under, or when the source or its
+    /// current assurance no longer match the assessed ones.
+    pub fn resolve_source_use(
+        &self,
+        current_assurance: &SourceAssurance,
+        state_fence: &StateFence,
+    ) -> Result<SourceUseAuthority, crate::SecurityContractError> {
+        self.validate()?;
+        if self.source_assurance.state_fence != *state_fence {
+            return Err(crate::SecurityContractError::FenceMismatch);
+        }
+        if self.source.source_ref != current_assurance.source_ref {
+            return Err(crate::SecurityContractError::StaleSourceAssessment {
+                field: "assessed_source.source_ref",
+            });
+        }
+        if &self.source_assurance != current_assurance {
+            return Err(crate::SecurityContractError::StaleSourceAssessment {
+                field: "assessed_source.source_assurance",
+            });
+        }
+        Ok(SourceUseAuthority {
+            assessed_source: self.source.clone(),
+            permitted_uses: assessment_intersection(
+                &current_assurance.allowed_epistemic_use,
+                &self.source_assurance.allowed_epistemic_use,
+            ),
+            permitted_effects: assessment_intersection(
+                &current_assurance.allowed_effects,
+                &self.source_assurance.allowed_effects,
+            ),
+            instruction_taint: current_assurance.instruction_taint,
+            state_fence: state_fence.clone(),
+        })
     }
 }
 
