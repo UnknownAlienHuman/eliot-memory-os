@@ -28,7 +28,6 @@ use eliot_protocol::{
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_store_api::ScopeId;
-use std::collections::BTreeMap;
 
 use crate::{
     AuditEventDraft, KernelComposition, Session, TransportError, activation_deadline_expired,
