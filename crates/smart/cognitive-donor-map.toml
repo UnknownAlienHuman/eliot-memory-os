@@ -1,6 +1,6 @@
 schema_version = 3
 map_id = "cognitive-donor-map-2026-08-28-rev6"
-current_main_commit = "e5384f544b518167111ccdcd9e7c49ce559ea1a0"
+current_main_commit = "569bf807343d335a3e1139d86e84a81c59d04286"
 superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
 rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
 source_status = "STATIC_REVIEW_ONLY"
@@ -94,17 +94,30 @@ rejected_overgeneralization = "Effective indexes, old READY labels or empty crat
 # Issue #816 makes the legacy split explicit without changing or deleting any
 # donor.  `observed_disposition` describes the current map; it is not runtime
 # completion evidence and does not turn a donor into an implementation owner.
-# `current_main_commit` above is the ONE current base on which both the
-# `[[donor]]` dispositions and the `[topology_donor_authority]` rows below were
-# re-read against current source; `dispositions_base` restates that same base
-# for the authority table, and a map whose two bases disagree is refused.
+# `current_main_commit` above, `[topology_donor_authority].dispositions_base`
+# and `[topology_donor_authority].authority_base` are ONE base, not three
+# identities. The donor dispositions and the topology donor authority are one
+# decision, so they are read against one base: this file's three base fields
+# must all equal the repository's current base, which
+# `scripts/verify-cognitive-donor-dispositions-816.py` resolves from git
+# (`origin/main`, else `main`) rather than comparing the three against a copy of
+# one another. A triple that is internally consistent but stale is refused for
+# the same reason, so the field cannot be satisfied by restating a stale commit.
+#
+# That makes `authority_base` a base, not a distinct #816 origin. The #816
+# origin commit 9e3562df010fb0c0aa9bceebb7db2245cf181ca1 remains the shared
+# authority origin recorded by `cognitive-wave-01.toml`,
+# `cognitive-edge-map.toml` and `cognitive-crate-decisions.toml`, and is still
+# pinned as such by `scripts/tests/test_cognitive_topology_contract.py`; this
+# file no longer names it as a second base for its own rows, because a
+# disposition is only current on the base it was actually re-read against.
 [topology_donor_authority]
 issue = 816
 schema_version = 1
-authority_base = "9e3562df010fb0c0aa9bceebb7db2245cf181ca1"
+authority_base = "569bf807343d335a3e1139d86e84a81c59d04286"
 proof_ceiling = "DONOR_AND_OWNER_RECONCILIATION_ONLY"
 runtime_completion = false
-dispositions_base = "e5384f544b518167111ccdcd9e7c49ce559ea1a0"
+dispositions_base = "569bf807343d335a3e1139d86e84a81c59d04286"
 
 [[topology_donor]]
 path = "crates/smart/eliot-context"
