@@ -710,7 +710,8 @@ impl ProfileRootLeaseSet {
         &self.selection
     }
 
-    /// Rechecks every retained file-object identity before a production use.
+    /// Rechecks every retained file-object identity and its declared path
+    /// before a production use.
     ///
     /// # Errors
     /// Returns `IdentityMismatch` when any pinned object changed or became
@@ -719,6 +720,7 @@ impl ProfileRootLeaseSet {
         for lease in &self.leases {
             lease
                 .verify_stable_identity()
+                .and_then(|()| lease.verify_path_identity())
                 .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
         }
         if let Some(anchor) = &self.local_app_data {
@@ -754,6 +756,7 @@ impl RetainedProfileRoots {
         for lease in &self.leases {
             lease
                 .verify_stable_identity()
+                .and_then(|()| lease.verify_path_identity())
                 .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
         }
         if let Some(anchor) = &self.local_app_data {
@@ -976,6 +979,7 @@ fn finish_profile_selection(
     for lease in &leases {
         lease
             .verify_stable_identity()
+            .and_then(|()| lease.verify_path_identity())
             .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
     }
     let current = crate::current_process_named_pipe_expectation()?;
