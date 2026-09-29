@@ -259,6 +259,7 @@ use eliot_kernel_core::{
 };
 
 mod activation_lifecycle;
+mod anchor_resolver;
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
