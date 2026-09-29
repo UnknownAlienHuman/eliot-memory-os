@@ -185,9 +185,10 @@ pub(crate) enum GovernedProcessEffectPortError {}
 ///
 /// Implementations capture the complete tracked-source baseline before launch,
 /// independently read the terminal source state, attach actual diff and fence
-/// invalidation handles, and ingest only the validated receipt supplied back by
-/// Kernel. Returning an empty `changes` list is valid only after complete
-/// before/after readback; process success is never source evidence.
+/// invalidation handles, and ingest the validated receipt bound to the exact
+/// governed baseline Kernel retained for the operation. Kernel always supplies
+/// that baseline at ingest so the observation keeps its Session/operation/
+/// State-Fence attribution; process success is never source evidence.
 pub(crate) trait GovernedProcessEffectPort: Send + Sync {
     fn capture_before(
         &self,
@@ -202,6 +203,7 @@ pub(crate) trait GovernedProcessEffectPort: Send + Sync {
 
     fn ingest(
         &self,
+        baseline: &GovernedProcessEffectBaseline,
         receipt: &GovernedProcessChangeReceipt,
     ) -> Result<(), GovernedProcessEffectPortError>;
 }
@@ -1284,9 +1286,9 @@ impl ProcessExecutionGateway {
     }
 
     /// Reads the terminal source state against the retained pre-effect
-    /// baseline and ingests the validated receipt (I10.21 A1: exact
-    /// before/after revisions, diff handle, State-Fence invalidation; W2:
-    /// Git/content re-read confirmation).
+    /// baseline and ingests the validated receipt bound to that exact
+    /// baseline (I10.21 A1: exact before/after revisions, diff handle,
+    /// State-Fence invalidation; W2: Git/content re-read confirmation).
     ///
     /// Monitor-path failures are observed and never fail the reconcile: the
     /// reported terminal evidence stays the owner's.
@@ -1310,7 +1312,7 @@ impl ProcessExecutionGateway {
             return;
         };
         match port.read_after(&baseline, evidence) {
-            Ok(receipt) => match port.ingest(&receipt) {
+            Ok(receipt) => match port.ingest(&baseline, &receipt) {
                 Ok(()) => observe_process("kernel.process.effect_observed", "success"),
                 Err(error) => observe_process(
                     "kernel.process.effect_ingest_failed",
