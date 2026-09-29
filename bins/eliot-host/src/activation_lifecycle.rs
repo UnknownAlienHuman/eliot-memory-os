@@ -753,7 +753,7 @@ impl HostComposition {
         }
     }
 
-    fn live_supervision_obligation_for(
+    pub(super) fn live_supervision_obligation_for(
         &self,
         activation: &EliotActivationRecord,
     ) -> Result<Option<PlatformHandle>, HostError> {
