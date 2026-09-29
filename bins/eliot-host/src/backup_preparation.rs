@@ -3061,20 +3061,33 @@ impl OwnerEvidence {
     ///   **current** final path from that same handle and requires it still to
     ///   equal `canonical_host_root`.
     ///
-    /// The second check is the one that closes the replacement race. A retained
-    /// handle's own file identity never changes, so `verify_stable_identity`
-    /// alone cannot notice that an actor with write access to the parent renamed
-    /// the installation `host` directory and created a new one in its place;
-    /// re-deriving the final path from the handle does notice, because the
-    /// handle now resolves somewhere else. Both failures are typed
-    /// [`PreparationError`]s and are observed once at this owner boundary.
+    /// The second check is the defence in depth behind the handle itself. The
+    /// lease's directory handle is opened with `FILE_SHARE_READ | FILE_SHARE_WRITE`
+    /// and **without** `FILE_SHARE_DELETE`
+    /// (`crates/kernel/eliot-platform-windows/src/protected_path.rs`), so while
+    /// this bundle holds it, Windows sharing rules do not admit a rename or
+    /// delete of the pinned directory at all. The re-derivation above therefore
+    /// confirms the object and its path rather than being the only barrier: a
+    /// handle's own file identity never changes, so an identity check alone could
+    /// not distinguish "still the admitted object" from "the admitted object,
+    /// moved". Both failures are typed [`PreparationError`]s and are observed once
+    /// at this owner boundary.
     ///
     /// What this does **not** claim: it does not prove the source tree's
-    /// *contents* are unchanged, and it does not hold the root against a writer
-    /// who renames it in the window between this check and the projection
-    /// hashing the value. It proves that, at the instant of this call, the
-    /// retained lease still pins the same object at the same path the rest of
-    /// the evidence chain was admitted against.
+    /// *contents* are unchanged — files inside the pinned directory are opened
+    /// independently of this lease and are not covered by the share mode above.
+    /// It proves that, at the instant of this call, the retained lease still pins
+    /// the same object at the same path the rest of the evidence chain was
+    /// admitted against, and it keeps that object pinned for as long as this
+    /// bundle is alive.
+    ///
+    /// The retention has a consequence worth stating rather than discovering: an
+    /// operation that legitimately renames or replaces a directory inside the
+    /// protected contour can now meet a sharing violation while a preparation is
+    /// in flight, where before the lease was dropped immediately after the
+    /// registry read. That is the cost of a reference that cannot go stale, and
+    /// it is the reason the lease is retained for the whole bundle instead of
+    /// only for the read that needed it.
     ///
     /// This is deliberately **not** the installation-wide
     /// `eliot_platform_windows::HostOwnerLease` mutex name. That lease is held by

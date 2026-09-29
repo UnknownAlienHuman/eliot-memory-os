@@ -940,10 +940,10 @@ pub struct ApprovedBuildBinding {
     ///   which is the exact Store config readback of the latest materialization.
     ///   The registry keeps `active_phase_b_rebind` after the commit and clears
     ///   it only when a new generation is staged, and
-    ///   `ApprovedGenerationRegistry::active_phase_b_provisioned_supervision_authority`
-    ///   already prefers the rebind over the committed fence, so reading the
-    ///   committed fence alone here would have named a pre-rebind digest for an
-    ///   installation whose config bytes were rebound;
+    ///   `ApprovedGenerationRegistry::provisioned_supervision_authority_for_generation`
+    ///   already prefers the completed rebind over the committed activation's
+    ///   authority, so reading the committed fence alone here would have named a
+    ///   pre-rebind digest for an installation whose config bytes were rebound;
     /// - otherwise `ActivationCommitFence::materialized_config_digest`, the
     ///   committed-activation readback. That field is documented as distinct from
     ///   the Phase-A template digest and from Store's semantic approved-config
