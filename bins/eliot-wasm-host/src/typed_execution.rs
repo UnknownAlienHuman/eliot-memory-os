@@ -13,6 +13,7 @@
 //! `eliot-wasm-runtime` crate keeps no Wasmtime dependency.
 
 use std::fmt;
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -20,7 +21,10 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eliot_wasm_runtime::component_contract::{ProofCeiling, TYPED_ABI_REVISION};
+use eliot_wasm_runtime::capsule::{ModuleContractKit, ModuleTestCapsule};
+use eliot_wasm_runtime::component_contract::{
+    ProofCeiling, TYPED_ABI_REVISION, TypedContractError,
+};
 use eliot_wasm_runtime::{
     CancellationPolicy, EngineTermination, EpochPolicy, InvocationLimits, MAX_EPOCH_DEADLINE_TICKS,
     Sha256Digest,
@@ -236,6 +240,10 @@ pub struct TypedReceipt {
 pub enum TypedExecutionError {
     /// Default governed refusal without Kernel admission.
     GovernedAdmissionRequired,
+    /// Governed or capsule admission binding disagrees with the attempted
+    /// call (world, operation, artifact digest, kit/capsule binding). An
+    /// exact owned typed denial, distinct from the unadmitted default.
+    AdmissionMismatch(String),
     /// Unknown world selection.
     WorldUnknown(String),
     /// Component exports do not select exactly one registered world.
@@ -278,6 +286,7 @@ impl fmt::Display for TypedExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GovernedAdmissionRequired => formatter.write_str("KERNEL_ADMISSION_REQUIRED"),
+            Self::AdmissionMismatch(reason) => write!(formatter, "ADMISSION_MISMATCH:{reason}"),
             Self::WorldUnknown(world) => write!(formatter, "WORLD_UNKNOWN:{world}"),
             Self::WorldSelection { reason } => write!(formatter, "WORLD_SELECTION:{reason}"),
             Self::ExportTypeMismatch(name) => write!(formatter, "EXPORT_TYPE_MISMATCH:{name}"),
@@ -305,6 +314,89 @@ impl From<PreflightError> for TypedExecutionError {
 /// Default governed refusal. No Kernel admission is bound in this host,
 /// so governed execution always fails closed before compile/instantiate.
 pub fn execute_governed_refusal() -> Result<(), TypedExecutionError> {
+    Err(TypedExecutionError::GovernedAdmissionRequired)
+}
+
+/// Governed admission bindings the default path requires: exact world,
+/// operation/task/scope/fence/policy identity, artifact hash, and effect
+/// ceiling. This is the host-side record of the Kernel/module admission;
+/// it carries no trust flag and grants nothing by itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedAdmission {
+    /// World the admission was issued for.
+    pub world: TypedWorld,
+    /// Admitted operation id.
+    pub operation_id: String,
+    /// Admitted task id.
+    pub task_id: String,
+    /// Admitted scope id.
+    pub scope_id: String,
+    /// Admitted state fence epoch.
+    pub fence_epoch: String,
+    /// Admitted policy identity.
+    pub policy_id: String,
+    /// Admitted artifact digest the call must hash to.
+    pub artifact_digest: Sha256Digest,
+    /// Highest proof ceiling this admission may claim.
+    pub proof_ceiling: ProofCeiling,
+}
+
+impl GovernedAdmission {
+    /// Rejects an admission record that is itself unbounded or malformed,
+    /// before any component is acquired, compiled, or instantiated.
+    pub fn validate(&self) -> Result<(), TypedExecutionError> {
+        for value in [
+            self.operation_id.as_str(),
+            self.task_id.as_str(),
+            self.scope_id.as_str(),
+            self.fence_epoch.as_str(),
+            self.policy_id.as_str(),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_DESCRIPTOR_STRING_BYTES
+                || value.chars().any(char::is_control)
+            {
+                return Err(TypedExecutionError::LimitDenied(
+                    "admission-field".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Default-governed admission gate. Denies before any artifact acquisition,
+/// compilation, or instantiation: this function takes no artifact bytes,
+/// performs no filesystem access, and builds no engine.
+///
+/// Denial order: absent admission yields `KERNEL_ADMISSION_REQUIRED`; a
+/// caller-supplied artifact path on the governed lane is denied the same
+/// way (no arbitrary path/URL acquisition, no fallback to the experimental
+/// mode); a malformed record yields the owned `LIMIT_DENIED` denial; a
+/// world or artifact-digest disagreement yields the owned
+/// `ADMISSION_MISMATCH` denial. A well-formed record is still denied with
+/// `KERNEL_ADMISSION_REQUIRED`: this host binds no live Kernel admission
+/// channel to re-anchor freshness against, so staleness cannot be proven
+/// fresh (an old request not listed in a committed record is stale).
+pub fn check_governed_admission(
+    world: TypedWorld,
+    artifact_digest: &Sha256Digest,
+    artifact_source: Option<&Path>,
+    admission: Option<&GovernedAdmission>,
+) -> Result<(), TypedExecutionError> {
+    let admitted = admission.ok_or(TypedExecutionError::GovernedAdmissionRequired)?;
+    if artifact_source.is_some() {
+        return Err(TypedExecutionError::GovernedAdmissionRequired);
+    }
+    admitted.validate()?;
+    if admitted.world != world {
+        return Err(TypedExecutionError::AdmissionMismatch("world".to_owned()));
+    }
+    if admitted.artifact_digest != *artifact_digest {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "artifact-digest".to_owned(),
+        ));
+    }
     Err(TypedExecutionError::GovernedAdmissionRequired)
 }
 
@@ -1564,6 +1656,132 @@ pub fn execute_domain_experimental(
         ),
     };
     Ok((receipt, result))
+}
+
+/// Maps a #760 neutral kit/capsule validation failure to the exact owned
+/// typed denial. Neutral causes carry bounded field names only, so the
+/// `InvalidKit`/`InvalidCapsule` tag passes through; every other cause maps
+/// to the host denial with the same fail-closed meaning. Failures stay
+/// typed: there is no stringly catch-all.
+fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
+    match error {
+        TypedContractError::UnknownWorld(_) => TypedExecutionError::WorldSelection {
+            reason: "capsule-world".to_owned(),
+        },
+        TypedContractError::LegacyRejected(_) => TypedExecutionError::LegacyMismatch,
+        TypedContractError::PackageMismatch { .. } => {
+            TypedExecutionError::AdmissionMismatch("package".to_owned())
+        }
+        TypedContractError::WorldMismatch { .. } => TypedExecutionError::WorldSelection {
+            reason: "capsule-world".to_owned(),
+        },
+        TypedContractError::VersionMismatch { .. } => {
+            TypedExecutionError::AdmissionMismatch("abi-version".to_owned())
+        }
+        TypedContractError::AbiMismatch { .. } => {
+            TypedExecutionError::AdmissionMismatch("abi-revision".to_owned())
+        }
+        TypedContractError::DescriptorField(_) => {
+            TypedExecutionError::AdmissionMismatch("abi-descriptor".to_owned())
+        }
+        TypedContractError::ImportMismatch => {
+            TypedExecutionError::ForbiddenImport("capsule-import".to_owned())
+        }
+        TypedContractError::ExportMismatch => {
+            TypedExecutionError::MissingExport("capsule-export".to_owned())
+        }
+        TypedContractError::EngineMismatch => {
+            TypedExecutionError::AdmissionMismatch("engine-binding".to_owned())
+        }
+        TypedContractError::ArtifactMismatch | TypedContractError::InterfaceMismatch => {
+            TypedExecutionError::AdmissionMismatch("capsule-artifact".to_owned())
+        }
+        TypedContractError::LimitDenied | TypedContractError::EnvelopeTooLarge => {
+            TypedExecutionError::LimitDenied("capsule-bound".to_owned())
+        }
+        TypedContractError::ReportMismatch => {
+            TypedExecutionError::AdmissionMismatch("capsule-report".to_owned())
+        }
+        TypedContractError::EngineDenied => {
+            TypedExecutionError::Engine("capsule-engine-denied".to_owned())
+        }
+        TypedContractError::EngineUnavailable => {
+            TypedExecutionError::Engine("capsule-engine-unavailable".to_owned())
+        }
+        TypedContractError::EngineUnknown => {
+            TypedExecutionError::Engine("capsule-engine-unknown".to_owned())
+        }
+        TypedContractError::InvalidKit(detail) => TypedExecutionError::AdmissionMismatch(detail),
+        TypedContractError::InvalidCapsule(detail) => TypedExecutionError::AdmissionMismatch(detail),
+        TypedContractError::Serialization(_) => {
+            TypedExecutionError::AdmissionMismatch("kit-digest".to_owned())
+        }
+    }
+}
+
+/// Executes the #760 neutral operation capsule's domain operation through
+/// the real Wasmtime component engine on the local-experimental path.
+///
+/// The neutral [`ModuleContractKit`] and [`ModuleTestCapsule`] own the
+/// world/operation/artifact/input/output bindings: the kit is validated,
+/// the capsule is validated against the kit (exact world match, operation
+/// equal to the world's domain export, kit-digest rebinding, fixture and
+/// expected output inside the capsule's declared input/output bounds), the
+/// capsule world and operation are rebound to the host's own generated
+/// selection by canonical contract name (no cross-crate type bridge), and
+/// the same artifact buffer is hashed and required to equal the kit-bound
+/// digest. A governed kit is refused on this lane: the experimental receipt
+/// is `NON_GOVERNED_EXPERIMENTAL` and can never satisfy governed proof.
+///
+/// The single invocation itself runs through [`execute_domain_experimental`]
+/// with the caller's typed request and admitted envelope: the same bounded
+/// buffer is compiled, the exact component type is preflighted (including
+/// the generated export-signature typecheck) before instantiation, the
+/// descriptor and the domain export are each called exactly once under the
+/// existing fuel/epoch/deadline/resource limits and cancellation policy,
+/// and the typed terminal result (outcome or the guest's own typed error)
+/// is retained verbatim. The typed request arrives as generated WIT types;
+/// the capsule fixture bytes are bounds evidence only, never parsed into a
+/// request, and there is no legacy byte-runner fallback.
+pub fn execute_capsule_domain_experimental(
+    kit: &ModuleContractKit,
+    capsule: &ModuleTestCapsule,
+    artifact: &[u8],
+    limits: &InvocationLimits,
+    request: &TypedDomainRequest,
+    admitted: &TypedDomainAdmission,
+) -> Result<(TypedReceipt, TypedDomainResult), TypedExecutionError> {
+    kit.validate().map_err(map_contract_error)?;
+    capsule.validate(kit).map_err(map_contract_error)?;
+    if kit.governed {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "kit-governed".to_owned(),
+        ));
+    }
+    let world = request.world();
+    if capsule.world.world_name() != world.world_name() {
+        return Err(TypedExecutionError::AdmissionMismatch("world".to_owned()));
+    }
+    if capsule.operation.as_str() != world.domain_func() {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "operation".to_owned(),
+        ));
+    }
+    let preflight = preflight_bytes(artifact)?;
+    if kit.artifact_digest != preflight.digest {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "artifact-digest".to_owned(),
+        ));
+    }
+    if capsule.max_input_bytes > limits.max_input_bytes {
+        return Err(TypedExecutionError::LimitDenied("capsule-input".to_owned()));
+    }
+    if capsule.max_output_bytes > limits.max_output_bytes {
+        return Err(TypedExecutionError::LimitDenied(
+            "capsule-output".to_owned(),
+        ));
+    }
+    execute_domain_experimental(world, artifact, limits, request, admitted)
 }
 
 /// Digest of the admitted operation envelope plus the measured request bound.
