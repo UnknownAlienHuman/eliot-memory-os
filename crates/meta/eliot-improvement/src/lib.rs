@@ -11,6 +11,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::candidate_bounds::canonical_evidence_lineage;
+
 pub mod application_class;
 pub mod brief;
 pub mod budget_proof;
@@ -99,6 +101,27 @@ pub enum ImprovementSurface {
     PacketCompiler,
     Verifier,
     Scheduler,
+}
+
+impl ImprovementSurface {
+    /// The closed `snake_case` name, identical to the `Serialize` spelling.
+    ///
+    /// Total and allocation-free, so a value that participates in a content
+    /// digest (see [`ImprovementCandidate::derive_candidate_id`]) names the
+    /// surface without restating a literal that a variant rename could
+    /// desynchronize from the wire spelling.
+    #[must_use]
+    pub const fn closed_name(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Skill => "skill",
+            Self::ToolProfile => "tool_profile",
+            Self::Rule => "rule",
+            Self::PacketCompiler => "packet_compiler",
+            Self::Verifier => "verifier",
+            Self::Scheduler => "scheduler",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,11 +256,30 @@ impl ImprovementCandidate {
         baseline_metrics: BTreeMap<String, f64>,
     ) -> Result<Self, ImprovementError> {
         let now = OffsetDateTime::now_utc();
-        let candidate = Self {
-            candidate_id: Uuid::now_v7().to_string(),
-            project_id: project_id.into(),
+        let project_id = project_id.into();
+        let proposed_change = proposed_change.into();
+        // Content-derived identity (I12.24:20-38, W3). The id is a digest over
+        // the project, the target surface, the proposed change, both scope-rule
+        // sets and the CANONICAL evidence lineage, so the same lineage always
+        // yields the same candidate identity. A fresh random id per pass made
+        // lineage deduplication unreachable and minted a new durable record key
+        // on every repeat — the opposite of "deduplicated by target surface and
+        // evidence lineage". Two different lineages still differ, so this never
+        // collapses two different problems onto one candidate.
+        let candidate_id = Self::derive_candidate_id(
+            &project_id,
             target_surface,
-            proposed_change: proposed_change.into(),
+            &proposed_change,
+            &applies_when,
+            &does_not_apply_when,
+            &source_trace_refs,
+            &evidence_refs,
+        );
+        let candidate = Self {
+            candidate_id,
+            project_id,
+            target_surface,
+            proposed_change,
             applies_when,
             does_not_apply_when,
             source_trace_refs,
@@ -315,6 +357,58 @@ impl ImprovementCandidate {
         non_empty(&self.rollback, "rollback")?;
         non_empty(&self.stop_condition, "stop_condition")?;
         Ok(())
+    }
+
+    /// Derives the stable candidate identity from candidate CONTENT.
+    ///
+    /// The digest covers the fields that decide WHICH improvement this is —
+    /// project, target surface, proposed change, the applies/does-not-apply
+    /// scope rules, the source trace and the canonical evidence lineage — and
+    /// nothing that varies per pass or per owner action. `created_at`,
+    /// `updated_at`, `revision` and `lifecycle` are deliberately excluded, so
+    /// re-observing the same evidence under the same change yields the same
+    /// id and the lineage merge in `BoundedBacklog::admit_reporting_pressure`
+    /// becomes reachable in production.
+    ///
+    /// Component boundaries are length-prefixed rather than concatenated, so no
+    /// two different field splittings can produce the same digest input.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one hashed component per identity field; the point is the digest input, not the arity"
+    )]
+    fn derive_candidate_id(
+        project_id: &str,
+        target_surface: ImprovementSurface,
+        proposed_change: &str,
+        applies_when: &[String],
+        does_not_apply_when: &[String],
+        source_trace_refs: &[String],
+        evidence_refs: &[String],
+    ) -> String {
+        let mut hasher = Hasher::new();
+        let mut component = |value: &str| {
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        };
+        component(project_id.trim());
+        component(target_surface.closed_name());
+        component(proposed_change.trim());
+        for rule in applies_when {
+            component(rule.trim());
+        }
+        for rule in does_not_apply_when {
+            component(rule.trim());
+        }
+        for reference in source_trace_refs {
+            component(reference.trim());
+        }
+        // The lineage is canonicalised (sorted, deduplicated, blank-free) so two
+        // orderings of the same refs are ONE identity, matching the comparison
+        // `BoundedBacklog` already performs on admission.
+        for reference in canonical_evidence_lineage(evidence_refs) {
+            component(&reference);
+        }
+        format!("cand-{}", hasher.finalize().to_hex())
     }
 
     /// Base structural checks that hold for every candidate, including
