@@ -9,8 +9,10 @@
 //! `IndependentKernelSensor::supervise` heartbeat plus `report_gap_nonfatal`
 //! gaps, composition containment `PidReused`/`ImageSubstituted` mapping to
 //! `publish_no_authority`, and `export`/`ack`/`compact` through `export_once`.
-//! The trailing manifest/source assertions prove no private launcher is
-//! present (zero `eliot_process` refs, no new dep edge).
+//! The trailing dependency/source assertions read the manifest's dependency
+//! declaration tables (the only place a dependency edge can exist) and prove no
+//! private launcher is present: no declared `eliot-process` edge and no
+//! `eliot_process`/launcher reference in the crate sources.
 //!
 //! Proof ceiling: this is a sensor/port and composition demonstration driven by
 //! fixtures — a fixture-issued supervision lease, a fake Host observation
@@ -32,6 +34,7 @@ use crate::{
 };
 use eliot_runtime_contracts::SupervisionLeaseVerifier;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -283,6 +286,21 @@ async fn await_reported_gap(reported: &Arc<tokio::sync::Notify>, expected: GapRe
     );
 }
 
+
+/// Recovers the readable text of a caught panic payload.
+///
+/// Used only to append residue to an already-failing demonstration without
+/// replacing its primary failure message.
+fn s08w_panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else {
+        "s08w proof failed with a non-text panic payload".to_owned()
+    }
+}
+
 /// Observes removal of the exact test-owned temporary paths this demonstration
 /// creates, on success and on failure alike.
 ///
@@ -303,12 +321,17 @@ impl S08wOwnedTempState {
         Self { paths, removed: 0 }
     }
 
-    /// Removes every owned path, reporting each failure with its exact path.
+    /// Removes every owned path and returns one report line per residue.
     ///
-    /// Must run after the sensor and ORS store are closed, because both keep a
-    /// live file handle on their own path; removal before that would fail for a
+    /// This never panics and never force-removes: the caller decides whether a
+    /// cleanup failure is the demonstration's failure or a suffix on an
+    /// already-failing one, so the primary assertion failure is preserved. Must
+    /// run after the sensor and ORS store are closed, because both keep a live
+    /// file handle on their own path; removal before that would fail for a
     /// reason that has nothing to do with the demonstration.
-    fn remove(&mut self) {
+    fn remove(&mut self) -> Vec<String> {
+        let mut residue = Vec::new();
+        let mut removed = 0usize;
         for path in &self.paths {
             let outcome = if path.is_dir() {
                 std::fs::remove_dir_all(path)
@@ -316,44 +339,100 @@ impl S08wOwnedTempState {
                 std::fs::remove_file(path)
             };
             match outcome {
-                Ok(()) => {
-                    self.removed += 1;
-                    assert!(
-                        !path.exists(),
-                        "s08w owned temp path still present after removal: {}",
-                        path.display()
-                    );
-                }
-                Err(error) => panic!(
-                    "s08w owned temp cleanup failed for {}: {error}; \
-                     residue is retained for inspection and the primary failure above is preserved",
+                Ok(()) if !path.exists() => removed += 1,
+                Ok(()) => residue.push(format!(
+                    "{}: removal reported success but the path is still present",
                     path.display()
-                ),
+                )),
+                Err(error) => residue.push(format!("{}: {error}", path.display())),
             }
         }
+        self.removed = removed;
+        residue
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "T2-S08W keeps one focused heartbeat+gaps+containment+export proof in a single test"
-)]
-#[tokio::test]
-async fn s08w_sensor_port_recovery_containment_export() {
-    // Sensor/port heartbeat: one real verified lease through the existing ORS
-    // fixture path, matching the sensor epoch so `record_heartbeat` admits it.
+/// Test entrypoint: runs the demonstration, then removes and reports the exact
+/// temporary paths it owns.
+///
+/// The proof runs inside `catch_unwind`, so owned temporary state is cleaned up
+/// and reported whether the demonstration passed or failed. A cleanup failure
+/// never replaces the primary assertion failure: when both occur, the residue is
+/// appended to the primary message and the test still fails on the primary
+/// cause. The test is driven on an explicit current-thread runtime rather than
+/// `#[tokio::test]` precisely so the cleanup path can run outside the unwinding
+/// future.
+#[test]
+fn s08w_sensor_port_recovery_containment_export() {
     let serial = super::FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
     let state_dir = std::env::temp_dir().join(format!(
         "eliot-watchdog-s08w-{}-{serial}",
         std::process::id()
     ));
     std::fs::create_dir_all(&state_dir).unwrap_or_else(|error| panic!("s08w state dir: {error}"));
-    let sensor =
-        IndependentKernelSensor::open_for_export_driver_test(&state_dir, "s08w-installation", 7, 1)
-            .unwrap_or_else(|error| panic!("s08w sensor: {error}"));
     let ors_path = supervision_fixture_path();
-    let store = eliot_ors::RedbRecoveryStore::open(&ors_path)
+    let mut owned = S08wOwnedTempState::new(vec![ors_path.clone(), state_dir.clone()]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("s08w runtime: {error}"));
+    let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(s08w_recovery_containment_proof(&state_dir, &ors_path))
+    }));
+    // Close the runtime (and with it every task the compositions left behind)
+    // before any owned path is removed.
+    drop(runtime);
+    let residue = owned.remove();
+    match primary {
+        Ok(()) => assert!(
+            residue.is_empty(),
+            "s08w owned temp cleanup failed and residue is retained for inspection: {}",
+            residue.join("; ")
+        ),
+        Err(payload) => {
+            assert!(
+                residue.is_empty(),
+                "{}\ns08w owned temp cleanup also failed; residue is retained for inspection: {}",
+                s08w_panic_text(payload.as_ref()),
+                residue.join("; ")
+            );
+            std::panic::resume_unwind(payload);
+        }
+    }
+    assert_eq!(
+        owned.removed,
+        owned.paths.len(),
+        "every test-owned temporary path must be observed removed"
+    );
+}
+
+/// The demonstration itself: admitted heartbeat, typed identity-loss gaps
+/// across the real composition boundary, and the export/ack/compaction route.
+///
+/// One focused step per obligation, so each step stays small and readable.
+/// Everything this opens (the sensor spool and the ORS fixture store) is
+/// dropped when this function returns or unwinds, which is what makes the
+/// caller's temp-state removal safe.
+async fn s08w_recovery_containment_proof(state_dir: &Path, ors_path: &Path) {
+    let sensor =
+        IndependentKernelSensor::open_for_export_driver_test(state_dir, "s08w-installation", 7, 1)
+            .unwrap_or_else(|error| panic!("s08w sensor: {error}"));
+    let store = eliot_ors::RedbRecoveryStore::open(ors_path)
         .unwrap_or_else(|error| panic!("s08w ors store: {error}"));
+    s08w_admitted_heartbeat(&sensor, &store).await;
+    s08w_identity_loss_gaps(&sensor).await;
+    s08w_composition_containment_pid_reuse().await;
+    s08w_composition_containment_image_substitution().await;
+    s08w_export_acknowledgement_and_compaction(&sensor).await;
+    s08w_no_private_launcher_assertions();
+}
+
+/// Sensor/port heartbeat: one real verified lease through the existing ORS
+/// fixture path, matching the sensor epoch so `record_heartbeat` admits it.
+async fn s08w_admitted_heartbeat(
+    sensor: &IndependentKernelSensor,
+    store: &eliot_ors::RedbRecoveryStore,
+) {
     let now_ms = crate::current_unix_ms().unwrap_or_else(|error| panic!("s08w clock: {error}"));
     let binding = supervision_fixture_binding(now_ms.saturating_sub(200))
         .unwrap_or_else(|error| panic!("s08w lease binding: {error}"));
@@ -377,14 +456,15 @@ async fn s08w_sensor_port_recovery_containment_export() {
         .verify(&envelope, &context)
         .unwrap_or_else(|error| panic!("s08w lease verify: {error}"));
     assert_eq!(verified.lease().watchdog_epoch.value(), 1);
-    KernelWatchdogPort::supervise(&sensor, &verified)
+    KernelWatchdogPort::supervise(sensor, &verified)
         .await
         .unwrap_or_else(|error| panic!("s08w heartbeat: {error}"));
+}
 
-    // Composition containment inputs: PID reuse and image substitution are
-    // classified by the existing monitor and map to typed gap reasons. The
-    // composition loop turns each into `publish_no_authority` plus a nonfatal
-    // gap; here the sensor port records the same gaps durably.
+/// Both typed identity-loss classes classified by the existing monitor and
+/// recorded as nonfatal gaps on the admitted sensor, retaining
+/// `coverage_claimed=false` on every gap record.
+async fn s08w_identity_loss_gaps(sensor: &IndependentKernelSensor) {
     let mut monitor = HostIdentityMonitor::new(None);
     let base = eliot_platform_windows::ProcessIdentity {
         process_id: 4242,
@@ -418,8 +498,8 @@ async fn s08w_sensor_port_recovery_containment_export() {
         image_observation.gap_reason(),
         Some(GapRecoveryReason::HostImageSubstituted)
     );
-    crate::report_gap_nonfatal(&sensor, GapRecoveryReason::HostPidReused).await;
-    crate::report_gap_nonfatal(&sensor, GapRecoveryReason::HostImageSubstituted).await;
+    crate::report_gap_nonfatal(sensor, GapRecoveryReason::HostPidReused).await;
+    crate::report_gap_nonfatal(sensor, GapRecoveryReason::HostImageSubstituted).await;
     let retained = sensor
         .retained_spool_entries_for_export_driver_test()
         .unwrap_or_else(|error| panic!("s08w retained: {error}"));
@@ -450,106 +530,135 @@ async fn s08w_sensor_port_recovery_containment_export() {
         ),
         "third record must be the image-substitution containment gap"
     );
+}
 
-    // Composition containment, class one: a `PidReused` host observation with
-    // no admission stays `RunningNoAuthority` (the public `publish_no_authority`
-    // projection) while the gap port observes the typed reason nonfatally.
-    // The wait is a bounded observation of the injected port's notification,
-    // never a fixed sleep: absence of the event is the failure.
-    let pid_port = S08wRecordingPort::new();
-    let pid_gaps = pid_port.gaps();
-    let pid_reported = Arc::clone(&pid_port.reported);
-    let pid_shutdown = Arc::new(AtomicBool::new(false));
+/// Bounded export limits shared by the refusing and accepting export steps.
+fn s08w_export_limits() -> WatchdogSpoolExportLimits {
+    WatchdogSpoolExportLimits {
+        max_items: 10,
+        max_bytes: 65_536,
+    }
+}
+
+/// Composition containment, class one: a `PidReused` host observation with no
+/// admission stays `RunningNoAuthority` (the public `publish_no_authority`
+/// projection) while the gap port observes the typed reason nonfatally. The
+/// wait is a bounded observation of the injected port's notification, never a
+/// fixed sleep: absence of the event is the failure.
+async fn s08w_composition_containment_pid_reuse() {
+    let port = S08wRecordingPort::new();
+    let gaps = port.gaps();
+    let reported = Arc::clone(&port.reported);
+    let shutdown = Arc::new(AtomicBool::new(false));
     let config = WatchdogConfig {
         tick_interval: Duration::from_millis(5),
         ..WatchdogConfig::default()
     };
-    let pid_composition = WatchdogComposition::start_with_shutdown_and_host(
-        config.clone(),
+    let composition = WatchdogComposition::start_with_shutdown_and_host(
+        config,
         Arc::new(S08wInvalidAdmission),
-        Arc::new(pid_port),
+        Arc::new(port),
         Arc::new(S08wPidReusedHost),
-        Arc::clone(&pid_shutdown),
+        Arc::clone(&shutdown),
     )
     .unwrap_or_else(|error| panic!("s08w composition (pid reuse): {error}"));
-    let pid_readiness = pid_composition.readiness();
+    let readiness = composition.readiness();
     assert_eq!(
-        pid_readiness.authority_state,
+        readiness.authority_state,
         WatchdogAuthorityState::RunningNoAuthority
     );
-    assert!(!pid_readiness.coverage_claimed);
-    await_reported_gap(&pid_reported, GapRecoveryReason::HostPidReused).await;
-    let pid_observed: Vec<GapRecoveryReason> = pid_gaps
+    assert!(!readiness.coverage_claimed);
+    await_reported_gap(&reported, GapRecoveryReason::HostPidReused).await;
+    let observed: Vec<GapRecoveryReason> = gaps
         .lock()
         .unwrap_or_else(|error| panic!("s08w pid gaps lock: {error}"))
         .clone();
     assert!(
-        pid_observed.contains(&GapRecoveryReason::HostPidReused),
-        "PidReused containment must report a nonfatal gap, got {pid_observed:?}"
+        observed.contains(&GapRecoveryReason::HostPidReused),
+        "PidReused containment must report a nonfatal gap, got {observed:?}"
     );
+    let readiness = composition.readiness();
     assert_eq!(
-        pid_composition.readiness().authority_state,
+        readiness.authority_state,
         WatchdogAuthorityState::RunningNoAuthority
     );
-    assert!(!pid_composition.readiness().coverage_claimed);
+    assert!(!readiness.coverage_claimed);
     // Shut the composition down and join it before any later resource
     // inspection, so nothing this test inspects is still held by a live task.
-    pid_shutdown.store(true, Ordering::Release);
-    pid_composition
+    shutdown.store(true, Ordering::Release);
+    composition
         .run_until_shutdown()
         .await
         .unwrap_or_else(|error| panic!("s08w shutdown (pid reuse): {error:?}"));
+}
 
-    // Composition containment, class two: the substituted-image identity loss
-    // crossing the same real composition boundary. Separate monitor
-    // assertions above are not composition proof, so this observes the typed
-    // `HostImageSubstituted` reason reaching the injected port through the
-    // production loop, and re-proves the no-authority/no-coverage state.
-    let image_port = S08wRecordingPort::new();
-    let image_gaps = image_port.gaps();
-    let image_reported = Arc::clone(&image_port.reported);
-    let image_shutdown = Arc::new(AtomicBool::new(false));
-    let image_composition = WatchdogComposition::start_with_shutdown_and_host(
+/// Composition containment, class two: the substituted-image identity loss
+/// crossing the same real composition boundary. Separate monitor assertions are
+/// not composition proof, so this observes the typed `HostImageSubstituted`
+/// reason reaching the injected port through the production loop, and re-proves
+/// the no-authority/no-coverage state.
+async fn s08w_composition_containment_image_substitution() {
+    let port = S08wRecordingPort::new();
+    let gaps = port.gaps();
+    let reported = Arc::clone(&port.reported);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let config = WatchdogConfig {
+        tick_interval: Duration::from_millis(5),
+        ..WatchdogConfig::default()
+    };
+    let composition = WatchdogComposition::start_with_shutdown_and_host(
         config,
         Arc::new(S08wInvalidAdmission),
-        Arc::new(image_port),
+        Arc::new(port),
         Arc::new(S08wImageSubstitutedHost),
-        Arc::clone(&image_shutdown),
+        Arc::clone(&shutdown),
     )
     .unwrap_or_else(|error| panic!("s08w composition (image substitution): {error}"));
-    let image_readiness = image_composition.readiness();
+    let readiness = composition.readiness();
     assert_eq!(
-        image_readiness.authority_state,
+        readiness.authority_state,
         WatchdogAuthorityState::RunningNoAuthority
     );
-    assert!(!image_readiness.coverage_claimed);
-    await_reported_gap(&image_reported, GapRecoveryReason::HostImageSubstituted).await;
-    let image_observed: Vec<GapRecoveryReason> = image_gaps
+    assert!(!readiness.coverage_claimed);
+    await_reported_gap(&reported, GapRecoveryReason::HostImageSubstituted).await;
+    let observed: Vec<GapRecoveryReason> = gaps
         .lock()
         .unwrap_or_else(|error| panic!("s08w image gaps lock: {error}"))
         .clone();
     assert!(
-        image_observed.contains(&GapRecoveryReason::HostImageSubstituted),
-        "ImageSubstituted containment must report a nonfatal gap, got {image_observed:?}"
+        observed.contains(&GapRecoveryReason::HostImageSubstituted),
+        "ImageSubstituted containment must report a nonfatal gap, got {observed:?}"
     );
+    let readiness = composition.readiness();
     assert_eq!(
-        image_composition.readiness().authority_state,
+        readiness.authority_state,
         WatchdogAuthorityState::RunningNoAuthority
     );
-    assert!(!image_composition.readiness().coverage_claimed);
-    image_shutdown.store(true, Ordering::Release);
-    image_composition
+    assert!(!readiness.coverage_claimed);
+    shutdown.store(true, Ordering::Release);
+    composition
         .run_until_shutdown()
         .await
         .unwrap_or_else(|error| panic!("s08w shutdown (image substitution): {error:?}"));
+}
 
-    // Existing admitted recovery route: bounded export, exact ack, compaction
-    // below the cursor. No child is launched; the sink only returns
-    // dispositions for the immutable batch.
-    let limits = WatchdogSpoolExportLimits {
-        max_items: 10,
-        max_bytes: 65_536,
-    };
+/// Existing admitted recovery route: bounded export, exact ack, compaction
+/// below the cursor. No child is launched; the sink only returns dispositions
+/// for the immutable batch.
+async fn s08w_export_acknowledgement_and_compaction(sensor: &IndependentKernelSensor) {
+    let limits = s08w_export_limits();
+    s08w_refusal_discriminator(sensor, limits).await;
+    s08w_acknowledged_export_and_compaction(sensor, limits).await;
+}
+
+/// Refusal/replay discriminator, run BEFORE the accepting export so the
+/// unacknowledged evidence is still present to be lost. Both classes must
+/// leave every record retained and the cursor unmoved, so the exact same batch
+/// is still replayable afterwards.
+async fn s08w_refusal_discriminator(
+    sensor: &IndependentKernelSensor,
+    limits: WatchdogSpoolExportLimits,
+) {
     let retained_before_export = sensor
         .retained_spool_entries_for_export_driver_test()
         .unwrap_or_else(|error| panic!("s08w retained before export: {error}"));
@@ -557,30 +666,22 @@ async fn s08w_sensor_port_recovery_containment_export() {
         .iter()
         .map(|entry| entry.sequence)
         .collect();
-
-    // Refusal/replay discriminator, run BEFORE the accepting export so the
-    // unacknowledged evidence is still present to be lost. Both classes must
-    // leave every record retained and the cursor unmoved, so the exact same
-    // batch is still replayable afterwards. A refusal that dropped or
-    // acknowledged anything would fail the identity comparison below.
     let failing_sink = S08wFailingSink {
         sink_id: "sink-s08w".to_owned(),
     };
-    let failed = export_once(&sensor, &failing_sink, limits);
+    let failed = export_once(sensor, &failing_sink, limits);
     assert!(
         failed.is_err(),
         "a sink that cannot acknowledge must not report a cursor advance"
     );
-
     let foreign_sink = S08wForeignAckSink {
         sink_id: "sink-s08w".to_owned(),
     };
-    let foreign = export_once(&sensor, &foreign_sink, limits);
+    let foreign = export_once(sensor, &foreign_sink, limits);
     assert!(
         foreign.is_err(),
         "a foreign acknowledgement must not report a cursor advance"
     );
-
     let after_refusal = sensor
         .retained_spool_entries_for_export_driver_test()
         .unwrap_or_else(|error| panic!("s08w retained after refusal: {error}"));
@@ -596,9 +697,23 @@ async fn s08w_sensor_port_recovery_containment_export() {
         after_refusal, retained_before_export,
         "refused acknowledgements must leave every retained record byte-identical"
     );
+}
 
-    // The accepting route is now proven to be the only thing that advances:
-    // the same exact batch identity is re-exported and acknowledged.
+/// The accepting route, proven to be the only thing that advances: the same
+/// exact batch identity is re-exported and acknowledged, the acknowledgement
+/// covers its entries 1:1 with each record's own digest, and compaction removes
+/// exactly the acknowledged prefix.
+async fn s08w_acknowledged_export_and_compaction(
+    sensor: &IndependentKernelSensor,
+    limits: WatchdogSpoolExportLimits,
+) {
+    let retained_before_export = sensor
+        .retained_spool_entries_for_export_driver_test()
+        .unwrap_or_else(|error| panic!("s08w retained before accepting export: {error}"));
+    let retained_sequences: Vec<u64> = retained_before_export
+        .iter()
+        .map(|entry| entry.sequence)
+        .collect();
     let sink = S08wTerminalSink {
         sink_id: "sink-s08w".to_owned(),
         last_acknowledged: Arc::new(Mutex::new(None)),
@@ -634,16 +749,15 @@ async fn s08w_sensor_port_recovery_containment_export() {
         "the replayed batch must preserve per-entry record identity in order"
     );
     // The batch the driver exported and the batch the sink answered must be
-    // the same immutable batch, and the acknowledgement must cover exactly its
-    // entries 1:1 with each record's own digest. This is fixture evidence of
-    // the ack contract, not evidence of a real backend delivery.
+    // the same immutable batch. This is fixture evidence of the ack contract,
+    // not evidence of a real backend delivery.
     let replayed_digests: Vec<String> = batch
         .entries
         .iter()
         .map(|entry| entry.record_digest.clone())
         .collect();
     let replayed_ids: Vec<u64> = batch.entries.iter().map(|entry| entry.sequence).collect();
-    let advanced = export_once(&sensor, &sink, limits)
+    let advanced = export_once(sensor, &sink, limits)
         .unwrap_or_else(|error| panic!("s08w export_once: {error}"));
     assert_eq!(advanced, 3);
     let acknowledged = sink_acknowledged
@@ -656,6 +770,28 @@ async fn s08w_sensor_port_recovery_containment_export() {
     assert_eq!(acknowledged.first_sequence, batch.first_sequence);
     assert_eq!(acknowledged.last_sequence, batch.last_sequence);
     assert_eq!(acknowledged.sink_id, "sink-s08w");
+    assert_s08w_disposition_coverage(&acknowledged, &replayed_ids, &replayed_digests);
+    let tail = sensor
+        .retained_spool_entries_for_export_driver_test()
+        .unwrap_or_else(|error| panic!("s08w tail: {error}"));
+    assert_eq!(
+        tail.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
+        vec![3],
+        "compaction must remove exactly the acknowledged prefix"
+    );
+    assert_eq!(
+        tail[0].payload, retained_before_export[2].payload,
+        "the surviving tail record must be byte-identical to the exported one"
+    );
+}
+
+/// The per-entry acknowledgement contract, compared against the exported
+/// batch's own sequences and record digests.
+fn assert_s08w_disposition_coverage(
+    acknowledged: &eliot_watchdog_core::WatchdogSpoolAcknowledgement,
+    replayed_ids: &[u64],
+    replayed_digests: &[String],
+) {
     assert_eq!(
         acknowledged
             .dispositions
@@ -686,29 +822,75 @@ async fn s08w_sensor_port_recovery_containment_export() {
             "gap records stay in the gap-resolution phase, not applied"
         );
     }
-    let tail = sensor
-        .retained_spool_entries_for_export_driver_test()
-        .unwrap_or_else(|error| panic!("s08w tail: {error}"));
-    assert_eq!(
-        tail.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
-        vec![3],
-        "compaction must remove exactly the acknowledged prefix"
-    );
-    assert_eq!(
-        tail[0].payload, retained_before_export[2].payload,
-        "the surviving tail record must be byte-identical to the exported one"
-    );
+}
 
-    // No private launcher: the watchdog keeps deterministic
-    // health/containment policy and never acquires arbitrary launch authority.
+/// Every dependency key this package actually declares, read from the
+/// manifest's dependency declaration tables.
+///
+/// Those tables are the only place a dependency edge can exist, so a key read
+/// from one of them is a real edge. The same words appearing in a comment, a
+/// description, or any other manifest-projection field are not an edge, and a
+/// whole-file substring search cannot tell those apart — so it is not used as
+/// the dependency proof here.
+fn s08w_declared_dependency_keys(manifest: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut in_dependency_table = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let header = trimmed.trim_matches(|character| character == '[' || character == ']');
+            in_dependency_table = header.split('.').next_back().is_some_and(|table| {
+                table == "dependencies"
+                    || table == "dev-dependencies"
+                    || table == "build-dependencies"
+            });
+            continue;
+        }
+        if !in_dependency_table || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, _value)) = trimmed.split_once('=') {
+            keys.push(s08w_dependency_name(key));
+        }
+    }
+    keys
+}
+
+/// The dependency name a declaration key actually binds.
+///
+/// Two declaration forms name the same dependency: `name.workspace = true`
+/// inherits the version from the workspace table, and `name = { workspace = … }`
+/// inherits it inline. Reading the key without normalizing the dotted form
+/// would compare `"eliot-process.workspace"` against `"eliot-process"` and
+/// miss the edge it is meant to detect.
+fn s08w_dependency_name(declaration_key: &str) -> String {
+    let key = declaration_key.trim().trim_matches('"');
+    key.strip_suffix(".workspace").unwrap_or(key).to_owned()
+}
+
+/// The Watchdog keeps deterministic health/containment policy and never
+/// acquires arbitrary launch authority: it declares no process-execution
+/// dependency edge, and no crate source references a process executor or a
+/// child launcher. The dependency edge is read from the manifest's declaration
+/// tables, which is where an edge must live to exist; the source assertions
+/// supplement that proof.
+fn s08w_no_private_launcher_assertions() {
     let manifest = include_str!("../../Cargo.toml");
+    let declared = s08w_declared_dependency_keys(manifest);
+    for forbidden in ["eliot-process", "eliot_process"] {
+        assert!(
+            !declared.iter().any(|key| key == forbidden),
+            "watchdog must not declare a process-launch dependency: \
+             {forbidden} is among its declared dependencies {declared:?}"
+        );
+    }
+    // The declared set must be non-empty, or the parser silently matched nothing
+    // and every assertion above would pass vacuously.
     assert!(
-        !manifest.contains("eliot-process"),
-        "watchdog must not gain a process-launch edge"
-    );
-    assert!(
-        !manifest.contains("eliot_process"),
-        "watchdog must not gain a process-launch edge"
+        declared.contains(&"eliot-watchdog-core".to_owned())
+            && declared.contains(&"eliot-platform-windows".to_owned())
+            && declared.contains(&"tokio".to_owned()),
+        "dependency declaration parse found no known dependencies: {declared:?}"
     );
     let lib_src = include_str!("../lib.rs");
     assert!(
@@ -733,24 +915,23 @@ async fn s08w_sensor_port_recovery_containment_export() {
         "watchdog composition must not invent a child launcher"
     );
     let driver_src = include_str!("../watchdog_spool/export_driver.rs");
+    // The driver's own no-launcher statement is a documentation anchor only, so
+    // it is matched on whitespace-normalized prose: a raw substring search would
+    // read a line wrap in that doc comment as a missing boundary.
+    let driver_prose: String = driver_src
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        driver_src.contains("no process execution"),
+        driver_prose.contains("no process execution, executor, or child-launch path"),
         "export driver must document the no-launcher boundary"
     );
-
-    // Owned temporary state: cleanup is an explicit, reported action, never a
-    // `Drop` side effect. Both the sensor (holding `watchdog.redb` open) and
-    // the ORS store (holding its own file open) are closed first, then the
-    // exact paths this test created are removed and verified gone. A failure
-    // here reports the exact path and retains the residue.
-    let owned = S08wOwnedTempState::new(vec![ors_path.clone(), state_dir.clone()]);
-    drop(sensor);
-    drop(store);
-    let mut owned = owned;
-    owned.remove();
-    assert_eq!(
-        owned.removed,
-        owned.paths.len(),
-        "every test-owned temporary path must be observed removed"
+    assert!(
+        !driver_src.contains("eliot_process"),
+        "export driver must not reference a process executor"
+    );
+    assert!(
+        !driver_src.contains("Command::new"),
+        "export driver must not invent a child launcher"
     );
 }
