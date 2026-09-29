@@ -11,7 +11,8 @@
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
 use super::daemon_request_dispatch::{
-    DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
+    AGENT_BRIDGE_REACTIVE_LEDGER_MUTATION_OPERATION, DAEMON_STARTUP_EVIDENCE_OPERATION,
+    NOTIFICATION_STATE_MUTATION_OPERATION,
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
     USER_AUTOMATION_RUNTIME_OPERATION,
 };
@@ -248,6 +249,7 @@ fn observe_runtime_capability_health(capability: &eliot_kernel_core::CapabilityH
 fn actual_route_name(action: &KernelFrameAction) -> &'static str {
     match action {
         KernelFrameAction::Reply(_) => "reply_admitted",
+        KernelFrameAction::ReactiveLedgerMutation { .. } => "reactive_ledger_admitted",
         KernelFrameAction::Daemon { .. } => "daemon_admitted",
         KernelFrameAction::Process { .. } => "process_admitted",
         KernelFrameAction::Doctor { .. } => "doctor_admitted",
@@ -872,6 +874,55 @@ impl KernelComposition {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
                 .ok_or(TransportError::SessionFenced)?;
+            if session.module_generation.module_id.as_str()
+                == eliot_protocol::AGENT_BRIDGE_MODULE_ID
+                && operation == AGENT_BRIDGE_REACTIVE_LEDGER_MUTATION_OPERATION
+            {
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if !probe_ready_state_admitted(
+                    self.service_state()
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ) {
+                    return Err(TransportError::SessionFenced);
+                }
+                let identity = frame
+                    .request_identity
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                if identity.request.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                let request: eliot_protocol::ReactiveLedgerMutationRequest =
+                    serde_json::from_value(
+                        payload
+                            .get("request")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                request
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if request.state_fence != identity.request.state_fence
+                    || identity
+                        .request
+                        .metadata
+                        .session_id
+                        .as_ref()
+                        .map(|session_id| session_id.as_str())
+                        != Some(request.session_id.as_str())
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::ReactiveLedgerMutation {
+                    request_id,
+                    identity: identity.clone(),
+                    request,
+                });
+            }
             if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
                 && is_daemon_operation(&operation)
             {

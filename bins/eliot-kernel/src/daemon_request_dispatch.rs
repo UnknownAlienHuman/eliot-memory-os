@@ -12,6 +12,10 @@
 //! dispatch convention; the new Store carriers below are explicitly typed.
 
 use super::*;
+/// Agent Bridge operation admitted onto the dedicated reactive-ledger CAS
+/// action. The protocol crate owns the wire vocabulary.
+pub(crate) const AGENT_BRIDGE_REACTIVE_LEDGER_MUTATION_OPERATION: &str =
+    eliot_protocol::REACTIVE_LEDGER_MUTATION_OPERATION;
 #[path = "store_receipt_dispatch.rs"]
 mod store_receipt_dispatch;
 use std::collections::{BTreeMap, BTreeSet};

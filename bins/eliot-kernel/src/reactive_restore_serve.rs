@@ -88,6 +88,7 @@ pub async fn serve_reactive_restore(
         session_id: query.session_id.clone(),
         state_fence: query.state_fence.clone(),
         ledger_json: ledger.ledger_json,
+        ledger_revision: ledger.ledger_revision,
         snapshots,
         revision,
     })
