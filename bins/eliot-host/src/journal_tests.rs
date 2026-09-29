@@ -3795,6 +3795,8 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
             user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
+            #[cfg(windows)]
+            backup_dispatch_queue: crate::HostBackupDispatchQueue::bounded(),
             store_recovery_startup_fence: StoreRecoveryStartupFence::Clear,
             active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind::None,
             owner_lease,
