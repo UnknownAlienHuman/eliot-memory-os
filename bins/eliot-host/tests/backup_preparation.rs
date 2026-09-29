@@ -868,7 +868,7 @@ fn lost_response_reconciles_before_retry() {
         PreparationError::UnknownState { .. }
     ),);
     let report =
-        cleanup_preparations(&journal, &["op-958-lossy".to_owned()]).expect("cleanup runs");
+        cleanup_preparations(&mut journal, &["op-958-lossy".to_owned()]).expect("cleanup runs");
     assert!(report.removed.is_empty(), "unknown never removed");
     assert_eq!(report.preserved.len(), 1);
     assert!(prepared.root.exists(), "unknown root preserved");
@@ -911,7 +911,7 @@ fn cancellation_cleanup_preserves_source_and_unknown() {
         "prior receipt preserved"
     );
     let report: CleanupReport =
-        cleanup_preparations(&journal, &["op-958-cancel".to_owned()]).expect("cleanup runs");
+        cleanup_preparations(&mut journal, &["op-958-cancel".to_owned()]).expect("cleanup runs");
     assert_eq!(report.removed, vec!["op-958-cancel".to_owned()]);
     assert!(!prepared.root.exists(), "owned root removed");
     assert_eq!(sentinel_bytes(&sentinel), before, "source preserved");
@@ -1014,7 +1014,8 @@ fn real_windows_isolated_root_preparation_and_cleanup() {
     }
     // Source installation byte-identical; cleanup removes only the destination.
     assert_eq!(sentinel_bytes(&sentinel), before, "source unchanged");
-    let report = cleanup_preparations(&journal, &["op-958-real".to_owned()]).expect("cleanup runs");
+    let report =
+        cleanup_preparations(&mut journal, &["op-958-real".to_owned()]).expect("cleanup runs");
     assert_eq!(report.removed, vec!["op-958-real".to_owned()]);
     assert!(!prepared.root.exists(), "destination removed");
     assert_eq!(sentinel_bytes(&sentinel), before, "source unchanged");

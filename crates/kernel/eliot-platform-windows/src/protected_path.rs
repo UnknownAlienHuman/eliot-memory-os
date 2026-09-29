@@ -357,7 +357,7 @@ impl ProtectedRootLease {
             drop(leaf_pin);
             let child = {
                 let parent = directories.last().ok_or(ProtectedPathError::InvalidPath)?;
-                crate::open_owned_directory_relative(parent, &name)
+                crate::directory_publication::open_owned_directory_relative(parent, &name)
                     .map_err(protected_publication_error)?
             };
             verify_retained_removal_object(&path, identity, parent_identity, &directories, &child)?;
