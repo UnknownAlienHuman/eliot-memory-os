@@ -19,14 +19,14 @@ use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, CanonicalObligation, DeliveryConfidence,
     DeliveryObservation, DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort,
     G08NotificationPort, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
-    LedgerReserveOutcome, NotificationEnvelope, NotificationSeverity, NotificationStateMutation,
-    NotificationStatePort, NotificationStateReadRequest, NotificationStateReadResponse,
-    NotificationStateRequest, NotificationStateResponse, NotifyCore, OneShotLedgerPort,
-    ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
-    UserAutomationInvocation, UserAutomationPreflightProjection, VerificationPorts,
-    WATCHDOG_PRODUCT_ID, WATCHDOG_SOURCE_ID, WatchdogSignaturePort,
-    validate_fallback_envelope_size, validate_fallback_freshness, watchdog_notification_id,
-    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
+    LedgerReserveOutcome, NotificationSeverity, NotificationStateMutation, NotificationStatePort,
+    NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
+    NotificationStateResponse, NotifyCore, OneShotLedgerPort, ResolutionAuthorization,
+    SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest, UserAutomationInvocation,
+    UserAutomationPreflightProjection, VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SOURCE_ID,
+    WatchdogSignaturePort, validate_fallback_envelope_size, validate_fallback_freshness,
+    watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
+    watchdog_signature_payload,
 };
 #[cfg(test)]
 use eliot_notify_core::{WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN};
@@ -155,6 +155,25 @@ pub fn render_acknowledge_request(
         parent: parent.clone(),
         notification_id,
         principal: principal.to_owned(),
+    })
+}
+
+/// Renders the exact one-line delivery request a spawner writes to the
+/// one-shot's stdin.
+///
+/// The bytes are the compact JSON of [`NotifyStdinRequest::Deliver`]: the
+/// spawner writes them as one stdin line and the binary parses them with
+/// [`parse_notify_stdin_request`], so writer and reader share one schema by
+/// construction. The envelope carries the canonical notification the adapter
+/// must project; authority over the delivery stays with the admitted
+/// Kernel-backed route inside the adapter, not with this line.
+pub fn render_deliver_request(
+    envelope: &NotificationEnvelope,
+    request: &NotificationRequest,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&NotifyStdinRequest::Deliver {
+        envelope: envelope.clone(),
+        request: request.clone(),
     })
 }
 
@@ -1761,6 +1780,7 @@ pub mod notify_declaration;
 pub mod notify_launch;
 pub mod operation_identity;
 pub mod quiet_hours;
+pub use eliot_notify_core::NotificationEnvelope;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{

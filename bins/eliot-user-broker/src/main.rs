@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use eliot_process::OperationId;
 use eliot_user_broker::{
     BrokerComposition, BrokerConfig, CompositionError, HumanStateAuthority, NotifyAcknowledge,
-    OperatorClientBinding, canonical_root, request_names_notify_image,
+    NotifyDeliver, OperatorClientBinding, canonical_root, request_names_notify_image,
 };
 use eliot_user_broker_core::{
     CutoverReceipt, LaunchRequest, OPERATOR_HANDOFF_TTL_MS, OperatorEndpoint,
@@ -50,16 +50,40 @@ enum Request {
         #[serde(default)]
         authority: Option<HumanStateAuthority>,
     },
+    /// Spawns the canonical installed `eliot-notify.exe` to deliver one
+    /// canonical notification as a native toast on a Kernel-authorized grant
+    /// (issue #1781, W2/A1).
+    ///
+    /// This is the production initiator of the delivery leg. It is a separate
+    /// operation, not a flag on `NotifyLaunch`, because the two differ in what
+    /// the child receives: `NotifyLaunch` stages and admits the spawn with no
+    /// standard input, while this operation composes the exact delivery line
+    /// and hands it to the child (I11.6:7 — the broker is the only admitted
+    /// spawner, and the broker composes what the adapter serves). The delivery
+    /// content travels as typed fields and never as caller bytes: [`NotifyDeliver`]
+    /// names the canonical envelope plus its binding request, and the line the
+    /// child reads is composed by this broker. A `stdin_payload` on the
+    /// inbound request is refused by the notify admission gate before anything
+    /// is dispatched, and the payload this request is finally launched with is
+    /// the broker's own rendered line. The delivery itself is applied and
+    /// re-validated on the admitted Kernel-backed route inside the adapter.
+    NotifyDeliver {
+        request: LaunchRequest,
+        delivery: NotifyDeliver,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
+    },
     /// Spawns the notification adapter to record one authenticated Human
     /// acknowledgement of one canonical notification (issue #1780, A2).
     ///
     /// This is the production initiator of the acknowledgement leg. It is a
     /// separate operation, not a flag on `NotifyLaunch`, because the two
-    /// differ in what the child receives: delivery launches the adapter with
-    /// no standard input, while this operation composes the exact
+    /// differ in what the child receives: `NotifyLaunch` stages and admits the
+    /// spawn with no standard input, while this operation composes the exact
     /// acknowledgement line and hands it to the child (I11.6:7 — the broker is
     /// the only admitted spawner, and the broker composes what the adapter
-    /// serves). A delivery request may not smuggle bytes onto this path; the
+    /// serves; the delivery leg carries its own broker-composed line through
+    /// `NotifyDeliver`). A delivery request may not smuggle bytes onto this path; the
     /// composition refuses any caller-supplied `stdin_payload` and renders the
     /// line itself.
     ///
@@ -432,20 +456,43 @@ fn parse_root() -> Result<PathBuf, String> {
     }
 }
 
+/// Dispatches one broker-admitted notify delivery.
+///
+/// The arm body lives here rather than inline so `dispatch` keeps its line
+/// budget: admit the Human state change, then launch the broker-composed
+/// delivery line through `launch_notify_deliver`.
+fn dispatch_notify_deliver(
+    composition: &mut BrokerComposition,
+    request: LaunchRequest,
+    delivery: &NotifyDeliver,
+    authority: Option<&HumanStateAuthority>,
+) -> Message {
+    let operation_key = request.approved.idempotency_key.clone();
+    match composition.admit_human_state_change(authority, &operation_key) {
+        Err(error) => composition_rejection(&error),
+        Ok(()) => dispatch_launch(composition.launch_notify_deliver(request, delivery)),
+    }
+}
+
+/// Parses one inbound broker request line.
+///
+/// A malformed line is a stable `REQUEST_INVALID` error, never a dispatch.
+fn parse_request(line: &str) -> Result<Request, Message> {
+    serde_json::from_str::<Request>(line).map_err(|error| Message::Error {
+        code: "REQUEST_INVALID",
+        detail: error.to_string(),
+    })
+}
+
 fn dispatch(
     composition: &mut BrokerComposition,
     line: &str,
     fallback_status: &Value,
     notify_launch_status: &Value,
 ) -> Message {
-    let request = match serde_json::from_str::<Request>(line) {
+    let request = match parse_request(line) {
         Ok(request) => request,
-        Err(error) => {
-            return Message::Error {
-                code: "REQUEST_INVALID",
-                detail: error.to_string(),
-            };
-        }
+        Err(message) => return message,
     };
     match request {
         Request::Launch { request, authority } => {
@@ -473,6 +520,11 @@ fn dispatch(
                 Ok(()) => dispatch_launch(composition.launch_notify(request)),
             }
         }
+        Request::NotifyDeliver {
+            request,
+            delivery,
+            authority,
+        } => dispatch_notify_deliver(composition, request, &delivery, authority.as_ref()),
         Request::NotifyAcknowledge {
             request,
             acknowledgement,

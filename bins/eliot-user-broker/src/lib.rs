@@ -63,9 +63,10 @@ pub use notify_fallback_ensure::{
     NotifyFallbackRegistration, ensure_notify_fallback_registered,
 };
 pub use notify_launch_callin::{
-    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyAcknowledge, NotifyLaunchStage,
-    VerifiedLaunchRef, admit_notify_request, render_notify_acknowledge_line,
-    request_names_notify_image, resolve_broker_notify_launch, stage_normal_notify_launch,
+    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyAcknowledge, NotifyDeliver,
+    NotifyLaunchStage, VerifiedLaunchRef, admit_notify_request, render_notify_acknowledge_line,
+    render_notify_deliver_line, request_names_notify_image, resolve_broker_notify_launch,
+    stage_normal_notify_launch,
 };
 use operation_identity::{
     BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
@@ -1690,6 +1691,48 @@ impl BrokerComposition {
         // The rendered line becomes the admitted request's own standard-input
         // bytes, so it is inside `digest(&request)`: this operation identity is
         // bound to exactly this acknowledgement, and a replay carrying different
+        // bytes is a `ReplayConflict` rather than a second effect.
+        let request = LaunchRequest {
+            stdin_payload: Some(line),
+            ..request
+        };
+        self.launch(request)
+    }
+
+    /// Spawns the per-user notification adapter to deliver one canonical
+    /// notification as a native toast (issue #1781, W2/A1).
+    ///
+    /// This is the composition's production entry to the delivery leg, and the
+    /// reason `eliot-notify`'s delivery line has a caller: the broker is the
+    /// only admitted spawner (I11.6:7, "canonical notification → User Broker →
+    /// native toast → authenticated local UI"), so the broker is what composes
+    /// the line the adapter serves
+    /// ([`notify_launch_callin::render_notify_deliver_line`]).
+    ///
+    /// The same three independent gates as [`Self::launch_notify`] apply — the
+    /// protected launch lease, the retained verified launch reference, and the
+    /// request naming exactly those bytes — plus one more: a caller-supplied
+    /// `stdin_payload` is refused, so the bytes handed to the child are always
+    /// the line this composition rendered and never caller text. The delivery
+    /// itself is applied and re-validated on the admitted Kernel-backed route
+    /// inside the adapter.
+    pub fn launch_notify_deliver(
+        &mut self,
+        request: LaunchRequest,
+        delivery: &NotifyDeliver,
+    ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        // This gate also refuses a caller-supplied `stdin_payload`, so the
+        // bytes bound below are the only bytes this launch can ever carry.
+        notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
+            |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
+        )?;
+        let line = notify_launch_callin::render_notify_deliver_line(delivery).map_err(|error| {
+            CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
+        })?;
+        // The rendered line becomes the admitted request's own standard-input
+        // bytes, so it is inside `digest(&request)`: this operation identity
+        // is bound to exactly this delivery, and a replay carrying different
         // bytes is a `ReplayConflict` rather than a second effect.
         let request = LaunchRequest {
             stdin_payload: Some(line),
