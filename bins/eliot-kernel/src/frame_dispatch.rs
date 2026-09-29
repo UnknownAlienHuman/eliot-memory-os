@@ -128,16 +128,15 @@ fn observe_frame(event: &'static str, outcome: &'static str) {
 }
 
 impl KernelComposition {
-    /// Observes one failed transport frame read without payload.
+    /// Observes one failed frame input without payload at the owned dispatch
+    /// boundary.
     ///
-    /// F-LOG-KERNEL-1 (#897 T10): the transport read happens in
-    /// `eliot-ipc::receive_frame`, before the decoded `Frame` ever reaches
-    /// `dispatch_frame`, so partial/zero/EOF input never reaches that seam.
-    /// The front-door driver calls this on every read error before fencing.
-    /// Only static event/outcome literals are emitted: byte counts classify
-    /// the outcome and never reach the record, and the `Io` message is never
-    /// logged (W6, I15.4).
-    pub fn observe_frame_read_input(error: &TransportError) {
+    /// F-LOG-KERNEL-1 (#897 T10/T26): shared classifier for failed frame
+    /// input, called by `dispatch_frame` on its decode-reject path so the
+    /// observation lives in the owned module. Only static event/outcome
+    /// literals are emitted: byte counts classify the outcome and never
+    /// reach the record, and the `Io` message is never logged (W6, I15.4).
+    fn observe_frame_read_input(error: &TransportError) {
         let outcome: &'static str = match error {
             TransportError::Protocol(eliot_protocol::ProtocolError::PartialFrame {
                 actual: 0,
@@ -152,21 +151,6 @@ impl KernelComposition {
             _ => "failed",
         };
         observe_frame("kernel.frame_read", outcome);
-    }
-
-    /// Observes one transport frame write outcome without payload.
-    ///
-    /// F-LOG-KERNEL-1 (#897 T15): the front-door driver owns every
-    /// `send_frame` write, so dispatch-side preparation is never delivery.
-    /// The driver calls this from `send_checked`: `Delivered` stays a
-    /// transport acknowledgement (never semantic completion, T16) and
-    /// `UnknownOutcome` remains `unknown` rather than collapsing into
-    /// success or failure.
-    pub fn observe_frame_write_outcome(delivered: bool) {
-        observe_frame(
-            "kernel.frame_write",
-            if delivered { "success" } else { "unknown" },
-        );
     }
 }
 
@@ -773,12 +757,13 @@ impl KernelComposition {
                         | TransportError::UnknownOutcome
                         | TransportError::Timeout
                 ) {
-                    // F-LOG-KERNEL-1 (#897 T10): failed frame input observed
-                    // without payload at the dispatch boundary. Static
-                    // event/outcome only; transport-level partial/zero/EOF at
+                    // F-LOG-KERNEL-1 (#897 T10/T26): failed frame input is
+                    // observed without payload at the owned dispatch boundary
+                    // through the shared classifier. Static event/outcome
+                    // only (W6, I15.4); transport-level partial/zero/EOF at
                     // `receive_frame` never reaches this seam (the driver
                     // fences first) and needs a revised explicit assignment.
-                    observe_frame("kernel.frame_input_unknown", "unknown");
+                    Self::observe_frame_read_input(error);
                 }
                 if matches!(error, TransportError::Cancelled) {
                     // F-LOG-KERNEL-1 (#897 W2): cancellation observed as the

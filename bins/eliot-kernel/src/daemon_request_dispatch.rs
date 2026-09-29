@@ -1938,7 +1938,15 @@ impl KernelComposition {
                     // the terminal below stays the single designated terminal.
                     observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
                 }
-                super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+                // F-LOG-KERNEL-1 (#897 T20): `receipt` failures already carry
+                // their single designated terminal from
+                // `store_receipt_dispatch::dispatch` (outside #897 scope), so
+                // a second terminal here would inflate one failed operation
+                // into two records. The fenced observations above stay the
+                // correlated subordinate phases.
+                if trusted_daemon_operation(operation) != "receipt" {
+                    super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+                }
                 observe_daemon_request("kernel.daemon_request_cleanup", "fenced");
             }
         }

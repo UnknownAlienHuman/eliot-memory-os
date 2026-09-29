@@ -151,15 +151,8 @@ pub async fn run_front_door_loop(kernel: Arc<KernelComposition>, binding: &Kerne
                 &peer_set,
             ) => {
                 let selection = match result {
-                    Ok(selection) => {
-                        // F-LOG-KERNEL-1 (#897 T2): the authenticated accept
-                        // act itself, distinct from bind-time accept-ready.
-                        // Observation only; no peer/session payload (I15.4).
-                        KernelComposition::observe_front_door_accepted();
-                        selection
-                    }
+                    Ok(selection) => selection,
                     Err(error) => {
-                    KernelComposition::observe_front_door_accept_fenced();
                     write_error("FRONT_DOOR_FAILURE", &error.to_string());
                     drop(front_door);
                     let (next_revision, next_peers) = match kernel.front_door_peer_set_snapshot(&principal) {
@@ -773,14 +766,7 @@ async fn receive_frame_or_shutdown(
     tokio::select! {
         result = front_door.receive_frame(limits) => match result {
             Ok(frame) => Ok(Some(frame)),
-            // F-LOG-KERNEL-1 (#897 T10): partial/zero/EOF/failed input is
-            // observed here without payload before the fence. Static
-            // outcome only; the `Io` message never reaches the record
-            // (W6, I15.4). Info only: no terminal is emitted on this path.
-            Err(error) => {
-                KernelComposition::observe_frame_read_input(&error);
-                Err(error)
-            }
+            Err(error) => Err(error),
         },
         changed = shutdown.changed() => {
             changed.map_err(|_| TransportError::Cancelled)?;
@@ -796,18 +782,7 @@ async fn send_checked(
     limits: TransportLimits,
 ) -> Result<(), TransportError> {
     match front_door.send_frame(frame, limits).await? {
-        // F-LOG-KERNEL-1 (#897 T15): the write outcome is observed here and
-        // stays what the transport witnessed. `Delivered` is a transport
-        // acknowledgement, never semantic completion (T16); `UnknownOutcome`
-        // remains `unknown` instead of collapsing into success or failure.
-        // Observation only; no frame payload (W6, I15.4).
-        DeliveryOutcome::Delivered => {
-            KernelComposition::observe_frame_write_outcome(true);
-            Ok(())
-        }
-        DeliveryOutcome::UnknownOutcome => {
-            KernelComposition::observe_frame_write_outcome(false);
-            Err(TransportError::UnknownOutcome)
-        }
+        DeliveryOutcome::Delivered => Ok(()),
+        DeliveryOutcome::UnknownOutcome => Err(TransportError::UnknownOutcome),
     }
 }

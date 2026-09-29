@@ -18,30 +18,6 @@ use eliot_ipc::NamedPipeServer;
 use eliot_platform_windows::NamedPipePeerSet;
 
 #[cfg(windows)]
-impl KernelComposition {
-    /// Observes the authenticated accept act on the production front-door loop.
-    ///
-    /// F-LOG-KERNEL-1 (#897 T2): `accept_ready` emitted at bind is readiness
-    /// for an accept, not the accept. The actual
-    /// `wait_for_authenticated_client_with_peer_set` await lives in the
-    /// front-door driver, so the driver calls this exactly once per accepted
-    /// client. Observation only; no peer/session payload (I15.4).
-    pub fn observe_front_door_accepted() {
-        observe_listener("kernel.front_door_listener_accept", "success");
-    }
-
-    /// Observes a failed authenticated accept act.
-    ///
-    /// F-LOG-KERNEL-1 (#897 T2): info-only correlate of
-    /// [`KernelComposition::observe_front_door_accepted`]; the designated
-    /// terminal path for a failed loop stays with the driver/`main` funnel,
-    /// so this never inflates one failure into two terminals (W5).
-    pub fn observe_front_door_accept_fenced() {
-        observe_listener("kernel.front_door_listener_accept", "fenced");
-    }
-}
-
-#[cfg(windows)]
 fn observe_listener(event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);

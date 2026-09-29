@@ -1011,6 +1011,23 @@ fn source_api_diff_and_family_partition_guard() {
         );
         assert!(!src.contains("dedup"), "no global dedup");
     }
+    // F-LOG-KERNEL-1 (#897 T26): the guard above only reads the six owned
+    // files, so it cannot see an edit to an unowned file. The transport-act
+    // observations live in the owned modules; the unowned front-door driver
+    // must carry no #897 observe callsite.
+    let driver_src =
+        std::fs::read_to_string(manifest_dir.join("src/front_door_driver.rs")).expect("driver");
+    for retired in [
+        "observe_front_door_accepted",
+        "observe_front_door_accept_fenced",
+        "observe_frame_read_input",
+        "observe_frame_write_outcome",
+    ] {
+        assert!(
+            !driver_src.contains(retired),
+            "no #897 observe callsite in unowned driver: {retired}"
+        );
+    }
     let (kernel, _guard) = test_kernel();
     let (logs, result) = capture_with(|| {
         kernel.bind_session("case26-conn", unavailable_peer(), &dummy_client_hello())
