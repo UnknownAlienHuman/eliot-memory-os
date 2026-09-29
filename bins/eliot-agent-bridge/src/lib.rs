@@ -18,7 +18,8 @@ use eliot_agent_bridge_core::{
     HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
     ProviderReadiness, ReconciliationConsumedFrontier, ReconciliationPortOutcome,
     ReconciliationPortResult, ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact,
-    RecoveredGapFact, RecoveredPendingView, RecoveredStreamFacts, RecoveryCandidateStreamFacts,
+    RecoveredGapFact, RecoveredPendingView, RecoveredSourceKind, RecoveredSourceProjection,
+    RecoveredSourceUnavailable, RecoveredStreamFacts, RecoveryCandidateStreamFacts,
     RecoveryDirective, RecoveryProjectionPage, RecoveryReadRequest, RecoveryResponseSelector,
     RecoveryStreamCut, RecoveryUnscopedGapCursor, RecoveryView, RecoveryWindowStatus,
     TerminalReductionInputs, TransportEdge,
@@ -1280,10 +1281,14 @@ fn decode_recovery_gap(
 /// Running decode budget: array lengths are enforced before any fact is
 /// built, so a hostile or corrupt answer cannot force unbounded
 /// materialization.
+#[derive(Default)]
 struct RecoveryDecodeBudget {
     events: usize,
     gaps: usize,
+    source_bytes: usize,
 }
+
+const MAX_RECOVERY_TOTAL_SOURCE_BYTES: usize = 128 * 1024;
 
 struct RecoveryReplyCoverage {
     unproven_scope_present: bool,
@@ -1738,8 +1743,9 @@ fn decode_stream_snapshot(
 }
 
 /// Decodes the page item array into checked event facts within the
-/// negotiated per-page and total budgets. No envelope is fabricated here:
-/// digest-only legs travel as named digests for the owner-redelivery path.
+/// negotiated per-page and total budgets. A small owner-retained source may
+/// accompany a fact only after its original hash and exact event identity
+/// have been checked; no envelope is inferred from metadata.
 fn decode_page_events(
     stream_id: &str,
     expected_producer: &str,
@@ -1799,21 +1805,139 @@ fn decode_page_events(
             ));
         }
         let staging_connection = recovery_text(item, "staging_connection")?;
-        events.push(
-            RecoveredEventFact::checked(
-                stream_id.to_owned(),
-                event_id,
-                sequence,
-                phase,
-                envelope_digest,
-                producer_id,
-                producer_generation,
-                staging_connection,
-            )
-            .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?,
-        );
+        let mut fact = RecoveredEventFact::checked(
+            stream_id.to_owned(),
+            event_id,
+            sequence,
+            phase,
+            envelope_digest,
+            producer_id,
+            producer_generation,
+            staging_connection,
+        )
+        .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?;
+        let (source, source_unavailable) = decode_recovered_source_projection(item, budget)?;
+        if let Some(source) = source {
+            fact = fact.with_source_projection(source).map_err(|_| {
+                event_shape_failure("reconciliation refused: retained source differs from event")
+            })?;
+        }
+        if source_unavailable {
+            fact = fact
+                .with_source_unavailable(RecoveredSourceUnavailable::RequiresSourceHandle)
+                .map_err(|_| {
+                    event_shape_failure("reconciliation refused: conflicting source availability")
+                })?;
+        }
+        events.push(fact);
     }
     Ok(events)
+}
+
+/// Decodes an optional small source from the persistent owner. Missing
+/// source is explicit, because large content still needs an immutable
+/// source/artifact handle and cannot be treated as a restored envelope.
+fn decode_recovered_source_projection(
+    item: &serde_json::Value,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<(Option<RecoveredSourceProjection>, bool), ProviderFailure> {
+    let projection = match item.get("source_projection") {
+        None | Some(serde_json::Value::Null) => {
+            let unavailable = match item.get("source_projection_unavailable") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::String(value)) if value == "requires_source_handle" => true,
+                _ => {
+                    return Err(event_shape_failure(
+                        "reconciliation refused: malformed source unavailability",
+                    ));
+                }
+            };
+            return Ok((None, unavailable));
+        }
+        Some(value) => value,
+    };
+    if !matches!(
+        item.get("source_projection_unavailable"),
+        None | Some(serde_json::Value::Null)
+    ) {
+        return Err(event_shape_failure(
+            "reconciliation refused: source and unavailability conflict",
+        ));
+    }
+    let kind = match projection.get("kind").and_then(serde_json::Value::as_str) {
+        Some("admitted_inline") => RecoveredSourceKind::AdmittedInline,
+        Some("redacted") => RecoveredSourceKind::Redacted,
+        _ => {
+            return Err(event_shape_failure(
+                "reconciliation refused: unknown source kind",
+            ));
+        }
+    };
+    let source_utf8 = projection
+        .get("source_utf8")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: missing retained source"))?;
+    let normalized_utf8 = projection
+        .get("normalized_utf8")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: missing normalized source"))?;
+    if source_utf8.len() > 4096
+        || normalized_utf8.len() > 4096
+        || budget
+            .source_bytes
+            .saturating_add(source_utf8.len())
+            .saturating_add(normalized_utf8.len())
+            > MAX_RECOVERY_TOTAL_SOURCE_BYTES
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: retained source exceeds the decode budget",
+        ));
+    }
+    budget.source_bytes = budget
+        .source_bytes
+        .saturating_add(source_utf8.len())
+        .saturating_add(normalized_utf8.len());
+    let transport_hash = recovery_digest(projection, "transport_hash")?;
+    let redaction_reason = match projection.get("redaction_reason") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => {
+            return Err(event_shape_failure(
+                "reconciliation refused: malformed redaction reason",
+            ));
+        }
+    };
+    let redacted_classes = projection
+        .get("redacted_classes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: missing redaction classes"))?;
+    if redacted_classes.len() > 16 {
+        return Err(event_shape_failure(
+            "reconciliation refused: redaction class count exceeds the owner cap",
+        ));
+    }
+    let redacted_classes = redacted_classes
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| value.len() <= MAX_RECOVERY_TEXT_BYTES)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    event_shape_failure("reconciliation refused: malformed redaction class")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecoveredSourceProjection::checked(
+        kind,
+        source_utf8.to_owned(),
+        normalized_utf8.to_owned(),
+        transport_hash,
+        redaction_reason,
+        redacted_classes,
+    )
+    .map(|source| (Some(source), false))
+    .map_err(|_| event_shape_failure("reconciliation refused: invalid retained source projection"))
 }
 
 /// Decodes the stream-scoped gap array within the negotiated gap budget.
@@ -2059,7 +2183,7 @@ fn decode_reconciliation_outcome(
         return Ok(legacy_denial);
     }
 
-    let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
+    let mut budget = RecoveryDecodeBudget::default();
     let stream_facts = decode_reconciliation_streams(
         reconciliation,
         identity.live_generation,
