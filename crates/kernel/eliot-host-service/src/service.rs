@@ -282,8 +282,16 @@ pub enum HostServiceError {
     /// directive names the classified origin, the precise permitted and
     /// blocked operations, the missing ownership evidence and the safe next
     /// action; the occupant itself is left untouched.
+    ///
+    /// The payload is boxed, following the `doctor.rs`
+    /// `Admitted(Box<DoctorRepairAdmission>)` precedent. Inlining a directive
+    /// this wide would make every `Result<_, HostServiceError>` in the crate
+    /// carry a multi-hundred-byte error. `Box` is invisible here: `Box<T>`
+    /// forwards `Display`, so the `#[error]` rendering above is byte-identical,
+    /// and the directive is otherwise only constructed, never destructured, by
+    /// this crate.
     #[error("foreign occupant holds the planned dependency identity: {0}")]
-    ForeignOccupant(ForeignOccupantRecoveryDirective),
+    ForeignOccupant(Box<ForeignOccupantRecoveryDirective>),
     /// The installation-wide Host owner lease could not be acquired or
     /// released by this service instance.
     #[error("Host owner lease: {0}")]
@@ -639,7 +647,7 @@ where
                     field: "dependency.foreign_occupant_directive",
                     reason: "observed occupant evidence was not complete enough to classify",
                 })?;
-                return Err(HostServiceError::ForeignOccupant(directive));
+                return Err(HostServiceError::ForeignOccupant(Box::new(directive)));
             }
             PortOutcome::Known(_) => return Err(HostServiceError::ReadinessNotProven),
             PortOutcome::Partial { .. } => return Err(HostServiceError::IncompleteObservation),
