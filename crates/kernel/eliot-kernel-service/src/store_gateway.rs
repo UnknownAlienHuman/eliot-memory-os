@@ -303,25 +303,6 @@ fn retained_terminal_evidence(
     }
 }
 
-/// Projects one already-resolved durable record into its typed answer,
-/// preserving the outcome it actually recorded.
-///
-/// The recorded outcome and its evidence digest are returned as the values the
-/// record holds, never as a synthesized success: a `RolledBack` key and a
-/// `Committed` key are different proven facts and the caller is given the one
-/// that actually happened.
-fn dreamer_dispositioned(
-    idempotency_key: &str,
-    record: &UnknownCommitRecord,
-) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
-    let (outcome, evidence_receipt_digest) = retained_terminal_evidence(idempotency_key, record)?;
-    Ok(DreamerCommitUncertain::AlreadyDispositioned {
-        idempotency_key: idempotency_key.to_owned(),
-        outcome,
-        evidence_receipt_digest,
-    })
-}
-
 /// Whether one closed Dreamer operation may write the ledger.
 ///
 /// Classification is by the operation's real owner semantics, never by its
