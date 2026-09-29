@@ -60,6 +60,7 @@ const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 mod audit_anchor_sink;
 mod backup_control;
 mod diagnostics;
+mod health_projection;
 mod heartbeat_transport;
 mod host_identity_observation;
 mod observation_coverage;
@@ -77,6 +78,11 @@ mod watchdog_publication_readback;
 mod watchdog_spool;
 
 pub use diagnostics::install_subscriber;
+
+pub use health_projection::{
+    HealthProjectionCell, HealthSignalEmission, WatchdogHealthCorpus, WatchdogHealthEvidence,
+    WatchdogHealthOwner, evaluate_interval_health,
+};
 
 pub use eliot_watchdog_core::{WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch};
 #[cfg(test)]
@@ -1403,6 +1409,36 @@ impl KernelWatchdogPort for IndependentKernelSensor {
                 })?
         })
     }
+
+    /// Measures this sensor's own retained spool for the I8.18 health
+    /// projection, bound to the identities this sensor retained at
+    /// construction.
+    ///
+    /// `now_ms` is the owner clock the caller already read for this tick, so
+    /// the freshness comparison uses one instant rather than a second clock
+    /// read. The freshness window is this crate's own declared backup/export
+    /// window — the same bound [`WatchdogBackupPort::check_capture_age`]
+    /// applies to a capture — not a threshold chosen for the projection.
+    ///
+    /// A read failure returns `None` rather than an empty corpus, so a corrupt
+    /// or unreachable spool is reported as unknown evidence and can never be
+    /// read as "nothing changed".
+    fn health_evidence(&self, now_ms: u64) -> Option<WatchdogHealthEvidence> {
+        let corpus = self
+            .spool
+            .health_corpus_summary(
+                now_ms,
+                WatchdogSpoolBackupLimits::default().page_ttl_ms,
+            )
+            .ok()?;
+        Some(WatchdogHealthEvidence {
+            owner: WatchdogHealthOwner {
+                installation_id: self.installation_id.clone(),
+                watchdog_generation: self.watchdog_generation,
+            },
+            corpus,
+        })
+    }
 }
 
 /// Closed observation-source label for an admission-reload rejection.
@@ -1521,6 +1557,19 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     /// owner reads and bounded quarantined appends, and binds every request
     /// against the owner's own retained installation identity and generation.
     fn spool_backup_port(&self) -> Option<Arc<WatchdogBackupPort>> {
+        None
+    }
+
+    /// One bounded measurement of this port's own retained observation bank and
+    /// the owner identities bound to it, for the I8.18 health projection.
+    ///
+    /// This is a read, not an authority: it measures the retained records this
+    /// owner already wrote, binds them to the identities this owner already
+    /// holds, and returns `None` for a port that owns no durable spool — which
+    /// the projection reports as unknown evidence rather than as an empty
+    /// corpus. It never reads a lease, mints an epoch, or interprets a record
+    /// beyond this owner's own classification of what it stored.
+    fn health_evidence(&self, _now_ms: u64) -> Option<WatchdogHealthEvidence> {
         None
     }
 }

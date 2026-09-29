@@ -78,6 +78,27 @@ pub enum HealthNoSignalReason {
     AcknowledgedUseObserved,
 }
 
+impl HealthNoSignalReason {
+    /// Returns the stable wire name of this reason.
+    ///
+    /// A rule that stayed silent must still say why, in a name the owner can
+    /// publish. A caller that reports a `NoSignal` without a reason would make
+    /// "no competent source reached this owner" indistinguishable from "the
+    /// source observed no delta", and those two are different claims.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DistinctObservationsNotProved => "distinct_observations_not_proved",
+            Self::TargetChanged => "target_changed",
+            Self::IncompleteEvidence => "incomplete_evidence",
+            Self::OwnerEvidenceUnknown => "owner_evidence_unknown",
+            Self::RequiredDeltaAbsent => "required_delta_absent",
+            Self::CoverageGapExplained => "coverage_gap_explained",
+            Self::AcknowledgedUseObserved => "acknowledged_use_observed",
+        }
+    }
+}
+
 /// Result of one deterministic health detector evaluation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HealthDetection<T> {
@@ -139,6 +160,22 @@ pub struct ProhibitedEffectDenial {
     pub subject: String,
     /// Why the cited output carries no authority for this class.
     pub reason: &'static str,
+}
+
+impl ProhibitedEffectClass {
+    /// Returns the stable wire name of this forbidden effect class.
+    ///
+    /// A caller publishing a denial names the class it was refused, so the name
+    /// an operator reads is the class itself rather than a restatement of the
+    /// denial text.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MemoryDelete => "memory_delete",
+            Self::PolicyAlter => "policy_alter",
+            Self::WorkTerminate => "work_terminate",
+        }
+    }
 }
 
 impl ProhibitedEffectAttempt {

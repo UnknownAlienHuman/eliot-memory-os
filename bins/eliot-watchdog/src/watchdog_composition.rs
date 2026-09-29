@@ -25,6 +25,7 @@ use crate::WatchdogRuntimeBinding;
 use crate::admission_gap_reason;
 use crate::backup_control::BackupControlRegistration;
 use crate::current_unix_ms;
+use crate::health_projection::{HealthProjectionCell, evaluate_interval_health};
 use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::kernel_gap_reason;
 use crate::observation_coverage::{
@@ -214,6 +215,16 @@ pub struct WatchdogComposition {
     /// coverage a readiness projection claims and the coverage a fence carries
     /// are one publication, not two.
     coverage: Arc<IntervalCoverageCell>,
+    /// This owner's I8.18 health-projection comparison state.
+    ///
+    /// The single reason this composition is the caller of the five I8.18
+    /// rules: it is the one owner of the bounded supervised loop, so it is the
+    /// only place where a closed coverage interval, a verified lease, and the
+    /// retained observation bank are all in hand at the same instant. Retained
+    /// here, not in the kernel port, because the projection is a property of
+    /// supervision rather than of the injected port - a second composition
+    /// gets its own cell and can never compare against the first one's state.
+    health: Arc<HealthProjectionCell>,
 }
 
 impl WatchdogComposition {
@@ -338,6 +349,11 @@ impl WatchdogComposition {
             |port| Arc::clone(port.coverage()),
         );
         let task_coverage = Arc::clone(&coverage);
+        // I8.18 (#2381): one health-projection cell per composition, so the
+        // previous interval a rule compares against is always this owner's own
+        // last interval and never another composition's.
+        let health = Arc::new(HealthProjectionCell::default());
+        let task_health = Arc::clone(&health);
         let interval = config.tick_interval;
         let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
             SERVICE_NAME,
@@ -351,11 +367,33 @@ impl WatchdogComposition {
                 let coverage = task_coverage.clone();
                 let intent_reconciliation_slot =
                     Arc::clone(&task_intent_reconciliation_slot);
+                let health = task_health.clone();
                 async move {
                     loop {
                         tokio::select! {
                             () = token.cancelled() => return Ok(()),
                             () = tokio::time::sleep(interval) => {}
+                        }
+                        // I8.18 (#2381): the five health rules run on the
+                        // interval the PREVIOUS tick closed, read before this
+                        // tick opens its own window — `begin_interval` clears
+                        // the published report, and an interval in progress
+                        // establishes no coverage at all. Reading it here is
+                        // therefore the only point at which a closed manifest
+                        // exists, and it is read against the retained
+                        // observation bank through the same owner handle every
+                        // heartbeat appends through. A port that owns no spool,
+                        // a sensor that has never held a lease, and the first
+                        // interval after start are each reported as unknown
+                        // evidence and open nothing; a rule that observes no
+                        // delta is traced with its own named reason.
+                        let now_ms = current_unix_ms().unwrap_or(0);
+                        if let Some(closed) = coverage.latest() {
+                            evaluate_interval_health(
+                                health.as_ref(),
+                                &closed,
+                                kernel.health_evidence(now_ms).as_ref(),
+                            );
                         }
                         // I8.2 (#1755 W5): one published coverage interval is
                         // exactly one tick. Opening it here also reports a
@@ -479,6 +517,21 @@ impl WatchdogComposition {
                                     admission.lease().lease().kernel_epoch.sequence.get();
                                 let watchdog_epoch = admission.watchdog_epoch().value();
                                 authority_state.publish_admitted(kernel_epoch, watchdog_epoch);
+                                // I8.18 (#2381): the health projection's signal
+                                // target and expected revisions come from the
+                                // same verified lease this tick supervises
+                                // through, on the admitted path only. A
+                                // degraded tick never admits a lease, so it
+                                // leaves the last admitted revisions in place
+                                // rather than substituting a placeholder scope.
+                                if let Some(installation_id) = kernel.installation_identity() {
+                                    health.observe_admitted(
+                                        installation_id,
+                                        admission.lease().lease().scope_ref.as_str(),
+                                        kernel_epoch,
+                                        watchdog_epoch,
+                                    );
+                                }
                                 emit_admitted_heartbeat_best_effort(
                                     heartbeat.as_ref(),
                                     kernel_epoch,
@@ -579,6 +632,7 @@ impl WatchdogComposition {
             heartbeat,
             backup_control_registration: BackupControlRegistration::open(),
             coverage,
+            health,
         })
     }
 
