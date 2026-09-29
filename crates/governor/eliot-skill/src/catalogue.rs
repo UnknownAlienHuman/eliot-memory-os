@@ -31,7 +31,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 
-use super::{DependencyVersion, SkillError, SkillScope, SkillStatus};
+use super::{
+    DependencyVersion, PromotionGate, SkillCandidate, SkillError, SkillScope, SkillStatus,
+    detect_dependency_staleness,
+};
 
 /// Maximum visible characters for one index trigger line (`I7.12`).
 pub const MAX_TRIGGER_CHARS: usize = 140;
@@ -741,6 +744,46 @@ pub struct SkillCatalogue {
     entries: BTreeMap<String, SkillCatalogueEntry>,
 }
 
+/// Live Skill world one catalogue staleness sweep compares standing entries
+/// against (`I7.13`).
+///
+/// Every leg compares stored pins with the exact content the caller observed
+/// for this operation — the live dependency registry set, the live
+/// host/profile versions, the live admitted Tool Definition version, and the
+/// tool owner's view — never a recomputed substitute. Entries pin exactly the
+/// observed dependency set, so added, removed, and changed names all count as
+/// drift.
+pub struct LiveSkillWorld<'a> {
+    /// Currently registered dependency versions (the full live set).
+    pub current_dependencies: &'a [DependencyVersion],
+    /// Live host version the install pins are compared against.
+    pub live_host_version: &'a str,
+    /// Live profile version the install pins are compared against.
+    pub live_profile_version: &'a str,
+    /// Live admitted Tool Definition version (contract leg).
+    pub live_definition_version: &'a str,
+    /// Tool owner's view the declared tool basis is rechecked against.
+    pub tools: &'a dyn KnownTools,
+}
+
+impl LiveSkillWorld<'_> {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        for dependency in self.current_dependencies {
+            dependency.validate()?;
+        }
+        let names: Vec<String> = self
+            .current_dependencies
+            .iter()
+            .map(|dependency| dependency.name.clone())
+            .collect();
+        check_unique(&names, "world.dependencies")?;
+        check_text(self.live_host_version, "world.host_version")?;
+        check_text(self.live_profile_version, "world.profile_version")?;
+        check_text(self.live_definition_version, "world.definition_version")?;
+        Ok(())
+    }
+}
+
 impl SkillCatalogue {
     pub fn from_snapshot(
         entries: impl IntoIterator<Item = SkillCatalogueEntry>,
@@ -795,16 +838,29 @@ impl SkillCatalogue {
         self.entries.keys().cloned().collect()
     }
 
+    /// Binds the exact catalogue state Hotset receipts commit to: every
+    /// entry identity, body digest, and lifecycle status. A drift mark
+    /// changes the status, so the digest rotates with it and Hotset receipts
+    /// issued before the sweep fail closed at `activation_display` instead
+    /// of displaying a drifted body (`I7.13`, issue #1882 A4).
     pub fn catalogue_digest(&self) -> Result<String, SkillError> {
-        let pairs: Vec<(&String, &String)> = {
-            let mut pairs = Vec::with_capacity(self.entries.len());
+        let rows: Vec<(&String, &String, &'static str)> = {
+            let mut rows = Vec::with_capacity(self.entries.len());
             for (skill_id, entry) in &self.entries {
                 entry.validate()?;
-                pairs.push((skill_id, &entry.body.body_digest));
+                let status = match entry.status {
+                    SkillStatus::Current => "current",
+                    SkillStatus::Provisional => "provisional",
+                    SkillStatus::Stale => "stale",
+                    SkillStatus::Suppressed => "suppressed",
+                    SkillStatus::Archived => "archived",
+                    SkillStatus::Quarantined => "quarantined",
+                };
+                rows.push((skill_id, &entry.body.body_digest, status));
             }
-            pairs
+            rows
         };
-        canonical_digest(&pairs, "catalogue.digest")
+        canonical_digest(&rows, "catalogue.digest")
     }
 
     /// Records an observed dependency set. A change marks the entry stale
@@ -962,6 +1018,90 @@ impl SkillCatalogue {
         Ok(true)
     }
 
+    /// Reconciles every usable standing entry against the observed live
+    /// world (`I7.13`, issue #1882 W2/A2/A4).
+    ///
+    /// A changed host/tool/contract dependency marks the Skill stale even
+    /// when no reinstall arrives and no activation is attempted: install-time
+    /// pre-insert marks cover the reinstalled Skill, while this sweep covers
+    /// every other standing entry before the bridge activation path serves
+    /// it. Only `Current`/`Provisional` entries are visited — the usable set
+    /// whose hidden drift could otherwise reach Material use. `Stale` already
+    /// blocks use, `Quarantined` is governed state, and `Suppressed`/`Archived`
+    /// already block use under a lifecycle disposition this sweep must not
+    /// clobber. Legs run dependency, host, definition (contract), tool — the
+    /// first drift found marks the entry through the existing mark path and
+    /// later legs see the `Stale` status and report no change, so one reason
+    /// names the sweep outcome per entry. Completeness is checked against the
+    /// independent expected set (`skill_ids`): every usable standing entry is
+    /// visited. A mark changes the entry, so the catalogue digest changes
+    /// with it and Hotset receipts issued before the sweep fail closed at
+    /// activation instead of displaying a drifted body. Returns the skill ids
+    /// that became stale, in catalogue order.
+    pub fn reconcile_staleness(
+        &mut self,
+        world: &LiveSkillWorld<'_>,
+    ) -> Result<Vec<String>, SkillError> {
+        world.validate()?;
+        let mut became_stale = Vec::new();
+        for skill_id in self.skill_ids() {
+            let standing = self.entries.get(&skill_id).ok_or(SkillError::NotFound)?;
+            if !matches!(
+                standing.status,
+                SkillStatus::Current | SkillStatus::Provisional
+            ) {
+                continue;
+            }
+            let pinned = standing.dependencies.clone();
+            let host_version = standing.host_version.clone();
+            let profile_version = standing.profile_version.clone();
+            let admitted_definition_version = standing.admitted_definition_version.clone();
+            let tool_refs = standing.body.tool_refs.clone();
+            if let Some(reason) = detect_dependency_staleness(&pinned, world.current_dependencies) {
+                if self.note_dependency_change(
+                    &skill_id,
+                    world.current_dependencies.to_vec(),
+                    reason,
+                )? {
+                    became_stale.push(skill_id.clone());
+                }
+                continue;
+            }
+            let host_drifted = host_version != world.live_host_version
+                || profile_version != world.live_profile_version;
+            if host_drifted
+                && self.mark_host_drift_stale(
+                    &skill_id,
+                    world.live_host_version,
+                    world.live_profile_version,
+                )?
+            {
+                became_stale.push(skill_id.clone());
+                continue;
+            }
+            let definition_drifted = admitted_definition_version != world.live_definition_version;
+            if definition_drifted
+                && self.mark_definition_drift_stale(
+                    &skill_id,
+                    world.live_definition_version,
+                    &admitted_definition_version,
+                )?
+            {
+                became_stale.push(skill_id.clone());
+                continue;
+            }
+            let missing_tools: Vec<String> = tool_refs
+                .iter()
+                .filter(|tool| !world.tools.knows_tool(tool))
+                .cloned()
+                .collect();
+            if !missing_tools.is_empty() && self.mark_tool_basis_stale(&skill_id, &missing_tools)? {
+                became_stale.push(skill_id);
+            }
+        }
+        Ok(became_stale)
+    }
+
     /// Returns a stale entry to explicitly scoped/provisional use after
     /// governed review (`I7.13`).
     ///
@@ -1070,6 +1210,32 @@ impl SkillCatalogue {
         }
     }
 
+    /// Promotes a provisional entry through the validated promotion gate
+    /// (`I7.13`, issue #1882 W2): the bridge activation path reaches Material
+    /// use only past `eliot-skill` validation, so catalogue promotion binds
+    /// the same [`PromotionGate`] the lifecycle owner enforces. The candidate
+    /// and gate are validated together ([`PromotionGate::validate_for`]:
+    /// candidate shape, gate↔candidate digest binding, fence, reversibility,
+    /// and route-proportional depth), the candidate must name this exact
+    /// entry, and the bound evidence then promotes through
+    /// [`promote`](Self::promote). A promotion that never passed the gate
+    /// cannot mint `Current`: without this binding the entry stays
+    /// provisional and its delivery carries the provisional ceiling.
+    pub fn promote_gated(
+        &mut self,
+        skill_id: &str,
+        candidate: &SkillCandidate,
+        gate: &PromotionGate,
+        evidence: &PromotionEvidence,
+    ) -> Result<(), SkillError> {
+        candidate.validate()?;
+        gate.validate_for(candidate)?;
+        if candidate.base_skill_ref.skill_id() != skill_id {
+            return Err(SkillError::IdentityMismatch);
+        }
+        self.promote(skill_id, evidence)
+    }
+
     /// Fail-closed use gate: unknown, invalid, or non-current/provisional
     /// entries are blocked. A stale entry stays blocked until its dependency
     /// drift is reviewed and re-admitted as a new validated revision.
@@ -1102,6 +1268,20 @@ impl SkillCatalogue {
             return Err(SkillError::InvalidField {
                 field: "entry.status",
                 reason: "stale or retired Skills are blocked from use",
+            });
+        }
+        // Promotion-gate binding on the bridge activation entry (issue #1882
+        // W2/A4): `Current` is earned only through the evidence path
+        // (`promote`/`promote_gated` persist the bound promotion record while
+        // install and stale revalidation land on `Provisional`). A `Current`
+        // entry carrying no promotion evidence never passed promotion
+        // validation, so it is unvalidated and cannot reach Material use;
+        // bounded use stays `Provisional` with its provisional delivery
+        // ceiling.
+        if entry.status == SkillStatus::Current && entry.promotion_evidence.is_none() {
+            return Err(SkillError::InvalidField {
+                field: "entry.promotion_evidence",
+                reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
             });
         }
         receipt.validate()?;
@@ -1182,30 +1362,43 @@ impl SkillCatalogue {
 
     /// Bridge activation entry binding validation to the live staleness gate.
     ///
-    /// Same delivery contract as `activation_display`, with the pinned
-    /// dependency set compared against the currently registered versions
-    /// first through the activation Material-use gate: a Skill whose
-    /// declared host/tool/contract dependencies changed since install is
-    /// refused here even when the stored status still reads `Current`, so an
-    /// unvalidated or stale Skill cannot reach Material use through a
-    /// stored-status lag. A passing display keeps the full receipt chain
+    /// Same delivery contract as `activation_display`, with the standing
+    /// catalogue swept against the observed live world first: the pre-serve
+    /// sweep runs [`reconcile_staleness`](Self::reconcile_staleness) over the
+    /// caller-observed live dependency set, live host/profile versions, live
+    /// admitted Tool Definition version, and tool-owner view, so a Skill
+    /// whose declared host/tool/contract dependencies changed since install
+    /// is marked stale here even when no reinstall arrives — before any
+    /// display is served. Only `Current`/`Provisional` entries are visited;
+    /// marking reuses the existing mark paths with first-drift-wins, and a
+    /// mark rotates the catalogue digest so Hotset receipts issued before the
+    /// sweep fail closed at `activation_display` instead of displaying a
+    /// drifted body. The pinned dependency set is then compared against the
+    /// currently registered versions through the activation Material-use
+    /// gate, so an unvalidated or stale Skill cannot reach Material use
+    /// through a stored-status lag; stale entries stay refused through the
+    /// existing `is_usable`/display refusal, and bounded use returns only as
+    /// provisional. A passing display keeps the full receipt chain
     /// (validation + catalogue-staleness + delivery-ack records).
     pub fn activation_display_against(
-        &self,
+        &mut self,
         skill_id: &str,
         receipt: &HotsetDeliveryReceipt,
         ack: &HotsetDeliveryAck,
-        tools: &dyn KnownTools,
-        current_dependencies: &[DependencyVersion],
+        world: &LiveSkillWorld<'_>,
     ) -> Result<ActivatedSkillDisplay, SkillError> {
+        // Pre-serve sweep: persist drift marks before serving. The outcome
+        // list is intentionally not served — refusals flow through the
+        // existing gate and display paths below with their typed reasons.
+        self.reconcile_staleness(world)?;
         let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
         entry.validate()?;
         super::activation::gate_material_use(
             entry.status,
             &entry.dependencies,
-            current_dependencies,
+            world.current_dependencies,
         )?;
-        self.activation_display(skill_id, receipt, ack, tools)
+        self.activation_display(skill_id, receipt, ack, world.tools)
     }
 }
 
