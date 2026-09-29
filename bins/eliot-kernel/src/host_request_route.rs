@@ -5387,7 +5387,7 @@ impl KernelComposition {
     /// Builds a typed request for the Governor disclosure owner from the exact
     /// source bytes and current activation binding (issue #1934, I7.23).
     ///
-    /// The request binds source hash, ORS namespace, WorkScope, task revision,
+    /// The request binds source hash, ORS namespace, `WorkScope`, task revision,
     /// fence, principal/session, and the ticket/request/result that established
     /// the application identity. It does not yet carry owner-resolved source
     /// domains, recovery-recipient capabilities, or provider-retention terms.
@@ -5438,7 +5438,6 @@ impl KernelComposition {
         request
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        let _owner_request = request;
         Ok(None)
     }
 
