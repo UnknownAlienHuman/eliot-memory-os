@@ -367,6 +367,9 @@ pub struct GovernedAdmission {
 impl GovernedAdmission {
     /// Rejects an admission record that is itself unbounded or malformed,
     /// before any component is acquired, compiled, or instantiated.
+    /// Locator-shaped identities (the `://` authority marker the artifact
+    /// path layer also rejects) are malformed here: an admitted identity is
+    /// a plain bounded local name, never a remote/registry/discovery source.
     pub fn validate(&self) -> Result<(), TypedExecutionError> {
         for value in [
             self.operation_id.as_str(),
@@ -377,6 +380,7 @@ impl GovernedAdmission {
         ] {
             if value.is_empty()
                 || value.len() > MAX_DESCRIPTOR_STRING_BYTES
+                || value.contains("://")
                 || value.chars().any(char::is_control)
             {
                 return Err(TypedExecutionError::LimitDenied(
@@ -400,7 +404,8 @@ impl GovernedAdmission {
 /// Denial order: absent admission yields `KERNEL_ADMISSION_REQUIRED`; a
 /// caller-supplied artifact path on the governed lane is denied the same
 /// way (no arbitrary path/URL acquisition, no fallback to the experimental
-/// mode); a malformed record yields the owned `LIMIT_DENIED` denial; a
+/// mode); a malformed record yields the owned `LIMIT_DENIED` denial (empty,
+/// over-long, control-character, or locator-shaped `://` identity); a
 /// world disagreement or a missing/mismatched artifact-digest binding yields
 /// the owned `ADMISSION_MISMATCH` denial. A well-formed record is still
 /// denied with `KERNEL_ADMISSION_REQUIRED`: this host binds no live Kernel
@@ -603,7 +608,9 @@ fn validate_descriptor_abi_digest(descriptor: &TypedDescriptor) -> Result<(), Ty
 /// before the host lowers it into guest memory and a result is bounded while
 /// its leaves are read. Nested records are bounded transitively by the store
 /// memory ceiling, which is the total host-allocation policy the pinned typed
-/// API offers for a not-yet-lifted result.
+/// API offers for a not-yet-lifted result. Accumulation itself is saturating:
+/// a hostile sequence of individually bounded leaves saturates into the typed
+/// `finish` denial instead of overflowing the counter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TypedBound {
     bytes: u64,
@@ -615,8 +622,10 @@ impl TypedBound {
         if value.len() > MAX_TYPED_STRING_BYTES {
             return Err(TypedExecutionError::LimitDenied("typed-string".to_owned()));
         }
-        self.bytes += u64::try_from(value.len()).unwrap_or(u64::MAX);
-        self.items += 1;
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+        self.items = self.items.saturating_add(1);
         Ok(())
     }
 
