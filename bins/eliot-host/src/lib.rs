@@ -7593,9 +7593,9 @@ impl HostComposition {
         // record-bound config approvals the shared restart gate joins them
         // with, so the gate never mixes records from two different reads.
         let journal_state = self.journal.snapshot()?;
-        let current_kernel = journal_state.kernel.ok_or_else(|| {
-            HostError::ProcessContour("no active Kernel to restart".to_owned())
-        })?;
+        let current_kernel = journal_state
+            .kernel
+            .ok_or_else(|| HostError::ProcessContour("no active Kernel to restart".to_owned()))?;
         let readiness_observations = journal_state.readiness_observations;
         if current_kernel.state != KernelActivationState::Active {
             return Err(HostError::ProcessContour(

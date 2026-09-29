@@ -233,7 +233,8 @@ fn journal_record_binds_approved_config(
     readiness_observations: &[KernelReadinessObservationRecord],
     approved_config: &PlatformHandle,
 ) -> bool {
-    let Ok(authorizing_checksum) = record_checksum(&HostStateRecord::Kernel(current.clone())) else {
+    let Ok(authorizing_checksum) = record_checksum(&HostStateRecord::Kernel(current.clone()))
+    else {
         return false;
     };
     readiness_observations.iter().any(|observation| {
