@@ -1323,10 +1323,7 @@ fn register_user_mode_profile_task_windows(
 fn register_user_mode_profile_task_in_apartment(
     spec: &UserModeProfileTaskSpec,
 ) -> Result<UserModeProfileTaskReceipt, UserModeProfileTaskRegistrationError> {
-    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-    use windows::Win32::System::TaskScheduler::{
-        CLSID_CTaskScheduler, ITaskService, TASK_CREATE, TASK_LOGON_INTERACTIVE_TOKEN,
-    };
+    use windows::Win32::System::TaskScheduler::{TASK_CREATE, TASK_LOGON_INTERACTIVE_TOKEN};
     use windows::Win32::System::Variant::VARIANT;
     use windows::core::BSTR;
 
@@ -1344,43 +1341,8 @@ fn register_user_mode_profile_task_in_apartment(
             WindowsAdapterError::IdentityMismatch,
         ));
     }
-    let service: ITaskService =
-        unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
-            .map_err(|_| WindowsAdapterError::Unavailable)?;
     let empty = VARIANT::default();
-    unsafe {
-        service
-            .Connect(&empty, &empty, &empty, &empty)
-            .map_err(|_| WindowsAdapterError::Unavailable)?;
-    }
-    let root = unsafe {
-        service
-            .GetFolder(&BSTR::from("\\"))
-            .map_err(|_| WindowsAdapterError::Unavailable)?
-    };
-    let folder = get_or_create_user_mode_task_folder(&root, &empty)?;
-    let leaf = spec
-        .task_name
-        .rsplit('\\')
-        .next()
-        .ok_or(WindowsAdapterError::InvalidInput)?;
-    match unsafe { folder.GetTask(&BSTR::from(leaf)) } {
-        Ok(_) => {
-            // Task paths are predictable. A matching name or public XML
-            // text is not an ownership receipt, so never adopt or update
-            // an existing object here. A separately retained prior
-            // receipt must drive any later exact replacement or cleanup.
-            return Err(UserModeProfileTaskRegistrationError::Rejected(
-                WindowsAdapterError::IdentityMismatch,
-            ));
-        }
-        Err(error) if task_scheduler_object_missing(&error) => {}
-        Err(_) => {
-            return Err(UserModeProfileTaskRegistrationError::Rejected(
-                WindowsAdapterError::Unavailable,
-            ));
-        }
-    }
+    let (folder, leaf) = open_absent_user_mode_task_folder(spec, &empty)?;
     let xml = user_mode_profile_task_xml(spec);
     let requested_xml_sha256 = crate::sha256_hex(xml.as_bytes());
     let registered = unsafe {
@@ -1411,18 +1373,16 @@ fn register_user_mode_profile_task_in_apartment(
             .err();
             return match cleanup_error {
                 None => Err(UserModeProfileTaskRegistrationError::Rejected(cause)),
-                Some(cleanup_error) => {
-                    Err(UserModeProfileTaskRegistrationError::CleanupRequired(
-                        UserModeProfileTaskCleanupRequired {
-                            task_name: spec.task_name.clone(),
-                            requested_xml_sha256,
-                            observed_xml_sha256,
-                            spec: spec.clone(),
-                            cause,
-                            cleanup_error,
-                        },
-                    ))
-                }
+                Some(cleanup_error) => Err(UserModeProfileTaskRegistrationError::CleanupRequired(
+                    UserModeProfileTaskCleanupRequired {
+                        task_name: spec.task_name.clone(),
+                        requested_xml_sha256,
+                        observed_xml_sha256,
+                        spec: spec.clone(),
+                        cause,
+                        cleanup_error,
+                    },
+                )),
             };
         }
     };
@@ -1444,6 +1404,55 @@ fn register_user_mode_profile_task_in_apartment(
         session_id: spec.expected_session_id,
         task_xml_sha256: crate::sha256_hex(actual_xml.as_bytes()),
     })
+}
+
+/// Connects to the Task Scheduler, opens the `UserMode` task folder, and proves
+/// the exact requested leaf is absent. Registration is create-only: an existing
+/// object is never adopted or updated here.
+#[cfg(windows)]
+fn open_absent_user_mode_task_folder(
+    spec: &UserModeProfileTaskSpec,
+    empty: &windows::Win32::System::Variant::VARIANT,
+) -> Result<
+    (
+        windows::Win32::System::TaskScheduler::ITaskFolder,
+        &str,
+    ),
+    WindowsAdapterError,
+> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::System::TaskScheduler::{CLSID_CTaskScheduler, ITaskService};
+    use windows::core::BSTR;
+
+    let service: ITaskService =
+        unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+    unsafe {
+        service
+            .Connect(empty, empty, empty, empty)
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+    }
+    let root = unsafe {
+        service
+            .GetFolder(&BSTR::from("\\"))
+            .map_err(|_| WindowsAdapterError::Unavailable)?
+    };
+    let folder = get_or_create_user_mode_task_folder(&root, empty)?;
+    let leaf = spec
+        .task_name
+        .rsplit('\\')
+        .next()
+        .ok_or(WindowsAdapterError::InvalidInput)?;
+    match unsafe { folder.GetTask(&BSTR::from(leaf)) } {
+        // Task paths are predictable. A matching name or public XML
+        // text is not an ownership receipt, so never adopt or update
+        // an existing object here. A separately retained prior
+        // receipt must drive any later exact replacement or cleanup.
+        Ok(_) => return Err(WindowsAdapterError::IdentityMismatch),
+        Err(error) if task_scheduler_object_missing(&error) => {}
+        Err(_) => return Err(WindowsAdapterError::Unavailable),
+    }
+    Ok((folder, leaf))
 }
 
 #[cfg(windows)]
@@ -1932,10 +1941,7 @@ fn open_user_mode_task_folder_and_leaf(
 
 #[cfg(windows)]
 fn task_scheduler_object_missing(error: &windows::core::Error) -> bool {
-    matches!(
-        error.code().0.cast_unsigned(),
-        0x8007_0002 | 0x8007_0003
-    )
+    matches!(error.code().0.cast_unsigned(), 0x8007_0002 | 0x8007_0003)
 }
 
 fn xml_escape(value: &str) -> String {
