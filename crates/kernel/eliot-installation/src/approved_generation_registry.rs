@@ -4008,58 +4008,6 @@ impl ApprovedGenerationRegistry {
             })
     }
 
-    /// Returns the exact Host-owned live Phase-B descriptor for a matching
-    /// pending generation, but only after the prepared record, its durable
-    /// receipt, and the final materialization receipt all agree. An absent
-    /// pending generation returns `None`; a matching but incomplete
-    /// generation is a typed recovery condition.
-    pub fn phase_b_live_launch_for_generation(
-        &self,
-        generation: &PlatformHandle,
-    ) -> Result<Option<&RuntimeLaunchDescriptor>, InstallationError> {
-        self.validate()?;
-        let Some(pending) = self
-            .pending_activation
-            .as_ref()
-            .filter(|pending| pending.manifest.generation == *generation)
-        else {
-            return Ok(None);
-        };
-        let (Some(intent), Some(prepared), Some(prepared_receipt), Some(receipt)) = (
-            pending.phase_b_intent.as_ref(),
-            pending.phase_b_prepared.as_ref(),
-            pending.phase_b_prepared_receipt.as_ref(),
-            pending.phase_b_receipt.as_ref(),
-        ) else {
-            return Err(InstallationError::IncompleteObservation(
-                "pending generation has no complete live Phase-B launch receipt chain".to_owned(),
-            ));
-        };
-        prepared.launch.require_phase_b_live()?;
-        if prepared.transaction_id != pending.transaction_id
-            || prepared.manifest_digest != pending.manifest_digest
-            || prepared.launch.generation != *generation
-            || prepared.launch.installation_id != pending.manifest.installation_id
-            || prepared.effect_id != intent.effect_id
-            || prepared.request_digest != intent.request_digest
-            || prepared.credential_effect_id != intent.credential_effect_id
-            || prepared_receipt.transaction_id != prepared.transaction_id
-            || prepared_receipt.candidate_manifest_digest != prepared.manifest_digest
-            || prepared_receipt.effect_id != prepared.effect_id
-            || prepared_receipt.request_digest != prepared.request_digest
-            || receipt.transaction_id != pending.transaction_id
-            || receipt.candidate_manifest_digest != pending.manifest_digest
-            || receipt.effect_id != intent.effect_id
-            || receipt.request_digest != intent.request_digest
-            || receipt.authority_descriptor_digest != prepared.authority_descriptor_digest
-            || receipt.authority_descriptor_digest
-                != prepared.launch.authority_descriptor_digest
-        {
-            return Err(InstallationError::IdentityConflict);
-        }
-        Ok(Some(&prepared.launch))
-    }
-
     /// Returns the active generation identity, if committed by Host.
     #[must_use]
     pub const fn active_generation(&self) -> Option<&PlatformHandle> {
@@ -5008,16 +4956,6 @@ impl PendingActivation {
             return Err(InstallationError::IdentityConflict);
         }
         if let Some(intent) = &self.phase_b_intent {
-            if !matches!(
-                self.manifest.runtime_launch.profile,
-                InstallationProfile::SystemService
-                    | InstallationProfile::UserMode
-                    | InstallationProfile::PortableDev
-            ) {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B intent requires a supported installation profile".to_owned(),
-                ));
-            }
             intent.validate()?;
             if intent.transaction_id != self.transaction_id
                 || intent.installation_plan_digest != self.plan_digest
@@ -5036,16 +4974,6 @@ impl PendingActivation {
             stage.validate_against_phase_b(intent, self)?;
         }
         if let Some(prepared) = &self.phase_b_prepared {
-            if !matches!(
-                self.manifest.runtime_launch.profile,
-                InstallationProfile::SystemService
-                    | InstallationProfile::UserMode
-                    | InstallationProfile::PortableDev
-            ) {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B preparation requires a supported installation profile".to_owned(),
-                ));
-            }
             prepared.validate()?;
             if prepared.transaction_id != self.transaction_id
                 || prepared.manifest_digest != self.manifest_digest
@@ -5103,16 +5031,6 @@ impl PendingActivation {
             }
         }
         if let Some(receipt) = &self.phase_b_receipt {
-            if !matches!(
-                self.manifest.runtime_launch.profile,
-                InstallationProfile::SystemService
-                    | InstallationProfile::UserMode
-                    | InstallationProfile::PortableDev
-            ) {
-                return Err(InstallationError::ProfileViolation(
-                    "Phase-B receipt requires a supported installation profile".to_owned(),
-                ));
-            }
             receipt.validate()?;
             if receipt.transaction_id != self.transaction_id
                 || receipt.candidate_manifest_digest != self.manifest_digest
