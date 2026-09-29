@@ -55,12 +55,12 @@ impl KernelHandoffReceipt {
                 ),
                 prior: prior.clone(),
             })),
-            PriorKernelDisposition::Running(_) | PriorKernelDisposition::Unknown(_) => Err(
-                HostError::RecoveryRequired(
+            PriorKernelDisposition::Running(_) | PriorKernelDisposition::Unknown(_) => {
+                Err(HostError::RecoveryRequired(
                     "Kernel handoff receipt requires an exactly terminated prior contour"
                         .to_owned(),
-                ),
-            ),
+                ))
+            }
         }
     }
 
