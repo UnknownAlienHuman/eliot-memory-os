@@ -451,21 +451,51 @@ Add-Record 'provenance_binding' 'FALLBACK_REQUIRED' @{
 }
 
 # ---------------------------------------------------------------------------
-# 7. Job Object descendant removal + filesystem/network sandboxing.
-#    Deliberately NOT proven locally (I18.44: a Job Object-only check cannot
-#    claim filesystem/network sandboxing). Minimal cancellation smoke only.
+# 7. Job Object descendant removal.
+#    The release build plane now launches every cargo child through a Job
+#    Object (scripts/build-eliot-windows-x64-release.ps1
+#    ::Invoke-JobContainedNativeProcess, created suspended -> assigned ->
+#    resumed). The previous evidence here was a single Stop-Process against one
+#    sleeping child, which the suite itself labelled "NOT a descendant-tree
+#    proof". This section measures a real descendant TREE through the release
+#    owner's own measurement function: a child that forks a sleeping grandchild
+#    and then exits. A direct-child kill cannot remove that grandchild.
+#
+#    Still NOT proven here, by construction (I18.44): a Job Object binds process
+#    lifetime and is NOT a filesystem or network sandbox. That boundary stays
+#    with the recorded VM/lab runner below.
 # ---------------------------------------------------------------------------
-$smoke = Start-Process -FilePath 'powershell' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru
-Start-Sleep -Milliseconds 500
-try { Stop-Process -Id $smoke.Id -Force -ErrorAction Stop } catch { }
-$smoke.WaitForExit(10000) | Out-Null
-$gone = $smoke.HasExited
-Test-NotReparse $repo
-Test-NotReparse $isolatedTarget
-Add-Record 'descendant_removal_and_sandbox' 'FALLBACK_REQUIRED' @{
-    reason                  = 'No local Job Object descendant tree verification and no filesystem/network sandbox boundary proof exist in this worktree; per I18.44 a Job Object-only check must not claim sandboxing.'
-    cancellation_smoke      = "single child kill observed exited=$gone; ACL probes re-verified intact (smoke only, NOT a descendant-tree proof)"
-    fallback                = 'VM/lab isolated runner owns descendant containment and filesystem/network sandboxing; release workflow must select and record it'
+$descendantProbe = Measure-ReleaseLaunchDescendantRemoval `
+    (Get-Command powershell -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source `
+    'Start-Process powershell -ArgumentList ''-NoProfile -Command Start-Sleep -Seconds 300'' -WindowStyle Hidden; Start-Sleep -Seconds 2; exit 0' `
+    20
+if ($descendantProbe.observed_descendant_count -lt 1) {
+    throw 'BUILD_SANDBOX_PROOF: the descendant probe observed no descendant process'
+}
+if ($descendantProbe.survivors_after_cancel -ne 0) {
+    throw "BUILD_SANDBOX_PROOF: $($descendantProbe.survivors_after_cancel) descendants survived Job Object cancellation"
+}
+# The ACL boundaries must still be intact after the cancellation.
+foreach ($probe in @($repo, $isolatedTarget, $tempBase)) {
+    Test-NotReparse $probe
+    $postCancelAcl = Get-AclBoundary $probe
+    $preCancelAcl = @($aclBoundaries | Where-Object { [string]$_.path -ceq $probe })[0]
+    if ($null -eq $preCancelAcl) { throw "BUILD_SANDBOX_PROOF: no pre-cancellation ACL snapshot for $probe" }
+    if ([string]$postCancelAcl.sddl_sha256 -cne [string]$preCancelAcl.sddl_sha256) {
+        throw "BUILD_SANDBOX_PROOF: the ACL boundary changed across Job Object cancellation: $probe"
+    }
+}
+Add-Record 'descendant_removal' 'PROVEN' @{
+    owner                     = [string]$descendantProbe.owner
+    release_launch_owner      = 'scripts/build-eliot-windows-x64-release.ps1 Invoke-JobContainedNativeProcess (every release cargo build child)'
+    job_name                  = [string]$descendantProbe.job_name
+    direct_child_exit_code    = $descendantProbe.direct_child_exit_code
+    observed_descendants      = $descendantProbe.observed_descendant_count
+    survivors_after_cancel    = $descendantProbe.survivors_after_cancel
+    acl_reverified_intact     = $true
+    claim_ceiling             = [string]$descendantProbe.claim_ceiling
+    reason                    = "Cancelling the build closes one owning Job handle with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, and the grandchild this probe forked is gone afterwards; a direct-child kill would have left it running. A Job Object is NOT a filesystem or network sandbox, so the claim is scoped to descendant process lifetime."
+    fallback                  = 'the VM/lab isolated runner still owns the filesystem and network sandbox boundary; a Job Object check never substitutes for it'
 }
 
 $failed = @($records | Where-Object { $_.status -notin @('PROVEN', 'FALLBACK_REQUIRED') })

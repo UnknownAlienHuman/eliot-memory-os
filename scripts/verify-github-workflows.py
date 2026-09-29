@@ -960,6 +960,99 @@ def check_workflows(root: Path) -> list[Finding]:
     return findings
 
 
+# Issue #1923 (I18.44): the dimensions a restored cargo cache is trusted across.
+# A `~/.cargo/registry` / `~/.cargo/git` restore is reused acquisition state, so
+# the key has to separate a cache entry by every dimension that changes whether
+# reusing it is safe: the toolchain that will consume it, the source manifests
+# that produced it, and the trust class the run runs under. Each entry is a
+# (dimension label, regex that must match the key value) pair, and every one is
+# required: a key that drops one lets a cache entry cross that boundary.
+CACHE_KEY_REQUIRED_BINDINGS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("runner platform", re.compile(r"runner\.os")),
+    ("runner architecture", re.compile(r"runner\.arch")),
+    ("dependency lock", re.compile(r"hashFiles\(\s*'Cargo\.lock'\s*\)")),
+    ("toolchain", re.compile(r"hashFiles\([^)]*'rust-toolchain\.toml'")),
+    ("source manifests", re.compile(r"hashFiles\([^)]*Cargo\.toml")),
+    ("event/trust class", re.compile(r"event_name")),
+    ("fork trust class", re.compile(r"head\.repo\.fork")),
+)
+
+
+def check_cache_key_fingerprints(root: Path) -> list[Finding]:
+    """Every `actions/cache` key must bind trust, source and toolchain.
+
+    A key that names only OS+lockfile+profile looks isolated but reuses the same
+    entry across a fork pull request, a changed source manifest and a changed
+    toolchain. Each missing dimension is its own finding so the report says
+    which boundary is open, and the rule is repository-level rather than
+    per-file so it also covers a workflow that caches without a `key:` at all.
+
+    EVERY `actions/cache` step in a file is judged, not just the first: a
+    workflow that restores the same cargo cache in three jobs would otherwise
+    have two of its three keys escape the rule entirely.
+    """
+    findings: list[Finding] = []
+    seen_cache_step = False
+    for wf_path in iter_workflow_files(root):
+        rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
+        try:
+            content = wf_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        lines = content.splitlines()
+        # Each cache step's `key:` lives inside that step's `with:` block, so the
+        # search for the next key stops at the next step entry, which is what
+        # keeps a sibling job's key from being read as this step's key.
+        for cache_line, line in enumerate(lines):
+            if "actions/cache@" not in workflow_code_line(line):
+                continue
+            seen_cache_step = True
+            step_indent = len(line) - len(line.lstrip(" "))
+            key_line = next(
+                (
+                    i
+                    for i in range(cache_line + 1, len(lines))
+                    if _yaml_key(lines[i]) == "key"
+                    or (
+                        _is_step_entry(lines[i])
+                        and len(lines[i]) - len(lines[i].lstrip(" ")) <= step_indent
+                    )
+                ),
+                None,
+            )
+            if key_line is None or _yaml_key(lines[key_line]) != "key":
+                findings.append(
+                    Finding(
+                        "GWF-020",
+                        rel_path,
+                        cache_line + 1,
+                        "actions/cache step declares no restore key, so every dimension boundary is open",
+                    )
+                )
+                continue
+            key_value = _yaml_value(lines[key_line])
+            for label, pattern in CACHE_KEY_REQUIRED_BINDINGS:
+                if not pattern.search(key_value):
+                    findings.append(
+                        Finding(
+                            "GWF-020",
+                            rel_path,
+                            key_line + 1,
+                            f"cache key does not bind the {label} dimension: {key_value}",
+                        )
+                    )
+    if not seen_cache_step:
+        findings.append(
+            Finding(
+                "GWF-020",
+                ".github/workflows",
+                0,
+                "no workflow restores a cargo cache, so cache isolation is never exercised",
+            )
+        )
+    return findings
+
+
 def iter_workflow_files(root: Path) -> list[Path]:
     """Every workflow file in the one closed directory, deterministically ordered."""
     workflows_dir = root / ".github" / "workflows"
@@ -1475,6 +1568,7 @@ def verify_all(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(check_workflows(root))
     findings.extend(check_action_pin_divergence(root))
+    findings.extend(check_cache_key_fingerprints(root))
     findings.extend(check_python_requirements(root))
     findings.extend(check_nuget_lock(root))
     findings.extend(check_dotnet_sdk_identity(root))
@@ -1659,6 +1753,127 @@ def run_self_tests() -> int:
                 )
                 return 1
 
+    # Cache-key fingerprint binding (issue #1923). Each fixture carries a fully
+    # bound key and then drops exactly one dimension, so a regression can only
+    # come from the rule under test and never from an unrelated finding.
+    def cache_workflow(key_line: str) -> str:
+        return (
+            gate_yaml.format(
+                body="- uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0\n"
+                "    with:\n"
+                "      path: |\n"
+                "        ~/.cargo/registry\n"
+                + key_line
+            )
+        )
+
+    bound_key = (
+        "      key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}"
+        "-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.toml') }}"
+        "-${{ github.event_name == 'push' && 'main' || 'pr' }}"
+        "-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}\n"
+    )
+    cache_cases = [
+        ("cache_key_full_binding_accepted", bound_key, False),
+        (
+            "cache_key_without_fork_trust_rejected",
+            bound_key.replace("${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}", "trusted"),
+            True,
+        ),
+        (
+            "cache_key_without_source_manifest_rejected",
+            bound_key.replace("${{ hashFiles('Cargo.toml') }}-", ""),
+            True,
+        ),
+        (
+            "cache_key_without_toolchain_rejected",
+            bound_key.replace("${{ hashFiles('rust-toolchain.toml') }}-", ""),
+            True,
+        ),
+        (
+            "cache_key_without_architecture_rejected",
+            bound_key.replace("${{ runner.arch }}-", ""),
+            True,
+        ),
+        ("cache_step_without_key_rejected", "", True),
+    ]
+    for name, key_line, expect_finding in cache_cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            wf_dir = tmp_root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "test.yml").write_text(cache_workflow(key_line), encoding="utf-8")
+            findings = check_cache_key_fingerprints(tmp_root)
+            has_finding = any(f.code == "GWF-020" for f in findings)
+            if expect_finding and not has_finding:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: expected GWF-020, got {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not expect_finding and findings:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: full binding produced unexpected findings: {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+
+    # A second cache step in the same file must be judged on its own key, not
+    # inherit the first step's verdict: the bound-then-unbound pair is the exact
+    # shape of a workflow that restores one cargo cache in several jobs, and
+    # judging only the first step left the rest unverified.
+    def two_step_cache_workflow(second_key_line: str) -> str:
+        return gate_yaml.format(
+            body="- uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0\n"
+            "    with:\n"
+            "      path: |\n"
+            "        ~/.cargo/registry\n"
+            + bound_key
+            + "  - name: Build\n"
+            "    run: echo built\n"
+            + "  - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0\n"
+            "    with:\n"
+            "      path: |\n"
+            "        ~/.cargo/registry\n"
+            + second_key_line
+        )
+
+    second_step_cases = [
+        ("cache_second_step_bound_accepted", bound_key, False),
+        (
+            "cache_second_step_unbound_rejected",
+            "      key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}\n",
+            True,
+        ),
+        (
+            "cache_second_step_key_absent_rejected",
+            "  - name: Build\n    run: echo built\n",
+            True,
+        ),
+    ]
+    for name, second_key_line, expect_finding in second_step_cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            wf_dir = tmp_root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "test.yml").write_text(
+                two_step_cache_workflow(second_key_line), encoding="utf-8"
+            )
+            findings = check_cache_key_fingerprints(tmp_root)
+            has_finding = any(f.code == "GWF-020" for f in findings)
+            if expect_finding and not has_finding:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: expected GWF-020, got {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not expect_finding and findings:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: full binding produced unexpected findings: {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+
     # The identity record is derived from the files and deterministic: the same
     # tree yields the same sorted records, and every third-party ref is present
     # including the job-level (no dash) form.
@@ -1810,8 +2025,19 @@ def run_self_tests() -> int:
             return 1
 
     # 31 single-file workflow cases + 2 cross-workflow divergence cases
-    # + 1 derived-identity case + 7 rule-level cases below.
-    case_count = len(test_cases) + len(divergence_cases) + 1 + 7
+    # + 1 derived-identity case + 7 rule-level cases below, plus the two
+    # cache-key groups (issue #1923). The reported count is derived from the
+    # case lists themselves: a hardcoded total would keep reporting PASS with
+    # the same number after a case group was added, which is the count reading
+    # as evidence when it is not counting the cases that actually ran.
+    case_count = (
+        len(test_cases)
+        + len(divergence_cases)
+        + 1
+        + 7
+        + len(cache_cases)
+        + len(second_step_cases)
+    )
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")
     return 0
 

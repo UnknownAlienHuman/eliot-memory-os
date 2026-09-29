@@ -61,7 +61,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          # Issue #1923 (I18.44): the key separates the entry by every
+          # dimension that changes whether reusing it is safe — runner
+          # platform/arch, dependency lock, toolchain, source manifests, and
+          # the run's trust class. scripts/verify-github-workflows.py rejects a
+          # key that drops one (GWF-020).
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', '.github/workflows/source-candidate.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
 
       - name: Formatting
         run: cargo fmt --all -- --check

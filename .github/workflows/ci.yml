@@ -63,7 +63,18 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-profile-mergecompile-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', 'scripts/verify.ps1', '.github/workflows/ci.yml') }}-${{ github.event_name == 'push' && 'main' || 'pr' }}
+          # Issue #1923 (I18.44): the key separates the entry by every
+          # dimension that changes whether reusing it is safe — runner
+          # platform/arch, dependency lock, toolchain, source manifests, the
+          # run's event class, and the run's trust class. A restored
+          # registry/git cache is reused build output whose trust boundary is
+          # exactly the fork/PR trust class, the source tree and the toolchain
+          # that produced it, so a key that named only OS+lockfile+profile
+          # reused one entry across all of them. Every workflow that restores
+          # this cache spells these dimensions the same way, and
+          # scripts/verify-github-workflows.py rejects a key that drops one
+          # (GWF-020), so the binding cannot silently regress.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-profile-mergecompile-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', 'scripts/verify.ps1', '.github/workflows/ci.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
           lookup-only: ${{ github.event.pull_request.head.repo.fork == true }}
 
       - name: Bind integration candidate identity
