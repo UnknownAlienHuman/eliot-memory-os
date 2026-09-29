@@ -9031,8 +9031,7 @@ fn recovered_commit_recovery(pause_release: Option<&PauseReleaseOutcome>) -> ser
             "ordering_scopes": scopes,
             "detail": detail,
         }),
-        Some(PauseReleaseOutcome::Released { .. })
-        | Some(PauseReleaseOutcome::NothingToRelease)
+        Some(PauseReleaseOutcome::Released { .. } | PauseReleaseOutcome::NothingToRelease)
         | None => serde_json::Value::Null,
     }
 }
