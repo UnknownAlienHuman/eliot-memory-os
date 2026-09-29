@@ -2325,6 +2325,72 @@ mod tests {
         );
     }
 
+    fn board_resolution_receipt() -> eliot_receipts::ReceiptEnvelope {
+        let state_fence = fence();
+        let request_id = RequestId::new("board-resolve-request").expect("request id");
+        let metadata = RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("board-product").expect("product"),
+            source_id: SourceId::new("owner-1").expect("source"),
+            state_fence: state_fence.clone(),
+            clock: ClockReading::default(),
+        };
+        eliot_receipts::ReceiptEnvelope::issue(eliot_receipts::ReceiptCore {
+            contract: eliot_receipts::contract_identity().expect("contract"),
+            kind: eliot_receipts::ReceiptKind::Verification,
+            work_scope: eliot_receipts::WorkScopeBinding {
+                scope_id: eliot_receipts::WorkScopeId::new("scope-1").expect("scope"),
+                product_id: metadata.product_id.clone(),
+                resource_generation: ResourceGeneration::new(7).expect("generation"),
+                state_fence: state_fence.clone(),
+            },
+            task: None,
+            session: None,
+            causal: eliot_receipts::CausalBinding {
+                state_fence: state_fence.clone(),
+                transaction_sequence: eliot_contracts::TransactionSequence::genesis(),
+                parent_receipt_id: None,
+                predecessor_receipt_ids: Vec::new(),
+            },
+            request: RequestBinding {
+                metadata,
+                state_fence: state_fence.clone(),
+            },
+            operation: eliot_receipts::OperationBinding {
+                operation_id: OperationId::new("board-resolve-operation").expect("operation"),
+                request_id,
+                idempotency_key: "board-resolve-idempotency".to_owned(),
+                operation_kind: "notification.resolve".to_owned(),
+                effect: eliot_receipts::EffectClass::ReversibleMutation,
+                state_fence: state_fence.clone(),
+            },
+            authority: eliot_receipts::AuthorityBinding {
+                authority_id: eliot_contracts::ContractId::new("authority-owner-1")
+                    .expect("authority"),
+                authority_owner: "owner-1".to_owned(),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+                allowed_effect: eliot_receipts::EffectClass::ReversibleMutation,
+                proof_ceiling: ProofCeiling::ScopedVerification,
+            },
+            artifacts: vec![eliot_receipts::ArtifactBinding {
+                artifact_id: eliot_contracts::ArtifactId::new("evidence-1").expect("artifact id"),
+                sha256: eliot_contracts::sha256_hex(b"evidence-1"),
+                role: eliot_receipts::ReceiptKind::Artifact,
+                source_revision: Some("test".to_owned()),
+            }],
+            verifier: None,
+            problem: None,
+            coordination: None,
+            disposition: eliot_receipts::ReceiptDisposition::Success {
+                proof: ProofCeiling::ScopedVerification,
+            },
+        })
+        .expect("receipt")
+    }
+
     fn board_notification(
         key: &str,
         severity: eliot_kernel_core::NotificationSeverity,
@@ -2332,6 +2398,16 @@ mod tests {
         acknowledged: bool,
         resolved: bool,
     ) -> Notification {
+        let resolution_receipt = board_resolution_receipt();
+        // Derived before the envelope is moved into the record below.
+        let resolution_receipt_id = resolution_receipt.identity.receipt_id.as_str().to_owned();
+        let resolution_authority_id = resolution_receipt
+            .core
+            .authority
+            .authority_id
+            .as_str()
+            .to_owned();
+        let resolution_authority_owner = resolution_receipt.core.authority.authority_owner.clone();
         Notification {
             notification_id: serde_json::from_value(serde_json::json!(format!(
                 "notification-{key}"
@@ -2360,9 +2436,10 @@ mod tests {
                 sequence: 1,
             }),
             resolution_ref: resolved.then(|| eliot_kernel_core::ResolutionRef {
-                receipt_id: "receipt-1".to_owned(),
-                authority_id: "authority-1".to_owned(),
-                authority_owner: "owner-1".to_owned(),
+                receipt: Some(resolution_receipt),
+                receipt_id: resolution_receipt_id,
+                authority_id: resolution_authority_id,
+                authority_owner: resolution_authority_owner,
                 evidence_handles: vec!["evidence-1".to_owned()],
                 disposition: "fixed".to_owned(),
             }),
