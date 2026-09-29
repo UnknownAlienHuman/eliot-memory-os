@@ -124,7 +124,8 @@ pub use maintenance_trigger_delivery::{
     handle_maintenance_trigger_mark_ambiguous, handle_maintenance_trigger_pending_page,
     handle_maintenance_trigger_release_expired, handle_maintenance_trigger_replacement_pending_set,
     handle_maintenance_trigger_revocation, handle_maintenance_trigger_supersession,
-    recover_maintenance_trigger_commit, replay_maintenance_trigger_after_crash,
+    reconcile_maintenance_trigger_replacement, recover_maintenance_trigger_commit,
+    replay_maintenance_trigger_after_crash,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
