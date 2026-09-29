@@ -103,14 +103,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
-    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
-    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
-    I14AlternativeRoute, I14BackpressureCause, I14_BACKPRESSURE_RESPONSE_VERSION,
-    I14CurrentnessState, I14EscalationCondition,
-    I14ForbiddenAction, I14RecoveryAction, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
-    frozen_bottleneck_owner_map,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
+    CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit,
+    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
+    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute,
+    I14BackpressureCause, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
+    I14RecoveryAction, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome, NormalWorkClass,
+    RecoveryCommitStatus, StatePreservationStatus, frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -663,7 +662,10 @@ impl StoreRecoveryDirectiveV1 {
     /// Validates every identity-bearing reference with the existing bounded
     /// non-blank owner rule.
     fn validate_identity_refs(&self) -> Result<(), StoreReserveError> {
-        validate_label(&self.profile_revision, "store_backpressure.profile_revision")?;
+        validate_label(
+            &self.profile_revision,
+            "store_backpressure.profile_revision",
+        )?;
         if let Some(operation_id) = &self.operation_id {
             validate_label(operation_id, "store_backpressure.operation_id")?;
         }
@@ -1122,7 +1124,8 @@ impl StoreRejectionParts {
             disposition,
             directive: StoreRecoveryDirectiveV1 {
                 cause: match disposition {
-                    BackpressureDisposition::Busy | BackpressureDisposition::StorageBackpressure => {
+                    BackpressureDisposition::Busy
+                    | BackpressureDisposition::StorageBackpressure => {
                         I14BackpressureCause::CapacityExhaustion
                     }
                     BackpressureDisposition::AcceptedPending => {
@@ -1131,7 +1134,9 @@ impl StoreRejectionParts {
                     BackpressureDisposition::DbUnavailable => {
                         I14BackpressureCause::CanonicalStoreUnavailable
                     }
-                    BackpressureDisposition::BudgetExhausted => I14BackpressureCause::BudgetExhausted,
+                    BackpressureDisposition::BudgetExhausted => {
+                        I14BackpressureCause::BudgetExhausted
+                    }
                     BackpressureDisposition::StateChurn => I14BackpressureCause::StateChurn,
                     BackpressureDisposition::CapabilityDegraded => {
                         I14BackpressureCause::CapabilityUnavailable
@@ -2007,7 +2012,9 @@ impl StoreReserve {
                 bottleneck: STORE_CONNECTION_BOTTLENECK,
                 unit: STORE_CONNECTION_BOTTLENECK.unit(),
                 requested_amount: 1,
-                availability: BottleneckAvailability::Exhausted { available_amount: 0 },
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: 0,
+                },
                 coverage_state: BottleneckCoverageState::Claimed,
             },
             operation_id: operation_id.to_owned(),
@@ -2054,7 +2061,9 @@ impl StoreReserve {
                 bottleneck: STORE_TRANSACTION_BOTTLENECK,
                 unit: STORE_TRANSACTION_BOTTLENECK.unit(),
                 requested_amount: 1,
-                availability: BottleneckAvailability::Exhausted { available_amount: 0 },
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: 0,
+                },
                 coverage_state: BottleneckCoverageState::Claimed,
             },
             operation_id: operation_id.to_owned(),
@@ -2252,16 +2261,17 @@ impl StoreReserve {
     ) -> Result<BottleneckCapacityProfile, StoreReserveError> {
         let bottleneck = dimension.bottleneck();
         let unit = bottleneck.unit();
-        let normal_quantity = NonZeroU64::new(capacities.normal_capacity)
-            .ok_or(StoreReserveError::InvalidField {
+        let normal_quantity =
+            NonZeroU64::new(capacities.normal_capacity).ok_or(StoreReserveError::InvalidField {
                 field: "store_reserve.normal_limit",
                 reason: "the normal partition of a claimed row is positive",
             })?;
-        let protected_quantity = NonZeroU64::new(capacities.protected_capacity)
-            .ok_or(StoreReserveError::InvalidField {
+        let protected_quantity = NonZeroU64::new(capacities.protected_capacity).ok_or(
+            StoreReserveError::InvalidField {
                 field: "store_reserve.protected_limit",
                 reason: "the protected partition of a claimed row is positive",
-            })?;
+            },
+        )?;
         let physical_total = capacities
             .normal_capacity
             .checked_add(capacities.protected_capacity)
