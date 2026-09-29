@@ -86,7 +86,10 @@ impl ManagedEnvironmentChangePlan {
     pub fn validate(&self) -> Result<(), InstallationError> {
         self.request.validate()?;
         for (value, field) in [
-            (&self.catalogue_origin, "managed_change_plan.catalogue_origin"),
+            (
+                &self.catalogue_origin,
+                "managed_change_plan.catalogue_origin",
+            ),
             (&self.family_id, "managed_change_plan.family_id"),
             (&self.confirmed_owner, "managed_change_plan.confirmed_owner"),
             (
@@ -112,10 +115,10 @@ impl ManagedEnvironmentChangePlan {
                 reason: "must be non-zero".to_owned(),
             });
         }
-        if &self.family_id != &self.request.target_family {
+        if self.family_id != self.request.target_family {
             return Err(InstallationError::IdentityConflict);
         }
-        if &self.confirmed_owner != &self.request.required_owner {
+        if self.confirmed_owner != self.request.required_owner {
             return Err(InstallationError::IdentityConflict);
         }
         for pair in self.observed_target_identities.windows(2) {
@@ -135,20 +138,17 @@ impl ManagedEnvironmentChangePlan {
         // resolved to an identity is not a current installation.
         match (&self.request.action, &self.target_identity) {
             (ManagedEnvironmentAction::Install, None) => Ok(()),
-            (ManagedEnvironmentAction::Install, Some(_)) => {
-                Err(InstallationError::InvalidField {
-                    field: "managed_change_plan.target_identity".to_owned(),
-                    reason: "an install request resolves no current target identity".to_owned(),
-                })
-            }
+            (ManagedEnvironmentAction::Install, Some(_)) => Err(InstallationError::InvalidField {
+                field: "managed_change_plan.target_identity".to_owned(),
+                reason: "an install request resolves no current target identity".to_owned(),
+            }),
             (_, None) => Err(InstallationError::IncompleteObservation(
                 "a non-install request must name a target identity the survey observed".to_owned(),
             )),
             (_, Some(identity)) => {
                 if !self.observed_target_identities.contains(identity) {
                     return Err(InstallationError::IncompleteObservation(
-                        "the requested target identity was not observed by this survey"
-                            .to_owned(),
+                        "the requested target identity was not observed by this survey".to_owned(),
                     ));
                 }
                 Ok(())
@@ -179,7 +179,7 @@ pub fn compile_managed_change_plan(
 ) -> Result<ManagedEnvironmentChangePlan, InstallationError> {
     request.validate()?;
     survey.validate()?;
-    if &survey.catalogue_origin != &catalogue.origin
+    if survey.catalogue_origin != catalogue.origin
         || survey.catalogue_revision != catalogue.revision
     {
         return Err(InstallationError::IdentityConflict);
@@ -247,9 +247,9 @@ pub fn revalidate_managed_change_plan(
 ) -> Result<(), InstallationError> {
     plan.validate()?;
     survey.validate()?;
-    if &survey.catalogue_origin != &plan.catalogue_origin
+    if survey.catalogue_origin != plan.catalogue_origin
         || survey.catalogue_revision != plan.catalogue_revision
-        || &catalogue.origin != &plan.catalogue_origin
+        || catalogue.origin != plan.catalogue_origin
         || catalogue.revision != plan.catalogue_revision
     {
         return Err(InstallationError::IdentityConflict);
@@ -275,10 +275,10 @@ pub fn revalidate_managed_change_plan(
     if observed != plan.observed_target_identities {
         return Err(InstallationError::IdentityConflict);
     }
-    if let Some(identity) = &plan.target_identity {
-        if !observed.contains(identity) {
-            return Err(InstallationError::IdentityConflict);
-        }
+    if let Some(identity) = &plan.target_identity
+        && !observed.contains(identity)
+    {
+        return Err(InstallationError::IdentityConflict);
     }
     Ok(())
 }
