@@ -1625,11 +1625,11 @@ impl DaemonComposition {
     /// intent before execution, reconcile before relaunch, unknown blocks
     /// terminal — for whatever owners the caller supplies.
     #[must_use]
-    pub fn swarm_composition<L, R>(
-        &self,
-        ledger: &L,
-        runner: &R,
-    ) -> swarm_composition::SwarmComposition<'_, L, R>
+    pub fn swarm_composition<'a, L, R>(
+        &'a self,
+        ledger: &'a L,
+        runner: &'a R,
+    ) -> swarm_composition::SwarmComposition<'a, L, R>
     where
         L: swarm_composition::LaunchIntentLedger,
         R: swarm_composition::ChildRunner,
