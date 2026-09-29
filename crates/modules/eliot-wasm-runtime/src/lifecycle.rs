@@ -888,12 +888,12 @@ pub enum SnapshotStrategy {
 /// exact defect this module exists to prevent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RollbackRouteRequest {
-    pub cutover_id: String,
-    pub route_scope: String,
-    pub from_generation: u64,
-    pub to_generation: u64,
-    pub old_epoch: u64,
-    pub new_epoch: u64,
+    /// The Kernel-owned cutover record this route proposes. Its epoch pair is
+    /// the lineage-aware [`GenerationCutoverRecord`] pair, and the original
+    /// recorded value is what gets validated: this module never re-derives,
+    /// re-binds, or re-orders an epoch from loose counters, so an old epoch
+    /// cannot be presented as the new authority.
+    pub cutover: GenerationCutoverRecord,
     pub in_flight: Vec<(String, InFlightDisposition)>,
     pub snapshot_strategy: SnapshotStrategy,
     pub state_compatible: bool,
