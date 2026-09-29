@@ -785,6 +785,11 @@ impl LaunchRequest {
     pub fn validate(&self) -> Result<(), BrokerError> {
         text(&self.approved.request_id, "request_id")?;
         bounded_text(&self.approved.attempt_id, 512, "attempt_id")?;
+        if self.approved.attempt_id == self.approved.request_id
+            || self.approved.attempt_id == self.approved.operation_id.as_str()
+        {
+            return Err(BrokerError::InvalidField("attempt_id"));
+        }
         text(&self.approved.route_fingerprint, "route_fingerprint")?;
         text(&self.approved.artifact_digest, "artifact_digest")?;
         hex_digest(&self.approved.artifact_digest, "artifact_digest")?;
