@@ -684,6 +684,17 @@ pub struct DaemonComposition {
     /// its owner. The durable truth is the state-root projection the driver
     /// persists before emit, never this slot.
     solo_state: std::sync::Mutex<solo_agent_driver::SoloDriverState>,
+    /// The single Governor-owned durable swarm-plan attachment composition
+    /// (issue #1126 W1/A1).
+    ///
+    /// Owns exactly one [`eliot_governor::SwarmPlanAttachmentService`] over
+    /// its canonical store image, so every swarm consumer vended through
+    /// [`DaemonComposition::swarm_composition`] converges on one durable-job
+    /// owner: the first job commits, an identical replay is idempotent, and
+    /// a second job observes the canonical winner. Cross-process durability
+    /// of the store image itself follows the canonical-write envelope wiring
+    /// (remainder, #1699); this field never claims it.
+    swarm_attachment: eliot_governor::SwarmAttachmentComposition,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -966,6 +977,9 @@ impl DaemonComposition {
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
             external_attach: None,
             solo_state: std::sync::Mutex::new(solo_agent_driver::SoloDriverState::new()),
+            swarm_attachment: eliot_governor::SwarmAttachmentComposition::new(
+                eliot_governor::SwarmPlanAttachmentService::new(),
+            ),
         })
     }
 
@@ -1605,6 +1619,42 @@ impl DaemonComposition {
     #[must_use]
     pub const fn learning_closure(&self) -> &eliot_governor::LearningClosureService {
         &self.learning_closure
+    }
+
+    /// Borrows the single Governor-owned durable swarm attachment composition.
+    #[must_use]
+    pub const fn swarm_attachment_composition(
+        &self,
+    ) -> &eliot_governor::SwarmAttachmentComposition {
+        &self.swarm_attachment
+    }
+
+    /// Binds the daemon swarm composition over the single Governor attachment
+    /// owner (issue #1126 W1/A1 slice A: daemon composition).
+    ///
+    /// Production caller of [`swarm_composition::SwarmComposition::new`]: the
+    /// attachment half is the daemon-owned durable-job owner above, so one
+    /// Governor owner admits every swarm plan this daemon launches. The
+    /// launch-intent ledger and child runner stay explicit caller ports
+    /// because their production owners do not exist on this base: no non-test
+    /// `LaunchIntentLedger`/`ChildRunner` or `DurableWorkStore` implementation
+    /// exists (remainder #1699), and no daemon-reachable admitted
+    /// `AdapterRegistry` or one-shot `DispatchPermit` runner binding exists
+    /// without a new architecture-boundary edge (remainder #2866 items 2-4,
+    /// #22). The returned composition enforces the owner order — persist
+    /// intent before execution, reconcile before relaunch, unknown blocks
+    /// terminal — for whatever owners the caller supplies.
+    #[must_use]
+    pub fn swarm_composition<'a, L, R>(
+        &'a self,
+        ledger: &'a L,
+        runner: &'a R,
+    ) -> swarm_composition::SwarmComposition<'a, L, R>
+    where
+        L: swarm_composition::LaunchIntentLedger,
+        R: swarm_composition::ChildRunner,
+    {
+        swarm_composition::SwarmComposition::new(&self.swarm_attachment, ledger, runner)
     }
 
     /// Returns the retained protected config path, for diagnostics only.
