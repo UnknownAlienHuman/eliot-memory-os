@@ -19,16 +19,14 @@
 //! references the trigger site passed in. Nothing here invents an observation:
 //! every ref below is derived from that decision's own fields.
 //!
-//! The source is typed as [`eliot_improvement::EvidenceSource::Watchdog`]
-//! because I12.24:40-55 lists "Watchdog" as the trigger family for an admitted
-//! problem/signal occurrence, and `MaintenanceTriggerOrigin::AdmittedObservation`
-//! is this daemon's own classification of exactly that
-//! (`maintenance_trigger_evaluator.rs::MaintenanceTriggerOrigin::maintenance_trigger`
-//! maps it to `MaintenanceTrigger::WatchdogProblem`). `ASSUMPTION:` the
-//! `Watchdog` variant is the honest label for a maintenance-trigger problem
-//! signal; I12.24:40-55 names no separate "maintenance" variant, and the
-//! daemon is the Watchdog-adjacent problem-recipe producer, not a
-//! `ConformanceDiagnosis` producer — it holds no `SelfQualityInput`.
+//! The evidence source is DERIVED from that decision's own closed fields by
+//! [`maintenance_evidence_source`], not asserted. It previously claimed
+//! [`eliot_improvement::EvidenceSource::Watchdog`] for every decision, which
+//! mislabelled the recorded lineage: a conformance-audit family and a
+//! security/dependency-scan family both recorded themselves as Watchdog
+//! signals, so a later reader could not tell what kind of occurrence the
+//! evidence was. The derivation and its residual are documented on that
+//! function.
 //!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
@@ -43,6 +41,23 @@
 //! in-memory `BoundedBacklog` is treated as durable: the backlog is used only
 //! for its deduplication registry within this one pass, and the committed
 //! record is the durable artifact.
+//!
+//! # What deduplication is and is NOT guaranteed here
+//!
+//! The candidate identity is content-derived
+//! ([`eliot_improvement::ImprovementCandidate::new`]), so a repeat of the same
+//! observation produces the same `candidate_id`, and therefore the same
+//! `improvement-candidate:<id>` commit key: the store converges on one row
+//! instead of appending a new candidate per cadence tick. That is the durable
+//! half of I12.24's "deduplicated by target surface and evidence lineage".
+//!
+//! The BACKLOG is still constructed per pass in
+//! `daemon_runtime::improvement_intake_artifact` and is never read across
+//! passes, so the in-memory merge branch of `admit_reporting_pressure` stays
+//! unreachable in this daemon and cross-pass archive relief is not restored
+//! after a restart. Carrying the registry across restarts needs an owner that
+//! reads committed learning rows back into a backlog, which this issue does
+//! not create; the statement above is limited to what the code does.
 //!
 //! # Promotion stays refused, by construction, not by omission
 //!
@@ -155,9 +170,10 @@ use eliot_improvement::candidate_bounds::{
     AdmitReport, ArchivedCandidate, BoundedBacklog, CandidateBoundPolicy, CrossTaskCarryover,
 };
 use eliot_improvement::{
-    EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError, ImprovementLifecycle,
-    ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan, SafeBoundary,
-    brief_at_safe_boundary, candidate_from_evidence, sourced_evidence,
+    ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
+    ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
+    SafeBoundary, brief_at_safe_boundary, candidate_from_evidence, check_class_gate, classify,
+    is_prohibited_tuning_surface, sourced_evidence,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
@@ -354,7 +370,7 @@ pub fn assemble_improvement_artifact(
     };
     let admitted_scope = admitted_fence_ref(state_fence)?;
     let evidence = sourced_evidence(
-        EvidenceSource::Watchdog,
+        maintenance_evidence_source(decision),
         &evidence_refs,
         &trace_refs,
         &trigger,
@@ -384,6 +400,26 @@ pub fn assemble_improvement_artifact(
     // Admitted intake is triaged for owner review, exactly as the intake
     // path does, so the durable record carries the owner-decision lifecycle.
     candidate.transition_lifecycle(ImprovementLifecycle::Triaged)?;
+
+    // The application-class boundary is enforced HERE, in the production
+    // assembly, not only inside `prepare_intake` (issue #1867 W5). Before this
+    // the gate had no production caller at all: `classify` and
+    // `check_class_gate` were reachable only from `intake_from_evidence`, which
+    // this daemon deliberately does not call because its budget gate would
+    // demand fabricated canary refs. The class is therefore decided here from
+    // the candidate's OWN recorded surface, and a candidate whose recorded
+    // surface the owner forbids to the advisory class is refused rather than
+    // assembled.
+    //
+    // Stated plainly so this call is not read as broader than it is: the
+    // candidate assembled above records [`IMPROVEMENT_SURFACE`] (`Memory`),
+    // which is not a protected surface, so on the live maintenance path the
+    // class taken is `Advisory` and the gate passes. What the gate buys here is
+    // that the class is a FUNCTION of the candidate's recorded surface rather
+    // than of literals — a candidate carrying `Verifier` or `Scheduler` is
+    // refused. See `enforce_advisory_class_gate` for the exact ceiling,
+    // including the two classes this path cannot represent at all.
+    enforce_advisory_class_gate(&candidate)?;
 
     // The safe boundary is the daemon's own admitted generation plus the
     // daemon's decision owner, both real values this daemon holds.
@@ -431,6 +467,146 @@ pub fn assemble_improvement_artifact(
         brief,
         decision: decision_record,
     })
+}
+
+/// Enforces the I12.24 application-class boundary over a real candidate
+/// (issue #1867 W5).
+///
+/// # The descriptor is the candidate's own recorded content
+///
+/// [`ImprovementCandidate::target_surface`] is the candidate's OWN closed
+/// surface record, and it is the only class evidence this path holds. The
+/// class flags are read from it and from what the candidate does NOT record:
+///
+/// - `touches_protected` is [`is_prohibited_tuning_surface`] over that surface,
+///   so it is a comparison of the candidate's recorded surface against the
+///   owner's closed rule, not a spelled literal. A candidate recorded on
+///   [`ImprovementSurface::Verifier`] or [`ImprovementSurface::Scheduler`]
+///   classifies as `Protected` and is refused below, because the owner class
+///   for those surfaces requires an explicit owner decision and a
+///   corresponding migration/proof (I12.24:93) and this path holds neither.
+///   `ASSUMPTION:` those two surfaces map to `Protected` rather than to
+///   `CodeModuleConfig`, because I12.24:93 names `verifier` and `authority` in
+///   the protected class and I12.24:87-88 names `verifier definition` and
+///   `Kernel/Watchdog reserve` as never-tuning — so the owner-decision route
+///   the crate's own [`is_prohibited_tuning_surface`] names for them is the
+///   protected one. `Protected` is also the stricter of the two routes that
+///   function allows, so the mapping fails closed.
+/// - `bounded_tuning` and `has_work_item_ref` are `false` because the candidate
+///   records NO bounded-tuning range and NO work-item reference. Neither the
+///   I12.24:20-38 `ImprovementCandidate` schema nor the crate's
+///   [`ImprovementCandidate`] struct carries a field for either, so there is
+///   nothing to read and nothing is invented. This is the real ceiling of this
+///   path, and it is stated rather than papered over — the
+///   `PreAuthorizedTuning` and `CodeModuleConfig` classes are NOT REACHABLE
+///   here, because the descriptor cannot be given the content that would
+///   select them. A future change that wants either class has to add the
+///   evidence to the candidate first; until then there is nothing for this gate
+///   to refuse on those two classes, and this comment does not claim
+///   otherwise.
+///
+/// [`ImprovementCandidate::advisory_only`] is deliberately NOT used as a class
+/// flag. It is a real recorded field, but it is not the same thing as these
+/// three: `validate_base` refuses any candidate whose `advisory_only` is false
+/// (`ImprovementError::SelfPromotionForbidden`), so it is a self-promotion
+/// invariant that is already enforced upstream on every candidate, not
+/// evidence about which of the four I12.24 classes this change belongs to.
+/// Reading it as a class input would re-derive a fact the owner already
+/// guarantees and would misreport the class boundary as content-bound when the
+/// class content is the surface record above.
+///
+/// # What the gate actually refuses
+///
+/// [`check_class_gate`] is asked for the material this path really holds:
+/// `rollback_ref` is the candidate's own recorded `rollback`;
+/// `owner_approved` is `false` and `migration_proof_ref` is `None` because
+/// this path holds no owner decision and no migration/proof, and
+/// `work_item_ref` is `None` because the candidate records no work item.
+/// Those absences are the fail-closed direction: a candidate whose recorded
+/// surface classifies as `Protected` is refused with
+/// [`ImprovementError::ApplicationClassViolation`] rather than assembled, and
+/// `live_experiments_on_surface` is `0` — this path starts no experiment — but
+/// it is not read, because the tuning class is not representable above.
+///
+/// The refusal is therefore content-bound: it turns on the surface the
+/// candidate actually records. It is not a claim that every class upgrade is
+/// caught, and no such claim is made here.
+fn enforce_advisory_class_gate(
+    candidate: &ImprovementCandidate,
+) -> Result<(), ImprovementDispatchError> {
+    let change = ChangeDescriptor {
+        target_surface: candidate.target_surface,
+        bounded_tuning: false,
+        touches_protected: is_prohibited_tuning_surface(candidate.target_surface),
+        has_work_item_ref: false,
+    };
+    let class = classify(&change);
+    check_class_gate(class, &change, 0, &candidate.rollback, None, false, None)?;
+    Ok(())
+}
+
+/// The I12.24 evidence source this daemon's own maintenance decision belongs
+/// to (issue #1867 W2).
+///
+/// The previous code asserted [`EvidenceSource::Watchdog`] unconditionally for
+/// every decision, which mislabelled the evidence lineage: a family this
+/// daemon is not even watching, and a policy-driven occurrence rather than a
+/// Watchdog problem, both claimed to be Watchdog signals. The label is now
+/// DERIVED from the closed fields the Governor's own decision carries, so the
+/// recorded source is a fact about the observation rather than an assumption:
+///
+/// - [`MaintenanceFamily::SecurityDependencyScan`] is the daemon's
+///   security/dependency incident family, which I12.24:40-55 lists as
+///   `SecurityIncident`.
+/// - [`MaintenanceFamily::DonorConformance`] is the conformance-audit family,
+///   which the same list names as `ConformanceDiagnosis`.
+/// - a decision the evaluator REFUSED to run (`Block`, `Escalate`) with a
+///   non-eligibility [`DecisionReason`] is a repeated refusal rather than a
+///   Watchdog problem, and I12.24:40-55 names that trigger `Attempt` — an
+///   attempt/outcome signal the daemon itself produced.
+/// - everything else keeps `Watchdog`, which is the honest residual: the
+///   daemon is the problem-recipe producer adjacent to supervision, and
+///   `MaintenanceTriggerOrigin::AdmittedObservation` is its own
+///   classification of exactly that.
+///
+/// `ASSUMPTION:` I12.24:40-55 names no separate "maintenance" variant, and no
+/// decision field carries a Dreamer or Concilium attribution — those two
+/// sources stay unreachable from this daemon rather than being mislabelled here.
+pub fn maintenance_evidence_source(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> EvidenceSource {
+    use eliot_maintenance::MaintenanceFamily;
+    match decision.family {
+        MaintenanceFamily::SecurityDependencyScan => EvidenceSource::SecurityIncident,
+        MaintenanceFamily::DonorConformance => EvidenceSource::ConformanceDiagnosis,
+        _ if refused_by_evaluator(decision.decision, decision.reason) => EvidenceSource::Attempt,
+        _ => EvidenceSource::Watchdog,
+    }
+}
+
+/// Whether the Governor refused this trigger for a non-eligibility reason.
+///
+/// `Suggest` and `SuppressDuplicate` are not refusals — the first preserves a
+/// recommendation and the second records that equivalent work is already active
+/// — so neither counts as a failed attempt.
+fn refused_by_evaluator(
+    decision: eliot_maintenance::AutomationDecision,
+    reason: eliot_maintenance::DecisionReason,
+) -> bool {
+    use eliot_maintenance::{AutomationDecision, DecisionReason};
+    matches!(
+        (decision, reason),
+        (
+            AutomationDecision::Block | AutomationDecision::Escalate,
+            DecisionReason::AutomationOff
+                | DecisionReason::ExplicitRequestRequired
+                | DecisionReason::BudgetUnavailable
+                | DecisionReason::NotIdle
+                | DecisionReason::OutsideSchedule
+                | DecisionReason::RouteUnavailable
+                | DecisionReason::UserSessionRequired
+        )
+    )
 }
 
 /// The bound the maintenance (`G-19`) owner decides for this surface, read
