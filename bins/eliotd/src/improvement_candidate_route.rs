@@ -41,8 +41,7 @@
 //! stands in for a record this build cannot read.
 
 use eliot_maintenance::improvement_pipeline::{
-    ImprovementCurrentProposal, RetainedImprovementProposal, UncheckedRecordIdentity,
-    compare_improvement_commitments,
+    ImprovementCurrentProposal, RetainedImprovementProposal, compare_improvement_commitments,
 };
 use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
