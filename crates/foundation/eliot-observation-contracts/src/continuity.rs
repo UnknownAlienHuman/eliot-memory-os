@@ -1109,8 +1109,16 @@ fn check_lineage_provenance(
     else {
         return Err(unproven());
     };
+    // A hop that names a hypothesis but carries no basis of its own has nothing
+    // to compare against the recorded one, so it is not a weaker statement but
+    // an absent one: `basis` is absent only for a step-declared hop, and that
+    // case returned above. Treating the absence as agreement would admit a hop
+    // that never restated what it rests on.
+    let Some(restated) = entry.basis else {
+        return Err(unproven());
+    };
     if original.basis.is_weak()
-        || original.basis != entry.basis
+        || original.basis != restated
         || original.subject_ref != entry.subject_ref
         || original.kind != entry.subject_kind
     {
