@@ -132,6 +132,11 @@ pub(crate) fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind 
         | HostError::StoreRecoveryRequired(_)
         | HostError::WatchdogCoverageUnavailable(_)
         | HostError::OwnerLeaseHeld
+        // A foreign endpoint occupant and an unreadable endpoint owner are
+        // both refused ownership proofs, not delivery outcomes: the launch was
+        // rejected, so this stays a rejected probe.
+        | HostError::OriginCollisionUnproven(_)
+        | HostError::StoreEndpointOwnerUnreadable(_)
         | HostError::OwnerLeaseRecovery(_) => ReadinessFailureKind::ProbeRejected,
     }
 }
