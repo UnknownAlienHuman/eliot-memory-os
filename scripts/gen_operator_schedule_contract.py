@@ -54,6 +54,8 @@ RUNTIME_CONTRACTS_RS = "crates/foundation/eliot-runtime-contracts/src/lib.rs"
 EPOCH_IDENTITY_RS = "crates/foundation/eliot-contracts/src/epoch_identity.rs"
 JOB_STATE_RS = "crates/foundation/eliot-protocol/src/dreamer_job.rs"
 NOTIFICATION_STATE_RS = "crates/kernel/eliot-kernel-core/src/module/notification_state.rs"
+RECEIPTS_RS = "crates/foundation/eliot-receipts/src/lib.rs"
+PLATFORM_HANDLE_RS = "crates/kernel/eliot-platform/src/handle_nonce.rs"
 OPERATOR_RESULT_DECODER_CS = "apps/Eliot.Operator/Protocol/UserAutomationScheduleContract.cs"
 
 ARTEFACT = "apps/Eliot.Operator/Protocol/Generated/OperatorScheduleContract.g.cs"
@@ -75,6 +77,8 @@ SOURCE_FILES = (
     "crates/foundation/eliot-protocol/src/dreamer_job.rs",
     "crates/storage/eliot-store-api/src/lib.rs",
     "crates/kernel/eliot-kernel-core/src/module/notification_state.rs",
+    RECEIPTS_RS,
+    PLATFORM_HANDLE_RS,
 )
 
 #: Constants the mirror needs as C# constants, in the order they are emitted.
@@ -281,7 +285,6 @@ RESULT_SCHEMA_DECLARATIONS = (
     (STORE_API_RS, "TransitionClass"),
     (STORE_API_RS, "Resubmission"),
     ("crates/foundation/eliot-contracts/src/lib.rs", "ErrorCode"),
-    (NOTIFICATION_STATE_RS, "DeliveryChannel"),
 )
 RESULT_SCHEMA_DECODER_PIN = "SupportedUserAutomationResultSchemaSha256"
 
@@ -698,13 +701,21 @@ def collect_result_struct(lines: list[str], name: str) -> RustResultStruct:
 
 def collect_result_declaration(lines: list[str], name: str) -> str:
     """Collect one serde type declaration, including its attributes and variants."""
-    header = re.compile(rf"^\s*pub\s+(?:struct|enum)\s+{re.escape(name)}\b")
+    header = re.compile(
+        rf"^\s*(?:(?:pub(?:\([^)]*\))?)\s+)?(?:struct|enum)\s+{re.escape(name)}\b"
+    )
     for index, line in enumerate(lines):
         if header.match(line) is None:
             continue
-        first = index
-        while first > 0 and lines[first - 1].strip().startswith("#["):
-            first -= 1
+        first = _preceding_attributes_start(lines, index)
+        type_kind = re.search(r"\b(struct|enum)\b", line)
+        if type_kind is not None and type_kind.group(1) == "struct":
+            # Tuple/unit structs end with `;` and have no declaration body.
+            # Stop there instead of accidentally absorbing the following impl
+            # block as if it were part of the serialized type.
+            line_code = line.split("//", 1)[0]
+            if ";" in line_code and "{" not in line_code:
+                return "\n".join(lines[first : index + 1])
         depth = 0
         opened = False
         declaration: list[str] = []
@@ -717,6 +728,612 @@ def collect_result_declaration(lines: list[str], name: str) -> str:
                 return "\n".join(lines[first:index] + declaration)
         raise Refused(f"result schema declaration {name!r} has no closing brace")
     raise Refused(f"result schema declaration {name!r} is absent")
+
+
+def _matching_delimiter(text: str, start: int, opening: str, closing: str) -> int:
+    """Return the matching delimiter while ignoring Rust comments and literals."""
+    depth = 0
+    in_string = False
+    in_char = False
+    escaped = False
+    line_comment = False
+    block_comment = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            continue
+        if block_comment:
+            if char == "/" and next_char == "*":
+                block_comment += 1
+            elif char == "*" and next_char == "/":
+                block_comment -= 1
+            continue
+        if in_string or in_char:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif in_string and char == '"':
+                in_string = False
+            elif in_char and char == "'":
+                in_char = False
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = 1
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        # A Rust lifetime starts with `'` followed by an identifier, while a
+        # character literal closes with the next unescaped quote. Only enter
+        # character mode when a closing quote appears before a newline.
+        if char == "'" and re.match(r"'(?:\\.|[^'\\])'", text[index:]) is not None:
+            in_char = True
+            continue
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise Refused(f"unclosed Rust delimiter {opening!r} in result schema input")
+
+
+def _strip_rust_comments_and_attributes(text: str) -> str:
+    """Remove comments/attributes for type-reference parsing only."""
+    output: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        next_pair = text[index : index + 2]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if next_pair == "//":
+            newline = text.find("\n", index)
+            if newline == -1:
+                break
+            output.append("\n")
+            index = newline + 1
+            continue
+        if next_pair == "/*":
+            end = index + 2
+            depth = 1
+            while end < len(text) and depth:
+                pair = text[end : end + 2]
+                if pair == "/*":
+                    depth += 1
+                    end += 2
+                elif pair == "*/":
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            if depth:
+                raise Refused("unclosed Rust block comment in result schema input")
+            output.append(" ")
+            index = end
+            continue
+        if next_pair == "#[":
+            end = _matching_delimiter(text, index + 1, "[", "]")
+            output.append(" ")
+            index = end + 1
+            continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _split_top_level(text: str, delimiter: str) -> list[str]:
+    """Split Rust declaration text at delimiters outside nested type syntax."""
+    result: list[str] = []
+    start = 0
+    angles = parens = brackets = braces = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == delimiter and angles == parens == brackets == braces == 0:
+            result.append(text[start:index])
+            start = index + 1
+            continue
+        if char == "<":
+            angles += 1
+        elif char == ">" and angles:
+            angles -= 1
+        elif char == "(":
+            parens += 1
+        elif char == ")":
+            parens -= 1
+        elif char == "[":
+            brackets += 1
+        elif char == "]":
+            brackets -= 1
+        elif char == "{":
+            braces += 1
+        elif char == "}":
+            braces -= 1
+    result.append(text[start:])
+    return result
+
+
+def _declaration_kind(declaration: str, name: str) -> str:
+    code = _strip_rust_comments_and_attributes(declaration)
+    match = re.search(
+        rf"\b(struct|enum|type)\s+{re.escape(name)}\b", code
+    )
+    if match is None:
+        for macro_name in _RESULT_TYPE_MACROS:
+            if f"{macro_name}!" in declaration:
+                return f"macro:{macro_name}"
+        raise Refused(f"result schema declaration kind for {name!r} is unsupported")
+    return match.group(1)
+
+
+def _type_expressions(declaration: str, name: str) -> list[str]:
+    """Read field/payload type expressions from one struct, enum or alias."""
+    code = _strip_rust_comments_and_attributes(declaration)
+    kind = _declaration_kind(declaration, name)
+    if kind.startswith("macro:"):
+        return []
+    if kind == "type":
+        alias = re.search(rf"\btype\s+{re.escape(name)}\b[^=]*=\s*(.*?);", code, re.S)
+        if alias is None:
+            raise Refused(f"type alias {name!r} could not be read exactly")
+        return [alias.group(1)]
+
+    header = re.search(rf"\b(?:struct|enum)\s+{re.escape(name)}\b", code)
+    assert header is not None
+    open_brace = code.find("{", header.end())
+    semicolon = code.find(";", header.end())
+    if kind == "struct" and semicolon >= 0 and (open_brace < 0 or semicolon < open_brace):
+        open_paren = code.find("(", header.end(), semicolon)
+        if open_paren < 0:
+            return []
+        close_paren = _matching_delimiter(code, open_paren, "(", ")")
+        return [
+            value.strip()
+            for value in _split_top_level(code[open_paren + 1 : close_paren], ",")
+            if value.strip()
+        ]
+    if open_brace < 0:
+        raise Refused(f"result schema declaration {name!r} has no body")
+    close_brace = _matching_delimiter(code, open_brace, "{", "}")
+    body = code[open_brace + 1 : close_brace]
+
+    def field_types(field_body: str) -> list[str]:
+        types: list[str] = []
+        for member in _split_top_level(field_body, ","):
+            parts = _split_top_level(member, ":")
+            if len(parts) < 2:
+                continue
+            types.append(":".join(parts[1:]).strip())
+        return types
+
+    if kind == "struct":
+        return field_types(body)
+
+    types = []
+    for variant in _split_top_level(body, ","):
+        open_paren = variant.find("(")
+        open_variant_brace = variant.find("{")
+        if open_variant_brace >= 0 and (open_paren < 0 or open_variant_brace < open_paren):
+            close_variant_brace = _matching_delimiter(
+                variant, open_variant_brace, "{", "}"
+            )
+            types.extend(field_types(variant[open_variant_brace + 1 : close_variant_brace]))
+        elif open_paren >= 0:
+            close_paren = _matching_delimiter(variant, open_paren, "(", ")")
+            types.extend(
+                value.strip()
+                for value in _split_top_level(variant[open_paren + 1 : close_paren], ",")
+                if value.strip()
+            )
+    return types
+
+
+_RUST_PRIMITIVE_TYPES = {
+    "bool", "char", "str", "String", "u8", "u16", "u32", "u64", "u128",
+    "usize", "i8", "i16", "i32", "i64", "i128", "isize", "f32", "f64",
+    "Self", "Box", "Vec", "Option", "Result", "BTreeMap", "BTreeSet",
+    "HashMap", "HashSet", "VecDeque", "Cow", "Arc", "Rc", "RefCell",
+    "Cell", "NonZeroU8", "NonZeroU16", "NonZeroU32", "NonZeroU64",
+}
+
+
+def _type_references(expression: str, generic_parameters: set[str]) -> set[str]:
+    """Return custom Rust type identifiers referenced by a field type."""
+    code = _strip_rust_comments_and_attributes(expression)
+    code = re.sub(r"'(?:[A-Za-z_][A-Za-z0-9_]*|_)", " ", code)
+    identifiers = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", code))
+    return {
+        identifier
+        for identifier in identifiers
+        if identifier[0].isupper()
+        and identifier not in _RUST_PRIMITIVE_TYPES
+        and identifier not in generic_parameters
+    }
+
+
+def _generic_parameters(declaration: str, name: str) -> set[str]:
+    code = _strip_rust_comments_and_attributes(declaration)
+    match = re.search(rf"\b(?:struct|enum|type)\s+{re.escape(name)}\b", code)
+    if match is None:
+        return set()
+    after_name = code[match.end() :]
+    generic_open = re.match(r"\s*<", after_name)
+    if generic_open is None:
+        return set()
+    open_angle = match.end() + generic_open.end() - 1
+    close_angle = _matching_delimiter(code, open_angle, "<", ">")
+    params = set()
+    for parameter in _split_top_level(code[open_angle + 1 : close_angle], ","):
+        found = re.match(r"\s*(?:const\s+)?(?:'([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))", parameter)
+        if found is not None:
+            params.add(found.group(1) or found.group(2))
+    return params
+
+
+def _collect_result_type_alias(lines: list[str], name: str) -> str:
+    header = re.compile(
+        rf"^\s*(?:(?:pub(?:\([^)]*\))?)\s+)?type\s+{re.escape(name)}\b"
+    )
+    for index, line in enumerate(lines):
+        if header.match(line) is None:
+            continue
+        first = _preceding_attributes_start(lines, index)
+        statement = lines[index]
+        end = index
+        while not statement_ends(statement) and end + 1 < len(lines):
+            end += 1
+            statement += " " + lines[end].strip()
+        if not statement_ends(statement):
+            raise Refused(f"result schema type alias {name!r} has no terminator")
+        return "\n".join(lines[first : index + 1] + lines[index + 1 : end + 1])
+    raise Refused(f"result schema type alias {name!r} is absent")
+
+
+def _preceding_attributes_start(lines: list[str], declaration_index: int) -> int:
+    """Return the start of adjacent attributes, including multiline groups."""
+    first = declaration_index
+    cursor = declaration_index - 1
+    while cursor >= 0:
+        if not lines[cursor].strip():
+            break
+        if lines[cursor].lstrip().startswith("//"):
+            break
+
+        depth = 0
+        group_start = None
+        for candidate_index in range(cursor, -1, -1):
+            candidate = lines[candidate_index]
+            if not candidate.strip() or candidate.lstrip().startswith("//"):
+                break
+            code = re.sub(r'"(?:\\.|[^"\\])*"', '""', candidate)
+            for char in reversed(code):
+                if char == "]":
+                    depth += 1
+                elif char == "[":
+                    depth -= 1
+            if depth == 0 and candidate.lstrip().startswith("#["):
+                group_start = candidate_index
+                break
+            if depth < 0:
+                break
+        if group_start is None:
+            break
+        first = group_start
+        cursor = group_start - 1
+    return first
+
+
+_RESULT_TYPE_MACROS = ("opaque_id", "string_id", "counter")
+
+
+def _collect_type_macro_type(lines: list[str], name: str, macro_name: str) -> str:
+    text = "\n".join(lines)
+    for match in re.finditer(rf"\b{re.escape(macro_name)}\s*!\s*\(", text):
+        opening = text.find("(", match.start())
+        closing = _matching_delimiter(text, opening, "(", ")")
+        invocation = text[match.start() : closing + 1]
+        without_line_comments = re.sub(r"(?m)//[^\n]*", "", invocation)
+        if re.search(rf"\b{re.escape(name)}\s*,", without_line_comments) is not None:
+            return invocation
+    raise Refused(f"{macro_name}! schema invocation {name!r} is absent")
+
+
+def _collect_type_macro_definition(lines: list[str], macro_name: str) -> str:
+    text = "\n".join(lines)
+    match = re.search(
+        rf"\bmacro_rules\s*!\s*{re.escape(macro_name)}\s*\{{", text
+    )
+    if match is None:
+        raise Refused(f"{macro_name}! macro definition is absent from its owner source")
+    opening = text.find("{", match.start())
+    closing = _matching_delimiter(text, opening, "{", "}")
+    return text[match.start() : closing + 1]
+
+
+def _collect_serde_impls(lines: list[str], name: str) -> list[str]:
+    text = "\n".join(lines)
+    implementations = []
+    for match in re.finditer(r"(?m)^\s*impl\b", text):
+        opening = _find_impl_body_opening(text, match.start())
+        if opening < 0:
+            raise Refused(f"serde impl for {name!r} has no body")
+        header = _strip_rust_comments_and_attributes(text[match.start() : opening])
+        if re.search(r"\b(?:Serialize|Deserialize)\b", header) is None:
+            continue
+        if re.search(
+            rf"\bfor\s+(?:[A-Za-z_][A-Za-z0-9_]*::)*{re.escape(name)}\b",
+            header,
+        ) is None:
+            continue
+        closing = _matching_delimiter(text, opening, "{", "}")
+        implementations.append(text[match.start() : closing + 1])
+    return implementations
+
+
+def _serde_impl_type_references(
+    implementation: str, generic_parameters: set[str]
+) -> set[str]:
+    """Find qualified owner types used by custom serde code, such as *Wire DTOs."""
+    code = _strip_rust_comments_and_attributes(implementation)
+    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
+    code = re.sub(r"\bserde_json\s*::\s*Value\b", " ", code)
+    names = set(re.findall(r"\b([A-Z][A-Za-z0-9_]*)\s*::", code))
+    serde_and_std_paths = {
+        "Deserialize", "Serialize", "Deserializer", "Serializer", "Error"
+    }
+    return {
+        name
+        for name in names
+        if name not in _RUST_PRIMITIVE_TYPES
+        and name not in generic_parameters
+        and name not in serde_and_std_paths
+    }
+
+
+def _implementation_generic_parameters(implementation: str) -> set[str]:
+    """Read generic names from a custom impl header so they are not owner types."""
+    opening = _find_impl_body_opening(implementation, 0)
+    if opening < 0:
+        raise Refused("custom serde implementation has no body")
+    header = _strip_rust_comments_and_attributes(implementation[:opening])
+    parameters: set[str] = set()
+
+    def add_parameter_names(generic_list: str) -> None:
+        for parameter in _split_top_level(generic_list, ","):
+            found = re.match(
+                r"\s*(?:const\s+)?(?:'([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))",
+                parameter,
+            )
+            if found is not None:
+                parameters.add(found.group(1) or found.group(2))
+
+    impl_generic = re.match(r"\s*impl\s*<", header)
+    if impl_generic is not None:
+        open_angle = impl_generic.end() - 1
+        close_angle = _matching_delimiter(header, open_angle, "<", ">")
+        add_parameter_names(header[open_angle + 1 : close_angle])
+
+    body = _strip_rust_comments_and_attributes(implementation)
+    for function in re.finditer(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*<", body):
+        open_angle = body.find("<", function.start())
+        close_angle = _matching_delimiter(body, open_angle, "<", ">")
+        add_parameter_names(body[open_angle + 1 : close_angle])
+    return parameters
+
+
+def _find_impl_body_opening(text: str, start: int) -> int:
+    """Find one impl body brace without confusing comments/generics for its body."""
+    angles = parens = brackets = 0
+    in_string = False
+    escaped = False
+    line_comment = False
+    block_comment = 0
+    index = start
+    while index < len(text):
+        char = text[index]
+        next_pair = text[index : index + 2]
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if next_pair == "/*":
+                block_comment += 1
+                index += 2
+            elif next_pair == "*/":
+                block_comment -= 1
+                index += 2
+            else:
+                index += 1
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if next_pair == "//":
+            line_comment = True
+            index += 2
+            continue
+        if next_pair == "/*":
+            block_comment = 1
+            index += 2
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "<":
+            angles += 1
+        elif char == ">" and angles:
+            angles -= 1
+        elif char == "(":
+            parens += 1
+        elif char == ")":
+            parens -= 1
+        elif char == "[":
+            brackets += 1
+        elif char == "]":
+            brackets -= 1
+        elif char == "{" and angles == parens == brackets == 0:
+            return index
+        elif char == ";" and angles == parens == brackets == 0:
+            return -1
+        index += 1
+    return -1
+
+
+def collect_result_schema_closure(
+    sources: dict[str, list[str]], roots: tuple[tuple[str, str], ...]
+) -> list[tuple[str, str, str]]:
+    """Resolve and fingerprint every custom type nested below accepted result roots."""
+    if len(set(roots)) != len(roots):
+        raise Refused("RESULT_SCHEMA_DECLARATIONS repeats a pinned owner declaration")
+    declarations: dict[tuple[str, str], tuple[str, str]] = {}
+    type_index: dict[str, list[tuple[str, str, str]]] = {}
+    for path, lines in sources.items():
+        for line in lines:
+            type_header = re.match(
+                r"^\s*(?:(?:pub(?:\([^)]*\))?)\s+)?(struct|enum)\s+([A-Z][A-Za-z0-9_]*)\b",
+                line,
+            )
+            if type_header is not None:
+                kind, name = type_header.groups()
+                type_index.setdefault(name, []).append((path, name, kind))
+                continue
+            alias_header = re.match(
+                r"^\s*(?:(?:pub(?:\([^)]*\))?)\s+)?type\s+([A-Z][A-Za-z0-9_]*)\b",
+                line,
+            )
+            if alias_header is not None:
+                name = alias_header.group(1)
+                type_index.setdefault(name, []).append((path, name, "type"))
+
+        text = "\n".join(lines)
+        for macro_name in _RESULT_TYPE_MACROS:
+            for match in re.finditer(rf"\b{re.escape(macro_name)}\s*!\s*\(", text):
+                opening = text.find("(", match.start())
+                closing = _matching_delimiter(text, opening, "(", ")")
+                invocation = text[match.start() : closing + 1]
+                invocation = re.sub(r"(?m)//[^\n]*", "", invocation)
+                declared = re.search(r"\b([A-Z][A-Za-z0-9_]*)\s*,", invocation)
+                if declared is not None:
+                    name = declared.group(1)
+                    candidate = (path, name, f"macro:{macro_name}")
+                    if candidate not in type_index.setdefault(name, []):
+                        type_index[name].append(candidate)
+
+    for name, candidates in type_index.items():
+        type_index[name] = list(dict.fromkeys(candidates))
+
+    pending = list(dict.fromkeys(roots))
+    visited: set[tuple[str, str]] = set()
+    while pending:
+        path, name = pending.pop(0)
+        key = (path, name)
+        if key in visited:
+            continue
+        if path not in sources:
+            raise Refused(f"result schema source {path!r} is not pinned in SOURCE_FILES")
+        macro_kind = next(
+            (
+                kind
+                for candidate_path, candidate_name, kind in type_index.get(name, [])
+                if candidate_path == path
+                and candidate_name == name
+                and kind.startswith("macro:")
+            ),
+            None,
+        )
+        if macro_kind is not None:
+            macro_name = macro_kind.removeprefix("macro:")
+            declaration = _collect_type_macro_type(sources[path], name, macro_name)
+            declaration = (
+                f"{macro_name}! macro definition\n"
+                + _collect_type_macro_definition(sources[path], macro_name)
+                + "\ninvocation\n"
+                + declaration
+            )
+        elif (path, name, "type") in type_index.get(name, []):
+            declaration = _collect_result_type_alias(sources[path], name)
+        else:
+            declaration = collect_result_declaration(sources[path], name)
+        kind = _declaration_kind(declaration, name)
+        serde_impls = _collect_serde_impls(sources[path], name)
+        if serde_impls:
+            declaration += "\ncustom serde implementations\n" + "\n".join(serde_impls)
+        declarations[key] = (kind, declaration)
+        visited.add(key)
+
+        generic_parameters = _generic_parameters(declaration, name)
+        dependencies: set[str] = set()
+        for expression in _type_expressions(declaration, name):
+            dependencies.update(_type_references(expression, generic_parameters))
+        for implementation in serde_impls:
+            dependencies.update(
+                _serde_impl_type_references(
+                    implementation,
+                    _implementation_generic_parameters(implementation),
+                )
+            )
+        for dependency in sorted(dependencies):
+            candidates = type_index.get(dependency, [])
+            if not candidates:
+                raise Refused(
+                    f"result schema type {path}:{name} references unresolved non-primitive "
+                    f"type {dependency!r}"
+                )
+            if len(candidates) == 1:
+                selected = candidates[0]
+            else:
+                distinct = sorted({candidate[0] for candidate in candidates})
+                raise Refused(
+                    f"result schema type {path}:{name} references ambiguous type "
+                    f"{dependency!r} in {distinct!r}"
+                )
+            pending.append((selected[0], selected[1]))
+
+    return [
+        (path, name, declarations[(path, name)][1])
+        for path, name in sorted(visited)
+    ]
 
 
 def collect_result_deserializer(lines: list[str], name: str) -> str:
@@ -1149,14 +1766,11 @@ def build(root: str) -> tuple[str, dict[str, int]]:
         )
         for name, member_constant in RESULT_SCHEMA_STRUCTS
     ]
-    result_declarations = [
-        (
-            path,
-            name,
-            collect_result_declaration(sources[path], name),
-        )
-        for path, name in RESULT_SCHEMA_DECLARATIONS
-    ]
+    if len(set(RESULT_SCHEMA_STRUCTS)) != len(RESULT_SCHEMA_STRUCTS):
+        raise Refused("RESULT_SCHEMA_STRUCTS repeats a pinned owner struct")
+    result_declarations = collect_result_schema_closure(
+        sources, RESULT_SCHEMA_DECLARATIONS
+    )
     result_schema_lines = [
         f"{path}\t{name}\n{declaration}"
         for path, name, declaration in result_declarations
@@ -1171,6 +1785,10 @@ def build(root: str) -> tuple[str, dict[str, int]]:
     result_schema_digest = hashlib.sha256(
         "\n".join(result_schema_lines).encode("utf-8")
     ).hexdigest()
+    if len(set(RESULT_SCHEMA_ENUMS)) != len(RESULT_SCHEMA_ENUMS) or len(
+        {(path, name) for path, name, _constant in RESULT_SCHEMA_ENUMS}
+    ) != len(RESULT_SCHEMA_ENUMS):
+        raise Refused("RESULT_SCHEMA_ENUMS repeats a pinned owner enum")
     result_enums = [
         (name, value_constant, collect_result_enum(sources[path], name))
         for path, name, value_constant in RESULT_SCHEMA_ENUMS

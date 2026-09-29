@@ -1053,7 +1053,7 @@ public static class UserAutomationOutcomeClassifier
     // Regeneration is refused unless this decoder explicitly acknowledges the
     // Rust result/transition schema digest. Update only with a reviewed decoder
     // change; the generated mirror alone must not widen the accepted wire.
-    private const string SupportedUserAutomationResultSchemaSha256 = "a4d89da9b0ebfe6474b7a39b293a104749804bf42f4d81d72ff7d51a2e47b8d9";
+    private const string SupportedUserAutomationResultSchemaSha256 = "30ebaa34afb15650f576a87522ac2f47f4e367256b31f1ffb8e06d6eb44328e8";
     private const int MaxTypedEnvelopeChars = 8_192;
     private const int MaxIdentityChars = 256;
     // The Kernel's bounded idempotency key is prefixed in operation_id.
