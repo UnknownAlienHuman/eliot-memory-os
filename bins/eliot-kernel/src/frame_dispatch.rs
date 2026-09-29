@@ -12,9 +12,8 @@
 
 use super::daemon_request_dispatch::{
     AGENT_BRIDGE_REACTIVE_LEDGER_MUTATION_OPERATION, DAEMON_STARTUP_EVIDENCE_OPERATION,
-    NOTIFICATION_STATE_MUTATION_OPERATION,
-    NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
-    USER_AUTOMATION_RUNTIME_OPERATION,
+    NOTIFICATION_STATE_MUTATION_OPERATION, NOTIFICATION_STATE_READ_OPERATION,
+    USER_AUTOMATION_OPERATOR_OPERATION, USER_AUTOMATION_RUNTIME_OPERATION,
 };
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
@@ -912,7 +911,7 @@ impl KernelComposition {
                         .metadata
                         .session_id
                         .as_ref()
-                        .map(|session_id| session_id.as_str())
+                        .map(eliot_contracts::SessionId::as_str)
                         != Some(request.session_id.as_str())
                 {
                     return Err(TransportError::SessionFenced);

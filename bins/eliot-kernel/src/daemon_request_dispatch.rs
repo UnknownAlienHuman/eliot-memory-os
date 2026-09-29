@@ -8027,7 +8027,7 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
+    pub(crate) fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
         self.canonical_store_gateway
             .lock()
             .map_err(|_| TransportError::SessionFenced)?

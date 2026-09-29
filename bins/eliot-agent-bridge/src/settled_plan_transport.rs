@@ -281,6 +281,22 @@ impl SettledPlanAdmission {
         });
     }
 
+    fn apply_batch_invalidations(
+        &mut self,
+        runner: &mut BridgeRunner,
+        batch: &BridgeAdmissionBatch,
+        live_session: &str,
+    ) -> usize {
+        let mut applied = 0;
+        for invalidation in &batch.invalidations {
+            if invalidation.session_id.as_str() == live_session {
+                applied += runner.invalidate_reactive_cue(invalidation);
+                self.invalidate_cue(invalidation);
+            }
+        }
+        applied
+    }
+
     /// Records one presented evidence tuple, rotating the oldest out at the bound.
     fn note_presented(&mut self, identity: ReplayIdentity) {
         if self.seen.len() >= MAX_TRANSPORT_REPLAY_KEYS {
@@ -332,14 +348,7 @@ impl SettledPlanAdmission {
                 live_session: live_session.clone(),
             });
         }
-        let mut invalidations_applied = 0;
-        for invalidation in &batch.invalidations {
-            if invalidation.session_id.as_str() != live_session {
-                continue;
-            }
-            invalidations_applied += runner.invalidate_reactive_cue(invalidation);
-            self.invalidate_cue(invalidation);
-        }
+        let invalidations_applied = self.apply_batch_invalidations(runner, batch, &live_session);
         let mut report = PlanAdmissionReport {
             session_id: live_session.clone(),
             invalidations_applied,

@@ -4,9 +4,9 @@ mod request_input;
 
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
-    CurrentAssessment, DeliveryPoint, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
-    ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile,
-    TransportAdmissionError, TransportProfile, UnderstandingBootstrap, UseOutcome,
+    CurrentAssessment, DeliveryPoint, DeliveryStatus, FiringEvidence, HotResourceView,
+    InjectionReceipt, ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue,
+    Profile, TransportAdmissionError, TransportProfile, UnderstandingBootstrap, UseOutcome,
     kernel_ports_with_declaration, loopback_http_route, parse_args, reactive_runtime_composition,
     validate_credential, validate_host, validate_origin,
 };
@@ -1503,7 +1503,7 @@ fn handle_forward_hook_durable(
         Ok(()) => match commit_pending_reactive_delivery(
             runner,
             port,
-            DeliveryPoint::HostHook {
+            &DeliveryPoint::HostHook {
                 hook_id: event.event_id.as_str().to_owned(),
             },
         ) {
@@ -1555,7 +1555,7 @@ fn handle_forward_event(
             match commit_pending_reactive_delivery(
                 runner,
                 port,
-                DeliveryPoint::NextBridgeResponse {
+                &DeliveryPoint::NextBridgeResponse {
                     response_id: response_id.clone(),
                 },
             ) {
@@ -1614,7 +1614,7 @@ fn drain_reactive_pending_into_invocation(
         match commit_pending_reactive_delivery(
             runner,
             port,
-            DeliveryPoint::NextBridgeResponse {
+            &DeliveryPoint::NextBridgeResponse {
                 response_id: correlation_id.to_owned(),
             },
         ) {
@@ -1629,20 +1629,16 @@ fn drain_reactive_pending_into_invocation(
 fn commit_pending_reactive_delivery(
     runner: &mut BridgeRunner,
     port: &mut dyn KernelHostRequestPort,
-    delivery: DeliveryPoint,
+    delivery: &DeliveryPoint,
 ) -> Result<Vec<InjectionReceipt>, BridgeError> {
-    reactive_runtime_composition::mutate_reactive_ledger(
-        runner,
-        port,
-        |candidate, session_id| {
-            candidate
-                .pending_item_ids(session_id)
-                .into_iter()
-                .map(|item_id| candidate.deliver(&item_id, delivery.clone()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| BridgeError::ProviderContract(error.to_string()))
-        },
-    )
+    reactive_runtime_composition::mutate_reactive_ledger(runner, port, |candidate, session_id| {
+        candidate
+            .pending_item_ids(session_id)
+            .into_iter()
+            .map(|item_id| candidate.deliver(&item_id, delivery.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))
+    })
 }
 
 /// Admits one live reactive-context injection through the stdio intake.
