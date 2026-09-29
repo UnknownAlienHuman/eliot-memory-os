@@ -105,15 +105,16 @@ use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
     KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
-    NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
-    TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
-    advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
+    NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
+    NativeWorkerExecutableBindingPublication, TestdAdmission, TestdAdmissionAttemptRequest,
+    TestdAdmissionEnvelope, TestdAdmissionResponse, advertise_doctor_repair,
+    advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
     handle_doctor_repair_cancellation, handle_testd_admission_attempt, handle_testd_cancellation,
     reconcile_testd_admission,
 };
 use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
-    NativeWorkerClaimRecord, OperationIdentity,
+    NativeWorkerClaimRecord, NativeWorkerClaimState, OperationIdentity,
 };
 use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
@@ -4017,6 +4018,11 @@ pub struct ReadyNativeWorkerLaunch {
     pub authority_epoch: EpochId,
     /// Live activation generation bound at admission.
     pub generation: Generation,
+    /// Exact request retained for pre-spawn comparison with the durable
+    /// ORS claim and Governor owner record.
+    request: NativeWorkerClaimRequest,
+    /// Original Governor digest loaded from the durable owner publication.
+    owner_binding_digest: String,
 }
 
 /// Outcome of one native-worker admit-then-launch call.
@@ -4069,10 +4075,10 @@ pub enum NativeWorkerLaunchOutcome {
 /// material written to the protected dispatch file, ready to spawn.
 ///
 /// Sequence: validate the child binding plus the closed claim shape and
-/// canonical digest; admit through live service authority plus the ORS
-/// claim table (`KernelService::admit_native_worker_claim` — the existing
-/// vocabulary, never a parallel one; exact replays rebuild the original
-/// receipt); reserve the original claim identity single-flight (changed
+/// canonical digest; load the original Governor owner record from the ORS
+/// claim row; admit through live service authority plus that exact record
+/// (`KernelService::admit_native_worker_claim_with_expectation`); reserve
+/// the original claim identity single-flight (changed
 /// terms under one identity refuse with `ChangedTerms`); mint the
 /// replay-stable nonce; write the admitted claim plus the launch grant
 /// through [`write_material_file`]. Nothing is spawned here:
@@ -4120,15 +4126,40 @@ pub fn prepare_native_worker_launch(
             "admission time must be non-zero milliseconds".to_owned(),
         ));
     }
+    let owner_binding =
+        load_native_worker_executable_binding_for_launch(kernel, &material.request.claim_id)?
+            .map(|(_, binding)| binding);
+    if let Some(owner) = owner_binding.as_ref() {
+        if owner.installation_id != contour.principal_owner {
+            return Err(DispatchLaunchError::Inconsistent(
+                "native-worker Governor owner binding belongs to another installation".to_owned(),
+            ));
+        }
+        let live_fence = kernel.current_state_fence().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "current state fence is unavailable for native-worker owner binding".to_owned(),
+            )
+        })?;
+        if live_fence != owner.state_fence {
+            return Err(DispatchLaunchError::Inconsistent(
+                "native-worker owner binding is not current for the live state fence".to_owned(),
+            ));
+        }
+    }
     let (authority_epoch, generation, response) = {
         let service = kernel
             .service
             .lock()
             .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        let expectation = owner_binding
+            .as_ref()
+            .map(NativeWorkerExecutableBindingPublication::to_kernel_expectation);
         let response = service
-            .admit_native_worker_claim(
+            .admit_native_worker_claim_with_expectation(
                 kernel.generation_gateway.ors.as_ref(),
                 material.request,
+                owner_binding.as_ref(),
+                expectation.as_ref(),
                 now_unix_ms,
             )
             .map_err(gate_error)?;
@@ -4144,7 +4175,7 @@ pub fn prepare_native_worker_launch(
         ));
     }
     let receipt = match response {
-        NativeWorkerClaimResponse::Admitted(receipt) => receipt,
+        NativeWorkerClaimResponse::Admitted(receipt) => *receipt,
         refused => return Ok(PreparedNativeWorkerLaunch::Refused(Box::new(refused))),
     };
     require_digest(
@@ -4164,6 +4195,14 @@ pub fn prepare_native_worker_launch(
             "native receipt does not answer the presented claim".to_owned(),
         ));
     }
+    let owner_binding_digest = owner_binding
+        .as_ref()
+        .map(|binding| binding.binding_digest.clone())
+        .ok_or_else(|| {
+            DispatchLaunchError::Inconsistent(
+                "native-worker admission has no persisted Governor owner binding".to_owned(),
+            )
+        })?;
     let admitted_at_nanos = receipt
         .admitted_at_unix_ms
         .checked_mul(1_000_000)
@@ -4278,7 +4317,172 @@ pub fn prepare_native_worker_launch(
         working_directory: material.working_directory.to_path_buf(),
         authority_epoch,
         generation,
+        request: material.request.clone(),
+        owner_binding_digest,
     }))
+}
+
+/// Loads and verifies the immutable Governor executable owner record retained
+/// on the existing ORS claim row. The full record, its original digest, and
+/// its Kernel projection must all agree; a request projection is never used to
+/// reconstruct missing owner data.
+fn load_native_worker_executable_binding_for_launch(
+    kernel: &KernelComposition,
+    claim_id: &str,
+) -> Result<
+    Option<(
+        NativeWorkerClaimRecord,
+        NativeWorkerExecutableBindingPublication,
+    )>,
+    DispatchLaunchError,
+> {
+    let claim_key = OperationIdentity::new(claim_id)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let Some(record) = kernel
+        .generation_gateway
+        .ors
+        .load_native_worker_claim(&claim_key)
+        .map_err(gate_error)?
+    else {
+        return Ok(None);
+    };
+    record
+        .validate()
+        .map_err(|error| DispatchLaunchError::Inconsistent(error.to_string()))?;
+    if record.claim_id.as_str() != claim_id {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native-worker ORS claim key disagrees with its durable row".to_owned(),
+        ));
+    }
+    let binding = match (
+        record.executable_binding_digest.as_deref(),
+        record.executable_binding_record_json.as_deref(),
+        record.executable_binding_projection.as_ref(),
+    ) {
+        (None, None, None) => return Ok(None),
+        (Some(digest), Some(record_json), Some(projection)) => {
+            let binding: NativeWorkerExecutableBindingPublication =
+                serde_json::from_str(record_json).map_err(|error| {
+                    DispatchLaunchError::Inconsistent(format!(
+                        "native-worker Governor owner record is malformed: {error}"
+                    ))
+                })?;
+            binding.validate_original_binding().map_err(gate_error)?;
+            let canonical_record_json = binding.canonical_record_json().map_err(gate_error)?;
+            if canonical_record_json != record_json
+                || binding.binding_digest != digest
+                || binding.to_ors_projection() != *projection
+                || binding.claim_id != claim_id
+            {
+                return Err(DispatchLaunchError::Inconsistent(
+                    "native-worker Governor owner record disagrees with its ORS digest, projection, or claim identity".to_owned(),
+                ));
+            }
+            binding
+        }
+        _ => {
+            return Err(DispatchLaunchError::Inconsistent(
+                "native-worker ORS row has an incomplete Governor owner binding".to_owned(),
+            ));
+        }
+    };
+    Ok(Some((record, binding)))
+}
+
+/// Revalidates the same durable Governor owner record and admitted claim
+/// immediately before process creation. A changed owner row, claim receipt,
+/// request, live fence, epoch, service generation, or deadline blocks spawn.
+fn revalidate_ready_native_worker_launch_owner(
+    kernel: &KernelComposition,
+    ready: &ReadyNativeWorkerLaunch,
+) -> Result<(), DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let receipt = ready.receipt.as_ref();
+    receipt.validate().map_err(gate_error)?;
+    ready.request.validate().map_err(gate_error)?;
+    ready
+        .request
+        .validate_canonical_digest()
+        .map_err(gate_error)?;
+    let Some((record, owner)) =
+        load_native_worker_executable_binding_for_launch(kernel, &receipt.claim_id)?
+    else {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native-worker owner binding disappeared before spawn".to_owned(),
+        ));
+    };
+    if record.state != NativeWorkerClaimState::Admitted
+        || record.receipt_digest.as_deref() != Some(receipt.receipt_digest.as_str())
+        || record.admitted_at_unix_ms != Some(receipt.admitted_at_unix_ms)
+        || record.binding_digest != ready.request.binding_digest
+        || record.request_digest != ready.request.request_digest
+        || record.executable_binding_digest.as_deref() != Some(ready.owner_binding_digest.as_str())
+        || owner.binding_digest != ready.owner_binding_digest
+        || owner.installation_id != contour.principal_owner
+        || receipt.claim_id != ready.request.claim_id
+        || receipt.binding_digest != ready.request.binding_digest
+        || !receipt
+            .authority_epoch
+            .is_same_authority(&owner.authority_epoch)
+        || receipt.state_fence != owner.state_fence
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native-worker ORS claim no longer matches its admitted request and Governor owner record".to_owned(),
+        ));
+    }
+    let now_unix_ms = super::unix_ms();
+    if now_unix_ms == 0
+        || now_unix_ms >= ready.request.deadline_unix_ms
+        || now_unix_ms >= owner.deadline_unix_ms
+        || now_unix_ms >= owner.expires_at_unix_ms
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native-worker owner binding or claim deadline elapsed before spawn".to_owned(),
+        ));
+    }
+    ready
+        .request
+        .require_executable_binding(&owner.to_kernel_expectation(), now_unix_ms)
+        .map_err(gate_error)?;
+    let live_fence = kernel.current_state_fence().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "current state fence is unavailable before native-worker spawn".to_owned(),
+        )
+    })?;
+    if live_fence != owner.state_fence {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native-worker owner state fence changed before spawn".to_owned(),
+        ));
+    }
+    let service = kernel
+        .service
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+    let live_epoch = service.authority_epoch();
+    let active_generation = service
+        .activation_receipt()
+        .map_or(0, |activation| activation.generation.value());
+    if service.state() != KernelServiceState::Ready
+        || service.generation_fenced()
+        || active_generation != ready.generation.get()
+        || !live_epoch.is_same_authority(&owner.authority_epoch)
+        || !live_epoch.is_same_authority(&ready.authority_epoch)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "native-worker live Kernel authority changed before spawn".to_owned(),
+        ));
+    }
+    if !service
+        .reconcile_native_worker_claim_admission(receipt, &ready.request)
+        .map_err(gate_error)?
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native-worker admission receipt no longer answers its request".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Spawns one prepared native-worker launch through the admitted process
@@ -4293,6 +4497,7 @@ pub async fn start_ready_native_worker_launch(
     kernel: &KernelComposition,
     ready: &ReadyNativeWorkerLaunch,
 ) -> Result<ChildStartOutcome, DispatchLaunchError> {
+    revalidate_ready_native_worker_launch_owner(kernel, ready)?;
     match spawn_ready_child(
         kernel,
         &SpawnInputs {
