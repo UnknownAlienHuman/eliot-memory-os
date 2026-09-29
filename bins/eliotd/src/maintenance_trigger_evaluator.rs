@@ -200,15 +200,23 @@ impl DaemonComposition {
         // a transported fence claim is not a current observation.
         let state_fence = self.governor.kernel_snapshot().state_fence().clone();
         let scope_ref = scope_ref_for(&state_fence);
-        // The trigger identity carries the catalog's deduplication scope, so
-        // the identity that duplicate suppression compares states which scope
-        // it is, and `MaintenanceController::admit`'s job identity inherits it.
-        let trigger_id = format!(
-            "{}:{}:{}:{scope_ref}",
-            entry.dedup.scope_name(),
-            observation.origin.as_str(),
-            observation.family
-        );
+        // The trigger identity is the catalog's canonical deduplication key,
+        // so the identity that duplicate suppression compares states which
+        // family, event, scope, subset and generation it is, and
+        // `MaintenanceController::admit`'s job identity inherits it. The board
+        // lookup and the job lookup both consume this same key. This daemon
+        // observes no subset identity, so a `FamilyScopeAndSubset` trigger
+        // fails closed here rather than coalescing work across subsets it
+        // cannot distinguish.
+        let trigger_id = entry.dedup.dedup_key(
+            &crate::maintenance_family_catalog::MaintenanceDedupIdentity {
+                family: observation.family,
+                origin: observation.origin.as_str(),
+                scope_ref: &scope_ref,
+                subset_ref: None,
+                resource_generation: state_fence.resource_generation.value(),
+            },
+        )?;
         let (input, notification_evidence) = {
             // Owner evidence for every gate (I14.22/I14.24, issue #1692). Each
             // value is derived from a Governor-owned evidence owner or held at
@@ -273,7 +281,18 @@ impl DaemonComposition {
         // dependency or absent Durable Job route that stops it today. A
         // triggered family is therefore never silently ignored, and no family
         // is ever reported as having run.
-        entry.record_start_route(&decision);
+        //
+        // The observed evidence is bound separately from the Governor
+        // projection: the trigger event, the evidence identities actually
+        // seen at this call site, and the selected policy revision travel
+        // beside the decision rather than being projected from the catalog's
+        // requirement lists, and each missing binding stays explicit.
+        let observed = crate::maintenance_family_catalog::MaintenanceObservedEvidence {
+            trigger_event: observation.origin.as_str(),
+            observed_refs: input.evidence_refs.clone(),
+            policy_revision: notification_evidence.policy.revision,
+        };
+        entry.record_start_route(&decision, observed);
         Ok((decision, notification_evidence))
     }
 
