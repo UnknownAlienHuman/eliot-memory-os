@@ -379,6 +379,10 @@ pub(crate) enum CurrentUserSupervisionCredentialProvisionOutcome {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WindowsCurrentUserSupervisionCredentialProvider;
 
+#[allow(
+    clippy::unused_self,
+    reason = "the provider methods are kept as an opaque instance boundary"
+)]
 impl WindowsCurrentUserSupervisionCredentialProvider {
     /// Creates a provider without opening or changing Credential Manager.
     #[must_use]
