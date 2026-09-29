@@ -1365,6 +1365,29 @@ pub struct PacketAdmissionBundle {
     pub measurements: Vec<AdmissionMeasurement>,
 }
 
+/// Owner-minted admission pieces closed into one bundle.
+///
+/// The future suppliers (Decision Safety Floor owner, candidate-policy
+/// owner, quality scorecard owner, route capacity/measurement owner) hand
+/// these pieces to [`PacketAdmissionBundle::build`], which validates each
+/// through its owner's own `validate` and proves closure over one
+/// compilation. Grouped so the builder takes an owner-pieces value instead
+/// of a long argument list.
+pub struct PacketAdmissionParts {
+    /// Owner-minted protected floor identity.
+    pub floor: SafetyFloorIdentity,
+    /// Owner-minted priority policy identity.
+    pub priority: PriorityPolicyIdentity,
+    /// Owner-minted admission rule identity.
+    pub rule: AdmissionRuleIdentity,
+    /// Owner-minted measurement composition profile.
+    pub measurement_profile: MeasurementCompositionProfile,
+    /// Caller-supplied omission bindings the decision must close over.
+    pub supplied_omissions: Vec<SuppliedOmissionBinding>,
+    /// Caller-supplied measurements the decision must close over.
+    pub measurements: Vec<AdmissionMeasurement>,
+}
+
 impl PacketAdmissionBundle {
     /// Builds the one validated admission closure for a packet compilation
     /// from owner-minted pieces (#2564 I3).
@@ -1393,15 +1416,18 @@ impl PacketAdmissionBundle {
     /// they do, the campaign packet reports the unbound-closure gap instead
     /// of compiling.
     pub fn build(
-        floor: SafetyFloorIdentity,
-        priority: PriorityPolicyIdentity,
-        rule: AdmissionRuleIdentity,
-        measurement_profile: MeasurementCompositionProfile,
-        supplied_omissions: Vec<SuppliedOmissionBinding>,
-        measurements: Vec<AdmissionMeasurement>,
+        parts: PacketAdmissionParts,
         recipe: &ContextRecipe,
         binding: &ContextBinding,
     ) -> Result<Self, PacketCompositionError> {
+        let PacketAdmissionParts {
+            floor,
+            priority,
+            rule,
+            measurement_profile,
+            supplied_omissions,
+            measurements,
+        } = parts;
         floor
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
@@ -1543,12 +1569,14 @@ impl KernelContextReadClient {
             .validate()
             .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
         let admission = PacketAdmissionBundle::build(
-            floor,
-            priority,
-            rule,
-            measurement_profile,
-            supplied_omissions,
-            measurements,
+            PacketAdmissionParts {
+                floor,
+                priority,
+                rule,
+                measurement_profile,
+                supplied_omissions,
+                measurements,
+            },
             recipe,
             &request.binding,
         )?;
