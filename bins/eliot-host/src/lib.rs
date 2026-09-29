@@ -5638,6 +5638,13 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
         // The type-checked routing is the decision: a table marker string is
         // never followed.
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {
+            // F-LOG-HOST-8 (#983 W3/W4): the live cutover dispatch contour, on
+            // the one production cutover ingress. This is the observation of the
+            // OWNER's routing decision only - it names the closed-table miss and
+            // nothing about any cutover's effect, and the refusal below is
+            // returned unchanged with the same operation and the same reason, so
+            // the owner's return value, ordering and text are untouched.
+            crate::backup_cutover::observe_live_cutover_dispatch(operation, None, false);
             return Err(refusal(
                 "no Host backup owner operation is registered for this method",
             ));
@@ -5649,10 +5656,34 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
         if HostComposition::backup_dispatch_needs_cutover_admission(operation)
             != eliot_host_control_endpoint::backup::requires_cutover_admission(operation)
         {
+            // #983: a stale cutover registration is observed as exactly that and
+            // never as a cutover progress or disposition claim, because nothing
+            // ran and nothing was admitted.
+            crate::backup_cutover::observe_live_cutover_dispatch(
+                operation,
+                Some(target),
+                HostComposition::backup_dispatch_needs_cutover_admission(operation)
+                    .unwrap_or_default(),
+            );
             return Err(refusal(
                 "registered cutover admission diverges from the accepted Host backup table",
             ));
         }
+        // #983: the live cutover ADMISSION point. This records the owner's own
+        // routing and cutover-admission decision for this operation - a routed
+        // cutover proves only that it selected the cutover target, never that it
+        // activated anything, so the observed disposition stays "none" and
+        // rehearsal can never reach a cutover word from here. The typed refusal
+        // below (no separately admitted cutover body is retained) is returned
+        // unchanged: this is the leaf's nonterminal evidence, and the outer
+        // dispatch boundary owns the single terminal record per failed
+        // operation.
+        crate::backup_cutover::observe_live_cutover_dispatch(
+            operation,
+            Some(target),
+            HostComposition::backup_dispatch_needs_cutover_admission(operation)
+                .unwrap_or_default(),
+        );
         Err(refusal(match target {
             BackupDispatchTarget::Prepare => {
                 "no owner-issued admitted isolated-restore preparation is retained by this Host"
