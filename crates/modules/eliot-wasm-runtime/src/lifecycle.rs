@@ -978,12 +978,7 @@ pub fn route_rollback(
             field: "rollback.in_flight",
         })?;
     let route_digest = canonical_digest(&(
-        &request.cutover_id,
-        &request.route_scope,
-        request.from_generation,
-        request.to_generation,
-        request.old_epoch,
-        request.new_epoch,
+        &request.cutover,
         &request.in_flight,
         request.snapshot_strategy,
         request.state_compatible,
@@ -992,12 +987,9 @@ pub fn route_rollback(
         detail: error.to_string(),
     })?;
     Ok(RollbackRouteProposal {
-        cutover_id: request.cutover_id.clone(),
-        route_scope: request.route_scope.clone(),
-        from_generation: request.from_generation,
-        to_generation: request.to_generation,
-        old_epoch: request.old_epoch,
-        new_epoch: request.new_epoch,
+        cutover_id: request.cutover.cutover_id.clone(),
+        route_scope: request.cutover.route_scope.clone(),
+        cutover: request.cutover.clone(),
         in_flight_count,
         snapshot_strategy: request.snapshot_strategy,
         route_digest,
