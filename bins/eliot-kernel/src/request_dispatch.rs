@@ -83,19 +83,24 @@
 //!   predecessor's durable namespace digest plus its canonical request hash — and
 //!   only after the route has proved the caller is admitted for the front door in the
 //!   same `WorkScope` and on the same authority LINEAGE, the named predecessor is the
-//!   same principal's, and the presented archive is the predecessor's archive. That
+//!   same principal's, and the capture owner re-decides the presented bytes and
+//!   re-proves that this is the same operation the named row holds
+//!   (`owner_reproves_predecessor_operation`). That
 //!   is the ONLY case `successor_of` exists for: the key cannot otherwise separate a
 //!   non-owner from the operation it wants to read. The verify payload is therefore
 //!   `{bundle_hex}` or `{bundle_hex, successor_of}`.
 //!
 //!   The succession evidence is CALLER-PRESENTED, not owner-issued, and the route
-//!   does not pretend otherwise. It is scope-guarded, the authorization checks
-//!   answer with ONE static sentence that names no class, the integrity/no-row arms
-//!   answer with the fail-closed `verification_not_recorded_reply`, and the original
-//!   operation identity is preserved on the answer. What it cannot prove is
-//!   that the owner would authorise THIS caller to reconcile THAT operation, because
-//!   no owner issues a backup-verify succession or reconciliation receipt on this
-//!   product; that owner is `backup-capture-owner (#959)`, OPEN. Nothing here invents
+//!   does not pretend otherwise. It is a POINTER, never an authorization: the pair
+//!   only selects which row is read, and the route is scope-guarded, the
+//!   authorization checks answer with ONE static sentence that names no class, the
+//!   integrity/no-row arms answer with the fail-closed
+//!   `verification_not_recorded_reply`, and the original operation identity is
+//!   preserved on the answer. What the evidence cannot do is authorize a REPEAT
+//!   reconciliation, because no owner issues a one-shot backup-verify succession or
+//!   reconciliation receipt on this product; that owner is `backup-capture-owner
+//!   (#959)`, OPEN. What it CAN do, and does, is force the owner to re-decide the
+//!   named operation: nothing here invents
 //!   a capability, a receipt type, or an owner value to paper over that.
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
