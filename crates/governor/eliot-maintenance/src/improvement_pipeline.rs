@@ -1160,10 +1160,22 @@ impl ImprovementUnknownEffect {
     ///
     /// The two comparable identities are the owner-side operation id and
     /// idempotency key against this obligation's committed logical operation and
-    /// idempotency namespace: the same pair the receipt owner itself binds a
-    /// terminal outcome to, and the same pair the attaching seam refuses on. The
-    /// owner's effect payload digest is deliberately not compared here because it
-    /// digests the effect payload, while [`ProposalCommitment::digest`] digests
+    /// idempotency namespace, and they are the same pair on the write seam and on
+    /// the read side. What that pair is NOT is an identity the effect owner
+    /// already relates to this pipeline: the receipt owner's own
+    /// `validate_terminal_receipt` relates the receipt's operation binding to the
+    /// authorized effect's, both inside the receipt, and never to a
+    /// [`ProposalCommitment`]. On the live improvement path
+    /// `ProposalCommitment.operation_ref` carries a maintenance-observation
+    /// identity, so no `OperationBinding` derived from it exists anywhere yet.
+    /// The comparison is therefore a fail-closed binding, not an established
+    /// correspondence: a receipt minted for a different operation is refused, and
+    /// until an owner mints one for this operation there is simply no receipt to
+    /// accept. That direction is the safe one, and it is why binding on this pair
+    /// is preferred over binding on nothing at all.
+    ///
+    /// The owner's effect payload digest is deliberately not compared here because
+    /// it digests the effect payload, while [`ProposalCommitment::digest`] digests
     /// the whole normalized proposal envelope, so the two are not the same
     /// preimage and matching them would assert an identity neither owner defines.
     fn owning_outcome(&self) -> Option<&EffectReceipt> {
