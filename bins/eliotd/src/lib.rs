@@ -53,7 +53,6 @@ pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
-mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
@@ -108,7 +107,6 @@ mod skill_bridge_adapter;
 pub mod skill_dispatch;
 mod skill_evidence_read;
 mod skill_lifecycle_adapters;
-mod skill_surface_adapters;
 pub mod solo_agent_driver;
 pub mod staffing_policy;
 pub mod startup_capability_bindings;
@@ -139,8 +137,6 @@ pub use agent_fabric::{
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
-use controlboard_adapters::SharedOperatorReplay;
-
 pub use canonical_config_precedence::{
     ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
     ResolvedContribution, canonical_layer_json_schema, canonical_layer_json_schema_pretty,
@@ -163,11 +159,6 @@ pub use capability_outcome::{
     DegradationScope, FallbackOutcomeRequest, GenerationChallengeOutcomeRequest,
     OutcomeDisposition, OutcomeError, SURVIVING_OPERATION_PREFIX, fallback_outcome,
     generation_challenge_outcome, project_degradation, removed_promise, surviving_operation,
-};
-pub use controlboard_adapters::{
-    CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
-    controlboard_notification_refresh_refusal_body, controlboard_result_body,
-    is_controlboard_read_tool, serve_controlboard_view,
 };
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 #[cfg(windows)]
@@ -528,20 +519,6 @@ pub struct DaemonComposition {
     config_path: PathBuf,
     state_root: PathBuf,
     started: bool,
-    /// Process-retained operator replay handle shared by every board built
-    /// through [`DaemonComposition::controlboard`].
-    ///
-    /// Volatile fast path only, never durability: a newly created board
-    /// replays an already-admitted operation without a second effecting-port
-    /// call while the process lives. Cross-restart durability is NOT owned by
-    /// Kernel ORS through an async Governor operator borrow: the borrow reaches
-    /// only `KernelTransitionPort::receipt`, whose `eliot_store_api::WriteReceipt`
-    /// carries neither the `session_id` nor the `access_digest` a reconciled
-    /// board receipt must carry, so the contract this would need is a
-    /// command-receipt projection read for the exact `OperationId` that no
-    /// reachable port returns. Post-commit refreshes retain this handle without
-    /// ever clearing it.
-    operator_replay: SharedOperatorReplay,
     /// Set when a post-commit refresh fails after the write receipt was
     /// already durable. The dependent view is stale/pending until the caller
     /// drops this composition and re-runs authenticated connect+start.
@@ -571,15 +548,14 @@ pub struct DaemonComposition {
     /// retained receipt instead of re-deriving expectations for an
     /// already-attempted key, so retry converges by construction without
     /// weakening the triple rule and without minting new operation
-    /// identities. Volatile fast path only, like `operator_replay`: durable
+    /// identities. Volatile fast path only: durable
     /// truth stays with the owner receipts, never with this map.
     committed_experience: BTreeMap<String, eliot_store_api::WriteReceipt>,
     /// Already-validated Kernel-issued owner session facts threaded once by
     /// the daemon runtime where the concrete client and this composition meet
-    /// (AUD-C02-B, Implements #1187). Facts only, never the client itself:
-    /// [`DaemonComposition::controlboard`] builds at most one admitted owner
-    /// binding from them. `None` until the runtime notes a live session, so
-    /// boards keep the empty (unadmitted) behaviour without one.
+    /// (AUD-C02-B). Facts only, never the client itself. `None` until the
+    /// runtime notes a live session (#1213: the board consumer of these facts
+    /// was removed; the retained startup binding stays as the ledger record).
     owner_session: Option<OwnerSessionFacts>,
     /// Canonical notification records hydrated from the closed
     /// `GetNotificationState` read (issue #1780).
@@ -587,9 +563,10 @@ pub struct DaemonComposition {
     /// Mirrors `capability_admission`: constructed empty at
     /// [`DaemonComposition::start`], hydrated by the daemon runtime attach
     /// where the concrete client and this composition meet (see
-    /// `notification_board_attach`), and consumed by
-    /// [`DaemonComposition::controlboard`]. An empty supply reads as an
-    /// empty inbox, never as resolved or suppressed state.
+    /// `notification_board_attach`). An empty supply reads as an
+    /// empty inbox, never as resolved or suppressed state (#1213: the board
+    /// consumer of these records was removed; the retained snapshot stays as
+    /// the ledger record).
     notification_snapshot: Vec<Notification>,
     /// Shared Governor Skill catalogue handle for catalogue-guarded skill
     /// promotion. Empty until catalogue installation wiring lands; absent
@@ -934,7 +911,6 @@ impl DaemonComposition {
             view_stale: false,
             cached_revision_fence,
             committed_experience: BTreeMap::new(),
-            operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
             notification_snapshot: Vec::new(),
             skill_catalogue: Arc::new(
@@ -1840,8 +1816,8 @@ impl DaemonComposition {
     /// Called once by the daemon runtime attach holding both the concrete
     /// [`DaemonKernelClient`] and this composition, mirroring
     /// [`Self::note_owner_session_binding`]. Stores records only, never the
-    /// client; no new thread, no new handshake. Until noted, boards built by
-    /// [`Self::controlboard`] keep the empty inbox behaviour.
+    /// client; no new thread, no new handshake. Until noted, readers see the
+    /// empty inbox behaviour (#1213: the board consumer was removed).
     pub fn note_notification_snapshot(&mut self, records: Vec<Notification>) {
         self.notification_snapshot = records;
     }
@@ -1872,56 +1848,6 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(self.governor.kernel_snapshot().state_fence().clone())
-    }
-
-    /// Builds one provider-neutral `ControlBoard` over the current Governor
-    /// projection snapshot.
-    ///
-    /// This is the one production composition owner of the `ControlBoard` ports
-    /// (Implements #1187 W1/A1). Its production caller is
-    /// [`serve_controlboard_view`](crate::serve_controlboard_view), which the
-    /// daemon runtime's local-read poller serves for one Kernel-admitted
-    /// claimed pair; no other site builds a board.
-    ///
-    /// The board reads one immutable snapshot taken here; every port call in
-    /// the returned value observes the same revision and fence, so one served
-    /// read cannot mix two of either. Callers take a fresh board per operation,
-    /// which means a Governor refresh is not observed by the board in flight:
-    /// it appears at the next read as a newer, still internally consistent view,
-    /// not as a mismatch. The board shares the retained volatile replay handle,
-    /// so a newly created board replays an already-admitted operation instead
-    /// of admitting it twice; cross-restart durability is not owned here — it
-    /// needs the command-receipt projection read for the exact `OperationId`
-    /// that the `operator_replay` field contract names and that no reachable
-    /// port provides. Access resolution admits exactly the one live
-    /// Kernel-issued owner session when the runtime threaded validated facts
-    /// (AUD-C02-B), else the typed provider gap; the Swarm projection remains
-    /// a typed provider gap until its owning slice lands. Reads serve a
-    /// coherent empty-items view over real G-11/I-12 bindings and submission
-    /// admits candidate-only intents.
-    pub fn controlboard(&self) -> Result<eliot_controlboard::ControlBoard, DaemonError> {
-        let snapshot = self.governor.controlboard_snapshot()?;
-        // One admitted owner binding from the threaded Kernel-issued facts
-        // when present, else the empty production behaviour (unadmitted typed
-        // gap). Malformed held facts stay fail-closed to empty: no live
-        // session is ever minted from a literal.
-        let admitted = match &self.owner_session {
-            Some(facts) => {
-                match controlboard_adapters::AdmittedSessionAccess::from_kernel_owner_facts(facts) {
-                    Ok(binding) => vec![binding],
-                    Err(_) => Vec::new(),
-                }
-            }
-            None => Vec::new(),
-        };
-        Ok(controlboard_adapters::controlboard_over_snapshot(
-            snapshot,
-            &self.operator_replay,
-            admitted,
-            // #1780: pre-fetched canonical records noted by the runtime
-            // attach; empty until that attach lands, never fabricated.
-            self.notification_snapshot.clone(),
-        ))
     }
 
     /// Borrows the single Governor Skill lifecycle owner as a forwarding
@@ -2430,29 +2356,6 @@ impl DaemonComposition {
         }
         Ok(task_lifecycle_adapters::ForwardingTaskLifecycle::new(
             self.governor.task_lifecycle(),
-        ))
-    }
-
-    /// Borrows the single Governor Skill lifecycle owner as the provider-neutral
-    /// [`SkillLifecyclePort`](eliot_controlboard::SkillLifecyclePort) surface port.
-    ///
-    /// The port forwards the exact admitted identity and typed fields to the
-    /// Governor canonical read/propose path (`skill_lifecycle` ->
-    /// `ForwardingSkillLifecycle` -> `GovernorSkillLifecycle::view/propose`)
-    /// and returns only typed results. No policy, admission, or semantic
-    /// rules live here; a stale fence fails closed in the Governor owner.
-    /// Callers take a fresh port per operation so a Governor refresh surfaces
-    /// as an exact-view mismatch instead of silent divergence.
-    pub fn skill_controlboard_port(
-        &self,
-    ) -> Result<impl eliot_controlboard::SkillLifecyclePort + '_, DaemonError> {
-        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
-            return Err(DaemonError::Composition(
-                eliot_governor::CompositionError::NotReady,
-            ));
-        }
-        Ok(skill_surface_adapters::GovernorSkillForwarder::new(
-            self.skill_lifecycle()?,
         ))
     }
 

@@ -32,13 +32,10 @@ pub const USER_AUTOMATION_ROUTE: &str = eliot_mcp::USER_AUTOMATION_ROUTE;
 /// Stable A-08 `PLAN_GAP` marker for this catalogue edge while its admitted
 /// providers remain uninjected by composition.
 ///
-/// Provenance (#1213 MGR01 half): previously re-exported as
-/// `eliot_controlboard::PLAN_GAP`
-/// (`crates/surfaces/eliot-controlboard/src/lib.rs:40`, value `"PLAN_GAP"`).
-/// The `eliot-controlboard` dependency is severed here; this is now a local
-/// literal pinned by `controlboard_plan_gap_marker_is_pinned`. That crate is a
-/// bounded reference fixture whose remaining production consumer is the
-/// `bins/eliotd` daemon composition; its full delete follows with the eliotd lane.
+/// Provenance (#1213): the `eliot-controlboard` package this marker was
+/// severed from is deleted, so this stays a local literal pinned by
+/// `controlboard_plan_gap_marker_is_pinned`. It names catalogue-edge
+/// provider absence, not a live crate binding.
 pub const CONTROLBOARD_PLAN_GAP: &str = "PLAN_GAP";
 
 /// Canonical command identifiers from the first-line command projection.

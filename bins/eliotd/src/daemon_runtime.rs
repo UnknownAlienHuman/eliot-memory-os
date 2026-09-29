@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
+use eliot_governor::KernelTransitionPort;
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
@@ -3249,109 +3249,6 @@ async fn run_local_read_poll(
             LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
         };
         return Ok(step(outcome, delta));
-    }
-    // #1187 W1/A1: a claimed pair naming the broker-owned operator read
-    // capability is served here, not forwarded on the Kernel `local_read` leg,
-    // because that leg serves store reads only. The branch builds one board
-    // over one immutable Governor snapshot and performs exactly one
-    // authenticated role-filtered read on it, so the canonical role-filtered
-    // view — or the board's exact typed refusal, including a `PlanGap` naming
-    // the missing owner — is served from the live daemon path instead of being
-    // composed into a board nobody reads. Every claimed pair, refusal included,
-    // settles through the same idempotent submit leg below, so a ControlBoard
-    // read can never poison the poller or drop a pair. The composition guard is
-    // held only around the read; it never crosses the submit leg.
-    //
-    // NOT REACHABLE AT RUNTIME for `operator.command` (#1187 piece C,
-    // re-verified against the current source of both crates). No production
-    // `operator.command` pair can reach the predicate below. The shared local-read carrier
-    // now admits `eliot.query` and the four `skill.*` lifecycle tools; closing
-    // the Operator gap still takes FOUR independent gates, not one. Each is
-    // cited by symbol rather than by line, because a line number in a comment
-    // is wrong the next time the file moves:
-    //
-    // 1. Queue. `host_request_route::KernelComposition::invoke_read_host_request`
-    //    is the only production entry that queues a pair for this poller, and it
-    //    queues only what `host_request_route::check_local_read_admission`
-    //    resolves. That routes through
-    //    `host_request_route::local_read_admission_from_tool`, whose closed
-    //    `match` admits `eliot.packet`, `eliot.query`, and the exact-capability
-    //    Skill tools `skill.inject`, `skill.display`, `skill.activate`, and
-    //    `skill.execute`; every other name, including `operator.command`, is
-    //    refused. The fallback
-    //    `host_request_route::daemon_claim_queue::check_task_controller_admission`
-    //    does not route `operator.command` to this poller either.
-    // 2. Claim. `host_request_route::KernelComposition::claim_local_read_pair`
-    //    rechecks the retained pair and only claims `Query` or `Skill`
-    //    admissions. `operator.command` matches neither admission.
-    // 3. Claim receipt. `daemon_kernel_client::DaemonKernelClient::claim_local_read_pair_async`
-    //    independently allows `eliot.query` or one of the four names returned
-    //    by `skill_tool_kind`, and requires an exact envelope-capability/tool
-    //    name match. It refuses `operator.command`. That gate is production
-    //    code inside `bins/eliotd` — not a test — and it sits on the same
-    //    `local_read_claim` wire operation as gate 2.
-    // 4. Submit. `host_request_route::KernelComposition::submit_local_read_result`
-    //    delegates to `submit_claimed_result`, whose local-read queue accepts
-    //    only `eliot.query` or `is_skill_lifecycle_tool(capability)`. A claimed
-    //    `operator.command` pair could not settle its own result body either.
-    //
-    // A fifth gap sits upstream of all four and is not a gate at all: nothing in
-    // this repository presents a host request naming this capability. The only
-    // production envelope builder is `kernel_host_request_client::finish_envelope`
-    // in `eliot-agent-bridge`; its tool surface is the closed `ADMITTED_TOOL_NAMES`
-    // set in `eliot_mcp::contract` (eight `eliot.*` names, and this is not one of
-    // them); and the Operator's own closed set in
-    // `apps/Eliot.Operator/Protocol/OperatorIntent.cs::LegacyOperatorAdapter::AdmittedTools`
-    // does not carry it either.
-    //
-    // Gates 1, 2 and 4 are one Kernel act in `host_request_route.rs`, and doing
-    // only that is worse than doing nothing: it would hand this poller a pair
-    // that gate 3 refuses, and a refused claim is a step failure, which
-    // `settle_local_read_completion` escalates into a failed daemon. Gate 3 and
-    // the absent producer are separate owner acts in files this lane does not
-    // own, so this branch stays source-reachable only.
-    //
-    // #1882: the four `skill.*` lifecycle capabilities now pass their own
-    // closed admission, claim, daemon validation and submit gates; this
-    // ControlBoard analysis does not apply to the Skill branch above. For
-    // `operator.command`, adding a branch would NOT create a production caller,
-    // and claiming one would be false: none of the four gates admits that
-    // capability, and no producer presents it either.
-    if eliotd::is_controlboard_read_tool(&tool) {
-        let body = match eliotd::notification_board_attach::fetch_notification_snapshot(kernel)
-            .await
-        {
-            Ok(snapshot) => {
-                let mut guard = composition.lock().await;
-                let kernel_fence = kernel.snapshot().state_fence();
-                let composition_fence = guard.kernel_snapshot().state_fence();
-                if snapshot.state_fence != kernel_fence || snapshot.state_fence != composition_fence
-                {
-                    eliotd::controlboard_notification_refresh_refusal_body(
-                        &envelope,
-                        &attempt,
-                        "Kernel or composition state fence changed before notification attach",
-                    )
-                } else {
-                    guard.note_notification_snapshot(snapshot.records);
-                    eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
-                }
-            }
-            Err(reason) => {
-                eliotd::controlboard_notification_refresh_refusal_body(&envelope, &attempt, &reason)
-            }
-        };
-        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
-            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
-            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
-            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
-        };
-        // #2647: this leg builds a board over the composition and reads it; it
-        // attaches no startup capability and re-evaluates no readiness, so the
-        // flight observed nothing and carries no delta. Settling it therefore
-        // cannot overwrite owner observations the loop recorded meanwhile, the
-        // same contract the ordinary forwarded read below settles under.
-        return Ok(step(outcome, None));
     }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await

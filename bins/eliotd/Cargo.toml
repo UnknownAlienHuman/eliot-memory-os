@@ -54,7 +54,6 @@ functional_cell_state_owners = [
   { cell = "governor.daemon.startup-binding", state = "startup-capability-bindings", owner = "eliotd::StartupCapabilityBindings" },
   { cell = "governor.daemon.poll-contour", state = "daemon-poll-contour", owner = "eliotd::daemon_runtime::run" },
   { cell = "governor.daemon.kernel-transport", state = "daemon-kernel-transport", owner = "eliotd::DaemonKernelClient" },
-  { cell = "governor.daemon.operator-replay", state = "operator-replay", owner = "eliotd::controlboard_adapters::SharedOperatorReplay" },
   { cell = "governor.daemon.skill-catalogue", state = "skill-catalogue", owner = "eliot_skill::SkillCatalogue" },
   { cell = "governor.daemon.capability-admission", state = "capability-admission-view", owner = "eliotd::capability_evidence_wiring::GovernorCapabilityAdmission" },
   { cell = "governor.daemon.learning-closure", state = "learning-closure", owner = "eliot_governor::LearningClosureService" },
@@ -75,7 +74,6 @@ eliot-context-assembly = { path = "../../crates/smart/eliot-context-assembly", v
 eliot-context-candidates = { path = "../../crates/smart/eliot-context-candidates", version = "0.1.0" }
 eliot-context-contracts.workspace = true
 eliot-config.workspace = true
-eliot-controlboard.workspace = true
 eliot-doctor-core.workspace = true
 eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle", version = "0.1.0" }
 eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation", version = "0.1.0" }

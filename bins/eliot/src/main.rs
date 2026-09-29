@@ -50,8 +50,6 @@ use std::{
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
-mod controlboard_status;
-mod dashboard;
 mod dev_crate_check;
 mod first_run_flow;
 mod plugin_preview;
@@ -142,24 +140,6 @@ enum Command {
         #[command(subcommand)]
         command: ReleaseCommand,
     },
-    /// Read the reconciled `ControlBoard` status projection (#1213).
-    #[command(name = "controlboard")]
-    ControlBoard {
-        #[command(subcommand)]
-        command: ControlBoardCommand,
-    },
-    /// Administrative, automation and recovery surface: open the
-    /// role-filtered terminal dashboard over the same authenticated
-    /// `ControlBoard` projection that `controlboard status` prints. I11.1
-    /// makes this CLI the mandatory admin/automation/recovery fallback; this
-    /// is the optional lightweight terminal view of it, not an
-    /// agent/provider prompt loop. Read-only: no prompt loop, no provider
-    /// selection, no arbitrary command execution, no persisted state, and no
-    /// mutation action. Requires an interactive terminal; under redirected or
-    /// noninteractive output it refuses without entering raw mode and directs
-    /// the caller to `eliot controlboard status`.
-    #[command(name = "dashboard")]
-    Dashboard,
     /// Backup creation/restore previews, issuance, isolated restore runs, key coverage (#1873; previews never issue; restore runs never cut over), and the three advertised `create`/`verify`/`restore-test` catalogue commands routed through the authenticated Kernel front door (#963).
     Backup {
         #[command(subcommand)]
@@ -635,15 +615,6 @@ enum ReleaseCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum ControlBoardCommand {
-    /// Fetch one reconciled `ControlBoard` board over the authenticated
-    /// `controlboard.status` transact path and project its typed rows.
-    /// Read-only: owns no board handle, cache, or canonical state, and
-    /// synthesizes no health from the dispositions.
-    Status,
-}
-
-#[derive(Debug, Subcommand)]
 enum SystemCommand {
     /// Capture source/build/runtime/store/integration evidence.
     Snapshot {
@@ -853,8 +824,6 @@ fn run() -> Result<i32> {
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
         Command::Release { command } => run_release(command),
-        Command::ControlBoard { command } => run_controlboard(command),
-        Command::Dashboard => dashboard::run_dashboard(),
         Command::Backup { command } => backup_entry::run_backup(command),
         Command::Scope { command } => Ok(run_scope(command)),
         Command::Dev { command } => Ok(run_dev(command)),
@@ -1227,86 +1196,6 @@ fn run_release(command: ReleaseCommand) -> Result<i32> {
             }
         }
     }
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "single-variant command dispatch keeps the by-value shape reserved for future variants"
-)]
-fn run_controlboard(command: ControlBoardCommand) -> Result<i32> {
-    match command {
-        // Actual consumer over the authenticated EBP transact path: the
-        // serving runtime (Ramanujan/Kernel lane) reconciles the board and
-        // answers `controlboard.status`; this front door only decodes the
-        // served board with the owner's transport types and projects its
-        // typed rows. No board handle, cache, or canonical state is owned
-        // here, and no health is synthesized from the dispositions.
-        ControlBoardCommand::Status => {
-            #[cfg(windows)]
-            {
-                run_controlboard_status_windows()
-            }
-            #[cfg(not(windows))]
-            {
-                write_json_error(
-                    "KERNEL_APPLICATION_PORT_CLOSED",
-                    "Windows authenticated Kernel front door",
-                );
-                Ok(FRONT_DOOR_CLOSED_EXIT)
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn run_controlboard_status_windows() -> Result<i32> {
-    use eliot_cli::kernel_client::KernelClientError;
-
-    let mut port = match AuthenticatedKernelPort::load() {
-        Ok(port) => port,
-        Err(CommandPortError::FrontDoorClosed { contract }) => {
-            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
-            return Ok(FRONT_DOOR_CLOSED_EXIT);
-        }
-        Err(error) => {
-            write_json_error("KERNEL_CLIENT_CONFIGURATION_REJECTED", &error.to_string());
-            return Ok(FRONT_DOOR_CLOSED_EXIT);
-        }
-    };
-    let served = match port.transact_controlboard_status() {
-        Ok(served) => served,
-        Err(KernelClientError::FrontDoorClosed(contract)) => {
-            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
-            return Ok(FRONT_DOOR_CLOSED_EXIT);
-        }
-        Err(KernelClientError::UnknownOutcome(detail)) => {
-            write_json_error("CONTROLBOARD_STATUS_UNKNOWN", &detail);
-            return Ok(UNKNOWN_OUTCOME_EXIT);
-        }
-        Err(KernelClientError::MissingRequestIdentity) => {
-            write_json_error(
-                "CONTROLBOARD_STATUS_NOT_ADMITTED",
-                "no admitted EBP request identity is bound for an operator-initiated controlboard read; the identity must arrive through the admitted host request path and Ramanujan must serve controlboard.status; tracker #1213",
-            );
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-        Err(error) => {
-            write_json_error("CONTROLBOARD_STATUS_REJECTED", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    let board = match controlboard_status::decode_status_response(served) {
-        Ok(board) => board,
-        Err(error) => {
-            write_json_error("CONTROLBOARD_STATUS_REFUSED", &error.to_string());
-            return Ok(UNKNOWN_OUTCOME_EXIT);
-        }
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&controlboard_status::render_status_json(&board)?)?
-    );
-    Ok(0)
 }
 
 fn run_scope(command: scope_observe::ScopeCommand) -> i32 {
@@ -4512,22 +4401,6 @@ impl AuthenticatedKernelPort {
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
         self.client.probe()
     }
-
-    /// Sends the exact `controlboard.status` operation through the
-    /// authenticated EBP Execute seam and returns the served result payload.
-    ///
-    /// The EBP request identity must already be bound on the client by an
-    /// admitted flow; this front door never mints principal, session, fence,
-    /// or idempotency identity. Without one the call fails closed with
-    /// `MissingRequestIdentity` before any byte is sent.
-    fn transact_controlboard_status(
-        &mut self,
-    ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
-        self.client.transact_json(
-            controlboard_status::STATUS_OPERATION,
-            controlboard_status::status_request_payload(),
-        )
-    }
 }
 
 #[cfg(windows)]
@@ -4982,18 +4855,6 @@ mod tests {
             b"{\"bridge\":\"demo\"}"
         );
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn controlboard_status_parses() {
-        let parsed = Cli::try_parse_from(["eliot", "controlboard", "status"])
-            .expect("controlboard status parses");
-        assert!(matches!(
-            parsed.command,
-            Command::ControlBoard {
-                command: ControlBoardCommand::Status
-            }
-        ));
     }
 
     fn applied_outcome() -> InstallationStepOutcome {

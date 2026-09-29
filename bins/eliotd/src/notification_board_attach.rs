@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use eliot_contracts::StateFence;
-use eliot_controlboard::CanonicalNotificationMetrics;
 use eliot_governor::KernelGenerationSnapshotProvider;
 use eliot_kernel_core::Notification;
 use eliot_store_api::{
@@ -30,6 +29,23 @@ use eliot_store_api::{
 use super::DaemonComposition;
 use super::daemon_kernel_client::DaemonKernelClient;
 use super::kernel_context_read_client::KernelContextReadClient;
+
+/// Exact metrics returned by the authenticated `GetNotificationState` owner.
+///
+/// Migrated verbatim from the removed `eliot-controlboard` package (#1213):
+/// same fields, same `deny_unknown_fields` wire shape. These counts may cover
+/// the selected scope rather than only the current page, so the attach
+/// preserves them instead of recomputing them from a truncated row slice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalNotificationMetrics {
+    pub unresolved_total: u64,
+    pub critical_unresolved: u64,
+    pub action_required_unresolved: u64,
+    pub failed_delivery_unresolved: u64,
+    pub acknowledged_unresolved: u64,
+    pub resolved_total: u64,
+}
 
 /// Typed outcome of the startup notification attach.
 pub enum NotificationBoardAttach {

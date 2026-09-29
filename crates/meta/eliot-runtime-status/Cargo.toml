@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 eliot-conformance-contracts.workspace = true
 eliot-contracts.workspace = true
-eliot-controlboard.workspace = true
 eliot-host-state.workspace = true
 eliot-installation.workspace = true
 eliot-ipc.workspace = true

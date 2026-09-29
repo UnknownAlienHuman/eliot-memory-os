@@ -70,11 +70,6 @@ forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "
 forbidden_prefix = ["eliot-dreamer", "eliot-agent-", "eliot-model"]
 
 [[runtime_root]]
-package = "eliot-controlboard"
-issue = 1810
-forbidden_exact = ["eliot-store-surreal-adapter", "surrealdb"]
-
-[[runtime_root]]
 package = "eliot-cli"
 issue = 1810
 forbidden_exact = ["eliot-store-surreal-adapter", "surrealdb"]

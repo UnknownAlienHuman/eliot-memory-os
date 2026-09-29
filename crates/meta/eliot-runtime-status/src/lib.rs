@@ -82,34 +82,10 @@ pub use implementation_deviation_status::{
     ImplementationDeviationStatusRow, project_implementation_deviation_status,
 };
 
-mod controlboard_projection;
-pub use controlboard_projection::{
-    CONTROLBOARD_CONTOUR_CONTRACT, ControlBoardContour, ControlBoardEntryKind,
-    ControlBoardProjectionBindings, ControlBoardProjectionError, ControlBoardStatusRow,
-    project_controlboard_contour, read_controlboard_contour,
-};
-
-mod controlboard_consumer;
-pub use controlboard_consumer::{
-    CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardCapability, ControlBoardConsumerError,
-    ControlBoardEvidenceHandle, ControlBoardExpectedSet, ControlBoardGeneration,
-    ControlBoardInstallation, ControlBoardObservationContext, ControlBoardObservationTime,
-    ControlBoardOwner, ControlBoardRecoveryOwner, ControlBoardRowDisposition,
-    ControlBoardSourceDigest, RenderedControlBoard, RenderedControlBoardRow,
-    read_controlboard_status, render_controlboard_status,
-};
-
-mod controlboard_transport;
-pub use controlboard_transport::{
-    CONTROLBOARD_STATUS_OPERATION, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardTransportError,
-    ControlBoardTransportMessage, build_controlboard_frame, decode_controlboard_response,
-    encode_controlboard_response, open_controlboard_frame,
-};
-
-// #1213: the ControlBoard contour carries the #216 owner records on its public
-// surface. They are re-exported, not redefined, so a consumer of this crate
-// needs no second dependency edge and cannot construct a ControlBoard-local
-// support or proof vocabulary.
+// #1213: the `eliot-controlboard` package was removed (no real production
+// read-only consumer existed; wiring one needs semantic admission owned
+// elsewhere), with its three projection/consumer/transport modules. The #216
+// owner records below stay available to every other status projection.
 pub use eliot_conformance_contracts::{
     CONTRACT_VERSION as CONFORMANCE_CONTRACT_VERSION, CapabilitySupportRow, ContractMaturity,
     DomainCoverage, EvidenceDomain, EvidenceExecutionStatus, ImplementationSupport,
