@@ -1897,7 +1897,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                         &revision.revision,
                     )
                     .await?;
-                if stored != *revision {
+                if stored != *revision.as_ref() {
                     return Err(StoreError::InvalidField {
                         field: "automation.revision",
                         reason: "stored revision diverged from the admitted revision",
