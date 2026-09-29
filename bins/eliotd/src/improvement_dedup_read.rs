@@ -141,9 +141,9 @@ use eliot_improvement::{
 };
 use eliot_store_api::{
     EXPERIENCE_PAGE_NEXT_CURSOR, EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE,
-    EXPERIENCE_PAGE_TRUNCATED, LearningRecordKind, LEARNING_PARAM_CURSOR, MAX_LEARNING_PAGE_RECORDS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, ScopeId, learning_record_read_request,
-    sha256_hex,
+    EXPERIENCE_PAGE_TRUNCATED, LEARNING_PARAM_CURSOR, LearningRecordKind,
+    MAX_LEARNING_PAGE_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse, ScopeId,
+    learning_record_read_request, sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -166,7 +166,11 @@ const DEDUP_SCOPE: &str = eliot_governor::GOVERNOR_SCOPE_ID;
 /// Every variant means NO registry was established. None of them is an empty
 /// registry, and a caller that treats one as "nothing was there" reintroduces
 /// exactly the gap this module closes.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+// `Eq` is deliberately absent: the `Registry` variant carries the crate's own
+// `BoundsError`, which holds an `f64` value and therefore derives `PartialEq`
+// only. Claiming `Eq` here would be a stronger guarantee than the wrapped
+// refusal can carry (E0277).
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum ImprovementDedupReadError {
     /// The closed read could not be planned, or the scope is not a contract
     /// value.
@@ -307,9 +311,7 @@ pub fn resolve_candidate_page(
     )
     .map_err(|_| ImprovementDedupReadError::Payload("state_fence"))?;
     if payload_fence != response.state_fence {
-        return Err(ImprovementDedupReadError::ResponseMismatch(
-            "payload_fence",
-        ));
+        return Err(ImprovementDedupReadError::ResponseMismatch("payload_fence"));
     }
     let truncated = response
         .payload
@@ -408,7 +410,7 @@ pub fn restored_registry(
     let mut archived: BTreeSet<String> = BTreeSet::new();
     for row in rows {
         match classify_row(row)? {
-            Row::Candidate(record) => records.push(record),
+            Row::Candidate(record) => records.push(*record),
             Row::Archived(candidate_id) => {
                 archived.insert(candidate_id);
             }
@@ -419,9 +421,13 @@ pub fn restored_registry(
 }
 
 /// One served row, classified by what its document actually is.
+///
+/// The candidate arm is boxed: `DurableCandidateRecord` carries a whole
+/// `ImprovementCandidate`, so inlining it would make every `Archived` row pay
+/// for a candidate it does not hold (`clippy::large_enum_variant`).
 enum Row {
     /// A committed candidate artifact that qualifies as a prior candidate.
-    Candidate(DurableCandidateRecord),
+    Candidate(Box<DurableCandidateRecord>),
     /// A committed archive receipt naming the candidate id it removed from the
     /// active set.
     Archived(String),
@@ -487,11 +493,12 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
         return Ok(Row::Archived(candidate_id));
     }
 
-    let artifact: CandidateArtifactDocument = serde_json::from_value(document).map_err(|error| {
-        refused(format!(
-            "record is neither a committed candidate artifact nor an archive receipt: {error}"
-        ))
-    })?;
+    let artifact: CandidateArtifactDocument =
+        serde_json::from_value(document).map_err(|error| {
+            refused(format!(
+                "record is neither a committed candidate artifact nor an archive receipt: {error}"
+            ))
+        })?;
     // The document must bind ITSELF. A brief or an owner decision that names
     // a different candidate, or a decision owner that disagrees with the one
     // the candidate records, is a spliced document: reading its owner or its
@@ -504,7 +511,8 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
             "the committed brief or owner decision names a different candidate".to_owned(),
         ));
     }
-    if artifact.owner_decision.owner.trim() != artifact.candidate.owner_and_decision_authority.trim()
+    if artifact.owner_decision.owner.trim()
+        != artifact.candidate.owner_and_decision_authority.trim()
     {
         return Err(refused(
             "the recorded decision owner is not the owner the candidate records".to_owned(),
@@ -515,19 +523,21 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
             "record carries no owner-issued governed admission digest".to_owned(),
         ));
     }
-    artifact
-        .enforced_bound
-        .validate()
-        .map_err(|error| refused(format!("recorded bound is not an owner-decided bound: {error}")))?;
-    artifact.candidate.validate().map_err(|error| {
-        refused(format!("stored candidate does not validate: {error}"))
+    artifact.enforced_bound.validate().map_err(|error| {
+        refused(format!(
+            "recorded bound is not an owner-decided bound: {error}"
+        ))
     })?;
-    Ok(Row::Candidate(DurableCandidateRecord {
+    artifact
+        .candidate
+        .validate()
+        .map_err(|error| refused(format!("stored candidate does not validate: {error}")))?;
+    Ok(Row::Candidate(Box::new(DurableCandidateRecord {
         // The candidate is the record's own decoded content, and the entry's
         // lineage digest is computed from IT by `BoundedBacklog::restored`.
         owner: Some(artifact.candidate.owner_and_decision_authority.clone()),
         admitted_under_authority: Some(artifact.enforced_bound.governor_authority_ref.clone()),
         admitted_value_floor: artifact.enforced_bound.min_value,
         candidate: artifact.candidate,
-    }))
+    })))
 }
