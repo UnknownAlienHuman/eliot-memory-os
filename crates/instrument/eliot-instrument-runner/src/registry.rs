@@ -507,7 +507,7 @@ impl ProfileIdentities {
     /// [`RegistryError::IdentitySlotDrift`] when a recorded identity differs
     /// from the entry field it duplicates.
     pub fn verify(&self, entry: &RegistryEntry) -> Result<(), RegistryError> {
-        self.verify_slot_partition(entry)?;
+        Self::verify_slot_partition(entry)?;
         for slot in REQUIRED_IDENTITY_SLOTS {
             if self.slot(slot).trim().is_empty() {
                 return Err(RegistryError::IdentitySlotBlank {
@@ -536,7 +536,7 @@ impl ProfileIdentities {
     /// cover every member of the independently declared
     /// [`PROFILE_IDENTITY_SLOTS`] list, so a newly declared slot can never sit
     /// outside both checked sets.
-    fn verify_slot_partition(&self, entry: &RegistryEntry) -> Result<(), RegistryError> {
+    fn verify_slot_partition(entry: &RegistryEntry) -> Result<(), RegistryError> {
         for slot in PROFILE_IDENTITY_SLOTS {
             if REQUIRED_IDENTITY_SLOTS.contains(&slot) || ATTESTED_IDENTITY_SLOTS.contains(&slot) {
                 continue;
@@ -636,8 +636,7 @@ pub const REQUIRED_IDENTITY_SLOTS: [IdentitySlot; 10] = [
 /// empty value is the honest "nothing attested" state the governed build lane
 /// already uses, so emptiness is reported as an unattested slot rather than a
 /// blank identity that could be mistaken for a bound one.
-pub const ATTESTED_IDENTITY_SLOTS: [IdentitySlot; 2] =
-    [IdentitySlot::Source, IdentitySlot::Lock];
+pub const ATTESTED_IDENTITY_SLOTS: [IdentitySlot; 2] = [IdentitySlot::Source, IdentitySlot::Lock];
 
 /// The declared identity values one entry binds.
 ///
@@ -1432,7 +1431,8 @@ fn rustc_entry(
             executable: RUSTC_EXECUTABLE.to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "rustc emits no artifact; diagnostics stream through the raw evidence handle".to_owned(),
+            artifact: "rustc emits no artifact; diagnostics stream through the raw evidence handle"
+                .to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
             operation: "P-03 OperationId for the admitted rustc stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
@@ -1486,7 +1486,9 @@ fn rustfmt_entry(
             executable: "cargo".to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "rustfmt --check emits no artifact; the check outcome streams as raw evidence".to_owned(),
+            artifact:
+                "rustfmt --check emits no artifact; the check outcome streams as raw evidence"
+                    .to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
             operation: "P-03 OperationId for the admitted rustfmt stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
@@ -1594,7 +1596,8 @@ fn scip_entry(
             executable: SCIP_INSTRUMENT.to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: OFFLINE_DECODE.to_owned(),
-            artifact: "emitted SCIP index bytes decoded in process; no child process is created".to_owned(),
+            artifact: "emitted SCIP index bytes decoded in process; no child process is created"
+                .to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
             operation: "decode-only operation identity; no admitted launch is required".to_owned(),
             timeout: "not applicable: decoder-only, decode is bounded by MAX_SCIP_BYTES".to_owned(),
@@ -1653,7 +1656,9 @@ fn dotnet_entry(
             executable: DOTNET_EXECUTABLE.to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "msbuild outputs under the admitted target layout; the report is raw evidence".to_owned(),
+            artifact:
+                "msbuild outputs under the admitted target layout; the report is raw evidence"
+                    .to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
             operation: "P-03 OperationId for the admitted msbuild stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
