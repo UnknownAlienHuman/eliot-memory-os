@@ -3122,6 +3122,34 @@ fn fixed_payloads_match(
     Ok(true)
 }
 
+/// Whether a fixed-name file is still absent or contains the exact bytes
+/// being re-exposed from its immutable generation slot. A partial exposure
+/// is repairable only when every surviving file still belongs to that slot.
+fn fixed_file_matches_or_missing(
+    install_dir: &std::path::Path,
+    file_name: &str,
+    expected: &[u8],
+) -> Result<bool, WasmDispatchError> {
+    let path = install_dir.join(file_name);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(_) => return Err(WasmDispatchError::DeliveryUnavailable),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_DELIVERY_PAYLOAD_BYTES as u64
+        || metadata.len() != expected.len() as u64
+    {
+        return Ok(false);
+    }
+    let bytes = std::fs::read(&path).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+    if metadata.len() != bytes.len() as u64 {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    Ok(bytes == expected)
+}
+
 /// Re-exposes the fixed-name set from the generation slot after a
 /// same-delivery replay found the live payloads missing. The slot's payload
 /// and envelope copies are re-hashed against the identity digests, then
@@ -3151,17 +3179,6 @@ fn reexpose_fixed_delivery_from_slot(
     {
         return Err(WasmDispatchError::DeliveryConflict);
     }
-    if live.is_none()
-        && fixed_names_present(
-            install_dir,
-            &[
-                WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
-                WASM_HOST_GUEST_INPUT_FILE_NAME,
-            ],
-        )?
-    {
-        return Err(WasmDispatchError::DeliveryUnavailable);
-    }
     let artifact = std::fs::read(slot.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))
         .map_err(|_| invalid("delivery-slot-payload"))?;
     if sha256_hex(&artifact) != identity.artifact_digest {
@@ -3176,6 +3193,15 @@ fn reexpose_fixed_delivery_from_slot(
         .map_err(|_| invalid("delivery-slot-payload"))?;
     if sha256_hex(&slot_envelope) != identity.envelope_digest {
         return Err(invalid("delivery-slot-payload"));
+    }
+    for (name, expected) in [
+        (WASM_HOST_GUEST_ARTIFACT_FILE_NAME, artifact.as_slice()),
+        (WASM_HOST_GUEST_INPUT_FILE_NAME, input.as_slice()),
+        (WASM_HOST_MATERIAL_FILE_NAME, slot_envelope.as_slice()),
+    ] {
+        if !fixed_file_matches_or_missing(install_dir, name, expected)? {
+            return Err(WasmDispatchError::DeliveryConflict);
+        }
     }
     let tag = identity.slot_name();
     stage_file_atomic(
@@ -3417,17 +3443,6 @@ pub fn publish_wasm_dispatch_bundle(
                 retire_or_backpressure_live(&owner_lock, &live, &live_envelope, install_dir)?;
             }
             let live = read_live_material(install_dir)?;
-            if live.is_none()
-                && fixed_names_present(
-                    install_dir,
-                    &[
-                        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
-                        WASM_HOST_GUEST_INPUT_FILE_NAME,
-                    ],
-                )?
-            {
-                return Err(WasmDispatchError::DeliveryUnavailable);
-            }
             let fixed_matches = match live {
                 Some(live) if identity.matches_material(&live) => {
                     fixed_payloads_match(install_dir, &identity)?
