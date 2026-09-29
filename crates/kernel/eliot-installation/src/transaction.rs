@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 
 use eliot_platform::GuardRevertOutcome;
-use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 use eliot_platform_windows::{
     TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
     terminal_containment_operation_digest, validate_terminal_containment_readback_for,
@@ -35,6 +34,7 @@ use super::{
     validate_current_user_store_credential_effect_bindings,
     validate_portable_dev_authority_effect_bindings,
     validate_user_mode_authority_effect_bindings, validate_user_mode_task_effect_bindings,
+    text,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -2053,7 +2053,7 @@ impl InstallationTransaction {
                 self.validate_current_user_task_receipt(&unknown.request, receipt)?;
                 if receipt.task_name != unknown.task_name
                     || receipt.task_xml_sha256 != unknown.requested_xml_sha256.as_str()
-                    || unknown.observed_xml_sha256.as_deref()
+                    || unknown.observed_xml_sha256.as_ref().map(PlatformHandle::as_str)
                         != Some(receipt.task_xml_sha256.as_str())
                     || unknown.request_digest.as_str() != receipt.request_digest
                 {
