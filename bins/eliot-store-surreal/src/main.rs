@@ -800,9 +800,9 @@ async fn run() -> Result<(), String> {
     // setup and the compatibility read/report because those paths access the
     // selected roots outside StoreComposition's provider methods.
     let mut compatibility = {
-        let _root_use = composition
-            .retain_roots_for_use()
-            .map_err(|error| format!("revalidate Store roots before startup side effects: {error}"))?;
+        let _root_use = composition.retain_roots_for_use().map_err(|error| {
+            format!("revalidate Store roots before startup side effects: {error}")
+        })?;
         install_observability(&config)?;
         // I5.9 compatibility gate (issue #1932). A maintenance verdict keeps
         // the installation queryable as a non-writer; canonical mutations are

@@ -86,7 +86,8 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<PreparedLa
         }
         LaunchMode::Protected { config_path } => {
             let config = load_config(Some(&config_path))?;
-            if config.runtime_launch.profile != eliot_installation::InstallationProfile::SystemService
+            if config.runtime_launch.profile
+                != eliot_installation::InstallationProfile::SystemService
             {
                 return Err("protected --config launch requires SystemService profile".to_owned());
             }
@@ -233,7 +234,13 @@ fn resolve_portable_dev_config(
 fn resolve_user_mode_config(
     root: &std::path::Path,
     config_path: PathBuf,
-) -> Result<(eliot_platform_windows::UserOwnedRootLease, StoreLaunchConfig), String> {
+) -> Result<
+    (
+        eliot_platform_windows::UserOwnedRootLease,
+        StoreLaunchConfig,
+    ),
+    String,
+> {
     let root = eliot_platform_windows::UserOwnedRootLease::open_existing(root)
         .map_err(|error| format!("open UserMode immutable-binaries root: {error}"))?;
     let config_path = if config_path.is_absolute() {

@@ -2898,10 +2898,8 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
                         .map_err(|error| anyhow::anyhow!(error.to_string()))?,
                 );
             }
-            let active_profile_governance = report
-                .active_profile_governed_roots
-                .as_ref()
-                .map(|roots| {
+            let active_profile_governance =
+                report.active_profile_governed_roots.as_ref().map(|roots| {
                     let profile = roots.runtime_state_roots.profile;
                     eliot_installation::ProfileGovernedRoots {
                         profile,

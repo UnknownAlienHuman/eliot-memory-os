@@ -1432,27 +1432,29 @@ pub fn collect_status_with_observers(
             "host-state-root does not exist; status never creates it".to_owned(),
         ));
     }
-    let retained_root = match
-        eliot_platform_windows::ProtectedRootLease::open_existing(host_state_root)
-    {
-        Ok(root) => root,
-        Err(protected_error) => {
-            if let Some(report) = collect_user_owned_profile_status(host_state_root, deadline)? {
-                return Ok(report);
+    let retained_root =
+        match eliot_platform_windows::ProtectedRootLease::open_existing(host_state_root) {
+            Ok(root) => root,
+            Err(protected_error) => {
+                if let Some(report) = collect_user_owned_profile_status(host_state_root, deadline)?
+                {
+                    return Ok(report);
+                }
+                let msg = protected_error.to_string().to_ascii_lowercase();
+                if msg.contains("not found")
+                    || msg.contains("missing")
+                    || msg.contains("notfound")
+                    || msg.contains("unsupported")
+                {
+                    return Err(StatusError::Unavailable(
+                        "host-state-root does not exist; status never creates it".to_owned(),
+                    ));
+                }
+                return Err(StatusError::Invalid(format!(
+                    "retain root: {protected_error}"
+                )));
             }
-            let msg = protected_error.to_string().to_ascii_lowercase();
-            if msg.contains("not found")
-                || msg.contains("missing")
-                || msg.contains("notfound")
-                || msg.contains("unsupported")
-            {
-                return Err(StatusError::Unavailable(
-                    "host-state-root does not exist; status never creates it".to_owned(),
-                ));
-            }
-            return Err(StatusError::Invalid(format!("retain root: {protected_error}")));
-        }
-    };
+        };
     let canonical_path = retained_root
         .canonical_path()
         .map_err(|e| StatusError::Invalid(format!("canonical: {e}")))?;
@@ -1866,12 +1868,11 @@ fn collect_user_owned_profile_status(
     deadline: Instant,
 ) -> Result<Option<RuntimeStatusReport>, StatusError> {
     check_deadline(deadline)?;
-    let retained_root = match eliot_platform_windows::UserOwnedRootLease::open_existing(
-        host_state_root,
-    ) {
-        Ok(root) => root,
-        Err(_) => return Ok(None),
-    };
+    let retained_root =
+        match eliot_platform_windows::UserOwnedRootLease::open_existing(host_state_root) {
+            Ok(root) => root,
+            Err(_) => return Ok(None),
+        };
     let canonical_path = retained_root
         .canonical_path()
         .map_err(|error| StatusError::Invalid(format!("retain user-owned root: {error}")))?;
@@ -1880,13 +1881,16 @@ fn collect_user_owned_profile_status(
             "host-state-root is not the exact retained current-user root".to_owned(),
         ));
     }
-    retained_root
-        .verify_stable_identity()
-        .map_err(|error| StatusError::Invalid(format!("stable user-owned root identity: {error}")))?;
+    retained_root.verify_stable_identity().map_err(|error| {
+        StatusError::Invalid(format!("stable user-owned root identity: {error}"))
+    })?;
 
     let mut registry = None;
     let mut last_registry_error = None;
-    for profile in [InstallationProfile::UserMode, InstallationProfile::PortableDev] {
+    for profile in [
+        InstallationProfile::UserMode,
+        InstallationProfile::PortableDev,
+    ] {
         check_deadline(deadline)?;
         let root = eliot_platform_windows::UserOwnedRootLease::open_existing(host_state_root)
             .map_err(|error| StatusError::Invalid(format!("reopen current-user root: {error}")))?;
@@ -1971,12 +1975,13 @@ fn collect_user_owned_profile_status(
             ));
         }
     }
-    let active_profile_root_binding = registry
-        .as_ref()
-        .zip(active_manifest.as_ref())
-        .and_then(|(registry, manifest)| {
-            profile_root_binding_contour(registry, manifest, deadline)
-        });
+    let active_profile_root_binding =
+        registry
+            .as_ref()
+            .zip(active_manifest.as_ref())
+            .and_then(|(registry, manifest)| {
+                profile_root_binding_contour(registry, manifest, deadline)
+            });
     let active_profile_supervision = active_manifest
         .as_ref()
         .and_then(profile_supervision_contour);
@@ -1987,7 +1992,11 @@ fn collect_user_owned_profile_status(
     if let Some(binding) = active_profile_root_binding.as_ref()
         && !binding.state.is_healthy()
     {
-        gaps.push(format!("profile roots: {} gap={}", component_reason(&binding.state), binding.gap));
+        gaps.push(format!(
+            "profile roots: {} gap={}",
+            component_reason(&binding.state),
+            binding.gap
+        ));
     }
     if let Some(supervision) = active_profile_supervision.as_ref()
         && !supervision.state.is_healthy()
@@ -2042,7 +2051,10 @@ fn collect_user_owned_profile_status(
             })
             .unwrap_or_default(),
         host_journal: HostJournalContour {
-            state: unknown("current-user Host journal was not inspected", "read-only user-owned journal adapter required"),
+            state: unknown(
+                "current-user Host journal was not inspected",
+                "read-only user-owned journal adapter required",
+            ),
             clean: None,
             sequence: None,
             last_checksum: None,
@@ -2050,25 +2062,46 @@ fn collect_user_owned_profile_status(
             gap: "read-only user-owned journal adapter required".to_owned(),
         },
         ors: OrsContour {
-            state: unknown("current-user ORS supervision was not inspected", "profile-specific ORS adapter required"),
+            state: unknown(
+                "current-user ORS supervision was not inspected",
+                "profile-specific ORS adapter required",
+            ),
             current_supervision: None,
             gap: "profile-specific ORS adapter required".to_owned(),
         },
         transaction_stage: TransactionStageContour {
-            state: unknown("current-user transaction stage was not inspected", "profile-specific transaction observer required"),
+            state: unknown(
+                "current-user transaction stage was not inspected",
+                "profile-specific transaction observer required",
+            ),
             stage: None,
             gap: "profile-specific transaction observer required".to_owned(),
         },
         services: ServiceContours {
-            kernel: unknown(unknown_runtime, "current-user live process observer required"),
-            store: unknown(unknown_runtime, "current-user live process observer required"),
-            eliotd: unknown(unknown_runtime, "current-user live process observer required"),
-            watchdog: unknown(unknown_runtime, "current-user live process observer required"),
+            kernel: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
+            store: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
+            eliotd: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
+            watchdog: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
             host_service_registration: not_scm("Host"),
             watchdog_service_registration: not_scm("Watchdog"),
         },
         readiness: ReadinessContour {
-            proof_status: unknown("current-user readiness was not inspected", "profile-specific authenticated readiness observer required"),
+            proof_status: unknown(
+                "current-user readiness was not inspected",
+                "profile-specific authenticated readiness observer required",
+            ),
             age_gap: "profile-specific authenticated readiness observer required".to_owned(),
         },
         runtime_health: None,
@@ -2076,12 +2109,30 @@ fn collect_user_owned_profile_status(
         gaps,
         components: ComponentStatuses {
             installation_registry: registry_state,
-            host_journal: unknown("current-user Host journal was not inspected", "read-only user-owned journal adapter required"),
-            ors_supervision: unknown("current-user ORS supervision was not inspected", "profile-specific ORS adapter required"),
-            kernel: unknown(unknown_runtime, "current-user live process observer required"),
-            store: unknown(unknown_runtime, "current-user live process observer required"),
-            eliotd: unknown(unknown_runtime, "current-user live process observer required"),
-            watchdog: unknown(unknown_runtime, "current-user live process observer required"),
+            host_journal: unknown(
+                "current-user Host journal was not inspected",
+                "read-only user-owned journal adapter required",
+            ),
+            ors_supervision: unknown(
+                "current-user ORS supervision was not inspected",
+                "profile-specific ORS adapter required",
+            ),
+            kernel: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
+            store: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
+            eliotd: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
+            watchdog: unknown(
+                unknown_runtime,
+                "current-user live process observer required",
+            ),
         },
         deadline_exceeded: false,
     };
@@ -2148,9 +2199,7 @@ fn profile_root_binding_contour(
         };
         return Some(contour);
     }
-    let original = match registry
-        .profile_selection_receipt_for_generation(&manifest.generation)
-    {
+    let original = match registry.profile_selection_receipt_for_generation(&manifest.generation) {
         Ok(receipt) => receipt.clone(),
         Err(error) => {
             contour.gap = format!("original profile selection receipt unavailable: {error}");
@@ -2178,11 +2227,12 @@ fn profile_root_binding_contour(
         .filter(|fence| fence.generation == manifest.generation)
         .and_then(|fence| fence.phase_b_live_binding.as_ref());
     let Some(live_binding) = live_binding else {
-        contour.gap = "active generation has no exact live Phase-B authority descriptor digest"
-            .to_owned();
+        contour.gap =
+            "active generation has no exact live Phase-B authority descriptor digest".to_owned();
         contour.state = ComponentState::Unknown {
-            reason: "live profile root request cannot be built without the committed Phase-B digest"
-                .to_owned(),
+            reason:
+                "live profile root request cannot be built without the committed Phase-B digest"
+                    .to_owned(),
             gap: contour.gap.clone(),
         };
         return Some(contour);
@@ -2210,18 +2260,17 @@ fn profile_root_binding_contour(
             return Some(contour);
         }
     };
-    let leases = match eliot_platform_windows::profile_supervision::open_profile_root_leases(
-        &request,
-    ) {
-        Ok(leases) => leases,
-        Err(error) => {
-            contour.gap = format!("live I3.1 root acquisition failed: {error}");
-            contour.state = ComponentState::NotHealthy {
-                reason: "active profile roots could not be retained and revalidated".to_owned(),
-            };
-            return Some(contour);
-        }
-    };
+    let leases =
+        match eliot_platform_windows::profile_supervision::open_profile_root_leases(&request) {
+            Ok(leases) => leases,
+            Err(error) => {
+                contour.gap = format!("live I3.1 root acquisition failed: {error}");
+                contour.state = ComponentState::NotHealthy {
+                    reason: "active profile roots could not be retained and revalidated".to_owned(),
+                };
+                return Some(contour);
+            }
+        };
     let live = leases.selection().clone();
     if let Err(error) = leases.verify_stable_identity() {
         contour.gap = format!("retained I3.1 root identity changed during status: {error}");
@@ -2233,8 +2282,9 @@ fn profile_root_binding_contour(
     match eliot_installation::profile_selection_receipts_match_retained_roots(&original, &live) {
         Ok(true) => {}
         Ok(false) => {
-            contour.gap = "fresh root observations do not match the registry's original retained identities"
-                .to_owned();
+            contour.gap =
+                "fresh root observations do not match the registry's original retained identities"
+                    .to_owned();
             contour.state = ComponentState::NotHealthy {
                 reason: "active profile root objects differ from the original selection receipt"
                     .to_owned(),
@@ -2255,9 +2305,7 @@ fn profile_root_binding_contour(
     Some(contour)
 }
 
-fn profile_supervision_contour(
-    manifest: &CandidateManifest,
-) -> Option<ProfileSupervisionContour> {
+fn profile_supervision_contour(manifest: &CandidateManifest) -> Option<ProfileSupervisionContour> {
     let profile = manifest.runtime_launch.profile;
     let intended_supervision = match profile {
         InstallationProfile::SystemService => {

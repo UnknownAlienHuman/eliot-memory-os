@@ -501,12 +501,14 @@ pub fn validate_user_mode_launch_root_binding(
         .and_then(|()| root.verify_path_identity())
         .map_err(|error| format!("revalidate user-owned config root: {error}"))?;
     let admitted_root = Path::new(
-        &config.runtime_launch.profile_governed_roots.immutable_binaries,
+        &config
+            .runtime_launch
+            .profile_governed_roots
+            .immutable_binaries,
     );
     if !eliot_platform_windows::windows_paths_equal(root.path(), admitted_root) {
         return Err(
-            "retained launch root does not match the descriptor immutable_binaries root"
-                .to_owned(),
+            "retained launch root does not match the descriptor immutable_binaries root".to_owned(),
         );
     }
     Ok(())

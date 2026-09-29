@@ -27,10 +27,10 @@ use eliot_kernel_service::{
     HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY, STORE_ROUTE_IDENTITY,
 };
 use eliot_platform::{ClockObservation, PlatformHandle};
-use eliot_platform_windows::{UserOwnedRootLease, WindowsPlatform};
 use eliot_platform_windows::profile_supervision::{
     ProfileRootLeaseSet, ProfileRootRequest, ProfileSelectionReceipt, open_profile_root_leases,
 };
+use eliot_platform_windows::{UserOwnedRootLease, WindowsPlatform};
 use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, ServerHello,
@@ -362,26 +362,23 @@ impl StoreComposition {
         let runtime_root_leases = roots
             .retain_and_validate(&mut root_lease_provider)
             .map_err(|error| format!("retain canonical runtime roots: {error}"))?;
-        let (profile_root_request, profile_root_leases, profile_selection_receipt) =
-            match roots.profile {
-                InstallationProfile::SystemService => {
-                    if user_mode_launch_root.is_some() {
-                        return Err(
-                            "SystemService launch cannot retain a UserMode config root".to_owned(),
-                        );
-                    }
-                    validate_runtime_leases_without_profile_receipt(
-                        roots,
-                        &runtime_root_leases,
-                    )?;
-                    (None, None, None)
+        let (profile_root_request, profile_root_leases, profile_selection_receipt) = match roots
+            .profile
+        {
+            InstallationProfile::SystemService => {
+                if user_mode_launch_root.is_some() {
+                    return Err(
+                        "SystemService launch cannot retain a UserMode config root".to_owned()
+                    );
                 }
-                InstallationProfile::UserMode | InstallationProfile::PortableDev => {
-                    let host_state = UserOwnedRootLease::open_existing(Path::new(
-                        roots.host_state_root.as_str(),
-                    ))
-                    .map_err(|error| format!("retain profile registry Host root: {error}"))?;
-                    let (receipt, activation_fence) =
+                validate_runtime_leases_without_profile_receipt(roots, &runtime_root_leases)?;
+                (None, None, None)
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let host_state =
+                    UserOwnedRootLease::open_existing(Path::new(roots.host_state_root.as_str()))
+                        .map_err(|error| format!("retain profile registry Host root: {error}"))?;
+                let (receipt, activation_fence) =
                         RedbInstallationRegistry::inspect_profile_selection_and_activation_fence_user_owned_at(
                             host_state,
                             roots.profile,
@@ -390,85 +387,76 @@ impl StoreComposition {
                         .map_err(|error| {
                             format!("read persisted profile selection and activation fence: {error}")
                         })?;
-                    if activation_fence.generation != config.runtime_launch.generation {
-                        return Err(
-                            "committed activation fence does not match the selected Store generation"
-                                .to_owned(),
-                        );
-                    }
-                    let phase_b_live_binding = activation_fence
-                        .phase_b_live_binding
-                        .as_ref()
-                        .ok_or_else(|| {
-                            "committed activation fence has no Phase-B live binding".to_owned()
-                        })?;
-                    let request = profile_root_request_for_live_activation(
-                        &config.runtime_launch,
-                        &phase_b_live_binding.authority_descriptor_digest,
-                        phase_b_live_binding
-                            .provisioned_supervision_authority
-                            .authority_generation
-                            .value(),
-                    )?;
-                    let live_roots = open_profile_root_leases(&request)
-                        .map_err(|error| format!("retain selected profile roots: {error}"))?;
-                    if !profile_selection_receipts_match_retained_roots(
-                        &receipt,
-                        live_roots.selection(),
-                    )
-                    .map_err(|error| {
-                        format!("validate persisted profile root identities: {error}")
-                    })? {
-                        return Err(
-                            "persisted profile selection does not match live no-follow roots"
-                                .to_owned(),
-                        );
-                    }
-                    validate_runtime_leases_against_selection(
-                        roots,
-                        &runtime_root_leases,
-                        live_roots.selection(),
-                    )?;
-                    validate_runtime_leases_against_selection(
-                        roots,
-                        &runtime_root_leases,
-                        &receipt,
-                    )?;
-                    match (roots.profile, user_mode_launch_root.as_ref()) {
-                        (InstallationProfile::UserMode, Some(launch_root)) => {
-                            launch_config::validate_user_mode_launch_root_binding(
-                                launch_root,
-                                config,
-                            )?;
-                            validate_user_owned_root_observation(
-                                launch_root,
-                                live_roots.selection(),
-                                "immutable_binaries",
-                            )?;
-                            validate_user_owned_root_observation(
-                                launch_root,
-                                &receipt,
-                                "immutable_binaries",
-                            )?;
-                        }
-                        (InstallationProfile::UserMode, None) => {
-                            return Err(
-                                "UserMode Store launch requires its explicit retained config root"
-                                    .to_owned(),
-                            );
-                        }
-                        (InstallationProfile::PortableDev, Some(_)) => {
-                            return Err(
-                                "PortableDev launch cannot consume a UserMode config root"
-                                    .to_owned(),
-                            );
-                        }
-                        (InstallationProfile::PortableDev, None) => {}
-                        (InstallationProfile::SystemService, _) => unreachable!(),
-                    }
-                    (Some(request), Some(live_roots), Some(receipt))
+                if activation_fence.generation != config.runtime_launch.generation {
+                    return Err(
+                        "committed activation fence does not match the selected Store generation"
+                            .to_owned(),
+                    );
                 }
-            };
+                let phase_b_live_binding = activation_fence
+                    .phase_b_live_binding
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "committed activation fence has no Phase-B live binding".to_owned()
+                    })?;
+                let request = profile_root_request_for_live_activation(
+                    &config.runtime_launch,
+                    &phase_b_live_binding.authority_descriptor_digest,
+                    phase_b_live_binding
+                        .provisioned_supervision_authority
+                        .authority_generation
+                        .value(),
+                )?;
+                let live_roots = open_profile_root_leases(&request)
+                    .map_err(|error| format!("retain selected profile roots: {error}"))?;
+                if !profile_selection_receipts_match_retained_roots(
+                    &receipt,
+                    live_roots.selection(),
+                )
+                .map_err(|error| format!("validate persisted profile root identities: {error}"))?
+                {
+                    return Err(
+                        "persisted profile selection does not match live no-follow roots"
+                            .to_owned(),
+                    );
+                }
+                validate_runtime_leases_against_selection(
+                    roots,
+                    &runtime_root_leases,
+                    live_roots.selection(),
+                )?;
+                validate_runtime_leases_against_selection(roots, &runtime_root_leases, &receipt)?;
+                match (roots.profile, user_mode_launch_root.as_ref()) {
+                    (InstallationProfile::UserMode, Some(launch_root)) => {
+                        launch_config::validate_user_mode_launch_root_binding(launch_root, config)?;
+                        validate_user_owned_root_observation(
+                            launch_root,
+                            live_roots.selection(),
+                            "immutable_binaries",
+                        )?;
+                        validate_user_owned_root_observation(
+                            launch_root,
+                            &receipt,
+                            "immutable_binaries",
+                        )?;
+                    }
+                    (InstallationProfile::UserMode, None) => {
+                        return Err(
+                            "UserMode Store launch requires its explicit retained config root"
+                                .to_owned(),
+                        );
+                    }
+                    (InstallationProfile::PortableDev, Some(_)) => {
+                        return Err(
+                            "PortableDev launch cannot consume a UserMode config root".to_owned()
+                        );
+                    }
+                    (InstallationProfile::PortableDev, None) => {}
+                    (InstallationProfile::SystemService, _) => unreachable!(),
+                }
+                (Some(request), Some(live_roots), Some(receipt))
+            }
+        };
         // Root admission and persisted selection comparison happen before any
         // Store/Blob owner, credential lookup, or provider path is composed.
         let blob = BlobRootOwner::claim(
@@ -1684,10 +1672,8 @@ fn validate_runtime_leases_against_selection(
         return Err("retained RuntimeStateRoots lease count changed".to_owned());
     }
     for (index, (role, declared_path)) in selected_roots.into_iter().enumerate() {
-        let observation = unique_profile_root_observation(
-            selection,
-            &format!("runtime_state_roots.{role}"),
-        )?;
+        let observation =
+            unique_profile_root_observation(selection, &format!("runtime_state_roots.{role}"))?;
         let lease = &leases.leases()[index];
         verify_runtime_root_lease(lease)?;
         if lease.file_identity()
@@ -1758,10 +1744,14 @@ fn unique_profile_root_observation<'a>(
 ) -> Result<&'a eliot_platform_windows::profile_supervision::ProfileRootObservation, String> {
     let mut matches = selection.roots.iter().filter(|root| root.role == role);
     let Some(observation) = matches.next() else {
-        return Err(format!("persisted profile selection omits root role {role}"));
+        return Err(format!(
+            "persisted profile selection omits root role {role}"
+        ));
     };
     if matches.next().is_some() {
-        return Err(format!("persisted profile selection duplicates root role {role}"));
+        return Err(format!(
+            "persisted profile selection duplicates root role {role}"
+        ));
     }
     Ok(observation)
 }
