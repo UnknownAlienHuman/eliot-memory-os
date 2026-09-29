@@ -1749,6 +1749,33 @@ pub enum HostError {
     StoreNotLive { evidence: StoreLivenessEvidence },
     #[error("Host child cleanup requires recovery: {0}")]
     RecoveryRequired(String),
+    /// A planned Store endpoint is occupied by a listener whose exact
+    /// installation ownership is unproven.
+    ///
+    /// Issue #1775. The typed directive is the recovery instruction: it names
+    /// the classified origin, the read-only operations still permitted, the
+    /// blocked control operations, the exact missing ownership evidence and one
+    /// safe next action. It authorizes nothing — the occupant is left running,
+    /// and no stop, kill, credential attachment, login, adoption, reuse or data
+    /// migration is performed. Its `Display` is the bounded, non-sensitive
+    /// summary, so endpoints and process identities stay in typed fields.
+    ///
+    /// The directive is boxed so the `Err` path of every function returning
+    /// `Result<_, HostError>` stays pointer-sized. Boxing relocates the same
+    /// typed value; it changes where the bytes live, never which variant of the
+    /// directive is produced, and `Display` still renders the bounded summary
+    /// through the box.
+    #[cfg(windows)]
+    #[error("planned Store endpoint is occupied and exact installation ownership is unproven: {0}")]
+    OriginCollisionUnproven(Box<eliot_host_service::ForeignOccupantRecoveryDirective>),
+    /// The planned Store endpoint's owner could not be read.
+    ///
+    /// Issue #1775. A read that failed is not a read that succeeded with an
+    /// empty answer, so this is never reported as clean absence: the
+    /// start/reconnect defers until exact ownership is observable.
+    #[cfg(windows)]
+    #[error("planned Store endpoint owner is unreadable, so ownership is unproven: {0}")]
+    StoreEndpointOwnerUnreadable(String),
     #[cfg(windows)]
     #[error("Watchdog coverage is unavailable: {0}")]
     WatchdogCoverageUnavailable(String),
@@ -4505,7 +4532,17 @@ impl HostJobBranches {
         )?;
         let (_, store_working_directory) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
-        host_job_launch::ensure_store_endpoint_available(&launch.canonical_store_arguments)?;
+        // Issue #1775: an owned reconnect resolves the collision against the
+        // same approved identity as the fresh launch, so a foreign occupant
+        // produces the typed directive and an unreadable owner defers.
+        host_job_launch::ensure_store_endpoint_available(
+            &launch.canonical_store_arguments,
+            &host_job_launch::StoreEndpointOwnershipBinding {
+                installation: &host.installation,
+                generation,
+                state_fence: &launch.authority_state_fence,
+            },
+        )?;
         let child = Self::launch(
             &executable,
             executable_lease,

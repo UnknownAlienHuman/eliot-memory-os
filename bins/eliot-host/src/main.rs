@@ -135,6 +135,10 @@ fn host_error_variant(error: &HostError) -> &'static str {
         HostError::StoreNotLive { .. } => "store_not_live",
         HostError::RecoveryRequired(_) => "recovery_required",
         #[cfg(windows)]
+        HostError::OriginCollisionUnproven(_) => "origin_collision_unproven",
+        #[cfg(windows)]
+        HostError::StoreEndpointOwnerUnreadable(_) => "store_endpoint_owner_unreadable",
+        #[cfg(windows)]
         HostError::StoreRecoveryRequired(_) => "store_recovery_required",
         #[cfg(windows)]
         HostError::WatchdogCoverageUnavailable(_) => "watchdog_coverage_unavailable",
