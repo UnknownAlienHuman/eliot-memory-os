@@ -26,6 +26,7 @@ use thiserror::Error;
 mod end_of_activity;
 mod improvement_admission;
 pub mod improvement_pipeline;
+mod trigger_intake;
 
 pub use end_of_activity::{
     ActivationScopeReference, AssessmentRecordReference, AssessmentSourceCoverage,
@@ -67,6 +68,11 @@ pub use improvement_pipeline::{
     UnestablishedPriorCause, VERIFIER_OWNER_FAMILY, assess_improvement_replay,
     compare_improvement_commitments, improvement_retry_permitted, ingest_improvement_candidate,
     proposal_digest, reconcile_unknown_activation, run_improvement_candidate_pipeline,
+};
+pub use trigger_intake::{
+    MaintenanceTriggerIntake, TriggerIntakeClasses, TriggerIntakeOperation, TriggerIntakePayload,
+    TriggerIntakePosition, TriggerIntakeRequest, TriggerIntakeRouting, TriggerIntakeSourceEvent,
+    TriggerIntakeWindow, derive_trigger_intake,
 };
 
 /// Stable wire name for the maintenance governor contract.

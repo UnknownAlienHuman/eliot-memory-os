@@ -13,6 +13,7 @@ mod cutover_ownership;
 mod doctor;
 mod effect_operation_lease;
 mod execution_manifest;
+mod maintenance_trigger_staging;
 mod model;
 mod process_stream_recovery;
 mod purge_ledger;
@@ -66,6 +67,11 @@ pub use execution_manifest::{
     KernelRestartEvidence, KernelServiceAdmission, ManifestDependencyEntry, ManifestEffectCeiling,
     ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
     RevocationAcknowledgement, verify_kernel_execution_restart,
+};
+pub use maintenance_trigger_staging::{
+    MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
+    MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest,
+    MaintenanceTriggerStagingRoute, stage_maintenance_trigger_intake,
 };
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
