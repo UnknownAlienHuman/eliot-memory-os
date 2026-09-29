@@ -336,7 +336,11 @@ pub struct BackupConfigRequest {
     /// Refused on the owner-bound production path: the note is caller-authored
     /// and nothing here compares its digest or its observed dispositions to Host
     /// state, so carrying it would put unverified claims into an owner-issued
-    /// record. The snapshot variant accepts it and keeps its forensic ceiling.
+    /// record. The snapshot variant accepts it, and there
+    /// [`AuditFenceNote::validate`] enforces its typed non-authoritative
+    /// ceiling: a note claiming restored active authority is refused with
+    /// [`ProjectionError::ActiveAuthorityInAuditFence`] before a projection is
+    /// built, and the ceiling is bound into the projection digest.
     pub audit: Option<AuditFenceNote>,
 }
 

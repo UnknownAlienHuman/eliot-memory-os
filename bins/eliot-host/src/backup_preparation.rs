@@ -699,11 +699,29 @@ pub struct CleanupReport {
 /// `impl<J: PreparationJournal> DelegatedPreparation<J>` is a bound, not an
 /// implementation. `HostComposition` does not implement it, so intent/result
 /// persistence survives neither a process restart nor a Host restart today.
+/// A4's own semantics are implemented in full against this port — a repeated
+/// request returns the recorded destination or a typed conflict, never a second
+/// installation, and reconciliation preserves an unknown rather than retrying
+/// it — but those semantics are only as durable as the sink bound here.
 ///
 /// A durable implementation is possible over `HostStateJournal::append` and
 /// `HostStateJournal::snapshot`, but it requires a **new** `HostStateRecord`
 /// variant in `crates/kernel/eliot-host-state`, which is outside issue #958's
-/// declared Exclusive mutable scope; that owner correction is the exact blocker.
+/// declared Exclusive mutable scope; that owner correction is the exact
+/// blocker. Measured on the current main: `HostStateRecord`
+/// (`crates/kernel/eliot-host-state/src/model.rs`) carries
+/// Activation, Kernel, Dependency, Drain, DrainCommit, Wake,
+/// WakeCancellationBatch, Observation, ReadinessObservation, CleanMarker,
+/// EpochRetirement, StoreRebind, ReactiveContext and CutoverIntent — the last
+/// added by #961, which is the precedent and the shape a preparation record
+/// would take. None of them is a destination-preparation record, and reusing one
+/// (for example appending a preparation intent as a `ReactiveContext` or
+/// `Observation` record) would store a preparation claim under an unrelated
+/// record's semantics, so no such substitution is made here. The installation
+/// registry is the other named owner and cannot hold one either: an unactivated
+/// destination is not an approved generation, and a new registry record type is
+/// a `crates/kernel/eliot-installation` edit, equally outside scope.
+///
 /// It is no longer the reason an unknown can be reported as absent:
 /// [`ReconcileDisposition::AdmittedWithoutResult`] now keeps a recorded intent
 /// out of [`ReconcileDisposition::Absent`] on every path, so a restart loses the
@@ -1948,7 +1966,11 @@ pub struct PresentedPreparationRequest {
     /// Presenting one is **refused** by the owner-bound configuration projection:
     /// nothing here compares its digest or observed dispositions to Host state,
     /// so it is never bound into a projection digest nor rendered into a
-    /// prepared-destination receipt. I5.13 keeps that fence optional.
+    /// prepared-destination receipt. I5.13 keeps that fence optional, and this
+    /// refusal is stronger than the note's own typed non-authoritative ceiling
+    /// (`crate::backup_config_projection::AuditFenceNote::validate`): a
+    /// lease/grant/current-state assertion is unreachable here rather than
+    /// merely refused when asserted.
     pub audit_fence_note: Option<AuditFenceNote>,
     /// Opaque caller-presented entropy text.
     ///
@@ -2424,6 +2446,23 @@ impl OwnerEvidence {
     /// `build_digests` subset check, both of which compare against owner-issued
     /// values. Nothing downstream may cite the `manifest_digest` comparison as
     /// an owner proof for a production preparation.
+    ///
+    /// The arm cannot be made a real presented-vs-owner comparison from this
+    /// lane, and the reason is scope rather than design.
+    /// [`PresentedPreparationRequest`] is the presented contract surface and it
+    /// carries no config/policy/module manifest digest field, so there is no
+    /// presented value to compare: feeding the owner value in as the presented
+    /// side is precisely the self-comparison above. Adding the field is the
+    /// correct fix, but `bins/eliot-host/tests/backup_preparation.rs` — outside
+    /// this issue's Exclusive mutable scope — constructs
+    /// [`PresentedPreparationRequest`] as an exhaustive struct literal, so a
+    /// field added here would not compile that suite. Until the presented
+    /// surface carries a configuration digest, T2's config-digest arm is
+    /// refused-as-evidence rather than claimed: the two owner comparisons that
+    /// ARE real on this path are the numeric `generation` arm (presented
+    /// `approved_generation` against the owner-issued authority generation) and
+    /// the `build_digests` subset arm (each presented digest against the
+    /// owner-issued approved artifact set).
     pub fn project_backup_configuration(
         &self,
         request: &PresentedPreparationRequest,
