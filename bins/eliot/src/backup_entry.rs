@@ -19,6 +19,16 @@
 //! in `eliot_cli::backup` admit them; a request that names another command,
 //! omits a required field, or carries a defaulted scope or destination
 //! refuses as a typed usage failure before any byte reaches the Kernel.
+//!
+//! `export-ecxf` (issue #1871) is the third door and the one that makes the
+//! canonical exchange format reachable from a product command: it invokes
+//! [`eliot_backup::export_ecxf_package`], the single `ECXF/1` export entry.
+//! That function owns the whole export, so this command owns only argv
+//! decoding, one typed request, the call, and the terminal projection of the
+//! owner's outcome. The `ECXF/1` package layout, the `ExportFence` and every
+//! residency/checksum/integrity proof belong to `eliot-ecxf` and the
+//! `eliot-backup` exporter; neither is reimplemented, defaulted, pre-checked
+//! or weakened here (I5.10, I5.13).
 
 use std::io::Read;
 use std::num::NonZeroU64;
@@ -27,7 +37,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use eliot_backup::{
-    BackupBundle, BackupCreateArgs, RestoreContext, RestoreEpochSpec, WrappedKeyManifest,
+    BackupBundle, BackupCreateArgs, BackupError, CapturedSourceStore, EcxfExportReport,
+    EcxfExportRequest, RestoreContext, RestoreEpochSpec, WrappedKeyManifest, export_ecxf_package,
     issue_backup, preview_backup_create, preview_restore, run_restore,
     verify_portable_key_material,
 };
@@ -136,6 +147,40 @@ pub enum BackupCommand {
         /// the explicit triple. Mutually exclusive with the triple.
         #[arg(long)]
         new_lineage: Option<String>,
+    },
+    /// Export one `ECXF/1` package for one declared scope (issue #1871).
+    ///
+    /// This is the reachable product front door for
+    /// [`eliot_backup::export_ecxf_package`], the single `ECXF/1` export
+    /// entry. It publishes a package containing `manifest.json`, `schema/`,
+    /// the event and projection streams, residency-keyed blob entries, the
+    /// receipt streams, `integrity.json` and `privacy-purge-ledger.json`,
+    /// under one manifest-bound `ExportFence` (I05-10, I05-13).
+    ///
+    /// The request and the coherent source view are operator-supplied closed
+    /// typed documents, not values this process mints: the export id, the
+    /// idempotency key, the canonical request hash, the declared scope and the
+    /// authenticated request fence all arrive already correlated. The
+    /// destination is passed to the exporter unchanged — it never creates,
+    /// probes, merges or pre-checks it, because the exporter refuses an
+    /// existing package and publishes by one atomic rename.
+    ExportEcxf {
+        /// Absolute path to the admitted `EcxfExportRequest` JSON document:
+        /// the export id, the idempotency key, the canonical request hash, the
+        /// declared scope, and the authenticated request metadata carrying the
+        /// state fence.
+        #[arg(long, value_parser = crate::absolute_path)]
+        request_json: PathBuf,
+        /// Absolute path to the admitted coherent source-view JSON document
+        /// the `EcxfSourceStore` owner reads, which carries the schema/store
+        /// generation, revision and ordering heads, event range, blob
+        /// residency/reachability, sealed blobs and purge ledger the exporter
+        /// turns into the `ExportFence`.
+        #[arg(long, value_parser = crate::absolute_path)]
+        source_json: PathBuf,
+        /// Absolute destination directory for the published `ECXF/1` package.
+        #[arg(long, value_parser = crate::absolute_path)]
+        out_dir: PathBuf,
     },
     /// Route the advertised `backup-create` command through the
     /// authenticated Kernel front door.
@@ -307,6 +352,11 @@ pub fn run_backup(command: BackupCommand) -> Result<i32> {
             target_generation,
             new_lineage.as_deref(),
         ),
+        BackupCommand::ExportEcxf {
+            request_json,
+            source_json,
+            out_dir,
+        } => run_ecxf_export(&request_json, &source_json, &out_dir),
     }
 }
 
@@ -467,5 +517,90 @@ fn run_restore_run(
             crate::write_installation_error("BACKUP_RESTORE_RUN_INVALID", &error.to_string());
             Ok(crate::INVALID_REQUEST_EXIT)
         }
+    }
+}
+
+/// Exports one `ECXF/1` package into an operator-selected destination and
+/// projects the exporter's own terminal outcome.
+///
+/// [`eliot_backup::export_ecxf_package`] is the single `ECXF/1` export entry
+/// (issue #1871, I05-10, I05-13) and this command is what makes it reachable
+/// from a product command. Everything the export actually does is the
+/// exporter's: it reads the coherent fenced source view, proves the coherent
+/// boundary, derives the `ExportFence` from the source's own evidence, builds
+/// the archive through `eliot-ecxf`, renders the complete `ECXF/1` package
+/// (`manifest.json`, `schema/`, event and projection streams, residency-keyed
+/// blob entries, receipt streams, `integrity.json` and
+/// `privacy-purge-ledger.json`), and publishes it as one unit by atomic
+/// rename. None of the `ECXF/1` layout, the fence, or the residency, checksum
+/// and integrity proofs is reimplemented, defaulted or pre-checked here, and
+/// this command never writes an `ECXF/1` byte itself.
+///
+/// Nothing is fabricated in this process. The [`EcxfExportRequest`] — the
+/// export id, the idempotency key, the canonical request hash, the declared
+/// scope and the authenticated request metadata with its state fence — is
+/// decoded from an operator-supplied closed typed document, and the source is
+/// the admitted [`CapturedSourceStore`] owner rather than a value assembled
+/// here. That is deliberate: the export id and the state fence are the
+/// attributes the archive is attributable to, and only the owning request path
+/// can produce a correlated one, so this command takes them as bounded
+/// explicit inputs instead of minting them.
+///
+/// The destination crosses the call unchanged. The exporter owns the
+/// "destination already exists" refusal and the staged exclusive claim, and a
+/// pre-check here would duplicate a weaker copy of that ownership, so this
+/// command neither creates nor probes the path.
+///
+/// Refusals are projected, never swallowed. A malformed or unreadable input is
+/// a usage failure on the invalid-request exit, exactly as for every sibling
+/// here. A refusal from the exporter is neither: the request was admitted, the
+/// owner answered honestly, and no `ECXF/1` package is proven. That is the
+/// backup owner-admission exit, which is deliberately not success, because
+/// backup existence is not recovery proof and a process exit must never stand
+/// in for it. A [`BackupError::PublishReconciliationRequired`] refusal is a
+/// published package awaiting reconciliation, so the projection names the
+/// export identity and the published path rather than implying that nothing
+/// was written.
+fn run_ecxf_export(request_json: &Path, source_json: &Path, out_dir: &Path) -> Result<i32> {
+    let request: EcxfExportRequest =
+        serde_json::from_slice(&read_json(request_json, "ECXF export request file")?)
+            .context("decode the admitted ECXF export request")?;
+    let source =
+        CapturedSourceStore::open(source_json).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build the current-thread ECXF export runtime")?;
+    let report: EcxfExportReport = match runtime.block_on(export_ecxf_package(
+        &request,
+        &source,
+        out_dir,
+    )) {
+        Ok(report) => report,
+        Err(error) => {
+            crate::write_installation_error("ECXF_EXPORT_REFUSED", &ecxf_export_refusal(&error));
+            return Ok(crate::BACKUP_OWNER_ADMISSION_REQUIRED_EXIT);
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(0)
+}
+
+/// Projects one typed `ECXF` exporter refusal as a bounded terminal detail.
+///
+/// The post-publication reconciliation refusal keeps its own status because it
+/// is the one outcome that reports an `ECXF/1` package which already exists on
+/// disk; every other refusal is a refusal to publish, and never carries a
+/// published path.
+fn ecxf_export_refusal(error: &BackupError) -> String {
+    match error {
+        BackupError::PublishReconciliationRequired {
+            export_id,
+            package_path,
+            reason,
+        } => format!(
+            "the ECXF/1 package for export {export_id} is published at {package_path} and requires reconciliation: {reason}"
+        ),
+        other => other.to_string(),
     }
 }
