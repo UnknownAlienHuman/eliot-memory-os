@@ -7441,6 +7441,7 @@ impl KernelComposition {
                             "live_operation_id": live.live_operation_id,
                             "live_expires_at": live.live_expires_at,
                             "retry_condition": live.retry_condition,
+                            "recovery_reference": live.recovery_reference,
                         },
                     }));
                 }
@@ -7458,9 +7459,9 @@ impl KernelComposition {
             &bundle.join,
             unix_ms(),
         ) {
-            Ok(eliot_kernel_service::WasmLaunchDisposition::Acquired {
-                launch_incarnation,
-            }) => launch_incarnation,
+            Ok(eliot_kernel_service::WasmLaunchDisposition::Acquired { launch_incarnation }) => {
+                launch_incarnation
+            }
             Ok(eliot_kernel_service::WasmLaunchDisposition::ExistingInFlight {
                 recovery_reference,
             }) => {
