@@ -475,10 +475,7 @@ impl ControlReserve {
     ///
     /// Returns [`KernelError::InvalidField`] when no restart seal is held, or
     /// when the epoch has not advanced past the seal.
-    pub fn unseal_after_epoch_advance(
-        &self,
-        current: AuthorityEpoch,
-    ) -> Result<(), KernelError> {
+    pub fn unseal_after_epoch_advance(&self, current: AuthorityEpoch) -> Result<(), KernelError> {
         let mut sealed = self
             .inner
             .sealed_epoch

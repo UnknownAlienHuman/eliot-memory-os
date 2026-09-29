@@ -81,9 +81,9 @@ pub use module::compatibility_handshake::{
 };
 pub use module::control_reserve_front_door::{
     AuthorityDecision, CapacityBottleneck, CapacityClass, ControlOperationClass, ControlPermit,
-    ControlReserve, DecisionDenialReason, EMERGENCY_PREALLOCATED_SLOTS, EmergencyOperationClass,
-    FRONT_DOOR_BOTTLENECK, FrontDoor, IdempotencyDisposition, IdempotencyLedger, NormalWorkClass,
-    PermitOperation,
+    ControlReleaseEvidence, ControlReserve, DecisionDenialReason, EMERGENCY_PREALLOCATED_SLOTS,
+    EmergencyOperationClass, FRONT_DOOR_BOTTLENECK, FrontDoor, IdempotencyDisposition,
+    IdempotencyLedger, NormalWorkClass, PermitLedgerBinding, PermitOperation,
 };
 pub use module::control_reserve_profile_compiler::{
     BottleneckOwnerEvidence, ControlReserveProfileIdentity, ControlReserveStatusRow,

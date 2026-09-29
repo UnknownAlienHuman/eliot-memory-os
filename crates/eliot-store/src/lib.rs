@@ -10,6 +10,7 @@ pub mod canonical_projection;
 mod canonical_projection_views;
 mod canonical_record;
 pub mod canonical_store;
+pub mod control_reserve;
 pub mod control_wal;
 mod db_client_metrics;
 pub mod db_client_set;
@@ -38,6 +39,12 @@ pub use canonical_store::{
     CognitiveProjectionFamilyCounts, CognitiveProjectionFamilyState,
     CognitiveProjectionIntentReceipt, CognitiveProjectionLease, CognitiveProjectionProject,
     CognitiveProjectionProjectPage, CognitiveProjectionPublicationStatus,
+};
+pub use control_reserve::{
+    STORE_CONNECTION_BOTTLENECK, STORE_PENDING_WRITE_BOTTLENECK, STORE_TRANSACTION_BOTTLENECK,
+    StoreDimension, StorePermit, StorePermitOperation, StorePermitRecord, StorePermitRequest,
+    StorePermitState, StoreReconcileDisposition, StoreReleaseEvidence, StoreReserve,
+    StoreReserveError,
 };
 pub use control_wal::{
     ControlWal, WalDeadLetter, WalFailedWrite, WalPendingWrite, WalProjectHead, WalWriteState,

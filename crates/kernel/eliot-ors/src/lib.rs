@@ -48,7 +48,7 @@ pub use backup_snapshot::{
 };
 pub use control_reserve::{
     ORS_DURABLE_BYTES_BOTTLENECK, ORS_TRANSACTION_BOTTLENECK, OrsDimension, OrsPermit,
-    OrsPermitOperation, OrsReserve, OrsReserveError,
+    OrsPermitOperation, OrsPermitRequest, OrsReserve, OrsReserveError,
 };
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,

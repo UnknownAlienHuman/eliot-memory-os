@@ -783,10 +783,7 @@ impl StoreReserve {
         validate_label(request.owner, "store_permit.owner")?;
         validate_label(request.operation_id, "store_permit.operation_id")?;
         validate_label(request.permit_id, "store_permit.permit_id")?;
-        validate_label(
-            request.profile_revision,
-            "store_permit.profile_revision",
-        )?;
+        validate_label(request.profile_revision, "store_permit.profile_revision")?;
         if request.owner_generation.is_nil() {
             return Err(StoreReserveError::InvalidField {
                 field: "store_permit.owner_generation",
@@ -868,7 +865,10 @@ impl StoreReserve {
         protected_pending_write_bytes: NonZeroU64,
     ) -> Result<Self, StoreReserveError> {
         for (value, field) in [
-            (normal_connection_slots, "store_reserve.normal_connection_slots"),
+            (
+                normal_connection_slots,
+                "store_reserve.normal_connection_slots",
+            ),
             (
                 protected_connection_slots,
                 "store_reserve.protected_connection_slots",
@@ -940,13 +940,11 @@ impl StoreReserve {
     /// Returns the currently available protected transaction slots.
     #[must_use]
     pub fn available_protected_transactions(&self) -> u64 {
-        self.inner
-            .transaction_protected_capacity
-            .saturating_sub(
-                self.inner
-                    .transaction_protected_in_flight
-                    .load(Ordering::Acquire),
-            )
+        self.inner.transaction_protected_capacity.saturating_sub(
+            self.inner
+                .transaction_protected_in_flight
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Returns the currently available normal pending-write bytes.
@@ -962,13 +960,11 @@ impl StoreReserve {
     /// Returns the currently available protected pending-write bytes.
     #[must_use]
     pub fn available_protected_pending_bytes(&self) -> u64 {
-        self.inner
-            .pending_protected_capacity_bytes
-            .saturating_sub(
-                self.inner
-                    .pending_protected_in_flight_bytes
-                    .load(Ordering::Acquire),
-            )
+        self.inner.pending_protected_capacity_bytes.saturating_sub(
+            self.inner
+                .pending_protected_in_flight_bytes
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Attempts to acquire one normal connection slot without blocking.
