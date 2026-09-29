@@ -390,33 +390,31 @@ impl HostReserve {
     /// Returns the currently available protected launch slots.
     #[must_use]
     pub fn available_protected_launch(&self) -> u64 {
-        self.inner
-            .launch_protected_capacity
-            .saturating_sub(self.inner.launch_protected_in_flight.load(Ordering::Acquire))
+        self.inner.launch_protected_capacity.saturating_sub(
+            self.inner
+                .launch_protected_in_flight
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Returns the currently available normal cancellation/termination operations.
     #[must_use]
     pub fn available_normal_cancellation(&self) -> u64 {
-        self.inner
-            .cancellation_normal_capacity
-            .saturating_sub(
-                self.inner
-                    .cancellation_normal_in_flight
-                    .load(Ordering::Acquire),
-            )
+        self.inner.cancellation_normal_capacity.saturating_sub(
+            self.inner
+                .cancellation_normal_in_flight
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Returns the currently available protected cancellation/termination operations.
     #[must_use]
     pub fn available_protected_cancellation(&self) -> u64 {
-        self.inner
-            .cancellation_protected_capacity
-            .saturating_sub(
-                self.inner
-                    .cancellation_protected_in_flight
-                    .load(Ordering::Acquire),
-            )
+        self.inner.cancellation_protected_capacity.saturating_sub(
+            self.inner
+                .cancellation_protected_in_flight
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Attempts to acquire one normal launch slot without blocking.
