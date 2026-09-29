@@ -2974,10 +2974,19 @@ pub enum BackupError {
     },
     /// A required `ECXF/1` source-view member was not observed by the source
     /// owner, so the export refuses instead of filling the member in.
-    #[error("ECXF export source member not observed: {member}")]
+    ///
+    /// This is a refusal about *which* member is missing, not a second verdict
+    /// on coherence: [`Self::InconsistentBoundary`] remains the answer to
+    /// "can this source prove one boundary", and both can be true at once — the
+    /// composition knows the boundary is unprovable and, from the source owner's
+    /// own evidence gap, which member of the view it never observed. The source
+    /// owner is the only party that can name it, which is why this variant is
+    /// constructed outside this crate: naming a member is not a decision this
+    /// crate makes about evidence it did not read.
+    #[error("ECXF source member not observed: {member}")]
     UnobservedSourceMember {
-        /// Static name of the `CoherentSourceExport` / `ExportFence` member the
-        /// source owner did not observe.
+        /// Static name of the `CoherentSourceExport` field the source owner did
+        /// not observe.
         member: &'static str,
     },
     #[error("serialization failed: {0}")]

@@ -77,7 +77,10 @@ pub struct EcxfExportArgs {
     /// prove the scope-to-record closure, so it never filters the provider
     /// read with it.
     pub scope_id: String,
-    /// Canonical request hash of the admitted request envelope.
+    /// Operator-declared canonical request hash for this export's request
+    /// identity. **There is no admitted request envelope for an ECXF export
+    /// today**, so this is not a value read from an admission path; see the
+    /// finding below.
     ///
     /// FINDING (#1871): no honest derivation of this digest exists in this
     /// process. `eliot_store_api::canonical_request_hash` is defined over
@@ -134,9 +137,15 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
 /// The vocabulary is the adapter's own `EcxfCaptureGap`
 /// (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`); this
 /// maps each gap onto the static name of the already-existing
-/// `CoherentSourceExport` / `ExportFence` member it leaves unobserved, and
-/// adds no second gap type. An owner that declares no gap at all has still not
-/// established the observed completeness itself.
+/// [`CoherentSourceExport`] field it leaves unobserved, and adds no second gap
+/// type. Only `scope_id` is also an `ExportFence` member under that name; the
+/// other four are source-view and manifest members (`purge_ledger`,
+/// `reachable_blob_residency_keys`, `architecture_source_digest`,
+/// `export_receipt`), which is why they are named after the field the source
+/// view would have had to supply. An owner that declares no gap at all has
+/// still not established the observed completeness itself, so that case names
+/// `completeness` — a source-view field whose counterpart in the fence is
+/// `consistent`, deliberately not the same word.
 fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
     match capture.missing_evidence.first() {
         Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => "scope_id",
