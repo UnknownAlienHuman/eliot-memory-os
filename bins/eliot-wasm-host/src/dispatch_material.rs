@@ -2408,7 +2408,7 @@ fn write_owner_disposition_unlocked(
 pub enum DeliveryClaimOutcome {
     /// This process atomically changed the owner reservation to InFlight.
     Acquired(DeliveryClaim),
-    /// A prior claimant owns this exact delivery but has no terminal result.
+    /// A prior claimant owns this exact delivery but has no committed terminal result.
     ExistingInFlight(DeliveryClaim),
     /// An exact terminal result is retained for replay, pending owner ACK.
     RetainedResult(DeliveryClaim),
@@ -2537,14 +2537,31 @@ pub fn acquire_delivery_claim(
                 {
                     return Ok(DeliveryClaimOutcome::Conflict);
                 }
-                Ok(DeliveryClaimOutcome::ExistingInFlight(bind_claim_to_owner(
+                let claim = bind_claim_to_owner(
                     staged,
                     &identity,
                     &join,
                     existing_request,
                     existing_launch,
                     existing_claimant,
-                )?))
+                )?;
+                // The result file is written before its matching terminal
+                // disposition. Under this same installation lock, recover
+                // that exact crash window before returning replay authority.
+                match read_served_result_unlocked(install_dir, &claim) {
+                    Ok(Some(result))
+                        if result
+                            .stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.terminal_sequence.is_some()) =>
+                    {
+                        Ok(DeliveryClaimOutcome::RetainedResult(claim))
+                    }
+                    Ok(None) | Ok(Some(_)) => {
+                        Ok(DeliveryClaimOutcome::ExistingInFlight(claim))
+                    }
+                    Err(_) => Ok(DeliveryClaimOutcome::Unavailable),
+                }
             }
             OwnerDeliveryDisposition::TerminalUnacknowledged {
                 launch_incarnation: existing_launch,
@@ -3009,13 +3026,27 @@ impl ServedResultRecord {
     }
 }
 
+/// Recomputes the result stream's commitment from the original stored JSON
+/// values, matching the request-loop writer and read-back validator.
+fn retained_result_stream_digest(
+    events: &[serde_json::Value],
+) -> Result<String, MaterialError> {
+    let mut commitment = String::new();
+    for event in events {
+        let bytes = serde_json::to_vec(event).map_err(|_| MaterialError::Malformed)?;
+        commitment.push_str(&sha256_hex(&bytes));
+    }
+    Ok(sha256_hex(commitment.as_bytes()))
+}
+
 /// Reads the durable served-result record, if any. Only an absent record
 /// answers `Ok(None)`; read failures, oversize files, malformed records, and
 /// records carrying zero or both result payloads fail closed so callers
 /// cannot treat uncertain retained state as a fresh delivery or as another
-/// identity's result. The retained content is returned opaquely: the driver
-/// that owns the result contract performs the real per-frame and stream-shape
-/// validation against the recorded values.
+/// identity's result. A complete, self-consistent terminal stream left beside
+/// an `InFlight` disposition is reconciled under the same installation lock
+/// before it is returned. The driver still performs typed per-frame and
+/// stream-shape validation against the original recorded values before replay.
 pub fn read_served_result(
     install_dir: &std::path::Path,
     claim: &DeliveryClaim,
@@ -3025,6 +3056,8 @@ pub fn read_served_result(
     })
 }
 
+/// Caller holds the shared installation-root lock. This read/repair path is
+/// used only by lock-owning publication, claim, read, and reclamation flows.
 fn read_served_result_unlocked(
     install_dir: &std::path::Path,
     claim: &DeliveryClaim,
@@ -3033,7 +3066,7 @@ fn read_served_result_unlocked(
         .owner_identity
         .as_ref()
         .ok_or(MaterialError::Malformed)?;
-    let disposition = read_owner_disposition_unlocked(install_dir, &claim.identity)?;
+    let mut disposition = read_owner_disposition_unlocked(install_dir, &claim.identity)?;
     if !disposition.disposition.is_claimed_by(claim) {
         return Err(MaterialError::DigestMismatch);
     }
@@ -3047,7 +3080,7 @@ fn read_served_result_unlocked(
             result_digest,
             result_sequence,
             ..
-        } => (Some(result_digest.as_str()), Some(*result_sequence)),
+        } => (Some(result_digest.clone()), Some(*result_sequence)),
         OwnerDeliveryDisposition::InFlight { .. } => (None, None),
         _ => return Err(MaterialError::DigestMismatch),
     };
@@ -3057,7 +3090,7 @@ fn read_served_result_unlocked(
         Err(error) => return Err(error),
         Ok(bytes) => bytes,
     };
-    if let Some(expected) = expected_digest
+    if let Some(expected) = expected_digest.as_deref()
         && Sha256Digest::of_bytes(&bytes).as_str() != expected
     {
         return Err(MaterialError::DigestMismatch);
@@ -3070,7 +3103,7 @@ fn read_served_result_unlocked(
         &record.runtime_request_digest,
         "served-result-runtime-digest",
     )?;
-    if record.retained_at_unix_ms == 0 || !record.names(claim) || record.identity != *owner_identity
+    if record.retained_at_unix_ms == 0 || !record.names(claim) || &record.identity != owner_identity
     {
         return Err(MaterialError::Malformed);
     }
@@ -3083,16 +3116,9 @@ fn read_served_result_unlocked(
         (Some(_), None) | (None, Some(_)) => {}
         _ => return Err(MaterialError::Malformed),
     }
-    if expected_digest.is_none()
-        && (record.frame.is_some()
-            || record
-                .stream
-                .as_ref()
-                .map_or(true, |stream| stream.terminal_sequence.is_some()))
-    {
-        // RESULT may reach disk just before a crash that prevents the matching
-        // terminal disposition write. Preserve the bytes, but never expose
-        // them as a terminal replay until the owner state records that commit.
+    if expected_digest.is_none() && record.frame.is_some() {
+        // The legacy terminal-only shape has no complete retained stream or
+        // owner sequence to reconcile. Preserve it unresolved.
         return Err(MaterialError::DigestMismatch);
     }
     if let Some(stream) = record.stream.as_ref() {
@@ -3100,12 +3126,18 @@ fn read_served_result_unlocked(
             return Err(MaterialError::Malformed);
         }
         hex_digest(&stream.stream_digest, "served-result-stream-digest")?;
+        if retained_result_stream_digest(&stream.events)? != stream.stream_digest {
+            return Err(MaterialError::DigestMismatch);
+        }
         if let Some(terminal) = stream.terminal_sequence {
             // A recorded terminal that names an event the record never
             // stored is malformed here, not a stream whose shape the driver
             // gets to decide.
             let index = usize::try_from(terminal).map_err(|_| MaterialError::Malformed)?;
             if stream.events.get(index).is_none() {
+                return Err(MaterialError::Malformed);
+            }
+            if expected_digest.is_none() && index != stream.events.len() - 1 {
                 return Err(MaterialError::Malformed);
             }
             if record.result_sequence != Some(terminal) {
@@ -3119,6 +3151,62 @@ fn read_served_result_unlocked(
         && record.result_sequence != Some(expected)
     {
         return Err(MaterialError::DigestMismatch);
+    }
+
+    if expected_digest.is_none() {
+        if let Some(stream) = record.stream.as_ref()
+            && let Some(result_sequence) = stream.terminal_sequence
+        {
+            let (
+                owner_identity,
+                owner_join,
+                request_commitment,
+                launch_incarnation,
+                claimant_incarnation,
+                runtime_request_digest,
+            ) = match &disposition.disposition {
+                OwnerDeliveryDisposition::InFlight {
+                    identity,
+                    join,
+                    request_commitment,
+                    launch_incarnation,
+                    claimant_incarnation,
+                    runtime_request_digest,
+                } => (
+                    identity.clone(),
+                    join.clone(),
+                    request_commitment.clone(),
+                    launch_incarnation.clone(),
+                    claimant_incarnation.clone(),
+                    runtime_request_digest.clone(),
+                ),
+                _ => return Err(MaterialError::DigestMismatch),
+            };
+            // The result's owner, request, launch, and claimant commitments
+            // must all match the exact InFlight record before its digest and
+            // terminal sequence can become durable owner state.
+            if &record.identity != &owner_identity
+                || &record.join != &owner_join
+                || record.request_commitment.as_str() != request_commitment.as_str()
+                || record.launch_incarnation.as_str() != launch_incarnation.as_str()
+                || record.claimant_incarnation.as_str() != claimant_incarnation.as_str()
+                || record.runtime_request_digest.as_str() != runtime_request_digest.as_str()
+            {
+                return Err(MaterialError::DigestMismatch);
+            }
+            disposition.disposition = OwnerDeliveryDisposition::TerminalUnacknowledged {
+                identity: owner_identity,
+                join: owner_join,
+                request_commitment,
+                launch_incarnation,
+                claimant_incarnation,
+                runtime_request_digest,
+                result_digest: Sha256Digest::of_bytes(&bytes).as_str().to_owned(),
+                result_sequence,
+            };
+            write_owner_disposition_unlocked(install_dir, &claim.identity, &disposition)
+                .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+        }
     }
     Ok(Some(record))
 }
@@ -3179,6 +3267,11 @@ pub fn write_served_result(
             let old = read_served_result_unlocked(install_dir, claim)
                 .map_err(|_| std::io::Error::other("retained-result-unavailable"))?
                 .ok_or_else(|| std::io::Error::other("retained-result-unavailable"))?;
+            // The nested read can reconcile an InFlight terminal result.
+            // Refresh owner state before deciding whether another write is
+            // still an append or would replace an already sealed result.
+            disposition = read_owner_disposition_unlocked(install_dir, &claim.identity)
+                .map_err(|_| std::io::Error::other("delivery-disposition-unavailable"))?;
             if !old.names(claim) {
                 return Err(std::io::Error::other("retained-result-conflict"));
             }
