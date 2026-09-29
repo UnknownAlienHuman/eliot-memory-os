@@ -16,8 +16,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_contracts::{
-    HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
+    ArtifactId, HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
     ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
+use eliot_kernel_core::KernelError;
+use eliot_runtime_contracts::{
+    AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
+    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, EarliestRecoveryCondition,
+    EvidenceCoverageState, HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION,
+    I14AlternativeRoute, I14BackpressureCause, I14BackpressureResponseV1, I14CurrentnessState,
+    I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction, I14RecoveryDirectiveV1,
+    I14RequiredAuthority, I14ResolutionState, I14WorkOutcome, NormalWorkClass,
+    RecoveryCommitStatus, StatePreservationStatus,
 };
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
@@ -45,7 +55,8 @@ use eliot_store_api::{
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
     StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
     WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
-    dreamer_job_queue_key, generated_operation_manifests, verify_canonical_request_hash,
+    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
+    verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -7763,6 +7774,124 @@ pub enum NamedReadGatewayError {
     /// Gateway validation, fencing, or route checks refused the read.
     #[error("{0}")]
     GatewayRefusal(String),
+}
+
+/// Builds the complete versioned I14.5 directive for one read that the
+/// canonical Store could not answer.
+///
+/// A read has no effect, so nothing was committed and nothing needs
+/// reconciliation: this is [`RecoveryCommitStatus::None`] with
+/// [`I14WorkOutcome::NotAccepted`], which is why the read may be re-issued under
+/// its own identity once the condition is met. The typed cause is read off the
+/// [`StoreError`] variant — never off a rendered sentence — so the closed cause
+/// `CANONICAL_STORE_UNAVAILABLE` is produced by pattern-matching the enum, not by
+/// comparing text a transport happened to produce.
+///
+/// The read-only boundary is preserved rather than widened: the only authorized
+/// fallback is [`I14AlternativeRoute::CanonicalReadOnly`], which continues to
+/// consult canonical state and grants no noncanonical substitute, and the only
+/// permitted next action is to await the named condition. A caller holding this
+/// directive cannot read it as permission to proceed on stale truth.
+///
+/// `operation_id` is the caller's exact admitted read identity when one exists.
+/// `profile_revision` is the owner-produced compiled read-profile artifact the
+/// directive was built from. Both are declared here and validated by the existing
+/// [`I14BackpressureResponseV1::validate`], so an inconsistent directive fails
+/// closed instead of shipping a partial one.
+pub fn store_read_unavailable_response(
+    state_fence: &StateFence,
+    operation_id: Option<&OperationId>,
+    profile_revision: &ArtifactId,
+) -> Result<I14BackpressureResponseV1, KernelError> {
+    let response = I14BackpressureResponseV1 {
+        contract_version: I14_BACKPRESSURE_RESPONSE_VERSION,
+        disposition: BackpressureDisposition::DbUnavailable,
+        directive: I14RecoveryDirectiveV1 {
+            cause: I14BackpressureCause::CanonicalStoreUnavailable,
+            affected_operation_class: AffectedOperationClass::Normal(NormalWorkClass::Interactive),
+            // A read depends on the canonical Store connection, not on a
+            // capacity dimension this owner has measured. The contract permits
+            // an explicit unknown observation for a non-capacity cause; claiming
+            // a measured exhausted dimension here would fabricate capacity
+            // evidence the outage path never observed.
+            bottlenecks: vec![BottleneckObservationV1 {
+                bottleneck: CapacityBottleneck::StoreConnectionSlots,
+                unit: CapacityBottleneck::StoreConnectionSlots.unit(),
+                requested_amount: 1,
+                availability: BottleneckAvailability::Unknown,
+                coverage_state: BottleneckCoverageState::Unknown,
+            }],
+            work_outcome: I14WorkOutcome::NotAccepted,
+            commit_status: RecoveryCommitStatus::None,
+            state_preservation: StatePreservationStatus::Preserved,
+            operation_id: operation_id.cloned(),
+            preserve_operation_id: operation_id.is_some(),
+            stage_receipt: None,
+            rollback_receipt: None,
+            // The read is refused, not staged and not uncertain: re-issue it once
+            // the Store is answering again. Polling or receipt reconciliation
+            // would be false, because no operation reached the Store to leave an
+            // effect to reconcile.
+            retry_strategy: I14RecoveryAction::AwaitCondition,
+            earliest_permitted_condition: EarliestRecoveryCondition::AuthorityRestored,
+            earliest_permitted_unix_millis: None,
+            actions_temporarily_forbidden: vec![
+                I14ForbiddenAction::AssumeCommitWithoutReadback,
+                I14ForbiddenAction::ContinueWithStaleAuthority,
+            ],
+            safe_fallback: Some(I14AlternativeRoute::CanonicalReadOnly),
+            required_authority: I14RequiredAuthority::ExistingOperationAuthority,
+            human_action_required: HumanActionRequirement::NoneRequired,
+            // A read that never reached the Store leaves no receipt to cite, and
+            // coverage is reported as unavailable rather than claimed complete.
+            evidence_refs: Vec::new(),
+            evidence_coverage: EvidenceCoverageState::Unavailable,
+            escalation_condition: I14EscalationCondition::ManualPlatformRecovery,
+            resolution_state: I14ResolutionState::Pending,
+            // The observation is live at the moment the Store refused, so the
+            // directive itself is current even though the answer it carries is
+            // not: the distinction is that a current observation of an
+            // unavailable Store still yields no current result.
+            currentness: I14CurrentnessState::Current,
+            profile_revision: profile_revision.clone(),
+            state_fence: Some(state_fence.clone()),
+            authority_epoch: Some(state_fence.authority_epoch.clone()),
+        },
+    };
+    response.validate()?;
+    Ok(response)
+}
+
+/// The owner-produced compiled read-profile artifact identity every
+/// `DB_UNAVAILABLE` read directive is bound to.
+///
+/// This is the generated Store operation-manifest set digest — the exact
+/// catalogue the read was validated against — not a caller-supplied string, so
+/// the directive names the profile it was actually issued under. It is derived
+/// from crate constants and is therefore the same value on every process, which
+/// is what makes it a usable artifact reference rather than per-process noise.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] when the generated catalogue cannot be
+/// produced or hashed into an artifact identity.
+pub fn store_read_profile_revision() -> Result<ArtifactId, KernelError> {
+    let entries = generated_operation_manifests().map_err(|error| KernelError::InvalidField {
+        field: "store_read_profile_revision.manifests",
+        reason: match error {
+            StoreError::Duplicate { .. } => "generated operation manifests contain a duplicate",
+            StoreError::Empty { .. } => "generated operation manifest set is empty",
+            _ => "generated operation manifests are not well formed",
+        },
+    })?;
+    let digest = operation_manifest_set_digest(&entries).map_err(|_| KernelError::InvalidField {
+        field: "store_read_profile_revision.digest",
+        reason: "operation manifest set digest could not be computed",
+    })?;
+    ArtifactId::new(digest.as_str()).map_err(|_| KernelError::InvalidField {
+        field: "store_read_profile_revision.artifact_id",
+        reason: "operation manifest set digest is not a valid artifact identity",
+    })
 }
 
 /// Closed failure set for one Dreamer ledger operation through the Kernel

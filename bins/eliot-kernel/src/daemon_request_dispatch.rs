@@ -7522,9 +7522,18 @@ impl KernelComposition {
             };
         }
         let gateway = self.retained_store_gateway()?;
+        let read_fence = operation.request.state_fence.clone();
         match gateway.execute_named_with_error(operation.request).await {
             Ok(response) => Ok(store_named_response(&response)),
-            Err(error) => Ok(Self::store_read_failure_response("store_named", &error)),
+            // This route is a bare closed named read with no Kernel-issued
+            // operation handle, so the directive carries no preserved identity
+            // rather than one invented at refusal time.
+            Err(error) => Ok(Self::store_read_failure_response(
+                "store_named",
+                &read_fence,
+                None,
+                &error,
+            )),
         }
     }
 
@@ -7609,8 +7618,23 @@ impl KernelComposition {
             // source moved (I15.7); nothing is re-executed, overwritten, or
             // narrowed here. The observed heads come from the Store's own head
             // read, so this is a causal join rather than a self-match.
-            self.check_retained_local_read_source_revisions(&record, &envelope)
-                .await?;
+            //
+            // When the canonical Store is unreachable the join is
+            // UNESTABLISHED rather than disproved: the retained bytes are
+            // withheld and the caller receives the typed unavailable answer with
+            // the full directive, so a cached view is never presented as current
+            // merely because the source that would disprove it was unreachable.
+            if let Err(error) = self
+                .check_retained_local_read_source_revisions(&record, &envelope)
+                .await?
+            {
+                return Ok(Self::store_read_failure_response(
+                    "local_read",
+                    &envelope.state_fence,
+                    Some(&host_request_operation_id(&envelope)),
+                    &error,
+                ));
+            }
             // The bytes are about to leave this process, so the CURRENT
             // disclosure permission is re-evaluated now, at the moment of
             // redelivery, against the durable row and the live owner reads —
@@ -7668,7 +7692,15 @@ impl KernelComposition {
         let response = match gateway.execute_named_with_error(read).await {
             Ok(response) => response,
             Err(error) => {
-                return Ok(Self::store_read_failure_response("local_read", &error));
+                // The Kernel-issued host-request handle is the admitted read's
+                // own identity, so the directive preserves THAT handle and the
+                // caller retries this read rather than a fresh one.
+                return Ok(Self::store_read_failure_response(
+                    "local_read",
+                    &envelope.state_fence,
+                    Some(&operation_id),
+                    &error,
+                ));
             }
         };
         if response.operation != NamedReadOperation::GetEvidencePack
@@ -7802,18 +7834,24 @@ impl KernelComposition {
     /// never erases an earlier delivery, and never spends another budget: a
     /// moved source simply fails the replay closed, leaving the original
     /// result identity and its evidence intact for its owner to replan.
+    ///
+    /// An unavailable canonical Store is returned as the typed cause rather than
+    /// collapsed into a fence, because freshness is then unestablished rather
+    /// than disproved: the caller reports the cached view's stale/unavailable
+    /// boundary with the full directive instead of presenting the retained bytes
+    /// as current or hiding why they were withheld.
     #[cfg(windows)]
     async fn check_retained_local_read_source_revisions(
         &self,
         record: &eliot_ors::HostRequestRecord,
         envelope: &HostRequestEnvelope,
-    ) -> Result<(), TransportError> {
+    ) -> Result<Result<(), NamedReadGatewayError>, TransportError> {
         let keys = host_request_route::retained_source_revision_keys(record)?;
         if keys.is_empty() {
-            return Ok(());
+            return Ok(Ok(()));
         }
         let gateway = self.retained_store_gateway()?;
-        let response = gateway
+        let response = match gateway
             .execute_named_with_error(NamedReadRequest {
                 operation: NamedReadOperation::GetRevisionHeads,
                 scope_id: None,
@@ -7822,7 +7860,16 @@ impl KernelComposition {
                 parameters: BTreeMap::new(),
             })
             .await
-            .map_err(|_| TransportError::SessionFenced)?;
+        {
+            Ok(response) => response,
+            // The Store's own typed refusal travels intact; only this one cause
+            // is distinguished, because it is the one where the source is
+            // unreachable rather than observed to have moved.
+            Err(NamedReadGatewayError::Store(StoreError::Unavailable)) => {
+                return Ok(Err(NamedReadGatewayError::Store(StoreError::Unavailable)));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
         if response.operation != NamedReadOperation::GetRevisionHeads
             || response.state_fence != envelope.state_fence
         {
@@ -7841,7 +7888,8 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?;
             observed.push(head);
         }
-        host_request_route::check_retained_source_revisions(record, &observed)
+        host_request_route::check_retained_source_revisions(record, &observed)?;
+        Ok(Ok(()))
     }
 
     /// Re-evaluates the CURRENT disclosure permission for one retained
@@ -8865,20 +8913,73 @@ impl KernelComposition {
         })
     }
 
+    /// Renders one refused canonical read as the truthful `DB_UNAVAILABLE`
+    /// answer (issue #1681 W3, I14.11, I14.5).
+    ///
+    /// The `Store` cause is read off the typed [`NamedReadGatewayError`] arm, so
+    /// the closed `DB_UNAVAILABLE` disposition follows from the enum variant the
+    /// Store API returned rather than from matching rendered text. The complete
+    /// versioned #1679 directive travels whole in `recovery`: commit status,
+    /// preserved state and evidence, forbidden actions, retry-versus-poll, the
+    /// preserved operation identity, the authorized bounded fallback, the next
+    /// action, and the escalation boundary. Nothing is dropped, and a directive
+    /// that fails the existing contract check is never partially emitted: the
+    /// answer keeps the same error status and code with a `null` directive rather
+    /// than a half-populated one.
+    ///
+    /// The read itself is never re-read, re-executed, or served from cache on
+    /// this path, and the answer carries no payload: an unavailable canonical
+    /// Store yields no result rather than an empty or stale one.
     #[cfg(windows)]
-    fn store_read_failure_response(kind: &str, error: &NamedReadGatewayError) -> serde_json::Value {
-        if matches!(error, NamedReadGatewayError::Store(StoreError::Unavailable)) {
-            return serde_json::json!({
-                "status": "error",
-                "code": "DB_UNAVAILABLE",
-                "reason": "Canonical Store is unavailable; named read was not completed.",
-                "value": { "kind": kind, "value": null },
-                "recovery": null,
-            });
-        }
-
-        Self::store_error_response_text(kind, &error.to_string())
+    fn store_read_failure_response(
+        kind: &str,
+        state_fence: &StateFence,
+        operation_id: Option<&str>,
+        error: &NamedReadGatewayError,
+    ) -> serde_json::Value {
+        let NamedReadGatewayError::Store(StoreError::Unavailable) = error else {
+            return Self::store_error_response_text(kind, &error.to_string());
+        };
+        let directive = store_read_unavailable_directive(state_fence, operation_id);
+        serde_json::json!({
+            "status": "error",
+            "code": "DB_UNAVAILABLE",
+            "reason": "Canonical Store is unavailable; named read was not completed.",
+            "value": { "kind": kind, "value": null },
+            "recovery": { "read_directive": directive },
+        })
     }
+}
+
+/// Builds the complete versioned I14.5 directive for one unavailable read, or
+/// `None` when the owner refuses to produce a valid one.
+///
+/// `operation_id` is the exact handle the admitted read already carries, so the
+/// directive preserves and the caller retries THAT read rather than a fresh one.
+/// A caller that holds no admitted read handle passes `None` and the directive
+/// reports that absence honestly instead of minting an identity for work that
+/// was never admitted.
+#[cfg(windows)]
+fn store_read_unavailable_directive(
+    state_fence: &StateFence,
+    operation_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    // `eliot_contracts::OperationId` is the I14.5 directive's operation identity
+    // and is distinct from this module's process-lane `OperationId` import.
+    let operation_id = operation_id.map(|handle| eliot_contracts::OperationId::new(handle.to_owned()));
+    let operation_id = match operation_id {
+        Some(Err(_)) => return None,
+        Some(Ok(operation_id)) => Some(operation_id),
+        None => None,
+    };
+    let profile_revision = eliot_kernel_service::store_read_profile_revision().ok()?;
+    eliot_kernel_service::store_read_unavailable_response(
+        state_fence,
+        operation_id.as_ref(),
+        &profile_revision,
+    )
+    .ok()
+    .and_then(|directive| serde_json::to_value(directive).ok())
 }
 
 /// Closed outcome of the graceful WASM control half of one
