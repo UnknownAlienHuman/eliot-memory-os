@@ -73,7 +73,20 @@ pub struct DurableJournalRecord {
     pub installation_ref: String,
     /// The committed authority generation of that installation.
     pub generation: ResourceGeneration,
-    /// The journal identity committed for this operation.
+    /// The journal identity committed for this operation: the key this record's
+    /// durable row was read under.
+    ///
+    /// This is the PER-EXECUTION STREAM KEY, derived from the plan as
+    /// `sha256(plan_id, bundle_sha256)`, and it is what keeps two restores of
+    /// the same archive in different journal streams. It is not the durable
+    /// channel's namespace identity: a channel is fixed across every
+    /// execution, while this value is different for every plan/bundle pair and
+    /// can never equal a fixed channel name. `database_ref` carries the
+    /// channel this record was read from; consumers that need to know which
+    /// store admitted a restore compare that field, and consumers that need to
+    /// know which execution an admission belongs to compare this one. Both
+    /// checks are exact equality, and
+    /// [`RestoreJournalAdmission::binds_owner_record`] performs the second.
     pub journal_identity_ref: String,
     /// The admission receipt committed for this operation.
     pub admission_receipt_ref: String,
