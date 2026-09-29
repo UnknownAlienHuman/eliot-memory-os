@@ -233,6 +233,42 @@ pub struct RecipeManifest {
     pub role_profiles: Vec<RoleProfileManifest>,
 }
 
+/// Human-selected staffing policy, carried unchanged with the frozen plan
+/// request. The budget is cost intent; lane budgets remain the task's ask and
+/// are checked against this ceiling by the daemon staffing policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanStaffingIntent {
+    pub preset: StaffingPreset,
+    pub per_job_budget: BudgetEnvelope,
+}
+
+/// I3.6 Human-selectable staffing decision presets. These select route and
+/// independence policy, never a provider allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StaffingPreset {
+    Economy,
+    Balanced,
+    Assurance,
+    Research,
+    Incident,
+}
+
+impl StaffingPreset {
+    /// Canonical wire spelling.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Economy => "economy",
+            Self::Balanced => "balanced",
+            Self::Assurance => "assurance",
+            Self::Research => "research",
+            Self::Incident => "incident",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteCandidateEvidence {
@@ -242,6 +278,14 @@ pub struct RouteCandidateEvidence {
     pub capacity_revision: RevisionId,
     pub capacity_limit: usize,
     pub budget_evidence: BudgetEvidence,
+    /// Owner-reported capability classes for this exact route. These are
+    /// intersected with recipe, role, and launch declarations by staffing.
+    pub route_classes: Vec<String>,
+    pub route_class_evidence_refs: Vec<String>,
+    /// The route's owner-supplied I3.4 data classes. This is route-local
+    /// evidence, distinct from the task's requested privacy class.
+    pub privacy_classes: Vec<PrivacyClass>,
+    pub privacy_evidence_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
 }
 
@@ -274,6 +318,9 @@ pub struct StaffingPlanRequest {
     pub task_revision: String,
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
+    /// Explicit Task-Controller/Human policy input. There is no preset default
+    /// or recipe-shape inference at the staffing boundary.
+    pub human_staffing_intent: HumanStaffingIntent,
     pub privacy_class: PrivacyClass,
     /// I14.1 work class for the whole plan (issue #1698) as the closed
     /// boundary type. Every lane must carry this same class; a mixed-class

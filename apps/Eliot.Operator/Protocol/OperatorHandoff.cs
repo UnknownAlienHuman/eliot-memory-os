@@ -63,12 +63,11 @@ public static class OperatorIdentityFields
 }
 
 /// The closed broker-issued Human role and capability vocabulary the UI
-/// renders under (I11.3, I11.8). The owner mints exactly one role with the two
-/// capabilities below (`crates/surfaces/eliot-user-broker-core::OPERATOR_ROLE`
-/// / `OPERATOR_CAPABILITIES`, exact-match enforced owner-side); the client
-/// pins the same closed set and refuses anything wider. Per-view and
-/// per-action gating reads the GRANTED binding, never a constant, so a
-/// narrower future binding withholds rather than executes.
+/// renders under (I11.3, I11.8). The owner mints the `human_operator` role
+/// with a non-empty subset of the two capabilities below; the client pins the
+/// same closed vocabulary and refuses anything wider, empty or duplicated.
+/// Per-view and per-action gating reads the GRANTED binding, never a
+/// constant, so a narrower binding withholds rather than executes.
 public static class OperatorCapabilityNames
 {
     public const string HumanOperatorRole = "human_operator";

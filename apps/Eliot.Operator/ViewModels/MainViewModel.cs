@@ -161,6 +161,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 OnPropertyChanged(nameof(IsGraphPage));
                 OnPropertyChanged(nameof(IsQueryPage));
                 OnPropertyChanged(nameof(IsUserAutomationPage));
+                OnPropertyChanged(nameof(IsUserAutomationOperable));
             }
         }
     }
@@ -170,6 +171,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public bool IsQueryPage => CurrentPage.Tag == "query_lab";
     public bool IsGraphPage => CurrentPage.Tag == "causal_provenance" || (IsQueryPage && ResultMode == "graph");
     public bool IsUserAutomationPage => CurrentPage.Tag == "user_automation";
+    /// Role-filtered rendering of the command-only UserAutomation view: the
+    /// typed command panel is shown only on its page AND under a grant that
+    /// carries the command capability. A known binding that withholds commands
+    /// gets the withheld explanation instead of an operable-looking panel.
+    public bool IsUserAutomationOperable => IsUserAutomationPage && CanIssueCommands;
     public bool IsBusy { get => _isBusy; private set => Set(ref _isBusy, value); }
     public string ProjectId
     {
@@ -928,8 +934,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (IsUserAutomationPage)
             {
                 // UserAutomation has a typed command route, but no canonical
-                // listing projection. Clear any prior page before showing that
-                // limitation; the command panel keeps its separate inputs.
+                // listing projection. Clear any prior page first. A known
+                // binding that withholds the command capability gets the
+                // withheld explanation (role-filtered rendering); the command
+                // panel itself stays hidden until the grant allows it.
                 Records.Clear();
                 SelectedRecord = null;
                 SelectedAction = null;
@@ -938,6 +946,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 _projectionBinding = null;
                 _taskContext = null;
                 ResultPayloadText = string.Empty;
+                if (!RequireCommandCapability("user_automation"))
+                {
+                    ResultSummary = "UserAutomation commands withheld for this role; no total is available.";
+                    return;
+                }
                 ResultSummary = "UserAutomation listing unavailable; no total is available.";
                 SetBanner(
                     "UserAutomation listing unavailable",
@@ -1007,7 +1020,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
             }
             RefreshRoleBinding();
             UpdateBindingSummary(page);
-            if (degraded.Count == 0)
+            // Green means whole: a truncated projection is an incomplete
+            // rendering of the canonical state, so it is shown as degraded
+            // (Warning) rather than green even when no incident or backup
+            // signal fired. The retained records stay visible; only the
+            // completeness claim is withheld.
+            if (page.Truncated)
+            {
+                ResultSummary += " The owner truncated this page: the rendering is incomplete.";
+            }
+            if (degraded.Count == 0 && !page.Truncated)
             {
                 SetBanner(
                     "Connected",
@@ -1015,6 +1037,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
                         ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
                         : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
                     OperatorBannerSeverity.Success);
+            }
+            else if (page.Truncated && degraded.Count == 0)
+            {
+                SetBanner(
+                    "Projection truncated",
+                    $"Runtime {page.RuntimeId} truncated the {page.Projection} page: {Records.Count} record(s) shown, completeness not claimed. Narrow the scope or filters for a whole page.",
+                    OperatorBannerSeverity.Warning);
             }
             else
             {
@@ -1040,6 +1069,21 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
             {
                 SetBanner("Request cancelled", "The nonblocking Governor request was cancelled.", OperatorBannerSeverity.Informational);
+            }
+        }
+        catch (OperatorRestartRequiredException restart)
+        {
+            // The broker session binding is gone: only a process restart under
+            // a fresh owner handoff restores it. This is a lifecycle state,
+            // not a backend degradation, so it never shares the degraded
+            // banner. Retained unknown-outcome operations keep their phase for
+            // reconciliation after restart; nothing is compacted here.
+            if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
+            {
+                SetBanner(
+                    "Session binding lost — restart required",
+                    $"{restart.Message} {OperatorHandoff.ReacquisitionRequirement}. Retained operations stay reconciling.",
+                    OperatorBannerSeverity.Warning);
             }
         }
         catch (Exception error)
@@ -1596,6 +1640,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         OnPropertyChanged(nameof(GrantedRole));
         OnPropertyChanged(nameof(CanReadProjection));
         OnPropertyChanged(nameof(CanIssueCommands));
+        OnPropertyChanged(nameof(IsUserAutomationOperable));
         UpdateBindingSummary(null);
     }
 

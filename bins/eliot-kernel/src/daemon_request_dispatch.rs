@@ -7184,6 +7184,17 @@ impl KernelComposition {
             // read, so this is a causal join rather than a self-match.
             self.check_retained_local_read_source_revisions(&record, &envelope)
                 .await?;
+            // The bytes are about to leave this process, so the CURRENT
+            // disclosure permission is re-evaluated now, at the moment of
+            // redelivery, against the durable row and the live owner reads —
+            // never against the value captured when the result was first
+            // produced and never against anything the presenting caller
+            // supplies. A changed permission withholds the bytes; it does not
+            // re-execute, does not overwrite the retained result, and does not
+            // erase an earlier delivery observation. A delivery whose outcome
+            // was never proven keeps its reconciliation obligation, because
+            // this leg only refuses and writes nothing.
+            self.reevaluate_retained_disclosure_permission(&record, session, &envelope)?;
             return Ok(replayed);
         }
         // No bypass: the presented attempt must be the live claim-record
@@ -7404,6 +7415,54 @@ impl KernelComposition {
             observed.push(head);
         }
         host_request_route::check_retained_source_revisions(record, &observed)
+    }
+
+    /// Re-evaluates the CURRENT disclosure permission for one retained
+    /// local-read result immediately before its bytes are re-sent (issue #1809
+    /// item 6).
+    ///
+    /// The permission is read from its real owner at the moment of
+    /// redelivery, in two independent halves that no caller can supply:
+    ///
+    /// * [`host_request_route::check_retained_disclosure_permission`] joins
+    ///   the durable row to the live authenticated `Session`: the row must be
+    ///   one ORS closed as a result, its retained delivery evidence must still
+    ///   describe its own recorded result under the existing ORS validator,
+    ///   and the live session's authority LINEAGE must still be the one the
+    ///   row was produced under. The session is established by the
+    ///   authenticated transport, so the presented envelope contributes
+    ///   nothing to this half.
+    /// * [`Self::admit_material_authority_for_governor_issued_fence`] — the
+    ///   SAME live owner read the fresh leg clears at
+    ///   [`Self::local_read_operation`]. It resolves the currently recorded
+    ///   Governor-issued coverage revision and active fingerprint, runs the
+    ///   unchanged fence, ceiling and Watchdog-supervision decision, and
+    ///   re-checks revision currency before admitting. The fresh leg reaches
+    ///   it because its record is not yet terminal; a replayed terminal record
+    ///   deliberately skips it inside envelope admission, which is exactly the
+    ///   gap this leg closes: the current permission that admitted the first
+    ///   delivery is re-read here rather than assumed. The profile, revision
+    ///   and fingerprint come from the owner, so no presented value can stand
+    ///   in for them; only the target fence is presented, and it is bound to
+    ///   the retained row by the first join.
+    ///
+    /// A refusal here is the only outcome. It never re-executes the read, so
+    /// a changed permission cannot consume another attempt or budget; it
+    /// performs no ORS write, so the retained result and any earlier delivery
+    /// observation are untouched; and because the refusal is not an answer and
+    /// not a state advance, a delivery whose external outcome was never proven
+    /// keeps its reconciliation obligation rather than being resolved into a
+    /// success or a failure by this leg.
+    #[cfg(windows)]
+    fn reevaluate_retained_disclosure_permission(
+        &self,
+        record: &eliot_ors::HostRequestRecord,
+        session: &Session,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), TransportError> {
+        host_request_route::check_retained_disclosure_permission(record, session)?;
+        self.admit_material_authority_for_governor_issued_fence(&envelope.state_fence)
+            .map_err(|_| TransportError::SessionFenced)
     }
 
     /// Publishes one owner-side WASM dispatch bundle on the admitted path

@@ -559,6 +559,18 @@ pub enum CoverageIndeterminacy {
     OwnerUnattached,
     /// No host-event stream was ever admitted for this route.
     NoStreamAdmitted,
+    /// The owner's proven interval does not reach this correlation's own
+    /// observation point. Contiguity over a disjoint sequence range proves
+    /// nothing about an invocation it never covered (issue #2899, item 7:
+    /// only an owner-proven complete interval *for this correlation* past the
+    /// deadline may establish the fault class). Missing host coverage is
+    /// `UNKNOWN`, never a self-reported clean interval.
+    CorrelationIntervalNotObserved {
+        /// Last sequence the owner's proven interval actually covers.
+        last_proven_seq: u64,
+        /// Sequence the correlation needs observed for coverage to bind.
+        required_seq: u64,
+    },
 }
 
 impl CoverageIndeterminacy {
@@ -568,6 +580,7 @@ impl CoverageIndeterminacy {
             Self::JournalRotated => "journal_rotated",
             Self::OwnerUnattached => "owner_unattached",
             Self::NoStreamAdmitted => "no_stream_admitted",
+            Self::CorrelationIntervalNotObserved { .. } => "correlation_interval_not_observed",
         }
     }
 }
@@ -581,6 +594,19 @@ pub struct ObservationWindow {
     pub now_unix_ms: Option<u64>,
     /// Owner-proven coverage over the host-event interval.
     pub coverage: CoverageProof,
+    /// Host-event sequence this correlation must itself reach for a proven
+    /// interval to say anything about it.
+    ///
+    /// The owner proves contiguity over the whole retained journal, and that
+    /// journal is not this invocation's. Without a required sequence the
+    /// correlation, a contiguous run of *other* invocations' events past an
+    /// already-expired deadline would read as owner-proven complete coverage
+    /// and establish `HostRespondingStuckAfterDeadline` for an interval the
+    /// owner never observed for this correlation (issue #2899 item 7; I7.23
+    /// "a native `completed` status may still map to `UNKNOWN_OUTCOME`").
+    /// `None` means the owner admitted no sequence binding for this
+    /// correlation, which is itself indeterminacy, never coverage.
+    pub required_seq: Option<u64>,
 }
 
 impl ObservationWindow {
@@ -590,17 +616,62 @@ impl ObservationWindow {
             deadline_unix_ms: None,
             now_unix_ms: None,
             coverage: CoverageProof::NoEventYet,
+            required_seq: None,
+        }
+    }
+
+    /// Whether this correlation's own host-event interval was observed.
+    ///
+    /// A `CompleteInterval` is coverage for this correlation only when the
+    /// owner admitted a required sequence and the proven interval actually
+    /// reaches it. A contiguous interval that stops short of this
+    /// correlation's sequence, or any interval with no admitted sequence
+    /// binding at all, is missing coverage — `Indeterminate`, never complete.
+    pub const fn covers_this_correlation(&self) -> bool {
+        match (&self.coverage, self.required_seq) {
+            (CoverageProof::CompleteInterval { to_seq, .. }, Some(required)) => *to_seq >= required,
+            _ => false,
         }
     }
 
     /// Whether a complete observed interval extends past the admitted deadline.
     ///
-    /// False unless the owner proved a complete interval AND admitted both a
-    /// deadline and a clock reading past it. Anything else stays pending.
+    /// False unless the owner proved a complete interval *for this
+    /// correlation* AND admitted both a deadline and a clock reading past it.
+    /// Anything else stays pending: a disjoint interval, an unattributed
+    /// sequence, a gap, or an absent clock reading is unknown, not a fault.
     pub const fn complete_interval_past_deadline(&self) -> bool {
-        match (&self.coverage, self.deadline_unix_ms, self.now_unix_ms) {
-            (CoverageProof::CompleteInterval { .. }, Some(deadline), Some(now)) => now > deadline,
+        match (
+            self.covers_this_correlation(),
+            self.deadline_unix_ms,
+            self.now_unix_ms,
+        ) {
+            (true, Some(deadline), Some(now)) => now > deadline,
             _ => false,
+        }
+    }
+
+    /// Coverage restated as coverage *of this correlation*.
+    ///
+    /// A proven interval the owner never extended to this correlation's own
+    /// required sequence is restated as
+    /// [`CoverageIndeterminacy::CorrelationIntervalNotObserved`], which
+    /// classifies as `TransportOutcomeUnknown`, not as a fault and not as a
+    /// clean pending interval. The other variants are already about this
+    /// route and pass through unchanged.
+    pub fn bounded_coverage(&self) -> CoverageProof {
+        match (&self.coverage, self.required_seq) {
+            (CoverageProof::CompleteInterval { to_seq, .. }, Some(required_seq))
+                if *to_seq < required_seq =>
+            {
+                CoverageProof::Indeterminate {
+                    cause: CoverageIndeterminacy::CorrelationIntervalNotObserved {
+                        last_proven_seq: *to_seq,
+                        required_seq,
+                    },
+                }
+            }
+            _ => self.coverage.clone(),
         }
     }
 }
@@ -1090,7 +1161,16 @@ pub fn assess_correlation(inputs: &AssessmentInputs<'_>) -> Assessment {
             evidence,
         };
     }
-    let state = match inputs.window.coverage {
+    // A contiguous interval that stops short of this correlation's own
+    // required sequence proves nothing here: the owner never observed this
+    // invocation's host events, so the outcome is UNKNOWN and never a fault
+    // (issue #2899 item 7; I7.23 "missing host coverage is TAINTED/UNKNOWN,
+    // never a self-reported PASS").
+    let coverage = inputs.window.bounded_coverage();
+    if coverage != inputs.window.coverage {
+        evidence.coverage = Some(coverage.clone());
+    }
+    let state = match &coverage {
         CoverageProof::CursorGap { .. } => {
             CorrelationAssessmentState::HostObservationUnavailableOrGapped
         }

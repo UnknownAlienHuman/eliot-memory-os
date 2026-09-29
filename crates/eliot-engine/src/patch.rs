@@ -773,7 +773,10 @@ fn instrument_kind_for_command(kind: VerifierCommandKind) -> Option<InstrumentKi
 /// and return the admission (`Some`), so the caller executes the admitted
 /// stage DAG instead of the quarantined command map; anything else fails
 /// closed so a forged governed claim can never execute or satisfy a finish
-/// gate.
+/// gate. The admitted revision is resolved once and pinned: the exact
+/// revision recompiles to identical definition digests, so a registry update
+/// cannot silently replace the definition under a live gate decision and
+/// every consumer of this gate shares one resolution identity.
 fn gate_requirement_profile(
     registry: &InstrumentRegistry,
     name: &str,
@@ -791,13 +794,33 @@ fn gate_requirement_profile(
             ),
         });
     };
-    let admitted = compiled
-        .require_kind(kind)
+    let Some(admitted) =
+        compiled
+            .require_kind(kind)
+            .map_err(|error| EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!("profile compiler rejected the verifier claim: {error}"),
+            })?
+    else {
+        return Ok(None);
+    };
+    let pinned = ProfileCompiler::new(registry)
+        .compile_exact(name, admitted.revision)
         .map_err(|error| EngineError::ServiceNotReady {
             service: "instrument-profile".to_owned(),
-            reason: format!("profile compiler rejected the verifier claim: {error}"),
+            reason: format!("profile compiler refused the pinned revision: {error}"),
         })?;
-    Ok(admitted.cloned())
+    if pinned.profile_digest != admitted.profile_digest || pinned.dag_digest != admitted.dag_digest
+    {
+        return Err(EngineError::ServiceNotReady {
+            service: "instrument-profile".to_owned(),
+            reason: format!(
+                "governed profile '{name}' revision {} changed during gating; refusing instead of executing a replaced definition",
+                admitted.revision
+            ),
+        });
+    }
+    Ok(Some(admitted.clone()))
 }
 
 fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {

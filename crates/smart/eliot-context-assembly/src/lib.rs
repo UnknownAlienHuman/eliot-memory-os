@@ -33,7 +33,8 @@ pub use assemble::{
 };
 pub use boundary::{
     BOUNDARY_ASSEMBLY_TRANSFORMER_ID, BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION,
-    assembly_boundary_limits, project_assembly_boundaries,
+    assembly_boundary_limits, boundary_binding_digest, project_assembly_boundaries,
+    read_back_boundaries, verify_boundary_binding,
 };
 pub use cite::project_citation;
 pub use error::AssemblyError;

@@ -73,6 +73,42 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), AssemblyError
     Ok(())
 }
 
+/// Builds and self-validates the selection proof for one assembled view.
+///
+/// Extracted so the membership and identity checks read as one step: the proof
+/// is what claims rendered membership is exactly admitted membership, and its
+/// own `validate` is the only place that claim is checked. See #251 - the two
+/// id sets must come from independent projections, and `validate` also compares
+/// lengths so a duplicated id cannot collapse inside a set.
+///
+/// The admitted identities are therefore read here from the admission owner's
+/// set, and the caller supplies only the rendered ones. Passing one list for
+/// both would make the equality a comparison of a list with a copy of itself,
+/// which no atom the projection dropped, added or duplicated could violate.
+/// `AdmittedContextSet::validate` refuses any record that is not `Include` or
+/// `HandleOnly` and `render` projects every record, so for a valid admitted set
+/// the two sets are equal; only the recorded order of `admitted_ids` differs
+/// from the presentation order of the projection.
+fn selection_proof(
+    admitted: &AdmittedContextSet,
+    rendered_ids: &[eliot_contracts::ArtifactId],
+    output_digest: &str,
+) -> Result<eliot_context_contracts::SelectionIntegrityProof, AssemblyError> {
+    let selection = eliot_context_contracts::SelectionIntegrityProof {
+        binding: admitted.binding.clone(),
+        admitted_ids: admitted
+            .records
+            .iter()
+            .map(|record| record.candidate.atom_id.clone())
+            .collect(),
+        rendered_ids: rendered_ids.to_vec(),
+        omission_evidence: admitted.economy.displaced.clone(),
+        output_digest: output_digest.to_owned(),
+    };
+    selection.validate()?;
+    Ok(selection)
+}
+
 /// Assemble one exact admitted set using one injected measurement call.
 ///
 /// The callback receives the exact canonical A-15 rendered payload bytes and
@@ -163,21 +199,11 @@ where
         policy,
         policy.max_serialized_bytes,
     )?;
-    let ids = rendered
-        .iter()
-        .map(|atom| atom.atom_id.clone())
-        .collect::<Vec<_>>();
-    let selection = eliot_context_contracts::SelectionIntegrityProof {
-        binding: admitted.binding.clone(),
-        admitted_ids: ids.clone(),
-        rendered_ids: ids.clone(),
-        omission_evidence: admitted.economy.displaced.clone(),
-        output_digest: output_digest.clone(),
-    };
-    selection.validate()?;
+    let rendered_ids: Vec<_> = rendered.iter().map(|atom| atom.atom_id.clone()).collect();
+    let selection = selection_proof(admitted, &rendered_ids, &output_digest)?;
     let view = ActiveUnderstandingView {
         binding: admitted.binding.clone(),
-        admitted_ids: ids,
+        admitted_ids: selection.admitted_ids.clone(),
         rendered,
         selection,
         quality,
@@ -187,11 +213,22 @@ where
         fence_digest: expected_fence_digest,
     };
     view.validate_against(admitted)?;
+    // Binding the boundary metadata into the output identity is a separate step so
+    // the three owner-produced inputs stay visible: the admission receipt sealed
+    // upstream, the rendered output identity, and the boundary envelopes with their
+    // ordered member relations. Altered boundary metadata therefore changes the
+    // bound output identity instead of being invisible to it.
+    let boundary_binding = boundary::boundary_binding_digest(
+        &admitted.economy.receipt_digest,
+        &view.output_digest,
+        &boundaries,
+    )?;
     Ok(ActiveUnderstandingViewResult {
         view,
         admitted: admitted.clone(),
         serialized_bytes: bytes,
         boundaries,
+        boundary_binding,
     })
 }
 
@@ -271,6 +308,52 @@ pub struct ActiveUnderstandingViewResult {
     /// This is the round-trip half of the assembly result: readback can compare the
     /// declared source identities, per-unit scope/fence and admitted source order
     /// against what it reconstructed, instead of trusting a concatenated string.
-    /// Its recorded digest is validated against the payload held.
+    /// Its recorded digest is validated against the payload held, and
+    /// `boundary_binding` binds it into the output identity together with the
+    /// upstream admission receipt digest.
     pub boundaries: eliot_context_contracts::BoundaryMetadataSet,
+    /// Exact digest binding the admission receipt, the rendered output identity,
+    /// and the boundary metadata into one output identity.
+    ///
+    /// A consumer re-checks it with `ActiveUnderstandingViewResult::verify_boundaries`
+    /// rather than trusting the field: it is recomputed from what the consumer holds.
+    pub boundary_binding: String,
+}
+
+impl ActiveUnderstandingViewResult {
+    /// Re-check this result's boundary binding against the values it holds.
+    ///
+    /// The digest is recomputed from the retained admission receipt, the rendered
+    /// output identity, and the boundary payload held here, so a substituted
+    /// envelope, a reordered member, or a foreign source revision fails even when
+    /// each object would still validate on its own.
+    pub fn verify_boundaries(&self) -> Result<(), AssemblyError> {
+        boundary::verify_boundary_binding(
+            &self.boundary_binding,
+            &self.admitted.economy.receipt_digest,
+            &self.view.output_digest,
+            &self.boundaries,
+        )?;
+        self.boundaries
+            .validate(&boundary::assembly_boundary_limits())?;
+        self.round_trip_boundary_bytes()
+    }
+
+    /// Round-trips the packed bytes against the binding recorded at production.
+    ///
+    /// `boundary_binding` was recorded before any transport and is bound to the
+    /// upstream admission receipt, so the comparison is against the value the
+    /// owner admitted - not against a digest derived from the bytes being read
+    /// back, which would agree with itself.
+    fn round_trip_boundary_bytes(&self) -> Result<(), AssemblyError> {
+        boundary::read_back_boundaries(
+            &self.boundaries.pack()?,
+            &self.boundary_binding,
+            &self.admitted.economy.receipt_digest,
+            &self.view.output_digest,
+            &self.view.rendered,
+        )
+        .map(|_| ())
+        .map_err(AssemblyError::Contract)
+    }
 }

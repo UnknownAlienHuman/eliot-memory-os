@@ -19,7 +19,8 @@
 //! refusals with exact reason, never silence or fabricated success).
 //!
 //! What this file owns: the journal-admission gate
-//! ([`require_production_admitted`]), the per-execution port bundle
+//! ([`require_production_admitted`]), the production durable owner that issues
+//! an admission ([`OrsRestoreJournalOwner`]), the per-execution port bundle
 //! ([`RestorePorts`]), the constructed (never accepted)
 //! [`KernelIsolatedDestination`], the pinned destination admission record,
 //! the [`check_kernel_effect_fence`] gate, and the fail-closed
@@ -68,8 +69,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_backup::{
-    BackupBundle, BackupError, RestoreJournalAdmission, RestoreJournalPort, RestoreJournalRecord,
-    RestoreJournalState,
+    BackupBundle, BackupError, DurableJournalRecord, OwnerTrustBinding, RestoreJournalAdmission,
+    RestoreJournalAdmissionOwner, RestoreJournalPort, RestoreJournalRecord, RestoreJournalState,
 };
 use eliot_contracts::{StateFence, sha256_hex};
 use eliot_ors::{
@@ -456,10 +457,14 @@ pub fn require_production_admitted(
 /// re-checked at each phase boundary by the target. The durable journal
 /// itself is NOT carried here: it is injected as `J: RestoreJournalPort`
 /// (see [`require_production_admitted`]) so no substitute can hide inside
-/// this bundle. Owner channels that bind later (#962: canonical Store #952,
-/// ORS recovery #953, Watchdog spool #955, Blob #956, installation #958)
-/// arrive as evidence obligations in the finalized receipt, never as live
-/// handles in this struct.
+/// this bundle. Owner channels that are not yet bound here (canonical Store,
+/// ORS recovery, Watchdog spool, Blob, installation identity) arrive as
+/// evidence obligations in the finalized receipt, never as live handles in
+/// this struct. The issues that delivered those owner sides — #952 (PR #3881),
+/// #953 (PR #3833), #955 (PR #2716), #956 (PR #2435) and #958 (PR #3879) — are
+/// coordination history, not code in this repository: what is absent is the
+/// Kernel-side producer of the corresponding evidence, not the owner itself.
+/// Nothing on this struct's behalf is proved by those merge records.
 pub struct RestorePorts<'a> {
     /// Owner-issued journal admission for the injected durable journal.
     pub journal_admission: &'a RestoreJournalAdmission,
@@ -469,7 +474,13 @@ pub struct RestorePorts<'a> {
     pub keys: Option<&'a eliot_backup::WrappedKeyManifest>,
     /// Destination blob scope for destination-owned re-sealing.
     pub blob_scope: Option<&'a eliot_backup::DestinationScope>,
-    /// Owner-approved destination manifest evidence (#958 issuer).
+    /// Owner-approved destination manifest evidence.
+    ///
+    /// The issuing owner is the Host-side manifest binding that merged as PR
+    /// #3879 (issue #958). #958 is CLOSED: it delivered the Host-side
+    /// preparation owner, and it did NOT deliver a producer of this Kernel-side
+    /// value, so this is a record of provenance, not an open blocker and not a
+    /// claim that an emitter exists.
     pub manifest_evidence: Option<DestinationManifestEvidence>,
     /// Rehearsal mode: isolated import runs, but cutover refuses and no
     /// activation, retirement, or effect unblocking exists on any path.
@@ -682,23 +693,122 @@ pub struct PinnedDestinationAdmission {
 
 /// Owner-derived identity of one ORS restore-journal stream family.
 ///
-/// Every field is an exact owner fact taken from live composition. The adapter
-/// never derives, defaults, or guesses any of them, and a blank or malformed
-/// value refuses at construction instead of being replaced with a placeholder.
+/// Every field is an exact owner fact taken from live composition, every field
+/// is private, and there is exactly one constructor
+/// ([`OrsRestoreBinding::from_composition`]): a caller cannot build this value
+/// field by field, name its own installation, or write a blank or malformed
+/// value that a placeholder would then have to replace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrsRestoreBinding {
     /// Exact source archive identity under restore.
-    pub source_archive_id: String,
+    source_archive_id: String,
     /// Exact archive class of that source. A class is never silently changed
     /// to make an effect admissible.
-    pub archive_class: RestoreJournalArchiveClass,
-    /// Exact isolated destination identity (owner-issued by #958).
-    pub destination_ref: String,
+    archive_class: RestoreJournalArchiveClass,
+    /// Exact isolated destination identity, declared by live composition.
+    ///
+    /// It is checked against the destination this execution constructs and
+    /// against the destination the ORS owner durably bound to the stream, so a
+    /// binding that names another destination refuses on read and on append. It
+    /// is a composition-declared owner fact like `writer_id`, not a value taken
+    /// from a request.
+    destination_ref: String,
     /// Exact Kernel writer identity that owns the stream.
-    pub writer_id: String,
+    writer_id: String,
+    /// Exact installation identity this stream is admitted against.
+    ///
+    /// Not a parameter and not a field anyone can set. It is read from
+    /// `ComposedDispatchContour::installation_id` — the set-once composition
+    /// cell [`crate::dispatch_contour`] fills from the authenticated Host
+    /// startup binding, and the same value
+    /// `KernelComposition::require_setup_admission` already compares an
+    /// `installation_id` against — so this is the Kernel's one existing
+    /// installation identity, not a second scheme.
+    ///
+    /// It is re-read and compared again by `require_live_installation` inside
+    /// [`OrsRestoreJournal::production`] and [`OrsRestoreJournalOwner::production`],
+    /// so a binding composed under one installation cannot be used by a
+    /// composition holding another, and an uncomposed process cannot mint one
+    /// at all.
+    ///
+    /// The ORS stream-binding row itself has no installation column — that row
+    /// type is owned by `crates/kernel/eliot-ors` and is not modified here — so
+    /// the installation is not re-proved from the row. It is proved by the
+    /// comparison against the live composition cell, which is a composition
+    /// fact, not a durable one.
+    installation_ref: String,
 }
 
 impl OrsRestoreBinding {
+    /// The one constructor. Every argument is validated and none of them is an
+    /// installation: the installation is read from live composition here, so
+    /// there is no code path — production or test — that puts a caller's
+    /// string into `installation_ref`.
+    ///
+    /// Refuses [`KernelRestoreError::InvalidInput`] for a blank or
+    /// control-character source archive, destination or writer identity, and
+    /// [`KernelRestoreError::OwnerEvidenceInvalid`] when the dispatch contour is
+    /// not composed, because an uncomposed Kernel has no installation identity
+    /// to admit a journal against.
+    pub fn from_composition(
+        source_archive_id: String,
+        archive_class: RestoreJournalArchiveClass,
+        destination_ref: String,
+        writer_id: String,
+    ) -> Result<Self, KernelRestoreError> {
+        for (value, field) in [
+            (
+                source_archive_id.as_str(),
+                "restore.journal_admission.source_archive_id",
+            ),
+            (
+                destination_ref.as_str(),
+                "restore.journal_admission.destination_ref",
+            ),
+            (writer_id.as_str(), "restore.journal_admission.writer_id"),
+        ] {
+            non_blank(value, field)?;
+        }
+        Ok(Self {
+            source_archive_id,
+            archive_class,
+            destination_ref,
+            writer_id,
+            installation_ref: live_installation_id()?.to_owned(),
+        })
+    }
+
+    /// The source archive identity the ORS owner binds this stream to.
+    #[must_use]
+    pub fn source_archive_id(&self) -> &str {
+        &self.source_archive_id
+    }
+
+    /// The archive class the ORS owner binds this stream to.
+    #[must_use]
+    pub fn archive_class(&self) -> RestoreJournalArchiveClass {
+        self.archive_class
+    }
+
+    /// The isolated destination the ORS owner binds this stream to.
+    #[must_use]
+    pub fn destination_ref(&self) -> &str {
+        &self.destination_ref
+    }
+
+    /// The Kernel writer identity the ORS owner binds this stream to.
+    #[must_use]
+    pub fn writer_id(&self) -> &str {
+        &self.writer_id
+    }
+
+    /// The live composition-owned installation identity this stream is admitted
+    /// against.
+    #[must_use]
+    pub fn installation_ref(&self) -> &str {
+        &self.installation_ref
+    }
+
     fn stream_binding(
         &self,
         transaction_id: &str,
@@ -712,6 +822,221 @@ impl OrsRestoreBinding {
             writer_id: self.writer_id.clone(),
             writer_fence_digest: writer_fence_digest.to_owned(),
         }
+    }
+}
+
+/// Returns the live, composition-owned installation identity.
+///
+/// The value is the Kernel's existing one: the set-once dispatch contour cell
+/// `compose_dispatch_contour` fills from the authenticated Host startup binding,
+/// read through `ComposedDispatchContour::installation_id`. This is the same
+/// identity `KernelComposition::require_setup_admission` already compares an
+/// `installation_id` against, so no second installation scheme is introduced
+/// and no request, config value or fixture can supply one.
+///
+/// An uncomposed process has no installation identity at all and refuses; it is
+/// never defaulted to a placeholder.
+fn live_installation_id() -> Result<&'static str, KernelRestoreError> {
+    let contour = crate::dispatch_launch::dispatch_contour().ok_or_else(|| {
+        KernelRestoreError::OwnerEvidenceInvalid(
+            "the Kernel dispatch contour is not composed, so this process has no installation identity to admit a restore journal against"
+                .to_owned(),
+        )
+    })?;
+    let installation = contour.installation_id();
+    non_blank(installation, "restore.journal.installation_ref")?;
+    Ok(installation)
+}
+
+/// Refuses a binding whose installation identity is not the live one.
+///
+/// This is the comparison that makes "a moved or foreign installation refuses"
+/// true: the admission owner and the journal adapter both re-read the
+/// composition cell at construction and compare it against the binding's own
+/// value, so a binding minted under a different installation identity is
+/// rejected before any row is read or written. It is a composition-fact
+/// comparison — the ORS stream-binding row carries no installation column, so
+/// nothing here claims the durable row proves it.
+fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRestoreError> {
+    let live = live_installation_id()?;
+    if binding.installation_ref != live {
+        return Err(KernelRestoreError::OwnerEvidenceInvalid(
+            "the restore journal binding names an installation identity this composition does not hold"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The production durable owner of one ORS restore-journal stream.
+///
+/// This is the composition side of the owner-issued admission. It holds no
+/// restore state machine, no second journal and no second trust scheme: it reads
+/// the same [`RedbRecoveryStore`] the adapter writes through, against the same
+/// [`OrsRestoreBinding`] and the same live [`StateFence`] the adapter seals
+/// every row with, and it answers
+/// [`RestoreJournalAdmissionOwner::durable_journal_record`] from that durable
+/// row alone. It is built from the same production owner handle, composition
+/// binding and live effect fence
+/// [`OrsRestoreJournal::production`] takes, and it has no constructor a
+/// request, a config value or a test fixture can reach with a value of its own.
+///
+/// ## What each admitted reference is, and where it is read
+///
+/// Four of the six fields are read out of the ORS stream-binding row the ORS
+/// owner committed through `bind_restore_journal_stream`:
+/// `persistent_owner.owner_id`, `persistent_owner.trust_binding_ref`,
+/// `journal_identity_ref` and `admission_receipt_ref`. The remaining two are
+/// NOT read from that row and are not claimed to be:
+///
+/// - `generation` is the live effect fence's `resource_generation`, a live
+///   composition fact rather than a durable one. It is not a caller number: the
+///   same fence is what produced the `writer_fence_digest` this read requires
+///   the durable row to carry, so the generation and the durable proof are
+///   checked against each other.
+/// - `database_ref` is this file's fixed owner label, not a durable fact. See
+///   its own entry below for exactly how far it is supported.
+///
+/// Field by field:
+///
+/// - `persistent_owner` — `OwnerTrustBinding { owner_id: writer_id,
+///   trust_binding_ref: writer_fence_digest }`, both read from the row. The
+///   existing [`OwnerTrustBinding`] and nothing else: the identity of the owner
+///   that durably owns this stream, plus the writer authority that authenticated
+///   it. The digest is the ORS owner's own committed value, and it is compared
+///   to a snapshot captured from the Kernel's LIVE fence, so a rotated authority
+///   refuses instead of admitting a stream another generation sealed.
+/// - `database_ref` — [`RESTORE_JOURNAL_OWNER_LABEL`], a fixed `&'static str`
+///   this owner returns as its own label for the one operational ORS database
+///   behind restore streams. It is a constant, so nothing derives it from
+///   durable state: the proof this owner holds is that the store it reads
+///   through returned the exact durable stream row the rest of this record
+///   reports, and the label is this owner's own name for that store. Row
+///   presence proves a row exists; it does not prove the label names that row's
+///   database, and no code here makes that claim.
+/// - `installation_ref` — `OrsRestoreBinding::installation_ref`, read from the
+///   live composition cell by `live_installation_id` and re-compared against it
+///   by `require_live_installation` at this constructor. It is a
+///   composition fact, not a durable one: the row type has no installation
+///   column and is not modified here.
+/// - `generation` — the live effect fence's `resource_generation`, as above.
+/// - `journal_identity_ref` — the key the durable row was read under, which is
+///   the plan-derived stream identity the issuer checks the admission against.
+/// - `admission_receipt_ref` — the transaction identity the ORS owner committed
+///   for this stream when it admitted the stream. It is read back from the
+///   durable row on every issue and never recomputed.
+///
+/// ## What it refuses
+///
+/// A missing durable stream binding is [`BackupError::RestoreJournalRequired`],
+/// never an empty record. A row that disagrees with live composition on the
+/// source archive, the archive class, the destination, the writer identity or
+/// the sealed writer fence is [`BackupError::RestoreJournalMismatch`], so a
+/// well-formed admission for another operation, another destination or a
+/// rotated authority fails closed. The row is checked with the ORS owner's own
+/// [`RestoreJournalStreamBinding::validate`]; nothing here recomputes a digest
+/// over values held in memory, because a fresh checksum replaces the proof
+/// instead of checking it.
+pub struct OrsRestoreJournalOwner {
+    store: Arc<RedbRecoveryStore>,
+    binding: OrsRestoreBinding,
+    kernel_fence: StateFence,
+    writer_fence_digest: String,
+}
+
+impl OrsRestoreJournalOwner {
+    /// Binds the admission owner to the same durable owner handle, the same
+    /// composition binding and the same live effect fence the journal adapter
+    /// seals its rows with.
+    ///
+    /// The writer fence digest is captured from `kernel_fence` with the ORS
+    /// owner's own [`StateFenceSnapshot::capture`], at the same authority
+    /// sequence [`OrsRestoreJournal::production`] uses, so the two agree by
+    /// construction rather than by a comparison of separately chosen values. A
+    /// fence that cannot be captured refuses; no digest is defaulted.
+    ///
+    /// The binding's installation identity is re-compared against the live
+    /// composition cell here (`require_live_installation`), so a binding
+    /// minted under another installation refuses before this owner can answer a
+    /// single admission.
+    pub fn production(
+        store: Arc<RedbRecoveryStore>,
+        binding: OrsRestoreBinding,
+        kernel_fence: &StateFence,
+    ) -> Result<Self, KernelRestoreError> {
+        for (value, field) in [
+            (
+                binding.source_archive_id.as_str(),
+                "restore.journal_admission.source_archive_id",
+            ),
+            (
+                binding.destination_ref.as_str(),
+                "restore.journal_admission.destination_ref",
+            ),
+            (
+                binding.writer_id.as_str(),
+                "restore.journal_admission.writer_id",
+            ),
+            (
+                binding.installation_ref.as_str(),
+                "restore.journal_admission.installation_ref",
+            ),
+        ] {
+            non_blank(value, field)?;
+        }
+        require_live_installation(&binding)?;
+        let sequence = kernel_fence.authority_epoch.sequence.get();
+        let fence_snapshot = StateFenceSnapshot::capture(kernel_fence, sequence)
+            .map_err(|error| KernelRestoreError::FenceMismatch(error.to_string()))?;
+        Ok(Self {
+            store,
+            binding,
+            kernel_fence: kernel_fence.clone(),
+            writer_fence_digest: fence_snapshot.sha256,
+        })
+    }
+}
+
+impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
+    fn durable_journal_record(
+        &self,
+        journal_key: &str,
+    ) -> Result<DurableJournalRecord, BackupError> {
+        if journal_key.trim().is_empty() {
+            return Err(BackupError::InvalidField {
+                field: "restore.journal_admission.journal_key",
+                reason: "the journal identity must be non-blank",
+            });
+        }
+        // The ORS owner reports a missing binding as absent, and absence is a
+        // refusal here: an owner that held no durable record must not report an
+        // empty one, or a well-formed admission could be issued for a stream
+        // nothing was ever committed to.
+        let bound = self
+            .store
+            .load_restore_journal_binding(journal_key)
+            .map_err(ors_to_backup)?
+            .ok_or(BackupError::RestoreJournalRequired)?;
+        // The ORIGINAL recorded row is validated with the ORS owner's own
+        // validator. Nothing is re-derived over the values held here.
+        bound.validate().map_err(ors_to_backup)?;
+        // The same exact-binding rule the adapter already applies on every read
+        // and append, so an admitted stream and a writable stream cannot
+        // disagree about what this composition owns.
+        if !matches_stream(&self.binding, &bound, &self.writer_fence_digest) {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        Ok(DurableJournalRecord {
+            persistent_owner: OwnerTrustBinding {
+                owner_id: bound.writer_id,
+                trust_binding_ref: bound.writer_fence_digest,
+            },
+            database_ref: RESTORE_JOURNAL_OWNER_LABEL.to_owned(),
+            installation_ref: self.binding.installation_ref().to_owned(),
+            generation: self.kernel_fence.resource_generation,
+            journal_identity_ref: journal_key.to_owned(),
+            admission_receipt_ref: bound.transaction_id,
+        })
     }
 }
 
@@ -815,7 +1140,9 @@ impl OrsRestoreJournal {
     /// The writer fence and the authority epoch are taken from the Kernel's
     /// own live effect fence, never from the journaled record: a caller cannot
     /// name its own writer authority. The `sealed_root` is the Kernel-owned
-    /// payload root under the work root.
+    /// payload root under the work root, and the binding's installation
+    /// identity is re-compared against the live composition cell
+    /// (`require_live_installation`).
     pub fn production(
         store: Arc<RedbRecoveryStore>,
         kernel_fence: &StateFence,
@@ -832,9 +1159,14 @@ impl OrsRestoreJournal {
                 "restore.journal.destination_ref",
             ),
             (binding.writer_id.as_str(), "restore.journal.writer_id"),
+            (
+                binding.installation_ref.as_str(),
+                "restore.journal.installation_ref",
+            ),
         ] {
             non_blank(value, field)?;
         }
+        require_live_installation(&binding)?;
         if !sealed_root.is_absolute() {
             return Err(KernelRestoreError::InvalidInput {
                 field: "restore.journal.sealed_root",

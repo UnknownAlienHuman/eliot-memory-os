@@ -199,6 +199,10 @@ fn test_request(
         plan_revision: RevisionId::new("plan-rev-872")
             .map_err(|error| format!("plan rev: {error}"))?,
         state_fence: fence.clone(),
+        human_staffing_intent: eliot_agent_coordinator::HumanStaffingIntent {
+            preset: eliot_agent_coordinator::StaffingPreset::Balanced,
+            per_job_budget: test_budget(),
+        },
         privacy_class: PrivacyClass::Private,
         work_class: "swarm".parse().map_err(|error| format!("class: {error}"))?,
         lanes: vec![StaffingLaneRequest {
@@ -219,6 +223,10 @@ fn test_request(
                     wall_time_ms: 100,
                     ..BudgetEvidence::default()
                 },
+                route_classes: vec!["provider-fabric-a".to_owned()],
+                route_class_evidence_refs: vec!["route-class-evidence-0".to_owned()],
+                privacy_classes: vec![PrivacyClass::Private],
+                privacy_evidence_refs: vec!["privacy-evidence-0".to_owned()],
                 evidence_refs: vec!["route-evidence-0".to_owned()],
             }],
             budget: test_budget(),

@@ -114,14 +114,48 @@ use eliot_store_api::{
 
 use crate::composition::{CompositionError, GovernorComposition, KernelGenerationPort};
 
+/// The deterministic admission reference one admitted policy is published
+/// under.
+///
+/// This is a digest over the exact policy value, so the reference on the
+/// durable document is *bound* to the policy it names rather than being a
+/// caller-supplied string that merely resembles an admission. A different
+/// disposition, revision, owner or named check yields a different reference.
+pub fn negative_memory_policy_admission_ref(policy: &NegativeMemoryActionPolicy) -> String {
+    let bytes = canonical_json_bytes(policy).unwrap_or_default();
+    format!(
+        "negative-memory-admission:{}:{}:{}",
+        policy.policy_id,
+        policy.policy_revision,
+        sha256_hex(&bytes)
+    )
+}
+
 /// The durable handle of one published rule activation. The store keys the row
 /// by `(record_kind, handle, record_digest)`; the handle names the rule
 /// revision so two revisions of one record identity are distinct rows and
 /// history is never rewritten in place.
-const ACTIVATION_HANDLE_PREFIX: &str = "negative-memory";
+pub(crate) const ACTIVATION_HANDLE_PREFIX: &str = "negative-memory";
+
+/// The exact durable handle one rule revision is published under.
+///
+/// The bounded rule read in [`crate::negative_memory_read`] re-derives this
+/// from the decoded document and refuses a row whose handle disagrees, so a
+/// document cannot be filed under a name owned by another rule revision.
+pub(crate) fn activation_handle(record_id: &str, rule_revision: u64) -> String {
+    format!("{ACTIVATION_HANDLE_PREFIX}:{record_id}:{rule_revision}")
+}
 
 /// Wire revision of the activation document this owner writes.
-const ACTIVATION_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+///
+/// Revision 2 carries the exact `NegativeMemoryFingerprint` and the complete
+/// `NegativeMemoryActionPolicy` instead of a caller-annotated action
+/// class/parameter pair and a bare disposition. A published activation is the
+/// durable home of the rule the gate later matches against, so the rule and
+/// the policy admitted for it must travel inside the document: a receipt that
+/// named only an identity and a disposition left the bounded read unable to
+/// rebuild anything to compare.
+const ACTIVATION_DOCUMENT_SCHEMA_VERSION: u32 = 2;
 
 /// The owner-issued evidence an activation decision rests on.
 ///
@@ -221,25 +255,6 @@ pub struct NegativeMemoryActivationRequest {
     pub policy: NegativeMemoryActionPolicy,
     /// Supporting evidence the owner proved before requesting activation.
     pub evidence: NegativeMemoryActivationEvidence,
-    /// The owner-facing action class the policy gates, in the owner's closed
-    /// spelling. Recorded verbatim on the durable document and covered by its
-    /// digest.
-    ///
-    /// This is *not* the record's action identity. The closed action identity
-    /// the matcher compares is `record.failed_action` — the full
-    /// `FailureAction { action_id, operation_id, attempt_id, target_id,
-    /// input_schema, input_digest, effect_id, effect_class, owner,
-    /// contract_revision, contract_digest }` — and that is already carried,
-    /// bound and validated by `record`, by `policy.validate_binding`, and by
-    /// the gate's own `NegativeMemorySubject.action` comparison. These two
-    /// fields are a human/owner-readable annotation of the same activation
-    /// and are admitted on shape only; defining a closed mapping from them onto
-    /// `FailureAction`'s fields would be a second action-identity scheme, which
-    /// this owner does not introduce.
-    pub action_class: String,
-    /// The owner-facing action parameters the policy gates, recorded verbatim
-    /// and admitted on shape only, exactly as [`Self::action_class`].
-    pub action_parameters: Vec<String>,
     /// The validity horizon, in the record's own clock/revision domain.
     pub validity_horizon: NegativeMemoryHorizon,
     /// The reopen criteria, which must equal the record's own condition.
@@ -267,6 +282,12 @@ pub struct NegativeMemoryActivationReceipt {
     pub record_digest: String,
     /// The admitted disposition now live.
     pub disposition: NegativeMemoryDisposition,
+    /// The exact admitted policy identity now live.
+    pub policy_id: String,
+    /// The exact admitted policy revision now live.
+    pub policy_revision: u64,
+    /// The exact admitted policy content digest now live.
+    pub policy_digest: String,
     /// The named discriminating check, non-empty exactly for `RequireCheck`.
     pub named_check_id: String,
     /// The compare-and-swap predecessor the store arbitrated.
@@ -393,14 +414,10 @@ pub fn validate_negative_memory_activation(
                 .to_owned(),
         });
     }
-    if request.action_class.trim().is_empty() || request.action_parameters.is_empty() {
+    if request.admission_ref != negative_memory_policy_admission_ref(&request.policy) {
         return Err(NegativeMemoryActivationRefusal::DocumentNotCanonical {
-            detail: "activation names no action class or no action parameters".to_owned(),
-        });
-    }
-    if request.admission_ref.trim().is_empty() {
-        return Err(NegativeMemoryActivationRefusal::DocumentNotCanonical {
-            detail: "activation names no owner-issued admission reference".to_owned(),
+            detail: "activation admission reference does not bind the exact admitted policy"
+                .to_owned(),
         });
     }
     Ok(())
@@ -469,25 +486,21 @@ fn retained_evidence_refs(record: &NegativeMemoryFingerprint) -> Vec<String> {
 /// semantic content the owner proved, and the round trip through
 /// [`NegativeMemoryActivationDocument::validate`] at the gate is what binds the
 /// read-back rule to the activation decision.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NegativeMemoryActivationDocument {
     /// Wire revision of this document.
     pub schema_version: u32,
-    /// The record identity that is live.
-    pub record_id: String,
-    /// The exact rule revision that is live.
-    pub rule_revision: u64,
-    /// The exact record content digest that is live.
-    pub record_digest: String,
-    /// The admitted disposition.
-    pub disposition: NegativeMemoryDisposition,
-    /// The named discriminating check required by `RequireCheck`.
-    pub named_check_id: String,
-    /// The exact action class the policy gates.
-    pub action_class: String,
-    /// The exact action parameters the policy gates.
-    pub action_parameters: Vec<String>,
+    /// The exact durable record this activation published.
+    ///
+    /// The record travels whole, not as an identity: the bounded rule read
+    /// rebuilds matcher candidates from this value and re-derives the record's
+    /// own `record_digest` with the record's own validator, so a receipt that
+    /// carried only an identity could never be compared against anything.
+    pub record: NegativeMemoryFingerprint,
+    /// The complete owner-admitted action policy for exactly that record
+    /// revision.
+    pub policy: NegativeMemoryActionPolicy,
     /// The validity horizon the activation was admitted for.
     pub validity_horizon: NegativeMemoryHorizon,
     /// The reopen criteria the activation was admitted for.
@@ -513,48 +526,86 @@ impl NegativeMemoryActivationDocument {
         Ok(sha256_hex(&bytes))
     }
 
-    /// Checks that this document's disposition and named check agree with the
-    /// policy value the gate holds.
+    /// The exact durable handle this document's rule revision is published
+    /// under.
+    #[must_use]
+    pub fn handle(&self) -> String {
+        activation_handle(&self.record.record_id, self.record.rule_revision)
+    }
+
+    /// The exact rule record this activation published.
+    #[must_use]
+    pub const fn record(&self) -> &NegativeMemoryFingerprint {
+        &self.record
+    }
+
+    /// The complete owner-admitted policy this activation published.
+    #[must_use]
+    pub const fn policy(&self) -> &NegativeMemoryActionPolicy {
+        &self.policy
+    }
+
+    /// Checks that this document preserves the exact record and policy the
+    /// activation admitted, and that both still validate against themselves.
+    ///
+    /// The record is validated with its **own** validator, which re-derives the
+    /// recorded `record_digest` over the recorded fields. Nothing here
+    /// recomputes a digest over something the caller holds instead: the
+    /// compared values are the document's own record and policy, and the
+    /// admitted values are re-proved against them.
     ///
     /// # Errors
     ///
-    /// Returns [`CompositionError::Owner`] when the record identity, rule
-    /// revision, record digest, disposition or named check differ.
+    /// Returns [`CompositionError::Owner`] when the schema revision is
+    /// unsupported, when the record or policy fails its own validation, when
+    /// the policy is not bound to this record revision, or when the horizon,
+    /// reopen criteria, admission reference, verifier or evidence set do not
+    /// match the record.
     pub fn validate_against_policy(
         &self,
+        record: &NegativeMemoryFingerprint,
         policy: &NegativeMemoryActionPolicy,
     ) -> Result<(), CompositionError> {
-        for (field, got, expected) in [
-            (
-                "record_id",
-                self.record_id.as_str(),
-                policy.binding.record_id.as_str(),
-            ),
-            (
-                "record_digest",
-                self.record_digest.as_str(),
-                policy.binding.record_digest.as_str(),
-            ),
-        ] {
-            if got != expected {
-                return Err(owner_error(format!(
-                    "activation document {field} does not match the admitted policy binding"
-                )));
-            }
-        }
-        if self.rule_revision != policy.binding.rule_revision {
+        if self.schema_version != ACTIVATION_DOCUMENT_SCHEMA_VERSION {
             return Err(owner_error(
-                "activation document rule revision does not match the admitted policy binding",
+                "activation document uses an unsupported schema version",
             ));
         }
-        if self.disposition != policy.disposition {
+        if &self.record != record {
             return Err(owner_error(
-                "activation document disposition does not match the admitted policy",
+                "activation document does not preserve the exact admitted rule record",
             ));
         }
-        if self.named_check_id != policy.named_check_id {
+        if &self.policy != policy {
             return Err(owner_error(
-                "activation document named check does not match the admitted policy",
+                "activation document does not preserve the complete admitted policy snapshot",
+            ));
+        }
+        record
+            .validate()
+            .map_err(|error| owner_error(format!("activation record invalid: {error}")))?;
+        policy
+            .validate()
+            .map_err(|error| owner_error(format!("activation policy invalid: {error}")))?;
+        policy
+            .validate_binding(record)
+            .map_err(|error| owner_error(format!("activation policy binding: {error}")))?;
+        if policy.policy_owner != record.semantic_owner {
+            return Err(owner_error(
+                "activation policy owner does not match the record semantic owner",
+            ));
+        }
+        if self.validity_horizon != record.do_not_repeat || self.reopen != record.reopen {
+            return Err(owner_error(
+                "activation document validity horizon or reopen criteria do not match the record",
+            ));
+        }
+        let verification = &record.invariant.verification;
+        if self.evidence_verifier != verification.verifier_id
+            || self.evidence_refs != retained_evidence_refs(record)
+        {
+            return Err(owner_error(
+                "activation document does not preserve the record's exact verifier and retained evidence set",
             ));
         }
         Ok(())
@@ -588,13 +639,8 @@ pub fn negative_memory_activation_mutation_request(
     validate_negative_memory_activation(request)?;
     let document = NegativeMemoryActivationDocument {
         schema_version: ACTIVATION_DOCUMENT_SCHEMA_VERSION,
-        record_id: request.record.record_id.clone(),
-        rule_revision: request.record.rule_revision,
-        record_digest: request.record.record_digest.clone(),
-        disposition: request.policy.disposition,
-        named_check_id: request.policy.named_check_id.clone(),
-        action_class: request.action_class.clone(),
-        action_parameters: request.action_parameters.clone(),
+        record: request.record.clone(),
+        policy: request.policy.clone(),
         validity_horizon: request.validity_horizon.clone(),
         reopen: request.reopen.clone(),
         admission_ref: request.admission_ref.clone(),
@@ -624,10 +670,7 @@ pub fn negative_memory_activation_mutation_request(
             ),
         });
     }
-    let handle = format!(
-        "{ACTIVATION_HANDLE_PREFIX}:{}:{}",
-        request.record.record_id, request.record.rule_revision
-    );
+    let handle = document.handle();
     let mutation = learning_record_mutation_request(learning_record_commit_params(
         LearningRecordKind::ActivationReceipt,
         handle,
@@ -696,7 +739,7 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
     }
     let operation_id = OperationId::new(format!(
         "negative-memory-activation:{}:{}",
-        document.record_id, document.rule_revision
+        document.record.record_id, document.record.rule_revision
     ))
     .map_err(|error| owner_error(format!("activation identity invalid: {error}")))?;
     let envelope_fence = identity.request.metadata.state_fence.clone();
@@ -741,11 +784,14 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
         .ok_or_else(|| owner_error("activation published without an expected revision head"))?;
     Ok(NegativeMemoryActivationReceipt {
         operation_id,
-        record_id: document.record_id.clone(),
-        rule_revision: document.rule_revision,
-        record_digest: document.record_digest.clone(),
-        disposition: document.disposition,
-        named_check_id: document.named_check_id.clone(),
+        record_id: document.record.record_id.clone(),
+        rule_revision: document.record.rule_revision,
+        record_digest: document.record.record_digest.clone(),
+        disposition: document.policy.disposition,
+        policy_id: document.policy.policy_id.clone(),
+        policy_revision: document.policy.policy_revision,
+        policy_digest: document.policy.policy_digest.clone(),
+        named_check_id: document.policy.named_check_id.clone(),
         expected_revision_head,
         store_write_receipt: receipt,
     })

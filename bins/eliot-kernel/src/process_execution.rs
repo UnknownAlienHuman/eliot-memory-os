@@ -1338,7 +1338,7 @@ impl ProcessExecutionGateway {
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        if let Err(error) = self.authorize_operation(owner, &operation_id) {
+        if let Err(error) = self.authorize_effect_with_grant(owner, &operation_id, grant) {
             observe_process("kernel.process.cancel_rejected", "fenced");
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             return Err(error);
@@ -1497,6 +1497,43 @@ impl ProcessExecutionGateway {
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
             .ok_or(ProcessExecutionError::NotFound)?;
         authorize_process_owner(&record.owner, owner)
+    }
+
+    /// Authorizes the owner for the exact operation and, when an origin
+    /// control grant funds the effect, proves that grant still names the
+    /// identity the authoritative durable record retains for that same
+    /// operation (issue #1775 W4; I3.4).
+    ///
+    /// The comparison is against the retained start receipt — the object the
+    /// Kernel itself created and persisted — never a PID reopened by number
+    /// and never the caller's serialized binding. A grant minted for one
+    /// child, one image, one start time, or one managed generation therefore
+    /// cannot authorize a substituted or different target, and an operation
+    /// with no proven retained identity has nothing to compare against and
+    /// fails closed.
+    fn authorize_effect_with_grant(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+        grant: Option<&OriginControlGrant>,
+    ) -> Result<(), ProcessExecutionError> {
+        let record = self
+            .replay_store
+            .load_process_start(operation_id)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
+            .ok_or(ProcessExecutionError::NotFound)?;
+        authorize_process_owner(&record.owner, owner)?;
+        let Some(grant) = grant else {
+            return Ok(());
+        };
+        let identity = record
+            .receipt
+            .as_ref()
+            .ok_or(ProcessExecutionError::UnknownOutcome)?
+            .identity();
+        grant
+            .binds_target(identity.physical(), identity.generation())
+            .map_err(ProcessExecutionError::Contract)
     }
 }
 

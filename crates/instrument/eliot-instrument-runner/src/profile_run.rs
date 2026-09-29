@@ -570,6 +570,36 @@ impl InstrumentRun {
         }
     }
 
+    /// Records a launched stage bound to its plan identity from birth (I10.8.4).
+    ///
+    /// The route's durable triple must belong to `plan`: a launched run for a
+    /// foreign profile, revision, or stage fails closed into an explicit
+    /// missing proof instead of a receipt that could satisfy another plan's
+    /// aggregate. The plan's candidate identity binds at construction, so the
+    /// same admitted profile observed through two entry points carries the
+    /// same revision, executable identity, and aggregate membership instead
+    /// of acquiring it by later mutation. Missing runs stay missing: this
+    /// constructor never converts an unobserved stage into a launched one.
+    pub fn launched_in_plan(
+        route: &TestExecutionPlaneRoute,
+        operation_id: String,
+        grant: &InstrumentAdmissionGrant,
+        target_layout: Option<StageTargetLayout>,
+        plan: &StagePlan,
+    ) -> Self {
+        let belongs = plan.stages.iter().any(|planned| {
+            planned.route.stage().profile == route.stage().profile
+                && planned.route.stage().profile_revision == route.stage().profile_revision
+                && planned.route.stage().stage_id == route.stage().stage_id
+        });
+        if !belongs {
+            return Self::missing(route, "launched stage does not belong to the bound plan");
+        }
+        let mut run = Self::launched(route, operation_id, grant, target_layout);
+        run.candidate_identity.clone_from(&plan.candidate_identity);
+        run
+    }
+
     /// Records an explicit missing proof for a stage that never ran.
     pub fn missing(route: &TestExecutionPlaneRoute, reason: impl Into<String>) -> Self {
         Self {
@@ -918,7 +948,7 @@ impl StageOrchestrator {
                 unlaunched.insert(route.stage().stage_id.clone());
                 continue;
             }
-            let mut run = Self::launch_one(runner, planned, launcher).await;
+            let mut run = Self::launch_one(runner, plan, planned, launcher).await;
             run.candidate_identity.clone_from(&plan.candidate_identity);
             if run.evidence.is_missing() {
                 unlaunched.insert(route.stage().stage_id.clone());
@@ -944,15 +974,13 @@ impl StageOrchestrator {
     /// inside admission.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
+        plan: &StagePlan,
         planned: &PlannedStage,
         launcher: &dyn StageLauncher,
     ) -> InstrumentRun {
         let route = &planned.route;
         if !route.external() {
-            return InstrumentRun::missing(
-                route,
-                "pure in-process stage bypasses the plane; no in-process lane is bound",
-            );
+            return InstrumentRun::missing(route, TestdPlaneAdmission::refuse_pure_stage(route));
         }
         let invocation = match launcher.invocation(planned) {
             Ok(invocation) => invocation,
@@ -1034,7 +1062,7 @@ impl StageOrchestrator {
             Ok(receipt) => {
                 let operation = receipt.process.operation_id().as_str().to_owned();
                 let target_layout = StageTargetLayout::sealed(planned, &receipt);
-                InstrumentRun::launched(route, operation, &grant, Some(target_layout))
+                InstrumentRun::launched_in_plan(route, operation, &grant, Some(target_layout), plan)
             }
             Err(error) => InstrumentRun::missing(route, format!("stage launch failed: {error}")),
         }
@@ -1149,6 +1177,18 @@ impl TestdPlaneAdmission {
             return Err(TestdPortError::UnsupportedByTestd { kind });
         }
         Ok((entry.adapter.clone(), entry.generation))
+    }
+
+    /// Refuses a pure in-process stage without an explicitly registered pure
+    /// implementation (I10.8.4).
+    ///
+    /// Only an explicitly registered pure implementation may bypass the test
+    /// execution plane; no such lane is bound on this path, so the stage
+    /// records the returned explicit missing proof instead of escaping
+    /// through a generic local command.
+    pub fn refuse_pure_stage(route: &TestExecutionPlaneRoute) -> String {
+        let _ = route;
+        "pure in-process stage bypasses the plane; no in-process lane is bound".to_owned()
     }
 }
 

@@ -240,6 +240,8 @@ pub(crate) use process_identity::{
     same_process_image_path, same_windows_path, thread_token_is_builtin_administrator,
     valid_process_image_path,
 };
+#[cfg(windows)]
+pub use process_job::OuterKillDomain;
 pub use process_job::{
     ExistingJobMemberObservation, JobObject, JobObjectIdentity, JobObjectLimits, JobObservationGap,
     JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,

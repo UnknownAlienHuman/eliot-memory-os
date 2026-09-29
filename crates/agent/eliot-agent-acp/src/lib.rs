@@ -36,12 +36,11 @@ use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AuthorityEnvelope,
     CONTRACT_VERSION, CancellationState, ClockReading, EffectKind, EventCursor, EventId,
     ExecutionOutcome, HostEventDeliveryDisposition, HostEventKind, HostEventNormalizationReceipt,
-    HostEventPrivacyClass, LowercaseSha256, MAX_TEXT_REF_CHARS, NormalizationCoverage,
-    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, ProviderObservationLineage, QuotaKnowledge,
-    RestrictedRawSourceHandle, ResultDisposition, RouteFingerprint, RouteObservationState, TaskId,
-    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
-    sanitize_adapter_error,
+    HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage, NormalizedHostEventEnvelope,
+    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ProviderObservationLineage, QuotaKnowledge, RestrictedRawSourceHandle, ResultDisposition,
+    RouteFingerprint, RouteObservationState, TaskId, UnsupportedDisposition,
+    UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt, sanitize_adapter_error,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -1547,30 +1546,10 @@ impl AcpResultEnvelope {
         }
     }
 
-    /// Owner-issued reconciliation handle for one ACP result (issue #2641):
-    /// the ELIOT operation identity under a fixed prefix, never provider
-    /// prose. A formatted explanation such as `acp-failed:{reason}` is not a
-    /// resolvable recovery handle, and a sanitized reason (up to
-    /// `MAX_SAFE_ERROR_CHARS`) plus a prefix can exceed the stricter
-    /// `recovery_ref` bound (`MAX_TEXT_REF_CHARS`), so the handle carries
-    /// only the bounded operation reference. Total by construction: a blank
-    /// operation identity yields the fixed unresolved handle rather than a
-    /// new failure mode.
-    fn acp_recovery_ref(operation_id: &str) -> String {
-        const PREFIX: &str = "acp-operation:";
-        let budget = MAX_TEXT_REF_CHARS.saturating_sub(PREFIX.len());
-        let operation: String = operation_id.chars().take(budget).collect();
-        let operation = operation.trim().to_owned();
-        if operation.is_empty() {
-            return "acp-operation-unresolved".to_owned();
-        }
-        format!("{PREFIX}{operation}")
-    }
-
     fn acp_result_execution_parts(
         disposition: ResultDisposition,
         unknown_reason: Option<&String>,
-        recovery_ref: &str,
+        operation_id: &str,
     ) -> (
         ExecutionOutcome,
         Option<CancellationState>,
@@ -1587,19 +1566,19 @@ impl AcpResultEnvelope {
             (ResultDisposition::FailedVerification, Some(reason)) => (
                 ExecutionOutcome::UnknownOutcome,
                 None,
-                Some(recovery_ref.to_owned()),
+                Some(operation_id.to_owned()),
                 Some((*reason).clone()),
             ),
             (ResultDisposition::UnknownOutcome, Some(_)) => (
                 ExecutionOutcome::UnknownOutcome,
                 None,
-                Some(recovery_ref.to_owned()),
+                Some(operation_id.to_owned()),
                 None,
             ),
             _ => (
                 ExecutionOutcome::UnknownOutcome,
                 None,
-                Some("acp-outcome-requires-reconciliation".to_owned()),
+                Some(operation_id.to_owned()),
                 unknown_reason.map(|reason| (*reason).clone()),
             ),
         }
@@ -1623,6 +1602,9 @@ impl AcpResultEnvelope {
         outcome: AcpResultOutcome,
         diagnostic_caller: Option<eliot_agent_api::route_receipts::TrustedAdapterDiagnosticCaller>,
     ) -> Result<AgentResult, AcpAdapterError> {
+        if self.operation_id.trim().is_empty() {
+            return Err(AcpAdapterError::InvalidInput("operation_id"));
+        }
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
         let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
         // Adapter-boundary sanitization (issues #369 and #2641): provider
@@ -1661,7 +1643,7 @@ impl AcpResultEnvelope {
             Self::acp_result_execution_parts(
                 disposition,
                 unknown_reason.as_ref(),
-                &Self::acp_recovery_ref(&self.operation_id),
+                &self.operation_id,
             );
         let mut actual_route = PhysicalRouteObservationReceipt {
             schema_version: CONTRACT_VERSION.to_owned(),
@@ -2657,7 +2639,7 @@ mod tests {
     }
 
     #[test]
-    fn result_projection_preserves_failed_and_unknown_reasons()
+    fn result_projection_keeps_disposition_and_recovery_identity_when_reasons_are_redacted()
     -> Result<(), Box<dyn std::error::Error>> {
         let failed = project_result(AcpResultOutcome::Failed {
             reason: "provider rejected request".into(),
@@ -2665,14 +2647,37 @@ mod tests {
         assert_eq!(failed.disposition, ResultDisposition::FailedVerification);
         assert_eq!(
             failed.unknown_reason.as_deref(),
-            Some("provider rejected request")
+            Some("redacted-provider-error")
+        );
+        assert_eq!(
+            failed.actual_route.safe_public_error.as_deref(),
+            Some("redacted-provider-error")
+        );
+        assert_eq!(
+            failed.actual_route.recovery_ref.as_deref(),
+            Some("operation")
+        );
+        assert_eq!(
+            failed.actual_route.execution_outcome,
+            ExecutionOutcome::UnknownOutcome
         );
 
         let unknown = project_result(AcpResultOutcome::Unknown {
             reason: "transport closed".into(),
         })?;
         assert_eq!(unknown.disposition, ResultDisposition::UnknownOutcome);
-        assert_eq!(unknown.unknown_reason.as_deref(), Some("transport closed"));
+        assert_eq!(
+            unknown.unknown_reason.as_deref(),
+            Some("redacted-provider-error")
+        );
+        assert_eq!(
+            unknown.actual_route.recovery_ref.as_deref(),
+            Some("operation")
+        );
+        assert_eq!(
+            unknown.actual_route.execution_outcome,
+            ExecutionOutcome::UnknownOutcome
+        );
         Ok(())
     }
 

@@ -139,8 +139,9 @@ pub enum TrustedAdapterDiagnosticCaller {
 /// numeric code is assigned public meaning here. A miss returns `None` so
 /// the caller falls through to [`sanitize_adapter_error`], which yields the
 /// explicit `redacted-provider-error` fallback for unestablished content.
-/// Designated production caller: `AcpResultEnvelope::into_agent_result`
-/// (fed by `assemble_candidate_result` and `drain_wire_result`).
+/// The ACP production caller is the fixed non-terminal arm of
+/// `AcpResultEnvelope::assemble_candidate_result`; wire-derived errors use
+/// `into_agent_result` without trusted caller provenance.
 #[must_use]
 pub fn resolve_trusted_adapter_diagnostic(
     caller: TrustedAdapterDiagnosticCaller,

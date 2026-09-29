@@ -24,15 +24,11 @@
 //! layer that is allowed to interpret policy — never inside Kernel and never
 //! inside the store bridge.
 //!
-//! [`evaluate_negative_memory_gate`] is invoked from
-//! [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical),
-//! the single governed write funnel every canonical commit in this process
-//! traverses ([`commit_canonical_with_readiness`](crate::composition::GovernorComposition::commit_canonical_with_readiness),
-//! [`commit_capability_evidence_record`](crate::capability_evidence_commit::commit_capability_evidence_record)
-//! and [`commit_experience_bank`](crate::experience_commit::commit_experience_bank) all route
-//! through it). Placing the gate there is what makes it impossible for a
-//! direct action invocation to bypass the check because no Context packet was
-//! requested: there is no second canonical write route to bypass.
+//! [`evaluate_negative_memory_gate`] is invoked by
+//! [`GovernorComposition::commit_canonical_gated_by_negative_memory`](crate::composition::GovernorComposition::commit_canonical_gated_by_negative_memory),
+//! the explicit gated wrapper whose gate input is a required parameter, so a
+//! caller that has not resolved an owner-observed rule set cannot reach the
+//! canonical dispatch through it at all.
 //!
 //! # What the gate does, in order
 //!
@@ -54,14 +50,25 @@
 //!    nothing: a match becomes a block only when an owner-admitted
 //!    [`NegativeMemoryActionPolicy`] agrees.
 //!
-//! The rule snapshot itself is resolved by the caller through the existing
-//! closed named read; [`NegativeMemoryGateInput::read`] is that
-//! [`NegativeMemoryCandidateRead`], produced by
-//! [`NegativeMemoryGateInput::resolve`] through
-//! [`eliot_store_api::learning_record_read_request`] on
+//! The rule snapshot is resolved by [`crate::negative_memory_read`], which
+//! plans and resolves the existing closed named read
+//! ([`eliot_store_api::learning_record_read_request`] on
 //! [`NamedReadOperation::GetLearningRecordRange`] filtered to
-//! [`LearningRecordKind::ActivationReceipt`] at the request's exact fence. No
+//! [`LearningRecordKind::ActivationReceipt`] at the request's exact fence) and
+//! returns a [`ResolvedNegativeMemoryRuleSet`] whose fields are private. No
 //! new database, no new named operation and no catalogue change are involved.
+//!
+//! # The read fence is authenticated, not merely equal
+//!
+//! The rule read is issued `ExactFence` at the fence the request is admitted
+//! at, and the store echoes the fence it served. The resolver copies that
+//! **store-observed** fence into the rule set, and this gate compares it
+//! against [`NegativeMemoryGateInput::state_fence`] — the pending canonical
+//! request's own fence. A caller cannot choose the read fence: the store either
+//! serves at the live fence or refuses, and a response answering a different
+//! fence is refused before a rule set exists. A mismatch is
+//! [`NegativeMemoryGateRefusal::ReadFenceNotAuthenticated`], which is neither a
+//! stale-block dispatch nor a bypass.
 //!
 //! # The four dispositions (I12.19: exact blocks, similarity only warns)
 //!
@@ -103,8 +110,9 @@
 //! again" can never be read as "nothing changed".
 //!
 //! The `StateFence` is bound by the read itself: the named read is issued
-//! `ExactFence` at the request's own fence, so a previous generation's snapshot
-//! is never served as current.
+//! `ExactFence` at the request's own fence, the store's echoed fence is carried
+//! on the resolved rule set, and the gate compares the two rather than trusting
+//! a caller-presented read fence.
 //!
 //! # Absence of a policy is not permission and not a block
 //!
@@ -117,14 +125,16 @@
 //! is enforced.
 
 use eliot_dreamer_failure::{
-    NegativeMemoryActionPolicy, NegativeMemoryCandidateRead, NegativeMemoryDisposition,
-    NegativeMemoryFingerprint, NegativeMemoryHorizonDomain, NegativeMemoryMatchBound,
-    NegativeMemoryMatchResult, NegativeMemoryOutcome, NegativeMemoryRecordDefect,
-    NegativeMemorySubject, match_negative_memory, negative_memory_record_defect,
+    NegativeMemoryCandidateRead, NegativeMemoryDisposition, NegativeMemoryFingerprint,
+    NegativeMemoryHorizonDomain, NegativeMemoryMatchBound, NegativeMemoryMatchResult,
+    NegativeMemoryOutcome, NegativeMemoryRecordDefect, NegativeMemorySubject,
+    match_negative_memory, negative_memory_record_defect,
 };
 use eliot_store_api::StateFence;
 
 use crate::composition::CompositionError;
+use crate::negative_memory_probe::NegativeMemoryProbeAdmission;
+use crate::negative_memory_read::ResolvedNegativeMemoryRuleSet;
 
 /// A near-match or advisory warning that accompanies a proceed.
 ///
@@ -186,6 +196,20 @@ pub enum NegativeMemoryGateRefusal {
     /// The caller supplied no dispatch-time rule-set revision, so nothing could
     /// be revalidated and staleness cannot be excluded.
     RuleSetRevisionAbsent,
+    /// The fence the store observed while serving the rule read is not the fence
+    /// this request is admitted at.
+    ///
+    /// This is the authenticated read-fence refusal. The read fence is not a
+    /// caller assertion that happens to match: it is what the store echoed for
+    /// the exact-fence read, and it is compared here against the canonical
+    /// request's own State Fence. A snapshot read at another generation can
+    /// neither be dispatched on nor be presented as current.
+    ReadFenceNotAuthenticated {
+        /// The fence the store reported for the rule read.
+        read: Box<StateFence>,
+        /// The fence this request is admitted at.
+        request: Box<StateFence>,
+    },
     /// The matcher or one of its inputs failed validation.
     MatchNotDecidable {
         /// Exact detail.
@@ -272,23 +296,42 @@ pub struct NegativeMemoryGateInput<'a> {
     pub observed_horizon: &'a NegativeMemoryHorizonDomain,
     /// The named bound the enumeration runs under.
     pub bound: &'a NegativeMemoryMatchBound,
-    /// The current applicable rule snapshot, resolved through bounded named
-    /// reads. Its `rule_set_revision` is the I12.16 Fence A reading.
-    pub read: &'a NegativeMemoryCandidateRead,
+    /// The current applicable rule set, resolved through one bounded exact-fence
+    /// named read.
+    ///
+    /// Its private fields are filled only by
+    /// [`resolve_negative_memory_rule_read`](crate::negative_memory_read::resolve_negative_memory_rule_read),
+    /// so the rules, the admitted policies and the read fence all come from the
+    /// same owner-observed read. `rule_set_revision()` is the I12.16 Fence A
+    /// reading and `store_observed_fence()` is the fence the **store** echoed.
+    pub resolved: &'a ResolvedNegativeMemoryRuleSet,
     /// The rule-set revision the caller re-read at dispatch (I12.16 Fence B).
     ///
     /// This is the anti-staleness input: it must equal
-    /// [`NegativeMemoryCandidateRead::rule_set_revision`], or the gate refuses
-    /// rather than dispatching on a stale or unverified snapshot.
+    /// [`ResolvedNegativeMemoryRuleSet::rule_set_revision`], or the gate
+    /// refuses rather than dispatching on a stale or unverified snapshot.
     pub revalidated_rule_set_revision: Option<u64>,
-    /// The owner-admitted action policies, one per live rule revision.
+    /// The State Fence the pending canonical request is admitted at.
     ///
-    /// A policy's presence is the only thing that can turn a match into a
-    /// disposition; it is not itself sufficient and is validated against the
-    /// matched record before use.
-    pub admitted_policies: &'a [NegativeMemoryActionPolicy],
-    /// The request's own State Fence the snapshot was read at.
+    /// This is **this operation's own** fence, and it is compared against
+    /// [`ResolvedNegativeMemoryRuleSet::store_observed_fence`]. The comparison
+    /// is therefore between an owner-observed read fence and the content of the
+    /// request being admitted, not between two values the caller supplied
+    /// together.
     pub state_fence: &'a StateFence,
+    /// The probe admission that resolves this action's
+    /// [`NegativeMemoryGateDecision::RequireCheck`], when one has been produced.
+    ///
+    /// A `RequireCheck` decision names the discriminating check that must run
+    /// and the verifier that must produce it, and by itself it refuses the
+    /// action. This is the second, producer-issued half: the admission returned
+    /// by
+    /// [`execute_negative_memory_probe`](crate::negative_memory_probe::execute_negative_memory_probe),
+    /// which re-reads the scope at the admitted fence and admits the result
+    /// only when the store's own verifier binding is the record's. It is
+    /// `None` when no probe has been executed, and a `None` here leaves the
+    /// action refused - it never turns a check into a pass.
+    pub probe_admission: Option<&'a NegativeMemoryProbeAdmission>,
 }
 
 fn refused(refusal: NegativeMemoryGateRefusal) -> NegativeMemoryGateDecision {
@@ -318,16 +361,19 @@ fn refused(refusal: NegativeMemoryGateRefusal) -> NegativeMemoryGateDecision {
 pub fn evaluate_negative_memory_gate(
     input: &NegativeMemoryGateInput<'_>,
 ) -> NegativeMemoryGateDecision {
+    if let Some(decision) = authenticate_read_fence(input) {
+        return decision;
+    }
     if let Some(decision) = revalidate_rule_set_revision(input) {
         return decision;
     }
-    if let Some(decision) = validate_every_rule(input.read) {
+    if let Some(decision) = validate_every_rule(input.resolved.read()) {
         return decision;
     }
     let matched = match_negative_memory(
         input.subject,
         input.observed_horizon,
-        input.read,
+        input.resolved.read(),
         input.bound,
     );
     let result = match matched {
@@ -341,10 +387,37 @@ pub fn evaluate_negative_memory_gate(
     decide(input, &result)
 }
 
+/// Returns a refusal when the store-observed read fence is not the fence this
+/// request is admitted at, and `None` when they are the same fence.
+///
+/// This is the authentication step. The read fence is what the **store**
+/// echoed while serving the bounded exact-fence read; the request fence is the
+/// content of the canonical write being admitted. Comparing those two is a
+/// measurement against owner-issued evidence, which is what makes the read
+/// fence more than a value the caller happened to pass in. An earlier spelling
+/// compared the caller's own read fence with the caller's own request fence,
+/// which no substitution could distinguish.
+fn authenticate_read_fence(
+    input: &NegativeMemoryGateInput<'_>,
+) -> Option<NegativeMemoryGateDecision> {
+    let read = input.resolved.store_observed_fence();
+    if read == input.state_fence {
+        return None;
+    }
+    Some(refused(
+        NegativeMemoryGateRefusal::ReadFenceNotAuthenticated {
+            read: Box::new(read.clone()),
+            request: Box::new(input.state_fence.clone()),
+        },
+    ))
+}
+
 /// Returns a refusal when the dispatch-time revalidation does not equal the
 /// snapshot's own Fence A revision, and `None` when it does.
 ///
-/// Both values are owner-observed revisions of the *same* rule scope. An absent
+/// Both values are owner-observed revisions of the *same* rule scope: the
+/// snapshot's is the scope revision head the store reported for the read, and
+/// the revalidation is the caller's second reading of that same head. An absent
 /// revalidation is refused, so a caller that never looked again cannot be read
 /// as a caller that observed no change.
 fn revalidate_rule_set_revision(
@@ -353,17 +426,7 @@ fn revalidate_rule_set_revision(
     let Some(revalidated) = input.revalidated_rule_set_revision else {
         return Some(refused(NegativeMemoryGateRefusal::RuleSetRevisionAbsent));
     };
-    let observed: u64 = match input.read.rule_set_revision.parse() {
-        Ok(observed) => observed,
-        Err(_) => {
-            return Some(refused(NegativeMemoryGateRefusal::MatchNotDecidable {
-                detail: format!(
-                    "rule snapshot carries a non-numeric rule-set revision {:?}",
-                    input.read.rule_set_revision
-                ),
-            }));
-        }
-    };
+    let observed = input.resolved.rule_set_revision();
     if observed != revalidated {
         return Some(refused(NegativeMemoryGateRefusal::RuleSetRevisionMoved {
             observed,
@@ -410,6 +473,7 @@ fn decide(
             result.enumeration,
             eliot_dreamer_failure::EnumerationCoverage::Incomplete { .. }
         )
+        || !input.resolved.enumeration_complete()
     {
         return refused(NegativeMemoryGateRefusal::EnumerationIncomplete {
             detail: "bounded rule enumeration did not cover the queried rule scope".to_owned(),
@@ -453,7 +517,7 @@ fn decide_exact(
     matched: &eliot_dreamer_failure::ExactMatch,
     rule_set_revision: u64,
 ) -> NegativeMemoryGateDecision {
-    let Some(record) = find_matched_record(input, matched) else {
+    let Some(record) = find_matched_record(input.resolved, matched) else {
         return refused(NegativeMemoryGateRefusal::MatchNotDecidable {
             detail: format!(
                 "matcher reported exact match {}:{} but the validated snapshot retains no such rule",
@@ -461,7 +525,7 @@ fn decide_exact(
             ),
         });
     };
-    let Some(policy) = input.admitted_policies.iter().find(|policy| {
+    let Some(policy) = input.resolved.policies().iter().find(|policy| {
         policy.binding.record_id == record.record_id
             && policy.binding.rule_revision == record.rule_revision
             && policy.binding.record_digest == record.record_digest
@@ -490,18 +554,44 @@ fn decide_exact(
             policy_id: policy.policy_id.clone(),
             rule_set_revision,
         },
-        NegativeMemoryDisposition::RequireCheck => NegativeMemoryGateDecision::RequireCheck {
-            record_id: record.record_id.clone(),
-            rule_revision: record.rule_revision,
-            policy_id: policy.policy_id.clone(),
-            check_id: record.discriminating_check.check_id.clone(),
-            required_verifier: record.discriminating_check.required_verifier.clone(),
-            discriminates_dimension_names: record
-                .discriminating_check
-                .discriminates_dimension_names
-                .clone(),
-            rule_set_revision,
-        },
+        NegativeMemoryDisposition::RequireCheck => {
+            let check = &record.discriminating_check;
+            // A `RequireCheck` is a demand, not a verdict: the action is
+            // refused until the named check has actually run. The only thing
+            // that resolves it is a probe admission for THIS check, run
+            // against THIS record and revision, produced by the verifier THIS
+            // record names, and served at the fence this request is admitted
+            // at. So an absent admission, an admission for a different check,
+            // an admission for a different rule revision, an admission whose
+            // verifier is not the record's, and an admission served at another
+            // fence all leave the action refused. Nothing here can turn an
+            // unexecuted check into a pass.
+            if let Some(admission) = input.probe_admission
+                && admission.check_id == check.check_id
+                && admission.verifier == check.required_verifier
+                && admission.record_id == record.record_id
+                && admission.rule_revision == record.rule_revision
+                && admission.served_state_fence == *input.state_fence
+            {
+                return NegativeMemoryGateDecision::Proceed {
+                    warning: Some(NegativeMemoryProceedWarning {
+                        record_id: record.record_id.clone(),
+                        rule_revision: record.rule_revision,
+                        differing_field_names: Vec::new(),
+                        enumeration_incomplete: false,
+                    }),
+                };
+            }
+            NegativeMemoryGateDecision::RequireCheck {
+                record_id: record.record_id.clone(),
+                rule_revision: record.rule_revision,
+                policy_id: policy.policy_id.clone(),
+                check_id: check.check_id.clone(),
+                required_verifier: check.required_verifier.clone(),
+                discriminates_dimension_names: check.discriminates_dimension_names.clone(),
+                rule_set_revision,
+            }
+        }
         // An advisory policy on an exact match is a warning, never a block: the
         // policy owner explicitly declined blocking power.
         NegativeMemoryDisposition::Advisory => NegativeMemoryGateDecision::Proceed {
@@ -521,11 +611,11 @@ fn decide_exact(
 /// digest; this looks up the record itself in the snapshot it just compared, so
 /// the disposition is decided against the record's own recorded discriminating
 /// check rather than against anything the caller supplied alongside the match.
-fn find_matched_record<'r>(
-    input: &'r NegativeMemoryGateInput<'_>,
+fn find_matched_record<'a>(
+    resolved: &'a ResolvedNegativeMemoryRuleSet,
     matched: &eliot_dreamer_failure::ExactMatch,
-) -> Option<&'r NegativeMemoryFingerprint> {
-    for page in &input.read.delivered_pages {
+) -> Option<&'a NegativeMemoryFingerprint> {
+    for page in &resolved.read().delivered_pages {
         for rule in &page.rules {
             if rule.record_id == matched.record_id
                 && rule.rule_revision == matched.rule_revision
@@ -545,7 +635,7 @@ fn find_matched_record<'r>(
 /// The gate is total and has no error type of its own at this boundary; this is
 /// the single place a refusal becomes a `CompositionError`, so no call site can
 /// silently discard it. `Proceed` yields `None`.
-pub(crate) fn refusal_as_composition_error(
+pub fn refusal_as_composition_error(
     decision: &NegativeMemoryGateDecision,
 ) -> Option<CompositionError> {
     match decision {
@@ -570,4 +660,18 @@ pub(crate) fn refusal_as_composition_error(
         ))),
         NegativeMemoryGateDecision::Proceed { .. } => None,
     }
+}
+
+/// The exact refusal message one decision carries, when it refuses.
+///
+/// This is the fail-closed message an outer action caller reports. It is the
+/// same conversion [`Self::refusal_as_composition_error`] performs, without the
+/// error wrapper, so a caller that only reports a refusal does not have to
+/// unwrap a `CompositionError` to learn which rule or check refused it. A
+/// `Proceed` decision yields `None`.
+#[must_use]
+pub fn negative_memory_gate_refusal_message(
+    decision: &NegativeMemoryGateDecision,
+) -> Option<String> {
+    refusal_as_composition_error(decision).map(|error| error.to_string())
 }

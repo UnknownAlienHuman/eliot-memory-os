@@ -1064,7 +1064,8 @@ mod dreamer_job_dispatch_tests {
             &self,
             _context: &RequestMeta,
             request: DurableJobRequest,
-        ) -> Result<DurableJobResponse, String> {
+        ) -> Result<DurableJobResponse, DreamerJobGatewayError> {
+            let outcome: Result<DurableJobResponse, String> = async {
             self.calls.lock().expect("calls lock").push(request.clone());
             if let Some(message) = self.refusal.lock().expect("refusal lock").clone() {
                 return Err(message);
@@ -1225,6 +1226,8 @@ mod dreamer_job_dispatch_tests {
                     "dreamer test ledger: operation not admitted on the requester path".to_owned(),
                 ),
             }
+            }.await;
+            outcome.map_err(DreamerJobGatewayError::GatewayRefusal)
         }
     }
 
@@ -1277,26 +1280,48 @@ mod dreamer_job_dispatch_tests {
     #[test]
     fn dreamer_store_error_classifier_fences_only_fence_and_unknown_markers() {
         assert!(dreamer_store_error_fences(
-            "canonical-store gateway is fenced for rebind"
-        ));
-        assert!(dreamer_store_error_fences("Kernel generation is fenced"));
-        assert!(dreamer_store_error_fences(
-            "receipt envelope is missing; write outcome is unknown"
+            &DreamerJobGatewayError::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned()
+            )
         ));
         assert!(dreamer_store_error_fences(
-            "transport disconnected; application outcome is unknown"
-        ));
-        assert!(dreamer_store_error_fences("UNKNOWN_OUTCOME"));
-        assert!(dreamer_store_error_fences(
-            "transport disconnected; application outcome is unknown"
+            &DreamerJobGatewayError::GatewayRefusal("Kernel generation is fenced".to_owned())
         ));
         assert!(dreamer_store_error_fences(
-            "canonical-store gateway in-flight drain timed out"
+            &DreamerJobGatewayError::GatewayRefusal(
+                "receipt envelope is missing; write outcome is unknown".to_owned()
+            )
         ));
-        assert!(!dreamer_store_error_fences("revision conflict"));
-        assert!(!dreamer_store_error_fences("state fence mismatch"));
-        assert!(!dreamer_store_error_fences("store unavailable"));
-        assert!(!dreamer_store_error_fences("unknown named operation"));
+        assert!(dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal(
+                "transport disconnected; application outcome is unknown".to_owned()
+            )
+        ));
+        assert!(dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal("UNKNOWN_OUTCOME".to_owned())
+        ));
+        assert!(dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal(
+                "transport disconnected; application outcome is unknown".to_owned()
+            )
+        ));
+        assert!(dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal(
+                "canonical-store gateway in-flight drain timed out".to_owned()
+            )
+        ));
+        assert!(!dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal("revision conflict".to_owned())
+        ));
+        assert!(!dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal("state fence mismatch".to_owned())
+        ));
+        assert!(!dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal("store unavailable".to_owned())
+        ));
+        assert!(!dreamer_store_error_fences(
+            &DreamerJobGatewayError::GatewayRefusal("unknown named operation".to_owned())
+        ));
     }
 
     #[tokio::test]

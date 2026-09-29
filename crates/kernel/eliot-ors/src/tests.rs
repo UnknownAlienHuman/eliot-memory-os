@@ -1866,7 +1866,10 @@ fn process_evidence(
             "physical": "PRESENT",
             "taint": "CLEAR"
         },
-        "schema_version": "eliot-process-evidence-v2"
+        // #844: the canonical current-version constant, never a second current
+        // version literal, so a schema bump on the `eliot-process` owner moves
+        // this fixture with it instead of silently pinning a stale wire value.
+        "schema_version": eliot_process::PROCESS_EVIDENCE_SCHEMA_VERSION
     }))?)
 }
 
