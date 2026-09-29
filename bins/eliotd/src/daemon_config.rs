@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_contracts::{ArtifactId, StateFence, sha256_hex};
+use eliot_contracts::{ArtifactId, ContractId, StateFence, sha256_hex};
 use eliot_governor::GovernorLaunchConfig;
 use eliot_platform_windows::{
     ProtectedRuntimePathLease, current_process_named_pipe_expectation, protected_program_data_path,
@@ -19,7 +19,7 @@ use eliot_runtime_contracts::{
 use super::canonical_config_precedence::{
     PolicyDocument, ResolvedChain, resolve_effective_configuration,
 };
-use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES};
+use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES, SERVICE_NAME};
 
 /// I3.9 installation config file, relative to the protected `ProgramData` root.
 const INSTALLATION_CONFIG_RELATIVE: &str = r"Eliot\config\installation.toml";
@@ -79,7 +79,7 @@ fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
         .map_err(|error| DaemonError::LaunchConfig(error.to_string()))
 }
 
-/// Loads and admits the immutable runtime `module.toml` shipped beside this
+/// Loads and admits the immutable runtime manifest shipped beside this
 /// admitted artifact.
 ///
 /// `I6.4` obliges every hot module to ship that manifest and `I14.14` places it
@@ -89,21 +89,36 @@ fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
 /// exact bytes are admitted against the accepted build identity. A missing,
 /// unreadable, substituted or unsupported manifest is refused.
 ///
-/// This is the daemon's manifest admission entry point. It is deliberately not
-/// reached from the live startup path: no build/package owner emits
-/// `module.toml` beside the artifact yet, so a live call could only fail.
+/// The manifest file name is qualified by this daemon's own module identity
+/// (`module.eliotd.toml`) because the release bundle stages every admitted
+/// runtime artifact flat into one `runtime/` directory. Under a single fixed
+/// name every artifact in that directory resolves the same file, so the first
+/// module to load would answer for all of them; qualifying the name keeps each
+/// artifact bound to its own declared contract.
+///
+/// This is the daemon's manifest admission entry point. It is not yet reached
+/// from the live startup path because no build/package owner stages the manifest
+/// beside the artifact; the release bundler would stage it from
+/// `scripts/build-eliot-windows-x64-release.ps1`, which is not this issue's
+/// owner.
 pub fn admit_daemon_module_manifest(
     accepted_artifact_sha256: &str,
 ) -> Result<AdmittedModuleManifest, DaemonError> {
     validate_sha256(accepted_artifact_sha256, "executable digest")?;
     let artifact_id = ArtifactId::new(accepted_artifact_sha256)
         .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+    let module_id = ContractId::new(SERVICE_NAME)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
     let admitted_artifact = std::env::current_exe().map_err(|error| {
         DaemonError::LaunchConfig(format!(
             "the admitted artifact location of the running daemon is unavailable: {error}"
         ))
     })?;
-    let manifest_path = admitted_manifest_path(&admitted_artifact)
+    // The manifest name is qualified by this daemon's own module identity
+    // because the release bundle stages every runtime artifact flat into one
+    // directory. Resolving one fixed file name beside `eliotd.exe` would read
+    // whichever module's manifest happened to be staged there first.
+    let manifest_path = admitted_manifest_path(&admitted_artifact, &module_id)
         .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
     let lease = ProtectedRuntimePathLease::open_existing_absolute(&manifest_path)?;
     if lease.path() != manifest_path {
