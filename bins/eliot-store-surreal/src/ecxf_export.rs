@@ -4,41 +4,47 @@
 //!
 //! This module is the composition root for the canonical exchange format: it
 //! decodes the one-shot arguments, constructs the typed
-//! [`EcxfExportRequest`], obtains the coherent source view from the store
+//! [`EcxfExportRequest`], binds the real [`EcxfSourceStore`] port to the store
 //! owner this process already holds, calls
 //! [`eliot_backup::export_ecxf_package`] — the single `ECXF/1` export entry —
 //! and projects the exporter's terminal outcome.
 //!
-//! The fence is STORE-OBSERVED, never caller-asserted. Every field of the
-//! source view comes from
+//! The `StoreOwnerEcxfSource` port implementation is the only place that reads
+//! source evidence. The fence is STORE-OBSERVED, never caller-asserted: every
+//! value it could supply comes from
 //! [`capture_ecxf_source`](eliot_store_surreal_adapter::capture_ecxf_source),
-//! the one real coherent read in the admitted vendor edge: it reads all nine
-//! canonical member classes inside a single fixed
-//! `BEGIN TRANSACTION`/`COMMIT` batch, so the rows and the observed
-//! `state_fence`, `schema_generation` and sequence counters come from the same
-//! transaction. This module adds no value of its own, parses no provider row
-//! into domain semantics, and passes every observed value through unchanged.
+//! the one real coherent read in the admitted vendor edge, which reads the
+//! canonical member classes and the observed `state_fence`,
+//! `schema_generation` and sequence counters inside one fixed
+//! `BEGIN TRANSACTION`/`COMMIT` batch. This module adds no value of its own,
+//! parses no provider row into domain semantics, and passes every observed
+//! value through unchanged.
 //!
 //! The `ECXF/1` package layout, the `ExportFence` and every residency,
 //! checksum and integrity proof belong to `eliot-ecxf` and to the
 //! `eliot-backup` exporter; neither is reimplemented, defaulted, pre-checked
 //! or weakened here (I05-10 "Consistent export boundary", I05-13).
 //!
-//! Fail-closed is the expected outcome today, and it is correct. The adapter's
-//! capture is explicitly `SnapshotCompleteness::Partial` and names the evidence
-//! its owners have not supplied, so `export_ecxf_package` refuses with
-//! [`BackupError::InconsistentBoundary`] before any byte is written. This
-//! command reports that refusal and exits nonzero; it never reports success
-//! over an incomplete view.
+//! Fail-closed is the reachable outcome today, and it is the required one, not
+//! a stub. The store owner states in its own capture that it cannot be
+//! projected into a complete `ECXF/1` source view while it declares evidence
+//! gaps, so the port returns the typed
+//! [`BackupError::UnobservedSourceMember`] refusal naming the first member the
+//! owner did not observe. Nothing is defaulted, no fence member is filled in,
+//! and the rows already read are not turned into records; no package is
+//! written. This command reports that refusal and exits nonzero; it never
+//! reports success over an incomplete view.
 
 use std::path::{Path, PathBuf};
 
 use eliot_backup::{
-    BackupError, EcxfExportRequest, StoreEcxfSource, export_ecxf_package,
+    BackupError, CoherentSourceExport, EcxfExportRequest, EcxfSourceStore, export_ecxf_package,
 };
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
 use eliot_store_api::{OperationId, OperationIdentity, RequestMeta, ScopeId};
-use eliot_store_surreal_adapter::capture_ecxf_source;
+use eliot_store_surreal_adapter::{
+    EcxfCaptureGap, EcxfSourceCapture, SurrealStoreAdapter, capture_ecxf_source,
+};
 
 use crate::{SERVICE_NAME, StoreComposition, StoreLaunchConfig};
 
@@ -92,6 +98,59 @@ pub struct EcxfExportArgs {
     pub out_dir: PathBuf,
 }
 
+/// The `EcxfSourceStore` over the canonical store owner this process composes
+/// (`StoreComposition::store_adapter`).
+struct StoreOwnerEcxfSource<'a> {
+    adapter: &'a SurrealStoreAdapter,
+}
+
+impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
+    async fn coherent_export(
+        &self,
+        request: &EcxfExportRequest,
+    ) -> Result<CoherentSourceExport, BackupError> {
+        // The one real coherent read in the admitted vendor edge: the rows and
+        // the observed state fence come from one fixed transaction.
+        let capture = capture_ecxf_source(self.adapter, request)
+            .await
+            .map_err(BackupError::Store)?;
+        // The store owner states in its own capture that it must not be
+        // projected into a complete ECXF source view while it declares
+        // evidence gaps (see `EcxfSourceCapture`'s own doc contract in
+        // `crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`).
+        // So the export refuses here, naming the member the owner did not
+        // observe. Nothing is defaulted, no fence member is filled in, and the
+        // rows already read are not turned into records.
+        Err(BackupError::UnobservedSourceMember {
+            member: unobserved_member(&capture),
+        })
+    }
+}
+
+/// Names the first source-view member the store owner declared it could not
+/// observe.
+///
+/// The vocabulary is the adapter's own `EcxfCaptureGap`
+/// (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`); this
+/// maps each gap onto the static name of the already-existing
+/// `CoherentSourceExport` / `ExportFence` member it leaves unobserved, and
+/// adds no second gap type. An owner that declares no gap at all has still not
+/// established the observed completeness itself.
+fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
+    match capture.missing_evidence.first() {
+        Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => "scope_id",
+        Some(EcxfCaptureGap::SourcePurgeLedgerUnavailable) => "purge_ledger",
+        Some(EcxfCaptureGap::BlobStoreEvidenceUnavailable) => {
+            "reachable_blob_residency_keys"
+        }
+        Some(EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable) => {
+            "architecture_source_digest"
+        }
+        Some(EcxfCaptureGap::SourceExportReceiptUnavailable) => "export_receipt",
+        None => "completeness",
+    }
+}
+
 /// Runs one `ECXF/1` export against the store owner this process holds and
 /// projects the exporter's terminal outcome.
 ///
@@ -109,31 +168,12 @@ pub async fn export_ecxf_once(
 ) -> Result<(), String> {
     let request = export_request(config, clock, args)?;
     let out_dir = destination(args)?;
-    // The one real coherent read of the admitted vendor edge. The rows and the
-    // observed fence share a single transaction, and the adapter itself refuses
-    // when the observed fence, schema generation or request does not hold.
-    let capture = capture_ecxf_source(composition.store_adapter(), &request)
-        .await
-        .map_err(|error| format!("coherent ECXF source capture refused: {error}"))?;
-    // Every value below is observed store evidence, forwarded verbatim. The
-    // gaps are named, not swallowed: the exporter refuses a partial view.
-    let source = StoreEcxfSource::from_store_observation(
-        capture.scope_id,
-        capture.state_fence,
-        capture.schema_generation,
-        capture.next_commit_sequence,
-        capture.next_outbox_sequence,
-        capture.completeness,
-        capture
-            .missing_evidence
-            .iter()
-            .map(|gap| format!("{gap:?}"))
-            .collect(),
-        capture
-            .source_classes
-            .into_iter()
-            .map(|class| (class.class_token, class.records)),
-    );
+    // The port implementation owns the single coherent read of the admitted
+    // vendor edge, so the exporter — not this command — decides what the store
+    // owner can and cannot prove.
+    let source = StoreOwnerEcxfSource {
+        adapter: composition.store_adapter(),
+    };
     match export_ecxf_package(&request, &source, out_dir).await {
         Ok(report) => {
             println!(
@@ -290,6 +330,9 @@ fn refusal_message(error: &BackupError) -> String {
             reason,
         } => format!(
             "the ECXF/1 package for export {export_id} is published at {package_path} and requires reconciliation: {reason}"
+        ),
+        BackupError::UnobservedSourceMember { member } => format!(
+            "the store owner did not observe the ECXF/1 source member {member}, so no package was published (I05-10)"
         ),
         BackupError::InconsistentBoundary => {
             "the observed source view cannot prove one coherent export boundary, so no ECXF/1 package was published (I05-10)".to_owned()

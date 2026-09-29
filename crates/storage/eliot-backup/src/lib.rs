@@ -2972,6 +2972,14 @@ pub enum BackupError {
         /// The published-but-unfinished step the caller must reconcile.
         reason: String,
     },
+    /// A required `ECXF/1` source-view member was not observed by the source
+    /// owner, so the export refuses instead of filling the member in.
+    #[error("ECXF export source member not observed: {member}")]
+    UnobservedSourceMember {
+        /// Static name of the `CoherentSourceExport` / `ExportFence` member the
+        /// source owner did not observe.
+        member: &'static str,
+    },
     #[error("serialization failed: {0}")]
     Serialization(String),
     #[error("restore target failed: {0}")]
