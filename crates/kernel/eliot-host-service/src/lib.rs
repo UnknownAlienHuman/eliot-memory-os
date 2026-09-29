@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod process_origin_collision;
 pub mod reactive_context_delivery;
 pub mod runtime_control;
 pub mod user_automation_durable_job;
@@ -21,8 +22,13 @@ pub mod user_automation_wake;
 
 mod service;
 
+pub use process_origin_collision::{
+    AdmittedOriginControl, MAX_COLLISION_EVIDENCE_REFS, MissingOwnershipEvidence,
+    OriginCollisionDirective, OriginCollisionError, OriginNextAction, OriginOperationClass,
+    PROCESS_OWNERSHIP_UNPROVEN, ProcessOriginClassification, StoreEndpointCollision,
+};
 pub use service::{
-    BoundedRestartOutcome, HostChildExecutor, HostDependencyPlan, HostFailure,
+    BoundedRestartOutcome, BoundChildControl, HostChildExecutor, HostDependencyPlan, HostFailure,
     HostManagedChildBinding, HostService, HostServiceError, HostServiceState, KernelStartReceipt,
     ManagedChildLiveness, ManagedChildReconcileOutcome, ServiceStopReceipt,
 };

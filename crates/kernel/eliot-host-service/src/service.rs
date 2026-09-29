@@ -17,6 +17,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::process_origin_collision::{AdmittedOriginControl, OriginOperationClass};
+
 /// Host activation states. These are the operational states persisted by the
 /// Host state owner; they never imply semantic or project authority.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -110,6 +112,149 @@ impl HostManagedChildBinding {
     }
 }
 
+/// One destructive control effect bound to its admitted operation, its
+/// installation/generation, and the exact retained target it may act on.
+///
+/// Issue #1775 W3 ("Bind every control proof to its admitted operation ...
+/// Recheck target identity and authority at the effect boundary while
+/// retaining the same object; do not validate a PID then reopen a possibly
+/// replaced process by number").
+///
+/// Before this type, [`HostChildExecutor::terminate_admitted_child`] was
+/// addressed by service name alone. Host observed one process, decided to
+/// terminate it, and then asked the executor to terminate *the branch* — a
+/// second, independent resolution that a replaced process can satisfy. The
+/// effect is now addressed to the retained [`ServiceProcessRecord`] itself and
+/// the reported outcome is checked back against that same retained object.
+///
+/// A `BoundChildControl` can only ever name a destructive-control class:
+/// [`AdmittedOriginControl`] has no read-only variant and its only widening
+/// from [`OriginOperationClass`] is a `TryFrom` that refuses `ReadStatus` and
+/// `ProbeObserve` by name. A status observation therefore cannot be turned
+/// into a termination here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundChildControl {
+    /// Exact service branch this effect is admitted against.
+    pub service: PlatformHandle,
+    /// Installation that admitted the branch.
+    pub installation: PlatformHandle,
+    /// Admitted generation that admitted the branch.
+    pub admitted_generation: PlatformHandle,
+    /// The single admitted destructive-control class.
+    pub operation: AdmittedOriginControl,
+    /// The RETAINED observed lineage. The effect addresses this object, never
+    /// a fresh lookup by service name or by process number.
+    pub target: ServiceProcessRecord,
+}
+
+impl BoundChildControl {
+    /// Binds a stop effect to one retained target under `binding`.
+    ///
+    /// The class is fixed to [`AdmittedOriginControl::Stop`], which is the
+    /// only class this cleanup performs; a caller cannot widen it to `Adopt`
+    /// or `AttachCredential` because those are separate variants that this
+    /// constructor does not produce.
+    pub fn for_retained_stop(
+        installation: &PlatformHandle,
+        binding: &HostManagedChildBinding,
+        target: ServiceProcessRecord,
+    ) -> Self {
+        Self {
+            service: binding.service.clone(),
+            installation: installation.clone(),
+            admitted_generation: binding.generation.clone(),
+            operation: AdmittedOriginControl::Stop,
+            target,
+        }
+    }
+
+    /// Returns the requested operation class this effect is admitted for.
+    #[must_use]
+    pub const fn operation_class(&self) -> OriginOperationClass {
+        self.operation.operation_class()
+    }
+
+    /// Rechecks the admitted binding at the effect boundary.
+    ///
+    /// Every dimension is compared against the caller's own admitted material
+    /// rather than against a value stored inside this proof, so a mismatched
+    /// service, installation, generation or operation class is refused before
+    /// the physical effect is dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostServiceError::InvalidField`] when a binding field is
+    /// malformed and [`HostServiceError::IdentityMismatch`] when the effect is
+    /// not admitted for the exact service, installation, generation and
+    /// operation class.
+    pub fn admits(
+        &self,
+        service: &PlatformHandle,
+        installation: &PlatformHandle,
+        generation: &PlatformHandle,
+        operation: OriginOperationClass,
+    ) -> Result<(), HostServiceError> {
+        validate_handle(&self.service, "child_control.service")?;
+        validate_handle(&self.installation, "child_control.installation")?;
+        validate_handle(&self.admitted_generation, "child_control.generation")?;
+        if self.service != *service
+            || self.installation != *installation
+            || self.admitted_generation != *generation
+        {
+            return Err(HostServiceError::IdentityMismatch);
+        }
+        if self.operation_class() != operation || !operation.is_control_class() {
+            return Err(HostServiceError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Rechecks the executor's reported effect outcome against the retained
+    /// target.
+    ///
+    /// The returned record is produced independently by the executor, so this
+    /// compares two distinct observations rather than a proof with itself. A
+    /// divergence means the executor acted on a different process than the one
+    /// Host retained, which is exactly the replaced-process case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostServiceError::IdentityMismatch`] when the terminated
+    /// lineage, owner or authority epoch is not the retained target.
+    pub fn recheck_effect(&self, terminated: &ServiceProcessRecord) -> Result<(), HostServiceError> {
+        if terminated.process_id != self.target.process_id
+            || terminated.owner != self.target.owner
+            || terminated.authority_epoch != self.target.authority_epoch
+        {
+            return Err(HostServiceError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Requires the executor to prove which lineage it terminated.
+    ///
+    /// A cleanup that cannot name the process it stopped leaves the branch in
+    /// an unknown state, so it is reported as an unknown outcome rather than
+    /// as a completed effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostServiceError::UnknownOutcome`] when the executor reports
+    /// no terminated lineage, and [`HostServiceError::IdentityMismatch`] when
+    /// the reported lineage is not the retained target.
+    pub fn proven_termination(
+        &self,
+        reported: Option<ServiceProcessRecord>,
+    ) -> Result<ServiceProcessRecord, HostServiceError> {
+        let Some(terminated) = reported else {
+            return Err(HostServiceError::UnknownOutcome);
+        };
+        self.recheck_effect(&terminated)?;
+        Ok(terminated)
+    }
+}
+
 /// Provider-neutral port for one Host-managed child generation.
 ///
 /// The shared process executor implements this port in production; tests and
@@ -130,15 +275,19 @@ pub trait HostChildExecutor {
         binding: &HostManagedChildBinding,
     ) -> Result<ServiceProcessRecord, HostServiceError>;
 
-    /// Terminates the named service branch, returning the prior lineage when
-    /// one was live.
+    /// Terminates exactly the retained target bound by `control`.
+    ///
+    /// The effect is addressed to [`BoundChildControl::target`], not to a
+    /// service name or a process number, and the port must report the lineage
+    /// it actually terminated so Host can recheck it against the retained
+    /// object.
     ///
     /// # Errors
     ///
     /// Returns a typed error when termination cannot be proven.
     fn terminate_admitted_child(
         &mut self,
-        service: &PlatformHandle,
+        control: &BoundChildControl,
     ) -> Result<Option<ServiceProcessRecord>, HostServiceError>;
 
     /// Observes the named service branch without mutating it.
@@ -197,7 +346,9 @@ pub struct KernelStartReceipt {
 pub struct ServiceStopReceipt {
     /// The service identity that was stopped.
     pub service: PlatformHandle,
-    /// The process lineage that was observed before the stop.
+    /// The process lineage Host proved it terminated: the retained observed
+    /// lineage, rechecked against the executor's effect report. A stop whose
+    /// terminated lineage could not be proven does not produce a receipt.
     pub prior_process: ServiceProcessRecord,
 }
 
@@ -660,16 +811,24 @@ where
             });
         }
         let process = executor.spawn_admitted_child(binding)?;
+        // The cleanup target is the object just returned by the spawn, never a
+        // fresh lookup of `binding.service`: a replaced process cannot satisfy
+        // this proof.
+        let cleanup = BoundChildControl::for_retained_stop(
+            &self.installation,
+            binding,
+            process.clone(),
+        );
         if process.owner != binding.expected_owner {
             self.admission_closed = true;
             self.fail(HostFailure::IdentityMismatch);
-            executor.terminate_admitted_child(&binding.service)?;
+            executor.terminate_admitted_child(&cleanup)?;
             return Err(HostServiceError::IdentityMismatch);
         }
         if process.state != ServiceProcessState::Ready || !process.health.is_fully_healthy() {
             self.admission_closed = true;
             self.fail(HostFailure::ReadinessNotProven);
-            executor.terminate_admitted_child(&binding.service)?;
+            executor.terminate_admitted_child(&cleanup)?;
             return Err(HostServiceError::ReadinessNotProven);
         }
         let transition = eliot_platform::ManagedDependencyTransition {
@@ -679,11 +838,25 @@ where
         };
         if let Err(error) = self.state_store.record_dependency(transition) {
             self.admission_closed = true;
-            if let Err(cleanup_error) = executor.terminate_admitted_child(&binding.service) {
-                self.fail(HostFailure::Platform(format!(
-                    "managed-child persistence failed ({error}); cleanup failed: {cleanup_error}"
-                )));
-                return Err(cleanup_error);
+            match executor.terminate_admitted_child(&cleanup) {
+                Ok(Some(terminated)) => {
+                    if let Err(mismatch) = cleanup.recheck_effect(&terminated) {
+                        self.fail(HostFailure::IdentityMismatch);
+                        return Err(mismatch);
+                    }
+                }
+                Ok(None) => {
+                    // The branch was spawned by this call and its cleanup could
+                    // not be proven; that is an unknown outcome, not success.
+                    self.fail(HostFailure::UnknownOutcome);
+                    return Err(HostServiceError::UnknownOutcome);
+                }
+                Err(cleanup_error) => {
+                    self.fail(HostFailure::Platform(format!(
+                        "managed-child persistence failed ({error}); cleanup failed: {cleanup_error}"
+                    )));
+                    return Err(cleanup_error);
+                }
             }
             self.fail(HostFailure::StateStore(error.to_string()));
             return Err(HostServiceError::StateStore(error));
@@ -692,12 +865,16 @@ where
     }
 
     /// Stops one admitted dependency generation through the shared child
-    /// executor and returns its prior lineage.
+    /// executor and returns the lineage it proved it terminated.
     ///
     /// The journal retains the observed lineage: there is no
     /// dependency-forget contract in [`HostStateStore`], so a clean stop
     /// terminates the branch without rewriting history. Stale authority stays
     /// fenced through [`HostService::reconcile_managed_child_owner_loss`].
+    ///
+    /// The effect is bound to the retained observed object: an executor that
+    /// cannot report which lineage it stopped, or that reports a different one,
+    /// fails closed instead of closing the branch by name.
     pub fn stop_managed_child(
         &mut self,
         context: &RequestMetadata,
@@ -720,17 +897,28 @@ where
         }
         match executor.observe_admitted_child(&binding.service)? {
             ManagedChildLiveness::Live(process) => {
-                if executor
-                    .terminate_admitted_child(&binding.service)?
-                    .is_some()
-                {
-                    Ok(ServiceStopReceipt {
+                let control = BoundChildControl::for_retained_stop(
+                    &self.installation,
+                    binding,
+                    process,
+                );
+                self.admit_child_control(&control, binding, OriginOperationClass::Stop)?;
+                let reported = match executor.terminate_admitted_child(&control) {
+                    Ok(reported) => reported,
+                    Err(error) => {
+                        self.fail(HostFailure::Platform(error.to_string()));
+                        return Err(error);
+                    }
+                };
+                match control.proven_termination(reported) {
+                    Ok(terminated) => Ok(ServiceStopReceipt {
                         service: binding.service.clone(),
-                        prior_process: process,
-                    })
-                } else {
-                    self.fail(HostFailure::UnknownOutcome);
-                    Err(HostServiceError::UnknownOutcome)
+                        prior_process: terminated,
+                    }),
+                    Err(error) => {
+                        self.fail(HostFailure::IdentityMismatch);
+                        Err(error)
+                    }
                 }
             }
             ManagedChildLiveness::Dead => {
@@ -749,6 +937,12 @@ where
     /// A live foreign owner is terminated on its exact branch and fenced in
     /// the durable journal; an absent branch is fenced without termination.
     /// An unknown observation stays unknown and is never retried blindly.
+    ///
+    /// The termination is bound to the retained foreign lineage observed in
+    /// this pass, and the executor must report that same lineage back. A
+    /// replaced process on the branch therefore cannot be terminated under this
+    /// proof: the branch is fenced and the outcome is reported as an identity
+    /// mismatch instead.
     pub fn reconcile_managed_child_owner_loss(
         &mut self,
         context: &RequestMetadata,
@@ -782,12 +976,33 @@ where
                 Err(HostServiceError::ReadinessNotProven)
             }
             ManagedChildLiveness::Live(process) => {
-                let Some(terminated) = executor.terminate_admitted_child(&binding.service)? else {
-                    self.fail(HostFailure::UnknownOutcome);
-                    return Err(HostServiceError::UnknownOutcome);
+                let control = BoundChildControl::for_retained_stop(
+                    &self.installation,
+                    binding,
+                    process.clone(),
+                );
+                self.admit_child_control(&control, binding, OriginOperationClass::Stop)?;
+                let reported = match executor.terminate_admitted_child(&control) {
+                    Ok(reported) => reported,
+                    Err(error) => {
+                        self.fail(HostFailure::Platform(error.to_string()));
+                        return Err(error);
+                    }
                 };
+                // The branch is fenced either way: whether the effect landed is
+                // a separate question from whether this branch's stale
+                // authority must be retired now.
+                let terminated = control.proven_termination(reported);
                 self.fence_managed_branch(binding, Some(process))?;
-                Ok(ManagedChildReconcileOutcome::OwnerLossCleaned { terminated })
+                match terminated {
+                    Ok(terminated) => {
+                        Ok(ManagedChildReconcileOutcome::OwnerLossCleaned { terminated })
+                    }
+                    Err(error) => {
+                        self.fail(HostFailure::IdentityMismatch);
+                        Err(error)
+                    }
+                }
             }
             ManagedChildLiveness::Dead => {
                 self.fence_managed_branch(binding, None)?;
@@ -798,6 +1013,26 @@ where
                 Err(HostServiceError::UnknownOutcome)
             }
         }
+    }
+
+    /// Rechecks a bound control effect against this installation's own admitted
+    /// material immediately before the physical effect is dispatched.
+    ///
+    /// The comparison is against `self.installation` and the caller's
+    /// `binding`, never against a value carried inside the proof, so a proof
+    /// cannot vouch for itself.
+    fn admit_child_control(
+        &self,
+        control: &BoundChildControl,
+        binding: &HostManagedChildBinding,
+        operation: OriginOperationClass,
+    ) -> Result<(), HostServiceError> {
+        control.admits(
+            &binding.service,
+            &self.installation,
+            &binding.generation,
+            operation,
+        )
     }
 
     fn fence_managed_branch(
@@ -1189,8 +1424,8 @@ fn ready_process(
 #[cfg(test)]
 mod managed_child_tests {
     use super::{
-        HostChildExecutor, HostManagedChildBinding, HostService, ManagedChildLiveness,
-        ManagedChildReconcileOutcome,
+        BoundChildControl, HostChildExecutor, HostManagedChildBinding, HostService,
+        ManagedChildLiveness, ManagedChildReconcileOutcome,
     };
     use eliot_contracts::{
         AuthorityEpoch, ClockReading, EpochId, EpochLineageId, ProductId, RequestId,
@@ -1256,7 +1491,9 @@ mod managed_child_tests {
     struct StubChildExecutor {
         spawned_bindings: Vec<HostManagedChildBinding>,
         spawn_results: VecDeque<Result<ServiceProcessRecord, super::HostServiceError>>,
-        terminated: Vec<PlatformHandle>,
+        /// Every destructive effect the service dispatched, carrying the
+        /// admitted operation class, generation and retained target.
+        terminated: Vec<BoundChildControl>,
         terminate_results: VecDeque<Result<Option<ServiceProcessRecord>, super::HostServiceError>>,
         observed: Vec<PlatformHandle>,
         observe_results: VecDeque<Result<ManagedChildLiveness, super::HostServiceError>>,
@@ -1275,9 +1512,9 @@ mod managed_child_tests {
 
         fn terminate_admitted_child(
             &mut self,
-            service: &PlatformHandle,
+            control: &BoundChildControl,
         ) -> Result<Option<ServiceProcessRecord>, super::HostServiceError> {
-            self.terminated.push(service.clone());
+            self.terminated.push(control.clone());
             self.terminate_results
                 .pop_front()
                 .unwrap_or_else(|| unreachable!())
@@ -1341,6 +1578,16 @@ mod managed_child_tests {
         test_process("7", KERNEL_OWNER)
     }
 
+    /// Builds the only control proof this seam may dispatch: a `Stop` bound to
+    /// the retained target under `installation`.
+    fn expected_stop(installation: &str, target: &ServiceProcessRecord) -> BoundChildControl {
+        BoundChildControl::for_retained_stop(
+            &test_handle(installation),
+            &test_binding(),
+            target.clone(),
+        )
+    }
+
     #[test]
     fn start_managed_child_persists_exact_observed_lineage() {
         let mut service = open_service("installation-managed-start", kernel_process());
@@ -1364,15 +1611,20 @@ mod managed_child_tests {
         let binding = test_binding();
         let foreign = test_process("store-12", "ForeignOwner");
         let mut executor = StubChildExecutor {
-            spawn_results: VecDeque::from([Ok(foreign)]),
-            terminate_results: VecDeque::from([Ok(None)]),
+            spawn_results: VecDeque::from([Ok(foreign.clone())]),
+            terminate_results: VecDeque::from([Ok(Some(foreign.clone()))]),
             ..StubChildExecutor::default()
         };
         assert!(matches!(
             service.start_managed_child(&test_context("managed-foreign"), &binding, &mut executor),
             Err(super::HostServiceError::IdentityMismatch)
         ));
-        assert_eq!(executor.terminated, vec![test_handle(STORE_SERVICE)]);
+        // The cleanup was addressed to the retained spawned lineage, not to a
+        // fresh lookup of the service branch.
+        assert_eq!(
+            executor.terminated,
+            vec![expected_stop("installation-managed-foreign", &foreign)]
+        );
     }
 
     #[test]
@@ -1408,7 +1660,54 @@ mod managed_child_tests {
         assert_eq!(receipt.service, test_handle(STORE_SERVICE));
         assert_eq!(receipt.prior_process, live);
         assert_eq!(executor.observed, vec![test_handle(STORE_SERVICE)]);
-        assert_eq!(executor.terminated, vec![test_handle(STORE_SERVICE)]);
+        assert_eq!(
+            executor.terminated,
+            vec![expected_stop("installation-managed-stop", &live)]
+        );
+    }
+
+    #[test]
+    fn stop_managed_child_refuses_a_replaced_terminated_lineage() {
+        // The executor reports a different process than the one Host retained.
+        // Comparing the report to itself would pass; comparing it to the
+        // retained target must fail, because a replaced process on the branch
+        // is not the process this stop was admitted against.
+        let mut service = open_service("installation-managed-replaced", kernel_process());
+        let binding = test_binding();
+        let retained = test_process("store-13", STORE_OWNER);
+        let replaced = test_process("store-99", STORE_OWNER);
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Live(retained.clone()))]),
+            terminate_results: VecDeque::from([Ok(Some(replaced))]),
+            ..StubChildExecutor::default()
+        };
+        assert!(matches!(
+            service.stop_managed_child(&test_context("managed-replaced"), &binding, &mut executor),
+            Err(super::HostServiceError::IdentityMismatch)
+        ));
+        // The effect was still addressed to the retained lineage.
+        assert_eq!(
+            executor.terminated,
+            vec![expected_stop("installation-managed-replaced", &retained)]
+        );
+    }
+
+    #[test]
+    fn stop_managed_child_refuses_an_unproven_termination() {
+        // The executor cannot name what it stopped: the branch is not closed
+        // by name, so this is an unknown outcome rather than a clean stop.
+        let mut service = open_service("installation-managed-unproven", kernel_process());
+        let binding = test_binding();
+        let live = test_process("store-13", STORE_OWNER);
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Live(live.clone()))]),
+            terminate_results: VecDeque::from([Ok(None)]),
+            ..StubChildExecutor::default()
+        };
+        assert!(matches!(
+            service.stop_managed_child(&test_context("managed-unproven"), &binding, &mut executor),
+            Err(super::HostServiceError::UnknownOutcome)
+        ));
     }
 
     #[test]
@@ -1469,7 +1768,42 @@ mod managed_child_tests {
                 terminated: foreign.clone()
             }
         );
-        assert_eq!(executor.terminated, vec![test_handle(STORE_SERVICE)]);
+        // The destructive effect named the retained foreign lineage, the
+        // admitted generation and a single control class.
+        let dispatched = &executor.terminated[0];
+        assert_eq!(dispatched.operation, super::AdmittedOriginControl::Stop);
+        assert_eq!(dispatched.service, test_handle(STORE_SERVICE));
+        assert_eq!(dispatched.admitted_generation, test_handle("generation-1"));
+        assert_eq!(dispatched.installation, test_handle("installation-managed-owner-loss"));
+        assert_eq!(dispatched.target, foreign);
+    }
+
+    #[test]
+    fn reconcile_fences_the_branch_when_the_terminated_lineage_was_replaced() {
+        // A replaced process on the branch must not be terminated under the
+        // retained proof. The stale authority is still fenced, and the effect
+        // outcome is reported as an identity mismatch rather than a clean-up.
+        let mut service = open_service("installation-managed-replaced-loss", kernel_process());
+        let binding = test_binding();
+        let foreign = test_process("store-15", "ForeignOwner");
+        let replaced = test_process("store-77", "ForeignOwner");
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Live(foreign.clone()))]),
+            terminate_results: VecDeque::from([Ok(Some(replaced))]),
+            ..StubChildExecutor::default()
+        };
+        assert!(matches!(
+            service.reconcile_managed_child_owner_loss(
+                &test_context("managed-replaced-loss"),
+                &binding,
+                &mut executor,
+            ),
+            Err(super::HostServiceError::IdentityMismatch)
+        ));
+        assert_eq!(
+            executor.terminated,
+            vec![expected_stop("installation-managed-replaced-loss", &foreign)]
+        );
     }
 
     #[test]
