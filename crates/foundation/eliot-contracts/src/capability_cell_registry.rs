@@ -886,10 +886,12 @@ impl CapabilityCellRegistry {
                 continue;
             }
             if let Some(origin) = production.get(record.cell.as_str()) {
-                return Err(CellClassificationError::DevelopmentReachableFromProduction {
-                    cell: record.cell.as_str().to_owned(),
-                    reachable_from: (*origin).to_owned(),
-                });
+                return Err(
+                    CellClassificationError::DevelopmentReachableFromProduction {
+                        cell: record.cell.as_str().to_owned(),
+                        reachable_from: (*origin).to_owned(),
+                    },
+                );
             }
         }
         Ok(())
@@ -907,18 +909,17 @@ impl CapabilityCellRegistry {
     /// roster; no crate, bundle, source-layer, or runtime-layer name decides
     /// reachability, and a cell that declares itself non-production-required
     /// gains no exemption from the walk.
-    fn production_reachable_cells<'a>(&'a self) -> BTreeMap<&'a str, &'a str> {
-        let seeds: Vec<&str> = self
-            .cells
-            .iter()
-            .filter(|record| {
-                record
-                    .executable_capsule
-                    .as_ref()
-                    .is_some_and(|binding| binding.disposition == CapsuleDisposition::Production)
-            })
-            .map(|record| record.cell.as_str())
-            .collect();
+    fn production_reachable_cells(&self) -> BTreeMap<&str, &str> {
+        let seeds: Vec<&str> =
+            self.cells
+                .iter()
+                .filter(|record| {
+                    record.executable_capsule.as_ref().is_some_and(|binding| {
+                        binding.disposition == CapsuleDisposition::Production
+                    })
+                })
+                .map(|record| record.cell.as_str())
+                .collect();
         let mut origins: BTreeMap<&str, &str> = BTreeMap::new();
         let mut frontier: Vec<&str> = Vec::new();
         for seed in seeds {
@@ -958,7 +959,10 @@ impl CapabilityCellRegistry {
             }
             if cell == record.cell.as_str() {
                 for edge in &record.affected_edges {
-                    if self.cells.iter().any(|peer| peer.cell.as_str() == edge.as_str())
+                    if self
+                        .cells
+                        .iter()
+                        .any(|peer| peer.cell.as_str() == edge.as_str())
                         && !neighbours.contains(&edge.as_str())
                     {
                         neighbours.push(edge.as_str());
