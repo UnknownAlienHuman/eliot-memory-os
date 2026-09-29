@@ -13,6 +13,7 @@ eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-receipts.workspace = true
+eliot-runtime-contracts.workspace = true
 eliot-platform.workspace = true
 schemars.workspace = true
 serde.workspace = true

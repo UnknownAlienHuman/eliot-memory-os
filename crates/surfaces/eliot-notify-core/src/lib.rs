@@ -8,10 +8,15 @@
 
 #![forbid(unsafe_code)]
 
+mod control_reserve;
 mod notify_declaration;
 mod telegram_experiment;
 mod user_automation;
 
+pub use control_reserve::{
+    NOTIFICATION_INBOX_BOTTLENECK, NotifyPermit, NotifyPermitOperation, NotifyReserve,
+    NotifyReserveError,
+};
 pub use notify_declaration::{
     FallbackVerificationDeclaration, NOTIFY_FALLBACK_VERIFIER_RELATIVE, NotifyDeclarationError,
     NotifyDeclarationInputs, RenderedNotifyDeclaration, decode_fallback_key_hex,
