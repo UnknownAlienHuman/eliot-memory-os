@@ -1957,10 +1957,15 @@ impl DaemonComposition {
     /// and the owner binding, so `BootstrapScanner::scan` executes only
     /// against the durable owner and the completed scan returns the exact
     /// replayable owner receipt. The persisted handle is read back through
-    /// the same store before return: a missing, inaccessible, corrupt or
-    /// replaced record fails with its typed
-    /// `eliot_workscope::WorkScopeError` cause and never produces a
+    /// the same store before return: a missing, inaccessible, corrupt,
+    /// replaced, stale, invalidated or unknown-commit record fails with its
+    /// typed `eliot_workscope::WorkScopeError` cause and never produces a
     /// completed outcome, so no terminal readiness receipt may reference it.
+    /// The returned handle is the exact `scan_receipt` value the live
+    /// terminal compilation takes: `GovernorComposition::compile_cold_start_at_trigger`
+    /// reads it back through the same store and binding before compiling,
+    /// so the terminal readiness receipt references the validated durable
+    /// scan receipt and never an in-memory or loose-file handle.
     /// A question outcome means the owner supplied no privacy inputs, which
     /// fails as `ScanContourNotAdmitted`: there is no in-memory-only or
     /// loose-file fallback.
