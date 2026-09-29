@@ -272,7 +272,10 @@ fn build_protocol_result(
 
 /// Lossless mapping from the Governor-internal typed outcome to the wire v2
 /// protocol result. Every variant is preserved 1:1; no error is coerced to
-/// `Resolved` and no error is dropped.
+/// `Resolved` and no error is dropped. A `Resolved` snapshot whose fence is
+/// not the exact ticket fence is not mappable: it fails closed as a mapping
+/// error, never as a binding, so stale selection cannot receive authority
+/// (issue #1746, W2/A2).
 pub fn map_governor_outcome_to_protocol(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
@@ -312,6 +315,20 @@ fn map_governor_outcome_to_protocol_inner(
         ticket = %crate::diagnostics::sanitize_identity(&ticket.ticket_id)
     )
     .entered();
+    // Issue #1746 (W2/A2): a Governor snapshot resolved under another fence is
+    // stale selection for this exact ticket. Projecting it as `Resolved`
+    // would mint application identity (principal/session/task) under the wrong
+    // epoch/generation, so the mapping fails closed here — before any binding
+    // is built — and the caller answers through the typed mapping-failure
+    // terminal instead. The live resolver pre-checks this same equality, so
+    // this arm only fires for out-of-band callers; it changes no live path.
+    if let GovernorActivationOutcome::Resolved(snapshot) = &outcome
+        && snapshot.state_fence != ticket.state_fence
+    {
+        return Err(DaemonError::Lifecycle(
+            "resolved activation snapshot fence differs from the exact ticket fence".to_owned(),
+        ));
+    }
     let owner_revision = match &outcome {
         GovernorActivationOutcome::Resolved(snapshot) => snapshot.owner_revision,
         _ => successor_observation
