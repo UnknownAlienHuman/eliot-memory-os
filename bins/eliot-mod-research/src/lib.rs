@@ -1359,9 +1359,11 @@ pub fn project_admitted_inquiry(
         // reopen-reason custody, and this crate is not the owner of the exchange
         // wire contract, so a run admitted here has no declared predecessor and
         // the freeze it produces is an honest first freeze rather than a silent
-        // successor. `EvidenceFreeze` will name, re-prove and refuse a successor
-        // the moment an admitted request does carry the pair; supplying that
-        // custody is BLOCKED-BY #1762, which owns inquiry/R6 composition. No
+        // successor. Both fields are therefore initialised to their honest
+        // first-freeze value rather than to a fabricated relation:
+        // `EvidenceFreeze` will name, re-prove and refuse a successor the moment
+        // an admitted request does carry the pair; supplying that custody on the
+        // request is BLOCKED-BY #1762, which owns inquiry/R6 composition. No
         // value is invented here to make the successor arm fire.
         predecessor_freeze_digest: None,
         reopen_reason: None,

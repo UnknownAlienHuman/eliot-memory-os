@@ -7329,7 +7329,12 @@ pub fn audit_claim(
     };
     let requirements = record_claim_requirements(&verdict, claim, portfolio);
     let mut evaluations = record_dimension_evaluations(&verdict, &requirements);
-    evaluations.sort_by(|left, right| left.dimension.cmp(&right.dimension));
+    // `sort_by_key` on `dimension`, which is `AuditDimension`'s own derived
+    // `Ord`. That is the very comparison the closure performed — derived
+    // declaration order, stable, ties left in their pre-sort order — so the
+    // roster the per-dimension digest is computed over is byte-identical to the
+    // one the `sort_by` form produced.
+    evaluations.sort_by_key(|evaluation| evaluation.dimension);
     ClaimVerdict {
         dimension_evaluations: evaluations,
         requirements,
@@ -7368,8 +7373,8 @@ fn record_claim_requirements(
     // claim's declared scope, and carries evidentiary weight. This is the
     // question the citation loop above already answered; it is read back out of
     // the audit's own computed evidence map rather than re-decided here.
-    let source = match verdict.evidence_map.is_empty() {
-        true => ClaimRequirement {
+    let source = if verdict.evidence_map.is_empty() {
+        ClaimRequirement {
             name: CLAIM_REQUIREMENTS[0],
             outcome: if claim.citations.is_empty() {
                 RequirementOutcome::Unsatisfied
@@ -7378,13 +7383,14 @@ fn record_claim_requirements(
             },
             examined_over: claim.citations.clone(),
             reason: "no admitted in-scope record supports this claim".to_owned(),
-        },
-        false => ClaimRequirement {
+        }
+    } else {
+        ClaimRequirement {
             name: CLAIM_REQUIREMENTS[0],
             outcome: RequirementOutcome::Satisfied,
             examined_over: supporting.clone(),
             reason: String::new(),
-        },
+        }
     };
     // `excerpt_supports_requirement`: the admitted revision must contain an exact
     // excerpt, with sufficient surrounding context, and that excerpt must
