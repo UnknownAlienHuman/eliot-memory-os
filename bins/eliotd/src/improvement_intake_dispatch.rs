@@ -173,7 +173,7 @@ use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
     ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
     SafeBoundary, brief_at_safe_boundary, candidate_from_evidence, check_class_gate, classify,
-    sourced_evidence,
+    is_prohibited_tuning_surface, sourced_evidence,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
@@ -406,10 +406,19 @@ pub fn assemble_improvement_artifact(
     // the gate had no production caller at all: `classify` and
     // `check_class_gate` were reachable only from `intake_from_evidence`, which
     // this daemon deliberately does not call because its budget gate would
-    // demand fabricated canary refs. Enforcing it here means the class
-    // decision is taken over a REAL candidate, and a class this path is not
-    // entitled to (tuning, code delivery, protected) is refused rather than
-    // asserted.
+    // demand fabricated canary refs. The class is therefore decided here from
+    // the candidate's OWN recorded surface, and a candidate whose recorded
+    // surface the owner forbids to the advisory class is refused rather than
+    // assembled.
+    //
+    // Stated plainly so this call is not read as broader than it is: the
+    // candidate assembled above records [`IMPROVEMENT_SURFACE`] (`Memory`),
+    // which is not a protected surface, so on the live maintenance path the
+    // class taken is `Advisory` and the gate passes. What the gate buys here is
+    // that the class is a FUNCTION of the candidate's recorded surface rather
+    // than of literals — a candidate carrying `Verifier` or `Scheduler` is
+    // refused. See `enforce_advisory_class_gate` for the exact ceiling,
+    // including the two classes this path cannot represent at all.
     enforce_advisory_class_gate(&candidate)?;
 
     // The safe boundary is the daemon's own admitted generation plus the
@@ -463,32 +472,72 @@ pub fn assemble_improvement_artifact(
 /// Enforces the I12.24 application-class boundary over a real candidate
 /// (issue #1867 W5).
 ///
-/// The descriptor is the candidate's OWN recorded content, not a literal: this
-/// path sets no bounded-tuning flag, names no work item, and touches no
-/// protected surface, which is exactly what the candidate's `advisory_only:
-/// true` asserts. A future change that made any of those true has to change
-/// the descriptor too, and the gate then refuses until the rollback,
-/// work-item and owner-approval material exists.
+/// # The descriptor is the candidate's own recorded content
 ///
-/// `live_experiments_on_surface` is `0` because this daemon runs no experiment
-/// and therefore holds no live experiment on any surface; the zero is not a
-/// claim about a count it cannot see but a fact about what this path does. The
-/// rollback reference passed is the candidate's OWN recorded `rollback`, so the
-/// advisory branch's material comes from the candidate rather than from a
-/// string this file spells.
+/// [`ImprovementCandidate::target_surface`] is the candidate's OWN closed
+/// surface record, and it is the only class evidence this path holds. The
+/// class flags are read from it and from what the candidate does NOT record:
 ///
-/// The gate is fail-closed: a class other than `Advisory` would need a
-/// rollback ref AND (for tuning) zero live experiments AND (for protected)
-/// explicit owner approval with a migration/proof ref, none of which this
-/// advisory path can supply, so an accidental upgrade of the class is refused
-/// rather than silently honoured.
+/// - `touches_protected` is [`is_prohibited_tuning_surface`] over that surface,
+///   so it is a comparison of the candidate's recorded surface against the
+///   owner's closed rule, not a spelled literal. A candidate recorded on
+///   [`ImprovementSurface::Verifier`] or [`ImprovementSurface::Scheduler`]
+///   classifies as `Protected` and is refused below, because the owner class
+///   for those surfaces requires an explicit owner decision and a
+///   corresponding migration/proof (I12.24:93) and this path holds neither.
+///   `ASSUMPTION:` those two surfaces map to `Protected` rather than to
+///   `CodeModuleConfig`, because I12.24:93 names `verifier` and `authority` in
+///   the protected class and I12.24:87-88 names `verifier definition` and
+///   `Kernel/Watchdog reserve` as never-tuning — so the owner-decision route
+///   the crate's own [`is_prohibited_tuning_surface`] names for them is the
+///   protected one. `Protected` is also the stricter of the two routes that
+///   function allows, so the mapping fails closed.
+/// - `bounded_tuning` and `has_work_item_ref` are `false` because the candidate
+///   records NO bounded-tuning range and NO work-item reference. Neither the
+///   I12.24:20-38 `ImprovementCandidate` schema nor the crate's
+///   [`ImprovementCandidate`] struct carries a field for either, so there is
+///   nothing to read and nothing is invented. This is the real ceiling of this
+///   path, and it is stated rather than papered over — the
+///   `PreAuthorizedTuning` and `CodeModuleConfig` classes are NOT REACHABLE
+///   here, because the descriptor cannot be given the content that would
+///   select them. A future change that wants either class has to add the
+///   evidence to the candidate first; until then there is nothing for this gate
+///   to refuse on those two classes, and this comment does not claim
+///   otherwise.
+///
+/// [`ImprovementCandidate::advisory_only`] is deliberately NOT used as a class
+/// flag. It is a real recorded field, but it is not the same thing as these
+/// three: `validate_base` refuses any candidate whose `advisory_only` is false
+/// (`ImprovementError::SelfPromotionForbidden`), so it is a self-promotion
+/// invariant that is already enforced upstream on every candidate, not
+/// evidence about which of the four I12.24 classes this change belongs to.
+/// Reading it as a class input would re-derive a fact the owner already
+/// guarantees and would misreport the class boundary as content-bound when the
+/// class content is the surface record above.
+///
+/// # What the gate actually refuses
+///
+/// [`check_class_gate`] is asked for the material this path really holds:
+/// `rollback_ref` is the candidate's own recorded `rollback`;
+/// `owner_approved` is `false` and `migration_proof_ref` is `None` because
+/// this path holds no owner decision and no migration/proof, and
+/// `work_item_ref` is `None` because the candidate records no work item.
+/// Those absences are the fail-closed direction: a candidate whose recorded
+/// surface classifies as `Protected` is refused with
+/// [`ImprovementError::ApplicationClassViolation`] rather than assembled, and
+/// `live_experiments_on_surface` is `0` — this path starts no experiment — but
+/// it is not read, because the tuning class is not representable above.
+///
+/// The refusal is therefore content-bound: it turns on the surface the
+/// candidate actually records. It is not a claim that every class upgrade is
+/// caught, and no such claim is made here.
 fn enforce_advisory_class_gate(
     candidate: &ImprovementCandidate,
 ) -> Result<(), ImprovementDispatchError> {
     let change = ChangeDescriptor {
         target_surface: candidate.target_surface,
         bounded_tuning: false,
-        touches_protected: false,
+        touches_protected: is_prohibited_tuning_surface(candidate.target_surface),
         has_work_item_ref: false,
     };
     let class = classify(&change);
