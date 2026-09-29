@@ -306,7 +306,11 @@ pub use terminal_containment::{
 pub(crate) use user_owned_leases::current_process_sid;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use user_owned_leases::protect_user_owned_opened_handle;
-pub use user_owned_leases::{UserOwnedPathLease, UserOwnedRootLease, UserOwnedRootReadLease};
+pub use user_owned_leases::{
+    UserOwnedPathLease, UserOwnedRootLease, UserOwnedRootReadLease, UserSelectedResourceError,
+    UserSelectedResourceKind, UserSelectedResourceLease, UserSelectedResourceMeasurement,
+    UserSelectedResourceNodeMeasurement,
+};
 
 /// Failure returned by a Windows-only primitive before it can be projected
 /// into a provider-neutral P-01 outcome.
