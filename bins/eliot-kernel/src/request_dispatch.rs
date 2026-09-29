@@ -83,19 +83,24 @@
 //!   predecessor's durable namespace digest plus its canonical request hash — and
 //!   only after the route has proved the caller is admitted for the front door in the
 //!   same `WorkScope` and on the same authority LINEAGE, the named predecessor is the
-//!   same principal's, and the presented archive is the predecessor's archive. That
+//!   same principal's, and the capture owner re-decides the presented bytes and
+//!   re-proves that this is the same operation the named row holds
+//!   (`owner_reproves_predecessor_operation`). That
 //!   is the ONLY case `successor_of` exists for: the key cannot otherwise separate a
 //!   non-owner from the operation it wants to read. The verify payload is therefore
 //!   `{bundle_hex}` or `{bundle_hex, successor_of}`.
 //!
 //!   The succession evidence is CALLER-PRESENTED, not owner-issued, and the route
-//!   does not pretend otherwise. It is scope-guarded, the authorization checks
-//!   answer with ONE static sentence that names no class, the integrity/no-row arms
-//!   answer with the fail-closed `verification_not_recorded_reply`, and the original
-//!   operation identity is preserved on the answer. What it cannot prove is
-//!   that the owner would authorise THIS caller to reconcile THAT operation, because
-//!   no owner issues a backup-verify succession or reconciliation receipt on this
-//!   product; that owner is `backup-capture-owner (#959)`, OPEN. Nothing here invents
+//!   does not pretend otherwise. It is a POINTER, never an authorization: the pair
+//!   only selects which row is read, and the route is scope-guarded, the
+//!   authorization checks answer with ONE static sentence that names no class, the
+//!   integrity/no-row arms answer with the fail-closed
+//!   `verification_not_recorded_reply`, and the original operation identity is
+//!   preserved on the answer. What the evidence cannot do is authorize a REPEAT
+//!   reconciliation, because no owner issues a one-shot backup-verify succession or
+//!   reconciliation receipt on this product; that owner is `backup-capture-owner
+//!   (#959)`, OPEN. What it CAN do, and does, is force the owner to re-decide the
+//!   named operation: nothing here invents
 //!   a capability, a receipt type, or an owner value to paper over that.
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
@@ -1523,6 +1528,67 @@ fn successor_caller_principal(session: &Session) -> Result<&str, TransportError>
     authenticated_backup_principal(session).map(|(principal, _)| principal)
 }
 
+/// Returns whether the owner re-decides, for the bytes just decoded, exactly the
+/// operation the named predecessor row already holds.
+///
+/// This is the owner half of #2883 instruction 4 and acceptance clause 3, and it
+/// is deliberately a CONTENT comparison over owner-proved values rather than a
+/// check that the presented succession evidence is well formed. The evidence a
+/// successor presents is a pair of digests the predecessor's own `ok` reply
+/// already carried, so a shape-valid pair proves nothing on its own: what makes
+/// the reconciliation an observation of THAT operation is that the capture owner,
+/// re-deciding the presented bytes on this call, lands on the same archive
+/// identity, the same declared source and owner contract, the same export and
+/// archived fence digests, the same evidenced class, the same evidence level and
+/// ceiling, the same publication receipt and the same independent member
+/// denominators that the stored row recorded. Every term compared is one the
+/// owner decides from the ARCHIVE, so it is a function of the bytes rather than
+/// of the verifying session.
+///
+/// The three denominators are counted from the owner's own
+/// [`member_domain_count`] dispositions — an INDEPENDENT expected set derived
+/// from the decoded archive — and compared against the three retained counts.
+/// They are not a coverage comparison of the stored list against a second copy
+/// of the caller's list, and the stored row retains only the counts, never the
+/// member list, so there is nothing to compare twice.
+///
+/// The archived-fence RELATION, its proof qualifier, its restriction tokens and
+/// its contract version are deliberately NOT compared. Those are relations
+/// between the archive's fence and the LIVE verifying target, so they are
+/// historical answer evidence (instruction 7) and a reconciliation read after an
+/// Authority Epoch rotation must still be able to report the relation that was
+/// observed then. Requiring them to match would forbid the rotation replay this
+/// durable row exists to enable. Everything compared here is either the archive
+/// itself or a value inside it.
+///
+/// The row is read back through
+/// [`RedbRecoveryStore::load_backup_verification_result`], which decodes and
+/// validates it through [`BackupVerificationResultRecord::validate`], so the
+/// RECORDED values on the other side of every comparison are the original ones
+/// and the flat/identity drift checks have already run. No digest is recomputed
+/// here to stand in for a recorded one.
+fn owner_reproves_predecessor_operation(
+    report: &CaptureReport,
+    stored: &BackupVerificationResultRecord,
+) -> bool {
+    let Ok(Value::String(class_ceiling)) = serde_json::to_value(report.class_ceiling) else {
+        return false;
+    };
+    report.archive_sha256 == stored.identity.archive_sha256
+        && report.backup_id == stored.backup_id
+        && class_name(report.class) == stored.identity.evidenced_class
+        && report.evidence_level.as_wire_name() == stored.verification_level
+        && class_ceiling == stored.class_ceiling
+        && report.owner_contract == stored.identity.archive_owner_contract
+        && report.source_installation == stored.identity.archive_source_installation
+        && report.export_fence_digest == stored.identity.archive_export_fence_digest
+        && report.archived_state_fence_digest == stored.identity.archived_fence_digest
+        && report.receipt_identity == stored.capture_receipt
+        && member_domain_count(report, MEMBER_DOMAIN_CANONICAL) == stored.event_count
+        && member_domain_count(report, MEMBER_DOMAIN_RECEIPT) == stored.receipt_count
+        && member_domain_count(report, MEMBER_DOMAIN_BLOB) == stored.blob_count
+}
+
 /// Projects the ONE refusal the failed AUTHORIZATION checks on the reconciliation
 /// path answer with (instructions 4, 5, 7 and 8 on that path).
 ///
@@ -1844,9 +1910,12 @@ enum PriorVerification {
 ///    digest comparison and before the row is used for anything observable.
 /// 2. the named predecessor must belong to the SAME authenticated principal, so a
 ///    caller cannot read another principal's operation at all.
-/// 3. the presented request hash must equal the stored one AND the presented archive
-///    must be the stored archive. The stored request hash covers the predecessor's
-///    own PRINCIPAL, `WorkScope`, operation id and archive provenance, so guessing the
+/// 3. the presented request hash must equal the stored one AND the owner must
+///    re-prove the stored operation for the decoded bytes
+///    ([`owner_reproves_predecessor_operation`]). The stored request hash covers the
+///    predecessor's
+///    own PRINCIPAL, `WorkScope`, operation id and archive provenance, and the owner
+///    re-proof covers the archive's whole decided content, so guessing the
 ///    namespace key alone — which is on the wire as `operation_namespace` — yields
 ///    nothing. It provably does NOT cover the predecessor's session, because
 ///    `session_id` is ambient; that is deliberate and is justified in
@@ -1875,10 +1944,23 @@ enum PriorVerification {
 /// trade is taken deliberately, and for the fact that the successor path has no
 /// operator surface today.
 ///
-/// What the pair is NOT is an owner-issued capability: nothing here proves the
-/// owner would have authorised THIS caller to reconcile THAT operation, because
+/// The pair is a POINTER, never an authorization on its own: both halves were
+/// already on the wire in the predecessor's own `ok` reply, so their shape and
+/// even their value prove nothing by themselves. What authorizes the
+/// reconciliation is [`owner_reproves_predecessor_operation`] — the capture
+/// owner, re-deciding the presented bytes on this call, must land on exactly the
+/// operation the named row holds — together with the scope, lineage and
+/// principal joins. The pair selects WHICH row is read; the owner decides
+/// whether that row is the operation the caller is reconciling.
+///
+/// What the pair still is NOT is an owner-ISSUED, one-shot succession capability:
 /// no owner issues a backup-verify succession or reconciliation receipt on this
-/// product. That owner is `backup-capture-owner (#959)`, which is OPEN.
+/// product, so there is no due time and no single-use consumption, and a holder
+/// of the pair may reconcile the same operation again. That residual belongs to
+/// `backup-capture-owner (#959)`, which is OPEN. It is a narrower claim than
+/// "the owner did not authorise this reconciliation": the owner does re-prove
+/// that the reconciled operation IS the named operation, and it does so over the
+/// whole archive content, not over a correlation the caller chose.
 struct VerifySuccessorEvidence {
     /// The predecessor operation's durable namespace key.
     predecessor_namespace_digest: String,
@@ -2113,9 +2195,10 @@ impl KernelComposition {
     /// principal owning the operation, which the namespace key cannot otherwise
     /// separate from it. Such a reconciliation answers from the NAMED predecessor's
     /// own row, not from a recompute of the presented bytes, so the presented bundle
-    /// must be that predecessor's archive: the freshly decoded
-    /// `report.archive_sha256` is compared against the stored
-    /// `identity.archive_sha256` before anything is projected. The bundle is still
+    /// must be that predecessor's archive: the owner re-decides the decoded bytes
+    /// and the whole of that decision is compared against the stored row by
+    /// [`owner_reproves_predecessor_operation`] before anything is projected. The
+    /// bundle is still
     /// decoded and validated first either way, so a reconciliation never skips the
     /// capture owner's admission gate.
     ///
@@ -2371,12 +2454,15 @@ impl KernelComposition {
     /// archive provenance. A namespace key alone is therefore not a succession
     /// claim.
     ///
-    /// (3) The presented archive IS that predecessor's archive: the freshly
-    /// decoded `report.archive_sha256` must equal the stored
-    /// `identity.archive_sha256`. Without this the caller could present a valid
-    /// but different archive and be answered with the predecessor's identity,
-    /// class, counts and fence relation, which would be a projection about bytes
-    /// the caller did not present.
+    /// (3) The owner re-decides THAT operation for the bytes just presented: see
+    /// [`owner_reproves_predecessor_operation`], which is the whole archive content
+    /// — identity, declared source and owner contract, export and archived fence
+    /// digests, class, evidence level and ceiling, receipt and member denominators
+    /// — and not one correlation value. The archive digest is a necessary part of
+    /// it, not the whole of it: without the full comparison a caller could present
+    /// a valid but different archive and be answered with the predecessor's
+    /// identity, class, counts and fence relation, which would be a projection
+    /// about bytes the caller did not present.
     ///
     /// The answer then keeps BOTH facts the transport needs. The envelope
     /// correlation is always the reconciling caller's own `idempotency_key`,
@@ -2403,7 +2489,7 @@ impl KernelComposition {
     /// ARMS ONLY, NOT ALL SIX ARMS OF THIS FUNCTION. This function has six refusal
     /// call sites, and they answer with TWO different sentences:
     /// - the three AUTHORIZATION call sites — the scope/lineage join, the separate
-    ///   principal compare, and the presented-digest + presented-archive compare —
+    ///   principal compare, and the presented-digest + owner re-proof compare —
     ///   all answer with the ONE [`successor_not_observed_reply`], whose reason is a
     ///   single static sentence naming no principal, no session, no scope, no
     ///   lineage, no digest, no archive identity, no count and no store error;
@@ -2441,23 +2527,35 @@ impl KernelComposition {
     /// caller is admitted for the front door, by [`admit_backup_caller`] and by
     /// `verify_only`'s own `require_capture_admitted`, before this function runs;
     /// (b) the caller is in the same `WorkScope` and on the same authority LINEAGE as
-    /// the named predecessor; and (c) the named predecessor is a real stored
+    /// the named predecessor; (c) the named predecessor is a real stored
     /// `backup.verify` row in this ORS file, whose canonical request hash — which
     /// covers its PRINCIPAL, `WorkScope`, operation id and archive provenance, and
-    /// provably NOT its session — is exactly the one presented, and whose archive is
-    /// exactly the one presented. The predecessor's own SESSION is deliberately not
+    /// provably NOT its session — is exactly the one presented; and (d) the capture
+    /// owner, re-deciding the bytes this call presented, re-proves that this is the
+    /// SAME operation the row holds, over the whole archive content rather than over
+    /// one correlation value — see [`owner_reproves_predecessor_operation`]. The
+    /// predecessor's own SESSION is deliberately not
     /// required to match and is deliberately not covered by the hash, and the
     /// justification is not a claim that the hash names it: a new session inheriting
     /// a prior session's operation is the ENTIRE POINT of a succession, so requiring
     /// session equality would make every reconciliation impossible.
     ///
-    /// What it does NOT prove is that the owner would authorise THIS caller to
-    /// reconcile THAT operation, because no owner issues a backup-verify succession
-    /// or reconciliation receipt on this product. That owner is
-    /// `backup-capture-owner (#959)`, which is OPEN. Instruction 4's
-    /// "owner-authorized" half is therefore NOT met on this product, and it cannot
-    /// be met here without inventing a capability, a receipt type, or an owner value
-    /// that does not exist.
+    /// (d) is what separates this from a successor that is merely ACCEPTED because
+    /// the pair it presented is well formed. The pair is a pointer: both halves were
+    /// on the wire in the predecessor's own `ok` reply, so nothing about their shape
+    /// or their value authorizes anything. What authorizes the read is that the OWNER
+    /// re-decided this archive and reached the same archive identity, declared
+    /// source and owner contract, export and archived fence digests, evidenced
+    /// class, evidence level and class ceiling, publication receipt and independent
+    /// member denominators the row recorded.
+    ///
+    /// What it still does NOT prove is that the owner would authorise a REPEAT
+    /// reconciliation by the same caller: no owner issues a one-shot backup-verify
+    /// succession or reconciliation receipt on this product, so the pair may be
+    /// replayed for as long as the row lives. That residual belongs to
+    /// `backup-capture-owner (#959)`, which is OPEN, and closing it would mean
+    /// inventing a capability, a receipt type or an owner value that does not exist
+    /// — not something this issue's own scope may add.
     ///
     /// # OPEN POINT FOR THE OWNER — the issue's clause-1 phrase. Clause 1 says "two
     /// authenticated principals OR SESSIONS" may use the same human idempotency text
@@ -2499,7 +2597,7 @@ impl KernelComposition {
             return successor_not_observed_reply(idempotency_key);
         }
         if stored.identity.identity_digest != successor.predecessor_identity_digest
-            || stored.identity.archive_sha256 != report.archive_sha256
+            || !owner_reproves_predecessor_operation(report, &stored)
         {
             return successor_not_observed_reply(idempotency_key);
         }
