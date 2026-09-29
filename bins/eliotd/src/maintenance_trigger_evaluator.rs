@@ -70,15 +70,15 @@ use super::notification_state_emit::{
 /// | `route_available` | `false` | No maintenance route/credential owner publishes a service-safe route to this daemon. | #1692 |
 /// | `budget_available` | `false` | No maintenance budget/quota owner publishes one. | #1692 |
 /// | `user_session_required` | `false` | The `interactive_maintenance` policy that would set it does not exist here. Held `false` grants nothing: `route_available` is already `false`, so no route can be selected. | #1692 |
+/// | `user_session_available` | `false` | The authenticated daemon transport is not User Broker registration/lease evidence, and Kernel exposes no current broker-status query to this caller. | #1692, #23 |
 /// | `explicit_request` | `false` | `eliotd` exposes no authenticated Human UI/CLI maintenance-request ingress; an untrusted flag is not a request. | #1692 |
 /// | `safety_required` | `false` | No owner publishes a verified mandatory safety/recovery obligation to this daemon, and the flag must never be asserted to bypass authentication. | #1692 |
 /// | `active_job_id` | `None` | [`MaintenanceController`] exposes no probe for an existing active job, so duplicate suppression cannot be fed. | #1694 |
 /// | `expires_at_ms` | `None` | No expiry policy is published to this daemon. | #1694 |
 ///
-/// The one gate that **is** filled from a real observation is
-/// `user_session_available`, read from the validated Kernel-issued owner
-/// session the daemon already retains.
-pub const UNRESOLVED_AUTHORITIES: &str = "mode,scheduled_window,route_available,budget_available,user_session_required,explicit_request,safety_required,active_job_id,expires_at_ms";
+/// `user_session_available` remains false until the Kernel's User Broker
+/// owner exposes a current authenticated registration/lease observation.
+pub const UNRESOLVED_AUTHORITIES: &str = "mode,scheduled_window,route_available,budget_available,user_session_required,user_session_available,explicit_request,safety_required,active_job_id,expires_at_ms";
 
 /// The durable maintenance trigger origins this daemon can genuinely observe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +249,9 @@ impl DaemonComposition {
             // `MaintenanceController::evaluate_trigger` and become reachable
             // only when a publisher appears. The transport session this
             // composition retains is explicitly not User Broker evidence.
+            // No accepted Kernel owner query supplies the broker
+            // registration/lease/revocation state, so the interactive session
+            // gate remains unavailable.
             let policy = MaintenancePolicyEvidence::unpublished(
                 entry.mode,
                 observation.family,
@@ -257,7 +260,7 @@ impl DaemonComposition {
             let route = MaintenanceRouteEvidence::unpublished();
             let budget = MaintenanceBudgetEvidence::unpublished();
             let schedule = MaintenanceScheduleEvidence::unpublished();
-            let broker = MaintenanceBrokerEvidence::transport_only(self.owner_session.is_some());
+            let broker = MaintenanceBrokerEvidence::owner_query_unavailable();
             let safety = MaintenanceSafetyEvidence::unpublished();
             let input = MaintenanceTriggerInput {
                 trigger_id,
@@ -272,11 +275,9 @@ impl DaemonComposition {
                 scheduled_window: schedule.is_current_window(),
                 route_available: route.is_service_safe(),
                 budget_available: budget.has_budget(),
-                // Observed, not claimed: transport presence carried by the
-                // broker evidence type, which never promotes it to broker
-                // admission; the separate interactive permission above stays
-                // denied.
-                user_session_available: broker.transport_present(),
+                // Fail closed until the Kernel owner supplies a current
+                // authenticated broker registration/lease observation.
+                user_session_available: broker.authenticated_session_available(),
                 user_session_required: policy.requires_interactive_session(),
                 safety_required: safety.is_required(),
                 now_ms: crate::unix_ms_i64(),

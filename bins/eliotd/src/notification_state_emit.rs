@@ -26,11 +26,11 @@
 //! notification keyed by automation revision and failure fingerprint. It does
 //! not emit one alert per occurrence; a material revision, verified recovery or
 //! Human disposition reopens that notification key." [`AutomationFailureKey`] is
-//! therefore the decision's *own* stable identity — `family`, `scope_ref`,
-//! `reason`, `decision`, `trigger_id` — together with the bound policy episode,
-//! requested catalog route and actual route evidence. No clock, counter, or
-//! per-observation value enters the key, so a repeat under unchanged evidence
-//! yields the same `dedup_key`.
+//! therefore the recommendation's stable identity — `family`, `scope_ref`,
+//! `reason` and policy episode. Trigger/job identities and requested/actual
+//! route evidence remain on the notification body and source receipt, but are
+//! not key material: another trigger or route observation in the same policy
+//! episode must coalesce onto the same Human obligation, not mint another one.
 //!
 //! Read that sentence against the store's own upsert, because it decides what
 //! this emitter may do. `NotificationStore::upsert` refuses a draft that does
@@ -147,8 +147,8 @@ use eliot_kernel_core::{
     DeadlineOrReview, DeliveryChannel, NotificationDraft, NotificationSeverity,
 };
 use eliot_maintenance::{
-    AutomationDecision, AutomationTriggerDecision, MaintenanceAutomationMode,
-    MaintenancePolicyEvidence, MaintenanceRouteEvidence,
+    AutomationTriggerDecision, MaintenanceAutomationMode, MaintenancePolicyEvidence,
+    MaintenanceRouteEvidence,
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::RequestIdentity;
@@ -347,21 +347,18 @@ fn automation_failure_key_with_family_decision(
         family_decision.route.target(),
         family_decision.route.missing(),
     );
+    // The canonical Human-board obligation is one per family/scope/reason and
+    // policy episode. Keep volatile trigger/job/route observations in the
+    // record below; including them here would create a new notification for
+    // each poll, replacement trigger, or route observation.
     let identity = (
         family.as_str(),
         decision.scope_ref.as_str(),
         reason.as_str(),
-        outcome.as_str(),
-        decision.trigger_id.as_str(),
         mode.as_str(),
         evidence.policy.revision,
         evidence.policy.digest.as_deref(),
         evidence.policy.override_provenance.as_deref(),
-        requested_route,
-        evidence.route.capability_fingerprint.as_deref(),
-        evidence.route.generation,
-        evidence.route.credential_ref.as_deref(),
-        evidence.route.unattended_suitable,
     );
     let fingerprint = sha256_hex(
         &canonical_json_bytes(&identity)
@@ -374,26 +371,56 @@ fn automation_failure_key_with_family_decision(
         summary: format!(
             "maintenance automation {family} at {} evaluated {outcome} for reason {reason}; \
              Governor admits job: {}; catalog route admits start: {}; trigger identity {}; \
-             policy episode {}; requested route {} (missing {}); actual route {}; \
-             board/job receipt {}",
+             job identity {}; policy episode {}; requested route {} (missing {}); actual route {}; \
+             next allowed action: {}",
             decision.scope_ref,
             decision.admits_job,
             family_decision.admits_start,
             decision.trigger_id,
+            decision
+                .durable_job_ref
+                .as_deref()
+                .unwrap_or("not allocated"),
             policy_episode_summary(&mode, evidence),
             requested_route.0,
             requested_route.1,
             actual_route_summary(evidence),
-            decision.durable_job_ref.as_deref().unwrap_or("unrecorded"),
+            family_decision.recommendation.required_action,
         ),
-        // Preserve the Governor's closed reason above and carry the catalog's
-        // exact one actionable recommendation, including its reason, evidence,
-        // benefit, cost, expiry, and safe deferral consequence.
-        required_action: family_decision.recommendation.text(),
+        // Preserve the exact decision and route evidence in the summary, and
+        // retain the catalog's typed recommendation fields in the action.
+        // Runtime cost and a maintenance expiry are unpublished, so say so
+        // explicitly instead of presenting a budget class as a cost estimate.
+        required_action: render_maintenance_recommendation(
+            &family_decision.recommendation,
+            requested_route,
+        ),
         fingerprint,
         owner: MAINTENANCE_AUTHORITY_OWNER.to_owned(),
         affected_scope: decision.scope_ref.clone(),
     })
+}
+
+fn render_maintenance_recommendation(
+    recommendation: &super::maintenance_family_catalog::MaintenanceRecommendation,
+    requested_route: (&str, &str),
+) -> String {
+    format!(
+        "Next allowed action: {}. Deferred reason: {}. Requested route: {} (missing {}). \
+         Evidence required: {}. Expected benefit hypothesis: {}. Cost: unknown until an \
+         admitted route provides an estimate; budget class: {}. Effect policy: {}. Expiry: {}. \
+         Safe deferral consequence: {}.",
+        recommendation.required_action,
+        recommendation.reason,
+        requested_route.0,
+        requested_route.1,
+        recommendation.evidence.join("+"),
+        recommendation.expected_benefit,
+        recommendation.cost.class_name(),
+        recommendation.effect_policy.effect_description(),
+        recommendation.expiry,
+        recommendation.deferral_consequence,
+    )
 }
 
 /// Renders one closed maintenance discriminator in its own declared wire form.
@@ -529,18 +556,12 @@ pub async fn notification_already_recorded(
 /// decision whose record is already stored is I11.12's repeat rather than a
 /// new occurrence; both return `Ok(None)` without touching the store.
 ///
-/// `Off` withholds proactive recommendations, never the durable record of a
-/// refusal. A `Start` or `Suggest` decision under `Off` returns before any
-/// canonical read/write, so a missing route cannot become a proactive board
-/// recommendation when automation is disabled; the verified mandatory
-/// safety/recovery evidence needed for I14.22's exception is not published to
-/// this path, so it does not bypass that refusal. A `Block` or `Defer`
-/// decision under `Off` is the durable record of the refusal itself rather
-/// than a recommendation to act, so it reaches the store through the existing
-/// owner chain instead of being silently ignored. At most the action the
-/// Governor decision allows is published, and a replayed decision re-derives
-/// the same failure fingerprint, so a repeat coalesces onto the one stored
-/// record instead of notifying again.
+/// `Off` withholds proactive recommendations before route-unavailability
+/// handling. This path has no verified mandatory safety/recovery publisher,
+/// so no decision under `Off` bypasses the mode gate. For an allowed
+/// recommendation, a replay re-derives the same family/scope/reason/policy
+/// episode key and checks the canonical store before writing; an existing
+/// item stays the single canonical record.
 ///
 /// Stated rather than implied: the second guard below,
 /// `decision.admits_job && family_decision.admits_start`, cannot short-circuit
@@ -565,22 +586,15 @@ pub async fn emit_blocked_automation_notification(
     decision: &AutomationTriggerDecision,
     evidence: &MaintenanceNotificationEvidence,
 ) -> Result<Option<NotificationStateEmit>, NotificationEmitError> {
-    let family_entry = super::maintenance_family_catalog::entry_for(decision.family);
     evidence.validate_for(decision)?;
-    // Off must not turn a missing route into a proactive board recommendation:
-    // a Start or Suggest decision stays refused before any canonical
-    // read/write. A Block or Defer decision is the durable record of that
-    // refusal rather than a recommendation, so it reaches the store. The
-    // verified mandatory safety/recovery publisher is not connected here, so
-    // this path has no safety bypass.
-    if evidence.policy.mode == MaintenanceAutomationMode::Off
-        && matches!(
-            decision.decision,
-            AutomationDecision::Start | AutomationDecision::Suggest
-        )
-    {
+    // Off is checked before resolving the family route or deriving a failure
+    // key: route unavailability cannot produce a proactive item while
+    // automation is disabled. Verified mandatory safety/recovery evidence is
+    // not published to this path and therefore cannot bypass this gate.
+    if evidence.policy.mode == MaintenanceAutomationMode::Off {
         return Ok(None);
     }
+    let family_entry = super::maintenance_family_catalog::entry_for(decision.family);
     let family_decision = family_entry.decide(decision);
     if decision.admits_job && family_decision.admits_start {
         return Ok(None);
@@ -680,13 +694,18 @@ fn policy_episode_summary(mode: &str, evidence: &MaintenanceNotificationEvidence
 
 fn actual_route_summary(evidence: &MaintenanceNotificationEvidence) -> String {
     format!(
-        "fingerprint={}, generation={:?}, unattended_suitable={}",
+        "fingerprint={}, generation={:?}, credential_ref={}, unattended_suitable={}",
         evidence
             .route
             .capability_fingerprint
             .as_deref()
             .unwrap_or("unpublished"),
         evidence.route.generation,
+        evidence
+            .route
+            .credential_ref
+            .as_deref()
+            .unwrap_or("unpublished"),
         evidence.route.unattended_suitable,
     )
 }
