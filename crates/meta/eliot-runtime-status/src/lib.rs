@@ -16,7 +16,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eliot_contracts::sha256_hex;
 use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
-use eliot_installation::{CandidateManifest, InstallerServiceRole};
+use eliot_installation::{CandidateManifest, InstallationProfile, InstallerServiceRole};
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_runtime_contracts::{HealthDimension, SupervisionLeaseVerifier};
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,232 @@ pub struct RuntimeStatusReport {
     pub gaps: Vec<String>,
     pub components: ComponentStatuses,
     pub deadline_exceeded: bool,
+    /// Profile and root evidence projected only from the validated active
+    /// manifest and the already retained Host root. Unsupported profile
+    /// guarantees remain explicit rather than being inferred from selection.
+    #[serde(default)]
+    pub installation_profile: InstallationProfileProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Profile-selected supervision model; this does not itself prove adapter support.
+pub enum InstallationSupervisionType {
+    /// Selected profile uses SCM demand-start supervision.
+    ScmDemandStart,
+    /// Selected profile requires current-user launcher and Task Scheduler supervision.
+    CurrentUserLauncherAndTaskScheduler,
+    /// Selected profile uses disposable repository-local supervision.
+    PortableDevRepositoryLocal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Resolved root paths declared by the selected manifest, with no inferred roots.
+pub struct InstallationRootRoles {
+    /// Versioned component binary root, kept immutable by the profile contract.
+    pub immutable_binaries: String,
+    /// Durable installation state root.
+    pub durable_data: String,
+    /// User configuration root.
+    pub user_config: String,
+    /// User cache root, projected separately even when the profile shares it.
+    pub user_cache: String,
+    /// OS-validated or explicitly retained anchor from the active manifest.
+    pub profile_anchor_root: String,
+    /// Installation-specific root from the active manifest.
+    pub installation_root: String,
+    /// Host journal and supervision state root.
+    pub host_state_root: String,
+    /// Kernel operational-record state root.
+    pub kernel_ors_root: String,
+    /// Kernel working directory.
+    pub kernel_work_root: String,
+    /// Canonical Store data root.
+    pub store_data_root: String,
+    /// Canonical Store working directory.
+    pub store_work_root: String,
+    /// Canonical Store temporary-file root.
+    pub store_temp_root: String,
+    /// Watchdog state and bounded spool root.
+    pub watchdog_state_root: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Read-only installation profile evidence for the runtime status report.
+pub struct InstallationProfileProjection {
+    /// Profile selected by the validated active manifest, if one is available.
+    pub selected_profile: Option<InstallationProfile>,
+    /// The supervision model selected by the profile contract. Adapter
+    /// support and live evidence are reported separately below.
+    pub selected_supervision_type: Option<InstallationSupervisionType>,
+    /// Version of the manifest's installation-root binding.
+    pub root_binding_version: Option<u32>,
+    /// Manifest-declared root roles. Only `host_state_root` is retained by
+    /// this status collector; other root object identities are not implied.
+    pub resolved_root_roles: Option<InstallationRootRoles>,
+    /// Guarantees supported by the validated manifest and retained Host root.
+    pub enforced_guarantees: Vec<String>,
+    /// Guarantees not established by the selected profile or available evidence.
+    pub unsupported_guarantees: Vec<String>,
+}
+
+impl Default for InstallationProfileProjection {
+    fn default() -> Self {
+        Self {
+            selected_profile: None,
+            selected_supervision_type: None,
+            root_binding_version: None,
+            resolved_root_roles: None,
+            enforced_guarantees: Vec::new(),
+            unsupported_guarantees: vec![
+                "selected_active_manifest_unavailable; profile selection is unproven".to_owned(),
+            ],
+        }
+    }
+}
+
+fn project_installation_profile(
+    active_manifest: Option<&CandidateManifest>,
+    retained_root: &eliot_platform_windows::ProtectedRootLease,
+    canonical_path: &Path,
+) -> InstallationProfileProjection {
+    let Some(manifest) = active_manifest else {
+        return InstallationProfileProjection::default();
+    };
+
+    let launch = &manifest.runtime_launch;
+    let profile = launch.profile;
+    let supervision_type = match profile {
+        InstallationProfile::SystemService => InstallationSupervisionType::ScmDemandStart,
+        InstallationProfile::UserMode => {
+            InstallationSupervisionType::CurrentUserLauncherAndTaskScheduler
+        }
+        InstallationProfile::PortableDev => InstallationSupervisionType::PortableDevRepositoryLocal,
+    };
+    let mut projection = InstallationProfileProjection {
+        selected_profile: Some(profile),
+        selected_supervision_type: Some(supervision_type),
+        root_binding_version: None,
+        resolved_root_roles: None,
+        enforced_guarantees: Vec::new(),
+        unsupported_guarantees: Vec::new(),
+    };
+
+    match profile {
+        InstallationProfile::SystemService => projection.unsupported_guarantees.extend([
+            "narrow_system_service_scm_dacl_not_independently_observed_by_status".to_owned(),
+            "system_service_recovery_policy_not_independently_observed_by_status".to_owned(),
+        ]),
+        InstallationProfile::UserMode => projection.unsupported_guarantees.extend([
+            "user_mode_current_user_launcher_and_task_scheduler_supervision_not_independently_observed_by_status".to_owned(),
+            "user_mode_restart_guarantee_not_independently_observed_by_status".to_owned(),
+            "user_mode_independent_watchdog_guarantee_not_independently_observed_by_status".to_owned(),
+            "user_mode_os_level_isolation_guarantee_not_independently_observed_by_status".to_owned(),
+            "user_mode_absence_of_scm_admin_and_programdata_dependencies_not_independently_observed_by_status".to_owned(),
+        ]),
+        InstallationProfile::PortableDev => projection.unsupported_guarantees.extend([
+            "portable_dev_supervision_composition_not_independently_observed_by_status".to_owned(),
+            "portable_dev_repository_local_retained_contour_not_verified_by_status".to_owned(),
+        ]),
+    }
+
+    let binding = &launch.profile_governed_roots;
+    projection.root_binding_version = Some(binding.binding_version);
+
+    if binding.validate(profile).is_err()
+        || binding.runtime_state_roots != launch.runtime_state_roots
+        || binding.runtime_state_roots.profile != profile
+    {
+        projection.unsupported_guarantees.extend([
+            "versioned_profile_root_binding_invalid_or_inconsistent_with_active_manifest"
+                .to_owned(),
+            "resolved_immutable_durable_user_config_and_user_cache_roots_unavailable".to_owned(),
+        ]);
+        return projection;
+    }
+
+    projection.resolved_root_roles = Some(InstallationRootRoles {
+        immutable_binaries: binding.immutable_binaries.clone(),
+        durable_data: binding.durable_data.clone(),
+        user_config: binding.user_config.clone(),
+        user_cache: binding.user_cache.clone(),
+        profile_anchor_root: binding
+            .runtime_state_roots
+            .profile_anchor_root
+            .as_str()
+            .to_owned(),
+        installation_root: binding
+            .runtime_state_roots
+            .installation_root
+            .as_str()
+            .to_owned(),
+        host_state_root: binding
+            .runtime_state_roots
+            .host_state_root
+            .as_str()
+            .to_owned(),
+        kernel_ors_root: binding
+            .runtime_state_roots
+            .kernel_ors_root
+            .as_str()
+            .to_owned(),
+        kernel_work_root: binding
+            .runtime_state_roots
+            .kernel_work_root
+            .as_str()
+            .to_owned(),
+        store_data_root: binding
+            .runtime_state_roots
+            .store_data_root
+            .as_str()
+            .to_owned(),
+        store_work_root: binding
+            .runtime_state_roots
+            .store_work_root
+            .as_str()
+            .to_owned(),
+        store_temp_root: binding
+            .runtime_state_roots
+            .store_temp_root
+            .as_str()
+            .to_owned(),
+        watchdog_state_root: binding
+            .runtime_state_roots
+            .watchdog_state_root
+            .as_str()
+            .to_owned(),
+    });
+    projection.enforced_guarantees.extend([
+        "active_manifest_profile_matches_versioned_root_binding".to_owned(),
+        "versioned_root_binding_paths_validate_for_selected_profile".to_owned(),
+    ]);
+    match profile {
+        InstallationProfile::SystemService => projection
+            .enforced_guarantees
+            .push("system_service_user_config_and_cache_share_the_bound_user_root".to_owned()),
+        InstallationProfile::UserMode | InstallationProfile::PortableDev => projection
+            .enforced_guarantees
+            .push("user_config_and_cache_are_separately_bound".to_owned()),
+    }
+
+    if retained_root.verify_stable_identity().is_ok()
+        && eliot_platform_windows::windows_paths_equal(
+            canonical_path,
+            Path::new(binding.runtime_state_roots.host_state_root.as_str()),
+        )
+    {
+        projection
+            .enforced_guarantees
+            .push("manifest_host_state_root_matches_stable_retained_host_root".to_owned());
+    } else {
+        projection
+            .unsupported_guarantees
+            .push("manifest_host_state_root_stable_retained_identity_not_proven".to_owned());
+    }
+    projection
+        .unsupported_guarantees
+        .push("non_host_runtime_root_object_identities_are_not_retained_by_status".to_owned());
+    projection
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1621,6 +1847,8 @@ pub fn collect_status_with_observers(
         effective_watchdog_observer,
         deadline,
     );
+    let installation_profile =
+        project_installation_profile(active_manifest.as_ref(), &retained_root, &canonical_path);
     let gaps = {
         let mut g = Vec::new();
         g.push(host_journal_gap());
@@ -1766,6 +1994,7 @@ pub fn collect_status_with_observers(
         gaps,
         components,
         deadline_exceeded: false,
+        installation_profile,
     })
 }
 
