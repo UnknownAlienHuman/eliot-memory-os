@@ -568,6 +568,37 @@ impl EcxfManifest {
                 reason: "start is greater than end",
             });
         }
+        // Issue #1141, W3: the manifest is what travels, and on import it is
+        // validated on its own before any payload is looked at, when there is
+        // no archive and no delivered blob to check it against. So the two
+        // coherence checks a package must satisfy before a byte of it is read
+        // belong here.
+        //
+        // The fence's blob reachability set is deliberately NOT compared to
+        // `blob_residency` here: `EcxfArchive::build` validates the
+        // caller-assembled manifest before it derives the residency entries, so
+        // at that point the residency set is legitimately still empty. That
+        // comparison belongs where the delivered blobs are known, which is
+        // `check_reachability` and `EcxfArchive::validate`; the importer
+        // repeats it against the members it actually received.
+        let head_span = self.export_fence.revision_heads.iter().fold(
+            None::<(u64, u64)>,
+            |span, head| {
+                Some(match span {
+                    Some((start, end)) => (start.min(head.revision), end.max(head.revision)),
+                    None => (head.revision, head.revision),
+                })
+            },
+        );
+        if head_span != self.revision_start.zip(self.revision_end) {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+        // The manifest and the fence it carries describe one export scope. A
+        // package whose two records disagree is incoherent, not a choice the
+        // importer may resolve by picking one.
+        if self.scope_id != self.export_fence.scope_id {
+            return Err(EcxfError::InconsistentBoundary);
+        }
         for (name, checksum) in &self.checksums {
             text(name, "checksums.name")?;
             digest(checksum, "checksums.value")?;
