@@ -895,8 +895,8 @@ pub fn dev_fast_registry(
     receipts: Vec<crate::registry::SupplyChainReceipt>,
 ) -> Result<InstrumentRegistry, DevFastError> {
     use crate::profile::{
-        builtin_specs, bundle_verification_profile, compiler_profile,
-        package_verification_profile, test_profile,
+        builtin_specs, bundle_verification_profile, compiler_profile, package_verification_profile,
+        test_profile,
     };
     let specs = builtin_specs()?;
     let profiles = vec![
@@ -976,22 +976,53 @@ pub fn dev_fast_caller_plan(
 /// [`build_verification_profile_receipt`](crate::verification_profile::build_verification_profile_receipt)
 /// refuses the run for a missing identity, a missing provenance receipt, a
 /// profile-identity divergence, or an undeclared stage.
+///
+/// The exact resolution request one verification route is admitted under.
+///
+/// Grouped so the route, its layout, scope, environment and the receipts that
+/// must cover them travel together as one closed value: a caller cannot resolve
+/// a route against a different environment than the one the receipt binds.
+pub struct VerificationRouteRequest {
+    /// Executable supply-chain receipts the run must be covered by.
+    pub receipts: Vec<SupplyChainReceipt>,
+    /// Closed route name, never a caller-selected executable or shell string.
+    pub route: String,
+    /// Target layout the route resolves against.
+    pub layout: TargetLayout,
+    /// Work scope the route is bounded to.
+    pub scope: WorkScope,
+    /// Stage environment the run executes under.
+    pub environment: StageEnvironment,
+}
+
+/// Resolves one admitted verification route and receipts the run, failing
+/// closed when the required identity or provenance data is absent.
 pub fn resolve_verification_route(
     generation: u64,
-    receipts: Vec<SupplyChainReceipt>,
-    route: &str,
-    layout: TargetLayout,
-    scope: WorkScope,
-    environment: StageEnvironment,
+    request: VerificationRouteRequest,
     aggregate: &ProfileAggregate,
     classes: &ProfileScopeClasses,
     environment_dependencies: &[DeclaredEnvironmentDependency],
 ) -> Result<VerificationProfileReceipt, DevFastError> {
+    let VerificationRouteRequest {
+        receipts,
+        route,
+        layout,
+        scope,
+        environment,
+    } = request;
     let registry = InstrumentRegistry::with_verification_route_profiles(generation, receipts)
-        .map_err(|error| DevFastError::Admission(format!("verification registry refused: {error}")))?;
+        .map_err(|error| {
+            DevFastError::Admission(format!("verification registry refused: {error}"))
+        })?;
     let compiler = ProfileCompiler::new(&registry);
+    // `resolve_route` takes the environment by value, but the receipt below
+    // still has to bind the exact environment this resolution ran under, so
+    // the owned value is cloned for the move and the original is what the
+    // receipt reads.
+    let environment_identity = environment.clone();
     let resolved = compiler
-        .resolve_route(route, layout, scope, environment)
+        .resolve_route(&route, layout, scope, environment)
         .map_err(|error| DevFastError::Admission(format!("profile route refused: {error}")))?;
     let admitted = compiler
         .compile_exact(&resolved.name, resolved.revision)
@@ -1002,7 +1033,7 @@ pub fn resolve_verification_route(
         &admitted,
         classes,
         aggregate,
-        &environment,
+        &environment_identity,
         environment_dependencies,
     )
     .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))

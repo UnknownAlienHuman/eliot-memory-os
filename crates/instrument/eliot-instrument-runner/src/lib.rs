@@ -49,11 +49,11 @@ pub use dev_fast::{
     DEV_FAST_STAGE_CLIPPY, DEV_FAST_STAGE_LIST, DEV_FAST_STAGE_RUN, DEV_FAST_STAGE_RUSTFMT,
     DevFastBudgets, DevFastCandidate, DevFastDispatch, DevFastError, DevFastFailurePolicy,
     DevFastPreflight, DevFastStageOutcome, DevFastTargetIdentity, DevFastToolRevisions,
-    VERIFICATION_PROFILE_RUN_VERSION, VerificationProfileRun, check_zero_execution,
-    confirm_dev_fast_finish, dev_fast_caller_plan, dev_fast_disposition, dev_fast_execute,
-    dev_fast_registry, dev_fast_replay, dev_fast_stage_dispatch, dev_fast_unresolved_runs,
-    finalize_dev_fast_stage, normalize_dev_fast_stage_bytes, require_dev_fast_parity,
-    resolve_verification_route, run_dev_fast_profile,
+    VERIFICATION_PROFILE_RUN_VERSION, VerificationProfileRun, VerificationRouteRequest,
+    check_zero_execution, confirm_dev_fast_finish, dev_fast_caller_plan, dev_fast_disposition,
+    dev_fast_execute, dev_fast_registry, dev_fast_replay, dev_fast_stage_dispatch,
+    dev_fast_unresolved_runs, finalize_dev_fast_stage, normalize_dev_fast_stage_bytes,
+    require_dev_fast_parity, resolve_verification_route, run_dev_fast_profile,
 };
 pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity, GovernedWorkEnvelope,
