@@ -126,7 +126,7 @@ REASON = re.compile(r"reason\s*=\s*\"([^\"]*)\"")
 INNER_ATTR = re.compile(
     r"^\s*#\!\s*\[\s*(allow|expect)\b(.*?)\]", re.MULTILINE | re.DOTALL)
 BROAD = re.compile(
-    r"#\s*\[\s*(allow|expect)\s*\(\s*(warnings|clippy::(?:all|pedantic|"
+    r"#\s*!?\s*\[\s*(allow|expect)\s*\(\s*(warnings|clippy::(?:all|pedantic|"
     r"restriction|nursery|correctness))\b")
 CANARY = re.compile(
     r"AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY"
@@ -1247,4 +1247,3 @@ class ClippyBaselineAcceptance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
