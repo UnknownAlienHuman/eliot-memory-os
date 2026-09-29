@@ -432,7 +432,10 @@ pub const RULE_TABLE: &[RuleDescriptor] = &[
         class: RuleClass::Bypass,
         subject: "one emission from a generation its owner has already fenced",
         required_observations: "owner-issued fence naming the fenced generation and competent emission coverage",
-        required: &[RequiredObservation::StateFence, RequiredObservation::CompetentCoverage],
+        required: &[
+            RequiredObservation::StateFence,
+            RequiredObservation::CompetentCoverage,
+        ],
         correlation: "the emitting generation is compared against the fencing owner record for the same lineage",
         bound: "one emission identity per evaluation",
         threshold: "the emitting generation is lower than the generation the owner already fenced for that lineage",
@@ -499,10 +502,10 @@ const fn rule_index(rule_id: &str) -> usize {
 const fn rule_table_has_one_identity_per_condition() -> bool {
     let mut index = 0;
     while index < RULE_TABLE.len() {
-        if let Some(merged) = RULE_TABLE[index].merged_detector_rule_id {
-            if !rule_id_is(RULE_TABLE[index].rule_id, merged) {
-                return false;
-            }
+        if let Some(merged) = RULE_TABLE[index].merged_detector_rule_id
+            && !rule_id_is(RULE_TABLE[index].rule_id, merged)
+        {
+            return false;
         }
         let mut other = index + 1;
         while other < RULE_TABLE.len() {
@@ -796,11 +799,9 @@ fn unusable_observation(
         },
         RequiredObservation::CompetentCoverage => match &subject.competent_coverage {
             None => Some(coverage_gap(rule_id, required)),
-            Some(coverage) if coverage.coverage_id.trim().is_empty() => {
-                Some(RuleApplicability::Malformed(
-                    MalformedProjection::BlankObservation(required),
-                ))
-            }
+            Some(coverage) if coverage.coverage_id.trim().is_empty() => Some(
+                RuleApplicability::Malformed(MalformedProjection::BlankObservation(required)),
+            ),
             Some(_) => None,
         },
     }
