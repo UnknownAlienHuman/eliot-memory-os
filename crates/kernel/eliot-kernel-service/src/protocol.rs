@@ -1355,6 +1355,9 @@ impl KernelControlRequest {
         if let KernelControlCommand::ReadRuntimeLeaseCensus(query) = &self.command {
             query.validate()?;
         }
+        if let KernelControlCommand::RevokeRuntimeLease(query) = &self.command {
+            query.validate()?;
+        }
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
         }
@@ -3236,6 +3239,36 @@ impl RuntimeLeaseCensusQuery {
     }
 }
 
+/// Authenticated administrative revocation of one exact-fence `RuntimeLease`.
+///
+/// The fence selects the owner row set and the lease id names the single row
+/// whose revision moves to `REVOKED` through the owner
+/// [`RuntimeLease::transition_to`] legality; terminal rows stay terminal and
+/// an unknown identity fails closed. Revocation is explicit-command only:
+/// drain and stop never revoke, so reconciliation duties cannot be abandoned
+/// implicitly (I1.5, #1751).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseRevokeQuery {
+    /// Complete fence selecting the lease row.
+    pub state_fence: StateFence,
+    /// Stable identity of the single lease to revoke.
+    pub lease_id: String,
+}
+
+impl RuntimeLeaseRevokeQuery {
+    /// Validates the query shape without touching any row.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_revoke.state_fence",
+                reason: "must be valid",
+            })?;
+        validate_text(&self.lease_id, "runtime_lease_revoke.lease_id")
+    }
+}
+
 /// One Kernel-authored census read from the canonical ORS current tables.
 ///
 /// Ported from #1751 donor 552ee79a (M2 integration copy; no authorship
@@ -3354,6 +3387,10 @@ pub enum KernelControlCommand {
     /// Read the exact-fence `RuntimeLease` set and current supervision row
     /// from the canonical ORS owner. This cannot issue or renew authority.
     ReadRuntimeLeaseCensus(RuntimeLeaseCensusQuery),
+    /// Revoke one exact-fence `RuntimeLease` on explicit administrative
+    /// command through the canonical ORS owner. This cannot issue or renew
+    /// authority; drain and stop never revoke.
+    RevokeRuntimeLease(RuntimeLeaseRevokeQuery),
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
     /// Read current capability-introduction rows for exact subjects from
