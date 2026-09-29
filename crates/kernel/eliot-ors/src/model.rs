@@ -5473,10 +5473,7 @@ impl BackupVerificationResultRecord {
             validate_digest(digest, "backup_verification_capture_receipt_digest")?;
         }
         if let Some(digest) = &self.validity_attestation_digest {
-            validate_digest(
-                digest,
-                "backup_verification_validity_attestation_digest",
-            )?;
+            validate_digest(digest, "backup_verification_validity_attestation_digest")?;
         }
         validate_digest(&self.request_digest, "backup_verification_request_digest")?;
         validate_digest(&self.archive_sha256, "backup_verification_archive_sha256")?;
@@ -6329,10 +6326,7 @@ impl BackupVerifyRequestIdentity {
             validate_digest(digest, "backup_verify_identity_capture_receipt_digest")?;
         }
         if let Some(digest) = &self.validity_attestation_digest {
-            validate_digest(
-                digest,
-                "backup_verify_identity_validity_attestation_digest",
-            )?;
+            validate_digest(digest, "backup_verify_identity_validity_attestation_digest")?;
         }
         if self.identity_digest != self.compute_digest()? {
             return Err(OrsError::InvalidField {
