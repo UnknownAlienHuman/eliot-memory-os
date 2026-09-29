@@ -503,17 +503,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// authenticated Governor client. The UI never supplies identity, fence,
     /// schedule authority, provider credentials, or Store receipt fields.
     ///
-    /// A revision is refused HERE, before transmission, whenever the local
-    /// mirror of the owner contract refuses its bytes: a legacy shape-only
-    /// occurrence, an unsupported contract version, a stale pinned normalization
-    /// revision, a duplicate or out-of-order canonical instant, or an edit that
-    /// reuses stale owner evidence. Each refusal is reported with the owner's
-    /// exact sentence and the one action that answers it, never as a generic
-    /// JSON error, and nothing is sent. A revision that passes the local check
-    /// is reported as ADMITTED FOR SUBMISSION, never as normalized. An owner
-    /// transition can echo the caller-supplied revision; normalization requires
-    /// separately bound owner receipt/provenance, which this projection does not
-    /// carry.
+    /// Create/edit revisions are parsed and validated for local inspection, then
+    /// refused at the fresh submission boundary because the owner contract exposes
+    /// no normalization result or migration action bound to the immutable
+    /// revision. The local projection is shown with the refusal and is never
+    /// treated as owner evidence. Read/inspect operations remain usable.
     public async Task RunUserAutomationAsync()
     {
         // A create or edit needs a caller-supplied schedule revision. The
@@ -531,66 +525,42 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
 
         UserAutomationOperation operation;
+        UserAutomationScheduleProjection? scheduleProjection = null;
         try
         {
             operation = BuildUserAutomationOperation();
+            scheduleProjection = operation switch
+            {
+                UserAutomationCreateOperation create => create.Revision.Schedule.ReadLocalProjection(),
+                UserAutomationEditOperation edit => edit.Revision.Schedule.ReadLocalProjection(),
+                _ => null
+            };
+            operation.Validate();
+            if (operation is UserAutomationCreateOperation)
+            {
+                UserAutomationScheduleMirror.RequireOwnerIssuedNormalizationForFreshSubmission("create");
+            }
+            else if (operation is UserAutomationEditOperation)
+            {
+                UserAutomationScheduleMirror.RequireOwnerIssuedNormalizationForFreshSubmission("edit");
+            }
         }
         catch (UserAutomationScheduleContractException refusal)
         {
             var refused = UserAutomationOutcomeClassifier.RefusedBeforeSubmission(refusal);
-            SetBanner(refused.Title, refused.Detail, OperatorBannerSeverity.Warning);
+            SetBanner(
+                refused.Title,
+                AppendLocalProjectionInspection(refused.Detail, scheduleProjection),
+                OperatorBannerSeverity.Warning);
             return;
         }
         catch (Exception error) when (error is InvalidOperationException or JsonException)
         {
-            SetBanner("UserAutomation command not sent", error.Message, OperatorBannerSeverity.Warning);
-            return;
-        }
-
-        // Show the exact caller-supplied schedule projection before transmission.
-        // Parsing establishes the V4 wire shape and the fields the bytes carry;
-        // it does not establish who normalized them. The typed operation key is
-        // derived from the whole canonical request and is the retry-stable
-        // identity journaled and sent below.
-        if (UserAutomationOperation is "create" or "edit"
-            && operation is UserAutomationCreateOperation or UserAutomationEditOperation)
-        {
-            var schedule = operation switch
-            {
-                UserAutomationCreateOperation create => create.Revision.Schedule,
-                UserAutomationEditOperation edit => edit.Revision.Schedule,
-                _ => throw new InvalidOperationException(
-                    "typed UserAutomation create/edit is not a schedule-carrying operation.")
-            };
-            var projection = schedule.NormalizationReceipt();
-            const int maxPreviewOccurrences = 4;
-            var shownOccurrences = Math.Min(maxPreviewOccurrences, projection.Occurrences.Count);
-            var occurrencePreview = string.Join(
-                Environment.NewLine,
-                projection.Occurrences
-                    .Take(shownOccurrences)
-                    .Select((occurrence, index) =>
-                        $"supplied V4 occurrence {index + 1}: {occurrence.Describe()}"));
-            var idempotencyKey = UserAutomationOperatorRequest.DeriveIdempotencyKey(operation);
-            var submissionDescription = UserAutomationOutcomeClassifier.DescribeSubmission(
-                UserAutomationOperation,
-                projection,
-                idempotencyKey)
-                + Environment.NewLine
-                + "No owner-issued normalization receipt is present; occurrence provenance is unverified.";
-            if (occurrencePreview.Length != 0)
-            {
-                submissionDescription += Environment.NewLine + occurrencePreview;
-            }
-            if (projection.Occurrences.Count > shownOccurrences)
-            {
-                submissionDescription += Environment.NewLine
-                    + $"...{projection.Occurrences.Count - shownOccurrences} further V4 occurrence record(s) remain in the submitted revision.";
-            }
             SetBanner(
-                "UserAutomation create/edit ready for owner submission",
-                submissionDescription,
-                OperatorBannerSeverity.Informational);
+                "UserAutomation command not sent",
+                AppendLocalProjectionInspection(error.Message, scheduleProjection),
+                OperatorBannerSeverity.Warning);
+            return;
         }
 
         await SubmitUserAutomationAsync(operation, UserAutomationOperation);
@@ -820,9 +790,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// <remarks>
     /// Create and edit both carry a caller-supplied schedule revision through the
     /// closed profile. An edit carries BOTH the previous and the new revision,
-    /// preserving its supersession lineage. The local mirror checks shape and
-    /// source-digest consistency, but cannot prove fresh owner normalization for
-    /// effect-relevant schedule changes. No revision is rewritten here.
+    /// preserving its supersession lineage. Since this contract has no bound
+    /// owner normalization result or migration route, both create and edit fail
+    /// closed before submission. No revision is rewritten here.
     /// </remarks>
     private UserAutomationOperation BuildUserAutomationOperation() => UserAutomationOperation switch
     {
@@ -844,6 +814,43 @@ public sealed class MainViewModel : INotifyPropertyChanged
         _ => throw new InvalidOperationException("UserAutomation operation is not in the closed operation catalogue.")
     };
 
+    private static string AppendLocalProjectionInspection(
+        string detail,
+        UserAutomationScheduleProjection? projection)
+    {
+        if (projection is null) return detail;
+
+        const int maxPreviewOccurrences = 4;
+        var shownOccurrences = Math.Min(maxPreviewOccurrences, projection.Occurrences.Count);
+        var occurrencePreview = string.Join(
+            Environment.NewLine,
+            projection.Occurrences
+                .Take(shownOccurrences)
+                .Select((occurrence, index) =>
+                    $"supplied V4 occurrence {index + 1}: {occurrence.Describe()}"));
+        var inspection = "Local schedule projection for inspection only; no owner-issued normalization result is bound, so occurrence provenance is unverified."
+            + Environment.NewLine
+            + projection.ContractIdentity();
+        inspection += projection.NormalizationReceipt is { } normalizationReceipt
+            ? Environment.NewLine
+                + "Caller-supplied normalization_receipt (identity and provenance unverified): "
+                + $"receipt_id {normalizationReceipt.ReceiptId}; authority {normalizationReceipt.NormalizerAuthority}; "
+                + $"source_digest {normalizationReceipt.SourceDigest}; "
+                + $"occurrences_digest {normalizationReceipt.OccurrencesDigest}; "
+                + $"zone_database_revision {normalizationReceipt.ZoneDatabaseRevision}."
+            : Environment.NewLine + "No normalization_receipt is available in this projection.";
+        if (occurrencePreview.Length != 0)
+        {
+            inspection += Environment.NewLine + occurrencePreview;
+        }
+        if (projection.Occurrences.Count > shownOccurrences)
+        {
+            inspection += Environment.NewLine
+                + $"...{projection.Occurrences.Count - shownOccurrences} further V4 occurrence record(s) remain in the revision.";
+        }
+        return detail + Environment.NewLine + inspection;
+    }
+
     private string RequiredUserAutomationId()
     {
         UserAutomationContract.RequireText(UserAutomationId, "automation_id");
@@ -858,7 +865,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     /// <summary>
     /// Reads one caller-supplied schedule revision into the closed contract type
-    /// and admits its shape for submission.
+    /// and checks its bounded local shape for inspection.
     /// </summary>
     /// <remarks>
     /// The payload is READ, never repaired. The closed profile refuses an
