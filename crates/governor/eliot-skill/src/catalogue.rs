@@ -1729,6 +1729,17 @@ impl ActivatedSkillDisplay {
                 reason: "only current or provisional Skills display",
             });
         }
+        // Promotion-grade binding (`I7.13`, issue #1882 A4): `Current` is
+        // earned only through the evidence path, so a current-grade display
+        // without the bound promotion record is unvalidated and never
+        // representable as generally delivered. Bounded use stays
+        // `Provisional` with its provisional delivery ceiling.
+        if self.status == SkillStatus::Current && self.promotion_digest.is_none() {
+            return Err(SkillError::InvalidField {
+                field: "activation.promotion_digest",
+                reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
+            });
+        }
         check_digest(
             &self.delivery_receipt_digest,
             "activation.delivery_receipt_digest",
