@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7"
-revision = 7
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
-supersedes_freeze_digest = "sha256:737571ecfba0a1731875a2d66f0dbc863d4a756e983244dacbd266d79738b50c"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r8"
+revision = 8
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7"
+supersedes_freeze_digest = "sha256:cab58a4cd3536ee407b1655c07a3a122fe2ae0f45e3ccabf447eb9a606b675c5"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -15,6 +15,31 @@ integration_owner = "cognitive-wave-integrator"
 [readback]
 rule = "Reproducible digest is sha256 over these exact file bytes. Any byte change creates a new freeze candidate; verdicts bound to the prior digest are invalidated, not edited."
 rejects = ["generic JSON treated as a projection contract", "prose-invented request/contribution types", "MCP surface DTOs treated as owner-neutral contracts"]
+
+# r8 exists for exactly one reason, and it is a reconciliation rather than a
+# new claim. The r7 `ProjectionCoverage` denominator_note stated a LOWER BOUND
+# ("Known{total} must cover projected plus omitted volume") and never mentioned
+# the resume frontier, so on its own it was not proof of completeness: an empty
+# batch declaring Known{total:1} with no omissions, no frontier,
+# truncated=false and revalidation_required=false satisfied it. The Rust owner
+# `MemoryProjectionBatch::validate` in
+# crates/foundation/eliot-memory-projection-contracts/src/contracts/batch.rs was
+# already stricter than the note, because its only producer
+# (`eliot-memory-projection-provider::project_batch`) partitions every observed
+# record into exactly one of records/omissions/frontier and already required
+# `request.denominator_total == observations.len()`. This candidate states the
+# rule the owner code actually enforces, so the contract and the code no longer
+# disagree. No type, field, enum, denominator id, or cell binding is added,
+# removed, or renamed by r8; the only semantic change is the wording of one
+# denominator_note. Every verdict bound to the r7 digest is invalidated by this
+# revision rather than edited, per the [readback] rule above.
+[revision_note]
+revision = 8
+supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7"
+changed = "one denominator_note: eliot-memory-projection-contracts::ProjectionCoverage"
+reason = "r7 stated a lower bound that omitted the resume frontier and was therefore not a completeness proof; the delivered owner code already enforced the exact disjoint three-way accounting this note now states."
+unchanged = "all frozen_type field lists, all enums, all denominator ids, all cell bindings, all [[bound]] rows, proof_ceiling, implementation_support, and evidence_execution_status"
+issue = "#196"
 
 # Historical cell numbers 69, 70, 72, 73, 75 (original #223 record) have no
 # referent in the current topology: cognitive-crate-decisions.toml assigns
@@ -59,7 +84,7 @@ denominator_note = "Every record binding must equal the batch binding; every rec
 crate = "eliot-memory-projection-contracts"
 rust_path = "eliot_memory_projection_contracts::ProjectionCoverage"
 fields = ["denominator", "truncated", "frontier", "omissions", "revalidation_required"]
-denominator_note = "Known{total} must cover projected plus omitted volume; truncation requires a nonempty resume frontier; truncation or omission requires revalidation."
+denominator_note = "Known{total} must equal projected plus omitted plus deferred volume exactly, and the three lists must be pairwise disjoint: every canonical record the read side observed is projected, omitted, or named in the resume frontier, and is exactly one of those three. Truncation requires a nonempty resume frontier and a frontier without truncation is unclaimed volume, so both are refused. A non-truncated batch with a known total that leaves an unexplained positive remainder is refused and is never carried as a Complete state. Truncation or omission requires revalidation. Unknown stays representable but no consumer may read it as completeness."
 
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"
