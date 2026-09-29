@@ -538,7 +538,8 @@ fn refuse_fenced_canary_admission(
     let Some(removal) = transaction_store.load_canary_removal_for_generation(
         &transaction.transaction_id,
         &transaction.candidate_manifest.generation,
-    )? else {
+    )?
+    else {
         return Ok(());
     };
     removal.validate()?;

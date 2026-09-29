@@ -918,8 +918,9 @@ impl CanaryRemovalOperation {
                 // method documentation for why each disposition is accounted
                 // for the way it is.
                 CanaryRemovalEffectState::Resolved {
-                    disposition: CanaryRemovalEffectDisposition::Absent
-                    | CanaryRemovalEffectDisposition::Retained,
+                    disposition:
+                        CanaryRemovalEffectDisposition::Absent
+                        | CanaryRemovalEffectDisposition::Retained,
                 } => {}
                 CanaryRemovalEffectState::Unknown { .. } => {
                     open += 1;
@@ -1424,8 +1425,7 @@ fn require_quiesced_owner_effects(
     // the resolved set is the transaction's own rather than the request's.
     if !install.pending_external_changes.is_empty() {
         return Err(InstallationError::IncompleteObservation(
-            "the installed transaction still carries unacknowledged external changes"
-                .to_owned(),
+            "the installed transaction still carries unacknowledged external changes".to_owned(),
         ));
     }
     if pending_external_change_count(install)? != plan.quiesce.pending_external_changes
@@ -1464,12 +1464,12 @@ fn require_quiesced_owner_effects(
         // The existing owner's own Watchdog admission template, validated by the
         // owner. This is the lease admission template that carries the canary's
         // lease scope, generation and trust anchor.
-        let template = authority
-            .watchdog_admission_template()
-            .map_err(|error| InstallationError::InvalidField {
+        let template = authority.watchdog_admission_template().map_err(|error| {
+            InstallationError::InvalidField {
                 field: "canary_removal.owner_effects.watchdog_admission_template".to_owned(),
                 reason: error.to_string(),
-            })?;
+            }
+        })?;
         template
             .validate()
             .map_err(|error| InstallationError::InvalidField {
@@ -1514,10 +1514,7 @@ fn require_quiesced_owner_effects(
         ),
     ];
     for (category, identity, action) in expected_owners {
-        let mut rows = plan
-            .effects
-            .iter()
-            .filter(|row| row.category == category);
+        let mut rows = plan.effects.iter().filter(|row| row.category == category);
         let Some(row) = rows.next() else {
             return Err(InstallationError::IncompleteObservation(format!(
                 "the frozen plan does not account for the canary's own {:?} owner effect",
@@ -2342,11 +2339,11 @@ where
     // therefore refuses this mutating call instead of being inherited from the
     // entry observation. The refusal writes nothing, so the durable incomplete
     // recovery survives with its blocking effect exactly as observed.
-    let observed_install = store
-        .load(&operation.plan.install_transaction_id)?
-        .ok_or(InstallationError::TransactionNotFound {
+    let observed_install = store.load(&operation.plan.install_transaction_id)?.ok_or(
+        InstallationError::TransactionNotFound {
             transaction_id: operation.plan.install_transaction_id.as_str().to_owned(),
-        })?;
+        },
+    )?;
     observed_install.validate()?;
     if observed_install.transaction_id != install.transaction_id
         || observed_install.installer_plan_digest != operation.plan.install_plan_digest
