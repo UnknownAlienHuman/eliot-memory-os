@@ -82,10 +82,10 @@ pub enum MaintenanceTriggerRedeliveryOutcome {
 pub enum MaintenanceTriggerRecoveryRoute {
     /// No decision is committed: re-present this exact retained record to the
     /// evaluator under the same identity. Never mint a new trigger.
-    ReplayRecord(MaintenanceTriggerRecord),
+    ReplayRecord(Box<MaintenanceTriggerRecord>),
     /// A decision is committed but unacknowledged: acknowledge this exact
     /// receipt without another job, recommendation, or wake.
-    AcknowledgeReceipt(MaintenanceTriggerDecisionReceipt),
+    AcknowledgeReceipt(Box<MaintenanceTriggerDecisionReceipt>),
 }
 
 /// Binds one maintenance-trigger session from live Kernel authority.
@@ -97,9 +97,8 @@ fn bind_session(
     service: &KernelService,
     principal_ref: &str,
 ) -> Result<AuthenticatedMaintenanceTriggerSession, MaintenanceTriggerDeliveryError> {
-    AuthenticatedMaintenanceTriggerSession::bind(service, principal_ref).map_err(
-        MaintenanceTriggerDeliveryError::Service,
-    )
+    AuthenticatedMaintenanceTriggerSession::bind(service, principal_ref)
+        .map_err(MaintenanceTriggerDeliveryError::Service)
 }
 
 /// Issues one finite fenced claim for the calling daemon generation.
@@ -156,7 +155,13 @@ pub fn redeliver_after_timeout(
 ) -> Result<MaintenanceTriggerRedeliveryOutcome, MaintenanceTriggerDeliveryError> {
     let session = bind_session(service, principal_ref)?;
     let trigger_id = request.trigger_id.clone();
-    handle_maintenance_trigger_release_expired(service, &session, ledger, &trigger_id, now_unix_ms)?;
+    handle_maintenance_trigger_release_expired(
+        service,
+        &session,
+        ledger,
+        &trigger_id,
+        now_unix_ms,
+    )?;
     let row = ledger
         .row(&trigger_id)
         .ok_or(MaintenanceTriggerDeliveryError::UnknownTrigger)?;
@@ -170,7 +175,8 @@ pub fn redeliver_after_timeout(
         MaintenanceTriggerDisposition::Pending
         | MaintenanceTriggerDisposition::Reconciling
         | MaintenanceTriggerDisposition::DecisionRecorded => {
-            let receipt = recover_maintenance_trigger_commit(service, &session, ledger, &trigger_id)?;
+            let receipt =
+                recover_maintenance_trigger_commit(service, &session, ledger, &trigger_id)?;
             Ok(MaintenanceTriggerRedeliveryOutcome::ReconcileByReceipt(
                 receipt,
             ))
@@ -178,9 +184,7 @@ pub fn redeliver_after_timeout(
         MaintenanceTriggerDisposition::Claimed
         | MaintenanceTriggerDisposition::Acknowledged
         | MaintenanceTriggerDisposition::Expired
-        | MaintenanceTriggerDisposition::Superseded => {
-            Err(ProtocolError::ReplayConflict.into())
-        }
+        | MaintenanceTriggerDisposition::Superseded => Err(ProtocolError::ReplayConflict.into()),
     }
 }
 
@@ -237,22 +241,24 @@ pub fn recover_trigger_for_replacement(
         | MaintenanceTriggerDisposition::Reconciling
             if row.decision_receipt.is_none() =>
         {
-            let record = replay_maintenance_trigger_after_crash(service, &session, ledger, trigger_id)?;
-            Ok(MaintenanceTriggerRecoveryRoute::ReplayRecord(record))
+            let record =
+                replay_maintenance_trigger_after_crash(service, &session, ledger, trigger_id)?;
+            Ok(MaintenanceTriggerRecoveryRoute::ReplayRecord(Box::new(
+                record,
+            )))
         }
         MaintenanceTriggerDisposition::Pending
         | MaintenanceTriggerDisposition::Claimed
         | MaintenanceTriggerDisposition::Reconciling
         | MaintenanceTriggerDisposition::DecisionRecorded => {
-            let receipt = recover_maintenance_trigger_commit(service, &session, ledger, trigger_id)?;
+            let receipt =
+                recover_maintenance_trigger_commit(service, &session, ledger, trigger_id)?;
             Ok(MaintenanceTriggerRecoveryRoute::AcknowledgeReceipt(
-                receipt,
+                Box::new(receipt),
             ))
         }
         MaintenanceTriggerDisposition::Acknowledged
         | MaintenanceTriggerDisposition::Expired
-        | MaintenanceTriggerDisposition::Superseded => {
-            Err(ProtocolError::ReplayConflict.into())
-        }
+        | MaintenanceTriggerDisposition::Superseded => Err(ProtocolError::ReplayConflict.into()),
     }
 }
