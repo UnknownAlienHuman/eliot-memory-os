@@ -28,9 +28,13 @@
 //! [`MemoryPressureCoordinator::next_deadline_ms`], feed platform
 //! observations through the existing process-gateway ports as
 //! [`MemoryPressureObservation`] values and reconcile owner outcomes via the
-//! `record_*` methods. Thresholds are conservative configured hypotheses
-//! until qualified (`qualified_proof_ref` is `None` while unqualified): they
-//! are not a universal no-OOM promise.
+//! `record_*` methods. The normal admission route calls
+//! [`MemoryPressureCoordinator::evaluate_admission`] with the partition the
+//! real caller belongs to and releases each grant it acts on through
+//! [`MemoryPressureCoordinator::release_admission`]. Thresholds are
+//! conservative configured hypotheses until qualified
+//! (`qualified_proof_ref` is `None` while unqualified): they are not a
+//! universal no-OOM promise.
 
 use std::fmt;
 
@@ -55,6 +59,10 @@ const MAX_REASON_LEN: usize = 512;
 const MAX_EPISODE_ACTIONS: u32 = 64;
 /// Maximum registered cache owners asked for bounded eviction.
 const MAX_REGISTERED_CACHE_OWNERS: usize = 32;
+/// Maximum simultaneously outstanding normal admission reservations. A full
+/// ledger fails the admission closed rather than admitting work whose bytes
+/// are not held against the headroom they consume.
+const MAX_IN_FLIGHT_ADMISSIONS: usize = 256;
 /// Maximum retained quarantine intents. Quarantine is never silently evicted:
 /// a full registry fails closed on new intents.
 const MAX_QUARANTINED_GENERATIONS: usize = 32;
@@ -795,11 +803,16 @@ impl ReserveSnapshot {
 /// simultaneous admissions cannot each consume the same headroom.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionVerdict {
-    /// Admission fits the remaining headroom below admission-stop.
+    /// Admission fits the remaining headroom below admission-stop, and the
+    /// requested bytes are now reserved against it.
     Admit {
-        /// Remaining headroom in bytes after this request.
+        /// Remaining headroom in bytes after this reservation.
         headroom_bytes: u64,
     },
+    /// The request is protected control, cancellation or receipt work. It
+    /// stays acquirable on its own partition while normal selection is
+    /// paused, consumes no normal headroom and holds no normal reservation.
+    AdmitProtected,
     /// Normal selection pauses; protected control is untouched.
     PauseSelection,
     /// The protected guarantee is lost; only the existing
@@ -807,7 +820,37 @@ pub(crate) enum AdmissionVerdict {
     RefuseControlGuaranteeLost,
 }
 
-/// Normal work classes paused under pressure, in contract order.
+/// Partition one admission request targets.
+///
+/// The pressure gate pauses normal selection only. Ordinary work is paused,
+/// never relabelled as protected, and protected control/cancellation/receipt
+/// work is decided on its own partition so a constrained optional worker can
+/// never borrow core control capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionRequest {
+    /// Ordinary work on the normal partition.
+    Normal(NormalWorkClass),
+    /// Protected control, cancellation or receipt work.
+    Protected(ControlOperationClass),
+}
+
+/// One in-flight normal admission reservation held by the coordinator's own
+/// ledger. Reserved bytes are counted from these entries, never from a
+/// caller-supplied total, so two simultaneous admissions cannot each consume
+/// the same headroom.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InFlightAdmission {
+    /// Exact reference the granted caller must present to release it.
+    reservation_ref: String,
+    /// Bytes this admission holds against the normal headroom.
+    bytes: u64,
+}
+
+/// Normal work classes paused by selection under pressure, in contract order.
+///
+/// A class outside this set is still ordinary work on the normal partition;
+/// it is evaluated against the proven headroom rather than paused outright,
+/// and is never relabelled as protected.
 #[must_use]
 pub(crate) const fn paused_normal_classes() -> [NormalWorkClass; 3] {
     [
@@ -818,9 +861,9 @@ pub(crate) const fn paused_normal_classes() -> [NormalWorkClass; 3] {
 }
 
 /// Protected control operations that stay acquirable while normal selection
-/// pauses, per `I14.3`. Ordinary work is paused by selection, never relabeled
-/// as protected: this list is descriptive and the coordinator owns no path
-/// that could move work across partitions.
+/// pauses, per `I14.3`. Only these classes may take the protected bypass: a
+/// request outside the family is ordinary work for admission purposes, so a
+/// constrained optional worker can never borrow core control capacity.
 #[must_use]
 pub(crate) const fn protected_operations_preserved() -> [ControlOperationClass; 9] {
     [
@@ -836,43 +879,24 @@ pub(crate) const fn protected_operations_preserved() -> [ControlOperationClass; 
     ]
 }
 
-/// Evaluates one admission request against level, reserve and reservations.
-///
-/// # Errors
-/// Returns [`PressureError::InvalidField`] for a zero request.
-pub(crate) fn evaluate_admission(
-    profile: &MemoryPressureProfile,
-    level: PressureLevel,
-    reserve: ReserveSnapshot,
-    observed_bytes: Option<u64>,
-    reserved_bytes: u64,
-    requested_bytes: u64,
-) -> Result<AdmissionVerdict, PressureError> {
-    if requested_bytes == 0 {
-        return Err(PressureError::InvalidField {
-            field: "admission.requested_bytes",
-            reason: "must be greater than zero",
-        });
+impl AdmissionRequest {
+    /// Returns whether this request may take the protected bypass.
+    ///
+    /// Membership is decided against the closed preserved family, not by the
+    /// caller's own claim: a protected class outside the family is treated as
+    /// ordinary work and cannot bypass a paused selection.
+    #[must_use]
+    pub(crate) fn is_preserved_control(self) -> bool {
+        matches!(self, Self::Protected(operation)
+            if protected_operations_preserved().contains(&operation))
     }
-    if reserve.control_guarantee_lost() {
-        return Ok(AdmissionVerdict::RefuseControlGuaranteeLost);
+
+    /// Returns whether this request is one of the normal classes paused by
+    /// selection under pressure.
+    #[must_use]
+    pub(crate) fn is_paused_normal(self) -> bool {
+        matches!(self, Self::Normal(class) if paused_normal_classes().contains(&class))
     }
-    if level >= PressureLevel::AdmissionStop {
-        return Ok(AdmissionVerdict::PauseSelection);
-    }
-    let Some(observed) = observed_bytes else {
-        // Unknown, denied, stale or unsupported observation is explicit, not
-        // zero pressure: headroom cannot be proven, so selection pauses.
-        return Ok(AdmissionVerdict::PauseSelection);
-    };
-    let committed = observed.saturating_add(reserved_bytes);
-    let ceiling = profile.admission_stop_bytes();
-    if committed.saturating_add(requested_bytes) > ceiling {
-        return Ok(AdmissionVerdict::PauseSelection);
-    }
-    Ok(AdmissionVerdict::Admit {
-        headroom_bytes: ceiling.saturating_sub(committed),
-    })
 }
 
 /// Kind of one bounded pressure action.
@@ -1819,6 +1843,10 @@ pub(crate) struct MemoryPressureCoordinator {
     below_band_since_ms: Option<u64>,
     /// Cache owners registered for bounded eviction.
     cache_owners: Vec<RegisteredCacheOwner>,
+    /// In-flight normal admission reservations. The coordinator owns this
+    /// ledger, so the reserved total it admits against is the sum of grants
+    /// this coordinator actually issued and has not been released.
+    in_flight: Vec<InFlightAdmission>,
     /// Retained quarantine intents; never auto-cleared by recovery.
     quarantines: Vec<QuarantineIntent>,
     /// Separately observed episode results.
@@ -1834,6 +1862,7 @@ impl MemoryPressureCoordinator {
             episode: None,
             below_band_since_ms: None,
             cache_owners: Vec::new(),
+            in_flight: Vec::new(),
             quarantines: Vec::new(),
             reconciliation: EpisodeReconciliation {
                 checkpoint: None,
@@ -1897,6 +1926,126 @@ impl MemoryPressureCoordinator {
             owner_ref: owner_ref.to_owned(),
         });
         Ok(())
+    }
+
+    /// Returns the bytes currently reserved by this coordinator's own
+    /// outstanding normal admissions.
+    #[must_use]
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self.in_flight
+            .iter()
+            .fold(0_u64, |total, held| total.saturating_add(held.bytes))
+    }
+
+    /// Evaluates one admission request against level, reserve, the observed
+    /// reading and this coordinator's own outstanding reservations.
+    ///
+    /// Normal work outside the paused classes is admitted only while the
+    /// observed reading plus the reserved total plus this request still fits
+    /// below the admission-stop threshold, so two simultaneous admissions
+    /// cannot each consume the same headroom. Paused normal classes stop being
+    /// selected at or above admission-stop. A protected request in the closed
+    /// preserved family takes the protected bypass: it holds no normal
+    /// reservation and stays acquirable while selection is paused, so a
+    /// protected cancellation or receipt remains possible. A request whose
+    /// claim is not in that family is ordinary work for admission purposes and
+    /// cannot borrow core control capacity. Unknown, denied, stale or
+    /// unsupported observation is explicit, not zero pressure: headroom cannot
+    /// be proven, so selection pauses.
+    ///
+    /// # Errors
+    /// Returns [`PressureError::InvalidField`] for a zero request or an
+    /// unbounded admission identity, and [`PressureError::RegistryFull`] when
+    /// the bounded in-flight ledger cannot hold the new reservation, which
+    /// fails the admission closed instead of admitting unreserved work.
+    pub(crate) fn evaluate_admission(
+        &mut self,
+        request: AdmissionRequest,
+        level: PressureLevel,
+        reserve: ReserveSnapshot,
+        observed_bytes: Option<u64>,
+        admission_ref: &str,
+        requested_bytes: u64,
+    ) -> Result<AdmissionVerdict, PressureError> {
+        if requested_bytes == 0 {
+            return Err(PressureError::InvalidField {
+                field: "admission.requested_bytes",
+                reason: "must be greater than zero",
+            });
+        }
+        if !valid_id(admission_ref) {
+            return Err(PressureError::InvalidField {
+                field: "admission.admission_ref",
+                reason: "must be a bounded non-blank reference",
+            });
+        }
+        if reserve.control_guarantee_lost() {
+            return Ok(AdmissionVerdict::RefuseControlGuaranteeLost);
+        }
+        if request.is_preserved_control() {
+            return Ok(AdmissionVerdict::AdmitProtected);
+        }
+        if level >= PressureLevel::AdmissionStop && request.is_paused_normal() {
+            return Ok(AdmissionVerdict::PauseSelection);
+        }
+        let Some(observed) = observed_bytes else {
+            return Ok(AdmissionVerdict::PauseSelection);
+        };
+        let committed = observed.saturating_add(self.reserved_bytes());
+        let ceiling = self.profile.admission_stop_bytes();
+        let headroom_bytes = ceiling.saturating_sub(committed);
+        if requested_bytes > headroom_bytes {
+            return Ok(AdmissionVerdict::PauseSelection);
+        }
+        // Replaying the same admission identity is idempotent: the existing
+        // grant is returned rather than reserved a second time.
+        if self
+            .in_flight
+            .iter()
+            .any(|held| held.reservation_ref == admission_ref)
+        {
+            return Ok(AdmissionVerdict::Admit { headroom_bytes });
+        }
+        if self.in_flight.len() >= MAX_IN_FLIGHT_ADMISSIONS {
+            return Err(PressureError::RegistryFull {
+                registry: "admission_reservation",
+            });
+        }
+        self.in_flight.push(InFlightAdmission {
+            reservation_ref: admission_ref.to_owned(),
+            bytes: requested_bytes,
+        });
+        Ok(AdmissionVerdict::Admit { headroom_bytes })
+    }
+
+    /// Releases one in-flight normal admission reservation.
+    ///
+    /// Reuse is by ownership of the reservation this coordinator issued: the
+    /// ledger entry is matched by its own reservation identity and its bytes
+    /// leave the reserved total only when that exact grant is released. An
+    /// unknown identity releases nothing and fails closed.
+    ///
+    /// # Errors
+    /// Returns [`PressureError::InvalidField`] for an unbounded or unknown
+    /// reservation identity.
+    pub(crate) fn release_admission(&mut self, admission_ref: &str) -> Result<u64, PressureError> {
+        if !valid_id(admission_ref) {
+            return Err(PressureError::InvalidField {
+                field: "admission.admission_ref",
+                reason: "must be a bounded non-blank reference",
+            });
+        }
+        let Some(index) = self
+            .in_flight
+            .iter()
+            .position(|held| held.reservation_ref == admission_ref)
+        else {
+            return Err(PressureError::InvalidField {
+                field: "admission.admission_ref",
+                reason: "holds no in-flight admission reservation",
+            });
+        };
+        Ok(self.in_flight.remove(index).bytes)
     }
 
     /// Observes one tick and returns the bounded decision.
