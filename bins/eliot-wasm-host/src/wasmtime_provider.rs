@@ -318,7 +318,7 @@ impl WasmtimeComponentEngine {
             engine_configuration: crate::pool::pooled_configuration_digest(&pool_config),
         };
         let (epoch_component, fuel_component) = pool
-            .compile(&key, artifact)
+            .compile(&key, artifact, component_configuration)
             .map_err(WasmtimeBuildError::Compile)?;
         let (epoch_engine, fuel_engine) = pool.into_engines();
         Ok(Self {
@@ -699,6 +699,13 @@ fn canonical_configuration_descriptor() -> &'static [u8] {
 }
 
 fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
+    // Exact enforced settings: component model on, epoch interruption on,
+    // and the fixed provider stack ceiling. Fuel accounting is enabled only
+    // on the fuel engine; the epoch-only engine still interrupts infinite
+    // loops via epoch — including component initialization, which executes
+    // under the invoking Store's epoch deadline set before instantiation —
+    // never via fuel. Fuel bounds invocation, never compilation: both
+    // engines compile the same bytes outside any Store.
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.consume_fuel(consume_fuel);
