@@ -24,8 +24,8 @@ use eliot_contracts::{
     ContractVersion, OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_runtime_contracts::{
-    RestartDependencyKind, RestartGroupStrategy, RestartInvalidationTrigger, RestartPolicyDisposition,
-    RestartPolicyV1, dispose_restart_policy,
+    RestartDependencyKind, RestartGroupStrategy, RestartInvalidationTrigger,
+    RestartPolicyDisposition, RestartPolicyV1, dispose_restart_policy,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -824,10 +824,7 @@ impl PreparedCatalogTransition {
     /// so a selection that quietly dropped a declared dependent, or swept in an
     /// undeclared one, is caught. An absent trigger means nothing was selected
     /// and the set must be empty.
-    pub fn verify_invalidation_dependents(
-        &self,
-        expected: &[ModuleId],
-    ) -> Result<(), ModuleError> {
+    pub fn verify_invalidation_dependents(&self, expected: &[ModuleId]) -> Result<(), ModuleError> {
         if self.invalidation_trigger.is_none() {
             return if self.invalidated_dependents.is_empty() {
                 Ok(())
@@ -933,6 +930,31 @@ pub struct ModuleCatalog {
     entries: BTreeMap<ModuleId, ModuleCatalogEntry>,
 }
 
+/// The entry one applied mutation produced, with the invalidation it recorded.
+///
+/// The trigger and the selection are carried as one value, not as two
+/// separately derived facts: an entry arrives here either with both set, which
+/// only a generation acceptance can do, or with neither. A mutation that only
+/// changes desired state therefore cannot record a trigger, and a trigger
+/// cannot be recorded without the set the same arm derived.
+struct AppliedCatalogMutation {
+    entry: ModuleCatalogEntry,
+    invalidated_dependents: Vec<ModuleId>,
+    invalidation_trigger: Option<RestartInvalidationTrigger>,
+}
+
+impl AppliedCatalogMutation {
+    /// A mutation that invalidates nothing: no trigger, and the empty selection
+    /// that an absent trigger is verified against.
+    fn without_invalidation(entry: ModuleCatalogEntry) -> Self {
+        Self {
+            entry,
+            invalidated_dependents: Vec::new(),
+            invalidation_trigger: None,
+        }
+    }
+}
+
 impl ModuleCatalog {
     pub fn new(state_fence: StateFence) -> Result<Self, ModuleError> {
         state_fence
@@ -1001,111 +1023,10 @@ impl ModuleCatalog {
             return Err(ModuleError::RevisionConflict);
         }
         let before = self.snapshot()?;
-        let mut entry = self.entries.get(&request.module_id).cloned();
-        // Only a generation acceptance replaces a running module, so only it
-        // selects affected dependents. `Upsert` and `SetState` change desired
-        // state and invalidate nothing that is already running.
-        let mut invalidated_dependents = Vec::new();
-        let mut invalidation_trigger = None;
-        // The expected set is re-derived from the graph after the transition is
-        // applied, independently of the selection recorded above. The two must
-        // agree, so the check compares two derivations of the declared edges
-        // rather than comparing the selection with itself.
-        let mut expected_dependents: Option<Vec<ModuleId>> = None;
-        match &request.mutation {
-            CatalogMutation::Upsert {
-                manifest,
-                desired_state,
-            } => {
-                if manifest
-                    .dependencies
-                    .iter()
-                    .any(|dependency| dependency.module_id == request.module_id)
-                {
-                    return Err(ModuleError::InvalidField {
-                        field: "dependencies",
-                        reason: "a module cannot depend on itself",
-                    });
-                }
-                let next = ModuleCatalogEntry {
-                    module_id: request.module_id.clone(),
-                    desired_state: *desired_state,
-                    manifest: manifest.clone(),
-                    restart_policy_disposition: dispose_restart_policy(
-                        manifest.restart_policy.as_ref(),
-                    )
-                    .map_err(|error| ModuleError::Contract(error.to_string()))?,
-                    catalog_revision: self.revision + 1,
-                    state_fence: self.state_fence.clone(),
-                    accepted_generation: entry
-                        .as_ref()
-                        .and_then(|existing| existing.accepted_generation.clone()),
-                    removal_reason: None,
-                };
-                next.validate()?;
-                entry = Some(next);
-            }
-            CatalogMutation::SetState {
-                desired_state,
-                removal_reason,
-            } => {
-                let mut current = entry.ok_or(ModuleError::NotFound)?;
-                current.desired_state = *desired_state;
-                current.removal_reason.clone_from(removal_reason);
-                current.catalog_revision = self.revision + 1;
-                current.state_fence = self.state_fence.clone();
-                current.validate()?;
-                entry = Some(current);
-            }
-            CatalogMutation::AcceptGeneration { admission } => {
-                let mut current = entry.ok_or(ModuleError::NotFound)?;
-                // The accepted generation is bound to the admitted policy
-                // digest. A withheld disposition permits no automatic restart
-                // and names no policy at all, so no generation is admitted
-                // under it: accepting one would put a running child under an
-                // unadmitted restart policy, which is precisely the wider
-                // authority the disposition refuses.
-                let expected_policy_digest = admitted_policy_digest(&current)?;
-                if admission.candidate.module_id != request.module_id
-                    || admission.state_fence != self.state_fence
-                    || admission.catalog_revision != self.revision
-                    || admission.candidate.artifact_digest != current.manifest.artifact_digest
-                    || admission.candidate.config_digest != current.manifest.config_digest
-                    || admission.candidate.protocol_digest != current.manifest.protocol_digest
-                    || admission.execution.artifact_digest != current.manifest.artifact_digest
-                    || admission.execution.config_digest != current.manifest.config_digest
-                    || admission.execution.protocol_digest != current.manifest.protocol_digest
-                    || admission.execution.command_ref != current.manifest.command_ref
-                    || admission.execution.health_contract_ref
-                        != current.manifest.health_contract_ref
-                    || admission.execution.effect_ceiling != current.manifest.effect_ceiling
-                    || admission.execution.restart_authorization
-                        != current.manifest.restart_authorization
-                    || admission.execution.restart_policy_digest != expected_policy_digest
-                {
-                    return Err(ModuleError::IdentityConflict);
-                }
-                current.accepted_generation = Some(admission.clone());
-                current.catalog_revision = self.revision + 1;
-                current.state_fence = self.state_fence.clone();
-                current.validate()?;
-                // A new generation is a new protocol identity for this module,
-                // so every dependent that declared `RequiredProtocolDigestMismatch`
-                // on it is genuinely invalidated and must be recovered with it.
-                // The set is derived from the declared edges here; no caller
-                // supplies it, so it cannot be a copy of the caller's intent.
-                invalidated_dependents = self.select_invalidation_dependents(
-                    &request.module_id,
-                    RestartInvalidationTrigger::RequiredProtocolDigestMismatch,
-                )?;
-                invalidation_trigger =
-                    Some(RestartInvalidationTrigger::RequiredProtocolDigestMismatch);
-                entry = Some(current);
-            }
-        }
-        let next_entry = entry.ok_or(ModuleError::NotFound)?;
+        let previous = self.entries.get(&request.module_id).cloned();
+        let applied = self.apply_mutation(&request.module_id, previous, &request.mutation)?;
         self.revision += 1;
-        self.entries.insert(request.module_id.clone(), next_entry);
+        self.entries.insert(request.module_id.clone(), applied.entry);
         let after = self.snapshot()?;
         let prepared = PreparedCatalogTransition {
             operation_id: request.operation_id.clone(),
@@ -1118,8 +1039,8 @@ impl ModuleCatalog {
             canonical_request_digest: request.canonical_request_digest()?,
             state_fence: self.state_fence.clone(),
             admission_contract_digest: digest_value(&request.mutation)?,
-            invalidated_dependents,
-            invalidation_trigger,
+            invalidated_dependents: applied.invalidated_dependents,
+            invalidation_trigger: applied.invalidation_trigger,
             approval_refs: request.approval_refs.clone(),
         };
         prepared.validate()?;
@@ -1129,14 +1050,14 @@ impl ModuleCatalog {
         // dependent or swept in an undeclared one is refused before the
         // transition is returned to its owner. The check cannot pass by
         // comparing nothing: an empty selection is verified against an
-        // independently derived empty set, not skipped.
+        // independently derived empty set, not skipped. The set below is
+        // derived, never read back off the transition, so the comparison is
+        // between two derivations and not the selection with itself.
+        let mut expected_dependents = Vec::new();
         if let Some(trigger) = prepared.invalidation_trigger {
-            expected_dependents =
-                Some(self.select_invalidation_dependents(&request.module_id, trigger)?);
+            expected_dependents = self.select_invalidation_dependents(&request.module_id, trigger)?;
         }
-        prepared.verify_invalidation_dependents(
-            expected_dependents.as_deref().unwrap_or_default(),
-        )?;
+        prepared.verify_invalidation_dependents(&expected_dependents)?;
         Ok(prepared)
     }
 
@@ -1171,10 +1092,10 @@ impl ModuleCatalog {
         // claims a different subject would supply another module's restart
         // strategy to this module's recovery, so the join is proved rather
         // than assumed.
-        if let Some(policy) = root.manifest.restart_policy.as_ref() {
-            if policy.subject_id != subject.as_str() {
-                return Err(ModuleError::IdentityConflict);
-            }
+        if let Some(policy) = root.manifest.restart_policy.as_ref()
+            && policy.subject_id != subject.as_str()
+        {
+            return Err(ModuleError::IdentityConflict);
         }
         let strategy = root
             .manifest
@@ -1231,6 +1152,108 @@ impl ModuleCatalog {
         }
         Ok(selected.into_iter().collect())
     }
+
+    /// Applies one catalog mutation to the entry it replaces, under the
+    /// catalog's current revision and state fence.
+    ///
+    /// The order inside an arm is the order of the checks the catalog relies
+    /// on, and each arm is refused before it replaces anything: the entry must
+    /// exist, the admitted policy must exist, the candidate must match the
+    /// manifest on every bound field, and only then is the new entry validated
+    /// and returned. Only a generation acceptance replaces a running module,
+    /// so only that arm selects affected dependents, and it records the
+    /// trigger and the selection together; `Upsert` and `SetState` change
+    /// desired state and invalidate nothing that is already running.
+    fn apply_mutation(
+        &self,
+        module_id: &ModuleId,
+        entry: Option<ModuleCatalogEntry>,
+        mutation: &CatalogMutation,
+    ) -> Result<AppliedCatalogMutation, ModuleError> {
+        match mutation {
+            CatalogMutation::Upsert {
+                manifest,
+                desired_state,
+            } => {
+                reject_self_dependency(manifest, module_id)?;
+                let next = ModuleCatalogEntry {
+                    module_id: module_id.clone(),
+                    desired_state: *desired_state,
+                    manifest: manifest.clone(),
+                    restart_policy_disposition: dispose_restart_policy(
+                        manifest.restart_policy.as_ref(),
+                    )
+                    .map_err(|error| ModuleError::Contract(error.to_string()))?,
+                    catalog_revision: self.revision + 1,
+                    state_fence: self.state_fence.clone(),
+                    accepted_generation: entry
+                        .as_ref()
+                        .and_then(|existing| existing.accepted_generation.clone()),
+                    removal_reason: None,
+                };
+                next.validate()?;
+                Ok(AppliedCatalogMutation::without_invalidation(next))
+            }
+            CatalogMutation::SetState {
+                desired_state,
+                removal_reason,
+            } => {
+                let mut current = entry.ok_or(ModuleError::NotFound)?;
+                current.desired_state = *desired_state;
+                current.removal_reason.clone_from(removal_reason);
+                current.catalog_revision = self.revision + 1;
+                current.state_fence = self.state_fence.clone();
+                current.validate()?;
+                Ok(AppliedCatalogMutation::without_invalidation(current))
+            }
+            CatalogMutation::AcceptGeneration { admission } => {
+                let mut current = entry.ok_or(ModuleError::NotFound)?;
+                // The accepted generation is bound to the admitted policy
+                // digest. A withheld disposition permits no automatic restart
+                // and names no policy at all, so no generation is admitted
+                // under it: accepting one would put a running child under an
+                // unadmitted restart policy, which is precisely the wider
+                // authority the disposition refuses.
+                let expected_policy_digest = admitted_policy_digest(&current)?;
+                if admission.candidate.module_id != *module_id
+                    || admission.state_fence != self.state_fence
+                    || admission.catalog_revision != self.revision
+                    || admission.candidate.artifact_digest != current.manifest.artifact_digest
+                    || admission.candidate.config_digest != current.manifest.config_digest
+                    || admission.candidate.protocol_digest != current.manifest.protocol_digest
+                    || admission.execution.artifact_digest != current.manifest.artifact_digest
+                    || admission.execution.config_digest != current.manifest.config_digest
+                    || admission.execution.protocol_digest != current.manifest.protocol_digest
+                    || admission.execution.command_ref != current.manifest.command_ref
+                    || admission.execution.health_contract_ref
+                        != current.manifest.health_contract_ref
+                    || admission.execution.effect_ceiling != current.manifest.effect_ceiling
+                    || admission.execution.restart_authorization
+                        != current.manifest.restart_authorization
+                    || admission.execution.restart_policy_digest != expected_policy_digest
+                {
+                    return Err(ModuleError::IdentityConflict);
+                }
+                current.accepted_generation = Some(admission.clone());
+                current.catalog_revision = self.revision + 1;
+                current.state_fence = self.state_fence.clone();
+                current.validate()?;
+                // A new generation is a new protocol identity for this module,
+                // so every dependent that declared `RequiredProtocolDigestMismatch`
+                // on it is genuinely invalidated and must be recovered with it.
+                // The set is derived from the declared edges here; no caller
+                // supplies it, so it cannot be a copy of the caller's intent.
+                let trigger = RestartInvalidationTrigger::RequiredProtocolDigestMismatch;
+                let invalidated_dependents =
+                    self.select_invalidation_dependents(module_id, trigger)?;
+                Ok(AppliedCatalogMutation {
+                    entry: current,
+                    invalidated_dependents,
+                    invalidation_trigger: Some(trigger),
+                })
+            }
+        }
+    }
 }
 
 /// The policy digest an entry's accepted generation must be bound to.
@@ -1249,6 +1272,26 @@ fn admitted_policy_digest(entry: &ModuleCatalogEntry) -> Result<String, ModuleEr
         .policy_digest()
         .map(str::to_owned)
         .ok_or(ModuleError::IdentityConflict)
+}
+
+/// A manifest that declares itself as its own dependency is refused, because
+/// an invalidation edge from a module to itself would make every pull select
+/// the subject as one of its own dependents.
+fn reject_self_dependency(
+    manifest: &ModuleManifest,
+    subject: &ModuleId,
+) -> Result<(), ModuleError> {
+    if manifest
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.module_id == *subject)
+    {
+        return Err(ModuleError::InvalidField {
+            field: "dependencies",
+            reason: "a module cannot depend on itself",
+        });
+    }
+    Ok(())
 }
 
 #[allow(async_fn_in_trait)]
