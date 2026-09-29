@@ -98,7 +98,7 @@
 //!   provenance or task-selection standing, and no owner maps a transition
 //!   effect ceiling onto [`RequestedEffect`]; evaluation there would be
 //!   `INCOMPLETE` for every real request. For `fetch_committed_candidate` the
-//!   closed `eliot_store_api::NamedReadOperation` catalogue (23 rows, verified
+//!   closed `eliot_store_api::NamedReadOperation` catalogue (27 rows, verified
 //!   at `main@941bc3fc`) exposes no projection-publication read and no
 //!   candidate-by-handle read, and the one production
 //!   `eliot_store_api::CanonicalReadClient` in `eliotd`
