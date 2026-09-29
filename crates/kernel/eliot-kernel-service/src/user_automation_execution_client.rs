@@ -541,7 +541,7 @@ pub enum UserAutomationHostExecutionOperation {
         /// Original same-fence cancellation request and complete target set.
         request: Box<UserAutomationWakeCancellation>,
     },
-    /// Publish one bounded recurring horizon to the existing WakeIntent owner.
+    /// Publish one bounded recurring horizon to the existing `WakeIntent` owner.
     PublishWakeHorizon {
         /// Immutable revision, bounded slice, publication identity, and fence.
         request: Box<UserAutomationWakeHorizonPublication>,
