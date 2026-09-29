@@ -193,7 +193,12 @@ pub fn profile_selection_receipts_match_retained_roots(
     Ok(true)
 }
 
-fn validate_profile_selection_receipt_shape(
+/// Validates the persisted shape and complete four-root/nine-runtime-root
+/// observation set without comparing it to a newly opened selection.
+///
+/// Callers that use the receipt as authority must also compare it to the
+/// descriptor and live leases through the profile-specific binding helpers.
+pub(crate) fn validate_profile_selection_receipt_shape(
     receipt: &ProfileSelectionReceipt,
     label: &str,
 ) -> Result<(), InstallationError> {
