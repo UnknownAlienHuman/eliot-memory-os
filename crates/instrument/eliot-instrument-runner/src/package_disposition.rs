@@ -237,11 +237,9 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         capability_owner: "eliot-instrument-runner::cache_lane",
         state_owner: "eliot-build-test-graph::DerivedCacheStore",
         contract: "eliot.instrument.build-test-graph",
-        proof_entrypoint:
-            "crates/eliot-engine/src/cached_derivation.rs::CachedDerivationService::derive_governed",
+        proof_entrypoint: "crates/eliot-engine/src/cached_derivation.rs::CachedDerivationService::derive_governed",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after every recorded consumer migrates and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after every recorded consumer migrates and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -255,8 +253,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         contract: "eliot.instrument.diagnostic",
         proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::diagnostic_id",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after every recorded consumer migrates and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after every recorded consumer migrates and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -268,11 +265,9 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
         contract: "eliot.instrument.cargo",
-        proof_entrypoint:
-            "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
+        proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after the governed build lane migrates off the cargo port and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after the governed build lane migrates off the cargo port and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -284,11 +279,9 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
         contract: "eliot.instrument.dotnet.msbuild",
-        proof_entrypoint:
-            "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
+        proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after the .NET denominator entry is withdrawn from ProviderRegistry::ready and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after the .NET denominator entry is withdrawn from ProviderRegistry::ready and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -300,11 +293,9 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
         contract: "eliot.instrument.nextest",
-        proof_entrypoint:
-            "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
+        proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after the current verification lane migrates and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after the current verification lane migrates and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -316,11 +307,9 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
         contract: "eliot.instrument.rustc",
-        proof_entrypoint:
-            "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
+        proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after the governed build lane migrates off the rustc adapter and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after the governed build lane migrates off the rustc adapter and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -332,11 +321,9 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
         contract: "eliot.instrument.rustfmt",
-        proof_entrypoint:
-            "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
+        proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after the format lane migrates off the rustfmt adapter and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after the format lane migrates off the rustfmt adapter and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -348,11 +335,9 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         capability_owner: "eliot-instrument-runner::registry",
         state_owner: "stateless",
         contract: "eliot.instrument.scip",
-        proof_entrypoint:
-            "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
+        proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after the code-intelligence adapter migrates off the decoder and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after the code-intelligence adapter migrates off the decoder and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -366,8 +351,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         contract: "eliot.instrument.observability",
         proof_entrypoint: "crates/eliot-engine/src/cached_derivation.rs::CachedDerivationService::publish_governed",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after every recorded consumer migrates and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after every recorded consumer migrates and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -381,8 +365,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         contract: "eliot.instrument.product-evaluation",
         proof_entrypoint: "bins/eliotd/src/campaign_evaluation_owner.rs::build_product_evaluation_publications",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after the campaign evaluation owner migrates and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after the campaign evaluation owner migrates and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -396,8 +379,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         contract: "eliot.instrument.test-selection",
         proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/dev_fast.rs::dev_fast_disposition",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after frozen-selection admission migrates and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after frozen-selection admission migrates and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -411,8 +393,7 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         contract: "eliot.instrument.verifier",
         proof_entrypoint: "crates/eliot-engine/src/verification/current.rs::run_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
-        removal_boundary:
-            "delete only after evaluation migrates to another admitted verifier and no Cargo, feature, route, documentation or test reference remains",
+        removal_boundary: "delete only after evaluation migrates to another admitted verifier and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
@@ -520,7 +501,9 @@ pub enum DispositionError {
         field: DispositionField,
     },
     /// A field names a value outside its declared closed universe.
-    #[error("instrument package '{package}' records {field} '{value}', which is outside the closed universe")]
+    #[error(
+        "instrument package '{package}' records {field} '{value}', which is outside the closed universe"
+    )]
     FieldOutsideUniverse {
         /// Recorded package name.
         package: &'static str,
@@ -530,7 +513,9 @@ pub enum DispositionError {
         value: &'static str,
     },
     /// A live Testd profile is claimed by no registry entry.
-    #[error("instrument package '{package}' is a live testd profile but no registry entry claims '{profile}'")]
+    #[error(
+        "instrument package '{package}' is a live testd profile but no registry entry claims '{profile}'"
+    )]
     UnregisteredLiveProfile {
         /// Recorded package name.
         package: &'static str,
@@ -538,7 +523,9 @@ pub enum DispositionError {
         profile: &'static str,
     },
     /// A library surface is claimed by a registry executable entry.
-    #[error("instrument package '{package}' is a library surface but registry entry '{profile}' claims it as an executable profile")]
+    #[error(
+        "instrument package '{package}' is a library surface but registry entry '{profile}' claims it as an executable profile"
+    )]
     RegisteredLibrarySurface {
         /// Recorded package name.
         package: &'static str,
@@ -546,7 +533,9 @@ pub enum DispositionError {
         profile: &'static str,
     },
     /// The recorded contour disagrees with the registry entry it binds.
-    #[error("instrument package '{package}' records a contour that contradicts registry entry '{profile}'")]
+    #[error(
+        "instrument package '{package}' records a contour that contradicts registry entry '{profile}'"
+    )]
     ContourMismatch {
         /// Recorded package name.
         package: &'static str,
@@ -576,7 +565,9 @@ pub enum DispositionError {
         reviewed_on: &'static str,
     },
     /// A non-dispatchable package names a Testd profile.
-    #[error("instrument package '{package}' is not dispatchable but names testd profile '{profile}'")]
+    #[error(
+        "instrument package '{package}' is not dispatchable but names testd profile '{profile}'"
+    )]
     NonDispatchableProfile {
         /// Recorded package name.
         package: &'static str,
@@ -584,7 +575,9 @@ pub enum DispositionError {
         profile: &'static str,
     },
     /// A bounded fixture or deleted package names a live consumer.
-    #[error("instrument package '{package}' is not dispatchable but names live consumer '{consumer}'")]
+    #[error(
+        "instrument package '{package}' is not dispatchable but names live consumer '{consumer}'"
+    )]
     UnexpectedLiveConsumer {
         /// Recorded package name.
         package: &'static str,
@@ -795,9 +788,9 @@ fn verify_contour(record: PackageDispositionRecord) -> Result<(), DispositionErr
             record.execution_contour,
             ExecutionContour::GovernedProcessExecutor | ExecutionContour::DecoderOnly
         ),
-        PackageRoute::LiveLibrarySurface
-        | PackageRoute::BoundedFixture
-        | PackageRoute::Deleted => record.execution_contour == ExecutionContour::NoExecution,
+        PackageRoute::LiveLibrarySurface | PackageRoute::BoundedFixture | PackageRoute::Deleted => {
+            record.execution_contour == ExecutionContour::NoExecution
+        }
     };
     if permitted {
         return Ok(());
