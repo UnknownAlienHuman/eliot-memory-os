@@ -1852,6 +1852,46 @@ pub struct KernelOwnerLease {
     authority: Arc<KernelOwnerAuthority>,
 }
 
+// SAFETY: `HANDLE` is `*mut c_void`, which is `!Send` only because the compiler
+// cannot see that a kernel handle is a process-wide reference, not a
+// thread-bound one. This lease is `Send` for four reasons that together cover
+// every field:
+//
+// 1. A Windows kernel handle is process-global. `CreateMutexW`,
+//    `ReleaseMutex` and `CloseHandle` are all callable from any thread of the
+//    owning process; nothing in the object is per-thread state. The kernel
+//    object itself outlives and is independent of the creating thread.
+// 2. The handle is uniquely owned. It is stored in exactly one
+//    `KernelOwnerLease`, is never cloned or handed out (the only accessor that
+//    exposes it is `release(&mut self)`), and is nulled by `release` and by
+//    `Drop` before the value can be moved again. `owns` is therefore a
+//    monotonic one-way latch, not shared mutable state.
+// 3. The in-process gate is already the concurrency control. Every mutation
+//    path - `release` and `Drop` - takes `authority.gate` before touching the
+//    handle and sets `revoked` under that same gate, and
+//    `KernelOwnerCapability::live_guard` holds the identical gate for the whole
+//    proof. Moving the lease to another thread cannot create a second
+//    concurrent accessor, because `release` needs `&mut self` and no other
+//    method reads the handle at all.
+// 4. The remaining fields are unconditionally `Send`: `bool`, `String`, and
+//    `Arc<KernelOwnerAuthority>`, whose contents are a `Mutex<()>`,
+//    an `AtomicBool` and two `Option<PlatformHandle>`.
+//
+// One Win32 detail is deliberately not claimed away: `CreateMutexW(.., TRUE,
+// ..)` makes the *calling thread* the mutex owner, and `ReleaseMutex` must be
+// called by that same thread. A lease released on a different thread therefore
+// returns [`KernelOwnerLeaseReleaseError::ReleaseMutex`] rather than silently
+// succeeding. That is a typed, caller-visible failure and not undefined
+// behaviour, and it cannot strand the object: `Drop` ignores the `ReleaseMutex`
+// result and still closes the handle, which is what actually destroys the named
+// object. `Send` here is a claim about memory safety and exclusive access, not
+// a promise that thread-affine Win32 calls succeed from any thread.
+//
+// This is the same claim the crate already makes, for the same reason, at
+// `unsafe impl Send for OwnedKernelHandle`.
+#[cfg(windows)]
+unsafe impl Send for KernelOwnerLease {}
+
 /// Compile-time proof that this process created and still owns one exact
 /// activation's Kernel owner object.
 ///
