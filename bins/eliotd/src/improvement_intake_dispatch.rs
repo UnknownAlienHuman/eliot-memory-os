@@ -25,8 +25,8 @@
 //! mislabelled the recorded lineage: a conformance-audit family and a
 //! security/dependency-scan family both recorded themselves as Watchdog
 //! signals, so a later reader could not tell what kind of occurrence the
-//! evidence was. The derivation and its residual are documented on that
-//! function.
+//! evidence was. The derivation — and why no `Watchdog` label survives it —
+//! are documented on that function.
 //!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
@@ -172,8 +172,8 @@ use eliot_improvement::candidate_bounds::{
 use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
     ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
-    SafeBoundary, SourcedEvidence, brief_at_safe_boundary, candidate_from_evidence, check_class_gate,
-    classify, is_prohibited_tuning_surface, sourced_evidence,
+    SafeBoundary, SourcedEvidence, brief_at_safe_boundary, candidate_from_evidence,
+    check_class_gate, classify, is_prohibited_tuning_surface, sourced_evidence,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
@@ -573,30 +573,67 @@ fn enforce_advisory_class_gate(
 /// The I12.24 evidence source this daemon's own maintenance decision belongs
 /// to (issue #1867 W2).
 ///
-/// The previous code asserted [`EvidenceSource::Watchdog`] unconditionally for
-/// every decision, which mislabelled the evidence lineage: a family this
-/// daemon is not even watching, and a policy-driven occurrence rather than a
-/// Watchdog problem, both claimed to be Watchdog signals. The label is now
 /// DERIVED from the closed fields the Governor's own decision carries, so the
-/// recorded source is a fact about the observation rather than an assumption:
+/// recorded source is a fact about the observation rather than an assumption.
+/// Every observation this function labels is the same KIND of occurrence: the
+/// maintenance owner's evaluation of one real maintenance trigger — an attempt
+/// at admitting that maintenance job together with the outcome it produced.
+/// I12.24:43 names that trigger "repeated failure/repair or no-progress loop",
+/// the closed I12.24 set spells it [`EvidenceSource::Attempt`], and this
+/// issue's own source list names "actual attempts/evaluators" among the sources
+/// this path must connect. So the two families whose occurrence is something
+/// else carry their own label, and everything else is an attempt:
 ///
-/// - [`MaintenanceFamily::SecurityDependencyScan`] is the daemon's
-///   security/dependency incident family, which I12.24:40-55 lists as
-///   `SecurityIncident`.
-/// - [`MaintenanceFamily::DonorConformance`] is the conformance-audit family,
-///   which the same list names as `ConformanceDiagnosis`.
-/// - a decision the evaluator REFUSED to run (`Block`, `Escalate`) with a
-///   non-eligibility [`DecisionReason`] is a repeated refusal rather than a
-///   Watchdog problem, and I12.24:40-55 names that trigger `Attempt` — an
-///   attempt/outcome signal the daemon itself produced.
-/// - everything else keeps `Watchdog`, which is the honest residual: the
-///   daemon is the problem-recipe producer adjacent to supervision, and
-///   `MaintenanceTriggerOrigin::AdmittedObservation` is its own
-///   classification of exactly that.
+/// - `MaintenanceFamily::SecurityDependencyScan` is the daemon's
+///   security/dependency incident family, and I12.24:49 names "security
+///   incident".
+/// - `MaintenanceFamily::DonorConformance` is the conformance-audit family,
+///   and I12.24:50 names "Architecture/Implementation/runtime conformance gap",
+///   which the closed set spells [`EvidenceSource::ConformanceDiagnosis`].
+/// - every other family, at every decision the evaluator can return, is the
+///   attempt itself: `AutomationDecision::Start` admits the job, `Suggest`
+///   preserves a recommendation instead, `Defer` holds it for a later eligible
+///   window, `Block` and `Escalate` deny or escalate it, and
+///   `SuppressDuplicate` records that equivalent work is already active. Each
+///   of those is an outcome this daemon itself produced, and none of them is a
+///   Watchdog suggestion.
+///
+/// # Why no decision reaching this function is a `Watchdog` observation
+///
+/// [`EvidenceSource::Watchdog`] is I12.24:54's "Dreamer/Watchdog/Concilium
+/// suggestion". [`eliot_maintenance::AutomationTriggerDecision`]
+/// (`crates/governor/eliot-maintenance/src/lib.rs:288-306`) carries
+/// `trigger_id`, `family`, `scope_ref`, `decision`, `reason`, `admits_job` and
+/// `durable_job_ref` — and no trigger-origin field, so no part of the decision
+/// establishes which kind of occurrence proposed the trigger. The origin that
+/// maps to `MaintenanceTrigger::WatchdogProblem` is
+/// `MaintenanceTriggerOrigin::AdmittedObservation`
+/// (`maintenance_trigger_evaluator.rs:125`), while the observation this dispatch
+/// records is built from `MaintenanceTriggerOrigin::IdleTransition`
+/// (`daemon_runtime.rs:2169`), which maps to `MaintenanceTrigger::Policy`
+/// (`maintenance_trigger_evaluator.rs:123`). A policy-driven occurrence is not
+/// a Watchdog suggestion, and nothing in the decision could make it one.
+///
+/// The residual this function used to carry claimed
+/// [`EvidenceSource::Watchdog`] for every decision that was neither of the two
+/// named families nor a refusal, which covered `Suggest`, `Defer`, `Start` and
+/// `SuppressDuplicate`. The refusal test it consulted admitted only `Block` and
+/// `Escalate`, although the owner's evaluator pairs `Defer` — never `Block` —
+/// with `NotIdle`, `OutsideSchedule`, `RouteUnavailable`, `BudgetUnavailable`
+/// and `UserSessionRequired`
+/// (`crates/governor/eliot-maintenance/src/lib.rs:628-643`), so it could in
+/// fact match `AutomationOff` alone. A label the decision's own content cannot
+/// support is the misattribution this issue exists to remove, so the residual
+/// is dropped rather than renamed.
 ///
 /// `ASSUMPTION:` I12.24:40-55 names no separate "maintenance" variant, and no
-/// decision field carries a Dreamer or Concilium attribution — those two
-/// sources stay unreachable from this daemon rather than being mislabelled here.
+/// field of the maintenance decision carries a Watchdog, Dreamer or Concilium
+/// attribution — those three sources therefore stay unreachable from this
+/// daemon rather than being mislabelled here. Reaching any of them needs the
+/// maintenance trigger ORIGIN to travel with the decision, which is an
+/// `eliot-maintenance` contract change this issue does not own; the honest
+/// outcome here is the `Attempt` label above plus that stated ceiling, not a
+/// refusal to classify a live observation.
 pub fn maintenance_evidence_source(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> EvidenceSource {
@@ -604,34 +641,8 @@ pub fn maintenance_evidence_source(
     match decision.family {
         MaintenanceFamily::SecurityDependencyScan => EvidenceSource::SecurityIncident,
         MaintenanceFamily::DonorConformance => EvidenceSource::ConformanceDiagnosis,
-        _ if refused_by_evaluator(decision.decision, decision.reason) => EvidenceSource::Attempt,
-        _ => EvidenceSource::Watchdog,
+        _ => EvidenceSource::Attempt,
     }
-}
-
-/// Whether the Governor refused this trigger for a non-eligibility reason.
-///
-/// `Suggest` and `SuppressDuplicate` are not refusals — the first preserves a
-/// recommendation and the second records that equivalent work is already active
-/// — so neither counts as a failed attempt.
-fn refused_by_evaluator(
-    decision: eliot_maintenance::AutomationDecision,
-    reason: eliot_maintenance::DecisionReason,
-) -> bool {
-    use eliot_maintenance::{AutomationDecision, DecisionReason};
-    matches!(
-        (decision, reason),
-        (
-            AutomationDecision::Block | AutomationDecision::Escalate,
-            DecisionReason::AutomationOff
-                | DecisionReason::ExplicitRequestRequired
-                | DecisionReason::BudgetUnavailable
-                | DecisionReason::NotIdle
-                | DecisionReason::OutsideSchedule
-                | DecisionReason::RouteUnavailable
-                | DecisionReason::UserSessionRequired
-        )
-    )
 }
 
 /// Projects one conformance-audit observation into the Self-Quality
@@ -697,9 +708,7 @@ fn conformance_diagnosis_evidence(
         trigger_problem_or_metric: trigger_problem_or_metric.to_owned(),
         validity_scope: validity_scope.to_owned(),
     };
-    Ok(eliot_self_quality::sourced_evidence_from_conformance_diagnosis(
-        &finding,
-    )?)
+    Ok(eliot_self_quality::sourced_evidence_from_conformance_diagnosis(&finding)?)
 }
 
 /// The priority axis this daemon assigns a conformance finding, DERIVED from
