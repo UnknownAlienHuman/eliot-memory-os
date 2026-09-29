@@ -1102,6 +1102,18 @@ impl HandoffContinuity {
     pub const fn requires_causal_link(self) -> bool {
         !matches!(self, Self::Fresh)
     }
+
+    /// Returns whether a transfer in this mode may execute tools.
+    ///
+    /// `Replayed` re-emits only public messages/events as inert context; it
+    /// never re-executes prior tool calls or external effects (I7.15). The
+    /// rule is a value the dispatch owner branches on, like
+    /// [`attempt_identity_rule`](Self::attempt_identity_rule): budget, retry
+    /// history and external-effect uncertainty stay with the effect owner
+    /// and are never reset by the transfer itself.
+    pub const fn permits_tool_execution(self) -> bool {
+        !matches!(self, Self::Replayed)
+    }
 }
 
 /// Attempt-identity rule derived from a continuity mode (I7.15).
