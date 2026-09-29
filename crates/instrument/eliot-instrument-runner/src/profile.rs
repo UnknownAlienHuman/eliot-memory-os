@@ -2010,7 +2010,7 @@ impl AdmittedStage {
             supply_digest: self
                 .supply_receipt
                 .as_ref()
-                .map(|receipt| receipt.digest())
+                .map(SupplyChainReceipt::digest)
                 .unwrap_or_default(),
             arguments: request.arguments.clone(),
             environment_class: self.environment_class.clone(),
