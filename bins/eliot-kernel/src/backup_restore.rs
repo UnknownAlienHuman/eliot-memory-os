@@ -875,15 +875,9 @@ impl KernelBackupRestore {
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?,
             None => Vec::new(),
         };
-        let mut target_impl = KernelRestoreTarget::new(
-            &self.work_root,
-            &destination,
-            bundle,
-            ports,
-            receipts,
-            ors,
-        )
-        .map_err(KernelRestoreError::TargetFailed)?;
+        let mut target_impl =
+            KernelRestoreTarget::new(&self.work_root, &destination, bundle, ports, receipts, ors)
+                .map_err(KernelRestoreError::TargetFailed)?;
         let receipt = match plan.execute_with_journal(bundle, &mut target_impl, journal) {
             Ok(receipt) => receipt,
             Err(primary) => {
@@ -2210,9 +2204,12 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
         PurgeOwnerClient::bind(entries).validate_entries()?;
         if !entries.is_empty() {
-            let ors = self.ors.as_ref().ok_or(BackupError::RestoreCapabilityUnsupported {
-                capability: owners::PURGE_OWNER_CHANNEL,
-            })?;
+            let ors = self
+                .ors
+                .as_ref()
+                .ok_or(BackupError::RestoreCapabilityUnsupported {
+                    capability: owners::PURGE_OWNER_CHANNEL,
+                })?;
             let mut consumed = 0;
             for entry in entries {
                 consumed = ors
