@@ -4575,7 +4575,10 @@ impl KernelComposition {
         // ModulesQuiescedReverse: dependents stop before the stores and
         // bridges they depend on. The contour is the live composition state:
         // the store bridge (dependency) ordered before the daemon
-        // (dependent), then reversed for quiescence.
+        // (dependent), then reversed for quiescence. This phase records the
+        // quiesce *request* against the live contour; each owner's completed
+        // stop is recorded separately at the phase that owner stops in, from
+        // that owner's own post-stop state.
         let mut dependency_order = Vec::new();
         #[cfg(windows)]
         match self.canonical_store_gateway.lock() {
@@ -4598,7 +4601,7 @@ impl KernelComposition {
             .map_err(|_| DrainHalt::new("module-contour-ambiguous"))?;
         record(
             ShutdownPhase::ModulesQuiescedReverse,
-            format!("quiescence-order:{}", quiescence.join(">")),
+            format!("quiesce-requested:{}", quiescence.join(">")),
         )?;
 
         // StoreStopLeaseZero: the store-stop request below is admitted only
@@ -4627,14 +4630,40 @@ impl KernelComposition {
                 vec![census.observation_code().to_owned()],
             ));
         }
+        // The store stop is the store owner's, not the coordinator's. The
+        // lease census above admits the drain only with no outstanding
+        // canonical-data or maintenance obligation, so the stop is requested
+        // here through the store gateway's own existing port and its
+        // completion is read back from that same owner. A stop the owner does
+        // not report as completed is an explicit residual, not a recorded
+        // phase: the store is never left half-stopped behind a clean terminal.
         #[cfg(windows)]
-        let store_evidence = match self.canonical_store_gateway.lock() {
-            Ok(gateway) => match gateway.as_ref() {
-                Some(gateway) if gateway.is_fenced() => "store-gateway-fenced",
-                Some(_) => "store-gateway-attached-unclaimed",
+        let store_evidence = {
+            let gateway = match self.canonical_store_gateway.lock() {
+                Ok(gateway) => gateway.clone(),
+                Err(_) => return Err(DrainHalt::new("store-gateway-unavailable")),
+            };
+            match gateway {
+                Some(gateway) => {
+                    if let Err(error) = gateway
+                        .fence_and_drain(Duration::from_secs(5))
+                        .await
+                    {
+                        return Err(DrainHalt::with_pending(
+                            "store-stop-unproven",
+                            vec![format!("store-gateway-drain-incomplete:{error}")],
+                        ));
+                    }
+                    if !gateway.is_fenced() {
+                        return Err(DrainHalt::with_pending(
+                            "store-stop-unproven",
+                            vec!["store-gateway-not-fenced-after-drain".to_owned()],
+                        ));
+                    }
+                    "store-gateway-drained-and-fenced"
+                }
                 None => "store-gateway-absent",
-            },
-            Err(_) => return Err(DrainHalt::new("store-gateway-unavailable")),
+            }
         };
         #[cfg(not(windows))]
         let store_evidence = "store-gateway-absent";
