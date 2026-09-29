@@ -1,6 +1,7 @@
 //! Deterministic schemas generated from the exact Serde contract types.
 
-use schemars::{JsonSchema, SchemaGenerator, SchemaSettings};
+use schemars::generate::SchemaSettings;
+use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
