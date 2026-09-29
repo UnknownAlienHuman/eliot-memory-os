@@ -152,6 +152,20 @@ pub enum ContractViolation {
     /// Preservation dimension failed/unknown and cannot be averaged away.
     #[error("preservation failure: {0}")]
     Preservation(String),
+    /// The retained packet's scorecard refused the requested operation.
+    ///
+    /// This is the readiness half of the boundary, kept separate from the
+    /// structural half on purpose. A closure or view that fails its own shape is
+    /// a [`ContractViolation::BindingMismatch`] and nothing else; a well-formed
+    /// packet whose grade cannot support the requested operation is this
+    /// variant, and it keeps the owner refusal whole — the requested operation,
+    /// whether it was blocked by a dimension result or by an unresolved
+    /// applicability input, and the exact blocking results with the evidence each
+    /// still lacks. Collapsing it to a reason string here would force every
+    /// consumer to re-derive the block from the card, which is exactly the
+    /// re-derivation the shared rule exists to remove.
+    #[error("quality refused {0}")]
+    QualityRefused(Box<eliot_context_contracts::QualityRefusal>),
     /// Candidate carries admitted/current/effect/delivery/use/outcome/promotion/Finish evidence.
     #[error("forbidden candidate carry: {0}")]
     ForbiddenCarry(String),

@@ -84,6 +84,15 @@ fn bundle_denied(error: &ContractViolation) -> DreamerError {
         ContractViolation::Preservation(_) => {
             DreamerError::InvalidAdmission("preservation failure")
         }
+        // A readiness refusal is not a request-rejection the caller can fix by
+        // reshaping its inputs: the packet is well-formed and its grade cannot
+        // support the operation. It maps to the same request-rejected code as
+        // the structural refusals, and the owner refusal keeps the requested
+        // operation and the blocking dimensions reachable on the typed value
+        // instead of being flattened into a field name.
+        ContractViolation::QualityRefused(_) => {
+            DreamerError::InvalidAdmission("quality refused the requested operation")
+        }
         ContractViolation::ForbiddenCarry(_) => {
             DreamerError::InvalidAdmission("forbidden candidate carry")
         }

@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, LossPolicy as ContextLossPolicy,
-    MeasurementCompositionProfile, MeasurementStatus, MeasurementUnit, SemanticRole, StuEstimate,
-    TokenizerObservation,
+    MeasurementCompositionProfile, MeasurementStatus, MeasurementUnit, QualityOperation,
+    QualityRefusalKind, QualitySuitability, SemanticRole, StuEstimate, TokenizerObservation,
 };
 use eliot_contracts::{ArtifactId, RequestId, StateFence};
 use schemars::JsonSchema;
@@ -49,6 +49,12 @@ pub struct ContextMaterialClosure {
 impl ContextMaterialClosure {
     /// Validates the view against the exact admitted set; membership is never
     /// reconstructed from rendered fields.
+    ///
+    /// This stays structural integrity, exactly as
+    /// [`ActiveUnderstandingView::validate`] does: it proves the retained view
+    /// is the projection of *this* admitted set, and nothing about whether the
+    /// packet is ready for an effect. Readiness is
+    /// [`ContextMaterialClosure::suitability`].
     pub fn validate(&self) -> Result<(), ContractViolation> {
         self.admitted
             .validate()
@@ -56,6 +62,55 @@ impl ContextMaterialClosure {
         self.view
             .validate_against(&self.admitted)
             .map_err(context_error("context.view"))
+    }
+
+    /// Applies the one shared readiness rule to the retained A-15 closure.
+    ///
+    /// [`ContextMaterialClosure::validate`] stays structural integrity, and a
+    /// structurally valid view is still not a gradeable packet. This is the
+    /// separate, operation-scoped fact, and it asks the *existing* owner rule —
+    /// [`ActiveUnderstandingView::suitability`] — rather than a second local one,
+    /// so assembly, reactive delivery, assessment intake and this consumer all
+    /// get the same answer from the same card.
+    ///
+    /// The Dreamer material set reads the retained A-15 view into the exact
+    /// model-visible preimage, which is compilation of that packet for a
+    /// downstream planner. This closure therefore asks about
+    /// [`QualityOperation::Compile`], the same operation the assembly owner
+    /// gates on, and never weakens it: `Compile` requires all twelve dimensions
+    /// to be a current pass, which includes everything
+    /// [`QualityOperation::DependentAction`] requires.
+    ///
+    /// The typed refusal is returned, never discarded or flattened. It names the
+    /// operation that was asked for, whether the block came from a dimension
+    /// result or from an unresolved applicability input, and the exact blocking
+    /// results with the evidence each still lacks. An
+    /// [`QualityRefusalKind::InvalidScorecard`] is re-derived as the structural
+    /// contract violation it is, so a view that is not even well-formed is not
+    /// reported as a quality incompleteness the caller would have to
+    /// re-derive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractViolation::QualityRefused`] carrying the owner refusal
+    /// for a blocked operation, or a structural [`ContractViolation`] when the
+    /// closure or its view is not valid at all.
+    pub fn suitability(
+        &self,
+        operation: QualityOperation,
+    ) -> Result<QualitySuitability, ContractViolation> {
+        // Structural integrity first, so a refusal can never be read off a
+        // closure that describes no gradeable packet.
+        self.validate()?;
+        self.view.suitability(operation, &[]).map_err(|refusal| {
+            if refusal.kind == QualityRefusalKind::InvalidScorecard {
+                // `validate` already ran, so the view's own intrinsic shape is
+                // sound; the card is what cannot be read. Name the card, not
+                // this consumer's opinion of it.
+                return context_error("context.quality")(ContextError::QualityIncomplete);
+            }
+            ContractViolation::QualityRefused(Box::new(refusal))
+        })
     }
 
     /// Validates the A-15 closure against the enclosing Dreamer identity.
@@ -1086,9 +1141,47 @@ impl AssemblyMaterialSet {
     /// supplied closure. The preimage contains the recipe/job binding,
     /// selected owner references, retained representations, omissions, and
     /// the exact A-15 view.
+    ///
+    /// This is the model-visible consumer, and it is a dependent one: the bytes
+    /// returned here are handed to a route that acts on the retained A-15 view.
+    /// Structural validity is therefore not permission, so the retained closure
+    /// is put to the one shared readiness rule for the compile operation before
+    /// any byte is produced. The same applies to
+    /// [`AssemblyMaterialSet::model_input_digest`], which digests exactly these
+    /// bytes, and to [`AssemblyResult::canonical_input_bytes`] through it. A
+    /// material set whose grading is incomplete or unknown now refuses here
+    /// instead of reaching the preimage.
+    ///
+    /// `validate` keeps its own meaning: it remains the structural identity
+    /// check used by every other validator in this file and by
+    /// [`BundleMeasurement::validate_for`] and
+    /// [`AssemblyResult::validate`], none of which is a model-visible
+    /// projection. Adding this check here rather than inside `validate` is what
+    /// keeps those three structural.
     pub fn model_input_bytes(&self) -> Result<Vec<u8>, ContractViolation> {
         self.validate()?;
+        self.require_context_readiness()?;
         self.model_input_bytes_unchecked()
+    }
+
+    /// Applies the shared readiness rule to the retained A-15 closure, if any.
+    ///
+    /// The rule is unconditional, not conditional on a caller: a material set
+    /// carrying no context closure has no A-15 packet to grade, and that is a
+    /// different fact from one carrying a packet that cannot be compiled. The
+    /// separate existence requirement for a recipe that demands context already
+    /// lives in [`AssemblyResult::validate_complete_materials`]; this does not
+    /// duplicate or relax it.
+    fn require_context_readiness(&self) -> Result<(), ContractViolation> {
+        let Some(context) = &self.context else {
+            return Ok(());
+        };
+        // The operation this consumer actually performs. The refusal names it,
+        // so the block can never be reported against an operation nobody asked
+        // for. On success the granted suitability carries only non-blocking
+        // information — an unknown this operation tolerates — and projecting
+        // these bytes does not consume it, so nothing is left unhandled here.
+        context.suitability(QualityOperation::Compile).map(drop)
     }
 
     /// Returns the digest of the exact model-visible input preimage.

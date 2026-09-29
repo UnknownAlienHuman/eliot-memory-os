@@ -104,6 +104,9 @@ fn grounding_denied(error: &ContractViolation) -> DreamerError {
         ContractViolation::Preservation(_) => {
             DreamerError::InvalidAdmission("preservation failure")
         }
+        ContractViolation::QualityRefused(_) => {
+            DreamerError::InvalidAdmission("quality refused the requested operation")
+        }
         ContractViolation::ForbiddenCarry(_) => {
             DreamerError::InvalidAdmission("forbidden candidate carry")
         }

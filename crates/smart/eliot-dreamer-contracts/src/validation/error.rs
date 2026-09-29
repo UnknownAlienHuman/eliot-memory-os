@@ -52,6 +52,7 @@ pub fn summarize_contract(
         | ContractViolation::Registry(_)
         | ContractViolation::ScreenIneligible(_)
         | ContractViolation::Preservation(_)
+        | ContractViolation::QualityRefused(_)
         | ContractViolation::ForbiddenCarry(_) => "contract",
     };
     DreamDraftValidationError::InvalidContract { phase, field }
