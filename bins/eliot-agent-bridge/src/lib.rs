@@ -3511,10 +3511,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// rights, including after a reconnect, and possession of the token
     /// alone authorizes nothing. The reply decodes through the same
     /// validating path as the full read, additionally requiring the
-    /// selected scope, predecessor, and next continuation to match. A Resume
-    /// selector carries no window identity: ORS resolves the unique persisted
-    /// owner-scoped window and its returned key is accepted only through the
-    /// page commitment and reconciliation-key checks.
+    /// selected scope, predecessor, and next continuation to match. A fresh-
+    /// process Resume omits the window key so ORS resolves the unique window
+    /// for the authenticated owner. A cached-core `ResumeWindow` constrains that
+    /// lookup to its previously admitted key, without a continuation proof or
+    /// authority; the returned key still passes the page-commitment and
+    /// reconciliation-key checks.
     fn reconcile_continue(
         &mut self,
         binding: &AttachBinding,
