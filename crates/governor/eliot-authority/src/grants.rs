@@ -2207,6 +2207,89 @@ impl GrantGraph {
         if !self.grants.contains_key(origin) {
             return Err(AuthorityError::MissingParent(origin.clone()));
         }
+        let edges = self.qualified_influence_edges();
+        let request = BoundedRevocationRequest {
+            request_id: format!("transitive-revocation:{}", origin.as_str()),
+            root_ref: origin.as_str().to_owned(),
+            reason: RevocationReason::SourceRevoked,
+            state_fence: fence.clone(),
+            edges,
+            completeness: ClosureCompleteness::Complete,
+            resumed_visited: Vec::new(),
+        };
+        let page_limits = eliot_influence::BoundedRevocationPageLimits {
+            max_page_edges: bounds.max_edges.min(REVOCATION_PAGE_EDGE_LIMIT),
+            max_page_work: bounds.max_work.min(REVOCATION_PAGE_WORK_LIMIT),
+        };
+        let mut outcome = eliot_influence::revoke_bounded_page(&request, bounds, page_limits)
+            .map_err(map_bounded_revocation_error)?;
+        // The receipt is bound to THIS request and THESE bounds by content
+        // before any of its affected set is reconciled against the structural
+        // walk below. `revoke_bounded_page` returns a complete outcome that
+        // carries no continuation, so without this check the affected set,
+        // frontier and omissions of a complete page were attributable to no
+        // operation at all: only the root reference named anything.
+        outcome
+            .verify_binding(&request, bounds)
+            .map_err(map_bounded_revocation_error)?;
+        while !outcome.complete {
+            if outcome.omissions.iter().any(|omission| {
+                matches!(
+                    omission.cause,
+                    eliot_influence::OmissionCause::BoundsExhausted
+                )
+            }) {
+                break;
+            }
+            let continuation = outcome
+                .continuation
+                .clone()
+                .ok_or(AuthorityError::InvalidField(
+                    "transitive_revocation_closure",
+                ))?;
+            let continuation_token =
+                outcome
+                    .continuation_token()
+                    .cloned()
+                    .ok_or(AuthorityError::InvalidField(
+                        "transitive_revocation_closure",
+                    ))?;
+            let previous_work = outcome.work_spent;
+            outcome = eliot_influence::resume_bounded_revocation(
+                &request,
+                &continuation,
+                &continuation_token,
+                bounds,
+                page_limits,
+            )
+            .map_err(map_bounded_revocation_error)?;
+            // Every page is re-bound to the same operation before the loop
+            // reads its completeness: a resumed page that answered a
+            // different request, graph snapshot, bound set, reason or fence
+            // refuses here rather than extending the closure.
+            outcome
+                .verify_binding(&request, bounds)
+                .map_err(map_bounded_revocation_error)?;
+            if !outcome.complete
+                && outcome.work_spent == previous_work
+                && !outcome.omissions.iter().any(|omission| {
+                    matches!(
+                        omission.cause,
+                        eliot_influence::OmissionCause::BoundsExhausted
+                    )
+                })
+            {
+                return Err(AuthorityError::InvalidField(
+                    "transitive_revocation_closure",
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Qualifies every grant edge the graph currently knows, plus each
+    /// retained quarantined relation, as a cross-scope influence edge.
+    fn qualified_influence_edges(&self) -> Vec<QualifiedInfluenceEdge> {
         // `BTreeMap` iteration is grant-id ordered, so edge order is
         // deterministic across restarts and owners.
         let mut edges = Vec::new();
@@ -2262,67 +2345,7 @@ impl GrantGraph {
                 relation.child.grant_id.as_str().to_owned(),
             ));
         }
-        let request = BoundedRevocationRequest {
-            request_id: format!("transitive-revocation:{}", origin.as_str()),
-            root_ref: origin.as_str().to_owned(),
-            reason: RevocationReason::SourceRevoked,
-            state_fence: fence.clone(),
-            edges,
-            completeness: ClosureCompleteness::Complete,
-            resumed_visited: Vec::new(),
-        };
-        let page_limits = eliot_influence::BoundedRevocationPageLimits {
-            max_page_edges: bounds.max_edges.min(REVOCATION_PAGE_EDGE_LIMIT),
-            max_page_work: bounds.max_work.min(REVOCATION_PAGE_WORK_LIMIT),
-        };
-        let mut outcome = eliot_influence::revoke_bounded_page(&request, bounds, page_limits)
-            .map_err(map_bounded_revocation_error)?;
-        while !outcome.complete {
-            if outcome.omissions.iter().any(|omission| {
-                matches!(
-                    omission.cause,
-                    eliot_influence::OmissionCause::BoundsExhausted
-                )
-            }) {
-                break;
-            }
-            let continuation = outcome
-                .continuation
-                .clone()
-                .ok_or(AuthorityError::InvalidField(
-                    "transitive_revocation_closure",
-                ))?;
-            let continuation_token =
-                outcome
-                    .continuation_token()
-                    .cloned()
-                    .ok_or(AuthorityError::InvalidField(
-                        "transitive_revocation_closure",
-                    ))?;
-            let previous_work = outcome.work_spent;
-            outcome = eliot_influence::resume_bounded_revocation(
-                &request,
-                &continuation,
-                &continuation_token,
-                bounds,
-                page_limits,
-            )
-            .map_err(map_bounded_revocation_error)?;
-            if !outcome.complete
-                && outcome.work_spent == previous_work
-                && !outcome.omissions.iter().any(|omission| {
-                    matches!(
-                        omission.cause,
-                        eliot_influence::OmissionCause::BoundsExhausted
-                    )
-                })
-            {
-                return Err(AuthorityError::InvalidField(
-                    "transitive_revocation_closure",
-                ));
-            }
-        }
-        Ok(outcome)
+        edges
     }
 
     /// Collects the quarantined dependents whose edge source the walk
