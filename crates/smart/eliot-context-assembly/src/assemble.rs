@@ -163,21 +163,23 @@ where
         policy,
         policy.max_serialized_bytes,
     )?;
-    let ids = rendered
-        .iter()
-        .map(|atom| atom.atom_id.clone())
-        .collect::<Vec<_>>();
+    // The admitted identities are read from the admitted set, and the rendered
+    // identities from the projection. Both sides derived from the projection
+    // would make this proof a comparison of one list with a copy of itself,
+    // which no atom the renderer dropped could violate.
+    let admitted_ids = admitted_member_ids(admitted);
+    let rendered_ids: Vec<_> = rendered.iter().map(|atom| atom.atom_id.clone()).collect();
     let selection = eliot_context_contracts::SelectionIntegrityProof {
         binding: admitted.binding.clone(),
-        admitted_ids: ids.clone(),
-        rendered_ids: ids.clone(),
+        admitted_ids: admitted_ids.clone(),
+        rendered_ids,
         omission_evidence: admitted.economy.displaced.clone(),
         output_digest: output_digest.clone(),
     };
     selection.validate()?;
     let view = ActiveUnderstandingView {
         binding: admitted.binding.clone(),
-        admitted_ids: ids,
+        admitted_ids,
         rendered,
         selection,
         quality,
@@ -193,6 +195,18 @@ where
         serialized_bytes: bytes,
         boundaries,
     })
+}
+
+/// Exact member identities of the admitted set, in admitted source order.
+///
+/// This is the independent side of the selection proof: it is read from the
+/// admission owner's set rather than from the projection it is meant to check.
+fn admitted_member_ids(admitted: &AdmittedContextSet) -> Vec<eliot_contracts::ArtifactId> {
+    admitted
+        .records
+        .iter()
+        .map(|record| record.candidate.atom_id.clone())
+        .collect()
 }
 
 fn preflight(

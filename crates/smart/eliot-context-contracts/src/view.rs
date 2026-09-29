@@ -192,10 +192,23 @@ impl ActiveUnderstandingView {
             })
             .map(RenderedAtom::from_admitted)
             .collect();
-        let ids = selected
+        // The admitted identities are read from the admitted set, and the
+        // rendered identities from the projection. Deriving both from the
+        // projection would make the equality this proof records a comparison of
+        // one list with a copy of itself, which no dropped member can violate.
+        let admitted_ids: Vec<ArtifactId> = admitted
+            .records
             .iter()
-            .map(|atom| atom.atom_id.clone())
-            .collect::<Vec<_>>();
+            .filter(|record| {
+                matches!(
+                    record.disposition,
+                    crate::AdmissionDisposition::Include | crate::AdmissionDisposition::HandleOnly
+                )
+            })
+            .map(|record| record.candidate.atom_id.clone())
+            .collect();
+        let rendered_ids: Vec<ArtifactId> =
+            selected.iter().map(|atom| atom.atom_id.clone()).collect();
         let derived_output_digest = Self::canonical_output_digest(
             &admitted.binding,
             &recipe_digest,
@@ -208,8 +221,8 @@ impl ActiveUnderstandingView {
         drop(output_digest);
         let selection = SelectionIntegrityProof {
             binding: admitted.binding.clone(),
-            admitted_ids: ids.clone(),
-            rendered_ids: ids.clone(),
+            admitted_ids: admitted_ids.clone(),
+            rendered_ids,
             omission_evidence: admitted.economy.displaced.clone(),
             output_digest: derived_output_digest.clone(),
         };
@@ -219,7 +232,7 @@ impl ActiveUnderstandingView {
         crate::validate_digest(&fence_digest, "view.fence_digest")?;
         let view = Self {
             binding: admitted.binding.clone(),
-            admitted_ids: ids,
+            admitted_ids,
             rendered: selected,
             selection,
             quality,
