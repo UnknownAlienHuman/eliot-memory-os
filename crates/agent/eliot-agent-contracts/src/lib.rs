@@ -11,6 +11,8 @@ pub use bridge_admission::*;
 
 mod handoff_checkpoint;
 pub use handoff_checkpoint::*;
+mod handoff_recovery;
+pub use handoff_recovery::*;
 
 use std::collections::BTreeSet;
 
