@@ -4116,8 +4116,10 @@ fn physical_supervision_signer_unseals_only_with_exact_eliot_host_service_sid_to
     )
     .expect("resolve exact EliotHost service SID");
     assert_eq!(live_sid, authority.key_reference.host_service_sid);
-    let signer = ProtectedSupervisionLeaseSigner::new(
+    let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
         kernel_root,
+        eliot_installation::InstallationProfile::SystemService,
+        None,
         &SupervisionLeaseAuthorityConfig { authority },
     )
     .expect("exact EliotHost service token must unseal the provisioned key");

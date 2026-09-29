@@ -155,19 +155,6 @@ impl fmt::Debug for ProtectedSupervisionLeaseSigner {
 
 #[cfg(windows)]
 impl ProtectedSupervisionLeaseSigner {
-    #[cfg(test)]
-    pub(super) fn new(
-        kernel_root: PathBuf,
-        config: &SupervisionLeaseAuthorityConfig,
-    ) -> Result<Self, SupervisionLeaseAuthorityError> {
-        Self::new_for_profile(
-            kernel_root,
-            InstallationProfile::SystemService,
-            None,
-            config,
-        )
-    }
-
     pub(super) fn new_for_profile(
         kernel_root: PathBuf,
         installation_profile: InstallationProfile,
