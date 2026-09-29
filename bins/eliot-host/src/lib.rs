@@ -7589,10 +7589,14 @@ impl HostComposition {
             None => PlatformHandle::new("0".repeat(64))
                 .map_err(|error| HostError::Platform(error.to_string()))?,
         };
-        let current_kernel =
-            self.journal.snapshot()?.kernel.clone().ok_or_else(|| {
-                HostError::ProcessContour("no active Kernel to restart".to_owned())
-            })?;
+        // One snapshot supplies both the authorizing record and the retained
+        // record-bound config approvals the shared restart gate joins them
+        // with, so the gate never mixes records from two different reads.
+        let journal_state = self.journal.snapshot()?;
+        let current_kernel = journal_state
+            .kernel
+            .ok_or_else(|| HostError::ProcessContour("no active Kernel to restart".to_owned()))?;
+        let readiness_observations = journal_state.readiness_observations;
         if current_kernel.state != KernelActivationState::Active {
             return Err(HostError::ProcessContour(
                 "Kernel is not Active; restart requires Active".to_owned(),
@@ -7605,11 +7609,12 @@ impl HostComposition {
         }
         // I1.9 A1: this explicit restart is permitted only when the valid
         // journal record binds the approved relaunch artifact and carries
-        // the full process lineage for it, the relaunch config is the
-        // approved config, and the record is owned by the current activation
-        // fence. The gate runs before termination destroys evidence, so a
-        // missing or unbound record refuses the restart as manual recovery
-        // instead of relaunching first.
+        // the full process lineage for it, the journal's own record-bound
+        // approval binds the approved config to that exact record, the
+        // relaunch config is the approved config, and the record is owned by
+        // the current activation fence. The gate runs before termination
+        // destroys evidence, so a missing or unbound record refuses the
+        // restart as manual recovery instead of relaunching first.
         let (kernel_artifact, _) = active_manifest
             .host_child_artifact_digests()
             .map_err(|e| HostError::ProcessContour(e.to_string()))?;
@@ -7621,6 +7626,7 @@ impl HostComposition {
         })?;
         require_journal_kernel_restart_record(
             &current_kernel,
+            &readiness_observations,
             kernel_artifact,
             &active_manifest.config_digest,
             &materialized_config_digest,
@@ -9214,24 +9220,35 @@ impl HostComposition {
             self.readiness_gate.branch_degraded();
         }
         if kernel_requires_activation {
-            let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
+            // One snapshot supplies both the authorizing record and the
+            // retained record-bound config approvals the shared restart gate
+            // joins them with, so the gate never mixes records from two
+            // different reads.
+            let journal_state = self.journal.snapshot()?;
+            let current = journal_state.kernel.ok_or_else(|| {
                 HostError::OwnerLeaseRecovery(
                     "dead Kernel branch has no durable Kernel record".to_owned(),
                 )
             })?;
+            let readiness_observations = journal_state.readiness_observations;
             // I1.9 A1: a Host-managed dependency (Kernel) restarts only when
             // the valid journal record binds this relaunch's approved
             // artifact and carries the full process lineage for it, the
-            // relaunch config is the approved config, and the record is
-            // owned by the current activation fence. The shared choke
-            // revalidates the original recorded record, refuses an artifact
-            // or config mismatch as manual recovery instead of relaunching
-            // an unapproved image or config, refuses a record without
-            // PID/Job lineage instead of reconstructing it, and refuses a
-            // stale-activation record instead of restarting from prior
-            // lineage. The snapshot above already fails a corrupt journal.
+            // journal's own record-bound approval binds the approved config
+            // to that exact record, the relaunch config is the approved
+            // config, and the record is owned by the current activation
+            // fence. The shared choke revalidates the original recorded
+            // record, refuses an artifact or config mismatch as manual
+            // recovery instead of relaunching an unapproved image or config,
+            // refuses a record without PID/Job lineage instead of
+            // reconstructing it, refuses a record whose approved config is
+            // not bound to it in the journal instead of trusting a live
+            // manifest, and refuses a stale-activation record instead of
+            // restarting from prior lineage. The snapshot above already fails
+            // a corrupt journal.
             require_journal_kernel_restart_record(
                 &current,
+                &readiness_observations,
                 kernel_artifact,
                 &active.manifest.config_digest,
                 &materialized_config_digest,
