@@ -449,12 +449,12 @@ impl GenerationExecutionPolicy {
                 .allowed_scopes
                 .iter()
                 .any(|allowed| allowed == &scope.work_scope)
-                || !intent.effect_ceiling.admits(manifest.effect_ceiling)
+                || !manifest.effect_ceiling.admits(intent.effect_ceiling)
             {
                 return Err(ModuleError::IdentityConflict);
             }
         }
-        if manifest.restart_authorization != RestartAuthorization::ReadRebuild
+        if manifest.effect_ceiling == EffectCeiling::EffectExactLease
             && self.allowed_route_scopes.is_empty()
         {
             return Err(ModuleError::InvalidField {
@@ -531,8 +531,7 @@ impl PreparedGenerationExecution {
             .execution_policy
             .as_ref()
             .ok_or(ModuleError::MissingExecutionPolicy)?;
-        let source_restart_policy_digest =
-            admitted_manifest_policy_digest(&self.source_manifest)?;
+        let source_restart_policy_digest = admitted_manifest_policy_digest(&self.source_manifest)?;
         let mut source_dependencies = self.source_manifest.dependencies.clone();
         source_dependencies.sort_by_key(|dependency| dependency.startup_order);
         if self.projection.artifact_digest != self.source_manifest.artifact_digest
@@ -548,6 +547,11 @@ impl PreparedGenerationExecution {
         {
             return Err(ModuleError::IdentityConflict);
         }
+        self.validate_projection_fields()?;
+        Ok(())
+    }
+
+    fn validate_projection_fields(&self) -> Result<(), ModuleError> {
         digest(
             &self.projection.artifact_digest,
             "prepared_execution.artifact_digest",
@@ -1692,9 +1696,7 @@ impl ModuleCatalog {
 fn admitted_policy_digest(entry: &ModuleCatalogEntry) -> Result<String, ModuleError> {
     let declared = dispose_restart_policy(entry.manifest.restart_policy.as_ref())
         .map_err(|error| ModuleError::Contract(error.to_string()))?;
-    if declared != entry.restart_policy_disposition
-        || !declared.permits_automatic_restart()
-    {
+    if declared != entry.restart_policy_disposition || !declared.permits_automatic_restart() {
         return Err(ModuleError::IdentityConflict);
     }
     declared
