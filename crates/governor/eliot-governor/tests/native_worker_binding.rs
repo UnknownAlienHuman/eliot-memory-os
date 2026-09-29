@@ -269,6 +269,7 @@ fn activation_scope_snapshot(fence: &StateFence) -> WorkScopeBindingSnapshot {
     serde_json::from_value(serde_json::json!({
         "state_fence": fence,
         "owner_revision": 1,
+        "privacy": {"admitted_classes": ["INTERNAL"]},
         "binding": {
             "scope": {
                 "scope_ref": "scope:work",

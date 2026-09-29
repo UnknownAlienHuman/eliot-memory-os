@@ -160,7 +160,12 @@ pub fn admit_initial_binding(
     if receipt.disposition != ScopeBindingDisposition::Matched {
         return Err(WorkScopeError::BindingReceiptNotMatched);
     }
-    let snapshot =
-        WorkScopeBindingSnapshot::new(fence.clone(), owner_revision, observed.clone(), receipt)?;
+    let snapshot = WorkScopeBindingSnapshot::new(
+        fence.clone(),
+        owner_revision,
+        observed.clone(),
+        privacy.clone(),
+        receipt,
+    )?;
     WorkScopeBindingOwner::new(snapshot)
 }

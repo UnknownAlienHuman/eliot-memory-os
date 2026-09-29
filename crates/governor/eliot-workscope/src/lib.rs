@@ -382,6 +382,91 @@ pub struct PrivacyProfile {
     pub admitted_classes: Vec<PrivacyClass>,
 }
 
+/// Exact inputs to a bridge-event privacy decision against the retained
+/// `WorkScope` owner.
+///
+/// `source_bytes` are hashed by the owner before it returns a decision. Scope
+/// identity and generation are caller observations and must match the live
+/// retained owner at `state_fence`.
+pub struct BridgeEventPrivacyInput<'a> {
+    pub source_bytes: &'a [u8],
+    pub scope_ref: &'a str,
+    pub scope_generation: u64,
+    pub source_class: PrivacyClass,
+    pub recipient_class: PrivacyClass,
+}
+
+/// Why an event cannot be retained verbatim under the current `WorkScope`
+/// privacy evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BridgeEventPrivacyRedactionReason {
+    SourceClassOutsideProfile,
+    RecipientClassOutsideProfile,
+    ProviderAndRetentionEvidenceUnavailable,
+}
+
+/// Governor decision bound to the exact event bytes and retained `WorkScope`
+/// policy revision.
+///
+/// Raw retention remains explicitly unadmitted until the live provider
+/// restriction and retention terms are supplied by their owners. A caller
+/// must persist only the deterministic redacted representation while either
+/// evidence set is absent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventPrivacyDecision {
+    pub source_sha256: String,
+    pub scope_ref: String,
+    pub scope_generation: u64,
+    pub policy_revision: u64,
+    pub source_class: PrivacyClass,
+    pub recipient_class: PrivacyClass,
+    /// Whether the caller-presented source class is listed by the retained
+    /// profile. This does not authenticate classification of the bytes.
+    pub source_class_assessment: BridgeEventPrivacyClassAssessment,
+    /// Whether the caller-presented recipient class is listed by the retained
+    /// profile. This does not authenticate the recipient capability.
+    pub recipient_class_assessment: BridgeEventPrivacyClassAssessment,
+    pub provider_restriction_evidence: BridgeEventPrivacyEvidenceStatus,
+    pub retention_policy_evidence: BridgeEventPrivacyEvidenceStatus,
+    pub raw_retention: BridgeEventRawRetentionDecision,
+    pub persistence: BridgeEventPersistenceDisposition,
+    pub redaction_reason: BridgeEventPrivacyRedactionReason,
+}
+
+/// Profile membership is checked, but source classification and recipient
+/// capability are not authenticated by the `WorkScope` owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BridgeEventPrivacyClassAssessment {
+    InProfileUnverified,
+    OutsideProfileUnverified,
+}
+
+/// Availability of policy evidence that must be resolved by its owning
+/// provider or retention authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BridgeEventPrivacyEvidenceStatus {
+    Unavailable,
+}
+
+/// Raw-byte persistence authorization under the current available evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BridgeEventRawRetentionDecision {
+    NotAdmitted,
+}
+
+/// Required persistence form while provider and retention evidence are
+/// unresolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BridgeEventPersistenceDisposition {
+    DeterministicRedactionRequired,
+}
+
 /// Typed resolver outcomes; no branch chooses a candidate silently.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "disposition", content = "detail")]
@@ -464,6 +549,8 @@ pub struct WorkScopeBindingSnapshot {
     pub state_fence: StateFence,
     pub owner_revision: u64,
     pub binding: ScopeBinding,
+    /// Admitted privacy profile approved with `owner_revision`.
+    pub privacy: PrivacyProfile,
     pub guard_receipt: ScopeBindingGuardReceipt,
 }
 
@@ -514,6 +601,8 @@ pub enum WorkScopeError {
     BindingReceiptNotMatched,
     #[error("scope binding guard receipt does not match the retained binding")]
     BindingReceiptMismatch,
+    #[error("work scope privacy profile is unavailable")]
+    PrivacyProfileUnavailable,
     #[error("scan disclosure storage contour is not admitted by the installation owner")]
     ScanContourNotAdmitted,
     #[error("scan disclosure identity conflicts with the retained owner record")]
@@ -2964,12 +3053,14 @@ impl WorkScopeBindingSnapshot {
         state_fence: StateFence,
         owner_revision: u64,
         binding: ScopeBinding,
+        privacy: PrivacyProfile,
         guard_receipt: ScopeBindingGuardReceipt,
     ) -> Result<Self, WorkScopeError> {
         let snapshot = Self {
             state_fence,
             owner_revision,
             binding,
+            privacy,
             guard_receipt,
         };
         snapshot.validate()?;
@@ -2983,6 +3074,10 @@ impl WorkScopeBindingSnapshot {
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
         counter(self.owner_revision, "owner_revision")?;
         self.binding.validate()?;
+        self.privacy.validate()?;
+        if !self.privacy.admits(self.binding.privacy_class) {
+            return Err(WorkScopeError::PrivacyDenied);
+        }
         let receipt = &self.guard_receipt;
         if receipt.disposition != ScopeBindingDisposition::Matched {
             return Err(WorkScopeError::BindingReceiptNotMatched);
@@ -3019,6 +3114,7 @@ struct WorkScopeBindingSnapshotWire {
     state_fence: StateFence,
     owner_revision: u64,
     binding: ScopeBinding,
+    privacy: Option<PrivacyProfile>,
     guard_receipt: ScopeBindingGuardReceipt,
 }
 
@@ -3028,10 +3124,14 @@ impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = WorkScopeBindingSnapshotWire::deserialize(deserializer)?;
+        let privacy = wire
+            .privacy
+            .ok_or_else(|| serde::de::Error::custom(WorkScopeError::PrivacyProfileUnavailable))?;
         Self::new(
             wire.state_fence,
             wire.owner_revision,
             wire.binding,
+            privacy,
             wire.guard_receipt,
         )
         .map_err(serde::de::Error::custom)
@@ -3063,6 +3163,61 @@ impl WorkScopeBindingOwner {
             return Err(WorkScopeError::StateFenceMismatch);
         }
         Ok(self.snapshot.clone())
+    }
+
+    /// Decides whether the retained `WorkScope` profile includes both source
+    /// and persistence recipient classes for these exact event bytes.
+    ///
+    /// The profile and its policy revision come from this owner snapshot,
+    /// never from the event or a caller-supplied verdict. Provider restriction
+    /// and event-retention terms are not present in the `WorkScope` owner yet, so
+    /// this decision always withholds verbatim retention and requires a
+    /// deterministic redacted representation. The returned class findings let
+    /// the consumer distinguish an out-of-profile event from missing
+    /// provider/retention evidence.
+    pub fn decide_bridge_event_privacy(
+        &self,
+        input: &BridgeEventPrivacyInput<'_>,
+        state_fence: &StateFence,
+    ) -> Result<BridgeEventPrivacyDecision, WorkScopeError> {
+        let snapshot = self.read_current(state_fence)?;
+        if input.scope_ref != snapshot.binding.scope.scope_ref.as_str()
+            || input.scope_generation != snapshot.binding.scope.generation
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        let source_class_in_profile = snapshot.privacy.admits(input.source_class);
+        let recipient_class_in_profile = snapshot.privacy.admits(input.recipient_class);
+        let redaction_reason = if !source_class_in_profile {
+            BridgeEventPrivacyRedactionReason::SourceClassOutsideProfile
+        } else if !recipient_class_in_profile {
+            BridgeEventPrivacyRedactionReason::RecipientClassOutsideProfile
+        } else {
+            BridgeEventPrivacyRedactionReason::ProviderAndRetentionEvidenceUnavailable
+        };
+        Ok(BridgeEventPrivacyDecision {
+            source_sha256: eliot_contracts::sha256_hex(input.source_bytes),
+            scope_ref: snapshot.binding.scope.scope_ref,
+            scope_generation: snapshot.binding.scope.generation,
+            policy_revision: snapshot.owner_revision,
+            source_class: input.source_class,
+            recipient_class: input.recipient_class,
+            source_class_assessment: if source_class_in_profile {
+                BridgeEventPrivacyClassAssessment::InProfileUnverified
+            } else {
+                BridgeEventPrivacyClassAssessment::OutsideProfileUnverified
+            },
+            recipient_class_assessment: if recipient_class_in_profile {
+                BridgeEventPrivacyClassAssessment::InProfileUnverified
+            } else {
+                BridgeEventPrivacyClassAssessment::OutsideProfileUnverified
+            },
+            provider_restriction_evidence: BridgeEventPrivacyEvidenceStatus::Unavailable,
+            retention_policy_evidence: BridgeEventPrivacyEvidenceStatus::Unavailable,
+            raw_retention: BridgeEventRawRetentionDecision::NotAdmitted,
+            persistence: BridgeEventPersistenceDisposition::DeterministicRedactionRequired,
+            redaction_reason,
+        })
     }
 }
 
@@ -3156,19 +3311,19 @@ mod tests {
             privacy_class: PrivacyClass::Internal,
             governing_source_generation: 1,
         };
-        let receipt = ScopeBindingGuard.check(
-            &binding,
-            &binding,
-            &source_set(&one),
-            &PrivacyProfile {
-                admitted_classes: vec![PrivacyClass::Internal],
-            },
-        );
+        let receipt =
+            ScopeBindingGuard.check(&binding, &binding, &source_set(&one), &privacy_profile());
         (
             StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis()),
             binding,
             receipt,
         )
+    }
+
+    fn privacy_profile() -> PrivacyProfile {
+        PrivacyProfile {
+            admitted_classes: vec![PrivacyClass::Internal],
+        }
     }
 
     fn source_set(scope: &WorkScopeCandidate) -> GoverningSourceSet {
@@ -3336,8 +3491,13 @@ mod tests {
     #[test]
     fn current_binding_owner_constructs_recovers_and_reads_a_clone() {
         let (state_fence, binding, receipt) = binding_fixture();
-        let snapshot = match WorkScopeBindingSnapshot::new(state_fence.clone(), 7, binding, receipt)
-        {
+        let snapshot = match WorkScopeBindingSnapshot::new(
+            state_fence.clone(),
+            7,
+            binding,
+            privacy_profile(),
+            receipt,
+        ) {
             Ok(value) => value,
             Err(error) => panic!("binding snapshot fixture is invalid: {error}"),
         };
@@ -3378,6 +3538,7 @@ mod tests {
             expected_fence.clone(),
             1,
             binding.clone(),
+            privacy_profile(),
             receipt.clone(),
         ) {
             Ok(value) => value,
@@ -3396,7 +3557,7 @@ mod tests {
             Err(WorkScopeError::StateFenceMismatch)
         );
         assert_eq!(
-            WorkScopeBindingSnapshot::new(expected_fence, 0, binding, receipt),
+            WorkScopeBindingSnapshot::new(expected_fence, 0, binding, privacy_profile(), receipt,),
             Err(WorkScopeError::InvalidCounter {
                 field: "owner_revision"
             })
@@ -3408,7 +3569,7 @@ mod tests {
         let (state_fence, binding, mut receipt) = binding_fixture();
         receipt.disposition = ScopeBindingDisposition::DifferentInstance;
         assert_eq!(
-            WorkScopeBindingSnapshot::new(state_fence, 1, binding, receipt),
+            WorkScopeBindingSnapshot::new(state_fence, 1, binding, privacy_profile(), receipt,),
             Err(WorkScopeError::BindingReceiptNotMatched)
         );
     }
@@ -3437,6 +3598,7 @@ mod tests {
                     state_fence.clone(),
                     1,
                     binding.clone(),
+                    privacy_profile(),
                     drifted_receipt,
                 ),
                 Err(WorkScopeError::BindingReceiptMismatch)
@@ -3452,6 +3614,7 @@ mod tests {
             "state_fence": state_fence,
             "owner_revision": 1,
             "binding": binding,
+            "privacy": privacy_profile(),
             "guard_receipt": receipt,
         });
         assert!(serde_json::from_value::<WorkScopeBindingSnapshot>(invalid).is_err());

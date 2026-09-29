@@ -94,14 +94,15 @@ use eliot_testd_core::{
 };
 use eliot_workscope::{
     AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
-    ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
-    GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
-    IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
-    OnboardingSingleFlight, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
-    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
-    ResolutionRequest, ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    BridgeEventPrivacyDecision, BridgeEventPrivacyInput, ColdStartController, ColdStartTrigger,
+    DiscoveryLeaseKey, DiscoveryReadLease, GenerationEvidence, GoverningSourceAdmission,
+    GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence, IdentityLegOutcome,
+    LeaseJoin, LooseScanQuarantine, MaterialAdmission, MaterialReadinessDirective,
+    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingSingleFlight,
+    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
@@ -885,6 +886,9 @@ pub enum CompositionError {
         missing_observed_binding: bool,
         missing_source_closure: bool,
     },
+    /// The retained `WorkScope` privacy owner could not decide the request.
+    #[error("WorkScope privacy decision failed: {0}")]
+    WorkScopePrivacy(WorkScopeError),
     /// A live workspace observation named several instances at a use boundary,
     /// so the scope stays `AMBIGUOUS` and no candidate is selected (I4.2.1).
     #[error(
@@ -4723,6 +4727,31 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(check_at_trigger(&snapshot.binding, observed, None, trigger))
     }
 
+    /// Resolves bridge-event privacy through the current retained `WorkScope`
+    /// owner (issue #1934, W5/AUD1 owner seam).
+    ///
+    /// The owner binds the exact event bytes, source and recipient privacy
+    /// classes, `WorkScope` identity/generation, and retained privacy policy
+    /// revision. It explicitly withholds raw retention while provider
+    /// restrictions and event-retention terms are absent from the current
+    /// owner evidence; callers must stage the deterministic redacted form.
+    pub fn decide_bridge_event_privacy(
+        &self,
+        input: &BridgeEventPrivacyInput<'_>,
+    ) -> Result<BridgeEventPrivacyDecision, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; event privacy admission is unavailable".to_owned(),
+            )
+        })?;
+        owner
+            .decide_bridge_event_privacy(input, &self.snapshot.state_fence())
+            .map_err(CompositionError::WorkScopePrivacy)
+    }
+
     /// Admits one trigger-gated operation against live `WorkScope` authority
     /// (issue #1787, admission wiring).
     ///
@@ -4973,8 +5002,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "relocation source closure is not matched for the observed instance".to_owned(),
             ));
         }
-        let snapshot = WorkScopeBindingSnapshot::new(fence, owner_revision, relocated, fresh)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let snapshot =
+            WorkScopeBindingSnapshot::new(fence, owner_revision, relocated, privacy.clone(), fresh)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         WorkScopeBindingOwner::new(snapshot)
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
@@ -8593,6 +8623,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "state_fence": fence,
             "owner_revision": 1,
+            "privacy": {"admitted_classes": ["INTERNAL"]},
             "binding": {
                 "scope": {
                     "scope_ref": "scope:work",

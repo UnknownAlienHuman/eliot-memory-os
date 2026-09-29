@@ -279,6 +279,7 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             StoreRecoveryAction::None,
             ctx,
         ),
+        CompositionError::WorkScopePrivacy(error) => map_work_scope_privacy_error(&error, ctx),
         CompositionError::StartupOrder { .. } => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "STARTUP_ORDER",
@@ -349,6 +350,69 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             trigger,
             missing_observed_binding,
             missing_source_closure,
+        ),
+    }
+}
+
+fn map_work_scope_privacy_error(
+    error: &eliot_workscope::WorkScopeError,
+    ctx: &StoreFailureIdentityContext,
+) -> SkillError {
+    use eliot_workscope::WorkScopeError;
+
+    match error {
+        WorkScopeError::InvalidStateFence | WorkScopeError::StateFenceMismatch => {
+            map_composition_store_failure(
+                StoreFailureDisposition::Conflict,
+                "WORKSCOPE_PRIVACY_FENCE_MISMATCH",
+                StoreRetryDirective::NewIdentityAfterCondition,
+                StoreRecoveryAction::RefreshStateFence,
+                ctx,
+            )
+        }
+        WorkScopeError::BindingReceiptMismatch | WorkScopeError::BindingReceiptNotMatched => {
+            map_composition_store_failure(
+                StoreFailureDisposition::DeterministicRejection,
+                "WORKSCOPE_PRIVACY_SCOPE_MISMATCH",
+                StoreRetryDirective::DoNotRetry,
+                StoreRecoveryAction::None,
+                ctx,
+            )
+        }
+        WorkScopeError::PrivacyDenied | WorkScopeError::PrivacyProfileUnavailable => {
+            map_composition_store_failure(
+                StoreFailureDisposition::Denied,
+                "WORKSCOPE_PRIVACY_NOT_ADMITTED",
+                StoreRetryDirective::DoNotRetry,
+                StoreRecoveryAction::None,
+                ctx,
+            )
+        }
+        WorkScopeError::InvalidText { .. }
+        | WorkScopeError::InvalidDigest { .. }
+        | WorkScopeError::InvalidCounter { .. }
+        | WorkScopeError::DuplicateReference { .. }
+        | WorkScopeError::EmptyCollection { .. }
+        | WorkScopeError::AmbiguousObservation { .. }
+        | WorkScopeError::InvalidSourceEvidence
+        | WorkScopeError::SourceIdentityMismatch
+        | WorkScopeError::SourceSetMismatch
+        | WorkScopeError::UnresolvedSourceConflict
+        | WorkScopeError::TaskAuthorityDenied
+        | WorkScopeError::ScanContourNotAdmitted
+        | WorkScopeError::ScanIdentityConflict
+        | WorkScopeError::ScanReceiptMissing
+        | WorkScopeError::ScanReceiptInaccessible
+        | WorkScopeError::ScanReceiptCorrupt
+        | WorkScopeError::ScanReceiptReplaced
+        | WorkScopeError::ScanReceiptStale
+        | WorkScopeError::ScanReceiptInvalidated
+        | WorkScopeError::ScanReceiptUnknownCommit => map_composition_store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "WORKSCOPE_PRIVACY_OWNER_INVALID",
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
         ),
     }
 }
