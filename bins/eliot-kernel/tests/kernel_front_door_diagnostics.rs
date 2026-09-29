@@ -992,6 +992,7 @@ fn source_api_diff_and_family_partition_guard() {
         !cargo_toml.contains("kernel-front-door-diagnostics"),
         "no manifest changes"
     );
+    let mut owned_all = String::new();
     for owned in [
         "src/agent_bridge.rs",
         "src/daemon_request_dispatch.rs",
@@ -1002,14 +1003,64 @@ fn source_api_diff_and_family_partition_guard() {
     ] {
         let src = std::fs::read_to_string(manifest_dir.join(owned)).expect("owned readable");
         assert!(
-            !src.contains("pub fn observe_"),
-            "no new public visibility in {owned}"
-        );
-        assert!(
             !src.contains("install_kernel_diagnostics"),
             "no new subscriber"
         );
         assert!(!src.contains("dedup"), "no global dedup");
+        owned_all.push_str(&src);
+    }
+    // F-LOG-KERNEL-1 (#897 T26): the owned modules expose exactly the four
+    // #897 transport-act observers and no other public observe_ surface.
+    for required in [
+        "pub fn observe_front_door_accepted",
+        "pub fn observe_front_door_accept_fenced",
+        "pub fn observe_frame_read_input",
+        "pub fn observe_frame_write_outcome",
+    ] {
+        assert!(
+            owned_all.contains(required),
+            "required owned observer missing: {required}"
+        );
+    }
+    assert_eq!(
+        owned_all.matches("pub fn observe_").count(),
+        4,
+        "exactly the four owned observers, no extras"
+    );
+    // F-LOG-KERNEL-1 (#897 T26): the owned-file loop above cannot see an edit
+    // to an unowned file, so the driver carries an explicit allowlist: the
+    // four #897 transport-act callsites must be present, and no other
+    // observe_ symbol may appear on any driver line.
+    let driver_src =
+        std::fs::read_to_string(manifest_dir.join("src/front_door_driver.rs")).expect("driver");
+    for required in [
+        "KernelComposition::observe_front_door_accepted()",
+        "KernelComposition::observe_front_door_accept_fenced()",
+        "KernelComposition::observe_frame_read_input(",
+        "KernelComposition::observe_frame_write_outcome(",
+    ] {
+        assert!(
+            driver_src.contains(required),
+            "required #897 callsite missing in driver: {required}"
+        );
+    }
+    for (index, line) in driver_src.lines().enumerate() {
+        if line.contains("observe_") {
+            assert!(
+                [
+                    "observe_entrypoint_with_detail",
+                    "observe_host",
+                    "observe_front_door_accepted",
+                    "observe_front_door_accept_fenced",
+                    "observe_frame_read_input",
+                    "observe_frame_write_outcome",
+                ]
+                .iter()
+                .any(|allowed| line.contains(allowed)),
+                "unexpected observe callsite at driver line {}: {line}",
+                index + 1
+            );
+        }
     }
     let (kernel, _guard) = test_kernel();
     let (logs, result) = capture_with(|| {

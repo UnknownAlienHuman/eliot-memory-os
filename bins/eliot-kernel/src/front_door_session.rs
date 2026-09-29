@@ -434,11 +434,13 @@ impl KernelComposition {
     /// Returns a peer set paired with the exact revision observed before and
     /// after construction.
     ///
-    /// Diagnostic wrapper: preserves the exact revision pair, emits the
-    /// snapshot observation with the retained revision, and keeps one
-    /// designated terminal per underlying failure. The snapshot path calls
-    /// the uninstrumented builder while it owns the transition read guard, so
-    /// this wrapper emits the terminal for both builder failures and churn.
+    /// Diagnostic wrapper: preserves the exact revision pair and emits the
+    /// snapshot observation with the retained revision. Observation only:
+    /// the single designated terminal for a failed snapshot is `exit_error`
+    /// (`COMPOSITION_FAILURE`), so this wrapper never terminalises and one
+    /// failed snapshot yields exactly one terminal record. The snapshot path
+    /// calls the uninstrumented builder while it owns the transition read
+    /// guard.
     #[cfg(windows)]
     pub fn front_door_peer_set_snapshot(
         &self,
@@ -447,8 +449,12 @@ impl KernelComposition {
         let Ok(_transition) = self.agent_bridge_transition_read() else {
             let error =
                 KernelBuildError::Principal("bridge profile transition lock poisoned".to_owned());
+            // F-LOG-KERNEL-1 (#897 W5): info-only correlate. The single
+            // designated terminal for this startup failure is `exit_error`
+            // (`COMPOSITION_FAILURE`); the sibling startup bind in
+            // `front_door_listener.rs` terminalises nothing for the same
+            // reason.
             observe_front_door_session("kernel.front_door_peer_set_snapshot", "fenced");
-            super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(&error));
             return Err(error);
         };
         observe_front_door_session("kernel.front_door_peer_set_snapshot", "attempt");
@@ -458,13 +464,15 @@ impl KernelComposition {
                 observe_peer_snapshot(*revision, "success");
             }
             Err(error) => {
+                // F-LOG-KERNEL-1 (#897 W5): info-only correlate for builder
+                // failures and churn alike; `exit_error` owns the single
+                // designated terminal, so no terminal is emitted here.
                 let is_churn = matches!(error, KernelBuildError::Principal(reason) if reason.contains("changed continuously"));
                 if is_churn {
                     observe_peer_snapshot(self.agent_bridge_peer_set_revision(), "fenced");
                 } else {
                     observe_front_door_session("kernel.front_door_peer_set_snapshot", "fenced");
                 }
-                super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(error));
             }
         }
         result
