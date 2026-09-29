@@ -2068,20 +2068,21 @@ fn main() -> Result<()> {
 /// `claude` and `claude-desktop` share the facade's `ClaudeGoverned` profile
 /// (`mcp_stdio.rs::resolve_effective_profile`), so the same owner argv serves
 /// both; `opencode` default-profile sessions move to the same owner contour.
-/// Every other host/profile keeps the legacy route: notably the Codex
-/// `codex_controller` profile, whose behavior home is the `eliot-mcp` track
-/// per `docs/release/WINDOWS_X64_RELEASE.md`, has no current-owner entry
-/// point and is never translated into a different contour here.
+/// Every other host/profile has no Bridge contour and is rejected, never
+/// served: notably the Codex `codex_controller` profile, whose behavior home
+/// is the `eliot-mcp` track per `docs/release/WINDOWS_X64_RELEASE.md`, has
+/// no current-owner entry point and is never translated into a different
+/// contour here.
 const BRIDGE_DELEGATED_MCP_HOSTS: &[&str] = &["claude", "claude-desktop", "opencode"];
 
-/// Flagged MCP front-door delegation (issue #2562; flag owned by
-/// #1719, refusal gate owned by #1858; delegated hosts extended under #18).
+/// Retired-host MCP front-door delegation (issue #2562; flag owned by
+/// #1719, refusal gate owned by #1858; delegated hosts extended under #18;
+/// unconditional cutover under #1858 AUD1/3).
 ///
-/// Once `ELIOT_CLAUDE_FRONT_DOOR=agent-bridge` retires a delegated host edge
-/// (see [`BRIDGE_DELEGATED_MCP_HOSTS`]), this process never serves MCP
-/// itself: it launches exactly one owned `eliot-agent-bridge.exe` child with
-/// the documented MCP argv and transfers the stdio session to it, then
-/// reports the child's exit status. The
+/// A delegated host edge (see [`BRIDGE_DELEGATED_MCP_HOSTS`]) never serves
+/// MCP itself: this process launches exactly one owned
+/// `eliot-agent-bridge.exe` child with the documented MCP argv and transfers
+/// the stdio session to it, then reports the child's exit status. The
 /// delegation is mechanical and runs before any legacy semantic
 /// initialization: no Governor, Store, WAL, or writer object is constructed
 /// on this path, and the shared `daemon run` runtime is never touched.
@@ -2123,7 +2124,7 @@ fn delegate_host_mcp_to_agent_bridge(host: &str) -> Result<std::process::ExitSta
     let bridge = exe_dir.join(BRIDGE_BINARY);
     if !bridge.is_file() {
         anyhow::bail!(
-            "flagged {host} MCP front door is selected but the approved Bridge artifact is missing: {} (Bridge exe ships beside the installed Governor; refusing without legacy fallback)",
+            "retired {host} MCP front door cannot delegate: the approved Bridge artifact is missing: {} (Bridge exe ships beside the installed Governor; refusing without legacy fallback)",
             bridge.display()
         );
     }
@@ -2141,7 +2142,7 @@ fn delegate_host_mcp_to_agent_bridge(host: &str) -> Result<std::process::ExitSta
     let declaration = exe_dir.join(DECLARATION_DIR).join(DECLARATION_FILE);
     if !declaration.is_file() {
         anyhow::bail!(
-            "flagged {host} MCP front door is selected but the installation-owned client declaration is missing: {} (refusing without legacy fallback; the bundle never invents it)",
+            "retired {host} MCP front door cannot delegate: the installation-owned client declaration is missing: {} (refusing without legacy fallback; the bundle never invents it)",
             declaration.display()
         );
     }
@@ -2159,13 +2160,13 @@ fn delegate_host_mcp_to_agent_bridge(host: &str) -> Result<std::process::ExitSta
         .spawn()
         .with_context(|| {
             format!(
-                "launch flagged {host} MCP front door {}",
+                "launch retired {host} MCP front door {}",
                 bridge_canonical.display()
             )
         })?;
     child.wait().with_context(|| {
         format!(
-            "wait for flagged {host} MCP front door {}",
+            "wait for retired {host} MCP front door {}",
             bridge_canonical.display()
         )
     })
@@ -2248,22 +2249,19 @@ async fn dispatch_command(
     command: Command,
     implicit_instance: Option<&str>,
 ) -> Result<()> {
-    // #1858 (I19.10): single front-door entry gate. Once the flag selects the
-    // new stack, every legacy entrypoint except `mcp stdio` refuses here with
-    // the stable cutover code plus canonical-route receipt, before any arm
-    // handler runs. MCP stdio falls through to its host-aware arm: only the
-    // exact `--host claude` branch delegates to Bridge; every other host is
-    // rejected there with host evidence before `mcp_stdio::run`. Absent or
-    // unknown flag values preserve today's behavior on every arm.
-    if front_door_cutover::front_door_cutover_selected()
-        && !matches!(
-            command,
-            Command::Mcp {
-                command: McpCommand::Stdio { .. },
-            }
-        )
-        && let Err(detail) =
-            front_door_cutover::gate_legacy_entrypoint(legacy_entrypoint_label(&command), None)
+    // #1858 (I19.10; AUD1/3/4): single front-door entry gate. Every legacy
+    // entrypoint except `mcp stdio` refuses here unconditionally — no ambient
+    // operator flag — with the stable cutover code plus canonical-route
+    // receipt, before any arm handler runs. MCP stdio falls through to its
+    // host-aware arm: delegated hosts redirect to Bridge; every other host
+    // is rejected there with host evidence before `mcp_stdio::run`.
+    if !matches!(
+        command,
+        Command::Mcp {
+            command: McpCommand::Stdio { .. },
+        }
+    ) && let Err(detail) =
+        front_door_cutover::gate_legacy_entrypoint(legacy_entrypoint_label(&command), None)
     {
         front_door_cutover::write_cutover_rejection(
             front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
@@ -2329,9 +2327,9 @@ async fn dispatch_command(
                 force,
             } => commands::run_daemon_init_default(config, &source_config, force),
             DaemonCommand::Run { instance } => {
-                // #1858 (I19.10): refused at the `dispatch_command` entry gate
-                // once the front-door flag selects the new stack, before
-                // DbClientSet, CanonicalStore, ControlWal, or WriterActor.
+                // #1858 (I19.10; AUD4): refused unconditionally at the
+                // `dispatch_command` entry gate, before DbClientSet,
+                // CanonicalStore, ControlWal, or WriterActor.
                 commands::run_daemon(
                     config,
                     selected_instance(instance, implicit_instance).as_deref(),
@@ -2357,9 +2355,9 @@ async fn dispatch_command(
         },
         Command::Service { command } => match command {
             ServiceCommand::Run => {
-                // #1858 (I19.10): refused at the `dispatch_command` entry gate
-                // on the same terms as `daemon run`, before the Windows
-                // service dispatcher starts.
+                // #1858 (I19.10; AUD4): refused unconditionally at the
+                // `dispatch_command` entry gate on the same terms as
+                // `daemon run`, before the Windows service dispatcher starts.
                 windows_service::run_dispatcher().map_err(Into::into)
             }
             ServiceCommand::Validate => commands::run_service_validate(config),
@@ -2655,9 +2653,9 @@ async fn dispatch_command(
         Command::Adapter { command } => dispatch_adapter_command(config, command).await,
         Command::Verifier { command } => dispatch_verifier_command(config, command).await,
         Command::Hook { command } => {
-            // #1858 (I19.10): refused at the `dispatch_command` entry gate
-            // once the front-door flag selects the new stack, before any hook
-            // processing or store-backed work starts.
+            // #1858 (I19.10; AUD3): refused unconditionally at the
+            // `dispatch_command` entry gate, before any hook processing or
+            // store-backed work starts.
             dispatch_hook_command(config, command)
         }
         Command::Mcp {
@@ -2668,17 +2666,17 @@ async fn dispatch_command(
                     instance,
                 },
         } => {
-            // #1858 (I19.5, I19.10), #2562, #18 W11: only the exact
-            // ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selection with a delegated
+            // #1858 (I19.5, I19.10; AUD1/3), #2562, #18 W11: a delegated
             // host value (`BRIDGE_DELEGATED_MCP_HOSTS`) at the exact
-            // inventoried default profile delegates to the approved Bridge.
-            // Its redirect receipt goes to stderr, keeping stdout available
-            // for the delegated JSON-RPC session. Every other host/profile,
-            // including the Codex `codex_controller` profile, receives a
-            // structured cutover rejection with its supplied host evidence
-            // before `mcp_stdio::run`; an absent or unknown flag preserves
-            // the existing route. A delegated path returns before legacy
-            // daemon, store, ControlWal, or WriterActor initialization.
+            // inventoried default profile delegates to the approved Bridge
+            // unconditionally — no ambient operator flag. Its redirect
+            // receipt goes to stderr, keeping stdout available for the
+            // delegated JSON-RPC session. Every other host/profile,
+            // including the Codex `codex_controller` profile (no Bridge
+            // contour per #18 W11), receives a structured cutover rejection
+            // with its supplied host evidence before `mcp_stdio::run`.
+            // A delegated path returns before legacy daemon, store,
+            // ControlWal, or WriterActor initialization.
             //
             // #2562: on the selected path this process additionally delegates
             // to the approved Bridge instead of stopping at the refusal. A
