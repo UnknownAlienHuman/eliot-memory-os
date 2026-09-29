@@ -171,8 +171,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public bool IsGraphPage => CurrentPage.Tag == "causal_provenance" || (IsQueryPage && ResultMode == "graph");
     public bool IsUserAutomationPage => CurrentPage.Tag == "user_automation";
     public bool IsBusy { get => _isBusy; private set => Set(ref _isBusy, value); }
-    public string ProjectId { get => _projectId; set => Set(ref _projectId, BoundInput(value)); }
-    public string TaskId { get => _taskId; set => Set(ref _taskId, BoundInput(value)); }
+    public string ProjectId
+    {
+        get => _projectId;
+        set
+        {
+            if (Set(ref _projectId, BoundInput(value))) InvalidateForScopeChange();
+        }
+    }
+    public string TaskId
+    {
+        get => _taskId;
+        set
+        {
+            if (Set(ref _taskId, BoundInput(value))) InvalidateForScopeChange();
+        }
+    }
     public string FilterText { get => _filterText; set => Set(ref _filterText, BoundInput(value)); }
     public string KindFilter { get => _kindFilter; set => Set(ref _kindFilter, BoundInput(value)); }
     public string StatusFilter { get => _statusFilter; set => Set(ref _statusFilter, BoundInput(value)); }
@@ -266,8 +280,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         CurrentPage = OperatorPageCatalog.All.FirstOrDefault(page => page.Tag == section)
             ?? OperatorPageCatalog.All[0];
-        _nextCursor = null;
-        _graphSelectedRef = null;
+        InvalidateForScopeChange();
         await RefreshAsync();
     }
 
@@ -331,6 +344,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public async Task ExecuteSelectedActionAsync()
     {
+        if (IsBusy)
+        {
+            SetBanner("Projection is changing", "Wait for the current request to finish before using a selected action.", OperatorBannerSeverity.Informational);
+            return;
+        }
         if (SelectedAction is null || SelectedRecord is null)
         {
             SetBanner("No action selected", "Select a record and one typed action.", OperatorBannerSeverity.Warning);
@@ -1505,13 +1523,35 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // before the new page is applied. The task context in particular
             // carries the owner task revision used as `expected_revision`, so
             // keeping it would send a mutation against a rotated revision.
-            _nextCursor = null;
-            _graphSelectedRef = null;
-            _taskContext = null;
-            ResultPayloadText = string.Empty;
-            ResultSummary = "No projection loaded.";
+            ClearDependentProjectionState("No projection loaded.");
         }
         return rotated;
+    }
+
+    /// A locally changed scope or page no longer describes the currently
+    /// displayed projection. Drop that rebuildable context immediately, before
+    /// the next owner request starts; pending operation identities stay intact.
+    private void InvalidateForScopeChange()
+    {
+        // A response started for the previous page or scope must not apply
+        // after this local binding changes. LoadPageAsync checks this token
+        // immediately after the owner call returns, before using the page.
+        _requestCancellation?.Cancel();
+        _projectionBinding = null;
+        ClearDependentProjectionState("No projection loaded for the current scope.");
+    }
+
+    private void ClearDependentProjectionState(string summary)
+    {
+        Records.Clear();
+        SelectedRecord = null;
+        SelectedAction = null;
+        _nextCursor = null;
+        _graphSelectedRef = null;
+        _taskContext = null;
+        ResultPayloadText = string.Empty;
+        ResultSummary = summary;
+        NotifyCounts();
     }
 
     /// One bounded page request size, pinned to the owner's declared page
