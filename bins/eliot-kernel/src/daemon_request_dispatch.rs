@@ -5133,50 +5133,46 @@ impl KernelComposition {
         // as this contour did, reached the Durable Job owner with no
         // `UserAutomationDurableJobMaterial` at all and so could never reach
         // `HostDurableJobOwner::dreamer_job`.
-        let execution = match Self::user_automation_due_wake_join(
-            client,
-            &request,
-            &resolution,
-            &readback,
-        )
-        .await
-        {
-            Ok(execution) => execution,
-            // Item 6, terminal leg. A refusal the Durable Job owner answered
-            // before any owner effect is a decided disposition about this
-            // occurrence, exactly as an admission is: the occurrence will not be
-            // admitted now, so leaving the recurring horizon pinned to it would
-            // wedge every later occurrence of the revision behind one
-            // permanently-refused wake. It advances through the same
-            // owner-acknowledged path the admitted branch uses, and it is
-            // reported as its own disposition rather than as a success.
-            //
-            // `Unavailable`, `NotRetained`, `UnknownOutcome` and
-            // `OutcomeSettled` deliberately do not reach this arm: none of them
-            // is an owner-acknowledged disposition about this occurrence. They
-            // respectively mean the owner could not answer, it answered about
-            // another record, it cannot say whether the effect landed, and the
-            // effect provably landed. Those keep the pre-existing fail-closed
-            // projection and do not advance.
-            Err(error @ UserAutomationRuntimeError::Rejected(_)) => {
-                return Self::user_automation_due_wake_terminal_response(
-                    session,
-                    &resolution,
-                    &occurrence_id,
-                    &request,
-                    &readback,
-                    client,
-                    error,
-                )
-                .await;
-            }
-            Err(error) => {
-                // No owner acknowledged a disposition, so the recurring horizon
-                // does not advance: this wake is still unconsumed and a later
-                // owner-issued submission can admit it.
-                return Ok(Self::user_automation_runtime_error_response(error));
-            }
-        };
+        let execution =
+            match Self::user_automation_due_wake_join(client, &request, &resolution, &readback)
+                .await
+            {
+                Ok(execution) => execution,
+                // Item 6, terminal leg. A refusal the Durable Job owner answered
+                // before any owner effect is a decided disposition about this
+                // occurrence, exactly as an admission is: the occurrence will not be
+                // admitted now, so leaving the recurring horizon pinned to it would
+                // wedge every later occurrence of the revision behind one
+                // permanently-refused wake. It advances through the same
+                // owner-acknowledged path the admitted branch uses, and it is
+                // reported as its own disposition rather than as a success.
+                //
+                // `Unavailable`, `NotRetained`, `UnknownOutcome` and
+                // `OutcomeSettled` deliberately do not reach this arm: none of them
+                // is an owner-acknowledged disposition about this occurrence. They
+                // respectively mean the owner could not answer, it answered about
+                // another record, it cannot say whether the effect landed, and the
+                // effect provably landed. Those keep the pre-existing fail-closed
+                // projection and do not advance.
+                Err(error @ UserAutomationRuntimeError::Rejected(_)) => {
+                    return Self::user_automation_due_wake_terminal_response(
+                        session,
+                        &resolution,
+                        &occurrence_id,
+                        &request,
+                        &readback,
+                        client,
+                        error,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    // No owner acknowledged a disposition, so the recurring horizon
+                    // does not advance: this wake is still unconsumed and a later
+                    // owner-issued submission can admit it.
+                    return Ok(Self::user_automation_runtime_error_response(error));
+                }
+            };
         if let Err(error) = execution.validate() {
             return Ok(Self::user_automation_runtime_error_response(
                 UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -5299,11 +5295,11 @@ impl KernelComposition {
         UserAutomationRuntimeError,
     > {
         let runtime = UserAutomationOperatorRuntime::new(client);
-        Box::pin(runtime.admit_occurrence(Self::user_automation_due_wake_admission(
-            request,
-            resolution,
-            readback,
-        )))
+        Box::pin(
+            runtime.admit_occurrence(Self::user_automation_due_wake_admission(
+                request, resolution, readback,
+            )),
+        )
         .await
     }
 
