@@ -794,12 +794,16 @@ fn gate_requirement_profile(
             ),
         });
     };
-    let admitted = compiled
-        .require_kind(kind)
-        .map_err(|error| EngineError::ServiceNotReady {
-            service: "instrument-profile".to_owned(),
-            reason: format!("profile compiler rejected the verifier claim: {error}"),
-        })?;
+    let Some(admitted) =
+        compiled
+            .require_kind(kind)
+            .map_err(|error| EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!("profile compiler rejected the verifier claim: {error}"),
+            })?
+    else {
+        return Ok(None);
+    };
     let pinned = ProfileCompiler::new(registry)
         .compile_exact(name, admitted.revision)
         .map_err(|error| EngineError::ServiceNotReady {
@@ -816,7 +820,7 @@ fn gate_requirement_profile(
             ),
         });
     }
-    Ok(admitted.cloned())
+    Ok(Some(admitted.clone()))
 }
 
 fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {
