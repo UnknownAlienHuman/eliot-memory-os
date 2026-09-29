@@ -777,7 +777,8 @@ class ClippyBaselineAcceptance(unittest.TestCase):
                 result[stem] = {"exit": proc.returncode, "stderr": proc.stderr}
         return result
 
-    def _build_ledger(self) -> list[dict]:
+    @classmethod
+    def _build_ledger(cls) -> list[dict]:
         """Build the accounting ledger from measured current evidence.
 
         Every row is derived from the live capture, then annotated with the
@@ -864,7 +865,7 @@ class ClippyBaselineAcceptance(unittest.TestCase):
             "reachability": "n/a",
         })
         # 5. the policy residuals, owner-blocked
-        for path, line in sorted({(r["path"], r["line"]) for r in self.in_scope_policy}):
+        for path, line in sorted({(r["path"], r["line"]) for r in cls.in_scope_policy}):
             ledger.append({
                 "key": "current/%s:%d:%s" % (path, line, POLICY_LINT),
                 "kind": "current",
@@ -883,7 +884,7 @@ class ClippyBaselineAcceptance(unittest.TestCase):
             })
         # 6. every other measured in-scope row that this branch did not select
         present = {r["key"] for r in ledger}
-        for row in self.in_scope_rows:
+        for row in cls.in_scope_rows:
             key = "current/%s:%s:%s" % (row["path"], row["line"], row["code"])
             if key in present:
                 continue
@@ -918,7 +919,7 @@ class ClippyBaselineAcceptance(unittest.TestCase):
             "reachability": "crates/governor/eliot-coordination/src/work_lease_issuance.rs (crate target eliot_coordination)",
         })
         # 8. every measured hard error, kept explicit
-        for row in self.current_errors:
+        for row in cls.current_errors:
             key = "current/%s:%s:%s" % (row["path"], row["line"], row["code"])
             if key in present:
                 continue
