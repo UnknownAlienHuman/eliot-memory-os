@@ -5191,7 +5191,7 @@ use journal_append::{
 // `ActivationTriggerClass` vocabulary, never from literals at the call site.
 use activation_lifecycle::{
     CAPABILITY_CANONICAL_STORE, CAPABILITY_INDEPENDENT_SUPERVISION, CAPABILITY_RUNTIME_SUPERVISION,
-    requires_capability,
+    is_fresh_admitting_observation, prove_terminal_runtime_release, requires_capability,
 };
 
 mod store_recovery_fence;
@@ -8484,10 +8484,7 @@ impl HostComposition {
                 "live supervision binding has no admitted readiness predecessor".to_owned(),
             )
         })?;
-        if observation.fence.activation_id != next.activation_id
-            || observation.fence.activation_generation != next.fence.activation_generation
-            || observation.evidence_refs.is_empty()
-        {
+        if !is_fresh_admitting_observation(next, observation) {
             return Err(HostError::RecoveryRequired(
                 "admitted supervision predecessor is not fresh evidence for this generation"
                     .to_owned(),
@@ -8525,6 +8522,17 @@ impl HostComposition {
             ActivationState::ControlReady | ActivationState::Active
         ) {
             self.refresh_supervision_lease_binding(&mut next)?;
+            // I1.5 W4: the same live entry issues or renews the generation's
+            // `RuntimeLease` reference from the same fresh admitting
+            // observation — never on stale predecessors, which fail closed
+            // inside the binding.
+            self.refresh_runtime_lease_binding(&mut next)?;
+        }
+        if state == ActivationState::StoppedClean {
+            // I1.5 W4 release: the clear below is a proven release, not a
+            // silent drop — every cleared reference must be this generation's
+            // own lease.
+            prove_terminal_runtime_release(&current)?;
         }
         self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
@@ -8564,6 +8572,13 @@ impl HostComposition {
             ActivationState::ControlReady | ActivationState::Active
         ) {
             self.refresh_supervision_lease_binding(&mut next)?;
+            // I1.5 W4: same live-entry `RuntimeLease` issue/renew as
+            // `transition_activation` — the production admission contour
+            // (`start_manifest_contour` below) enters its live states here.
+            self.refresh_runtime_lease_binding(&mut next)?;
+        }
+        if state == ActivationState::StoppedClean {
+            prove_terminal_runtime_release(&current)?;
         }
         self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
