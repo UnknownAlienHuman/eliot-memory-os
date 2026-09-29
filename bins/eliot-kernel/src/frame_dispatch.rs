@@ -1755,8 +1755,10 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
-        self.execute_doctor_request_with_control(session, request_id, operation, payload, false, false)
-            .await
+        self.execute_doctor_request_with_control(
+            session, request_id, operation, payload, false, false,
+        )
+        .await
     }
 
     #[allow(
@@ -2067,8 +2069,10 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
-        self.execute_testd_request_with_control(session, request_id, operation, payload, false, false)
-            .await
+        self.execute_testd_request_with_control(
+            session, request_id, operation, payload, false, false,
+        )
+        .await
     }
 
     #[allow(
