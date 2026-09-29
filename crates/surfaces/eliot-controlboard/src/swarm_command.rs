@@ -636,8 +636,11 @@ mod tests {
             Err(ControlBoardError::HiddenOrMissingTarget)
         );
 
-        // Stale expected policy revision: copied from a superseded revision,
-        // so it no longer equals the replacement identity.
+        // Stale expected policy revision fixture: the envelope carries
+        // preferences None, so the arm refuses closed with StaleView before
+        // compile_replace_policy_candidate runs; in production the
+        // expectation is compared against the CURRENT policy
+        // (request.current_policy.revision), never the replacement.
         let stale_revision = OperatorAction::ReplaceSwarmPolicy {
             policy: policy("policy-rev-7"),
             expected_policy_revision: "policy-rev-6".to_owned(),
@@ -648,8 +651,11 @@ mod tests {
             Err(ControlBoardError::StaleView)
         );
 
-        // Stale expected policy digest: revision matches but the digest no
-        // longer equals the recomputed replacement digest.
+        // Stale expected policy digest fixture: the same missing-preferences
+        // StaleView refusal fires before any compiler call; in production
+        // the expectation is compared against the CURRENT policy digest
+        // recomputed by preference_policy_digest(&request.current_policy),
+        // never the replacement's digest.
         let stale_digest = OperatorAction::ReplaceSwarmPolicy {
             policy: policy("policy-rev-7"),
             expected_policy_revision: "policy-rev-7".to_owned(),
