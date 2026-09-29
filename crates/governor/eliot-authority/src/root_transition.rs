@@ -355,7 +355,9 @@ impl RootTransitionActivationReceipt {
     /// any committed field disagrees with the presented request,
     /// [`AuthorityError::ReceiptMismatch`] when the Kernel activation receipt is
     /// not a validated `Active` receipt for the presented snapshot and epoch,
-    /// and [`AuthorityError::StaleTransitionEvidence`] when a non-committed
+    /// and [`AuthorityError::UnreconciledTransitionEvidence`] when the owner
+    /// reports an unproven commit outcome for this exact operation identity,
+    /// plus [`AuthorityError::StaleTransitionEvidence`] when a terminal
     /// disposition is claimed as authority.
     pub fn validate(
         &self,
@@ -462,10 +464,26 @@ impl RootTransitionActivationReceipt {
         {
             return Err(AuthorityError::ReceiptMismatch);
         }
-        if self.disposition != RootTransitionDisposition::Committed {
-            return Err(AuthorityError::StaleTransitionEvidence(
-                "root_transition_receipt.disposition",
-            ));
+        match self.disposition {
+            RootTransitionDisposition::Committed => {}
+            // A possible commit is not stale evidence. It is the owner saying
+            // it cannot tell whether THIS operation identity committed, so the
+            // crossing stays unadmitted under its own typed refusal and the
+            // only way out is reconciliation against that exact identity.
+            // Reporting it as stale would invite a fresh presentation, which
+            // cannot conflict with this attempt and can apply it twice.
+            RootTransitionDisposition::UnknownOutcome => {
+                return Err(AuthorityError::UnreconciledTransitionEvidence(
+                    "root_transition_receipt.outcome_unknown",
+                ));
+            }
+            // A terminal disposition is final: the owner will not commit this
+            // operation, so its evidence never becomes current.
+            RootTransitionDisposition::Terminal => {
+                return Err(AuthorityError::StaleTransitionEvidence(
+                    "root_transition_receipt.disposition",
+                ));
+            }
         }
         Ok(())
     }
@@ -732,6 +750,23 @@ impl AdmittedRootTransition {
             ors_record_ref: ors_record_ref.to_owned(),
             disposition,
         })
+    }
+
+    /// The disposition the owner receipt carried when this crossing was
+    /// admitted.
+    ///
+    /// It is read from the same receipt every other coordinate in this type
+    /// is read from, and this crate derives none of it. Both admission paths
+    /// run the shared receipt proof first, and that proof refuses any
+    /// disposition but [`RootTransitionDisposition::Committed`], so a value
+    /// read here is the owner's committed answer and nothing else. A possible
+    /// commit ([`RootTransitionDisposition::UnknownOutcome`]) and a terminal
+    /// refusal never reach an admitted value at all: both leave the crossing
+    /// unadmitted, so a caller cannot read either one here as if it had
+    /// committed.
+    #[must_use]
+    pub const fn disposition(&self) -> RootTransitionDisposition {
+        self.disposition
     }
 }
 

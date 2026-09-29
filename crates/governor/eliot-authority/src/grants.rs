@@ -13,11 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::quarantine_evidence::{QuarantineDisposition, VerifiedQuarantineBinding};
 use crate::revocation_history::{
-    AdmittedRevocationClosure, AuthorityRootRef, OriginTargetMismatch,
+    AdmittedRevocationClosure, AuthorityRootRef, ClosureIdentityConflict, OriginTargetMismatch,
     RevocationEvidenceDisposition, RevocationOrigin, ValidatedRevocationClosure,
     derive_suppressions,
 };
-use crate::root_transition::{AdmittedRootTransition, AdmittedRootTransitionRecord};
+use crate::root_transition::{
+    AdmittedRootTransition, AdmittedRootTransitionRecord, RootTransitionDisposition,
+};
 use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
 
 const REVOCATION_PAGE_EDGE_LIMIT: u64 = 256;
@@ -87,6 +89,7 @@ fn map_bounded_history_error(error: AuthorityError) -> RevocationHistoryError {
         | AuthorityError::EffectCeilingExceeded
         | AuthorityError::IdentityConflict
         | AuthorityError::StaleTransitionEvidence(_)
+        | AuthorityError::UnreconciledTransitionEvidence(_)
         | AuthorityError::StaleQuarantineEvidence(_)
         | AuthorityError::StaleEffectAuthority(_)
         | AuthorityError::InvalidLifecycleTransition
@@ -990,21 +993,49 @@ pub enum RevocationClosureState {
     },
 }
 
-/// Typed revocation-closure verdict: a complete denominator or an explicit
-/// partial/unknown state, never an omission-labelled success.
+/// Typed revocation-closure verdict: the replayable transition/record the
+/// durable descendant-closure fencing owner (#2100) consumes.
 ///
-/// The exact verdict the durable descendant-closure fencing owner (#2100)
-/// consumes: the same-root denominator, the receipt-authorized cross-root
-/// descendants with their authorizing receipts, the quarantine frontier
-/// with its CURRENT verified bindings, every traversed transition receipt,
-/// and the honest completeness state reconciling the bounded engine
-/// outcome against the live graph.
+/// The record binds the exact operation that produced it: the same-root
+/// denominator, the receipt-authorized cross-root descendants with their
+/// authorizing receipts, the quarantine frontier with its CURRENT verified
+/// bindings, every transition receipt the walk actually followed, the
+/// snapshot revision, the State Fence (hence the authority epoch), the
+/// traversal bounds the completeness claim was proven under, the engine's own
+/// recomputed request digest, and the honest completeness state reconciling
+/// the bounded engine outcome against the live graph.
+///
+/// `traversed_transitions` holds the crate's admitted transition evidence
+/// itself, not a list of transition names. A member here can only be produced
+/// by [`AdmittedRootTransition::admit`] or [`AdmittedRootTransition::admit_restored`],
+/// each of which re-verifies an owner activation receipt against CURRENT
+/// owner state, so every value in it — operation identity, idempotency key,
+/// canonical request digest, graph snapshot, fence/epoch binding, Kernel
+/// activation identity, durable ORS record, and the owner's own disposition —
+/// was supplied by the persistence owner. This crate mints none of them and
+/// cannot place an entry here that the owner did not commit, so the record
+/// never reports a transition receipt it did not receive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevocationClosureVerdict {
     /// Revoked origin.
     pub origin: GrantId,
     /// Graph revision the verdict was computed at.
     pub revision: u64,
+    /// Exact State Fence the walk and the bounded engine both ran under. The
+    /// authority epoch travels inside it, so the record binds the epoch it was
+    /// proven at rather than leaving the two to be re-derived by a consumer.
+    pub state_fence: StateFence,
+    /// Exact traversal bounds the completeness claim below was proven under. A
+    /// completeness claim is meaningless without them: the same membership
+    /// proven whole under wider bounds is a different proof.
+    pub bounds: eliot_influence::RevocationBounds,
+    /// Canonical request digest the bounded engine recomputed for the exact
+    /// request it answered, over the request id, the origin, the reason, the
+    /// fence, the declared completeness, and the qualified-edge multiset. It
+    /// is read from the engine's own outcome after `verify_binding` re-derived
+    /// and compared it, so it identifies this evaluation and not merely the
+    /// root reference it started from. This crate does not compute it.
+    pub request_digest: String,
     /// Origin authority root.
     pub authority_root_ref: String,
     /// Same-root denominator in parent-before-child order with the target
@@ -1017,10 +1048,58 @@ pub struct RevocationClosureVerdict {
     /// CURRENT verified binding when the owner supplied one. Members
     /// without a binding are explicitly legacy and unverified.
     pub quarantined_frontier: Vec<QuarantinedFrontierMember>,
-    /// Every transition receipt authorizing a followed crossing, sorted.
-    pub traversed_transitions: Vec<String>,
+    /// Admitted transition evidence for every crossing this walk followed, in
+    /// transition-id order. Each entry is the owner's own admitted record; an
+    /// entry here proves the crossing committed under the identity it names.
+    pub traversed_transitions: Vec<AdmittedRootTransition>,
     /// Honest completeness state of this closure.
     pub state: RevocationClosureState,
+}
+
+/// The structural results of one authorized dependency walk, before the
+/// bounded engine outcome is reconciled against them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClosureWalk {
+    /// Authority root the walked origin belongs to.
+    authority_root_ref: String,
+    /// Same-root denominator, parent before child, origin first.
+    members: Vec<GrantClosureMemberRef>,
+    /// Receipt-authorized cross-root descendants with the transition
+    /// identity that authorized each.
+    authorized_cross_root: Vec<AuthorizedCrossRootMember>,
+    /// Every reference the walk reached, including cross-root members.
+    reached: BTreeSet<String>,
+}
+
+/// Adds one verdict's admitted crossing evidence to a denominator's transition
+/// set, in transition-id order.
+///
+/// One transition identity, and one owner operation identity, may each appear
+/// once. A repeat that carries different content is the I5.27
+/// same-operation/changed-payload conflict and refuses whole, so a changed
+/// payload is never unioned into a second crossing under an identity that
+/// already committed different content. A repeat with identical content is one
+/// crossing seen twice and is deduplicated. Every value compared here was
+/// supplied by the persistence owner and re-verified at admission; nothing is
+/// derived from the request being re-evaluated.
+fn admit_traversed_transition(
+    traversed: &mut BTreeMap<String, AdmittedRootTransition>,
+    evidence: AdmittedRootTransition,
+) -> Result<(), AuthorityError> {
+    let conflicting = traversed.values().any(|known| {
+        let same_transition = known.record().transition_id == evidence.record().transition_id;
+        let same_operation = known.record().operation_id == evidence.record().operation_id;
+        let same_digest = known.canonical_request_digest() == evidence.canonical_request_digest();
+        (same_transition && !(same_operation && same_digest)) || (same_operation && !same_digest)
+    });
+    if conflicting {
+        return Err(AuthorityError::IdentityConflict);
+    }
+    let transition_id = evidence.record().transition_id.clone();
+    if !traversed.contains_key(&transition_id) {
+        traversed.insert(transition_id, evidence);
+    }
+    Ok(())
 }
 
 /// Owner-declared expected denominator for exactly one declared revocation
@@ -1051,8 +1130,13 @@ pub struct RevocationDenominator {
     /// Retained quarantined dependents the walk reached; their relation ids
     /// are forensic labels, not members.
     pub quarantined_frontier: Vec<QuarantinedFrontierMember>,
-    /// Every transition id authorizing a followed crossing, in order.
-    pub traversed_transitions: Vec<String>,
+    /// Admitted transition evidence for every crossing any contributing
+    /// verdict followed, in transition-id order. Every value in an entry was
+    /// supplied by the persistence owner; this crate mints none of them.
+    pub traversed_transitions: Vec<AdmittedRootTransition>,
+    /// Exact traversal bounds the completeness claim below was proven under.
+    /// Without them the claim does not identify which proof it rests on.
+    pub bounds: eliot_influence::RevocationBounds,
     /// Honest completeness of this denominator, reconciled against the
     /// bounded engine outcome. Anything but `Complete` denies it whole.
     pub completeness: RevocationClosureState,
@@ -1130,13 +1214,18 @@ impl GrantGraph {
             let record = evidence.record();
             let parent_id = GrantId::new(record.parent_grant_id.clone())?;
             let child_id = GrantId::new(record.child_grant_id.clone())?;
-            if transitions
-                .values()
-                .any(|known| known.record().transition_id == record.transition_id)
-                || transitions
-                    .insert((parent_id, child_id), evidence)
-                    .is_some()
-            {
+            // One transition identity may appear once, and one OWNER operation
+            // identity may be bound to exactly one canonical request digest.
+            // A second presentation of that operation identity carrying a
+            // DIFFERENT digest is the I5.27 same-operation/changed-payload
+            // conflict: the committed result stays authoritative, the new
+            // content is refused, and no second crossing is admitted.
+            let duplicate_identity = transitions.values().any(|known| {
+                known.record().transition_id == record.transition_id
+                    || (known.operation_id() == evidence.operation_id()
+                        && known.canonical_request_digest() != evidence.canonical_request_digest())
+            });
+            if duplicate_identity || transitions.insert((parent_id, child_id), evidence).is_some() {
                 return Err(AuthorityError::IdentityConflict);
             }
         }
@@ -1365,7 +1454,7 @@ impl GrantGraph {
         match origin {
             RevocationOrigin::Grant(grant_id) => {
                 let verdict = self.revocation_closure_verdict(grant_id, fence, bounds)?;
-                Ok(self.denominator_from_verdicts(origin, fence, [verdict]))
+                self.denominator_from_verdicts(origin, fence, bounds, [verdict])
             }
             RevocationOrigin::AuthorityRoot(root_ref) => {
                 // `BTreeMap` iteration is grant-id ordered, so the union below
@@ -1380,7 +1469,7 @@ impl GrantGraph {
                 for grant_id in owned {
                     verdicts.push(self.revocation_closure_verdict(&grant_id, fence, bounds)?);
                 }
-                Ok(self.denominator_from_verdicts(origin, fence, verdicts))
+                self.denominator_from_verdicts(origin, fence, bounds, verdicts)
             }
         }
     }
@@ -1388,17 +1477,26 @@ impl GrantGraph {
     /// Collapses the one verdict per declared origin into the single typed
     /// denominator recovery compares against, deduplicating by grant
     /// identity and keeping every honest partial/unknown frontier.
+    ///
+    /// The union is also where two contributing verdicts' transition evidence
+    /// is reconciled. The same transition id contributed by two verdicts is one
+    /// crossing, so it appears once; the same OWNER operation identity
+    /// contributed twice with two different canonical request digests is the
+    /// I5.27 same-operation/changed-payload conflict and refuses whole, so a
+    /// changed payload can never be unioned into a second crossing under an
+    /// identity that already committed different content.
     fn denominator_from_verdicts(
         &self,
         origin: &RevocationOrigin,
         state_fence: &StateFence,
+        bounds: &eliot_influence::RevocationBounds,
         verdicts: impl IntoIterator<Item = RevocationClosureVerdict>,
-    ) -> RevocationDenominator {
+    ) -> Result<RevocationDenominator, AuthorityError> {
         let mut members = BTreeSet::new();
         let mut authorized_cross_root: BTreeMap<String, AuthorizedCrossRootMember> =
             BTreeMap::new();
         let mut quarantined_frontier: BTreeMap<String, QuarantinedFrontierMember> = BTreeMap::new();
-        let mut traversed = BTreeSet::new();
+        let mut traversed: BTreeMap<String, AdmittedRootTransition> = BTreeMap::new();
         let mut frontier = BTreeSet::new();
         let mut omissions = Vec::new();
         let mut bound: BTreeMap<String, VerifiedQuarantineBinding> = BTreeMap::new();
@@ -1418,7 +1516,9 @@ impl GrantGraph {
             for member in &verdict.quarantined_frontier {
                 quarantined_frontier.insert(member.grant_id.to_string(), member.clone());
             }
-            traversed.extend(verdict.traversed_transitions.iter().cloned());
+            for evidence in verdict.traversed_transitions {
+                admit_traversed_transition(&mut traversed, evidence)?;
+            }
             match verdict.state {
                 RevocationClosureState::Complete {
                     separately_quarantined: listed,
@@ -1451,16 +1551,17 @@ impl GrantGraph {
                 separately_quarantined: bound.into_values().collect(),
             }
         };
-        RevocationDenominator {
+        Ok(RevocationDenominator {
             origin: origin.clone(),
             revision: self.revision,
             state_fence: state_fence.clone(),
             members,
             authorized_cross_root: authorized_cross_root.into_values().collect(),
             quarantined_frontier: quarantined_frontier.into_values().collect(),
-            traversed_transitions: traversed.into_iter().collect(),
+            traversed_transitions: traversed.into_values().collect(),
+            bounds: bounds.clone(),
             completeness,
-        }
+        })
     }
 
     /// Marks one grant revoked without replaying history.
@@ -1594,8 +1695,10 @@ impl GrantGraph {
     /// target is exactly the case that must never be reinterpreted as a
     /// second revocation origin.
     /// [`RevocationHistoryError::IdentityConflict`] names one closure
-    /// identity presented twice with changed content: the committed result
-    /// is authoritative and nothing is applied.
+    /// identity presented twice with changed content, or one crossing that
+    /// closure depends on re-presented under a single owner operation
+    /// identity with a different canonical request digest: the committed
+    /// result is authoritative and nothing is applied.
     ///
     /// The legacy [`from_recovery_snapshot`](Self::from_recovery_snapshot)
     /// preserves its exact prior behavior for previously-admitted callers.
@@ -1785,7 +1888,21 @@ impl GrantGraph {
         }
         let denominator = self
             .revocation_denominator_for_origin(&origin, fence, &bounds)
-            .map_err(map_bounded_history_error)?;
+            .map_err(|error| match error {
+                // A crossing this closure depends on was presented twice under
+                // one owner operation identity with different content. That is
+                // the I5.27 conflict, and it stays a conflict here: naming it as
+                // unknown history would tell the caller the record is
+                // unclassifiable rather than that the SAME operation was
+                // re-presented with a changed payload.
+                AuthorityError::IdentityConflict => {
+                    RevocationHistoryError::IdentityConflict(ClosureIdentityConflict {
+                        closure_id: closure.closure_id.clone(),
+                        field: "recovery.closure_crossing_evidence",
+                    })
+                }
+                other => map_bounded_history_error(other),
+            })?;
         // A denominator that is not complete is a bounded prefix, so the
         // committed affected set cannot be compared against it at all.
         if !matches!(
@@ -2529,6 +2646,44 @@ impl GrantGraph {
         (frontier_refs, bound, forensic, partial)
     }
 
+    /// Resolves the owner evidence authorizing one followed cross-root
+    /// crossing, and records that evidence for the verdict.
+    ///
+    /// Returns the transition identity the crossing was authorized by, or
+    /// `None` after adding the dependent to `unbound`. A crossing is
+    /// authorized only by the owner's own admitted record, and only while
+    /// that record carries the owner's committed disposition. Admission
+    /// stores the receipt's disposition verbatim and refuses every other
+    /// value, so this is the readback of that invariant exactly where a
+    /// crossing would otherwise let a dependent into the affected set:
+    /// absent evidence, or evidence whose disposition is anything but
+    /// committed, leaves the dependent unresolved and the verdict
+    /// partial/unknown instead of quietly fencing or clearing it.
+    ///
+    /// Everything recorded in `traversed` is the owner's admitted record
+    /// itself, so the verdict restates the receipt the owner supplied rather
+    /// than a name this crate composed.
+    fn committed_crossing_evidence(
+        &self,
+        parent: &GrantId,
+        child: &GrantId,
+        traversed: &mut BTreeMap<String, AdmittedRootTransition>,
+        unbound: &mut BTreeSet<String>,
+    ) -> Option<String> {
+        let authorized = self
+            .transition_for_edge(parent, child)
+            .filter(|evidence| evidence.disposition() == RootTransitionDisposition::Committed)
+            .map(|evidence| {
+                let transition_id = evidence.record().transition_id.clone();
+                traversed.insert(transition_id.clone(), evidence.clone());
+                transition_id
+            });
+        if authorized.is_none() {
+            unbound.insert(child.as_str().to_owned());
+        }
+        authorized
+    }
+
     /// Computes the honest revocation-closure verdict for one grant (#2875
     /// items 6, 7): the exact denominator the durable fencing owner (#2100)
     /// consumes.
@@ -2547,52 +2702,35 @@ impl GrantGraph {
         self.revocation_closure_verdict_with_quarantine(origin, fence, bounds, &BTreeMap::new())
     }
 
-    /// Computes the honest revocation-closure verdict for one grant (#2875
-    /// items 6, 7) with CURRENT owner-qualified quarantine evidence: the
-    /// exact denominator the durable fencing owner (#2100) consumes.
+    /// Structural walk of one origin's authorized dependency closure.
     ///
-    /// The structural walk follows authorized inheritance — same-root and
-    /// receipt-covered edges — from the origin, recording the same-root
-    /// denominator, the receipt-authorized cross-root descendants with
-    /// their authorizing receipts, every traversed transition, and the
-    /// quarantined dependents encountered with their CURRENT verified
-    /// bindings. The bounded engine outcome is reconciled against that
-    /// walk: completeness requires the engine's affected set to match the
-    /// reached set exactly, every cross-scope omission to leave the
-    /// omission source's authority root, and every such omission to bind to
-    /// a CURRENT verified quarantine binding. Anything less — an unfinished
-    /// traversal, a nonempty frontier, a same-root dependent recorded as
-    /// cross-scope, an unbound omission, or a denominator mismatch — is an
-    /// explicit partial/unknown state with the exact frontier and
-    /// omissions, never an omission-labelled success.
-    ///
-    /// The graph consumes already-qualified evidence only: it looks
-    /// bindings up by exact relation id and rechecks the edge, but it
-    /// cannot construct a binding from a relation id alone.
-    pub fn revocation_closure_verdict_with_quarantine(
+    /// Returns the same-root denominator in parent-before-child order with
+    /// the origin first, the receipt-authorized cross-root descendants with
+    /// the transition identity that authorized each, and every reference the
+    /// walk reached. A dependent the walk cannot authorize on committed
+    /// owner evidence is recorded in `unresolved` rather than skipped, so the
+    /// verdict that consumes this walk stays partial/unknown. The admitted
+    /// transition evidence for every followed crossing is recorded in
+    /// `traversals` as the owner's own record.
+    fn walk_authorized_closure(
         &self,
         origin: &GrantId,
-        fence: &StateFence,
-        bounds: &eliot_influence::RevocationBounds,
-        bindings: &BTreeMap<String, VerifiedQuarantineBinding>,
-    ) -> Result<RevocationClosureVerdict, AuthorityError> {
+        traversals: &mut BTreeMap<String, AdmittedRootTransition>,
+        unresolved: &mut BTreeSet<String>,
+    ) -> Result<ClosureWalk, AuthorityError> {
         let target = self
             .grants
             .get(origin)
             .ok_or_else(|| AuthorityError::MissingParent(origin.clone()))?;
-        let authority_root_ref = target.authority_root_ref.clone();
-        // Structural walk: the stack discipline of `delegated_closure`
-        // (grant-id-ordered children, parent before child), extended
-        // across receipt-authorized crossings. `crossed` marks members
-        // reached through at least one crossing; `authorizing` carries the
-        // nearest crossing receipt above the entry.
+        // Stack discipline of `delegated_closure` (grant-id-ordered children,
+        // parent before child), extended across receipt-authorized crossings.
+        // `crossed` marks members reached through at least one crossing;
+        // `authorizing` carries the nearest crossing above the entry.
         let mut members = vec![GrantClosureMemberRef {
             grant_id: target.grant_id.clone(),
             parent_grant_id: target.parent_grant_id.clone(),
         }];
         let mut authorized_cross_root = Vec::new();
-        let mut traversed = BTreeSet::new();
-        let mut unbound: BTreeSet<String> = BTreeSet::new();
         let mut reached: BTreeSet<String> = BTreeSet::from([origin.as_str().to_owned()]);
         let mut seen = BTreeSet::new();
         seen.insert(target.grant_id.clone());
@@ -2615,26 +2753,28 @@ impl GrantGraph {
                 if !edge_is_authorized(node, child, &self.transitions) {
                     // Unauthorized in-map edge: never followed; the active
                     // dependent stays unresolved and forces partial/unknown.
-                    unbound.insert(child.grant_id.as_str().to_owned());
+                    unresolved.insert(child.grant_id.as_str().to_owned());
                     continue;
                 }
                 let edge_crosses =
                     crosses_authority_root(&node.authority_root_ref, &child.authority_root_ref);
                 let child_authorizing = if edge_crosses {
-                    let Some(receipt) = self.transition_for_edge(&node.grant_id, &child.grant_id)
-                    else {
-                        unbound.insert(child.grant_id.as_str().to_owned());
-                        continue;
-                    };
-                    traversed.insert(receipt.record().transition_id.clone());
-                    Some(receipt.record().transition_id.clone())
+                    match self.committed_crossing_evidence(
+                        &node.grant_id,
+                        &child.grant_id,
+                        traversals,
+                        unresolved,
+                    ) {
+                        Some(transition_id) => Some(transition_id),
+                        None => continue,
+                    }
                 } else {
                     authorizing.clone()
                 };
                 reached.insert(child.grant_id.as_str().to_owned());
                 if crossed || edge_crosses {
                     let Some(receipt_id) = child_authorizing.clone() else {
-                        unbound.insert(child.grant_id.as_str().to_owned());
+                        unresolved.insert(child.grant_id.as_str().to_owned());
                         continue;
                     };
                     authorized_cross_root.push(AuthorizedCrossRootMember {
@@ -2653,10 +2793,54 @@ impl GrantGraph {
                 }
             }
         }
-        let quarantined_frontier = self.collect_quarantined_frontier(&reached, bindings);
+        Ok(ClosureWalk {
+            authority_root_ref: target.authority_root_ref.clone(),
+            members,
+            authorized_cross_root,
+            reached,
+        })
+    }
+
+    /// Computes the honest revocation-closure verdict for one grant (#2875
+    /// items 6, 7) with CURRENT owner-qualified quarantine evidence: the
+    /// exact denominator the durable fencing owner (#2100) consumes.
+    ///
+    /// The structural walk follows authorized inheritance — same-root and
+    /// receipt-covered edges — from the origin, recording the same-root
+    /// denominator, the receipt-authorized cross-root descendants with
+    /// their authorizing receipts, the admitted owner evidence of every
+    /// traversed transition, and the quarantined dependents encountered with
+    /// their CURRENT verified bindings. The bounded engine outcome is
+    /// reconciled against that walk: completeness requires the engine's
+    /// affected set to match the reached set exactly, every cross-scope
+    /// omission to leave the omission source's authority root, and every such
+    /// omission to bind to a CURRENT verified quarantine binding. Anything
+    /// less — an unfinished traversal, a nonempty frontier, a same-root
+    /// dependent recorded as cross-scope, an unbound omission, or a
+    /// denominator mismatch — is an explicit partial/unknown state with the
+    /// exact frontier and omissions, never an omission-labelled success.
+    ///
+    /// The graph consumes already-qualified evidence only: it looks
+    /// bindings up by exact relation id and rechecks the edge, but it
+    /// cannot construct a binding from a relation id alone.
+    pub fn revocation_closure_verdict_with_quarantine(
+        &self,
+        origin: &GrantId,
+        fence: &StateFence,
+        bounds: &eliot_influence::RevocationBounds,
+        bindings: &BTreeMap<String, VerifiedQuarantineBinding>,
+    ) -> Result<RevocationClosureVerdict, AuthorityError> {
+        let mut traversed: BTreeMap<String, AdmittedRootTransition> = BTreeMap::new();
+        let mut unbound: BTreeSet<String> = BTreeSet::new();
+        let walk = self.walk_authorized_closure(origin, &mut traversed, &mut unbound)?;
+        let quarantined_frontier = self.collect_quarantined_frontier(&walk.reached, bindings);
         let outcome = self.transitive_revocation_closure(origin, fence, bounds)?;
         let (frontier_refs, bound, forensic, partial) =
-            self.reconcile_engine_outcome(&outcome, &reached, unbound, bindings);
+            self.reconcile_engine_outcome(&outcome, &walk.reached, unbound, bindings);
+        // Read before the omissions move below: this is the bounded engine's
+        // own recomputed digest for the exact request it answered, already
+        // re-bound to this request and these bounds by `verify_binding`.
+        let request_digest = outcome.request_digest.clone();
         let state = if partial {
             RevocationClosureState::PartialOrUnknown {
                 frontier: frontier_refs.into_iter().collect(),
@@ -2671,11 +2855,14 @@ impl GrantGraph {
         Ok(RevocationClosureVerdict {
             origin: origin.clone(),
             revision: self.revision,
-            authority_root_ref,
-            members,
-            authorized_cross_root,
+            state_fence: fence.clone(),
+            bounds: bounds.clone(),
+            request_digest,
+            authority_root_ref: walk.authority_root_ref,
+            members: walk.members,
+            authorized_cross_root: walk.authorized_cross_root,
             quarantined_frontier,
-            traversed_transitions: traversed.into_iter().collect(),
+            traversed_transitions: traversed.into_values().collect(),
             state,
         })
     }

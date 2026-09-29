@@ -97,6 +97,19 @@ pub enum AuthorityError {
     /// disposition. The named field says which readback clause refused, so a
     /// stale crossing is distinguishable from a malformed one.
     StaleTransitionEvidence(&'static str),
+    /// The mechanical owner answered for this exact operation identity that
+    /// the commit outcome is UNKNOWN: the operation may or may not have
+    /// committed, and the acknowledgement was lost.
+    ///
+    /// This is deliberately not [`Self::StaleTransitionEvidence`]. An unknown
+    /// outcome is not stale evidence, and reporting it as such invites the
+    /// one action the contract forbids — discarding the operation and
+    /// presenting the work again under a FRESH identity, which cannot
+    /// conflict with the first attempt and can double-apply it. The outcome
+    /// stays unknown here, the operation is retained under its original
+    /// operation identity and idempotency key, and the way out is exact
+    /// reconciliation against the owner's own record of that identity.
+    UnreconciledTransitionEvidence(&'static str),
     /// Quarantine evidence no longer matches CURRENT owner state: revoked,
     /// stale, unreadable, or missing its durable receipt readback. The named
     /// field says which readback clause refused, so a stale quarantine is
@@ -143,6 +156,11 @@ impl fmt::Display for AuthorityError {
             Self::StaleTransitionEvidence(field) => write!(
                 formatter,
                 "stale or uncommitted root-transition evidence: {field}"
+            ),
+            Self::UnreconciledTransitionEvidence(field) => write!(
+                formatter,
+                "root-transition commit outcome is unknown and unproven: {field}; \
+                 reconcile this exact operation identity, never re-present a fresh one"
             ),
             Self::StaleQuarantineEvidence(field) => {
                 write!(formatter, "stale or unproven quarantine evidence: {field}")

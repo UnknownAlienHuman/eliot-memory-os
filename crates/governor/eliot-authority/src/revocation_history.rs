@@ -813,7 +813,10 @@ impl fmt::Display for ClosureIdentityConflict {
 /// Governor/Kernel owner (#2100). The durable owner reference this crate CAN
 /// bind is declared on the wire and proven here: the owner namespace this
 /// graph owns, the durable history revision the closure was observed at, and
-/// the full fence both were read under.
+/// the full fence both were read under. The only transition receipts this
+/// crate can carry are the ones the owner already committed and this graph
+/// already admitted — they ride on `denominator.traversed_transitions` as the
+/// admitted owner records themselves, never as a name this crate composed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedRevocationClosure {
     /// Stable closure identity carried by the evidence.
