@@ -6265,11 +6265,23 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let outcome = {
-            let links = write
-                .open_table(HOST_REQUEST_LOGICAL_KEYS)
-                .map_err(storage)?;
-            if let Some(link_value) = links.get(logical_key.as_str()).map_err(storage)? {
-                let link = Self::decode_host_request_logical_link(link_value.value())?;
+            // The lookup handle is scoped so it drops before the fresh-stage
+            // helper re-opens HOST_REQUEST_LOGICAL_KEYS in this same write
+            // transaction (redb 4.1.0 returns TableAlreadyOpen while the first
+            // handle is alive; issue #2571 AUD2). The decoded link moves out;
+            // both fresh-stage entries still claim through
+            // stage_host_request_logical_link_in and commit atomically below.
+            let staged_link: Option<HostRequestLogicalLink> = {
+                let links = write
+                    .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                    .map_err(storage)?;
+                links
+                    .get(logical_key.as_str())
+                    .map_err(storage)?
+                    .map(|link_value| Self::decode_host_request_logical_link(link_value.value()))
+                    .transpose()?
+            };
+            if let Some(link) = staged_link {
                 let winner = {
                     let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
                     let row_key =
