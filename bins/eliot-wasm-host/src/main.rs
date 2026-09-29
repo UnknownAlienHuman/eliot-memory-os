@@ -4,10 +4,10 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use eliot_wasm_host::{
-    CliError, ContourGateError, PrototypeContourDecision, TypedWorld, admit_generation,
-    admit_prototype, default_experimental_limits, execute_describe_experimental,
-    experimental_manifest, parse_args, read_bounded_artifact, run_guest_exec,
-    run_ordinary_request_loop, typed_wit_digest,
+    CliError, ContourGateError, LoopError, PrototypeContourDecision, TypedWorld, admit_generation,
+    admit_prototype, default_experimental_limits,
+    execute_describe_experimental, experimental_manifest, parse_args, read_bounded_artifact,
+    run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -143,7 +143,19 @@ fn main() {
         // experimental describe mode only.
         Ok(_) => {}
         Err(error) => {
-            emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());
+            // A failed final same-owner result write is a recovery state,
+            // not an admission denial. Preserve that typed distinction at
+            // the process boundary without emitting in-memory frames through
+            // a second result channel.
+            let code = if matches!(
+                error.recovery_handoff_error(),
+                Some(LoopError::ResultRetentionFailed { .. })
+            ) {
+                "RESULT_RECOVERY_PERSISTENCE_FAILED"
+            } else {
+                "KERNEL_ADMISSION_REQUIRED"
+            };
+            emit_error(code, &error.to_string());
             std::process::exit(ADMISSION_REQUIRED_EXIT);
         }
     }
