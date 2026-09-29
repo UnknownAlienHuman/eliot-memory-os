@@ -20,7 +20,10 @@
 //! member and candidate. Atoms are whole units only: no split, summary,
 //! truncation, rewrite or generation. The closed versioned
 //! member-kind-to-semantic-role-to-loss-policy map lives in
-//! [`vocabulary`]. Required and protected Safety-Floor representation is
+//! [`vocabulary`], and the closed registry that resolves a contributing
+//! provider identity to its registered provider/role slot lives in the
+//! crate-internal `provider_registry` module. Required and protected
+//! Safety-Floor representation is
 //! reserved before optional volume (representation fairness, not admission);
 //! explicit omissions and frontier are emitted on bounds. No query, ranking,
 //! admission, assembly, delivery, authority, effect or Finish step runs here:
@@ -45,6 +48,7 @@
 pub mod derive;
 pub mod inputs;
 pub mod mapper;
+pub(crate) mod provider_registry;
 pub mod vocabulary;
 
 pub use derive::{

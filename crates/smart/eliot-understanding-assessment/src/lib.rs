@@ -6,10 +6,14 @@
 //! Fence. Both consume immutable owner projections **by handle only**,
 //! bundled as one [`OwnerContext`]:
 //!
-//! * the already-compiled [`ActiveUnderstandingView`] (frozen 9/9,
+//! * the already-compiled
+//!   [`ActiveUnderstandingView`](eliot_context_contracts::ActiveUnderstandingView)
+//!   (frozen 9/9,
 //!   `eliot-context-contracts`), never a second `ContextCompiler`
 //!   invocation and never a second admission pass;
-//! * the unit-#3 [`AcceptedSourceProjection`] (frozen owner contract,
+//! * the unit-#3
+//!   [`AcceptedSourceProjection`](eliot_dreamer_contracts::self_query::AcceptedSourceProjection)
+//!   (frozen owner contract,
 //!   `eliot-dreamer-contracts`), cited by exact handle/revision/digest
 //!   triple with no similarity fallback;
 //! * the owner [`ProviderContribution`] (`eliot-epistemic-contracts`),
@@ -70,14 +74,25 @@
 //! This module performs no model, storage, network, canonical-write,
 //! admission, delivery, lease, or effect behavior. It is a static candidate
 //! record, not edge, product, or pulse proof.
+//!
+//! The self-model Context projection itself — the owner envelope, the
+//! view-atom role resolution and the carried-fence gating that read that
+//! projected Context material — is owned by `src/context_projection.rs`, not
+//! by this root (#238). `OwnerContext` keeps its public path at the crate
+//! root; the two cells in this crate no longer share one `lib.rs` as the
+//! implementation owner of that projection.
 
 #![forbid(unsafe_code)]
 
-use eliot_context_contracts::{ActiveUnderstandingView, ContextError, SemanticRole};
+mod context_projection;
+
+pub use context_projection::OwnerContext;
+
+use context_projection::{gate_owner, view_atom_role};
+
+use eliot_context_contracts::{ContextError, SemanticRole};
 use eliot_contracts::{ArtifactId, ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_dreamer_contracts::self_query::{
-    AcceptedSourceProjection, AcceptedSourceRef, SelfQueryContractError,
-};
+use eliot_dreamer_contracts::self_query::{AcceptedSourceRef, SelfQueryContractError};
 use eliot_epistemic_contracts::{ContractError as EpistemicError, ProviderContribution};
 use eliot_observation_contracts::{
     BankProjection, ExperienceRecordRef, FeedbackProjection, JournalProjection, ObservationError,
@@ -323,7 +338,7 @@ fn fence_shape(value: &StateFence, field: &'static str) -> Result<(), Assessment
     Ok(())
 }
 
-fn gate_compatible(
+pub(crate) fn gate_compatible(
     carried: &StateFence,
     governing: &StateFence,
     field: &'static str,
@@ -431,7 +446,9 @@ pub enum CitedFamily {
 /// One handle-bound evidence cite: identity plus revision cursor and digest.
 ///
 /// Accepted-source cites revalidate by exact triple match against the
-/// supplied [`AcceptedSourceProjection`]; all other families are
+/// supplied
+/// [`AcceptedSourceProjection`](eliot_dreamer_contracts::self_query::AcceptedSourceProjection);
+/// all other families are
 /// shape-checked here and bound to their owner envelopes by the caller.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -625,22 +642,6 @@ pub struct DenominatorRecheck {
     pub drifted: Vec<String>,
 }
 
-/// Shared owner-envelope intake for assessment and recheck: the compiled
-/// view, the accepted-source projection, the optional admitted
-/// contribution, and the optional experience envelopes — all by handle,
-/// all sourced ONLY from their owners.
-#[derive(Clone, Copy, Debug)]
-pub struct OwnerContext<'a> {
-    /// Already-compiled understanding view, by handle.
-    pub view: &'a ActiveUnderstandingView,
-    /// Accepted-source projection for citation checks.
-    pub sources: &'a AcceptedSourceProjection,
-    /// Optional admitted epistemic contribution, echoed by digest/claim.
-    pub contribution: Option<&'a ProviderContribution>,
-    /// Optional experience envelopes for outcome-side evidence.
-    pub experience: &'a [ExperienceEvidence<'a>],
-}
-
 /// Outcome of binding one cite into the passed owner objects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CiteBinding {
@@ -684,20 +685,6 @@ fn journal_record_kind(cite: &EvidenceCite, owner: &OwnerContext<'_>) -> Option<
         }
     }
     None
-}
-
-/// Match an outcome/verifier cite to a compiled view atom: exact atom
-/// handle plus source revision plus source digest. Returns the owner
-/// semantic role assigned at admission.
-fn view_atom_role(cite: &EvidenceCite, view: &ActiveUnderstandingView) -> Option<SemanticRole> {
-    view.rendered
-        .iter()
-        .find(|atom| {
-            atom.atom_id == cite.handle
-                && atom.source_revision == cite.revision
-                && atom.source_digest == cite.digest
-        })
-        .map(|atom| atom.role)
 }
 
 /// Which adequacy leg a cite fills: only outcome and discriminator legs
@@ -894,51 +881,6 @@ impl BindingRollup {
     fn fully_bound(&self) -> bool {
         self.stale.is_empty() && self.unbound.is_empty() && self.role_mismatch.is_empty()
     }
-}
-
-/// Gate every carried fence against the assessment fence.
-fn gate_owner(owner: &OwnerContext<'_>, scope: &AssessmentScope) -> Result<(), AssessmentError> {
-    owner.view.validate()?;
-    owner.sources.validate()?;
-    if owner.view.binding.scope_id.as_str() != scope.scope_id {
-        return Err(AssessmentError::InvalidField {
-            field: "assessment.scope_id",
-            reason: "compiled view is bound to a different work scope",
-        });
-    }
-    gate_compatible(
-        &owner.view.binding.state_fence,
-        &scope.state_fence,
-        "assessment.view_fence",
-    )?;
-    gate_compatible(
-        &owner.sources.fence,
-        &scope.state_fence,
-        "assessment.sources_fence",
-    )?;
-    if let Some(contribution) = owner.contribution {
-        contribution.validate()?;
-        gate_compatible(
-            &contribution.fence,
-            &scope.state_fence,
-            "assessment.contribution_fence",
-        )?;
-    }
-    for (index, evidence) in owner.experience.iter().enumerate() {
-        evidence.validate()?;
-        if index >= MAX_EVIDENCE_CITES {
-            return Err(AssessmentError::InvalidField {
-                field: "assessment.experience",
-                reason: "exceeds bounded length",
-            });
-        }
-        gate_compatible(
-            evidence.fence(),
-            &scope.state_fence,
-            "assessment.experience_fence",
-        )?;
-    }
-    Ok(())
 }
 
 fn decide_status(
