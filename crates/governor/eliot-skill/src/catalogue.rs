@@ -1495,6 +1495,8 @@ impl ActivatedSkillDisplay {
                 reason: "at least one eligible route, profile, or policy is required",
             });
         }
+        check_unique(&self.eligible_routes, "activation.eligible_routes")?;
+        check_unique(&self.eligible_profiles, "activation.eligible_profiles")?;
         check_unique(&self.eligible_policies, "activation.eligible_policies")?;
         for dependency in &self.dependency_versions {
             dependency.validate()?;
