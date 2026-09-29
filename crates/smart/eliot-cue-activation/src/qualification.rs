@@ -23,10 +23,11 @@
 //!   normalization revision and runtime identity it names.
 
 use eliot_contracts::ClockReading;
-use eliot_cue_contracts::{ActivationProfile, Digest, NormalizationProfile, WorkScopeId};
+use eliot_cue_contracts::{Digest, NormalizationProfile, WorkScopeId};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ActivationError;
+use crate::profile::ActivationProfile;
 
 /// Bounded text ceiling for one qualification text field.
 const MAX_TEXT_BYTES: usize = 512;
@@ -95,7 +96,11 @@ pub struct SpreadQualification {
 /// Spreading is off. This is the decision a caller gets for free, and it is
 /// deliberately a value rather than an absence: an unbenchmarked profile has no
 /// path to being enabled by not being asked about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+///
+/// This type is not `Copy`: the enabled variant owns the identity of the
+/// qualification that admitted the operation, and that identity is the evidence
+/// a consumer reads back. It is moved, not cloned at each call site.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SpreadEnablement {

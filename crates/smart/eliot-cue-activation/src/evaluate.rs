@@ -1033,7 +1033,7 @@ impl SpreadWork<'_> {
                 return Ok(());
             }
             let edge = &self.candidate.relation_edges[index];
-            if self.departures(&state.target, edge) {
+            if self.departs(&state.target, edge) {
                 outgoing.push(index);
             }
         }
