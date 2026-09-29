@@ -5560,7 +5560,25 @@ impl InquiryGovernance {
         // all instead of a record that publishes a false bound allowlist into
         // the profile, coverage receipt, evidence freeze and terminal digests.
         observation.reference_manifest.validate()?;
-        let profile = resolve_profile(&observation)?;
+        let resolved = resolve_profile(&observation)?;
+        // I21.3 revision, on the live path and before anything binds the profile
+        // digest. The first revision is resolved from the requested source-class
+        // list alone; the revision is decided from what the evidence set actually
+        // covers, so it runs between resolution and source assessment, and before
+        // the coverage receipt, the obligations, the freeze, the claim audit and
+        // the terminal record — every one of which binds `profile.integrity_digest`
+        // through the admissibility records.
+        //
+        // It is deliberately before `assess_sources`, not after: a
+        // `SourceAdmissibilityRecord` freezes `profile_digest`
+        // (`source_admissibility.rs:384`), and `SourcePortfolio::assemble`
+        // refuses any record whose digest is not the profile it assembles against
+        // (`portfolio.record_binding`). Revising after assessment would therefore
+        // leave the record holding admissibility decisions about a superseded
+        // revision, and the re-assembly that a later revision needs is exactly
+        // what that refusal forbids. Deciding from the observed coverage instead
+        // is what keeps one profile revision governing one whole record.
+        let profile = revise_profile(&observation, &resolved)?;
         let admissibility = assess_sources(&observation, &profile)?;
         // I21.7 demotion, still before any promotion: `assess_sources` decides
         // eligibility and nothing else — it does not assemble the portfolio, the
@@ -6258,18 +6276,14 @@ impl std::fmt::Display for InquiryGovernance {
     }
 }
 
-/// Resolves the profile revision for one observed inquiry.
+/// The exact admitted material one profile revision is resolved from.
 ///
-/// This is on the live path of every run: `InquiryGovernance::record` calls it
-/// before anything else is assessed, and it is the only place a profile revision
-/// is produced. It resolves the selection, commits the lane registration the
-/// selection demands through [`commit_lane_registration`], and only then freezes
-/// the revision that carries it — so a confirmatory profile exists only where an
-/// owner-committed registration precedes it, and an exploratory one exists where
-/// none is needed.
-fn resolve_profile(
-    observation: &InquiryObservation,
-) -> Result<InquiryProtocolProfile, InquiryError> {
+/// [`resolve_profile`] builds revision one from this and
+/// [`revise_profile`] builds the next revision from the same values, so the two
+/// cannot drift into resolving from different inputs: a revision that changed its
+/// own selection inputs would compare a new selection against a registration
+/// committed for the old one.
+fn profile_params(observation: &InquiryObservation) -> Result<InquiryProfileParams, InquiryError> {
     let stop_rule = InquiryStopRule::resolve(
         observation.budget_units,
         observation.deadline_ms,
@@ -6280,7 +6294,7 @@ fn resolve_profile(
     truth_surfaces.push(observation.provider_generation.clone());
     truth_surfaces.sort();
     truth_surfaces.dedup();
-    let mut params = InquiryProfileParams {
+    Ok(InquiryProfileParams {
         profile_id: observation.profile_id.clone(),
         inquiry_id: observation.inquiry_id.clone(),
         operation_id: observation.operation_id.clone(),
@@ -6301,7 +6315,22 @@ fn resolve_profile(
         stop_rule,
         state_fence: observation.reference_manifest.state_fence.clone(),
         committed_lane_registration: None,
-    };
+    })
+}
+
+/// Resolves the profile revision for one observed inquiry.
+///
+/// This is on the live path of every run: `InquiryGovernance::record` calls it
+/// before anything else is assessed, and it is the only place a profile revision
+/// is produced. It resolves the selection, commits the lane registration the
+/// selection demands through [`commit_lane_registration`], and only then freezes
+/// the revision that carries it — so a confirmatory profile exists only where an
+/// owner-committed registration precedes it, and an exploratory one exists where
+/// none is needed.
+fn resolve_profile(
+    observation: &InquiryObservation,
+) -> Result<InquiryProtocolProfile, InquiryError> {
+    let mut params = profile_params(observation)?;
     // I21.4: the profile states the required rigour, and a confirmatory lane
     // additionally requires a frozen registration committed before any outcome
     // exposure. The selection is resolved first because the registration has to
@@ -6316,6 +6345,152 @@ fn resolve_profile(
         1,
         None,
         "initial inquiry protocol resolution",
+    )
+}
+
+/// Revises the profile for one observed inquiry when the run observed something
+/// that changes the resolved selection.
+///
+/// I21.3: "Protocol choice is a Default, not a Hard Boundary: it may be changed
+/// mid-run with a recorded reason, and the change invalidates only obligations
+/// that depended on the previous protocol." I21.1 puts that revision in the
+/// Researcher's own ownership ("resolution **and revision** of the versioned
+/// inquiry profile and Evidence Grade"). Until this existed,
+/// [`InquiryProtocolProfile::revise`] had no production caller on this plane, so
+/// every run froze revision one and a selection the admitted material
+/// contradicted stayed in force for the rest of the run.
+///
+/// # What decides the revision
+///
+/// One fact read from the material this run was admitted to carry: the profile
+/// resolved [`InquiryProtocol::EvidenceReview`], which
+/// [`select_protocol`] selects only when `primary_source_available` is true, and
+/// the admitted candidates contain no primary-source class at all.
+///
+/// That is the *same* predicate [`SourcePortfolio::assemble`] buckets with — it
+/// places exactly `Paper | Documentation | Repository` in `primary_sources` — so
+/// "the profile selected a protocol for a primary class" and "an admitted
+/// candidate is of a primary class" are one question read from one list, not two
+/// definitions that can drift. The consequence is the one I21.3's opening
+/// sentence names ("A single generic pipeline for every question is the most
+/// common failure of research automation") and the one I21.1 answers by
+/// revision ("Absence of a provider narrows declared coverage and is reported
+/// as a gap"): a run whose material holds no primary source cannot review
+/// evidence, and continuing to declare that protocol would assert rigour the
+/// admitted material does not carry.
+///
+/// The condition is content — a set membership over the admitted candidates and
+/// the profile's own class list — not a flag, not a version and not a caller
+/// intention.
+///
+/// # Why the decision is made from the candidates and not from the evidence set
+///
+/// This runs before [`assess_sources`] on purpose, and that ordering is forced
+/// rather than chosen. A [`SourceAdmissibilityRecord`](crate::source_admissibility::SourceAdmissibilityRecord)
+/// freezes `profile_digest` and [`SourcePortfolio::assemble`] refuses any record
+/// whose digest is not the profile it assembles against
+/// (`portfolio.record_binding`), so a revision taken *after* assessment would
+/// leave the record holding admissibility decisions about a superseded revision,
+/// with no way to re-derive them. Deciding from the candidate classes therefore
+/// reads exactly the input the eligibility decision is about to be taken over,
+/// and leaves one profile revision governing one whole record.
+///
+/// # What the revision carries
+///
+/// Real values on every field, none of them a stand-in:
+///
+/// - `features` are the observation's own [`InquirySelectionFeatures`] with
+///   `primary_source_available` corrected to the observed fact, so
+///   [`select_protocol`] re-resolves to the protocol the admitted material
+///   supports rather than the one the requested classes implied;
+/// - every other field is the identical admitted value the first revision was
+///   resolved from, rebuilt by [`profile_params`], so a revision cannot
+///   restate the question, the scope or the intended decision;
+/// - `committed_lane_registration` is `None`. That is the value the re-resolved
+///   exploratory selection must carry, and re-committing the superseded
+///   revision's registration would freeze a receipt that names a revision this
+///   run did not produce. The drop is safe exactly because the re-resolution
+///   can only reach an exploratory lane here: [`select_lane`] admits a
+///   confirmatory lane only under an evaluator and a strong verifier, and the
+///   revision is reachable only from an [`InquiryProtocol::EvidenceReview`]
+///   selection that this branch has just re-derived from features carrying
+///   `evaluator_exists` from the observation unchanged. If a re-resolution ever
+///   did reach a confirmatory lane, [`IndependenceBlindingPolicy::resolve`]
+///   refuses the missing registration rather than publishing an unregistered
+///   confirmatory revision, so the failure is typed and the record is refused;
+/// - the reason names the classes the run admitted, the classes the protocol was
+///   selected for, and the run's own acquisition outcome and reason code — the
+///   observed facts, not a restated version number.
+///
+/// # Errors
+///
+/// Returns the profile domain's own errors when the revised selection cannot be
+/// resolved or the revision does not re-prove its own digest, so a run whose
+/// material cannot support a coherent selection produces no record rather than a
+/// record whose profile disagrees with its evidence.
+fn revise_profile(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+) -> Result<InquiryProtocolProfile, InquiryError> {
+    if profile.protocol != InquiryProtocol::EvidenceReview {
+        return Ok(profile.clone());
+    }
+    // The protocol was selected for a primary source, so only a class the profile
+    // actually admits can have satisfied that premise. Reading the candidates
+    // through the profile's own class list keeps the trigger inside the admitted
+    // scope: a primary class nobody asked for is not evidence that this
+    // evidence-review premise failed.
+    let admits_primary = profile
+        .admissible_source_classes
+        .iter()
+        .any(|class| is_primary_source_class(*class));
+    let admitted_primary: BTreeSet<&'static str> = observation
+        .candidates
+        .iter()
+        .filter(|candidate| is_primary_source_class(candidate.class))
+        .map(|candidate| class_wire(candidate.class))
+        .collect();
+    if !admits_primary || !admitted_primary.is_empty() {
+        return Ok(profile.clone());
+    }
+    let unmet: Vec<&'static str> = profile
+        .admissible_source_classes
+        .iter()
+        .filter(|class| is_primary_source_class(**class))
+        .map(|class| class_wire(*class))
+        .collect();
+    let mut params = profile_params(observation)?;
+    params.features.primary_source_available = false;
+    let reason = format!(
+        "revision {}-{} selected {} because the request admitted the primary source class(es) \
+         {}, but the run admitted {} candidate(s) and none of them is of a primary class; \
+         acquisition outcome {} with reason {}; the protocol is revised to the one this evidence \
+         can support",
+        profile.revision,
+        profile.profile_id,
+        profile.protocol.wire_name(),
+        unmet.join(","),
+        observation.candidates.len(),
+        observation.outcome.wire_name(),
+        observation.reason_code,
+    );
+    let revised = profile.revise(params, &reason)?;
+    revised.validate_integrity()?;
+    Ok(revised)
+}
+
+/// Whether a source class is a primary source or specification.
+///
+/// This is the one class predicate this plane already uses, read off
+/// [`SourcePortfolio::assemble`], which buckets exactly
+/// `Paper | Documentation | Repository` into `primary_sources`. Naming the same
+/// three here is what makes "the protocol was selected for a primary class" and
+/// "an admitted candidate is a primary class" the same question rather than two
+/// lists that can drift apart.
+fn is_primary_source_class(class: SourceClass) -> bool {
+    matches!(
+        class,
+        SourceClass::Paper | SourceClass::Documentation | SourceClass::Repository
     )
 }
 
