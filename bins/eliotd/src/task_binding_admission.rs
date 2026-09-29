@@ -266,7 +266,15 @@ pub enum TaskBindingAdmission {
     /// Cold unbound capture: durable bytes with no task effect.
     ColdUnbound(ObservationCandidate),
     /// Exact task-bound transition admitted toward the governed owner commit.
-    TaskBound,
+    ///
+    /// Carries the exact admitted [`TaskSelectionEvidence`] (issue #1746, W6):
+    /// the admitted operation identity is this evidence plus its task, scope,
+    /// and fence — never a mutable ambient selection. The dispatch edge must
+    /// revalidate it against the live fence at the effect gate (see
+    /// [`revalidate_task_bound_for_effect`]) instead of reusing the
+    /// caller-presented fence; a moved fence, task, or scope conflicts for
+    /// rebind, it is never rewritten under the old operation identity.
+    TaskBound(TaskSelectionEvidence),
     /// Task-relative transition whose selection decision belongs to the
     /// caller that owns the exact selection evidence, never to a capture
     /// edge. Reported, never admitted and never silently downgraded.
@@ -721,7 +729,10 @@ fn compatibility_for(
 /// recency, proximity, or the newest/open task. Its typed evidence is exactly
 /// what the store bridge cannot see: the store gate re-derives presence and
 /// agreement from the opaque proof handles, this gate verifies the
-/// `TaskSelectionEvidence` values against the caller's own receipt.
+/// `TaskSelectionEvidence` values against the caller's own receipt. A
+/// `TaskBound` admission carries the exact evidence forward; the dispatch
+/// effect gate revalidates it against the live fence through
+/// [`revalidate_task_bound_for_effect`] (issue #1746, W6/A5).
 pub fn admit_canonical_write(
     candidate_id: String,
     context: &RequestMetadata,
@@ -809,7 +820,7 @@ pub fn admit_canonical_write(
                     write_fence,
                     compatibility,
                 )?;
-                Ok(TaskBindingAdmission::TaskBound)
+                Ok(TaskBindingAdmission::TaskBound(evidence))
             }
         };
     }
@@ -834,10 +845,83 @@ pub fn admit_canonical_write(
             write_fence,
             compatibility,
         )?;
-        return Ok(TaskBindingAdmission::TaskBound);
+        let Some(evidence) = selection else {
+            return Err(TaskBindingError::selection_required(
+                "task-relative write admitted without selection evidence",
+            ));
+        };
+        return Ok(TaskBindingAdmission::TaskBound(evidence));
     }
 
     Ok(TaskBindingAdmission::NotTaskRelative)
+}
+
+/// Revalidates one admitted task-bound transition at the effect gate against
+/// the live fence (issue #1746, W6/A5).
+///
+/// [`admit_canonical_write`] admits against the caller-presented write fence;
+/// between that admission (bootstrap) and the commit (dispatch) the task,
+/// scope, or generation may have moved. This entry carries the exact admitted
+/// [`TaskSelectionEvidence`] forward and rejoins it here: the ORIGINAL
+/// evidence is validated with the existing [`TaskSelectionEvidence::validate`],
+/// contamination still refuses, the evidence task/scope must name exactly the
+/// admitted request task and the write scope, and the presented fence must
+/// still match the live owner fence exactly. A mismatch fails closed with
+/// `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind: the old operation is never
+/// rewritten to the new task under its identity, never duplicated, and already
+/// possible effects keep their original identity for reconciliation. This entry
+/// mints no evidence and selects no task; `admitted_task_ref` is the exact
+/// task the admitted request names (the request-context task, or the envelope
+/// task when the context names none — the same value admission compared),
+/// never the evidence's own value.
+///
+/// Designated caller (STITCH, daemon composition lane): the pre-commit effect
+/// gate in `DaemonComposition::commit_canonical_and_refresh`
+/// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
+/// and the scope-sensitive trigger, passing the admitted request task, the
+/// envelope scope, the readiness fence as presented, and the live Governor
+/// kernel-snapshot fence as live.
+pub fn revalidate_task_bound_for_effect(
+    evidence: &TaskSelectionEvidence,
+    admitted_task_ref: Option<&str>,
+    expected_scope_ref: &str,
+    presented_fence: &StateFence,
+    live_fence: &StateFence,
+) -> Result<(), TaskBindingError> {
+    let Some(admitted_task_ref) = admitted_task_ref else {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted task",
+        ));
+    };
+    if admitted_task_ref.trim().is_empty() || admitted_task_ref.chars().any(char::is_control) {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch admitted task is blank",
+        ));
+    }
+    evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
+    })?;
+    if evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "task selection is contaminated",
+        ));
+    }
+    if evidence.task_ref != admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched task is not the admitted task; rebind under a new operation, no rewrite",
+        ));
+    }
+    if evidence.work_scope_ref != expected_scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatched WorkScope is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(presented_fence, live_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "admitted fence moved before effect; rebind at the live fence, no silent rebind",
+        ));
+    }
+    Ok(())
 }
 
 /// Admits the capture leg of one prepared transition at the daemon transport
