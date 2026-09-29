@@ -1057,9 +1057,7 @@ impl SkillCatalogue {
             let profile_version = standing.profile_version.clone();
             let admitted_definition_version = standing.admitted_definition_version.clone();
             let tool_refs = standing.body.tool_refs.clone();
-            if let Some(reason) =
-                detect_dependency_staleness(&pinned, world.current_dependencies)
-            {
+            if let Some(reason) = detect_dependency_staleness(&pinned, world.current_dependencies) {
                 if self.note_dependency_change(
                     &skill_id,
                     world.current_dependencies.to_vec(),
@@ -1097,9 +1095,7 @@ impl SkillCatalogue {
                 .filter(|tool| !world.tools.knows_tool(tool))
                 .cloned()
                 .collect();
-            if !missing_tools.is_empty()
-                && self.mark_tool_basis_stale(&skill_id, &missing_tools)?
-            {
+            if !missing_tools.is_empty() && self.mark_tool_basis_stale(&skill_id, &missing_tools)? {
                 became_stale.push(skill_id);
             }
         }
