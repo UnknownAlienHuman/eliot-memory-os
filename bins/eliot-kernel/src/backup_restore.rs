@@ -2512,10 +2512,6 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 }
 
-/// Rejects a journal binding that names a different source, class or
-/// destination than the archive and target actually being restored (issue
-/// #960).
-///
 /// Carries the owner-issued admission into the execution body.
 ///
 /// Every other field is the caller's, moved across unchanged, so the ONLY
@@ -2540,6 +2536,10 @@ fn admitted_restore_ports<'a>(
     }
 }
 
+/// Rejects a journal binding that names a different source, class or
+/// destination than the archive and target actually being restored (issue
+/// #960).
+///
 /// The ORS binding is what every journal row is keyed to, so a binding that
 /// disagrees with the archive would file this transaction's durable rows under
 /// another source's, another class's or another destination's stream while the
