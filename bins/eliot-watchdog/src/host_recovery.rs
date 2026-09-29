@@ -27,6 +27,18 @@
 //! exclusion is a durable row in the Watchdog's own journal, so a hung Host can
 //! neither hold it nor make the Watchdog wait on it.
 //!
+//! One guard, two boundaries: the owner-evidence check is a single helper applied
+//! both where an attempt is armed and where the durable operation is advanced
+//! toward its stop or its start, so the completion boundary can never admit less
+//! than the fence did.
+//!
+//! Dual audit: spool persistence and Event Log delivery are two independent
+//! fields of one correlated record, so neither can stand in for the other and a
+//! log failure can never cause a replayed SCM effect. The Event Log leg is a
+//! finite handoff whose timeout abandons only the waiter, never the synchronous
+//! OS call, and the installed source/event contract's own closed rule decides
+//! whether anything is submitted at all.
+//!
 //! Redaction: only validated coordination identities and content digests enter
 //! a durable row or a diagnostic. Credentials, nonces, raw process values (process
 //! ID, start time, image path), and user data are never carried: a process
@@ -35,7 +47,7 @@
 
 use eliot_contracts::sha256_hex;
 use eliot_platform::PlatformHandle;
-use eliot_platform_windows::{AdmittedEventLogEvent, ProcessIdentity};
+use eliot_platform_windows::{AdmittedEventLogEvent, ProcessIdentity, report_local_event};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -248,6 +260,38 @@ pub struct BoundaryEvidence {
     pub generation: Option<PlatformHandle>,
 }
 
+/// The one owner-evidence guard, shared by fence arming and step completion.
+///
+/// Both irreversible boundaries apply exactly this check: the fence that admits
+/// a recovery intent, and the durable step commit that advances an open
+/// operation toward its stop or its start. A guard written into only one of
+/// them would let the other arm a substituted target, so neither duplicates the
+/// checks and neither may skip one. A service name and an earlier status query
+/// satisfy none of the three facts and therefore admit nothing.
+fn owner_evidence_admits(
+    target: &RecoveryTarget,
+    evidence: &BoundaryEvidence,
+) -> Result<(), BoundaryRefusal> {
+    if !evidence.registration_unchanged {
+        return Err(BoundaryRefusal::RegistrationChanged);
+    }
+    match evidence.identity_digest.as_ref() {
+        None => return Err(BoundaryRefusal::IdentityNotRetained),
+        Some(observed) if observed != &target.identity_digest => {
+            return Err(BoundaryRefusal::IdentityChanged);
+        }
+        Some(_) => {}
+    }
+    match evidence.generation.as_ref() {
+        None => return Err(BoundaryRefusal::GenerationUnavailable),
+        Some(observed) if observed != &target.generation => {
+            return Err(BoundaryRefusal::GenerationChanged);
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
 /// Why a boundary refused one recovery attempt.
 ///
 /// Every refusal keeps the decision explicit. None of them is a health claim, and
@@ -367,20 +411,37 @@ pub enum AuditEventKind {
 /// This cell records only the fact it can prove. The installed port admits only
 /// the fixed `EliotHost` source and its three Host lifecycle events, and its own
 /// closed rule reports `false` for a Watchdog audit record. Nothing is submitted
-/// and nothing is visible; extending the installed source/event contract is
-/// coordinated through its owners (issue #984, `bins/eliot-host#889`) rather than
-/// by impersonating `EliotHost` or passing an arbitrary source name.
+/// and nothing is visible until that rule admits the record: extending the
+/// installed source/event contract is coordinated through its owners (issue
+/// #984, `bins/eliot-host#889`) rather than by impersonating `EliotHost` or
+/// passing an arbitrary source name.
+///
+/// The admitted event is supplied by the owner of the installed contract, never
+/// chosen here, so this cell can neither pick a Host lifecycle event to carry a
+/// Watchdog record nor invent a source name.
 ///
 /// There is deliberately no visible variant: a Watchdog audit record can never be
-/// claimed readable back from this port, so no code can mistake a persisted spool
-/// record for Event Log visibility.
+/// claimed readable back from this port, so no code can mistake a submitted or a
+/// persisted record for Event Log visibility. [`Self::readable_back`] is the only
+/// visibility question, and it reads the installed port's own closed rule.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventLogDelivery {
-    /// The installed source/event contract does not admit this record.
+    /// The installed source/event contract does not admit this record, so
+    /// nothing was submitted and no code path can make it visible.
     NotAdmittedByInstalledSource {
         /// Owner to coordinate the closed extension with.
         owner: &'static str,
     },
+    /// The bounded writer returned an OS acceptance receipt for the record. OS
+    /// acceptance is not visibility and not a readback: while the installed rule
+    /// refuses the record it still cannot be claimed readable back.
+    SubmittedToWriter,
+    /// The finite handoff bound elapsed while the synchronous OS call was still
+    /// in flight. That call is not cancelled, so its outcome stays unknown and is
+    /// never reported as delivered.
+    PendingAfterBound,
+    /// The bounded writer refused the validated record; nothing was submitted.
+    RefusedByWriter,
 }
 
 impl EventLogDelivery {
@@ -396,11 +457,61 @@ impl EventLogDelivery {
     ///
     /// It reads the installed port's own closed admission rule rather than
     /// assuming it, so a future owner extension flips this without a second
-    /// source of truth. While it is `false` no code may treat a persisted spool
-    /// record as Event Log visibility.
+    /// source of truth. While it is `false` no code may treat a submitted or a
+    /// persisted record as Event Log visibility.
     #[must_use]
     pub fn readable_back(&self) -> bool {
         AdmittedEventLogEvent::admits_watchdog_audit()
+    }
+}
+
+/// The bounded, already-redacted insertion one correlated audit record carries.
+///
+/// It is composed only of validated coordination identities, so a credential, a
+/// nonce, a raw path, or a user datum cannot reach the installed writer through
+/// it.
+fn correlation_insertion(correlation: &AuditCorrelation) -> String {
+    format!(
+        "operation={} policy={} target_generation={} target_identity={}",
+        correlation.operation_id.as_str(),
+        correlation.policy_digest.as_str(),
+        correlation.target_generation.as_str(),
+        correlation.target_identity_digest.as_str(),
+    )
+}
+
+/// Hands one correlated audit record to the installed bounded Event Log writer
+/// through a finite asynchronous handoff.
+///
+/// The handoff is finite and its bound belongs to the caller, because the
+/// installation owns it. When the bound elapses the synchronous OS call is
+/// **not** cancelled: it keeps running on the blocking pool and its outcome
+/// stays unknown, which is [`EventLogDelivery::PendingAfterBound`] rather than a
+/// success. A record the installed source/event contract does not admit is never
+/// submitted at all.
+///
+/// `admitted` is the installed contract owner's own admitted event, never one
+/// chosen here, so this cannot impersonate a Host lifecycle event. The handoff
+/// requests, retries, and replays no SCM effect, so a sink failure can never
+/// cause one.
+pub async fn hand_off_recovery_audit(
+    audit: &DualAuditRecord,
+    admitted: AdmittedEventLogEvent,
+    bound: std::time::Duration,
+) -> EventLogDelivery {
+    if !AdmittedEventLogEvent::admits_watchdog_audit() {
+        return EventLogDelivery::current();
+    }
+    let insertion = correlation_insertion(&audit.correlation);
+    let submitted = tokio::time::timeout(
+        bound,
+        tokio::task::spawn_blocking(move || report_local_event(admitted, &insertion)),
+    )
+    .await;
+    match submitted {
+        Ok(Ok(Ok(_receipt))) => EventLogDelivery::SubmittedToWriter,
+        Ok(Ok(Err(_refused))) | Ok(Err(_join)) => EventLogDelivery::RefusedByWriter,
+        Err(_elapsed) => EventLogDelivery::PendingAfterBound,
     }
 }
 
@@ -983,23 +1094,7 @@ pub struct RecoveryFence<'audit> {
 pub fn fence_recovery(
     fence: &RecoveryFence<'_>,
 ) -> Result<AdmittedRecoveryIntent, BoundaryRefusal> {
-    if !fence.evidence.registration_unchanged {
-        return Err(BoundaryRefusal::RegistrationChanged);
-    }
-    match fence.evidence.identity_digest.as_ref() {
-        None => return Err(BoundaryRefusal::IdentityNotRetained),
-        Some(observed) if observed != &fence.target.identity_digest => {
-            return Err(BoundaryRefusal::IdentityChanged);
-        }
-        Some(_) => {}
-    }
-    match fence.evidence.generation.as_ref() {
-        None => return Err(BoundaryRefusal::GenerationUnavailable),
-        Some(observed) if observed != &fence.target.generation => {
-            return Err(BoundaryRefusal::GenerationChanged);
-        }
-        Some(_) => {}
-    }
+    owner_evidence_admits(fence.target, &fence.evidence)?;
     if fence.target.recipe_digest != fence.policy.recipe_digest {
         return Err(BoundaryRefusal::RecipeNotAdmitted);
     }
@@ -1303,16 +1398,17 @@ pub fn begin_recovery_operation(
 /// The stored row is re-read inside the transaction and compared content-wise with
 /// the caller's `expected`, so an interleaved writer can neither be overwritten nor
 /// substituted. A mismatch is a conflict, never a silent advance (I13.5). A step
-/// that requests an irreversible effect additionally revalidates the operation's own
-/// approved registration and expected generation against a fresh readback, so only
-/// the currently approved unchanged registration is ever started, and only after the
-/// required old-target disposition.
+/// that requests an irreversible effect additionally applies the shared
+/// `owner_evidence_admits` guard against a fresh readback, so only the currently
+/// approved unchanged registration is ever started, only after the required
+/// old-target disposition, and the completion boundary can never admit less than
+/// the fence did.
 ///
 /// # Errors
 ///
 /// Returns [`RecoveryError::Conflict`] when the stored row is not the exact expected
-/// row, [`RecoveryError::Boundary`] when a fresh readback no longer matches the
-/// operation's approved registration or expected generation,
+/// row, [`RecoveryError::Boundary`] when a fresh readback no longer proves the
+/// operation's approved registration, runtime identity, and expected generation,
 /// [`RecoveryError::IllegalPhase`] when the step does not follow the current phase,
 /// and [`RecoveryError::Invalid`] for a non-canonical step.
 pub fn commit_recovery_step(
@@ -1339,15 +1435,7 @@ pub fn commit_recovery_step(
         stored
     };
     if step.requests_effect() {
-        let target = stored.target();
-        if !evidence.registration_unchanged {
-            return Err(RecoveryError::Boundary(
-                BoundaryRefusal::RegistrationChanged,
-            ));
-        }
-        if evidence.generation.as_ref() != Some(&target.generation) {
-            return Err(RecoveryError::Boundary(BoundaryRefusal::GenerationChanged));
-        }
+        owner_evidence_admits(stored.target(), evidence).map_err(RecoveryError::Boundary)?;
     }
     stored.apply(step)?;
     let bytes = encode(&stored)?;
