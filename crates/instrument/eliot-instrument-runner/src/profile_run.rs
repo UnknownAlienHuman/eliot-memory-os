@@ -961,17 +961,19 @@ impl StageOrchestrator {
     /// Binds and launches one stage through the existing runner primitives.
     ///
     /// The pre-launch closure runs in fixed order before any child process
-    /// exists: the owning port binds the invocation shape into the sealed
-    /// process request (adapter schema authority), the executable
-    /// hash/file identity resolves from the machine against the
-    /// intent-sealed digest, the shared admission gate checks the fixed
-    /// argument template and executable identity into a sealed grant, and
-    /// only then does the runner launch. A changed executable, an unknown
-    /// identity, or an off-template argument combination becomes an
-    /// explicit missing run here instead of a child process. The tool
-    /// version stays unobserved (`None`): no version is attested on this
-    /// path, so none is claimed, while a spec-pinned version still gates
-    /// inside admission.
+    /// exists: the invocation profile, revision, and exact argument template
+    /// are checked against the admitted stage before the owning port binds
+    /// the invocation shape into the sealed process request (adapter schema
+    /// authority), the executable hash/file identity resolves from the
+    /// machine against the intent-sealed digest, the shared admission gate
+    /// checks the fixed argument template and executable identity into a
+    /// sealed grant, the grant is revalidated against the planned stage and
+    /// the sealed request at use, and only then does the runner launch. A
+    /// changed executable, an unknown identity, or an off-template argument
+    /// combination becomes an explicit missing run here instead of a child
+    /// process. The tool version stays unobserved (`None`): no version is
+    /// attested on this path, so none is claimed, while a spec-pinned
+    /// version still gates inside admission.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         plan: &StagePlan,
@@ -1007,6 +1009,18 @@ impl StageOrchestrator {
             return InstrumentRun::missing(
                 route,
                 "stage admission refused: invocation profile differs from admitted stage",
+            );
+        }
+        if route.stage().profile_revision != planned.stage.profile_revision {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: route revision differs from admitted stage revision",
+            );
+        }
+        if invocation.arguments != planned.stage.argument_template {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: requested arguments differ from the admitted fixed template",
             );
         }
         let process_request = match launcher.port(planned).bind(&invocation) {
@@ -1052,6 +1066,30 @@ impl StageOrchestrator {
                     );
                 }
             };
+        if grant.profile != route.stage().profile
+            || grant.profile_revision != route.stage().profile_revision
+        {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: grant profile differs from the admitted route",
+            );
+        }
+        if grant.spec_digest != planned.stage.spec_digest
+            || grant.parser.as_str() != planned.stage.parser.as_str()
+            || grant.parser_generation != planned.stage.parser_generation
+            || grant.arguments != planned.stage.argument_template
+        {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: grant differs from the admitted stage",
+            );
+        }
+        if process_request.executable_sha256() != grant.content_digest.as_str() {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: sealed request carries a different executable identity than the grant",
+            );
+        }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
             Err(error) => {
