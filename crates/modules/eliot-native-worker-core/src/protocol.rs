@@ -16,6 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::WorkerError;
+pub use crate::generated::WorkerRequest;
 
 /// Stable version of A-13's language-neutral native-worker protocol.
 pub const PROTOCOL_VERSION: &str = "eliot-native-worker/v2";
@@ -170,33 +171,6 @@ pub struct WorkerReady {
     pub stream_id: String,
     pub process_start_receipt: ProcessStartReceipt,
     pub ready_event: WorkerEventEnvelope,
-}
-
-/// A public request is only a proposal until the injected admission port accepts it.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerRequest {
-    pub attempt_id: AttemptId,
-    pub capability: String,
-    pub payload: BTreeMap<String, String>,
-    pub proposed_effect: Option<ProposedEffect>,
-}
-
-impl WorkerRequest {
-    pub(crate) fn validate_shape(&self) -> Result<(), WorkerError> {
-        if self.capability.trim().is_empty() {
-            return Err(WorkerError::InvalidRequest("capability"));
-        }
-        if self.payload.len() > 128 {
-            return Err(WorkerError::InvalidRequest("payload"));
-        }
-        if let Some(effect) = &self.proposed_effect
-            && effect.attempt_id != self.attempt_id
-        {
-            return Err(WorkerError::InvalidRequest("effect_attempt"));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -527,12 +501,12 @@ pub const NATIVE_WORKER_CLAIM_WIRE_VERSION: u16 = 2;
 /// explicitly at the executable gate instead of promoting them silently.
 pub const NATIVE_WORKER_CLAIM_WIRE_VERSION_V1: u16 = 1;
 /// Expected wire revision of the owner-produced executable binding (T9-01
-/// `NativeWorkerExecutableBinding` v1).
+/// NativeWorkerExecutableBinding v2).
 ///
 /// Carried by value, never imported: this crate must not depend on
 /// `eliot-governor`. A binding-wire drift changes the owner digest as well,
 /// so this pin fails closed twice.
-pub const NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION: u16 = 1;
+pub const NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION: u16 = 2;
 /// Maximum length of bounded claim/registration text fields, in UTF-8 bytes.
 pub const MAX_CLAIM_TEXT_LEN: usize = 1_024;
 /// Maximum length of one native-worker operation identity, in UTF-8 bytes.
@@ -804,12 +778,12 @@ impl NativeWorkerRegistration {
 
 /// Worker-side projection of the owner-produced executable binding (T9-02).
 ///
-/// Carries the M1 currentness inputs the start path needs for refusal —
+/// Carries the M1 currentness inputs the start path needs for refusal:
 /// route, adapter, config, facet, cell, grant and catalog revisions, replay
-/// stream, launch nonce, invocation digest, epoch/generation/fence, and the
-/// binding window — plus the opaque owner-produced `NativeWorkerExecutableBinding` v1
-/// digest. Field names reuse the T9-01 names where they exist, matching the
-/// Kernel-side `eliot-kernel-service` projection field-for-field. This is an
+/// stream, launch nonce, invocation digest, epoch/generation/fence, binding
+/// window, and eight lifecycle lineage/policy digests. Field names reuse the
+/// T9-01 names where they exist, matching the Kernel-side
+/// eliot-kernel-service projection field-for-field. This is an
 /// identity/epoch/fence/ordering projection only: it carries references and
 /// revisions, never task meaning, plan/policy content, effective ceilings,
 /// credential or resource values, or Governor composition. The full T9-01
@@ -859,6 +833,22 @@ pub struct NativeWorkerExecutableBinding {
     pub executable_wire_version: u16,
     /// Opaque owner-produced executable digest (lowercase SHA-256).
     pub executable_binding_digest: String,
+    /// Lowercase SHA-256 of the capability-cell registry snapshot.
+    pub capability_cell_registry_digest: String,
+    /// Lowercase SHA-256 of the admitted Kernel execution manifest.
+    pub kernel_execution_manifest_digest: String,
+    /// Owner reference for the Durable Job lineage.
+    pub job_object_lineage_ref: String,
+    /// Lowercase SHA-256 of the admitted resource limits.
+    pub resource_limits_digest: String,
+    /// Owner reference for the cancellation policy.
+    pub cancellation_policy_ref: String,
+    /// Lowercase SHA-256 of the checkpoint policy.
+    pub checkpoint_policy_digest: String,
+    /// Owner reference for the drain policy.
+    pub drain_policy_ref: String,
+    /// Lowercase SHA-256 of the restart policy.
+    pub restart_policy_digest: String,
 }
 
 impl NativeWorkerExecutableBinding {
@@ -914,10 +904,46 @@ impl NativeWorkerExecutableBinding {
                 &self.executable_binding_digest,
                 "executable_binding.executable_binding_digest",
             ),
+            (
+                &self.capability_cell_registry_digest,
+                "executable_binding.capability_cell_registry_digest",
+            ),
+            (
+                &self.kernel_execution_manifest_digest,
+                "executable_binding.kernel_execution_manifest_digest",
+            ),
+            (
+                &self.resource_limits_digest,
+                "executable_binding.resource_limits_digest",
+            ),
+            (
+                &self.checkpoint_policy_digest,
+                "executable_binding.checkpoint_policy_digest",
+            ),
+            (
+                &self.restart_policy_digest,
+                "executable_binding.restart_policy_digest",
+            ),
         ] {
             if !is_lowercase_sha256(digest) {
                 return Err(WorkerError::InvalidRequest(field));
             }
+        }
+        for (text, field) in [
+            (
+                &self.job_object_lineage_ref,
+                "executable_binding.job_object_lineage_ref",
+            ),
+            (
+                &self.cancellation_policy_ref,
+                "executable_binding.cancellation_policy_ref",
+            ),
+            (
+                &self.drain_policy_ref,
+                "executable_binding.drain_policy_ref",
+            ),
+        ] {
+            validate_claim_text(text, field)?;
         }
         if self.adapter_revision == 0 || self.grant_graph_revision == 0 {
             return Err(WorkerError::InvalidRequest("executable_binding.revisions"));
@@ -1468,6 +1494,46 @@ fn compare_executable_currentness(
     if presented.executable_binding_digest != current.executable_binding_digest {
         return Err(WorkerError::InvalidRequest(
             "executable_binding.executable_binding_digest",
+        ));
+    }
+    if presented.capability_cell_registry_digest != current.capability_cell_registry_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.capability_cell_registry_digest",
+        ));
+    }
+    if presented.kernel_execution_manifest_digest != current.kernel_execution_manifest_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.kernel_execution_manifest_digest",
+        ));
+    }
+    if presented.job_object_lineage_ref != current.job_object_lineage_ref {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.job_object_lineage_ref",
+        ));
+    }
+    if presented.resource_limits_digest != current.resource_limits_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.resource_limits_digest",
+        ));
+    }
+    if presented.cancellation_policy_ref != current.cancellation_policy_ref {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.cancellation_policy_ref",
+        ));
+    }
+    if presented.checkpoint_policy_digest != current.checkpoint_policy_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.checkpoint_policy_digest",
+        ));
+    }
+    if presented.drain_policy_ref != current.drain_policy_ref {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.drain_policy_ref",
+        ));
+    }
+    if presented.restart_policy_digest != current.restart_policy_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.restart_policy_digest",
         ));
     }
     if presented.executable_wire_version != current.executable_wire_version {
