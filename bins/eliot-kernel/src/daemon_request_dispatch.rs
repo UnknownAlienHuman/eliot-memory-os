@@ -3758,6 +3758,15 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
         };
         if request_fence != &session.module_generation.state_fence {
             return Err(TransportError::SessionFenced);
@@ -3794,6 +3803,13 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_horizon(session, request)
                         .await,
                 )
             }
@@ -3854,6 +3870,13 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request }
+            | UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_horizon(session, request)
                         .await,
                 )
             }
@@ -3937,7 +3960,87 @@ impl KernelComposition {
                     Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
                 }
             }
+            UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
+                let answer = match Box::pin(client.publish_wake_horizon(request.clone())).await {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        return Ok(Self::user_automation_runtime_error_response(error));
+                    }
+                };
+                Ok(Self::user_automation_horizon_publication_response(
+                    "wake_horizon_published",
+                    request.as_ref(),
+                    answer,
+                ))
+            }
+            UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
+                let answer =
+                    match Box::pin(client.read_wake_horizon_publication(request.clone())).await {
+                        Ok(answer) => answer,
+                        Err(error) => {
+                            return Ok(Self::user_automation_runtime_error_response(error));
+                        }
+                    };
+                Ok(Self::user_automation_horizon_publication_response(
+                    "wake_horizon_publication_readback",
+                    request.as_ref(),
+                    answer,
+                ))
+            }
         }
+    }
+
+    #[cfg(windows)]
+    /// Projects one schedule owner's horizon answer against the exact request it
+    /// was asked for (issue #2806 items 4 and 9).
+    ///
+    /// The owner's acknowledgement is validated against the exact publication
+    /// through `UserAutomationWakePublication::validate_for`, which requires the
+    /// acknowledged and remaining sets to partition the requested set exactly.
+    /// An answer that does not account for the request is reported as unknown
+    /// rather than as a partial success, because a mismatched remainder is not
+    /// evidence about any occurrence.
+    ///
+    /// A remainder is never projected as completion. When the owner leaves
+    /// occurrences unacknowledged, the exact remaining set and the owner's own
+    /// replay handle are returned as the recovery directive, which forces
+    /// `status: "unknown"`; only an answer that acknowledged the whole requested
+    /// set settles the route.
+    #[cfg(windows)]
+    fn user_automation_horizon_publication_response(
+        outcome: &str,
+        request: &UserAutomationWakeHorizonPublication,
+        answer: UserAutomationWakePublication,
+    ) -> serde_json::Value {
+        if let Err(error) = answer.validate_for(request) {
+            return Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "the schedule owner answer does not account for the requested horizon: {error}"
+                )),
+            );
+        }
+        let recovery = if answer.acknowledged_all() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "kind": "partial_horizon",
+                "reason": "the schedule owner did not acknowledge every requested occurrence, so \
+                           the exact remaining set is retained and must be replayed under its \
+                           handle",
+                "automation_id": answer.automation_id.clone(),
+                "automation_revision": answer.automation_revision.clone(),
+                "remaining_occurrence_ids": answer.remaining_occurrence_ids.clone(),
+                "retry_handle": answer.retry_handle.clone(),
+            }))
+        };
+        serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": outcome,
+                "publication": answer,
+            },
+            "recovery": recovery,
+        })
     }
 
     #[cfg(windows)]
@@ -5749,6 +5852,86 @@ impl KernelComposition {
                 .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
                 != request.revision_digest
             || owner_denominator != request.denominator
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_store_receipt(&gateway, &lookup.state_fence, &request.identity)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates one bounded recurring wake horizon against the authenticated
+    /// owner and the canonical parent operation receipt before Host.
+    ///
+    /// A horizon publication belongs to the read/observation family, not the
+    /// occurrence family: it names an immutable revision and a State Fence but
+    /// no occurrence. `revalidate_user_automation_enumeration` is therefore its
+    /// exact analogue — the same `UserAutomationOwnerLookup`, the same canonical
+    /// owner readback, the same owner-recompiled occurrence denominator, and the
+    /// same parent Store receipt proof. `revalidate_user_automation_wake_read` is
+    /// not usable here because it keys on a `UserAutomationWakeReadRequest` and
+    /// its invocation.
+    ///
+    /// The caller-carried publication is never an authority source. The
+    /// automation identity, the revision, the owner principal and the complete
+    /// occurrence denominator are all recompiled from the canonical current
+    /// revision, and the carried `revision_digest` must equal that revision's
+    /// own `digest()` — a digest a caller could compute for itself would
+    /// otherwise name another revision's cursor. This is issue #2806 item 2's
+    /// "revalidate principal, revision, State Fence and owner denominator
+    /// before each owner call", applied to the publish leg and the read-back leg
+    /// alike.
+    async fn revalidate_user_automation_horizon(
+        &self,
+        session: &Session,
+        request: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal
+            || request.context.state_fence != session.module_generation.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.automation_id.clone(),
+            requested_revision: request.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        let owner_occurrence_ids = owner
+            .revision
+            .compile_occurrence_identities()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        if owner.automation_id != request.automation_id
+            || owner.revision.revision != request.automation_revision
+            || owner.revision.owner_principal != authenticated_principal
+            || owner
+                .revision
+                .digest()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+                != request.revision_digest
+            || owner_occurrence_ids != request.denominator_occurrence_ids
         {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
