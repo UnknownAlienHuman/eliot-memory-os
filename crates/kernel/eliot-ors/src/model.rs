@@ -32,7 +32,7 @@ use crate::process_stream_recovery::ProcessStreamObservation;
 use crate::reservation_model::ReservationRecord;
 use crate::{CONTRACT_VERSION, MAX_INLINE_RECOVERY_BYTES, MAX_RECOVERY_PAGE};
 
-/// HostRequest rows written with this send-claim protocol persist a durable
+/// `HostRequest` rows written with this send-claim protocol persist a durable
 /// pre-transport fence and typed custody evidence. Zero remains the legacy
 /// wire value and is classified conservatively during restart recovery.
 pub const HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION: u16 = 1;
@@ -40,7 +40,7 @@ pub const HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION: u16 = 1;
 /// This issue allows one original send attempt plus one proven-not-sent retry.
 pub const MAX_HOST_REQUEST_SEND_ATTEMPTS: usize = 2;
 
-/// Maximum active claim lifetime for one authenticated UserAutomation send.
+/// Maximum active claim lifetime for one authenticated `UserAutomation` send.
 /// This follows the Host Control Endpoint's existing 30-second queue-response
 /// timeout; expiry moves an uncertain claim to reconciliation and never frees
 /// it for another send.
@@ -4277,7 +4277,7 @@ pub enum OrsError {
     AuthoritySnapshotUnavailable,
     #[error("operational projection exceeds its declared bound")]
     ProjectionLimitExceeded,
-    /// A HostRequest exhausted its original send attempt and its one
+    /// A `HostRequest` exhausted its original send attempt and its one
     /// proven-not-sent same-identity retry; its existing claim remains retained.
     #[error("HostRequest send-attempt bound is exhausted; reconcile the retained operation")]
     HostRequestAttemptLimitExceeded,
@@ -6609,7 +6609,7 @@ pub enum HostRequestTransportCustody {
     ResponseReceived,
 }
 
-/// Last durable transport boundary retained under one exact HostRequest claim.
+/// Last durable transport boundary retained under one exact `HostRequest` claim.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HostRequestTransportBoundary {
@@ -6674,9 +6674,9 @@ pub struct HostRequestTransportObservation {
     /// Digest of the exact typed transport request carrier sent on that
     /// authenticated channel. Every observation in this claim repeats it.
     pub transport_request_sha256: String,
-    /// Exact retained HostRequest operation commitment.
+    /// Exact retained `HostRequest` operation commitment.
     pub request_commitment_sha256: String,
-    /// Exact retained HostRequest payload commitment from the admitted row.
+    /// Exact retained `HostRequest` payload commitment from the admitted row.
     pub payload_commitment_sha256: String,
     /// Present only when the named-pipe send boundary returned an outcome.
     #[serde(default)]
@@ -6697,6 +6697,10 @@ pub struct HostRequestTransportObservation {
 }
 
 impl HostRequestTransportObservation {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact observation identity and custody fields are validated as one boundary"
+    )]
     pub(crate) fn validate_for(
         &self,
         record: &HostRequestRecord,
@@ -6883,14 +6887,11 @@ impl HostRequestAttemptPhase {
     /// Returns the durable custody observation, if this phase carries one.
     pub const fn transport_custody(self) -> Option<HostRequestTransportCustody> {
         match self {
-            Self::Claimed | Self::DispatchStarted => {
+            Self::Claimed | Self::DispatchStarted | Self::DeliveryOutcomeUnknown => {
                 Some(HostRequestTransportCustody::DeliveryOutcomeUnknown)
             }
             Self::DefinitelyNotSent | Self::DeferredNoEffect => {
                 Some(HostRequestTransportCustody::DefinitelyNotSent)
-            }
-            Self::DeliveryOutcomeUnknown => {
-                Some(HostRequestTransportCustody::DeliveryOutcomeUnknown)
             }
             Self::DeliveredToAuthenticatedHost => {
                 Some(HostRequestTransportCustody::DeliveredToAuthenticatedHost)
@@ -7429,7 +7430,7 @@ pub struct HostRequestRecord {
     #[serde(default)]
     pub send_claim_protocol_version: u16,
     /// Authenticated Host channel receipt committed with a versioned
-    /// UserAutomation transport operation before its send claim. Legacy rows
+    /// `UserAutomation` transport operation before its send claim. Legacy rows
     /// omit it.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7686,6 +7687,10 @@ impl HostRequestRecord {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the retained request and cancellation identities share one validation boundary"
+    )]
     fn validate_identity_and_cancellation_binding(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
@@ -7717,7 +7722,7 @@ impl HostRequestRecord {
             self.transport_channel_binding_sha256.as_deref(),
         ) {
             (HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION, Some(digest)) => {
-                validate_digest(digest, "host_request_transport_channel_binding_sha256")?
+                validate_digest(digest, "host_request_transport_channel_binding_sha256")?;
             }
             (HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION, None) => {
                 return Err(OrsError::InvalidField {
@@ -7725,7 +7730,6 @@ impl HostRequestRecord {
                     reason: "versioned send rows require the authenticated channel committed at staging",
                 });
             }
-            (0, None) => {}
             (0, Some(_)) => {
                 return Err(OrsError::InvalidField {
                     field: "host_request_transport_channel_binding_sha256",
@@ -7879,6 +7883,10 @@ impl HostRequestRecord {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the monotonic observation sequence and original commitments validate together"
+    )]
     fn validate_attempt_observations(&self, attempt: &HostRequestAttempt) -> Result<(), OrsError> {
         if self.send_claim_protocol_version == 0 && !attempt.transport_observations.is_empty() {
             return Err(OrsError::InvalidField {
@@ -7943,18 +7951,15 @@ impl HostRequestRecord {
                 | [
                     HostRequestTransportBoundary::DispatchStarted,
                     HostRequestTransportBoundary::DefinitelyNotSent
-                ]
-                | [
-                    HostRequestTransportBoundary::DispatchStarted,
-                    HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | HostRequestTransportBoundary::DeliveryOutcomeUnknown
                         | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
-                        | HostRequestTransportBoundary::ResponseReceived,
+                        | HostRequestTransportBoundary::ResponseReceived
                 ]
                 | [
                     HostRequestTransportBoundary::DispatchStarted,
                     HostRequestTransportBoundary::DeliveryOutcomeUnknown
                         | HostRequestTransportBoundary::DeliveredToAuthenticatedHost,
-                    HostRequestTransportBoundary::ResponseReceived,
+                    HostRequestTransportBoundary::ResponseReceived
                 ]
         );
         if !legal {
@@ -8004,41 +8009,36 @@ impl HostRequestRecord {
         if let (Some(result_digest), Some(observation)) = (
             self.result_digest.as_deref(),
             attempt.transport_observations.last(),
-        ) {
-            if observation.boundary == HostRequestTransportBoundary::ResponseReceived
-                && observation.response_commitment_sha256.as_deref() != Some(result_digest)
-            {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_transport_response_commitment",
-                    reason: "retained result must equal the original response observation",
-                });
-            }
+        ) && observation.boundary == HostRequestTransportBoundary::ResponseReceived
+            && observation.response_commitment_sha256.as_deref() != Some(result_digest)
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_transport_response_commitment",
+                reason: "retained result must equal the original response observation",
+            });
         }
         if let (Some(result_digest), Some(readback)) = (
             self.result_digest.as_deref(),
             attempt.owner_readback.as_ref(),
-        ) {
-            if readback.result_commitment_sha256 != result_digest {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_owner_readback_result_commitment",
-                    reason: "retained result must equal the original owner readback commitment",
-                });
-            }
+        ) && readback.result_commitment_sha256 != result_digest
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_owner_readback_result_commitment",
+                reason: "retained result must equal the original owner readback commitment",
+            });
         }
         if let (Some(readback), Some(response_observation)) = (
             attempt.owner_readback.as_ref(),
             attempt.transport_observations.last().filter(|observation| {
                 observation.boundary == HostRequestTransportBoundary::ResponseReceived
             }),
-        ) {
-            if response_observation.response_commitment_sha256.as_deref()
-                != Some(readback.result_commitment_sha256.as_str())
-            {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_owner_readback_result_commitment",
-                    reason: "owner readback must confirm the exact observed response commitment",
-                });
-            }
+        ) && response_observation.response_commitment_sha256.as_deref()
+            != Some(readback.result_commitment_sha256.as_str())
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_owner_readback_result_commitment",
+                reason: "owner readback must confirm the exact observed response commitment",
+            });
         }
         Ok(())
     }

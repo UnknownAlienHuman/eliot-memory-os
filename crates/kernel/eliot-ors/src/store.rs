@@ -8801,6 +8801,10 @@ impl RedbRecoveryStore {
     /// caller observes that durable winner without changing its state, so the
     /// winner can persist the transport boundary; legacy ownership conflicts
     /// keep their conservative `Unknown` fence.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exclusive claim and retained loser disposition share one atomic transaction"
+    )]
     pub fn claim_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -9227,6 +9231,10 @@ impl RedbRecoveryStore {
     /// Appends one monotonic typed transport observation to the exact active
     /// claim. The observation is validated and retained in the same redb
     /// transaction as its phase/state projection.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the observed custody boundary and claim state commit atomically"
+    )]
     pub fn observe_host_request_transport_custody(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -9529,6 +9537,10 @@ impl RedbRecoveryStore {
     /// exact owner readback. When `owner_readback` is present, both that
     /// evidence and the terminal response are retained in this same redb
     /// transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact owner result and claim terminalization commit atomically"
+    )]
     pub fn persist_claimed_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -24233,8 +24245,8 @@ impl RedbRecoveryStore {
     /// Identity-index rows share `HOST_REQUESTS` and are told apart by the
     /// same `request_digest` marker the reuse check uses, so only real
     /// operation rows are candidates. The legacy no-claim Admitted/Routed
-    /// fallback is restricted to the UserAutomation runtime channel: generic
-    /// protocol-v0 HostRequest rows retain their pre-protocol restart behavior.
+    /// fallback is restricted to the `UserAutomation` runtime channel: generic
+    /// protocol-v0 `HostRequest` rows retain their pre-protocol restart behavior.
     fn recover_interrupted_host_requests(&self) -> Result<(), OrsError> {
         loop {
             let write = self.database.begin_write().map_err(storage)?;
