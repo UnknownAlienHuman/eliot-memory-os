@@ -931,8 +931,10 @@ async fn read_capability_evidence_records(
 /// instead of yielding a positive summary. A subject no owner row names stays
 /// unresolved — never a negative fact — and is refused as unqualified rather
 /// than published from the receipt's self-declared stages. The admission
-/// re-validates the receipt against its ORIGINAL recorded value and binds it
-/// to the stored view's exact revision and package.
+/// re-validates the receipt's shape and binds it to the stored view's exact
+/// revision and package; admission itself retains no activation receipt, so
+/// cross-ingest activation replay awaits the lifecycle-owner write item 5
+/// requires (the execution leg already enforces it through the owner).
 ///
 /// A candidate that cannot name the ingest it arrived on, or that carries a
 /// broken owner revision binding, is refused outright.
@@ -1023,8 +1025,11 @@ fn commit_activation_candidate(
         return SkillResultEnvelope::refused(&eliot_skill::SkillError::IdentityMismatch);
     }
     for held in &view.attempt_receipts {
-        // Exact replay under a retained receipt identity is idempotent; a
-        // changed record under that identity is a conflict, never a rewrite.
+        // A retained row under this receipt or attempt identity must agree
+        // byte-for-byte with the candidate: a changed record under a retained
+        // identity is a conflict, never a rewrite. Admission retains no
+        // activation receipt itself, so this fires only where the owner
+        // already holds rows; it never invents a conflict.
         if (held.receipt_id == candidate.receipt.receipt_id
             || held.attempt_ref == candidate.receipt.attempt_ref)
             && *held != *candidate.receipt
