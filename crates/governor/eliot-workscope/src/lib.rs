@@ -1004,6 +1004,104 @@ pub enum TaskBindingState {
     },
 }
 
+/// Data projection of one current task selection from a readiness receipt.
+///
+/// This value is not owner evidence or an admission capability. The receipt
+/// has public fields and can be caller-constructed, so a consumer must obtain
+/// the receipt from the retained owner and join this projection to the current
+/// activation and `WorkScope` before using it in a write admission path. The
+/// exact readiness receipt and onboarding lease references are retained as
+/// join inputs; they are not proof by themselves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentTaskSelectionProjection {
+    receipt_ref: String,
+    lease_ref: String,
+    principal_ref: String,
+    session_ref: String,
+    work_scope_ref: String,
+    scope_descriptor_revision: u64,
+    instance_ref: String,
+    governing_source_generation: u64,
+    task_ref: String,
+    task_revision: u64,
+    acceptance_digest: String,
+    state_fence: StateFence,
+}
+
+impl CurrentTaskSelectionProjection {
+    /// Exact owner readiness receipt that contains this task selection.
+    #[must_use]
+    pub fn receipt_ref(&self) -> &str {
+        &self.receipt_ref
+    }
+
+    /// Exact onboarding lease that admitted the readiness receipt.
+    #[must_use]
+    pub fn lease_ref(&self) -> &str {
+        &self.lease_ref
+    }
+
+    /// Principal bound by the owner readiness receipt.
+    #[must_use]
+    pub fn principal_ref(&self) -> &str {
+        &self.principal_ref
+    }
+
+    /// Session bound by the owner readiness receipt.
+    #[must_use]
+    pub fn session_ref(&self) -> &str {
+        &self.session_ref
+    }
+
+    /// `WorkScope` identity bound by the owner readiness receipt.
+    #[must_use]
+    pub fn work_scope_ref(&self) -> &str {
+        &self.work_scope_ref
+    }
+
+    /// Expected descriptor revision recorded by the owner readiness receipt.
+    #[must_use]
+    pub const fn scope_descriptor_revision(&self) -> u64 {
+        self.scope_descriptor_revision
+    }
+
+    /// Workspace instance bound by the owner readiness receipt.
+    #[must_use]
+    pub fn instance_ref(&self) -> &str {
+        &self.instance_ref
+    }
+
+    /// Governing-source generation bound by the owner readiness receipt.
+    #[must_use]
+    pub const fn governing_source_generation(&self) -> u64 {
+        self.governing_source_generation
+    }
+
+    /// Exact task identity selected by the owner receipt.
+    #[must_use]
+    pub fn task_ref(&self) -> &str {
+        &self.task_ref
+    }
+
+    /// Current task-contract revision selected by the owner receipt.
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+
+    /// Acceptance digest selected by the owner receipt.
+    #[must_use]
+    pub fn acceptance_digest(&self) -> &str {
+        &self.acceptance_digest
+    }
+
+    /// State Fence at which the owner receipt was compiled.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+}
+
 /// Cold-start lifecycle position of one compiled readiness receipt.
 ///
 /// `compile` emits a narrow subset: `NeedsTask` for a missing, ambiguous or
@@ -1128,6 +1226,47 @@ pub struct OnboardingReadinessReceipt {
 }
 
 impl OnboardingReadinessReceipt {
+    /// Returns the task selection data carried by this validated readiness
+    /// receipt, when it is material-ready and scope-authenticated.
+    ///
+    /// The returned projection is not evidence and is insufficient for a
+    /// write. Its caller must first obtain this receipt from the retained owner,
+    /// then join it to the current activation, current `WorkScope` observation
+    /// and write fence. Non-current, exploratory, stale, ambiguous and
+    /// task-free receipts remain typed non-selections.
+    pub fn current_task_selection_projection(
+        &self,
+    ) -> Result<Option<CurrentTaskSelectionProjection>, WorkScopeError> {
+        self.validate()?;
+        if self.scope_resolution != ScopeResolutionState::Authenticated
+            || self.readiness != ReadinessLifecycle::ReadyMaterial
+        {
+            return Ok(None);
+        }
+        let TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } = &self.task_binding
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CurrentTaskSelectionProjection {
+            receipt_ref: self.receipt_ref.clone(),
+            lease_ref: self.lease_ref.clone(),
+            principal_ref: self.principal_ref.clone(),
+            session_ref: self.session_ref.clone(),
+            work_scope_ref: self.scope.scope_ref.clone(),
+            scope_descriptor_revision: self.scope_descriptor_revision,
+            instance_ref: self.instance.instance_ref.clone(),
+            governing_source_generation: self.governing_source_generation,
+            task_ref: task_ref.clone(),
+            task_revision: *task_revision,
+            acceptance_digest: acceptance_digest.clone(),
+            state_fence: self.state_fence.clone(),
+        }))
+    }
+
     /// Validates every bound reference without re-resolving any authority.
     ///
     /// # Errors
