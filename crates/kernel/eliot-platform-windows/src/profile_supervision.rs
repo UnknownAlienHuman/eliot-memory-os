@@ -138,10 +138,27 @@ pub struct CurrentUserTaskRequest {
     pub bootstrap_arguments: Vec<String>,
 }
 
+impl CurrentUserTaskRequest {
+    /// Computes the canonical SHA-256 binding for this exact retained request.
+    ///
+    /// Transaction owners use this when validating a persisted receipt or
+    /// unknown outcome, so the stored digest is always recomputed from the
+    /// complete request bytes.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if canonical request serialization fails.
+    pub fn request_digest(&self) -> Result<String, WindowsAdapterError> {
+        let canonical = serde_json::to_vec(self).map_err(|_| WindowsAdapterError::InvalidInput)?;
+        Ok(crate::sha256_hex(&canonical))
+    }
+}
+
 /// Task Scheduler registration/readback proof for one current-user Host task.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentUserTaskReceipt {
+    /// SHA-256 of the exact canonical request bytes retained below.
+    pub request_digest: String,
     /// Root/profile selection observation bound to task registration.
     pub selection: ProfileSelectionReceipt,
     /// Stable per-installation Task Scheduler path.
@@ -240,6 +257,8 @@ pub enum CurrentUserTaskRegistrationError {
     CommittedUnknown {
         /// Boxed for storage only; the exact original request is retained.
         request: Box<CurrentUserTaskRequest>,
+        /// SHA-256 of the exact canonical request bytes.
+        request_digest: String,
         task_name: String,
         requested_xml_sha256: String,
         observed_xml_sha256: Option<String>,
@@ -303,6 +322,7 @@ pub fn register_current_user_task(
     let retained_roots = open_profile_root_leases(&request.roots)?;
     let selection = retained_roots.selection.clone();
     validate_user_mode_bootstrap(request, &selection)?;
+    let request_digest = current_user_task_request_digest(request)?;
     let (executable, root_lease) = retain_user_mode_host_image(request)?;
 
     let task_name = task_name_for_selection(&selection)?;
@@ -338,6 +358,7 @@ pub fn register_current_user_task(
         )) => {
             return Err(CurrentUserTaskRegistrationError::CommittedUnknown {
                 request: Box::new(request.clone()),
+                request_digest,
                 task_name: unknown.task_name,
                 requested_xml_sha256: unknown.requested_xml_sha256,
                 observed_xml_sha256: unknown.observed_xml_sha256,
@@ -348,6 +369,7 @@ pub fn register_current_user_task(
     };
     let task_receipt = current_user_task_receipt(
         request.clone(),
+        request_digest,
         selection.clone(),
         executable.clone(),
         &platform_receipt,
@@ -419,11 +441,13 @@ fn retain_user_mode_host_image(
 
 fn current_user_task_receipt(
     request: CurrentUserTaskRequest,
+    request_digest: String,
     selection: ProfileSelectionReceipt,
     executable: PathBuf,
     platform: &crate::platform_security::UserModeProfileTaskReceipt,
 ) -> CurrentUserTaskReceipt {
     CurrentUserTaskReceipt {
+        request_digest,
         selection,
         task_name: platform.task_name.clone(),
         sid: platform.sid.clone(),
@@ -435,6 +459,12 @@ fn current_user_task_receipt(
         task_xml_sha256: platform.task_xml_sha256.clone(),
         request,
     }
+}
+
+fn current_user_task_request_digest(
+    request: &CurrentUserTaskRequest,
+) -> Result<String, WindowsAdapterError> {
+    request.request_digest()
 }
 
 fn cleanup_after_registration(
@@ -517,6 +547,7 @@ pub fn inspect_current_user_task(
     {
         return Err(WindowsAdapterError::InvalidInput);
     }
+    let request_digest = current_user_task_request_digest(request)?;
     let retained_roots = open_profile_root_leases(&request.roots)?;
     let selection = retained_roots.selection.clone();
     validate_user_mode_bootstrap(request, &selection)?;
@@ -536,6 +567,7 @@ pub fn inspect_current_user_task(
     let spec = platform_task_spec(request, &selection, executable.clone())?;
     if let Some(receipt) = expected_receipt
         && (receipt.request != *request
+            || receipt.request_digest != request_digest
             || !same_selection_except_session(&receipt.selection, &selection)
             || receipt.task_name != task_name
             || receipt.executable != executable
@@ -561,6 +593,7 @@ pub fn inspect_current_user_task(
         && expected_receipt.is_none_or(|receipt| observed_digest == receipt.task_xml_sha256)
     {
         let receipt = CurrentUserTaskReceipt {
+            request_digest,
             selection: selection.clone(),
             task_name,
             sid: selection.owner_sid.clone(),
@@ -595,6 +628,7 @@ fn platform_task_receipt(
     if receipt.request.roots.profile != ProfileSelection::UserMode
         || receipt.selection.profile != ProfileSelection::UserMode
         || !same_selection_except_session(&receipt.selection, current_selection)
+        || receipt.request_digest != current_user_task_request_digest(&receipt.request)?
         || !crate::valid_sha256_hex(&receipt.task_xml_sha256)
         || receipt.request.executable_sha256 != receipt.executable_sha256
         || receipt.request.working_directory != receipt.working_directory
