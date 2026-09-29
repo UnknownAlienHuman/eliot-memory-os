@@ -92,20 +92,22 @@ fn live_state_fence(binding: &AttachBinding) -> Result<StateFence, BridgeError> 
 
 /// Restore durable reactive state for the live attach session and fence.
 ///
-/// Reads the live session and fence from the runner's own attach binding
-/// (never caller text), serves one authenticated restore round-trip through
-/// the Kernel port, verifies the reply echoes the exact live binding, then
-/// feeds the existing runner calls: ledger bytes into
+/// Reads the live session, scope, task, and fence from the runner's own
+/// attach binding (never caller text), serves one authenticated restore
+/// round-trip through the Kernel port, verifies the reply echoes the exact
+/// live binding, then feeds the existing runner calls: ledger bytes into
 /// `restore_reactive_ledger`, each served snapshot into
 /// `publish_canonical_resource` (canonical grammar + digest binding enforced
 /// there). `uris` is the bounded caller-nominated snapshot set; attach
-/// passes an empty set. The live session's own canonical attention and
-/// mailbox addresses (`eliot://session/<live-session>/attention|mailbox`,
-/// derived from the authenticated binding, never caller text) are always
-/// requested alongside the caller set so owner-held session snapshots flow
-/// through the existing publish path when served; a URI the owner does not
-/// serve yields no report entry and publishes nothing — never an invented
-/// snapshot.
+/// passes an empty set. The live binding's own canonical session
+/// attention/mailbox, scope state, and task packet addresses
+/// (`eliot://session/<live-session>/attention|mailbox`,
+/// `eliot://scope/<live-scope>/state`,
+/// `eliot://task/<live-task>/packet/<live-revision>`, all derived from the
+/// authenticated binding, never caller text) are always requested alongside
+/// the caller set so owner-held snapshots flow through the existing publish
+/// path when served; a URI the owner does not serve yields no report entry
+/// and publishes nothing — never an invented snapshot.
 ///
 /// Fence or session mismatch with the live binding refuses before any wire
 /// traffic. A refused reply echo discards the bytes. Store errors leave the
@@ -117,19 +119,29 @@ pub fn restore_reactive_runtime(
 ) -> Result<ReactiveRestoreReport, BridgeError> {
     let view = runner.attach_view().ok_or(BridgeError::NotAttached)?;
     let live_session = view.binding().session_id().as_str().to_owned();
+    let live_scope = view.binding().task_binding().work_scope_id().to_owned();
+    let live_task = view.binding().task_binding().task_id().as_str().to_owned();
+    let live_task_revision = view
+        .binding()
+        .task_binding()
+        .task_revision()
+        .to_owned();
     let live_fence = live_state_fence(view.binding())?;
-    // Live-session self addresses: the bridge requests only its own session's
-    // canonical attention/mailbox URIs (authenticated binding, validated
-    // against the I7.18 grammar here). Foreign families still arrive only via
-    // the caller-nominated set; served bytes still flow through
-    // `publish_canonical_resource` with digest binding, while a URI the owner
-    // does not serve yields no report entry and publishes nothing. No content
-    // is invented: the URIs are requests, the bytes come from the owner or
-    // not at all.
-    let mut requested: Vec<String> = Vec::with_capacity(uris.len().saturating_add(2));
+    // Live-binding self addresses: the bridge requests only its own session's
+    // canonical attention/mailbox URIs, its own scope state, and its own task
+    // packet at the authenticated revision (all from the attach binding,
+    // validated against the I7.18 grammar here). Remaining families still
+    // arrive only via the caller-nominated set; served bytes still flow
+    // through `publish_canonical_resource` with digest binding, while a URI
+    // the owner does not serve yields no report entry and publishes nothing.
+    // No content is invented: the URIs are requests, the bytes come from the
+    // owner or not at all.
+    let mut requested: Vec<String> = Vec::with_capacity(uris.len().saturating_add(4));
     for candidate in [
         format!("eliot://session/{live_session}/attention"),
         format!("eliot://session/{live_session}/mailbox"),
+        format!("eliot://scope/{live_scope}/state"),
+        format!("eliot://task/{live_task}/packet/{live_task_revision}"),
     ] {
         if ResourceUri::parse(candidate.clone()).is_ok() && !requested.contains(&candidate) {
             requested.push(candidate);
