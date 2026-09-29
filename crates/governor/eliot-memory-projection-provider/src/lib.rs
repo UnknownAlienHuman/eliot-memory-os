@@ -23,15 +23,16 @@
 //!
 //! Continuity is enforced at this boundary whenever a read reaches it:
 //! [`project_batch`] refuses the whole read when a continuity observation
-//! breaks the I12.35 ingestion rules, or when an attached workflow view does
-//! not belong to the batch binding, before a single record is built. Admitted
-//! continuity then reaches the denominator exactly once, so a
+//! breaks the I12.35 ingestion rules, when an attached workflow view does
+//! not belong to the batch binding, or when attached workflow continuity
+//! evidence is not continuous with that same view, before a single record is
+//! built. Admitted continuity then reaches the denominator exactly once, so a
 //! continuity-gated read can never report a denominator that quietly dropped
 //! the continuity material it was gated on.
 //!
 //! That boundary is not reached at runtime today, and this prose does not
 //! claim it is. No package in this repository depends on this one, so no
-//! binary links [`project_batch`] or either continuity gate; the crate
+//! binary links [`project_batch`] or any continuity gate; the crate
 //! manifest, not this comment, is the authority — it declares
 //! `prototype = true` with
 //! `workspace_admission = "workspace_member_prototype_proof_pending"` and
@@ -42,7 +43,10 @@
 #![forbid(unsafe_code)]
 
 mod continuity;
-pub use continuity::{admit_continuity_for_projection, admit_workflow_view_for_projection};
+pub use continuity::{
+    admit_continuity_for_projection, admit_workflow_continuity_for_projection,
+    admit_workflow_view_for_projection,
+};
 
 use eliot_contracts::{ArtifactId, SessionId, SourceId, StateFence, TaskId};
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
@@ -52,7 +56,7 @@ use eliot_memory_projection_contracts::{
     MemoryProjectionError, MemoryProjectionRecord, MemoryRole, MemoryScopeBinding, NegativeTrigger,
     Precondition, ProjectionCoverage, WorkflowStateView,
 };
-use eliot_observation_contracts::{ContinuityError, ContinuityObservation};
+use eliot_observation_contracts::{ContinuityError, ContinuityObservation, WorkflowContinuity};
 use eliot_receipts::WorkScopeId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -108,6 +112,12 @@ pub enum ProjectionError {
         supplied: usize,
         /// Intake ceiling.
         bound: usize,
+    },
+    /// Supplied workflow continuity is not continuous with the attested view.
+    #[error("workflow continuity is not continuous with the supplied workflow view: {reason}")]
+    WorkflowContinuityDiscontinuous {
+        /// Stable refusal reason.
+        reason: &'static str,
     },
 }
 
@@ -192,6 +202,16 @@ pub struct ProjectionRequest {
     /// and found consistent, because a supplied view that does not belong to
     /// the batch binding fails the whole read.
     pub workflow_view: Option<WorkflowStateView>,
+    /// Workflow continuity evidence travelling with that view, when one is
+    /// attested.
+    ///
+    /// This is attestation about the same workflow position the view
+    /// describes, not a separately observed item, so it is accounted exactly
+    /// like the view rather than added to `denominator_total`. It may never
+    /// travel alone: [`admit_workflow_continuity_for_projection`] refuses a
+    /// record with no attested view, because a workflow identity and step are
+    /// continuous with nothing until a view names them.
+    pub workflow_continuity: Option<WorkflowContinuity>,
 }
 
 impl ProjectionRequest {
@@ -247,6 +267,9 @@ pub fn project_batch(
     admit_continuity_for_projection(&request.continuity)?;
     if let Some(view) = &request.workflow_view {
         admit_workflow_view_for_projection(view, &request.binding)?;
+    }
+    if let Some(continuity) = &request.workflow_continuity {
+        admit_workflow_continuity_for_projection(continuity, request.workflow_view.as_ref())?;
     }
     let mut records = Vec::new();
     let mut omissions = Vec::new();
