@@ -35,6 +35,10 @@ pub const COMPILER_PROFILE: &str = "compiler";
 pub const TEST_PROFILE: &str = "test";
 /// Exact revision shipped for both builtin profiles.
 pub const BUILTIN_PROFILE_REVISION: u64 = 1;
+/// Stable wire name of the package verification route.
+pub const PACKAGE_VERIFICATION_ROUTE: &str = "package-verification";
+/// Stable wire name of the bundle verification route.
+pub const BUNDLE_VERIFICATION_ROUTE: &str = "bundle-verification";
 /// Spec revision shipped for every builtin [`InstrumentSpec`].
 pub const BUILTIN_SPEC_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Target scope class recorded for builtin profiles: the exact worktree
@@ -110,6 +114,12 @@ pub enum ProfileError {
         profile: String,
         /// Requested revision.
         revision: u64,
+    },
+    /// A requested alias is outside the closed [`PROFILE_ALIASES`] table.
+    #[error("'{alias}' is not an admitted profile alias")]
+    UnknownAlias {
+        /// Requested alias name.
+        alias: String,
     },
     /// A stage references an [`InstrumentSpec`] the registry never admitted.
     #[error("profile '{profile}' stage '{stage}' references unknown spec '{spec}'")]
@@ -1049,6 +1059,212 @@ pub fn test_profile() -> Result<InstrumentProfile, ProfileError> {
     )
 }
 
+/// Builds the versioned `package-verification` profile (issue #1914 W1).
+///
+/// I18.33's crate-local route is `eliot dev crate check <package>`: it resolves
+/// the one `ModuleTestCapsule` and runs the applicable contract/schema/format
+/// checks, the exact-package compilation, the selected unit/property/model/
+/// golden tests, and the separately reported format check. The stage graph
+/// declares only what the governing documents already fix — the compilation
+/// class, the test class, and the format class — over the same builtin specs
+/// `compiler`, `test`, and `dev-fast` already bind, so the route reuses admitted
+/// executable identity instead of naming a command, a path, or a package.
+///
+/// The capsule's own typed selector, services, resources, expected discovery
+/// rule, and proof ceiling bind at resolve time through the composition root
+/// ([`crate::capsule_binding`]), exactly as they do for `dev-fast`; this profile
+/// text never names a package, a test identity, or a task.
+///
+/// # Errors
+///
+/// Returns [`ProfileError`] when a builtin literal fails validation or the
+/// declared graph is not a DAG.
+pub fn package_verification_profile() -> Result<InstrumentProfile, ProfileError> {
+    let dag = StageDag::build(
+        PACKAGE_VERIFICATION_ROUTE,
+        vec![
+            StageDecl::new(
+                "package-compile".to_owned(),
+                ContractId::new(RUSTC_INSTRUMENT)?,
+                InstrumentKind::Build,
+                Vec::new(),
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "package-test".to_owned(),
+                ContractId::new(NEXTEST_INSTRUMENT)?,
+                InstrumentKind::Test,
+                vec!["package-compile".to_owned()],
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "package-format".to_owned(),
+                ContractId::new(RUSTFMT_INSTRUMENT)?,
+                InstrumentKind::Format,
+                Vec::new(),
+                true,
+                true,
+            )?,
+        ],
+    )?;
+    InstrumentProfile::new(
+        PACKAGE_VERIFICATION_ROUTE.to_owned(),
+        BUILTIN_PROFILE_REVISION,
+        BUILTIN_SPEC_VERSION,
+        vec![
+            InstrumentKind::Build,
+            InstrumentKind::Test,
+            InstrumentKind::Format,
+        ],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            ISOLATED_PROCESS_CLASS.to_owned(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
+}
+
+/// Builds the versioned `bundle-verification` profile (issue #1914 W1).
+///
+/// I18.21's parity contract makes the local and the CI result of one named
+/// profile revision comparable, so the bundle route is a versioned profile too
+/// rather than a per-run command list. Its graph is the shared compile/test
+/// spine every ELIOT verification route needs before any bundle-specific
+/// identity is admitted: a bundle that adds release-specific stages binds them
+/// as a new admitted revision of this name, never as an undeclared extra stage
+/// or a second profile type.
+///
+/// The bundle identity itself — the published artifact set, its digests, and
+/// its provenance — is not profile text. It is caller-attested and compared,
+/// and the same `require_provenance` gate that refuses a missing tool identity
+/// refuses a bundle stage whose recorded executable digest does not equal its
+/// admitted supply-chain receipt.
+///
+/// # Errors
+///
+/// Returns [`ProfileError`] when a builtin literal fails validation or the
+/// declared graph is not a DAG.
+pub fn bundle_verification_profile() -> Result<InstrumentProfile, ProfileError> {
+    let dag = StageDag::build(
+        BUNDLE_VERIFICATION_ROUTE,
+        vec![
+            StageDecl::new(
+                "bundle-compile".to_owned(),
+                ContractId::new(RUSTC_INSTRUMENT)?,
+                InstrumentKind::Build,
+                Vec::new(),
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "bundle-test".to_owned(),
+                ContractId::new(NEXTEST_INSTRUMENT)?,
+                InstrumentKind::Test,
+                vec!["bundle-compile".to_owned()],
+                true,
+                true,
+            )?,
+        ],
+    )?;
+    InstrumentProfile::new(
+        BUNDLE_VERIFICATION_ROUTE.to_owned(),
+        BUILTIN_PROFILE_REVISION,
+        BUILTIN_SPEC_VERSION,
+        vec![InstrumentKind::Build, InstrumentKind::Test],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            ISOLATED_PROCESS_CLASS.to_owned(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
+}
+
+/// Alias naming the package-verification route at its shipped revision.
+///
+/// An alias is a stable, closed name a thin invoker (a workflow, a wrapper
+/// script, a Justfile recipe) passes instead of restating a command list. It
+/// carries no command, no shell string, no executable path, and no environment
+/// selection: it names exactly one admitted profile revision and nothing else.
+pub const PACKAGE_VERIFICATION_ALIAS: &str = "package-verification";
+/// Alias naming the bundle-verification route at its shipped revision.
+pub const BUNDLE_VERIFICATION_ALIAS: &str = "bundle-verification";
+
+/// One entry of the closed [`PROFILE_ALIASES`] table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileAlias {
+    /// Stable alias name an invoker passes.
+    pub alias: &'static str,
+    /// Admitted profile the alias resolves to.
+    pub profile: &'static str,
+    /// Exact admitted revision the alias pins.
+    pub revision: u64,
+}
+
+/// The closed alias table: the only way a caller names a verification route
+/// (issue #1914 W4).
+///
+/// I18.21 requires "there is no hidden CI-only verifier command list". A
+/// command list is unverifiable precisely because it is a second copy of an
+/// order the shared owner already defines: it drifts without failing anything.
+/// An alias is the opposite of a command list — it is a name, resolved through
+/// the same registry both a local entrypoint and CI admit, so a run cannot
+/// execute a stage the registry never admitted.
+///
+/// The table is a `const` slice of a fixed element type, so it cannot grow at
+/// runtime, take caller data, or be extended by a stringly-typed lookup. It
+/// admits exactly the two versioned verification routes and nothing else: an
+/// alias outside this slice is refused with
+/// [`ProfileError::UnknownAlias`], never normalized, trimmed, case-folded, or
+/// mapped to a neighbouring route. There is no default alias and no
+/// head-revision resolution — each entry pins one exact revision, so an alias
+/// that a registry does not admit at that revision fails closed rather than
+/// resolving to whatever revision happens to be the highest.
+pub const PROFILE_ALIASES: &[ProfileAlias] = &[
+    ProfileAlias {
+        alias: PACKAGE_VERIFICATION_ALIAS,
+        profile: PACKAGE_VERIFICATION_ROUTE,
+        revision: BUILTIN_PROFILE_REVISION,
+    },
+    ProfileAlias {
+        alias: BUNDLE_VERIFICATION_ALIAS,
+        profile: BUNDLE_VERIFICATION_ROUTE,
+        revision: BUILTIN_PROFILE_REVISION,
+    },
+];
+
+/// Resolves one closed alias name to its admitted profile at its pinned
+/// revision (issue #1914 W4).
+///
+/// This is the one entry a thin invoker uses to name a verification route. The
+/// name is matched exactly against [`PROFILE_ALIASES`] — no trimming, case
+/// folding, prefix match, or alias-of-alias — and the pinned revision is then
+/// resolved through the registry at that exact revision, so a registry that
+/// does not admit it fails closed with [`ProfileError::UnknownRevision`]
+/// instead of falling back to the route's head revision or to another route.
+///
+/// # Errors
+///
+/// Returns [`ProfileError::UnknownAlias`] when the name is outside the closed
+/// table, and [`ProfileError::UnknownProfile`] or
+/// [`ProfileError::UnknownRevision`] when the table's pinned revision is not
+/// admitted by this registry.
+pub fn admitted_profile_for_alias<'a>(
+    alias: &str,
+    registry: &'a InstrumentRegistry,
+) -> Result<&'a InstrumentProfile, ProfileError> {
+    let entry = PROFILE_ALIASES
+        .iter()
+        .find(|entry| entry.alias == alias)
+        .ok_or_else(|| ProfileError::UnknownAlias {
+            alias: alias.to_owned(),
+        })?;
+    registry.admitted(entry.profile, entry.revision)
+}
+
 /// Admission registry for versioned specs and profiles (I10.8.1).
 ///
 /// The registry owns instrument definitions and profiles; it never spawns a
@@ -1171,6 +1387,45 @@ impl InstrumentRegistry {
             vec![compiler_profile()?, test_profile()?],
             generation,
             Vec::new(),
+        )
+    }
+
+    /// Assembles the registry with every builtin profile, including the two
+    /// verification routes of issue #1914.
+    ///
+    /// This is the one registry a local entrypoint and CI both admit, so the
+    /// `package-verification` and `bundle-verification` routes resolve to the
+    /// same exact revision, digest, and stage DAG on either side. A route that
+    /// is missing here is missing on both sides together, never only in CI.
+    ///
+    /// `receipts` are the caller-attested executable supply-chain receipts.
+    /// A receipt is validated against the admitted spec digest at exactly this
+    /// generation, so a drifted or orphan receipt fails closed here and the
+    /// routes refuse to resolve at all. Passing no receipt is admitted as an
+    /// explicit absence — the pre-launch gate then binds the admitted
+    /// executable file and schema without a pinned digest — and
+    /// `require_provenance` is what later refuses a receipted route whose
+    /// stages carry no recorded identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError`] when a builtin literal fails validation, or
+    /// the admission error when a receipt is orphan, drifted, or of a
+    /// mismatched generation.
+    pub fn with_verification_route_profiles(
+        generation: u64,
+        receipts: Vec<SupplyChainReceipt>,
+    ) -> Result<Self, ProfileError> {
+        Self::build(
+            builtin_specs()?,
+            vec![
+                compiler_profile()?,
+                test_profile()?,
+                package_verification_profile()?,
+                bundle_verification_profile()?,
+            ],
+            generation,
+            receipts,
         )
     }
 
@@ -2311,5 +2566,38 @@ impl<'a> ProfileCompiler<'a> {
             scope,
             environment,
         )
+    }
+
+    /// Resolves the verification route both local and CI invoke (issue #1914
+    /// W2).
+    ///
+    /// I18.21 requires "CI builds the ELIOT verifier/runner bootstrap and then
+    /// calls the same versioned profiles used locally", and I10.8.10 requires
+    /// "Justfile and CI → thin invokers of the same named profile". Both
+    /// requirements are satisfied by exactly this one call: there is no second
+    /// gate-order source, no CI-only stage list, and no per-entrypoint profile
+    /// choice, because the caller names only the route and supplies only the
+    /// admitted execution bindings. The route name is resolved to its admitted
+    /// revision here, and the caller learns the exact identity from the returned
+    /// [`ResolvedProfile`]; it can never select a revision itself.
+    ///
+    /// A route that is not admitted fails closed with
+    /// [`ProfileError::UnknownProfile`]. A caller that wants a different route
+    /// passes a different name, which is an explicit visible change, never an
+    /// environment sniff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::UnknownProfile`] when the route admits no
+    /// revision, and the [`InstrumentProfileResolver::resolve`] failures when a
+    /// binding is refused.
+    pub fn resolve_route(
+        &self,
+        route: &str,
+        layout: TargetLayout,
+        scope: WorkScope,
+        environment: StageEnvironment,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        self.resolve_admitted(route, layout, scope, environment)
     }
 }
