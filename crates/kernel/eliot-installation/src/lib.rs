@@ -3159,7 +3159,13 @@ impl InstallationEffectRequest {
                     ));
                 }
             }
-            InstallationProfile::PortableDev => {}
+            InstallationProfile::PortableDev => {
+                if !installation_root.ends_with(&[".eliot-dev", "state"]) {
+                    return Err(InstallationError::ProfileViolation(
+                        "PortableDev effect installation_root must be the selected repository .eliot-dev/state root".to_owned(),
+                    ));
+                }
+            }
         }
         handle(&self.effect_id, "effect.effect_id")?;
         if self.effect_id != *self.plan.effect_id() {
@@ -6791,10 +6797,9 @@ fn windows_root_spec(
         InstallationProfile::UserMode => {
             current_user_local_app_data_root().map_err(|_| PortError::InvalidRequestMetadata)?
         }
-        InstallationProfile::PortableDev => Path::new(request.installation_root.as_str())
-            .parent()
-            .ok_or(PortError::InvalidRequestMetadata)?
-            .to_path_buf(),
+        InstallationProfile::PortableDev => portable_repository_anchor_from_installation_root(
+            Path::new(request.installation_root.as_str()),
+        )?,
     };
     Ok((
         InstallerRootPrimitiveSpec {
@@ -6805,6 +6810,33 @@ fn windows_root_spec(
         },
         operation,
     ))
+}
+
+/// Recovers the already-selected repository anchor from the exact disposable
+/// state contour. The Windows root primitive retains this object before it
+/// creates `.eliot-dev` or any of its state/config/cache children.
+fn portable_repository_anchor_from_installation_root(
+    installation_root: &Path,
+) -> Result<PathBuf, PortError> {
+    let state = installation_root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(PortError::InvalidRequestMetadata)?;
+    let dot_eliot_dev = installation_root
+        .parent()
+        .ok_or(PortError::InvalidRequestMetadata)?;
+    let directory = dot_eliot_dev
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(PortError::InvalidRequestMetadata)?;
+    if !state.eq_ignore_ascii_case("state") || !directory.eq_ignore_ascii_case(".eliot-dev") {
+        return Err(PortError::InvalidRequestMetadata);
+    }
+    dot_eliot_dev
+        .parent()
+        .filter(|repo| repo.is_absolute())
+        .map(Path::to_path_buf)
+        .ok_or(PortError::InvalidRequestMetadata)
 }
 
 fn platform_object_snapshot(
