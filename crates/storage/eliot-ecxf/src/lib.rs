@@ -501,6 +501,80 @@ fn derived_purge_ledger_revision(ledger: &[PurgeLedgerEntry]) -> Result<Option<u
     Ok(revision)
 }
 
+/// Binds the manifest's declared purge state to the ledger the package
+/// actually carries (issue #1141, A2/W3).
+///
+/// I5.13 binds every export entry to "retention/erasure domains and
+/// purge-ledger revision", and A2 requires the erasure identity to be a
+/// recorded one rather than a claim. The manifest's `purge_state` is one
+/// recorded position; the carried `privacy-purge-ledger.json` member is a
+/// second, independent one. This function compares them in both directions, so
+/// neither can be edited without the other:
+///
+/// * a manifest that declares a carried ledger while the package carries an
+///   empty one is refused, because its erasure claim has no ledger behind it;
+/// * a manifest that declares no entries while the package carries a ledger is
+///   refused, because the package would ship purge evidence the manifest does
+///   not acknowledge.
+///
+/// `PurgeExportState::Applied` is deliberately left unbound here. It asserts
+/// that the *source* already removed the purged content, which nothing in this
+/// package can observe, so this crate has no second recorded position to
+/// compare it against and no rule may be invented for one.
+///
+/// It re-uses `derived_purge_ledger_revision` and the existing
+/// `PurgeLedgerEntry::validate`, so this is a comparison between two recorded
+/// sets and not a second definition of either. The check runs where the ledger
+/// is known — `EcxfArchive::validate` and `import_ecxf_package` — and never
+/// from `EcxfManifest::validate`, which has no ledger to compare against.
+fn check_purge_claim(
+    manifest: &EcxfManifest,
+    ledger: &[PurgeLedgerEntry],
+) -> Result<(), EcxfError> {
+    let carried = !ledger.is_empty();
+    if carried != (manifest.purge_state == PurgeExportState::IncludedLedger) {
+        return Err(EcxfError::InconsistentBoundary);
+    }
+    if manifest.purge_ledger_revision != derived_purge_ledger_revision(ledger)? {
+        return Err(EcxfError::DigestMismatch {
+            subject: "purge ledger revision".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Binds the export fence's declared canonical event interval to the events the
+/// package actually carries (issue #1141, A3).
+///
+/// I5.10 requires the export fence to carry "the canonical event range" and
+/// forbids "mixing unrelated table moments into one 'backup'". A package whose
+/// fence declares `count` events while carrying a different number of event
+/// records spans a moment its own boundary does not describe: either the
+/// interval was narrowed after the events were read, or records were dropped
+/// from under a recorded range. Neither is visible by examining the section
+/// alone, because a truncated section is internally self-consistent and
+/// re-digests cleanly — which is exactly why the recorded digests are not
+/// sufficient evidence here.
+///
+/// The two sides come from different recorded positions — the fence is written
+/// by the export boundary, the section is written by the record stream — so
+/// this compares against an independent expected count rather than a value with
+/// its own twin. An empty export stays representable: a fence with no interval
+/// declares `count == 0`, and that is a real recorded count, not a synthesized
+/// bound.
+fn check_event_coverage(
+    export_fence: &ExportFence,
+    sections: &BTreeMap<SectionKind, CanonicalSection>,
+) -> Result<(), EcxfError> {
+    let carried = sections
+        .get(&SectionKind::Events)
+        .map_or(0_u64, |section| section.record_count);
+    if carried != export_fence.event_range.count {
+        return Err(EcxfError::InconsistentBoundary);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EcxfManifest {
@@ -838,6 +912,11 @@ impl EcxfArchive {
         manifest
             .blob_residency
             .sort_by(|left, right| left.residency_key_digest.cmp(&right.residency_key_digest));
+        // Issue #1141, A3: the fence declares the canonical event interval and
+        // the caller supplies the events. Refuse a view whose two disagree
+        // before the manifest is accepted, so `EcxfManifest::validate` is never
+        // reached with a fence that over- or under-declares its own range.
+        check_event_coverage(&export_fence, &sections)?;
         manifest.validate()?;
         let mut archive = Self {
             manifest,
@@ -909,13 +988,14 @@ impl EcxfArchive {
             blob.validate()?;
         }
         check_reachability(&self.manifest.export_fence, &self.blobs)?;
-        if self.manifest.purge_ledger_revision
-            != derived_purge_ledger_revision(&self.privacy_purge_ledger)?
-        {
-            return Err(EcxfError::DigestMismatch {
-                subject: "purge ledger revision".to_owned(),
-            });
-        }
+        // Issue #1141, A2/A3: the two recorded positions that only disagree in
+        // one direction each. `check_purge_claim` re-derives the revision from
+        // the carried ledger and compares it in both directions against the
+        // declared purge state; `check_event_coverage` compares the fence's
+        // declared interval against the events the archive actually holds.
+        // Both run before any caller can act on the archive.
+        check_purge_claim(&self.manifest, &self.privacy_purge_ledger)?;
+        check_event_coverage(&self.manifest.export_fence, &self.sections)?;
         let expected_residency: BTreeMap<_, _> = self
             .blobs
             .iter()
@@ -1166,6 +1246,8 @@ fn section_kind_from_wire_name(wire_name: &str) -> Result<SectionKind, EcxfError
 ///   → the recorded manifest digest is checked against the manifest bytes
 ///   → the recorded purge-ledger digest is checked against the ledger bytes,
 ///     and the ledger's own validation, purge revision and state fence
+///   → the recorded purge state is compared against the carried ledger in both
+///     directions, and the fence's event interval against the delivered events
 ///   → the recorded schema declaration is checked against this crate's format
 ///   → every recorded section member is decoded and checked against its digest
 ///   → every recorded blob member is checked against its digest
@@ -1264,11 +1346,18 @@ pub fn import_ecxf_package(
             return Err(EcxfError::InconsistentBoundary);
         }
     }
-    if manifest.purge_ledger_revision != derived_purge_ledger_revision(&privacy_purge_ledger)? {
-        return Err(EcxfError::DigestMismatch {
-            subject: "purge ledger revision".to_owned(),
-        });
-    }
+    // Issue #1141, A2: the declared purge state is compared against the ledger
+    // the package actually carries, in both directions, so a manifest that
+    // claims a carried ledger with an empty member — or acknowledges no entries
+    // while shipping one — cannot be admitted. This REPLACES the one-directional
+    // revision comparison that stood here alone: the revision on its own could
+    // not tell an empty ledger from a ledger that merely declares no revision,
+    // because `derived_purge_ledger_revision` answers `None` for both. It runs
+    // on the recorded manifest and the recorded ledger member, before any
+    // section or blob is decoded, and re-uses the entry validation and revision
+    // derivation above, so it is a comparison between two recorded positions
+    // and not a second definition of either.
+    check_purge_claim(&manifest, &privacy_purge_ledger)?;
 
     // The recorded schema declaration must be this crate's format and contract,
     // so a package that declares another format cannot be read as ECXF/1.
@@ -1346,6 +1435,13 @@ pub fn import_ecxf_package(
             });
         }
     }
+    // Issue #1141, A3: the fence's recorded canonical event interval against
+    // the events this package actually delivered. The interval was written by
+    // the export boundary and the events by the record stream, so this is a
+    // comparison between two independent recorded positions. A package whose
+    // event stream was truncated under a recorded range is refused here even
+    // though every delivered section still hashes to its recorded digest.
+    check_event_coverage(&manifest.export_fence, &sections)?;
 
     // Every recorded blob member. The expected set is derived from the
     // residency entries the manifest recorded, so a member dropped from the
