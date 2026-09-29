@@ -1090,11 +1090,12 @@ impl SkillRegistry {
     ///
     /// * when the presented identity equals the stored view's identity, the
     ///   view is re-derived for that identity as before;
-    /// * when it differs, the caller must supply the retained catalogue entry
-    ///   for the PRESENTED identity — resolved from retained install history,
-    ///   never reconstructed from payload fields (issue #2663 item 1: a
-    ///   current collector reports an older attempt only through an explicit
-    ///   permitted historical binding). The observation is then filed as a
+    /// * when it differs, the caller-supplied entry must still name the
+    ///   presented identity — the live catalogue entry, never a reconstruction
+    ///   from payload fields — so this fires only while the catalogue still
+    ///   stands on the presented identity and the stored view has moved on. A
+    ///   current collector reports an older attempt only through this explicit
+    ///   binding (issue #2663 item 1). The observation is then filed as a
     ///   linked revision: the new records are appended, the lifecycle revision
     ///   advances, and the stored view keeps its current Skill
     ///   revision/package, scope, fence, dependencies and status, so ingesting
@@ -1102,7 +1103,7 @@ impl SkillRegistry {
     ///   re-stamp it with today's fence.
     ///
     /// A presented identity matching neither the stored view nor the supplied
-    /// retained entry is refused with [`SkillError::IdentityMismatch`]: a
+    /// entry is refused with [`SkillError::IdentityMismatch`]: a
     /// substituted revision or package cannot be filed under any identity.
     /// Exact replay under the same execution identity is idempotent and
     /// returns the stored view unchanged; a CHANGED record under that identity
