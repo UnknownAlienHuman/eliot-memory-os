@@ -46,6 +46,37 @@
 //! actually been closed. Failing closed is the direction I12.24:64 requires — a
 //! brief must not reach an owner as though a boundary had been observed when
 //! none was.
+//!
+//! # The brief's `proposed_owner` and its boundary are ONE principal
+//!
+//! I12.24:64 sends the brief "to active Main Agent or Human at a safe
+//! boundary" and I12.24:74 requires the brief to state a "proposed owner".
+//! Those are two clauses of one decision, so a brief over an observed boundary
+//! takes `proposed_owner` from
+//! [`SafeBoundary::observed_principal_ref`] — the same `actor_id` the boundary
+//! gate was built from — rather than from a second, unrelated name. A brief that
+//! says "produced at a boundary actor X observed" while proposing owner Y reads
+//! as though two principals were involved in producing it, and a reader cannot
+//! tell from the artifact which of them decides.
+//!
+//! [`SafeBoundary::observed_boundary_ref`] is the matching read-only handle for
+//! the derived boundary itself, so a caller can name the same two values in the
+//! brief's own text that the gate enforced.
+//!
+//! The roles that ARE genuinely different live on different artifacts, not in
+//! adjacent fields of this one, and this module does not merge them:
+//!
+//! - the boundary's principal EXECUTED the observed consequential attempt, and
+//!   is the principal this brief proposes should decide;
+//! - a candidate's ADMISSION authority is a separate owner decision, recorded
+//!   on [`ImprovementCandidate::owner_and_decision_authority`], and is what
+//!   admits the candidate to the backlog.
+//!
+//! `brief_at_safe_boundary` takes `proposed_owner` as a parameter rather than
+//! deriving it, because `intake_from_evidence` supplies both the boundary and
+//! the owner from its own request; it therefore cannot be checked here without
+//! constraining that caller. The relationship above is the contract, and the
+//! production caller is held to it.
 
 use eliot_governor::CanonicalLearningDeltaStore;
 use serde::{Deserialize, Serialize};
@@ -181,6 +212,27 @@ impl SafeBoundary {
         Ok(boundary)
     }
 
+    /// The observed principal this boundary was read from.
+    ///
+    /// Read-only: it hands back the `actor_id` [`Self::from_observed_closure`]
+    /// read from the committed record and cannot be used to change the
+    /// boundary. An owner-facing brief takes this value as its `proposed_owner`
+    /// so the name it proposes and the name its gate observed are one principal
+    /// (see the module documentation).
+    pub fn observed_principal_ref(&self) -> &str {
+        &self.active_main_agent_or_human_ref
+    }
+
+    /// The derived consequential boundary the owner observed.
+    ///
+    /// Read-only counterpart of [`Self::observed_principal_ref`]: the
+    /// `consequential_boundary` spelling the closure record itself committed.
+    /// A brief that describes the operation it is gated on names this value, so
+    /// the described boundary and the enforced one cannot differ.
+    pub fn observed_boundary_ref(&self) -> &str {
+        &self.boundary_ref
+    }
+
     /// Rejects a boundary that names no principal or no derived boundary.
     ///
     /// This is a shape check over values [`Self::from_observed_closure`] read
@@ -202,6 +254,12 @@ impl SafeBoundary {
 ///
 /// Validates the boundary first, then the candidate, then the brief fields.
 /// The brief carries the candidate's evidence refs and revision by value.
+///
+/// `proposed_owner` is a parameter, not a value read from `boundary`, because
+/// `intake_from_evidence` supplies the boundary and the owner from its own
+/// request. Over an OBSERVED boundary the two are one principal, so pass
+/// `boundary.observed_principal_ref()` here; see the module documentation for
+/// why an admission authority is the wrong name for this field.
 #[allow(
     clippy::too_many_arguments,
     reason = "brief assembly takes one concise field per I12.24:74 decision slot"

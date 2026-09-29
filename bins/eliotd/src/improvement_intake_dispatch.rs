@@ -478,21 +478,143 @@ pub fn assemble_improvement_artifact(
     // observed when none was — and the refusal is reported as a typed
     // `ImprovementDispatchError::Improvement` by the caller, not swallowed.
     let boundary = SafeBoundary::from_observed_closure(observed_closures)?;
+
+    // The brief's decision information is a PROJECTION OF THAT SAME OBSERVED
+    // RECORD, not the raw maintenance trigger text. I12.24:74 requires the
+    // named decision owner to read the problem, evidence, likely benefit, risk,
+    // cost, next reversible step and unknowns without searching raw metrics;
+    // repeating the trigger text satisfied the letter of that and none of its
+    // purpose, because it said nothing about what the closure actually
+    // recorded.
+    //
+    // `load` is the same mutex-guarded read `from_observed_closure` just
+    // performed on the same image, under the composition guard the caller
+    // already holds (`daemon_runtime::improvement_intake_artifact`), and this
+    // guarded phase commits nothing, so the newest record here is the record
+    // whose `actor_id` and `consequential_boundary` the boundary above names.
+    // It is read a second time because the two-string `SafeBoundary` cannot
+    // carry the record itself: `eliot-improvement` has no `eliot-learning-delta`
+    // edge, so widening `SafeBoundary` to hold one would be a new dependency
+    // for a value the brief only needs to quote. The record TYPE is not named
+    // here either — `eliotd` has no `eliot-learning-delta` dependency — so it is
+    // read by inference and through the record's own accessors. An unreadable
+    // or empty image is the same typed `UnsafeBoundary` refusal the boundary
+    // constructor returns for the same condition, never a substituted value.
+    let (observed_records, _observed_version) = observed_closures
+        .load()
+        .map_err(|_| ImprovementError::UnsafeBoundary)?;
+    let observed = observed_records
+        .last()
+        .ok_or(ImprovementError::UnsafeBoundary)?;
+    // The durable lineage handle and canonical digest the record itself
+    // committed, so the owner can read exactly this closure without searching.
+    let (observed_artifact, observed_digest) = observed.lineage_ref();
+    // What the observed closure actually concluded about behaviour, read
+    // through the record's own predicates rather than re-spelled here.
+    let observed_effect = if observed.carries_behavioural_proposal() {
+        "and proposes a next-behaviour change for the next attempt"
+    } else {
+        "and closed with no next-behaviour change proposed"
+    };
+    // The two values below are the boundary's OWN observed strings, so the
+    // boundary this brief describes and the boundary it is gated on are
+    // literally the same value.
+    let principal = boundary.observed_principal_ref();
+    let boundary_ref = boundary.observed_boundary_ref();
+    // Unknowns are the states the record could NOT resolve, plus the one the
+    // closure cannot speak to at all. The maintenance start-route question is
+    // kept: it is real and no closure record answers it. `require_refs` in
+    // `ImprovementBrief::validate` still hard-requires a non-empty list.
+    let mut unknowns = vec![format!(
+        "unknown whether maintenance family {} has a start route",
+        decision.family
+    )];
+    if observed.lineage_for_retry().is_none() {
+        unknowns.push(format!(
+            "the observed closure of campaign {} records no prior-attempt lineage, so it \
+             establishes no repeated-strategy comparison",
+            observed.campaign_id.as_str()
+        ));
+    }
+
+    // ONE principal, named once. `proposed_owner` is the observed
+    // `active_main_agent_or_human_ref`, so the brief proposes that the actor
+    // which executed the observed consequential attempt decides — I12.24:64
+    // ("to active Main Agent or Human at a safe boundary") and I12.24:74
+    // ("proposed owner") describe the same decision and are now filled from the
+    // same observation. It was `IMPROVEMENT_OWNER` before the boundary became
+    // observed, which put a compile-time constant beside a real observed
+    // principal in adjacent fields with nothing to reconcile them.
+    //
+    // `ASSUMPTION:` the principal that EXECUTED the observed consequential
+    // attempt is the one proposed to decide, rather than the maintenance
+    // admission authority. I12.24:64 sends the brief "to active Main Agent or
+    // Human at a safe boundary" and I12.24:74 asks the same brief for a
+    // "proposed owner", so one reading satisfies both; the alternative reading
+    // (deliver to the actor, but let a governance constant decide) is not
+    // stated anywhere in I12.24 and would make the brief's own proposed owner
+    // unobserved by its own gate. The closure seam records no Human identity,
+    // so no observed alternative principal exists to name instead.
+    //
+    // This is a decision owner, NOT the candidate's admission authority, and the
+    // admission authority is not lost by moving it out of the brief:
+    // `IMPROVEMENT_OWNER` is what `sourced_evidence` recorded on the candidate
+    // above, so it is durably carried as
+    // `ImprovementCandidate::owner_and_decision_authority` and is what
+    // `CandidateBoundPolicy::validate_governed` is checked against inside the
+    // governed admission. The two names are different roles and are recorded on
+    // different artifacts: this one is who should decide, that one is who may
+    // admit.
+    //
+    // What the closure CANNOT supply, stated so no field is invented to fill the
+    // gap. `StoredLearningDelta` carries campaign, attempt, State Fence,
+    // actor/route/overlay identity, the derived boundary, the strategy
+    // fingerprint, observed evidence refs, the retry relation, the disposition
+    // and the admission receipt id. It carries no cost, compute, tool, test-time
+    // or Human-attention field — that material is the I18.47
+    // `BudgetEquivalenceLedger` / `ComplexityEconomicsDelta`, which belongs to
+    // the promotion path this advisory pass deliberately does not enter — and it
+    // carries no risk and no proposed next action. So `cost`, `risk` and
+    // `next_reversible_step` keep the honest values this pass can state and are
+    // not dressed up as observations: `cost` is the cost of the decision itself,
+    // `risk` is the advisory class's actual no-effect statement, and
+    // `next_reversible_step` is a triage action that NAMES the observed
+    // boundary so the owner starts from the record rather than from a search.
+    // `evidence_refs` is not listed here either: `brief_at_safe_boundary` takes
+    // the candidate's own evidence lineage by value, and the observed closure's
+    // evidence is quoted in `problem` as the durable delta artifact and digest
+    // instead of being spliced into a second ref list.
     let brief = brief_at_safe_boundary(
         &candidate,
-        &trigger,
         &format!(
-            "the blocked family {} is evaluated on every cadence and cannot start",
+            "{trigger}; the learning closure this brief is gated on committed durable delta \
+             {observed_artifact} (digest {observed_digest}) for attempt {} of campaign {} on \
+             route {}, at consequential boundary {boundary_ref} by principal {principal}, over {} \
+             observed evidence ref(s)",
+            observed.attempt_id.as_str(),
+            observed.campaign_id.as_str(),
+            observed.route_id,
+            observed.evidence_refs.len(),
+        ),
+        &format!(
+            "the blocked family {} is evaluated on every cadence and cannot start, and the \
+             closure this brief is gated on {observed_effect}; giving that family a start route \
+             removes a blocked evaluation per cadence",
             decision.family
         ),
-        "advisory only; no authority, privacy, finish or durability effect is taken",
-        IMPROVEMENT_OWNER,
-        "one owner triage pass over the stored brief",
-        &format!("triage maintenance trigger {}", decision.trigger_id),
-        vec![format!(
-            "unknown whether maintenance family {} has a start route",
-            decision.family
-        )],
+        &format!(
+            "advisory only; no authority, privacy, finish or durability effect is taken, and the \
+             observed boundary {boundary_ref} is not modified by it"
+        ),
+        principal,
+        "one owner triage pass over the stored brief; the observed closure record carries no \
+         cost, compute or Human-attention field, so the cost of the decision itself is the only \
+         cost this brief can state",
+        &format!(
+            "triage maintenance trigger {} against the observed boundary {boundary_ref}",
+            decision.trigger_id
+        ),
+        unknowns,
         &boundary,
     )?;
 
@@ -500,6 +622,15 @@ pub fn assemble_improvement_artifact(
     // artifact is real and actionable, and recording it changes nothing. This
     // is the production caller of the bridge's
     // `record_brief_decision`, which previously had none.
+    //
+    // The `owner` here is the maintenance (`G-19`) admission authority and is
+    // deliberately NOT the brief's `proposed_owner`: this field names the
+    // principal that RECORDED this disposition, which the maintenance owner is
+    // (it issued the permit this candidate was assembled under), whereas the
+    // brief's `proposed_owner` names the principal proposed to decide. Naming
+    // the same constant in both would be the incoherence this region exists to
+    // remove; naming them differently, with the difference stated here, is what
+    // makes each field mean one thing.
     let decision_record = crate::improvement_intake::record_brief_decision(
         &brief,
         IMPROVEMENT_OWNER,
