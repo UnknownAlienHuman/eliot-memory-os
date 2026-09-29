@@ -2750,7 +2750,7 @@ impl CancellingCommit {
                         "edit-and-cancel requires edit",
                     ));
                 };
-                if superseded.as_ref() != previous_revision {
+                if superseded.as_ref() != previous_revision.as_ref() {
                     return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                         "superseded predecessor is not the edit intent previous revision",
                     ));
@@ -3434,7 +3434,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 result: UserAutomationReadResult::Status { execution, .. },
             } => {
                 require_complete_occurrence_view(&execution)?;
-                Ok(execution)
+                Ok(*execution)
             }
             _ => Err(UserAutomationExecutionError::OperationMismatch(
                 "owner execution view did not return a status projection",
@@ -4076,6 +4076,22 @@ mod tests {
                 start_at: "2026-09-21T00:00:00Z".to_owned(),
                 end_at: None,
                 next_occurrences: vec!["2026-09-21T12:00:00-04:00".to_owned()],
+                // This fixture carries a retired shape-only occurrence key, so
+                // the owning calendar adapter has not issued a normalization
+                // binding for it and the revision requires re-normalization.
+                // Empty evidence can never satisfy the required binding, so the
+                // fixture stays refused instead of becoming admitted.
+                normalization_receipt: Box::new(
+                    eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
+                        receipt_id: String::new(),
+                        normalizer_authority: String::new(),
+                        source_digest: String::new(),
+                        zone_database_revision:
+                            eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION
+                                .to_owned(),
+                        occurrences_digest: String::new(),
+                    },
+                ),
             },
             mode: UserAutomationExecutionMode::DeterministicProcess,
             task: AutomationTaskBinding {

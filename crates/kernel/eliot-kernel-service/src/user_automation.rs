@@ -130,6 +130,14 @@ impl UserAutomationStoreRequest {
 }
 
 /// Read projections returned by the canonical UserAutomation owner.
+///
+/// The revision, execution and failure payloads are boxed because the read
+/// vocabulary mixes one 24-byte list with projections that inline a whole
+/// immutable revision and a whole Durable Job/history projection, which made
+/// this enum by far the largest value on the Store read boundary. Each box is a
+/// storage detail only: serde encodes a boxed value exactly as the unboxed one,
+/// so the wire bytes, the tagged shape and the `null` failure case are
+/// unchanged.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UserAutomationReadResult {
@@ -141,25 +149,25 @@ pub enum UserAutomationReadResult {
     /// Current configuration and execution projection.
     Status {
         /// Current immutable revision.
-        revision: UserAutomationRevision,
+        revision: Box<UserAutomationRevision>,
         /// Projection into the existing Durable Job/history owner.
-        execution: UserAutomationExecutionProjection,
+        execution: Box<UserAutomationExecutionProjection>,
     },
     /// Immutable execution/history projection.
     History {
         /// Automation selected by the query.
         automation_id: String,
         /// Execution and reconciliation references retained by the owner.
-        execution: UserAutomationExecutionProjection,
+        execution: Box<UserAutomationExecutionProjection>,
     },
     /// Last owner-issued failure, with its revision binding.
     InspectLastFailure {
         /// Automation selected by the query.
         automation_id: String,
         /// Revision that owns the failure class.
-        revision: UserAutomationRevision,
+        revision: Box<UserAutomationRevision>,
         /// No failure means no notification is manufactured by this service.
-        failure: Option<UserAutomationFailureProjection>,
+        failure: Option<Box<UserAutomationFailureProjection>>,
     },
 }
 
@@ -418,7 +426,7 @@ fn validate_mutation_result(
         ) => {
             expected.validate()?;
             revision.validate()?;
-            if expected != revision
+            if expected.as_ref() != revision
                 || revision.supersedes.is_some()
                 || !cancelled_wake_ids.is_empty()
             {
@@ -440,7 +448,7 @@ fn validate_mutation_result(
         ) => {
             expected.validate_supersedes(previous_revision)?;
             revision.validate_supersedes(previous_revision)?;
-            if expected != revision || !cancelled_wake_ids.is_empty() {
+            if expected.as_ref() != revision || !cancelled_wake_ids.is_empty() {
                 return Err(UserAutomationServiceError::ResponseMismatch(
                     "edit revision result",
                 ));

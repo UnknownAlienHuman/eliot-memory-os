@@ -1781,13 +1781,22 @@ impl KernelStoreGateway {
     {
         Self::validate_user_automation_request(&request)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
-        let sealed = self
-            .seal_user_automation_operation(&store, request)
-            .await
-            .map_err(user_automation_gateway_unknown)?;
-        let response = Box::pin(UserAutomationService::new(&store).dispatch(sealed.clone()))
-            .await
-            .map_err(user_automation_gateway_unknown)?;
+        // The sealed request is the one value this frame must keep across every
+        // remaining await, and it inlines the closed operator operation
+        // vocabulary, so holding it by value makes this future larger than the
+        // frame budget while it is suspended. The heap box is a storage detail
+        // only: it is read by reference everywhere below, and it is dropped at
+        // the same point the by-value value was dropped, so no step observes a
+        // different request, lifetime or ownership.
+        let sealed = Box::new(
+            self.seal_user_automation_operation(&store, request)
+                .await
+                .map_err(user_automation_gateway_unknown)?,
+        );
+        let response =
+            Box::pin(UserAutomationService::new(&store).dispatch(sealed.as_ref().clone()))
+                .await
+                .map_err(user_automation_gateway_unknown)?;
         if response.identity != sealed.identity
             || response.state_fence != sealed.context.state_fence
         {
@@ -3160,11 +3169,24 @@ impl KernelStoreGateway {
         if owner.current_configuration_state == UserAutomationConfigurationState::Active {
             Self::require_run_now_active_evidence(owner, &execution, &evidence)?;
         }
+        // The schedule normalization envelope the revision names is owner
+        // evidence over the compiled occurrence set. This boundary reads the
+        // committed occurrence through the Store write receipt above, which
+        // carries no calendar normalization envelope, and nothing in the
+        // repository publishes or retains one yet: the owner that compiles an
+        // expression has no accepted write path yet (#2806). The run-now route
+        // therefore supplies none, and the preflight binding refuses the
+        // revision with `ReceiptBinding` rather than admitting a schedule whose
+        // occurrence set is only self-asserted. That is the fail-closed
+        // behaviour the versioned contract requires; it is not a fallback and
+        // the route recovers the moment the owner envelope is readable here.
+        let normalization_receipts: Vec<eliot_receipts::ReceiptEnvelope> = Vec::new();
         UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
             revision: &owner.revision,
             configuration_state: owner.current_configuration_state,
             config_snapshot: &config_snapshot,
             source_receipt: &source_receipt,
+            normalization_receipts: &normalization_receipts,
             execution: &execution,
             invocation,
             request_metadata: &sealed.context,
@@ -3356,7 +3378,7 @@ impl KernelStoreGateway {
                         "owner failure read does not bind to the current owner revision".to_owned(),
                     ));
                 }
-                Ok(failure)
+                Ok(failure.map(|failure| *failure))
             }
             _ => Err(RunNowPreflightAssembly::Unknown(
                 "owner failure read did not return a failure projection".to_owned(),
@@ -3654,7 +3676,7 @@ impl KernelStoreGateway {
         else {
             return Err("superseding edit did not return a canonical revision".to_owned());
         };
-        if committed != revision {
+        if committed != revision.as_ref() {
             return Err(
                 "committed UserAutomation revision does not match the superseding edit request"
                     .to_owned(),
@@ -3676,7 +3698,7 @@ impl KernelStoreGateway {
                 state_fence: sealed.context.state_fence.clone(),
             })
             .await?;
-        if owner.revision != *revision {
+        if owner.revision != *revision.as_ref() {
             return Err(
                 "committed UserAutomation revision does not match the current owner revision"
                     .to_owned(),
