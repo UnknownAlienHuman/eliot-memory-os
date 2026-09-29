@@ -5772,8 +5772,11 @@ impl WindowsInstallationEffectPort {
                 {
                     return Err(PortError::IdentityConflict);
                 }
-                let live_session_id = root.session_id();
-                if live_session_id == 0 || host_root.session_id() != live_session_id {
+                let live_client =
+                    eliot_platform_windows::current_process_named_pipe_expectation()
+                        .map_err(secret_port_error)?;
+                let live_session_id = live_client.expected_session_id();
+                if live_client.expected_sid() != selection.owner_sid || live_session_id == 0 {
                     return Err(PortError::IdentityConflict);
                 }
                 let executable = UserOwnedPathLease::open_existing(
@@ -10456,7 +10459,8 @@ where
                             .map_err(|error| platform_error(&error))?,
                         );
                     };
-                    let expected_identity = portable_dev_key_identity(receipt)?;
+                    let expected_identity = portable_dev_key_identity(receipt)
+                        .map_err(|_| InstallationError::IdentityConflict)?;
                     let expected_postcondition = receipt_postcondition_digest(receipt)
                         .map_err(|_| InstallationError::IdentityConflict)?;
                     if !was_intent
