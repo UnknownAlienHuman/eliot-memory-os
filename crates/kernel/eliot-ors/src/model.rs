@@ -7938,8 +7938,8 @@ impl HostRequestRecord {
             .collect::<Vec<_>>();
         let legal = matches!(
             boundaries.as_slice(),
-            [] | [HostRequestTransportBoundary::DispatchStarted]
-                | [HostRequestTransportBoundary::DefinitelyNotSent]
+            [] | [HostRequestTransportBoundary::DispatchStarted
+                | HostRequestTransportBoundary::DefinitelyNotSent]
                 | [
                     HostRequestTransportBoundary::DispatchStarted,
                     HostRequestTransportBoundary::DefinitelyNotSent
@@ -7947,24 +7947,14 @@ impl HostRequestRecord {
                 | [
                     HostRequestTransportBoundary::DispatchStarted,
                     HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                        | HostRequestTransportBoundary::ResponseReceived,
                 ]
                 | [
                     HostRequestTransportBoundary::DispatchStarted,
-                    HostRequestTransportBoundary::DeliveredToAuthenticatedHost
-                ]
-                | [
-                    HostRequestTransportBoundary::DispatchStarted,
-                    HostRequestTransportBoundary::ResponseReceived
-                ]
-                | [
-                    HostRequestTransportBoundary::DispatchStarted,
-                    HostRequestTransportBoundary::DeliveryOutcomeUnknown,
-                    HostRequestTransportBoundary::ResponseReceived
-                ]
-                | [
-                    HostRequestTransportBoundary::DispatchStarted,
-                    HostRequestTransportBoundary::DeliveredToAuthenticatedHost,
-                    HostRequestTransportBoundary::ResponseReceived
+                    HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | HostRequestTransportBoundary::DeliveredToAuthenticatedHost,
+                    HostRequestTransportBoundary::ResponseReceived,
                 ]
         );
         if !legal {

@@ -8649,10 +8649,10 @@ impl RedbRecoveryStore {
             crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
                 match parent.attempt.as_ref().map(|attempt| attempt.phase) {
                     None
-                    | Some(crate::HostRequestAttemptPhase::DeferredNoEffect)
-                    | Some(crate::HostRequestAttemptPhase::DefinitelyNotSent) => {
-                        crate::HostRequestState::Cancelled
-                    }
+                    | Some(
+                        crate::HostRequestAttemptPhase::DeferredNoEffect
+                        | crate::HostRequestAttemptPhase::DefinitelyNotSent,
+                    ) => crate::HostRequestState::Cancelled,
                     Some(
                         crate::HostRequestAttemptPhase::Claimed
                         | crate::HostRequestAttemptPhase::DispatchStarted
@@ -9050,14 +9050,15 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
-        let Some(mut record) = ({
+        let existing: Option<crate::HostRequestRecord> = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?
-        }) else {
+        };
+        let Some(mut record) = existing else {
             return Ok(None);
         };
         record.validate()?;
@@ -9146,14 +9147,15 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
-        let Some(mut record) = ({
+        let existing: Option<crate::HostRequestRecord> = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?
-        }) else {
+        };
+        let Some(mut record) = existing else {
             return Ok(None);
         };
         record.validate()?;
@@ -9235,14 +9237,15 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
-        let Some(mut record) = ({
+        let existing: Option<crate::HostRequestRecord> = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?
-        }) else {
+        };
+        let Some(mut record) = existing else {
             return Ok(None);
         };
         record.validate()?;
@@ -9537,7 +9540,7 @@ impl RedbRecoveryStore {
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         crate::model::validate_digest(result_digest, "host_request_result_digest")?;
-        validate_result_response(result_response)?;
+        crate::model::validate_result_response(result_response)?;
         let result_body_bytes = canonical_json_bytes(result_response)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let result_body_digest = crate::model::sha256_hex(&result_body_bytes);
