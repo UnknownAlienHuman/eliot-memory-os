@@ -969,13 +969,14 @@ fn automation_revision_key(automation_id: &str, revision: &str) -> String {
 ///
 /// Runs beside [`dispatch_apply_reactive_state`] under the same lock as
 /// the receipt commit: one identity, one receipt, recoverable replay
-/// without duplicate work. Revision rows are immutable and create-only
-/// (divergent rewrites fail closed); the current pointer moves only
-/// through the observed revision; invocation rows are create-only by
-/// occurrence identity. Each command appends one outbox intent bound to
+/// without duplicate work. Each command appends one outbox intent bound to
 /// the resulting row bytes, so rows and their outbox intents commit
 /// atomically via [`commit_transaction`]. Non-automation transitions are
 /// a no-op here.
+///
+/// The admitted-leg gate and the outbox binding are this function; the row
+/// mutations are [`AutomationDispatch`], one method per leg, so no leg's
+/// admission rules are spelled inside the loop that binds its outbox.
 fn dispatch_apply_automation_state(
     state: &mut MemoryState,
     transition: &PreparedTransition,
@@ -992,6 +993,7 @@ fn dispatch_apply_automation_state(
         return Err(StoreError::TransitionClassExceeded);
     }
     let operation_key = transition.identity.operation_id.to_string();
+    let mut dispatch = AutomationDispatch::new(state, transition);
     let mut automation_index = 0_usize;
     for command in &transition.named_operations {
         let decoded = match command.operation {
@@ -1000,238 +1002,7 @@ fn dispatch_apply_automation_state(
             }
             _ => continue,
         };
-        let row_json = match decoded {
-            DecodedAutomationMutation::Create {
-                automation_id,
-                revision,
-                revision_json,
-                normalization_envelope_json,
-                configuration_state,
-            } => {
-                let key = automation_revision_key(&automation_id, &revision);
-                match state.automation_revisions.get(&key) {
-                    Some(existing)
-                        if existing.revision_json != revision_json
-                            || existing.normalization_envelope_json
-                                != normalization_envelope_json =>
-                    {
-                        return Err(StoreError::IdentityConflict);
-                    }
-                    Some(_) => {}
-                    None => {
-                        state.automation_revisions.insert(
-                            key,
-                            AutomationRevisionRow {
-                                automation_id: automation_id.clone(),
-                                revision: revision.clone(),
-                                revision_json: revision_json.clone(),
-                                normalization_envelope_json: normalization_envelope_json.clone(),
-                                state_fence: transition.state_fence.clone(),
-                                scope_id: transition.scope_id.to_string(),
-                                task_id: transition.task_id.clone(),
-                            },
-                        );
-                    }
-                }
-                if state.automation_currents.contains_key(&automation_id) {
-                    return Err(StoreError::IdentityConflict);
-                }
-                state.automation_currents.insert(
-                    automation_id.clone(),
-                    AutomationCurrentRow {
-                        automation_id,
-                        revision,
-                        configuration_state,
-                        state_fence: transition.state_fence.clone(),
-                        scope_id: transition.scope_id.to_string(),
-                        task_id: transition.task_id.clone(),
-                    },
-                );
-                serde_json::to_value(&revision_json)
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?
-            }
-            DecodedAutomationMutation::Edit {
-                automation_id,
-                previous_revision,
-                revision,
-                revision_json,
-                normalization_envelope_json,
-                configuration_state,
-            } => {
-                let current = state.automation_currents.get(&automation_id).ok_or(
-                    StoreError::InvalidField {
-                        field: "automation.automation_id",
-                        reason: "unknown automation",
-                    },
-                )?;
-                if current.revision != previous_revision {
-                    return Err(StoreError::IdentityConflict);
-                }
-                if current.state_fence != transition.state_fence {
-                    return Err(StoreError::FenceMismatch);
-                }
-                let key = automation_revision_key(&automation_id, &revision);
-                match state.automation_revisions.get(&key) {
-                    Some(existing)
-                        if existing.revision_json != revision_json
-                            || existing.normalization_envelope_json
-                                != normalization_envelope_json =>
-                    {
-                        return Err(StoreError::IdentityConflict);
-                    }
-                    Some(_) => {}
-                    None => {
-                        state.automation_revisions.insert(
-                            key,
-                            AutomationRevisionRow {
-                                automation_id: automation_id.clone(),
-                                revision: revision.clone(),
-                                revision_json: revision_json.clone(),
-                                normalization_envelope_json: normalization_envelope_json.clone(),
-                                state_fence: transition.state_fence.clone(),
-                                scope_id: transition.scope_id.to_string(),
-                                task_id: transition.task_id.clone(),
-                            },
-                        );
-                    }
-                }
-                state.automation_currents.insert(
-                    automation_id.clone(),
-                    AutomationCurrentRow {
-                        automation_id,
-                        revision,
-                        configuration_state,
-                        state_fence: transition.state_fence.clone(),
-                        scope_id: transition.scope_id.to_string(),
-                        task_id: transition.task_id.clone(),
-                    },
-                );
-                serde_json::to_value(&revision_json)
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?
-            }
-            DecodedAutomationMutation::StateTransition {
-                automation_id,
-                revision,
-                configuration_state,
-                ..
-            } => {
-                let key = automation_revision_key(&automation_id, &revision);
-                if !state.automation_revisions.contains_key(&key) {
-                    return Err(StoreError::InvalidField {
-                        field: "automation.revision",
-                        reason: "unknown automation revision",
-                    });
-                }
-                let current = state.automation_currents.get(&automation_id).ok_or(
-                    StoreError::InvalidField {
-                        field: "automation.automation_id",
-                        reason: "unknown automation",
-                    },
-                )?;
-                if current.revision != revision {
-                    return Err(StoreError::IdentityConflict);
-                }
-                if current.state_fence != transition.state_fence {
-                    return Err(StoreError::FenceMismatch);
-                }
-                let row_json = serde_json::to_value(&revision)
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                state.automation_currents.insert(
-                    automation_id.clone(),
-                    AutomationCurrentRow {
-                        automation_id,
-                        revision,
-                        configuration_state,
-                        state_fence: transition.state_fence.clone(),
-                        scope_id: transition.scope_id.to_string(),
-                        task_id: transition.task_id.clone(),
-                    },
-                );
-                row_json
-            }
-            DecodedAutomationMutation::RunNow {
-                automation_id,
-                revision,
-                occurrence_id,
-                invocation_json,
-            } => {
-                let key = automation_revision_key(&automation_id, &revision);
-                if !state.automation_revisions.contains_key(&key) {
-                    return Err(StoreError::InvalidField {
-                        field: "automation.revision",
-                        reason: "unknown automation revision",
-                    });
-                }
-                match state.automation_invocations.get(&occurrence_id) {
-                    Some(existing) if existing.invocation_json != invocation_json => {
-                        return Err(StoreError::IdentityConflict);
-                    }
-                    Some(_) => {}
-                    None => {
-                        state.automation_invocations.insert(
-                            occurrence_id.clone(),
-                            AutomationInvocationRow {
-                                occurrence_id,
-                                automation_id: automation_id.clone(),
-                                invocation_json: invocation_json.clone(),
-                                state_fence: transition.state_fence.clone(),
-                                scope_id: transition.scope_id.to_string(),
-                                task_id: transition.task_id.clone(),
-                            },
-                        );
-                    }
-                }
-                serde_json::to_value(&invocation_json)
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?
-            }
-            DecodedAutomationMutation::Failure {
-                automation_id,
-                revision,
-                occurrence_id,
-                failure,
-                failure_json,
-            } => {
-                let key = automation_revision_key(&automation_id, &revision);
-                if !state.automation_revisions.contains_key(&key) {
-                    return Err(StoreError::InvalidField {
-                        field: "automation.revision",
-                        reason: "unknown automation revision",
-                    });
-                }
-                let failure_key = eliot_store_api::automation_failure_key(
-                    &automation_id,
-                    &revision,
-                    &failure.fingerprint,
-                );
-                match state.automation_failures.get(&failure_key) {
-                    Some(existing) if existing.failure_json != failure_json => {
-                        return Err(StoreError::IdentityConflict);
-                    }
-                    Some(_) => {}
-                    None => {
-                        state.automation_failures.insert(
-                            failure_key.clone(),
-                            AutomationFailureRow {
-                                automation_id: automation_id.clone(),
-                                revision: revision.clone(),
-                                occurrence_id: occurrence_id.clone(),
-                                fingerprint: failure.fingerprint.clone(),
-                                failure_json: failure_json.clone(),
-                                source_operation_id: operation_key.clone(),
-                                state_fence: transition.state_fence.clone(),
-                                scope_id: transition.scope_id.to_string(),
-                                task_id: transition.task_id.clone(),
-                            },
-                        );
-                    }
-                }
-                state
-                    .automation_last_failure
-                    .insert(automation_id.clone(), failure_key);
-                serde_json::to_value(&failure_json)
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?
-            }
-        };
+        let row_json = dispatch.apply_leg(decoded)?;
         let payload_digest = sha256_hex(
             &canonical_json_bytes(&row_json)
                 .map_err(|error| StoreError::Serialization(error.to_string()))?,
@@ -1256,6 +1027,348 @@ fn dispatch_apply_automation_state(
         automation_index = automation_index.saturating_add(1);
     }
     Ok(())
+}
+
+/// The locked state plus the ONE transition's provenance that every automation
+/// row written under it carries (issue #1779).
+///
+/// Fence, scope, and task are bound once here rather than restated by each leg,
+/// so a leg body is only the mutation it applies and cannot stamp a row with
+/// provenance that differs from its neighbour's. `source_operation_id` is the
+/// first-writer identity the immutable failure row records.
+struct AutomationDispatch<'a> {
+    state: &'a mut MemoryState,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+    source_operation_id: String,
+}
+
+impl AutomationDispatch<'_> {
+    /// Binds the locked state to the one transition this dispatch writes under.
+    fn new(state: &mut MemoryState, transition: &PreparedTransition) -> Self {
+        Self {
+            state,
+            state_fence: transition.state_fence.clone(),
+            scope_id: transition.scope_id.to_string(),
+            task_id: transition.task_id.clone(),
+            source_operation_id: transition.identity.operation_id.to_string(),
+        }
+    }
+
+    /// Applies one decoded leg and returns the exact row bytes its outbox
+    /// intent binds to.
+    fn apply_leg(&mut self, decoded: DecodedAutomationMutation) -> Result<Value, StoreError> {
+        match decoded {
+            DecodedAutomationMutation::Create {
+                automation_id,
+                revision,
+                revision_json,
+                normalization_envelope_json,
+                configuration_state,
+            } => self.create_leg(
+                automation_id,
+                revision,
+                revision_json,
+                normalization_envelope_json,
+                configuration_state,
+            ),
+            DecodedAutomationMutation::Edit {
+                automation_id,
+                previous_revision,
+                revision,
+                revision_json,
+                normalization_envelope_json,
+                configuration_state,
+            } => self.edit_leg(
+                automation_id,
+                previous_revision,
+                revision,
+                revision_json,
+                normalization_envelope_json,
+                configuration_state,
+            ),
+            DecodedAutomationMutation::StateTransition {
+                automation_id,
+                revision,
+                configuration_state,
+                ..
+            } => self.state_transition_leg(automation_id, revision, configuration_state),
+            DecodedAutomationMutation::RunNow {
+                automation_id,
+                revision,
+                occurrence_id,
+                invocation_json,
+            } => self.run_now_leg(automation_id, revision, occurrence_id, invocation_json),
+            DecodedAutomationMutation::Failure {
+                automation_id,
+                revision,
+                occurrence_id,
+                failure,
+                failure_json,
+            } => self.failure_leg(
+                automation_id,
+                revision,
+                occurrence_id,
+                failure.fingerprint,
+                failure_json,
+            ),
+        }
+    }
+
+    /// Retains one immutable revision row together with the normalization
+    /// envelope retained on it.
+    ///
+    /// The row is create-only: an identical replay converges, while a repeat
+    /// carrying a different revision document OR a different retained envelope
+    /// for the same immutable row is a divergent claim about ONE immutable
+    /// value and fails closed. The envelope is part of what the row asserts, so
+    /// it is compared as the stored bytes it is; nothing here re-derives a
+    /// digest or interprets the envelope, which is the requesting owner's
+    /// question against the envelope's own parsed identity.
+    fn retain_revision_row(
+        &mut self,
+        automation_id: &str,
+        revision: &str,
+        revision_json: &str,
+        normalization_envelope_json: &str,
+    ) -> Result<(), StoreError> {
+        let key = automation_revision_key(automation_id, revision);
+        match self.state.automation_revisions.get(&key) {
+            Some(existing)
+                if existing.revision_json != revision_json
+                    || existing.normalization_envelope_json != normalization_envelope_json =>
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+            Some(_) => {}
+            None => {
+                self.state.automation_revisions.insert(
+                    key,
+                    AutomationRevisionRow {
+                        automation_id: automation_id.to_owned(),
+                        revision: revision.to_owned(),
+                        revision_json: revision_json.to_owned(),
+                        normalization_envelope_json: normalization_envelope_json.to_owned(),
+                        state_fence: self.state_fence.clone(),
+                        scope_id: self.scope_id.clone(),
+                        task_id: self.task_id.clone(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Create leg: fresh immutable revision row plus a fresh current pointer.
+    fn create_leg(
+        &mut self,
+        automation_id: String,
+        revision: String,
+        revision_json: String,
+        normalization_envelope_json: String,
+        configuration_state: String,
+    ) -> Result<Value, StoreError> {
+        self.retain_revision_row(
+            &automation_id,
+            &revision,
+            &revision_json,
+            &normalization_envelope_json,
+        )?;
+        if self.state.automation_currents.contains_key(&automation_id) {
+            return Err(StoreError::IdentityConflict);
+        }
+        self.state.automation_currents.insert(
+            automation_id.clone(),
+            AutomationCurrentRow {
+                automation_id,
+                revision,
+                configuration_state,
+                state_fence: self.state_fence.clone(),
+                scope_id: self.scope_id.clone(),
+                task_id: self.task_id.clone(),
+            },
+        );
+        serde_json::to_value(&revision_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
+    /// Edit leg: fresh immutable revision row plus a pointer move off the
+    /// lineage base, which must be the pointer this transition observed.
+    fn edit_leg(
+        &mut self,
+        automation_id: String,
+        previous_revision: String,
+        revision: String,
+        revision_json: String,
+        normalization_envelope_json: String,
+        configuration_state: String,
+    ) -> Result<Value, StoreError> {
+        let current =
+            self.state
+                .automation_currents
+                .get(&automation_id)
+                .ok_or(StoreError::InvalidField {
+                    field: "automation.automation_id",
+                    reason: "unknown automation",
+                })?;
+        if current.revision != previous_revision {
+            return Err(StoreError::IdentityConflict);
+        }
+        if current.state_fence != self.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        self.retain_revision_row(
+            &automation_id,
+            &revision,
+            &revision_json,
+            &normalization_envelope_json,
+        )?;
+        self.state.automation_currents.insert(
+            automation_id.clone(),
+            AutomationCurrentRow {
+                automation_id,
+                revision,
+                configuration_state,
+                state_fence: self.state_fence.clone(),
+                scope_id: self.scope_id.clone(),
+                task_id: self.task_id.clone(),
+            },
+        );
+        serde_json::to_value(&revision_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
+    /// Pause/resume/remove leg: pointer move only. The immutable revision row
+    /// must exist and is read, never rewritten.
+    fn state_transition_leg(
+        &mut self,
+        automation_id: String,
+        revision: String,
+        configuration_state: String,
+    ) -> Result<Value, StoreError> {
+        let key = automation_revision_key(&automation_id, &revision);
+        if !self.state.automation_revisions.contains_key(&key) {
+            return Err(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "unknown automation revision",
+            });
+        }
+        let current =
+            self.state
+                .automation_currents
+                .get(&automation_id)
+                .ok_or(StoreError::InvalidField {
+                    field: "automation.automation_id",
+                    reason: "unknown automation",
+                })?;
+        if current.revision != revision {
+            return Err(StoreError::IdentityConflict);
+        }
+        if current.state_fence != self.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        let row_json = serde_json::to_value(&revision)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        self.state.automation_currents.insert(
+            automation_id.clone(),
+            AutomationCurrentRow {
+                automation_id,
+                revision,
+                configuration_state,
+                state_fence: self.state_fence.clone(),
+                scope_id: self.scope_id.clone(),
+                task_id: self.task_id.clone(),
+            },
+        );
+        Ok(row_json)
+    }
+
+    /// Run-now leg: invocation row only, create-only by occurrence identity.
+    fn run_now_leg(
+        &mut self,
+        automation_id: String,
+        revision: String,
+        occurrence_id: String,
+        invocation_json: String,
+    ) -> Result<Value, StoreError> {
+        let key = automation_revision_key(&automation_id, &revision);
+        if !self.state.automation_revisions.contains_key(&key) {
+            return Err(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "unknown automation revision",
+            });
+        }
+        match self.state.automation_invocations.get(&occurrence_id) {
+            Some(existing) if existing.invocation_json != invocation_json => {
+                return Err(StoreError::IdentityConflict);
+            }
+            Some(_) => {}
+            None => {
+                self.state.automation_invocations.insert(
+                    occurrence_id.clone(),
+                    AutomationInvocationRow {
+                        occurrence_id,
+                        automation_id: automation_id.clone(),
+                        invocation_json: invocation_json.clone(),
+                        state_fence: self.state_fence.clone(),
+                        scope_id: self.scope_id.clone(),
+                        task_id: self.task_id.clone(),
+                    },
+                );
+            }
+        }
+        serde_json::to_value(&invocation_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
+    /// Failure leg: immutable revision-bound failure row plus the last-failure
+    /// pointer move. Repeats of one failure class converge on the existing row.
+    fn failure_leg(
+        &mut self,
+        automation_id: String,
+        revision: String,
+        occurrence_id: String,
+        fingerprint: String,
+        failure_json: String,
+    ) -> Result<Value, StoreError> {
+        let key = automation_revision_key(&automation_id, &revision);
+        if !self.state.automation_revisions.contains_key(&key) {
+            return Err(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "unknown automation revision",
+            });
+        }
+        let failure_key =
+            eliot_store_api::automation_failure_key(&automation_id, &revision, &fingerprint);
+        match self.state.automation_failures.get(&failure_key) {
+            Some(existing) if existing.failure_json != failure_json => {
+                return Err(StoreError::IdentityConflict);
+            }
+            Some(_) => {}
+            None => {
+                self.state.automation_failures.insert(
+                    failure_key.clone(),
+                    AutomationFailureRow {
+                        automation_id: automation_id.clone(),
+                        revision: revision.clone(),
+                        occurrence_id: occurrence_id.clone(),
+                        fingerprint,
+                        failure_json: failure_json.clone(),
+                        source_operation_id: self.source_operation_id.clone(),
+                        state_fence: self.state_fence.clone(),
+                        scope_id: self.scope_id.clone(),
+                        task_id: self.task_id.clone(),
+                    },
+                );
+            }
+        }
+        self.state
+            .automation_last_failure
+            .insert(automation_id, failure_key);
+        serde_json::to_value(&failure_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
 }
 
 /// Joins one experience row address. Collision-free by the same
@@ -2520,7 +2633,9 @@ fn automation_state_payload(
                     reason: "exact receipt identity selector is required",
                 });
             }
-            automation_normalization_envelopes_payload(state, fence, &id, revision)
+            Ok(automation_normalization_envelopes_payload(
+                state, fence, &id, revision,
+            ))
         }
         _ => Err(StoreError::InvalidField {
             field: "query",
@@ -2799,12 +2914,17 @@ fn automation_invocations_payload(
 /// projects an empty array rather than another era's envelope. An immutable
 /// revision row retains exactly one envelope, so this projection is a
 /// zero-or-one answer and never a filtered subset.
+///
+/// It cannot fail: both of its gates are decided by rows already in the locked
+/// state, and a row that is absent or cross-fence is the exact empty answer
+/// rather than a failure. A typed failure here would be a failure this contour
+/// does not have.
 fn automation_normalization_envelopes_payload(
     state: &MemoryState,
     fence: &StateFence,
     automation_id: &str,
     revision: &str,
-) -> Result<Value, StoreError> {
+) -> Value {
     let mut envelopes = Vec::new();
     if let Some(row) = state
         .automation_revisions
@@ -2817,10 +2937,10 @@ fn automation_normalization_envelopes_payload(
             "envelope_json": row.normalization_envelope_json,
         }));
     }
-    Ok(json!({
+    json!({
         "normalization_envelopes": envelopes,
         "state_fence": fence,
-    }))
+    })
 }
 
 /// Digests the exact revision-head set one automation read observed.
