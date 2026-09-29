@@ -992,17 +992,14 @@ fn map_call_error(
         wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
         wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
         wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
-        // `unreachable` — the instruction a guest panic lowers to — is a
-        // guest trap, never a guest error: the owner-typed `Trap(GuestTrap)`
-        // cause keeps it distinct from `TypedDomainResult::GuestError` and
-        // from fuel, deadline, stack, and resource terminations. The staged
-        // `Invoke` wrapper records the terminal stage without claiming
-        // success, and the single invocation is never retried on another
-        // world.
-        wasmtime::Trap::UnreachableCodeReached => {
-            EngineTermination::Trap(TrapClass::GuestTrap)
-        }
-        _ => EngineTermination::Trap(TrapClass::GuestTrap),
+        // `unreachable` — the instruction a guest panic lowers to — and every
+        // other fault code are guest traps, never guest errors: the
+        // owner-typed `Trap(GuestTrap)` cause keeps them distinct from
+        // `TypedDomainResult::GuestError` and from fuel, deadline, stack, and
+        // resource terminations. The staged `Invoke` wrapper records the
+        // terminal stage without claiming success, and the single invocation
+        // is never retried on another world.
+        wasmtime::Trap::UnreachableCodeReached | _ => EngineTermination::Trap(TrapClass::GuestTrap),
     };
     TypedExecutionError::Engine(format!("{termination:?}"))
 }
