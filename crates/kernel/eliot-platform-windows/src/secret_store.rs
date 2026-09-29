@@ -322,7 +322,7 @@ impl WindowsInstallerSecretProvider {
     }
 }
 
-/// Receipt for one current-token UserMode supervision-key write and exact
+/// Receipt for one current-token `UserMode` supervision-key write and exact
 /// Credential Manager readback. It is provider evidence only; installation
 /// transaction progress and the public authority receipt remain the authority
 /// owners.
@@ -347,7 +347,7 @@ pub(crate) enum CurrentUserSupervisionCredentialObservation {
     },
 }
 
-/// Result after the provider has attempted the one exact WinCred write.
+/// Result after the provider has attempted the one exact `WinCred` write.
 ///
 /// A mutation error or failed post-write readback cannot establish that the
 /// target stayed absent. `Unknown` therefore carries the exact transaction
@@ -364,9 +364,9 @@ pub(crate) enum CurrentUserSupervisionCredentialProvisionOutcome {
     },
 }
 
-/// Current-token Credential Manager primitive for the UserMode supervision
+/// Current-token Credential Manager primitive for the `UserMode` supervision
 /// signing seed. Its target namespace is purpose-separated from installer-root
-/// HMAC keys, Store credentials, and LocalService credential targets.
+/// HMAC keys, Store credentials, and `LocalService` credential targets.
 ///
 /// Credential Manager has no atomic create-only API. The provider serializes
 /// cooperating callers with a mutex ACL'd to the exact current SID, requires
@@ -387,7 +387,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
     }
 
     /// Returns the exact current process-token SID.
-    pub(crate) fn principal_sid(&self) -> Result<PlatformHandle, crate::WindowsAdapterError> {
+    pub(crate) fn principal_sid(self) -> Result<PlatformHandle, crate::WindowsAdapterError> {
         let sid =
             crate::current_process_sid().map_err(|_| crate::WindowsAdapterError::Unavailable)?;
         PlatformHandle::new(sid).map_err(|_| crate::WindowsAdapterError::InvalidInput)
@@ -396,7 +396,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
     /// Derives the one current-user key target from immutable installation and
     /// effect identities. Callers must persist these identities before write.
     pub(crate) fn target_for_effect(
-        &self,
+        self,
         installation_id: &str,
         transaction_id: &str,
         effect_id: &str,
@@ -436,7 +436,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
 
     /// Observes one exact target under the expected current-user SID.
     pub(crate) fn inspect(
-        &self,
+        self,
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
     ) -> Result<CurrentUserSupervisionCredentialObservation, crate::WindowsAdapterError> {
@@ -460,13 +460,13 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
     /// after its immediate current-token readback matches byte-for-byte.
     ///
     /// Once `credential_write` is invoked, every provider error or failed
-    /// readback is returned as `Unknown`: WinCred may have accepted the bytes
+    /// readback is returned as `Unknown`: `WinCred` may have accepted the bytes
     /// before the error became visible. The caller must persist that result
     /// against the original transaction/effect and inspect this same target
     /// before any later action. It must not infer absence or retry from an
     /// error.
     pub(crate) fn write_exact_if_absent(
-        &self,
+        self,
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
         secret: CredentialSecret,
@@ -487,15 +487,12 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
                 target: target.clone(),
             });
         }
-        let readback = match credential_read_optional(target.as_str()) {
-            Ok(readback) => readback,
-            Err(_) => {
-                drop(secret);
-                return Ok(CurrentUserSupervisionCredentialProvisionOutcome::Unknown {
-                    owner_sid: expected_owner_sid.clone(),
-                    target: target.clone(),
-                });
-            }
+        let Ok(readback) = credential_read_optional(target.as_str()) else {
+            drop(secret);
+            return Ok(CurrentUserSupervisionCredentialProvisionOutcome::Unknown {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            });
         };
         if require_exact_credential_readback(
             secret.expose(),
@@ -523,7 +520,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
 
     /// Reads one exact 256-bit seed only in the bound current-user token.
     pub(crate) fn read(
-        &self,
+        self,
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
     ) -> Result<CredentialSecret, crate::WindowsAdapterError> {
@@ -538,7 +535,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
     /// Deletes only a seed that derives the exact public key in the original
     /// transaction receipt, then proves target absence.
     pub(crate) fn delete_if_signing_key_matches(
-        &self,
+        self,
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
         signer_id: &str,
@@ -575,7 +572,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
     }
 
     fn validate_binding(
-        &self,
+        self,
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
     ) -> Result<(), crate::WindowsAdapterError> {
