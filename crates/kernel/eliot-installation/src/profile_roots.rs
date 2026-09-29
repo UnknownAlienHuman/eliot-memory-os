@@ -2,7 +2,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
-use super::{InstallationError, WindowsPathIdentity, joined_windows_path, text};
+use super::{
+    InstallationError, ProfileGovernedRoots, WindowsPathIdentity, joined_windows_path, text,
+};
 
 /// Breaking revision of the persisted four-root installation binding.
 ///
@@ -139,6 +141,26 @@ impl InstallationRoots {
         }
         self.validate_durable_runtime_join(profile)?;
         Ok(())
+    }
+
+    /// Admits an additional mutable output against this selected profile's
+    /// immutable binaries binding.
+    ///
+    /// Callers use this for outputs that are not represented by an installation
+    /// effect, such as a diagnostic file or transaction-store location. The
+    /// binding is validated against its retained runtime profile before the
+    /// existing profile-governed write rule is applied.
+    pub fn admits_write_target(&self, target: &str) -> Result<(), InstallationError> {
+        let profile = self.runtime_state_roots.profile;
+        self.validate(profile)?;
+        ProfileGovernedRoots {
+            profile,
+            immutable_binaries: self.immutable_binaries.clone(),
+            durable_data: self.durable_data.clone(),
+            user_config: self.user_config.clone(),
+            user_cache: self.user_cache.clone(),
+        }
+        .admits_write_target(target)
     }
 
     /// Refuses a source bundle that overlaps the selected immutable binaries

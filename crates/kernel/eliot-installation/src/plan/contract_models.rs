@@ -213,7 +213,10 @@ impl UserModeSupervisionAuthorityProvisionPlan {
         for (value, field) in [
             (&self.transaction_id, "user_mode_supervision.transaction_id"),
             (&self.effect_id, "user_mode_supervision.effect_id"),
-            (&self.installation_id, "user_mode_supervision.installation_id"),
+            (
+                &self.installation_id,
+                "user_mode_supervision.installation_id",
+            ),
             (
                 &self.candidate_generation,
                 "user_mode_supervision.candidate_generation",

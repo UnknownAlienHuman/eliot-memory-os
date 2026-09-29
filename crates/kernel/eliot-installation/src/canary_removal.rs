@@ -54,10 +54,11 @@ use super::{
 /// is a separate durable record, not a rewritten install.
 ///
 /// Version 2 makes the absolute reconcile deadline of the bounded reconcile
-/// wait a mandatory durable member. A version 1 record cannot supply it and
-/// requires explicit migration; a deadline is never synthesized as a default,
-/// because a defaulted budget would silently grant an unbounded second wait.
-pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
+/// wait mandatory. Version 3 adds the UserMode supervision-authority credential
+/// as a typed resource in the frozen removal graph. Older records require
+/// explicit migration; neither deadlines nor resource classifications are
+/// synthesized as defaults.
+pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 
 /// Canonical prefix of every derived canary-removal operation identity.
 const CANARY_REMOVAL_OPERATION_PREFIX: &str = "canary-removal/v1:";
@@ -99,6 +100,9 @@ pub enum CanaryRemovalResource {
     GenerationPackageRoot,
     /// The `LocalService` Store credential provisioned for this generation.
     StoreCredential,
+    /// The exact current-user supervision-authority credential provisioned by
+    /// the original UserMode transaction.
+    UserModeAuthorityCredential,
     /// One canonical SCM service registration admitted for this generation.
     ServiceRegistration,
     /// One canonical SCM service start admitted for this generation.
@@ -1339,6 +1343,12 @@ fn freeze_effect_graph(
             ),
             InstallerEffectPlan::ProvisionStoreCredential { .. } => (
                 CanaryRemovalResource::StoreCredential,
+                applied_identity(progress)?,
+                false,
+                true,
+            ),
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => (
+                CanaryRemovalResource::UserModeAuthorityCredential,
                 applied_identity(progress)?,
                 false,
                 true,

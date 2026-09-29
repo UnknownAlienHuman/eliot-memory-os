@@ -289,14 +289,12 @@ impl RuntimeStateRoots {
                 ));
             }
         };
-        let installation_root = PlatformHandle::new(joined_windows_path(
-            profile_anchor_root.as_str(),
-            &suffix,
-        ))
-        .map_err(|error| InstallationError::InvalidField {
-            field: "runtime_state_roots.installation_root".to_owned(),
-            reason: error.to_string(),
-        })?;
+        let installation_root =
+            PlatformHandle::new(joined_windows_path(profile_anchor_root.as_str(), &suffix))
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "runtime_state_roots.installation_root".to_owned(),
+                    reason: error.to_string(),
+                })?;
         Self::derived(profile, profile_anchor_root, installation_root)
     }
 

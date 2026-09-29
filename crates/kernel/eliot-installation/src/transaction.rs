@@ -18,10 +18,10 @@ use super::{
     SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
     StoreCredentialProgress, candidate_manifest_digest, handle, handles,
     ownership_secret_absence_evidence, phase_b_scm_digest,
-    prove_no_service_profile_authority_dependency, validate_user_mode_authority_effect_bindings,
-    sha256_handle, sha256_hex, validate_installer_effects, validate_package_binding,
-    validate_phase_b_effect_bindings, validate_staging_receipt_for_observation,
-    validate_staging_receipt_for_plan,
+    prove_no_service_profile_authority_dependency, sha256_handle, sha256_hex,
+    validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
+    validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
+    validate_user_mode_authority_effect_bindings,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -556,7 +556,12 @@ impl InstallationTransaction {
             }
         })?;
         binding.validate(self.profile)?;
-        if binding != &self.candidate_manifest.runtime_launch.profile_governed_roots {
+        if binding
+            != &self
+                .candidate_manifest
+                .runtime_launch
+                .profile_governed_roots
+        {
             return Err(InstallationError::ProfileViolation(
                 "recorded profile-governed roots disagree with the candidate launch binding"
                     .to_owned(),
@@ -778,7 +783,12 @@ impl InstallationTransaction {
         // validated launch descriptor; production constructors leave the
         // field unset until the published-selection planner binds it below.
         let profile_governed_roots = if cfg!(test) {
-            Some(candidate_manifest.runtime_launch.profile_governed_roots.clone())
+            Some(
+                candidate_manifest
+                    .runtime_launch
+                    .profile_governed_roots
+                    .clone(),
+            )
         } else {
             None
         };
@@ -1243,11 +1253,10 @@ impl InstallationTransaction {
         let mut approvals = Vec::new();
         let mut roles = BTreeSet::new();
         let mut nonces = BTreeSet::<PlatformHandle>::new();
-        for (index, (effect, progress)) in self
+        for (effect, progress) in self
             .installer_effects
             .iter()
             .zip(&self.effect_progress)
-            .enumerate()
         {
             let InstallerEffectPlan::RegisterService {
                 effect_id,
@@ -1566,7 +1575,12 @@ impl InstallationTransaction {
             return Err(InstallationError::IdentityConflict);
         }
         let mut unsettled_seen = false;
-        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
+        for (index, (effect, progress)) in self
+            .installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .enumerate()
+        {
             if progress.effect_id != *effect.effect_id() {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -1640,10 +1654,12 @@ impl InstallationTransaction {
                 else {
                     return Err(InstallationError::IdentityConflict);
                 };
-                receipt.validate().map_err(|error| InstallationError::InvalidField {
-                    field: "effect_progress.user_mode_authority_receipt".to_owned(),
-                    reason: error.to_string(),
-                })?;
+                receipt
+                    .validate()
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "effect_progress.user_mode_authority_receipt".to_owned(),
+                        reason: error.to_string(),
+                    })?;
                 if receipt.request.transaction_id != self.transaction_id.as_str()
                     || receipt.request.effect_id != progress.effect_id.as_str()
                     || receipt.request.installation_id != provision.installation_id.as_str()
