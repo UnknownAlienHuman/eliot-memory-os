@@ -1027,9 +1027,12 @@ fn commit_activation_candidate(
     // is revalidated as observed before any of its fields is trusted, and a
     // stale or quarantined standing refuses here. A Skill whose declared
     // host/tool/contract dependencies changed stays blocked from Material
-    // use even when the catalogue entry itself has not been remarked yet;
-    // only revalidation or explicit scoped/provisional admission through the
-    // governed lifecycle path lifts the standing. The owner admits the same
+    // use through this commit plus the owner admission below: this leg
+    // refuses stale/quarantined standing on the observed view, and the
+    // admission re-checks live dep staleness even when the catalogue entry
+    // itself has not been remarked yet; only revalidation or explicit
+    // scoped/provisional admission through the governed lifecycle path
+    // lifts the standing. The owner admits the same
     // standing again at admission time; this leg keeps the commit's fence,
     // route and retained-receipt legs consistent on one observation instead
     // of trusting fields of an unvalidated or stale record.
