@@ -3017,7 +3017,7 @@ async fn audit_range_payload(
     // Defence in depth for any internally constructed indeterminate state: it
     // is unavailable, not a proved empty projection, and no candidate is
     // served. The production path reaches the same verdict below.
-    if suppression == &ErasureSuppression::Unknown {
+    if suppression == ErasureSuppression::Unknown {
         return Err(AdapterError::Store(StoreError::Unavailable));
     }
     // Deterministic candidate order across calls: commit sequence, then
