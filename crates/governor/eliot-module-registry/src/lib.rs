@@ -1150,8 +1150,8 @@ impl ModuleCatalog {
     /// selected, so a later-started unrelated child stays running while an
     /// independent earlier sibling does too.
     ///
-    /// The walk is transitive under finite node/edge bounds and refuses a
-    /// required-edge cycle rather than looping or silently truncating the
+    /// The walk is transitive and bounded by the catalog's declared edge count,
+    /// so a cyclic declaration cannot make it loop or silently truncate the
     /// closure. Optional and advisory edges are followed for the closure (a
     /// declared invalidation is a declared invalidation) but never create a
     /// liveness edge: their absence degrades a capability instead.
@@ -1167,6 +1167,15 @@ impl ModuleCatalog {
         trigger: RestartInvalidationTrigger,
     ) -> Result<Vec<ModuleId>, ModuleError> {
         let root = self.entries.get(subject).ok_or(ModuleError::NotFound)?;
+        // The policy's own `subject_id` must name this module. A policy that
+        // claims a different subject would supply another module's restart
+        // strategy to this module's recovery, so the join is proved rather
+        // than assumed.
+        if let Some(policy) = root.manifest.restart_policy.as_ref() {
+            if policy.subject_id != subject.as_str() {
+                return Err(ModuleError::IdentityConflict);
+            }
+        }
         let strategy = root
             .manifest
             .restart_policy
@@ -1187,10 +1196,12 @@ impl ModuleCatalog {
         // invalidation, and reading it is exactly the defect this replaces.
         let mut selected: BTreeSet<ModuleId> = BTreeSet::from([subject.clone()]);
         let mut frontier: Vec<ModuleId> = vec![subject.clone()];
-        // The bound is the total declared edge count of the catalog plus the
-        // subject. A closure over an acyclic declared graph visits each node at
-        // most once, so exceeding this means the declared graph is cyclic; this
-        // refuses rather than silently truncating the affected set.
+        // The work bound is the total declared edge count of the catalog plus
+        // the subject. Every selected module except the subject was reached
+        // through at least one declared edge, so the closure cannot exceed it.
+        // It is checked rather than assumed, so a malformed graph that selected
+        // more than its own declarations justify is refused instead of being
+        // returned as a complete affected set.
         let edge_budget = self
             .entries
             .values()
@@ -1212,7 +1223,7 @@ impl ModuleCatalog {
                 if work > edge_budget {
                     return Err(ModuleError::InvalidField {
                         field: "dependencies",
-                        reason: "declared invalidation graph is cyclic or exceeds its edge bound",
+                        reason: "the selected set exceeds the declared edge bound",
                     });
                 }
                 frontier.push(entry.module_id.clone());
