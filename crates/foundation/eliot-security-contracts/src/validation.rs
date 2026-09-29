@@ -36,6 +36,8 @@ pub enum SecurityContractError {
     DisclosureCoverageGap,
     #[error("taint was cleared without a declassification receipt")]
     TaintLaundering,
+    #[error("assessed source or profile is no longer current at the use boundary: {field}")]
+    StaleSourceAssessment { field: &'static str },
     #[error("revoked influence is still marked active")]
     RevokedInfluenceActive,
     #[error("revoked influence has no invalidation reason")]

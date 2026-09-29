@@ -463,6 +463,11 @@ impl SourceVerificationPort for GovernorWasmAdmission {
     fn verify(&mut self, _request: &InvocationRequest) -> Result<SourceVerification, PortError> {
         Ok(SourceVerification {
             assurance: self.assurance.clone(),
+            // No admitted `SourceSecurityAssessment` is retained by this
+            // observation bundle, so this port attests the assurance alone and
+            // the neutral runtime resolves any recorded assessment it is
+            // handed against that same assurance.
+            security_assessment: None,
             verification_revision: self.verification_revision,
             verification_receipt_digest: self.source_receipt()?,
         })
