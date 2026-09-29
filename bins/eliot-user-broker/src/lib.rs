@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,8 +41,8 @@ use eliot_user_broker_core::{
     CutoverReceipt, DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest,
     IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest,
     LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest, PortError,
-    ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider,
-    UserBroker,
+    ProcessEffectLineage, ProcessPort, ProcessStartOutcome, RegistrationReceipt,
+    RegistrationStatus, RequiredProvider, UserBroker,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -81,6 +81,39 @@ pub const SERVICE_NAME: &str = "eliot-user-broker";
 pub const PROTOCOL_VERSION: &str = "eliot.user-broker.v1";
 const SNAPSHOT_RELATIVE_DIRECTORY: &str = "Eliot/user-broker";
 const SNAPSHOT_LIMIT: u64 = 16 * 1024 * 1024;
+
+struct BoundedSnapshotWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedSnapshotWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+}
+
+impl Write for BoundedSnapshotWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("snapshot exceeds its byte limit"))?;
+        if next_len > self.limit {
+            return Err(io::Error::other("snapshot exceeds its byte limit"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerConfig {
@@ -518,6 +551,13 @@ impl IssuedOperationIdentityLedger for IssuedIdentityLedger {
             Err(_) => Err("broker identity lock is poisoned".to_owned()),
         }
     }
+
+    fn process_effect_lineage(&self) -> Result<Vec<ProcessEffectLineage>, String> {
+        match self.issuer.lock() {
+            Ok(issuer) => Ok(issuer.process_effect_lineage()),
+            Err(_) => Err("broker process-lineage lock is poisoned".to_owned()),
+        }
+    }
 }
 
 impl From<DurableIssuedIdentity> for IssuedOperationIdentity {
@@ -682,6 +722,14 @@ impl DispatchValidationPort for BrokerDispatchAuthority {
 /// Local P-04 composition for the interactive user's Job/process contour.
 /// Kernel only supplies a typed `LaunchGrant`; this adapter never sends the
 /// sealed P-03 request over EBP.
+struct PendingProcessStart {
+    request: ProcessRequest,
+    stdin_payload: Option<Vec<u8>>,
+    caller_request_id: String,
+    grant_request_digest: String,
+    process_request_digest: String,
+}
+
 struct LocalProcessPort {
     authority: Arc<BrokerDispatchAuthority>,
     executor: WindowsProcessExecutor,
@@ -693,8 +741,9 @@ struct LocalProcessPort {
     /// request-content field), and they are read at the start boundary rather
     /// than accepted again there, so the payload written to the child is the
     /// payload the durably committed request digest was computed from.
-    pending_requests: BTreeMap<OperationId, (ProcessRequest, Option<Vec<u8>>)>,
+    pending_requests: BTreeMap<OperationId, PendingProcessStart>,
     identity_issuer: Option<IssuerHandle>,
+    last_lineage_recovery_required: Option<bool>,
 }
 
 impl LocalProcessPort {
@@ -715,12 +764,13 @@ impl LocalProcessPort {
             evidence: Arc::new(Mutex::new(Vec::new())),
             pending_requests: BTreeMap::new(),
             identity_issuer: None,
+            last_lineage_recovery_required: None,
         })
     }
 
     /// Attaches the operation-identity issuer for process/effect lineage
-    /// bookkeeping. Lineage never blocks an effect; a missing issuer only
-    /// omits the broker-local lineage entry.
+    /// bookkeeping. The process cursor carries a recovery obligation if this
+    /// observational ledger is unavailable when a real effect is returned.
     pub(crate) fn set_identity_issuer(&mut self, issuer: IssuerHandle) {
         self.identity_issuer = Some(issuer);
     }
@@ -730,18 +780,24 @@ impl LocalProcessPort {
         caller_request_id: &str,
         grant_request_digest: &str,
         process_request_digest: &str,
-    ) {
-        let now = Self::now_ms().unwrap_or(0);
-        if let Some(issuer) = self.identity_issuer.as_ref()
-            && let Ok(mut issuer) = issuer.lock()
-        {
-            issuer.note_process_effect(
+    ) -> bool {
+        let Ok(now) = Self::now_ms() else {
+            return true;
+        };
+        let Some(issuer) = self.identity_issuer.as_ref() else {
+            return true;
+        };
+        let Ok(mut issuer) = issuer.lock() else {
+            return true;
+        };
+        issuer
+            .note_process_effect(
                 caller_request_id,
                 grant_request_digest,
                 process_request_digest,
                 now,
-            );
-        }
+            )
+            .is_err()
     }
 
     fn now_ms() -> Result<u64, PortError> {
@@ -819,22 +875,17 @@ impl ProcessPort for LocalProcessPort {
         let request = self.request_from_grant(grant)?;
         let operation_id = request.operation_id().clone();
         let request_digest = request.invocation_digest().to_owned();
-        // Record the authorization→effect lineage link before the physical
-        // start boundary. The grant, transport, and effect identities stay
-        // distinct; this entry only joins them for reconciliation.
-        self.note_process_effect(
-            &grant.approved.request_id,
-            &grant.request_digest,
-            &request_digest,
-        );
         if self
             .pending_requests
             .insert(
                 operation_id,
-                (
+                PendingProcessStart {
                     request,
-                    stdin_payload.map(<str>::as_bytes).map(<[u8]>::to_vec),
-                ),
+                    stdin_payload: stdin_payload.map(<str>::as_bytes).map(<[u8]>::to_vec),
+                    caller_request_id: grant.approved.request_id.clone(),
+                    grant_request_digest: grant.request_digest.clone(),
+                    process_request_digest: request_digest.clone(),
+                },
             )
             .is_some()
         {
@@ -851,11 +902,12 @@ impl ProcessPort for LocalProcessPort {
         _registration: &RegistrationReceipt,
         expected_request_digest: &str,
     ) -> Result<ProcessStartOutcome, PortError> {
-        let (request, stdin_payload) =
-            self.pending_requests
-                .remove(&grant.approved.operation_id)
-                .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
-        let request_digest = request.invocation_digest().to_owned();
+        self.last_lineage_recovery_required = None;
+        let pending = self
+            .pending_requests
+            .remove(&grant.approved.operation_id)
+            .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
+        let request_digest = pending.request.invocation_digest().to_owned();
         if request_digest != expected_request_digest {
             return Err(PortError::Invalid(
                 "prepared process request digest changed".to_owned(),
@@ -872,10 +924,23 @@ impl ProcessPort for LocalProcessPort {
         // `start_with_stdin` is the synchronous physical start, the same driver
         // the async `ProcessExecutor::start` method reaches, so it is driven on
         // this single-threaded runtime through `ready` rather than spawned.
-        let start = self
-            .executor
-            .start_with_stdin(request, sink, stdin_payload.as_deref());
-        match self.runtime.block_on(std::future::ready(start)) {
+        let start =
+            self.executor
+                .start_with_stdin(pending.request, sink, pending.stdin_payload.as_deref());
+        let result = self.runtime.block_on(std::future::ready(start));
+        self.last_lineage_recovery_required = match &result {
+            Ok(_) => Some(self.note_process_effect(
+                &pending.caller_request_id,
+                &pending.grant_request_digest,
+                &pending.process_request_digest,
+            )),
+            // The invocation was attempted, but its physical effect was not
+            // proven. Do not write an effect-lineage row that could be read as
+            // confirmation; preserve the exact Unknown cursor obligation.
+            Err(ProcessExecutionError::UnknownOutcome) => Some(true),
+            Err(_) => None,
+        };
+        match result {
             Ok(receipt) => Ok(ProcessStartOutcome::Started {
                 request_digest,
                 receipt,
@@ -885,6 +950,12 @@ impl ProcessPort for LocalProcessPort {
             }
             Err(error) => Err(Self::map_error(error)),
         }
+    }
+
+    fn take_process_lineage_recovery_obligation(&mut self) -> Result<bool, PortError> {
+        self.last_lineage_recovery_required.take().ok_or_else(|| {
+            PortError::Invalid("process lineage status is unavailable for this start".to_owned())
+        })
     }
 
     fn inspect(&mut self, operation_id: &OperationId) -> Result<ProcessExecutionView, PortError> {
@@ -1028,8 +1099,13 @@ impl DurableRegistrationPort for FileRegistrationStore {
     }
 
     fn save(&mut self, snapshot: &BrokerSnapshot) -> Result<(), PortError> {
-        let bytes = serde_json::to_vec(snapshot)
+        let snapshot_limit = usize::try_from(SNAPSHOT_LIMIT).map_err(|_| {
+            PortError::Invalid("snapshot limit does not fit the platform address space".to_owned())
+        })?;
+        let mut writer = BoundedSnapshotWriter::new(snapshot_limit);
+        serde_json::to_writer(&mut writer, snapshot)
             .map_err(|error| PortError::Invalid(format!("encode snapshot: {error}")))?;
+        let bytes = writer.bytes;
         #[cfg(windows)]
         {
             let relative = self
@@ -1227,6 +1303,11 @@ impl BrokerComposition {
                 .restore_issued(&DurableIssuedIdentity::from(&retained), restored_at)
                 .map_err(|error| CompositionError::OperationIdentityLedger(error.to_string()))?;
         }
+        for retained in broker.recovered_process_effect_lineage() {
+            identity
+                .restore_process_effect_lineage(&retained)
+                .map_err(|error| CompositionError::OperationIdentityLedger(error.to_string()))?;
+        }
         Ok(())
     }
 
@@ -1272,6 +1353,7 @@ impl BrokerComposition {
                     user_broker_epoch: 0,
                     operation_cursors: Vec::new(),
                     operation_identities: Vec::new(),
+                    process_effect_lineage: Vec::new(),
                     retired_operations: Vec::new(),
                     predecessor_registration: None,
                     cutover_receipt: None,

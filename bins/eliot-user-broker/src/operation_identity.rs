@@ -50,7 +50,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use eliot_protocol::RequestIdentity;
-use eliot_user_broker_core::ISSUED_OPERATION_IDENTITY_VERSION;
+use eliot_user_broker_core::{
+    ISSUED_OPERATION_CONTROL_BYTE_RESERVE, ISSUED_OPERATION_CONTROL_ENTRY_RESERVE,
+    ISSUED_OPERATION_IDENTITY_VERSION, MAX_ISSUED_OPERATION_IDENTITIES,
+    MAX_ISSUED_OPERATION_IDENTITY_BYTES, MAX_PROCESS_EFFECT_LINEAGE_BYTES,
+    MAX_PROCESS_EFFECT_LINEAGE_ENTRIES, ProcessEffectLineage,
+};
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -169,7 +175,7 @@ pub(crate) struct IssuedIdentity {
 }
 
 /// Lineage from a caller launch request to its authorize-launch identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct LaunchLineageEntry {
     /// Caller request id (`ApprovedLaunch.request_id`).
     pub(crate) caller_request_id: String,
@@ -181,19 +187,8 @@ pub(crate) struct LaunchLineageEntry {
     pub(crate) canonical_digest: String,
 }
 
-/// Lineage from an authorization to its process/effect invocation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProcessLineageEntry {
-    /// Caller request id used to join with [`LaunchLineageEntry`].
-    pub(crate) caller_request_id: String,
-    /// Transport authorize request id when the grant postdates this issuer.
-    pub(crate) authorize_request_id: Option<String>,
-    /// Kernel grant request digest observed with the grant.
-    pub(crate) grant_request_digest: String,
-    /// Sealed process invocation digest (effect identity, never collapsed
-    /// into the transport identity).
-    pub(crate) process_request_digest: String,
-}
+/// Lineage from a grant to its exact process/effect invocation.
+pub(crate) type ProcessLineageEntry = ProcessEffectLineage;
 
 /// One issued operation identity as it is retained across a broker restart
 /// (issue #74 A4).
@@ -204,7 +199,7 @@ pub(crate) struct ProcessLineageEntry {
 /// and are imported only as spent-ID tombstones. Nothing here is authority:
 /// the row proves only which request, cancellation, and idempotency strings
 /// were already spent.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DurableIssuedIdentity {
     /// Explicit durable row schema version. Version 1 rows are imported as
     /// tombstones because they did not preserve the original `RequestIdentity`.
@@ -264,6 +259,9 @@ pub(crate) enum OperationIdentityError {
     /// Random identity regeneration collided repeatedly.
     #[error("operation identity regeneration collided")]
     IdentityExhausted,
+    /// The retained anti-reuse or lineage ledger reached its fixed budget.
+    #[error("operation identity evidence capacity is exhausted")]
+    IdentityCapacityExceeded,
 }
 
 /// Ledger key: one exact operation selector plus canonical payload digest.
@@ -302,6 +300,9 @@ pub(crate) struct OperationIdentityIssuer {
     launch_lineage: Vec<LaunchLineageEntry>,
     process_lineage: Vec<ProcessLineageEntry>,
     issued: BTreeMap<LedgerKey, DurableIssuedIdentity>,
+    issued_bytes: usize,
+    launch_lineage_bytes: usize,
+    process_lineage_bytes: usize,
 }
 
 /// Shared issuer handle between the composition and its authority/process ports.
@@ -330,6 +331,9 @@ impl OperationIdentityIssuer {
             launch_lineage: Vec::new(),
             process_lineage: Vec::new(),
             issued: BTreeMap::new(),
+            issued_bytes: 0,
+            launch_lineage_bytes: 0,
+            process_lineage_bytes: 0,
         })
     }
 
@@ -354,6 +358,9 @@ impl OperationIdentityIssuer {
             launch_lineage: Vec::new(),
             process_lineage: Vec::new(),
             issued: BTreeMap::new(),
+            issued_bytes: 0,
+            launch_lineage_bytes: 0,
+            process_lineage_bytes: 0,
         }
     }
 
@@ -496,34 +503,21 @@ impl OperationIdentityIssuer {
                 )))
             };
         }
-        if self.by_request.contains_key(&retained.request_id)
-            || self.by_cancellation.contains_key(&retained.cancellation_id)
-            || self.by_idempotency.contains_key(&retained.idempotency_key)
-        {
-            return Err(OperationIdentityError::IdentityConflict(format!(
-                "retained request/cancellation/idempotency identity of {} is already bound to another operation",
-                retained.operation
-            )));
-        }
-        if retained
-            .caller_request_id
-            .as_deref()
-            .is_some_and(|caller| self.by_caller_request.contains_key(caller))
-        {
-            return Err(OperationIdentityError::IdentityConflict(format!(
-                "retained caller launch binding of {} is already bound to another launch",
-                retained.operation
-            )));
-        }
-        if retained
-            .caller_idempotency_key
-            .as_deref()
-            .is_some_and(|caller_key| self.caller_launch_keys.contains_key(caller_key))
-        {
-            return Err(OperationIdentityError::IdentityConflict(format!(
-                "retained caller launch idempotency key of {} is already bound to different bytes",
-                retained.operation
-            )));
+        self.ensure_restored_identity_unbound(retained)?;
+        let retained_bytes = serde_json::to_vec(retained)
+            .map_err(|error| OperationIdentityError::Encoding(error.to_string()))?
+            .len();
+        self.ensure_issued_capacity(retained.operation.as_str(), retained_bytes)?;
+        let launch_lineage = self.restored_launch_lineage(retained)?;
+        let next_issued_bytes = self
+            .issued_bytes
+            .checked_add(retained_bytes)
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        // Complete every fallible lineage check and insertion before the
+        // spent-ID indexes change. A corrupt/conflicting lineage row must
+        // leave this issuer exactly as it was so restore can be retried.
+        if let Some(launch_lineage) = launch_lineage {
+            self.record_launch_lineage(launch_lineage)?;
         }
         if retained.schema_version == LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
             && retained.operation == AUTHORIZE_LAUNCH_OPERATION
@@ -578,7 +572,78 @@ impl OperationIdentityIssuer {
             );
         }
         self.issued.insert(key, retained.clone());
+        self.issued_bytes = next_issued_bytes;
         Ok(())
+    }
+
+    fn ensure_restored_identity_unbound(
+        &self,
+        retained: &DurableIssuedIdentity,
+    ) -> Result<(), OperationIdentityError> {
+        if self.by_request.contains_key(&retained.request_id)
+            || self.by_cancellation.contains_key(&retained.cancellation_id)
+            || self.by_idempotency.contains_key(&retained.idempotency_key)
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "retained request/cancellation/idempotency identity of {} is already bound to another operation",
+                retained.operation
+            )));
+        }
+        if retained
+            .caller_request_id
+            .as_deref()
+            .is_some_and(|caller| self.by_caller_request.contains_key(caller))
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "retained caller launch binding of {} is already bound to another launch",
+                retained.operation
+            )));
+        }
+        if retained
+            .caller_idempotency_key
+            .as_deref()
+            .is_some_and(|caller_key| self.caller_launch_keys.contains_key(caller_key))
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "retained caller launch idempotency key of {} is already bound to different bytes",
+                retained.operation
+            )));
+        }
+        Ok(())
+    }
+
+    fn restored_launch_lineage(
+        &self,
+        retained: &DurableIssuedIdentity,
+    ) -> Result<Option<LaunchLineageEntry>, OperationIdentityError> {
+        if retained.operation != AUTHORIZE_LAUNCH_OPERATION
+            || retained.schema_version != ISSUED_OPERATION_IDENTITY_VERSION
+        {
+            return Ok(None);
+        }
+        let caller_request_id = retained.caller_request_id.as_deref().ok_or_else(|| {
+            OperationIdentityError::InvalidIdentity(
+                "authorize-launch identity omitted its caller request id".to_owned(),
+            )
+        })?;
+        let caller_idempotency_key =
+            retained.caller_idempotency_key.as_deref().ok_or_else(|| {
+                OperationIdentityError::InvalidIdentity(
+                    "authorize-launch identity omitted its caller idempotency key".to_owned(),
+                )
+            })?;
+        self.ensure_launch_lineage_capacity(
+            caller_request_id,
+            &retained.request_id,
+            caller_idempotency_key,
+            &retained.canonical_digest,
+        )?;
+        Ok(Some(LaunchLineageEntry {
+            caller_request_id: caller_request_id.to_owned(),
+            authorize_request_id: retained.request_id.clone(),
+            authorize_idempotency_key: caller_idempotency_key.to_owned(),
+            canonical_digest: retained.canonical_digest.clone(),
+        }))
     }
 
     /// Returns the process/effect lineage log (grant to invocation digest).
@@ -586,6 +651,44 @@ impl OperationIdentityIssuer {
     #[must_use]
     pub(crate) fn process_lineage(&self) -> &[ProcessLineageEntry] {
         &self.process_lineage
+    }
+
+    /// Returns retained process/effect lineage in deterministic order.
+    #[must_use]
+    pub(crate) fn process_effect_lineage(&self) -> Vec<ProcessEffectLineage> {
+        self.process_lineage.clone()
+    }
+
+    /// Re-seeds one durable process/effect relation without replacing an
+    /// existing binding for the same caller and grant.
+    pub(crate) fn restore_process_effect_lineage(
+        &mut self,
+        retained: &ProcessEffectLineage,
+    ) -> Result<(), OperationIdentityError> {
+        validate_process_effect_lineage(retained)?;
+        if let Some(existing) = self.process_lineage.iter().find(|entry| {
+            entry.caller_request_id == retained.caller_request_id
+                && entry.grant_request_digest == retained.grant_request_digest
+        }) {
+            return if existing == retained {
+                Ok(())
+            } else {
+                Err(OperationIdentityError::IdentityConflict(
+                    "retained process lineage changed under the same caller and grant".to_owned(),
+                ))
+            };
+        }
+        let row_bytes = serde_json::to_vec(retained)
+            .map_err(|error| OperationIdentityError::Encoding(error.to_string()))?
+            .len();
+        self.ensure_process_lineage_capacity(row_bytes)?;
+        let next_process_lineage_bytes = self
+            .process_lineage_bytes
+            .checked_add(row_bytes)
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        self.process_lineage.push(retained.clone());
+        self.process_lineage_bytes = next_process_lineage_bytes;
+        Ok(())
     }
 
     /// Issues (or exactly retries) the register operation identity.
@@ -653,6 +756,17 @@ impl OperationIdentityIssuer {
                 "caller launch request id is already bound to another launch".to_owned(),
             ));
         }
+        if !self.ledger.contains_key(&caller_ledger_key)
+            && !self.issued.contains_key(&caller_ledger_key)
+        {
+            let request_id_budget = "ub-req-00000000000000000000000000000000";
+            self.ensure_launch_lineage_capacity(
+                caller_request_id,
+                request_id_budget,
+                caller_idempotency_key,
+                &canonical_digest,
+            )?;
+        }
         let link = CallerLink::launch(
             caller_request_id.to_owned(),
             caller_idempotency_key.to_owned(),
@@ -675,12 +789,12 @@ impl OperationIdentityIssuer {
                     issued.canonical_digest.clone(),
                 ),
             );
-            self.launch_lineage.push(LaunchLineageEntry {
+            self.record_launch_lineage(LaunchLineageEntry {
                 caller_request_id: caller_request_id.to_owned(),
                 authorize_request_id: issued.request_id.clone(),
                 authorize_idempotency_key: issued.identity.idempotency_key.clone(),
                 canonical_digest: issued.canonical_digest.clone(),
-            });
+            })?;
         }
         Ok(issued)
     }
@@ -796,10 +910,12 @@ impl OperationIdentityIssuer {
                 "caller launch idempotency key is already spent".to_owned(),
             ));
         }
+        let estimated_bytes =
+            self.estimate_new_identity_bytes(operation, idempotency_key, caller)?;
+        self.ensure_issued_capacity(operation.selector(), estimated_bytes)?;
         self.mint(
             key,
             operation,
-            payload,
             &canonical_digest,
             idempotency_key,
             now_unix_ms,
@@ -827,20 +943,223 @@ impl OperationIdentityIssuer {
         caller_request_id: &str,
         grant_request_digest: &str,
         process_request_digest: &str,
-        noted_at_ms: u64,
-    ) {
-        let _ = noted_at_ms;
+        _noted_at_ms: u64,
+    ) -> Result<(), OperationIdentityError> {
+        if caller_request_id.trim().is_empty()
+            || caller_request_id.chars().any(char::is_control)
+            || !is_lowercase_sha256(grant_request_digest)
+            || !is_lowercase_sha256(process_request_digest)
+        {
+            return Err(OperationIdentityError::InvalidIdentity(
+                "process lineage identity fields are invalid".to_owned(),
+            ));
+        }
         let authorize_request_id = self
             .by_caller_request
             .get(caller_request_id)
-            .and_then(|key| self.ledger.get(key))
-            .map(|entry| entry.request_id.clone());
-        self.process_lineage.push(ProcessLineageEntry {
-            caller_request_id: caller_request_id.to_owned(),
+            .and_then(|key| self.issued.get(key))
+            .map(|entry| entry.request_id.as_str());
+        if let Some(existing) = self.process_lineage.iter().find(|entry| {
+            entry.caller_request_id == caller_request_id
+                && entry.grant_request_digest == grant_request_digest
+        }) {
+            return if existing.authorize_request_id.as_deref() == authorize_request_id
+                && existing.process_request_digest == process_request_digest
+            {
+                Ok(())
+            } else {
+                Err(OperationIdentityError::IdentityConflict(
+                    "process invocation changed under the same caller and grant identity"
+                        .to_owned(),
+                ))
+            };
+        }
+        let estimated_bytes = estimate_process_lineage_bytes(
+            caller_request_id,
             authorize_request_id,
+            grant_request_digest,
+            process_request_digest,
+        )?;
+        self.ensure_process_lineage_capacity(estimated_bytes)?;
+        let entry = ProcessLineageEntry {
+            caller_request_id: caller_request_id.to_owned(),
+            authorize_request_id: authorize_request_id.map(str::to_owned),
             grant_request_digest: grant_request_digest.to_owned(),
             process_request_digest: process_request_digest.to_owned(),
-        });
+        };
+        validate_process_effect_lineage(&entry)?;
+        let row_bytes = serde_json::to_vec(&entry)
+            .map_err(|error| OperationIdentityError::Encoding(error.to_string()))?
+            .len();
+        self.ensure_process_lineage_capacity(row_bytes)?;
+        let next_process_lineage_bytes = self
+            .process_lineage_bytes
+            .checked_add(row_bytes)
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        self.process_lineage.push(entry);
+        self.process_lineage_bytes = next_process_lineage_bytes;
+        Ok(())
+    }
+
+    fn estimate_new_identity_bytes(
+        &self,
+        operation: BrokerOperation,
+        idempotency_key: &str,
+        caller: &CallerLink,
+    ) -> Result<usize, OperationIdentityError> {
+        let fence = self.current_fence.as_ref().ok_or_else(|| {
+            if self.binding_digest.is_none() {
+                OperationIdentityError::MissingBinding
+            } else {
+                OperationIdentityError::MissingFence
+            }
+        })?;
+        let fence_bytes = serde_json::to_vec(fence)
+            .map_err(|error| OperationIdentityError::Encoding(error.to_string()))?
+            .len();
+        let mut estimate = 2_048_usize
+            .checked_add(fence_bytes.saturating_mul(2))
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        for length in [
+            operation.selector().len(),
+            64,
+            "ub-req-".len() + 32,
+            idempotency_key.len(),
+            "ub-cancel-".len() + 32,
+            64,
+        ] {
+            estimate = estimate
+                .checked_add(json_string_upper_bound(length))
+                .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        }
+        for binding in [
+            caller.caller_request_id.as_deref(),
+            caller.caller_idempotency_key.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            estimate = estimate
+                .checked_add(json_string_upper_bound(binding.len()))
+                .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        }
+        Ok(estimate)
+    }
+
+    fn ensure_issued_capacity(
+        &self,
+        operation: &str,
+        row_bytes: usize,
+    ) -> Result<(), OperationIdentityError> {
+        let next_entries = self
+            .issued
+            .len()
+            .checked_add(1)
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        let next_bytes = self
+            .issued_bytes
+            .checked_add(row_bytes)
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        if next_entries > MAX_ISSUED_OPERATION_IDENTITIES
+            || next_bytes > MAX_ISSUED_OPERATION_IDENTITY_BYTES
+        {
+            return Err(OperationIdentityError::IdentityCapacityExceeded);
+        }
+        if operation != FENCE_OPERATION
+            && (next_entries
+                > MAX_ISSUED_OPERATION_IDENTITIES
+                    .saturating_sub(ISSUED_OPERATION_CONTROL_ENTRY_RESERVE)
+                || next_bytes
+                    > MAX_ISSUED_OPERATION_IDENTITY_BYTES
+                        .saturating_sub(ISSUED_OPERATION_CONTROL_BYTE_RESERVE))
+        {
+            return Err(OperationIdentityError::IdentityCapacityExceeded);
+        }
+        Ok(())
+    }
+
+    fn ensure_launch_lineage_capacity(
+        &self,
+        caller_request_id: &str,
+        authorize_request_id: &str,
+        authorize_idempotency_key: &str,
+        canonical_digest: &str,
+    ) -> Result<(), OperationIdentityError> {
+        if self.launch_lineage.len() >= MAX_ISSUED_OPERATION_IDENTITIES {
+            return Err(OperationIdentityError::IdentityCapacityExceeded);
+        }
+        let estimate = 256_usize
+            .checked_add(json_string_upper_bound(caller_request_id.len()))
+            .and_then(|total| {
+                total.checked_add(json_string_upper_bound(authorize_request_id.len()))
+            })
+            .and_then(|total| {
+                total.checked_add(json_string_upper_bound(authorize_idempotency_key.len()))
+            })
+            .and_then(|total| total.checked_add(json_string_upper_bound(canonical_digest.len())))
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        if self
+            .launch_lineage_bytes
+            .checked_add(estimate)
+            .is_none_or(|bytes| bytes > MAX_ISSUED_OPERATION_IDENTITY_BYTES)
+        {
+            return Err(OperationIdentityError::IdentityCapacityExceeded);
+        }
+        Ok(())
+    }
+
+    fn record_launch_lineage(
+        &mut self,
+        entry: LaunchLineageEntry,
+    ) -> Result<(), OperationIdentityError> {
+        for retained in &self.launch_lineage {
+            if retained.caller_request_id == entry.caller_request_id
+                || retained.authorize_request_id == entry.authorize_request_id
+            {
+                return if retained == &entry {
+                    Ok(())
+                } else {
+                    Err(OperationIdentityError::IdentityConflict(
+                        "launch lineage changed under the same caller or authorize identity"
+                            .to_owned(),
+                    ))
+                };
+            }
+        }
+        self.ensure_launch_lineage_capacity(
+            &entry.caller_request_id,
+            &entry.authorize_request_id,
+            &entry.authorize_idempotency_key,
+            &entry.canonical_digest,
+        )?;
+        let row_bytes = serde_json::to_vec(&entry)
+            .map_err(|error| OperationIdentityError::Encoding(error.to_string()))?
+            .len();
+        let next_bytes = self
+            .launch_lineage_bytes
+            .checked_add(row_bytes)
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+        if next_bytes > MAX_ISSUED_OPERATION_IDENTITY_BYTES {
+            return Err(OperationIdentityError::IdentityCapacityExceeded);
+        }
+        self.launch_lineage.push(entry);
+        self.launch_lineage_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn ensure_process_lineage_capacity(
+        &self,
+        row_bytes: usize,
+    ) -> Result<(), OperationIdentityError> {
+        if self.process_lineage.len() >= MAX_PROCESS_EFFECT_LINEAGE_ENTRIES
+            || self
+                .process_lineage_bytes
+                .checked_add(row_bytes)
+                .is_none_or(|bytes| bytes > MAX_PROCESS_EFFECT_LINEAGE_BYTES)
+        {
+            return Err(OperationIdentityError::IdentityCapacityExceeded);
+        }
+        Ok(())
     }
 
     fn issue(
@@ -873,18 +1192,15 @@ impl OperationIdentityIssuer {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn mint(
         &mut self,
         key: LedgerKey,
         operation: BrokerOperation,
-        payload: &Value,
         canonical_digest: &str,
         idempotency_key: &str,
         now_unix_ms: u64,
         caller: &CallerLink,
     ) -> Result<IssuedIdentity, OperationIdentityError> {
-        let _ = payload;
         let caller_request_id = caller.caller_request_id.clone();
         let caller_idempotency_key = caller.caller_idempotency_key.clone();
         let fence = self.current_fence.clone().ok_or_else(|| {
@@ -901,17 +1217,7 @@ impl OperationIdentityIssuer {
             .checked_add(OPERATION_IDENTITY_TTL_MS)
             .filter(|deadline| *deadline > now_unix_ms)
             .ok_or(OperationIdentityError::InvalidClock)?;
-        if let Some(owner) = self.by_idempotency.get(idempotency_key) {
-            let reason = if owner == &key {
-                "idempotency key is already spent by a historical identity"
-            } else {
-                "idempotency key is already bound to different canonical bytes"
-            };
-            return Err(OperationIdentityError::IdentityConflict(format!(
-                "{reason}: {}",
-                owner.0,
-            )));
-        }
+        self.ensure_mint_idempotency_available(&key, idempotency_key)?;
         for _ in 0..IDENTITY_REGENERATION_LIMIT {
             let request_id = format!("ub-req-{}", uuid::Uuid::new_v4().simple());
             let cancellation_id = format!("ub-cancel-{}", uuid::Uuid::new_v4().simple());
@@ -944,6 +1250,14 @@ impl OperationIdentityIssuer {
                 caller_idempotency_key: caller_idempotency_key.clone(),
             };
             validate_retained_identity(&issued)?;
+            let row_bytes = serde_json::to_vec(&issued)
+                .map_err(|error| OperationIdentityError::Encoding(error.to_string()))?
+                .len();
+            self.ensure_issued_capacity(operation.selector(), row_bytes)?;
+            let next_issued_bytes = self
+                .issued_bytes
+                .checked_add(row_bytes)
+                .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
             self.by_idempotency
                 .insert(idempotency_key.to_owned(), key.clone());
             self.by_request.insert(request_id.clone(), key.clone());
@@ -967,6 +1281,7 @@ impl OperationIdentityIssuer {
                 },
             );
             self.issued.insert(key, issued);
+            self.issued_bytes = next_issued_bytes;
             return Ok(IssuedIdentity {
                 identity,
                 operation,
@@ -977,6 +1292,72 @@ impl OperationIdentityIssuer {
         }
         Err(OperationIdentityError::IdentityExhausted)
     }
+
+    fn ensure_mint_idempotency_available(
+        &self,
+        key: &LedgerKey,
+        idempotency_key: &str,
+    ) -> Result<(), OperationIdentityError> {
+        let Some(owner) = self.by_idempotency.get(idempotency_key) else {
+            return Ok(());
+        };
+        let reason = if owner == key {
+            "idempotency key is already spent by a historical identity"
+        } else {
+            "idempotency key is already bound to different canonical bytes"
+        };
+        Err(OperationIdentityError::IdentityConflict(format!(
+            "{reason}: {}",
+            owner.0,
+        )))
+    }
+}
+
+fn validate_process_effect_lineage(
+    relation: &ProcessEffectLineage,
+) -> Result<(), OperationIdentityError> {
+    if relation.caller_request_id.trim().is_empty()
+        || relation.caller_request_id.chars().any(char::is_control)
+        || relation
+            .authorize_request_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        || !is_lowercase_sha256(&relation.grant_request_digest)
+        || !is_lowercase_sha256(&relation.process_request_digest)
+    {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained process lineage row is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn estimate_process_lineage_bytes(
+    caller_request_id: &str,
+    authorize_request_id: Option<&str>,
+    grant_request_digest: &str,
+    process_request_digest: &str,
+) -> Result<usize, OperationIdentityError> {
+    let mut estimate = 256_usize;
+    for length in [
+        caller_request_id.len(),
+        grant_request_digest.len(),
+        process_request_digest.len(),
+    ] {
+        estimate = estimate
+            .checked_add(json_string_upper_bound(length))
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+    }
+    if let Some(authorize_request_id) = authorize_request_id {
+        estimate = estimate
+            .checked_add(json_string_upper_bound(authorize_request_id.len()))
+            .ok_or(OperationIdentityError::IdentityCapacityExceeded)?;
+    }
+    Ok(estimate)
+}
+
+fn json_string_upper_bound(text_bytes: usize) -> usize {
+    text_bytes.saturating_mul(6).saturating_add(2)
 }
 
 impl IssuedIdentity {
@@ -1602,12 +1983,14 @@ mod tests {
                 NOW,
             )
             .expect("launch identity");
-        issuer.note_process_effect(
-            "caller-req-lineage",
-            "grant-digest-1",
-            "process-invocation-digest-1",
-            NOW + 10,
-        );
+        issuer
+            .note_process_effect(
+                "caller-req-lineage",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                NOW + 10,
+            )
+            .expect("valid process lineage observation");
         let lineage = issuer.launch_lineage();
         assert_eq!(lineage.len(), 1);
         assert_eq!(lineage[0].caller_request_id, "caller-req-lineage");
@@ -1624,7 +2007,7 @@ mod tests {
         );
         assert_eq!(
             effects[0].process_request_digest,
-            "process-invocation-digest-1"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert_ne!(
             effects[0].process_request_digest, authorization.request_id,
