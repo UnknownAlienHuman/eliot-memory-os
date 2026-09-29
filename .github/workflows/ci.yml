@@ -83,25 +83,36 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-profile-mergecompile-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', 'scripts/verify.ps1', '.github/workflows/ci.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml', 'workspace/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
           lookup-only: ${{ github.event.pull_request.head.repo.fork == true }}
 
-      # Clean-runner dependency-policy preparation (issues #3004/#1229/#1225):
-      # invoke #1229's input preparation on the clean runner before the
-      # read-only offline profile. The project-local Surreal provisioner
-      # materializes the approved evidence; locked prefetch warms exactly the
-      # pinned dependencies. This step records PREPARE_* outcomes and never
-      # writes locks, receipts, or verdicts: missing or substituted inputs
-      # fail the MergeCompile gate below with its own findings. Nothing here
+      # Clean-runner dependency-policy preparation (issues #3004/#1229/#1225,
+      # external audits 5887267578 / 5885520490(d)):
+      # invoke #1229's one declared preparation entrypoint on the clean runner
+      # before the read-only offline gate, exactly as
+      # scripts/verify-dependency-policy.py names it (PREPARATION_ENTRYPOINT,
+      # line 3769) and for the profile that gate actually runs (offline-source,
+      # scripts/verify.ps1 line 72). That entrypoint owns discovery of the
+      # pinned scanner identity, of the project-local Surreal provisioner, and
+      # of the standalone resolver inputs; this file no longer re-implements
+      # that discovery and no longer declines a leg. The only operations kept
+      # here are the two the owner deliberately does not perform: installing
+      # the exact pinned scanner, and fetching the root lock's selected
+      # dependency bytes. Preparation writes no lock, no receipt and no
+      # verdict - it records a PREPARE_* marker plus a step-summary line for
+      # every declared input, and a nonzero owner exit keeps the read-only
+      # offline gate failed, because that gate owns the verdict. Nothing here
       # converts a failed policy into PASS or fabricates evidence.
       - name: Prepare dependency-policy inputs
         shell: pwsh
         run: |
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Dependency-policy input preparation'
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Owner interfaces only: the exact pinned scanner provisioner, scripts/provision-surrealdb-release.py, and locked cargo prefetch; no lock/receipt writes, no verdict'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Owner entrypoint scripts/prepare-dependency-policy-inputs.py (profile offline-source) owns the pinned scanner identity, scripts/provision-surrealdb-release.py and the standalone resolver inputs. This step adds only the exact pinned scanner install and the root locked prefetch; it writes no lock, no receipt and no verdict'
           # The dependency-policy gate resolves its scanner through PATH and
           # admits only digest-matched bytes, so a clean runner must
           # materialize the exact identity declared in
           # config/dependency-policy.toml rather than install a latest
-          # cargo-deny. A nonzero exit here keeps the gate failed; the
-          # provisioner provisions inputs and never writes a verdict.
+          # cargo-deny. The preparation owner verifies that identity and
+          # never installs a tool, so this provisioning call stays ahead of
+          # it. A nonzero exit here keeps the gate failed; the provisioner
+          # provisions inputs and never writes a verdict.
           $scannerJson = python scripts/provision-dependency-scanner.py --root .
           $scannerExit = $LASTEXITCODE
           if ($scannerExit -ne 0) {
@@ -115,39 +126,38 @@ jobs:
           $scannerDirectory = Join-Path $env:GITHUB_WORKSPACE $scanner.install_directory
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $scannerDirectory
           $env:PATH = $scannerDirectory + [IO.Path]::PathSeparator + $env:PATH
-          python scripts/provision-surrealdb-release.py --root .
-          $surrealPrepareExit = $LASTEXITCODE
-          Write-Host "PREPARE_SURREAL_PROVISIONER: exit=$surrealPrepareExit"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Surreal provisioner exit=$surrealPrepareExit (nonzero keeps the offline gate failed; the gate owns the verdict)"
+          $preparationManifest = '.eliot/dependency-policy-preparation.json'
+          $preparationOutput = @(& python scripts/prepare-dependency-policy-inputs.py --root . --profile offline-source --manifest-out $preparationManifest 2>&1)
+          $preparationExit = $LASTEXITCODE
+          foreach ($preparationLine in $preparationOutput) { Write-Host $preparationLine }
+          Write-Host "PREPARE_DEPENDENCY_POLICY_INPUTS: exit=$preparationExit"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Owner preparation exit=$preparationExit (nonzero keeps the offline gate failed; the gate owns the verdict and reports the same inputs)"
+          $preparation = $null
+          if (Test-Path -LiteralPath $preparationManifest -PathType Leaf) {
+            $preparation = Get-Content -LiteralPath $preparationManifest -Raw | ConvertFrom-Json
+          }
+          if ($null -eq $preparation) {
+            Write-Host "PREPARE_PREPARATION_MANIFEST: absent=$preparationManifest"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Owner preparation manifest absent at $preparationManifest; the read-only offline gate keeps the failed result failed and names the missing inputs itself"
+          } else {
+            foreach ($inputRecord in @($preparation.inputs)) {
+              Write-Host "PREPARE_INPUT: $($inputRecord.input) status=$($inputRecord.status) scope=$($inputRecord.evidence_scope) detail=$($inputRecord.detail)"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Input $($inputRecord.input): $($inputRecord.status) ($($inputRecord.evidence_scope))"
+            }
+            $missingInputs = @($preparation.missing_inputs | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+            if ($missingInputs.Count -eq 0) {
+              Write-Host "PREPARE_MISSING_INPUTS: none"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Missing required preparation inputs: none'
+            } else {
+              Write-Host "PREPARE_MISSING_INPUTS: $($missingInputs -join ', ')"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Missing required preparation inputs: $($missingInputs -join ', ') (the owner materializes nothing it does not own; the read-only offline gate below reports these same inputs and owns the verdict)"
+            }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Preparation manifest: $preparationManifest (per-input and per-standalone-workspace detail; ignored local input, never a PASS receipt)"
+          }
           cargo fetch --locked
           $rootFetchExit = $LASTEXITCODE
           Write-Host "PREPARE_ROOT_FETCH_LOCKED: exit=$rootFetchExit"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Root cargo fetch --locked exit=$rootFetchExit"
-          $standaloneList = @(& python scripts/verify-standalone-crates.py --root . --list 2>&1)
-          $standaloneListExit = $LASTEXITCODE
-          $standaloneCount = @($standaloneList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
-          Write-Host "PREPARE_STANDALONE_DISCOVERY: exit=$standaloneListExit count=$standaloneCount"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone discovery exit=$standaloneListExit count=$standaloneCount (prefetch only where an accepted adjacent lock exists)"
-          foreach ($standaloneLine in $standaloneList) {
-            $relativeDirectory = ([string]$standaloneLine).Trim()
-            if ([string]::IsNullOrWhiteSpace($relativeDirectory)) { continue }
-            if ($relativeDirectory.StartsWith('exclude: ', [StringComparison]::Ordinal)) {
-              Write-Host "PREPARE_STANDALONE_SKIPPED: $relativeDirectory reason=excluded leg is compiled by the gate from workspace discovery"
-              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone skipped: $relativeDirectory (excluded leg; gate-owned)"
-              continue
-            }
-            $manifestPath = "$relativeDirectory/Cargo.toml"
-            $lockPath = "$relativeDirectory/Cargo.lock"
-            if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
-              Write-Host "PREPARE_STANDALONE_SKIPPED: $relativeDirectory reason=no accepted adjacent lock; standalone lock contract owned by #1229; offline gate reports source_only_incomplete"
-              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone skipped: $relativeDirectory (no accepted adjacent lock; #1229-owned)"
-              continue
-            }
-            cargo fetch --locked --manifest-path $manifestPath
-            $standaloneFetchExit = $LASTEXITCODE
-            Write-Host "PREPARE_STANDALONE_FETCH: $relativeDirectory exit=$standaloneFetchExit"
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone prefetch: $relativeDirectory exit=$standaloneFetchExit"
-          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Root cargo fetch --locked exit=$rootFetchExit (prepares the root resolution only; standalone resolution inputs are declared by the owner above)"
 
       - name: Bind integration candidate identity
         shell: pwsh
