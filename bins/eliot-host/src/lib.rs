@@ -6192,7 +6192,15 @@ impl HostComposition {
         // is returned exactly as its owner observation produced it, so this
         // read model can never restate a retained unknown as progress (#2737).
         if committed.disposition != CutoverDisposition::Committed {
-            host_terminal.disarm();
+            // #983 R1: an unresolved execute outcome is returned exactly as
+            // its owner observation produced it, and a `Failed` one is a
+            // failure of THIS operation that still owes the terminal record
+            // its own armed boundary owns. Disarming on the `Ok` alone
+            // retired the guard for a failed cutover and emitted nothing.
+            // The guard stays armed only for the owner's own failure word.
+            if !crate::backup_cutover::cutover_disposition_reports_failure(committed.disposition) {
+                host_terminal.disarm();
+            }
             return Ok((committed, barrier));
         }
         // The registry and the journal are separate owners with no shared
@@ -6291,7 +6299,15 @@ impl HostComposition {
         // more, and the barrier still has to be presented to the separately
         // authorized `backup_dispatch_cutover_retire` step before any prior
         // generation is retired.
-        host_terminal.disarm();
+        //
+        // #983 R1: the reconcile projection is the OWNER's own read model, and
+        // it can return a `Failed` disposition for a commit this port's
+        // registry flip produced. The operation therefore failed and still
+        // owes its single terminal record; the returned disposition, the
+        // barrier and every owner read are unchanged by this decision.
+        if !crate::backup_cutover::cutover_disposition_reports_failure(reconciled.disposition) {
+            host_terminal.disarm();
+        }
         Ok((reconciled, barrier))
     }
 
@@ -6350,7 +6366,16 @@ impl HostComposition {
             &readback,
             retirement_receipt,
         )?;
-        host_terminal.disarm();
+        // #983 R1: this read returning `Ok` says the READ succeeded, not that
+        // the cutover it reports on did. When the owners' own projection
+        // resolves this operation to `Failed`, the disposition read operation
+        // has failed BY DISPOSITION and owes the terminal record its own armed
+        // boundary owns. `Unknown` and every progress/settlement word still
+        // disarm: preserved uncertainty is not a failure (I14.21), and the
+        // read's result, order and owner state are untouched either way.
+        if !crate::backup_cutover::cutover_disposition_reports_failure(outcome.disposition) {
+            host_terminal.disarm();
+        }
         Ok(outcome)
     }
 
@@ -6426,7 +6451,15 @@ impl HostComposition {
             barrier,
             retirement_authorization,
         )?;
-        host_terminal.disarm();
+        // #983 R1: the same disposition rule as the two sibling cutover
+        // boundaries. `retire_authorized_generation` returns `Ok` for a
+        // bounded `Unknown` retirement state, and a `Failed` word from the
+        // shared owner read model would be a failure of THIS operation, so
+        // the guard stays armed exactly for the owner's failure word and
+        // disarms for every other one.
+        if !crate::backup_cutover::cutover_disposition_reports_failure(retired.disposition) {
+            host_terminal.disarm();
+        }
         Ok(retired)
     }
 
