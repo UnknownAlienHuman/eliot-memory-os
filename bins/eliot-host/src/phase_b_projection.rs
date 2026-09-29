@@ -6,8 +6,9 @@ use super::{
     ActivePhaseBRebindIntent, AuthoritySnapshotBindingWire, CandidateManifest,
     CredentialAccessReceipt, DispatchAuthorityId, EpochIdentity, EpochLineage, HostError,
     HostInstallationEpoch, HostPhaseBMaterialization, HostPhaseBMaterializationIntent,
-    HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt, LOCAL_SERVICE_SID, OpaqueLabel,
-    OperationIdentity, OrsEpochIdentity, PhaseBLiveBinding, PlatformHandle,
+    HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt, InstallationProfile,
+    LOCAL_SERVICE_SID, OpaqueLabel, OperationIdentity, OrsEpochIdentity, PhaseBLiveBinding,
+    PlatformHandle,
     ProcessAuthorityHandoffDescriptor, ProvisionedSupervisionAuthority, RuntimeLaunchDescriptor,
     SecretReference, Sha256, StateFence, StateFenceSnapshot, StoreCredentialProvider,
     StoreCredentialScope, host_owner_epoch_digest, installation_phase_b_credential_receipt_digest,
@@ -113,24 +114,68 @@ pub(super) fn validate_phase_b_credential_receipt(
     receipt: &CredentialAccessReceipt,
     manifest: &CandidateManifest,
     intent: &HostPhaseBMaterializationIntent,
+    selected_owner_sid: Option<&str>,
 ) -> Result<(), HostError> {
     phase_b_projection_observe("host.phase-b projection requested");
     receipt.validate().map_err(|error| {
         phase_b_projection_observe("host.phase-b projection mismatch retained");
         HostError::RecoveryRequired(error.to_string())
     })?;
+    let profile_credential_matches = match manifest.runtime_launch.profile {
+        InstallationProfile::SystemService | InstallationProfile::PortableDev => {
+            selected_owner_sid.is_none()
+                && receipt.scope == StoreCredentialScope::LocalService
+                && receipt.principal_sid.as_str() == LOCAL_SERVICE_SID
+        }
+        InstallationProfile::UserMode => {
+            let selected_owner_sid = selected_owner_sid.ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B UserMode profile owner selection is not retained by Host".to_owned(),
+                )
+            })?;
+            // The descriptor's admitted Host state root is a retained
+            // current-user object for UserMode. Re-open it under the live Host
+            // token so the receipt SID is checked against both the actual
+            // owner and the original retained profile selection, not accepted
+            // from the receipt's own claim.
+            let host_state_root = std::path::Path::new(
+                manifest
+                    .runtime_launch
+                    .runtime_state_roots
+                    .host_state_root
+                    .as_str(),
+            );
+            let root = eliot_platform_windows::UserOwnedRootLease::open_existing(host_state_root)
+                .map_err(|_| {
+                    HostError::RecoveryRequired(
+                        "Phase-B UserMode Host state root is not owned by the current user"
+                            .to_owned(),
+                    )
+                })?;
+            root.verify_stable_identity().map_err(|_| {
+                HostError::RecoveryRequired(
+                    "Phase-B UserMode Host state root identity changed".to_owned(),
+                )
+            })?;
+            let current_user_sid = root.current_user_sid();
+            receipt.scope == StoreCredentialScope::CurrentUser
+                && current_user_sid != LOCAL_SERVICE_SID
+                && current_user_sid == selected_owner_sid
+                && receipt.principal_sid.as_str() == current_user_sid
+        }
+    };
+
     if receipt.transaction_id != intent.transaction_id
         || receipt.effect_id != intent.credential_effect_id
         || receipt.generation != manifest.runtime_launch.authority_generation
         || receipt.config_digest != manifest.config_digest
         || receipt.target != manifest.runtime_launch.store_credential_target
         || receipt.provider != StoreCredentialProvider::WindowsCredentialManager
-        || receipt.scope != StoreCredentialScope::LocalService
-        || receipt.principal_sid.as_str() != LOCAL_SERVICE_SID
+        || !profile_credential_matches
     {
         phase_b_projection_observe("host.phase-b projection mismatch retained");
         return Err(HostError::RecoveryRequired(
-            "Phase-B credential receipt is not the exact LocalService receipt for the candidate"
+            "Phase-B credential receipt does not match the candidate profile and transaction"
                 .to_owned(),
         ));
     }

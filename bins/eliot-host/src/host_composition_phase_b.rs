@@ -228,6 +228,94 @@ fn phase_b_observe_bound(observation: &PhaseBObservation) {
 }
 
 impl HostComposition {
+    /// Validates a Phase-B credential receipt against the Host's retained
+    /// profile selection before any operation can publish or reconcile its
+    /// live descriptors. UserMode rechecks every admitted root and binds the
+    /// receipt principal to the original selected owner SID.
+    #[cfg(windows)]
+    pub(super) fn validate_phase_b_credential_receipt_for_profile(
+        &self,
+        receipt: &CredentialAccessReceipt,
+        manifest: &CandidateManifest,
+        intent: &HostPhaseBMaterializationIntent,
+    ) -> Result<(), HostError> {
+        let selected_owner_sid = match manifest.runtime_launch.profile {
+            InstallationProfile::UserMode => {
+                #[cfg(not(test))]
+                {
+                    let retained = self.profile_root_leases.as_ref().ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Phase-B UserMode profile roots are not retained by Host".to_owned(),
+                        )
+                    })?;
+                    retained.verify_stable_identity().map_err(|_| {
+                        HostError::RecoveryRequired(
+                            "Phase-B UserMode profile root identity changed".to_owned(),
+                        )
+                    })?;
+                    let selection = retained.selection();
+                    let launch = &manifest.runtime_launch;
+                    if selection.profile
+                        != eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+                        || selection.installation_id
+                            != launch.installation_epoch.installation.as_str()
+                        || selection.installation_key.as_deref()
+                            != launch
+                                .profile_installation_key
+                                .as_ref()
+                                .map(|key| key.as_str())
+                        || selection.component != launch.profile_component.as_str()
+                        || selection.version != launch.profile_version.as_str()
+                        || selection.generation != launch.generation.as_str()
+                        || selection.authority_descriptor_path
+                            != Path::new(launch.authority_descriptor_path.as_str())
+                        || selection.authority_descriptor_sha256
+                            != launch.authority_descriptor_digest.as_str()
+                        || selection.authority_generation != launch.authority_generation.value()
+                        || selection.owner_sid == LOCAL_SERVICE_SID
+                    {
+                        return Err(HostError::RecoveryRequired(
+                            "Phase-B UserMode profile selection does not match the candidate"
+                                .to_owned(),
+                        ));
+                    }
+                    let request = super::host_job_launch::profile_root_request(launch)?;
+                    let observed_selection =
+                        eliot_platform_windows::profile_supervision::validate_profile_roots(
+                            &request,
+                        )
+                        .map_err(|_| {
+                            HostError::RecoveryRequired(
+                                "Phase-B UserMode profile roots no longer match their admission"
+                                    .to_owned(),
+                            )
+                        })?;
+                    if &observed_selection != selection {
+                        return Err(HostError::RecoveryRequired(
+                            "Phase-B UserMode profile root identities changed".to_owned(),
+                        ));
+                    }
+                    Some(selection.owner_sid.as_str())
+                }
+                #[cfg(test)]
+                {
+                    // Test compositions do not retain the production root
+                    // selection; the projection validator therefore fails
+                    // closed for UserMode.
+                    None
+                }
+            }
+            InstallationProfile::SystemService | InstallationProfile::PortableDev => None,
+        };
+
+        super::validate_phase_b_credential_receipt(
+            receipt,
+            manifest,
+            intent,
+            selected_owner_sid,
+        )
+    }
+
     /// Materializes the Host-owned Phase-B authority, Store bootstrap, and
     /// dynamic launch descriptors for one already-approved generation.
     ///
