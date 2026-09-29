@@ -5,15 +5,18 @@
 
 #![cfg(windows)]
 
+use sha2::{Digest as _, Sha256};
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
+use std::marker::PhantomData;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -23,11 +26,12 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER,
     ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_SHARING_VIOLATION, FILETIME,
     GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
-    SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    SetHandleInformation, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW,
@@ -67,12 +71,12 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeClientProcessId};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    QueryFullProcessImageNameW, ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
@@ -83,6 +87,8 @@ const MAX_PROCESS_IMAGE_CHARS: usize = 32_768;
 /// fits the Windows 32_767-character limit; anything larger would expand a
 /// corrupt `OsStr` into an unbounded allocation, so it fails closed.
 const MAX_WIDE_UNITS_INCL_NUL: usize = 32_768;
+const INSTALLATION_ROOT_MUTEX_NAME_PREFIX: &str = "Global\\Eliot-Installation-Root-v1-";
+const INSTALLATION_ROOT_MUTEX_WAIT_TIMEOUT_MS: u32 = 5_000;
 const MAX_JOB_PROCESS_IDS: usize = 4_096;
 const JOB_COMPLETION_KEY: usize = 0x454c_494f;
 const JOB_OBSERVER_SHUTDOWN_KEY: usize = 0x454e_4421;
@@ -92,6 +98,263 @@ const JOB_OBSERVER_POLL_TIMEOUT_MS: u32 = 10;
 static LEGACY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
 const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
+
+/// A process-wide Windows mutex protecting one approved installation root.
+///
+/// The fields and constructor remain private so callers can only obtain a live
+/// guard through [`acquire_installation_root_lock`]. The guard is thread-affine
+/// because Windows mutex ownership belongs to the thread that acquired it.
+/// Hold it only around bounded local I/O and delivery-state revalidation; do
+/// not perform guest execution, RPC, output, waits, or async work while held.
+#[must_use = "the installation-root lock is held only while its guard is alive"]
+pub struct InstallationRootLockGuard {
+    handle: HANDLE,
+    _thread_affine: PhantomData<Rc<()>>,
+}
+
+/// Failure to resolve the approved root or acquire its cross-process mutex.
+#[derive(Debug)]
+pub enum InstallationRootLockError {
+    /// The supplied root could not be canonicalized.
+    CanonicalizeRoot(io::Error),
+    /// The supplied root is relative and would depend on current-directory state.
+    RelativeRoot,
+    /// The canonical root does not identify a directory.
+    RootNotDirectory,
+    /// The canonical root path cannot be represented as valid UTF-16 text.
+    InvalidRootEncoding,
+    /// The canonical mutex name could not be converted to a Win32 string.
+    InvalidMutexName(io::Error),
+    /// Win32 could not create or open the root mutex with the current-user ACL.
+    CreateMutex(io::Error),
+    /// The opened root mutex does not have the expected current-user/system DACL.
+    InvalidMutexSecurity(io::Error),
+    /// Win32 failed while waiting for the root mutex.
+    WaitForMutex(io::Error),
+    /// The root mutex remained owned past the bounded acquisition window.
+    TimedOut,
+    /// Win32 returned an unrecognized result for the root mutex wait.
+    UnexpectedWaitResult(u32),
+}
+
+impl std::fmt::Display for InstallationRootLockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CanonicalizeRoot(error) => {
+                write!(formatter, "canonicalize installation root: {error}")
+            }
+            Self::RelativeRoot => {
+                formatter.write_str("installation root must be an absolute approved path")
+            }
+            Self::RootNotDirectory => {
+                formatter.write_str("installation root is not an existing directory")
+            }
+            Self::InvalidRootEncoding => {
+                formatter.write_str("installation root path is not valid UTF-16")
+            }
+            Self::InvalidMutexName(error) => {
+                write!(formatter, "encode installation root mutex name: {error}")
+            }
+            Self::CreateMutex(error) => {
+                write!(formatter, "create or open installation root mutex: {error}")
+            }
+            Self::InvalidMutexSecurity(error) => {
+                write!(
+                    formatter,
+                    "installation root mutex security is invalid: {error}"
+                )
+            }
+            Self::WaitForMutex(error) => {
+                write!(formatter, "wait for installation root mutex: {error}")
+            }
+            Self::TimedOut => formatter.write_str(
+                "installation root mutex was not acquired before the bounded wait expired",
+            ),
+            Self::UnexpectedWaitResult(result) => write!(
+                formatter,
+                "installation root mutex wait returned unexpected Win32 result {result}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InstallationRootLockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CanonicalizeRoot(error)
+            | Self::InvalidMutexName(error)
+            | Self::CreateMutex(error)
+            | Self::InvalidMutexSecurity(error)
+            | Self::WaitForMutex(error) => Some(error),
+            Self::RelativeRoot
+            | Self::RootNotDirectory
+            | Self::InvalidRootEncoding
+            | Self::TimedOut
+            | Self::UnexpectedWaitResult(_) => None,
+        }
+    }
+}
+
+/// Acquires the single cross-process lock for one approved installation root.
+///
+/// `root` must be the caller-approved absolute installation root. The named
+/// mutex identity is `Global\\Eliot-Installation-Root-v1-` followed by the
+/// lowercase hexadecimal SHA-256 digest of the canonical root path,
+/// lowercased with Rust Unicode casing. Kernel and host callers therefore
+/// rendezvous on the same machine-wide object for the same filesystem root.
+/// Its DACL grants access only to the creating process's token user and
+/// `LocalSystem`; access failures are rejected.
+///
+/// `WAIT_ABANDONED` is returned as an acquired guard because Windows proves
+/// that the previous owner thread terminated. The caller must still re-read
+/// the authoritative delivery state and manifest under this guard before any
+/// publication, claim, marker transition, or reclamation. Abandonment does
+/// not itself acknowledge, retire, or reclaim a delivery.
+///
+/// # Errors
+///
+/// Returns an error if `root` cannot be canonicalized as an existing
+/// directory, if the protected mutex cannot be created/opened, or if Win32
+/// cannot acquire the mutex within the bounded five-second wait. A timeout
+/// never steals, bypasses, or changes an existing owner's claim.
+pub fn acquire_installation_root_lock(
+    root: &Path,
+) -> Result<InstallationRootLockGuard, InstallationRootLockError> {
+    let name = installation_root_mutex_name(root)?;
+    let wide_name = nul_terminated_wide(OsStr::new(&name))
+        .map_err(InstallationRootLockError::InvalidMutexName)?;
+    let sid = current_process_token_sid().map_err(InstallationRootLockError::CreateMutex)?;
+    let descriptor = SecurityDescriptor::for_current_user(&sid)
+        .map_err(InstallationRootLockError::CreateMutex)?;
+    let name_length = u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).map_err(|_| {
+        InstallationRootLockError::CreateMutex(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SECURITY_ATTRIBUTES size does not fit u32",
+        ))
+    })?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: name_length,
+        lpSecurityDescriptor: descriptor.raw,
+        bInheritHandle: 0,
+    };
+
+    // SAFETY: the name, security descriptor, and attributes remain live for
+    // the complete call; the returned handle is transferred to this guard.
+    let handle = unsafe { CreateMutexW(&raw const attributes, 0, wide_name.as_ptr()) };
+    if handle.is_null() {
+        return Err(InstallationRootLockError::CreateMutex(
+            io::Error::last_os_error(),
+        ));
+    }
+
+    // SECURITY_ATTRIBUTES apply only when CreateMutexW creates the object;
+    // they are ignored when the name already exists. Verify the object we
+    // actually opened before waiting on it so a pre-created permissive
+    // Global mutex cannot silently join the installation lock protocol.
+    if let Err(error) = verify_installation_mutex_security(handle, &sid) {
+        // SAFETY: this frame owns the valid handle returned by CreateMutexW,
+        // and no guard is constructed when its security contour is rejected.
+        unsafe { CloseHandle(handle) };
+        return Err(InstallationRootLockError::InvalidMutexSecurity(error));
+    }
+
+    // The bounded wait prevents a contended local filesystem transaction
+    // from parking an async runtime worker indefinitely. Timeout fails
+    // closed; it never substitutes a stale-PID observation for ownership.
+    // SAFETY: `handle` is a live mutex handle returned by CreateMutexW and
+    // remains owned by this frame until the acquired guard is returned.
+    let wait_result =
+        unsafe { WaitForSingleObject(handle, INSTALLATION_ROOT_MUTEX_WAIT_TIMEOUT_MS) };
+    if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
+        return Ok(InstallationRootLockGuard {
+            handle,
+            _thread_affine: PhantomData,
+        });
+    }
+
+    let error = match wait_result {
+        WAIT_TIMEOUT => InstallationRootLockError::TimedOut,
+        WAIT_FAILED => InstallationRootLockError::WaitForMutex(io::Error::last_os_error()),
+        unexpected => InstallationRootLockError::UnexpectedWaitResult(unexpected),
+    };
+    // SAFETY: this frame owns the valid handle returned by CreateMutexW, and
+    // the wait result did not transfer mutex ownership to the current thread.
+    unsafe { CloseHandle(handle) };
+    Err(error)
+}
+
+fn verify_installation_mutex_security(handle: HANDLE, expected_owner: &str) -> io::Result<()> {
+    let mut owner: PSID = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `handle` is a live mutex handle returned by CreateMutexW; the
+    // output pointers are live stack slots. On success, Windows allocates a
+    // descriptor that this function frees exactly once below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            ptr::null_mut(),
+            &raw mut dacl,
+            ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(status_to_error(status));
+    }
+    if descriptor.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "installation root mutex security query returned no descriptor",
+        ));
+    }
+    let verdict = verify_transport_file_descriptor(descriptor, dacl, expected_owner);
+    // SAFETY: GetSecurityInfo allocated this descriptor and no other owner
+    // receives it; it is freed exactly once after all borrowed SIDs/ACLs.
+    unsafe { LocalFree(descriptor.cast()) };
+    verdict
+}
+
+fn installation_root_mutex_name(root: &Path) -> Result<String, InstallationRootLockError> {
+    if !root.is_absolute() {
+        return Err(InstallationRootLockError::RelativeRoot);
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(InstallationRootLockError::CanonicalizeRoot)?;
+    if !canonical_root.is_dir() {
+        return Err(InstallationRootLockError::RootNotDirectory);
+    }
+    let canonical_units = canonical_root.as_os_str().encode_wide().collect::<Vec<_>>();
+    let canonical_text = String::from_utf16(&canonical_units)
+        .map_err(|_| InstallationRootLockError::InvalidRootEncoding)?;
+    let normalized_root = canonical_text.to_lowercase();
+    let digest = Sha256::digest(normalized_root.as_bytes());
+    let mut suffix = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    Ok(format!("{INSTALLATION_ROOT_MUTEX_NAME_PREFIX}{suffix}"))
+}
+
+impl Drop for InstallationRootLockGuard {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        // SAFETY: this guard can only be constructed after WAIT_OBJECT_0 or
+        // WAIT_ABANDONED transferred ownership to this thread; the handle
+        // remains live until the following CloseHandle.
+        unsafe { ReleaseMutex(self.handle) };
+        // SAFETY: this guard owns the live CreateMutexW handle exactly once.
+        unsafe { CloseHandle(self.handle) };
+        self.handle = ptr::null_mut();
+    }
+}
 
 /// Typed outcome of one asynchronous Windows I/O operation (issue #789,
 /// implementation-requirements paragraph 4).
