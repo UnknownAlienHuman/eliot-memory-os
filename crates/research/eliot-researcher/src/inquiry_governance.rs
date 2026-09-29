@@ -50,9 +50,11 @@ use eliot_research_exchange_api::{
 };
 
 use crate::evidence_portfolio::{
-    AbsencePreconditions, AbsenceVerdict, ClaimVerdict, CoverageAccount, LineageTable,
-    ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
-    SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
+    AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, AuditedClaim,
+    AuthorizedManifest, AuthorizedManifestParams, ClaimCoverageMap, ClaimVerdict, CoverageAccount,
+    EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, ObservedOutsideScope,
+    PortfolioError, PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
+    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, audit_claim, bool_text,
     check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
     push_field, reject_vague, text,
 };
@@ -81,10 +83,9 @@ pub const INQUIRY_GOVERNANCE_CONTRACT: &str = "eliot.research.inquiry-governance
 /// all three are inside `InquiryTerminalRecord::compute_digest`, so every
 /// terminal record has a different digest than it did under
 /// `inquiry-terminal-record/v1` and the surface a consumer reads gained three
-/// typed fields. The claim audit is honestly absent on the live path: binding one
-/// needs an `evidence_portfolio::AuditedClaim`, and no production path in this
-/// repository produces one, so the field is `None` today rather than a stand-in
-/// verdict. See the field's own doc comment.
+/// typed fields. #1765 supplied the missing `AuditedClaim` producer this field
+/// had been `None` for, so the field now carries a real audit on any run that
+/// released admitted material. See the field's own doc comment.
 ///
 /// **What this constant does not do, stated plainly:** it is in no digest
 /// preimage. It appears only in the `Display` impl below. The invalidation above
@@ -266,6 +267,16 @@ pub enum InquiryError {
     },
     /// The frozen acquisition-side discipline refused the material.
     Portfolio(PortfolioError),
+    /// The run-bound audit reference authorization refused to bind.
+    ///
+    /// I21.7 requires an audit job to be bound to the exact run and State Fence
+    /// it may judge under, and that binding is owned by
+    /// [`AuditReferenceBinding`]. Its refusal is carried here whole rather than
+    /// collapsed into a field path, because "the run-bound manifest does not
+    /// match its own digest" and "the authorized manifest does not match its own
+    /// digest" are different facts about different owners, and a run whose audit
+    /// authorization cannot be proved produces no record at all.
+    AuditBinding(AuditBindingError),
     /// The exchange contract refused the admitted reference manifest.
     ///
     /// I21.7: the run-bound `AllowedReferenceManifest` is a mandatory input, so
@@ -348,6 +359,9 @@ impl std::fmt::Display for InquiryError {
                 )
             }
             Self::Portfolio(error) => write!(formatter, "frozen portfolio discipline: {error}"),
+            Self::AuditBinding(cause) => {
+                write!(formatter, "claim audit reference binding: {cause}")
+            }
             Self::Contract(error) => {
                 write!(formatter, "reference manifest contract: {error}")
             }
@@ -398,10 +412,6 @@ fn require_digest(value: &str, field: &'static str) -> Result<(), InquiryError> 
 fn require_scope(value: &str, field: &'static str) -> Result<(), InquiryError> {
     text(value, field).map_err(InquiryError::from)?;
     reject_vague(value, field).map_err(InquiryError::from)
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }
 
 /// Canonical grade on the frozen I21.2 ladder.
@@ -3778,17 +3788,16 @@ pub struct InquiryTerminalRecord {
     pub freeze: EvidenceFreeze,
     /// Claim audit bound to this terminal record, when one exists (I21.8).
     ///
-    /// `None` means no audited claim was bound to this run, and it is the honest
-    /// value rather than a stand-in: binding one needs an
-    /// [`crate::evidence_portfolio::AuditedClaim`] and the
-    /// [`crate::evidence_portfolio::EvidencePortfolio`] plus
-    /// [`crate::evidence_portfolio::AuditReferenceBinding`] that
-    /// [`crate::evidence_portfolio::audit_claim`] judges it against, and no
-    /// production path in this crate builds any of them from an admitted
-    /// observation. This is the same absent producer
-    /// `ClaimAuditRecord::bind` itself is blocked on, so a `Some` here is only
-    /// reachable once that owner lands, and every check in
-    /// `validate_carried_artifacts` runs on a real audit the moment it can.
+    /// `None` means this run released no material claim at all: the producer
+    /// derives one audited claim per admitted, citable source handle, and a run
+    /// with no admitted material releases none. `None` is therefore never a
+    /// stand-in for a skipped audit — a run that cannot audit its material claims
+    /// produces no record at all, because the binding is attempted with
+    /// `?` rather than defaulted. Where a run did release material claims this
+    /// is the first of them, and
+    /// [`Self::validate_carried_artifacts`](Self) — with the full trail and the
+    /// A3 coverage map carried beside it on [`InquiryGovernance`] — proves the
+    /// terminal audit is one of the audited claims rather than a foreign record.
     pub claim_audit: Option<ClaimAuditRecord>,
     /// Unsupported-precision residue the evidence set preserves (I21.7).
     ///
@@ -4708,6 +4717,33 @@ pub struct InquiryGovernance {
     /// data instead of being dropped, and nothing in this set is a source, a
     /// citation, a support relation or an evidence edge.
     pub unadmitted_references: Vec<UnadmittedReference>,
+    /// One bound claim-audit record per material claim this run released.
+    ///
+    /// This is the per-claim audit trail I21.8 requires and it is produced here
+    /// by `claim_audit_for_run`, which runs the existing
+    /// [`crate::evidence_portfolio::audit_claim`] over each claim it derives from
+    /// admitted material. An empty set is the honest "this run released no
+    /// material claim", never a stand-in verdict: a run whose audit could not be
+    /// built produces no record at all.
+    pub claim_audits: Vec<ClaimAuditRecord>,
+    /// The final coverage map over those claims.
+    ///
+    /// Carried whole rather than as a digest beside it, because A3 is a
+    /// completeness question a reader must be able to re-ask: which material
+    /// claims the frozen owner admitted, which the run actually audited, and
+    /// which are in exactly one of the two. The map's expected roster is derived
+    /// independently by [`MaterialClaimRoster::derive`] from the portfolio and
+    /// the frozen manifest, so a member cannot disappear from it by being dropped
+    /// from the release.
+    pub claim_coverage: ClaimCoverageMap,
+    /// Material claims the frozen owner admitted that carry no released verdict,
+    /// sorted.
+    ///
+    /// Non-empty is exactly the condition under which
+    /// [`crate::evidence_portfolio::require_complete_claim_coverage`] refuses a
+    /// complete-audit claim. It is published beside the map so a consumer reads
+    /// the specific unaudited claim and not only that coverage is incomplete.
+    pub claim_coverage_unaccounted: Vec<String>,
     /// Frozen source portfolio.
     pub portfolio: SourcePortfolio,
     /// Coverage receipt with its declared denominator kind.
@@ -4810,19 +4846,16 @@ impl InquiryGovernance {
             &admissibility,
             &research_debts,
         )?;
-        // No claim audit is bound here, and the honest reason is recorded rather
-        // than papered over: `ClaimAuditRecord::bind` needs an
-        // `evidence_portfolio::AuditedClaim` plus the `EvidencePortfolio` and
-        // `AuditReferenceBinding` that `audit_claim` judges it against, and no
-        // production path in this repository builds any of them from an admitted
-        // `InquiryObservation` — the observation carries candidate source custody
-        // (handle, content digest, receipt handle, lineage), never a structured
-        // material claim. The terminal record therefore carries `None`, which is
-        // the state the world is actually in; it is not a stand-in verdict and
-        // nothing in this crate will mint one to fill it. When the admitted
-        // evidence-bundle producer lands, the value is threaded from here and
-        // every check in `InquiryTerminalRecord::validate_carried_artifacts`
-        // starts running against a real audit.
+        // The per-claim audit now has a production producer. `claim_audit_for_run`
+        // derives the audited claims from the admitted material this record already
+        // resolved, runs `audit_claim` over each, binds a record per verdict and
+        // builds the coverage map. The previous `None` recorded a real state — no
+        // `AuditedClaim` producer existed — and that state is now over, so the
+        // value is threaded from the audit rather than restated. A run that cannot
+        // audit its material claims produces no record at all, so an absent audit
+        // here means the run released no material claim, never that the audit was
+        // skipped.
+        let claim_audit = claim_audit_for_run(&observation, &profile, &account, &admissibility)?;
         let terminal = terminal_record(
             &observation,
             &profile,
@@ -4832,7 +4865,7 @@ impl InquiryGovernance {
             &obligations,
             &research_debts,
             &freeze,
-            None,
+            claim_audit.records.first(),
         )?;
         let record = Self {
             inquiry_id: observation.inquiry_id,
@@ -4844,6 +4877,9 @@ impl InquiryGovernance {
                 .collect::<Result<Vec<_>, _>>()?,
             unadmitted_references,
             profile,
+            claim_audits: claim_audit.records,
+            claim_coverage: claim_audit.coverage,
+            claim_coverage_unaccounted: claim_audit.unaccounted,
             admissibility,
             portfolio,
             coverage_receipt,
@@ -4921,6 +4957,17 @@ impl InquiryGovernance {
             });
         }
         self.validate_terminal_carried_bindings()?;
+        // The claim-audit trail and the coverage map are re-proved here, not
+        // carried on trust. A record that lost an audit between construction and
+        // publication would otherwise present a coverage map whose `released`
+        // roster no longer matches the records it claims to describe, and a
+        // complete-audit claim would survive the loss. Re-deriving the released
+        // roster from the carried records is what makes the omission observable.
+        for audit in &self.claim_audits {
+            audit.validate_integrity()?;
+        }
+        self.claim_coverage.verify_integrity()?;
+        self.validate_claim_coverage_binding()?;
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
@@ -4979,6 +5026,64 @@ impl InquiryGovernance {
         Ok(())
     }
 
+    /// A3: the published coverage map must still describe the audit trail this
+    /// record carries.
+    ///
+    /// Three facts are re-derived and compared, and each names a different way
+    /// the map could have stopped describing the release:
+    ///
+    /// * the map's `released` roster must equal the claim identities the carried
+    ///   [`ClaimAuditRecord`]s actually name, so a dropped audit cannot leave a
+    ///   map that still claims it was covered;
+    /// * the published `claim_coverage_unaccounted` list must equal what
+    ///   [`crate::evidence_portfolio::require_complete_claim_coverage`] returns
+    ///   for this map, so the specific unaudited claims a consumer reads are the
+    ///   ones the gate refuses on;
+    /// * the terminal record's carried audit must be one of the audited claims,
+    ///   not a foreign record the map never saw.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first disagreement.
+    fn validate_claim_coverage_binding(&self) -> Result<(), InquiryError> {
+        let released: Vec<String> = self
+            .claim_audits
+            .iter()
+            .map(|audit| audit.claim_id.clone())
+            .collect();
+        if released != self.claim_coverage.released_material_claims() {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.claim_coverage_released",
+            });
+        }
+        let gate = crate::evidence_portfolio::require_complete_claim_coverage(&self.claim_coverage)
+            .err()
+            .unwrap_or_default();
+        if gate != self.claim_coverage_unaccounted {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.claim_coverage_unaccounted",
+            });
+        }
+        if let Some(audit) = &self.terminal.claim_audit
+            && !released.contains(&audit.claim_id)
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "terminal.claim_audit_binding",
+            });
+        }
+        for audit in &self.claim_audits {
+            if audit.inquiry_id != self.inquiry_id
+                || audit.evidence_set_id != self.evidence_set_id
+                || audit.profile_digest != self.profile.integrity_digest
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.claim_audit_binding",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// I21.7/I21.8: the terminal projection has to carry the evidence freeze and
     /// the unsupported-precision residue this run produced, not a copy that was
     /// restated while it was being bound. Comparing the two owners to what the
@@ -5023,10 +5128,10 @@ impl std::fmt::Display for InquiryGovernance {
     /// What the terminal record *carries* is printed as its own key so a reader
     /// can see which freeze, claim audit and unsupported-precision residue the
     /// disposition was bound over rather than only that the composite holds some.
-    /// `terminal_claim_audit=none` is the honest spelling of the live state: no
-    /// production path produces an `AuditedClaim`, so the terminal record carries
-    /// no claim audit, and the line says that instead of omitting the field or
-    /// printing a digest for an audit that never ran.
+    /// `terminal_claim_audit=none` is the honest spelling of a run that released
+    /// no material claim — the producer derives one audited claim per admitted,
+    /// citable source handle — and not a stand-in for a skipped audit, because a
+    /// run that cannot audit its material claims produces no record at all.
     ///
     /// The Governor-facing source-admission requests are counted and their
     /// digests published here, which is what makes this line the Researcher half
@@ -5044,11 +5149,6 @@ impl std::fmt::Display for InquiryGovernance {
     /// line says that instead of omitting the figure.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let terminal = &self.terminal;
-        let eligible = self
-            .admissibility
-            .iter()
-            .filter(|record| record.eligibility == SourceEligibility::Eligible)
-            .count();
         write!(
             formatter,
             "contract={INQUIRY_GOVERNANCE_CONTRACT} version={INQUIRY_GOVERNANCE_VERSION} \
@@ -5061,11 +5161,9 @@ impl std::fmt::Display for InquiryGovernance {
              supported_precision={} precision_residue={} obligations={} \
              materialisable={} deferred={} certified={} compilation_inputs={} freeze={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
-             debts={} debt_kinds={} debt_restricted={} debt_restriction_refused={} \
-             disposition={} terminal_denominator_kind={} may_close={} \
-             acquisition_succeeded={} preserved_unknown={} narrower_claim={} \
-             next_probe={} reason={} authority_epoch={}/{} candidate_only={} \
-             source_admission_requests={} source_admission_request_digests={} \
+             claim_audits={} claim_coverage={} \
+             debts={} debt_kinds={} {} \
+             {} \
              source_admission_owner_receipt=none",
             self.inquiry_id,
             self.evidence_set_id,
@@ -5084,7 +5182,10 @@ impl std::fmt::Display for InquiryGovernance {
             self.profile.output_contract.output_contract,
             self.portfolio.independence.meets_requirement,
             self.admissibility.len(),
-            eligible,
+            self.admissibility
+                .iter()
+                .filter(|record| record.eligibility == SourceEligibility::Eligible)
+                .count(),
             self.unadmitted_references.len(),
             self.portfolio.digest,
             self.coverage_receipt.expected_members,
@@ -5111,33 +5212,20 @@ impl std::fmt::Display for InquiryGovernance {
                 .as_ref()
                 .map_or("none", |audit| audit.digest.as_str()),
             terminal.unsupported_precision.len(),
+            self.claim_audits.len(),
+            ClaimCoverageProjection {
+                map: &self.claim_coverage,
+                unaccounted: &self.claim_coverage_unaccounted,
+            },
             self.research_debts.len(),
             debt_kinds_wire(&self.research_debts),
-            terminal.debt_restriction.restricted,
-            terminal
-                .debt_restriction
-                .refused_dispositions
-                .iter()
-                .map(|disposition| disposition_wire(*disposition))
-                .collect::<Vec<&str>>()
-                .join(","),
-            disposition_wire(terminal.disposition),
-            terminal.denominator_kind,
-            terminal.may_close(),
-            terminal.acquisition_succeeded(),
-            terminal.explicit_unknown.is_some(),
-            terminal.narrower_claim.is_some(),
-            terminal.next_probe.is_some(),
-            terminal.reason_code,
-            terminal.state_fence.authority_epoch.lineage_id,
-            terminal.state_fence.authority_epoch.sequence,
-            terminal.candidate_only,
-            self.source_admission_requests.len(),
-            self.source_admission_requests
-                .iter()
-                .map(|request| request.request_digest.as_str())
-                .collect::<Vec<&str>>()
-                .join(","),
+            DebtRestrictionProjection {
+                restriction: &terminal.debt_restriction,
+            },
+            TerminalDispositionProjection {
+                terminal,
+                source_admission_requests: &self.source_admission_requests,
+            },
         )
     }
 }
@@ -6107,6 +6195,224 @@ fn coverage_account(
     Ok(account)
 }
 
+/// The claim audit this run actually produced, plus the coverage map that says
+/// whether it audited everything the frozen owner admitted.
+///
+/// The composite previously carried `None` here and recorded the reason: nothing
+/// in this repository produced an [`AuditedClaim`], so the per-claim audit trail
+/// had no producer and was unreachable from any production entry point. This is
+/// that producer, and it is a real one: it derives the audited claims from
+/// already-admitted material — the reference firewall, the source-admissibility
+/// dispositions and the coverage accounting above all ran on the same
+/// [`InquiryObservation`] before this — runs the existing
+/// [`audit_claim`] over each, and binds a [`ClaimAuditRecord`] per verdict.
+///
+/// # The claim this run releases
+///
+/// One material claim per **admitted, citable** source handle: "this retained
+/// material is evidence the inquiry's question could be decided from, within
+/// this run's admitted scope". That is the only material statement an admitted
+/// provider run actually asserts, and it is exactly the statement I21.8 requires
+/// to carry a resolved chain. A handle the manifest revoked, never admitted, or
+/// admits without a provable record produces no claim: there is nothing released
+/// about it to audit, and manufacturing a verdict for it would be the fabricated
+/// provenance this crate refuses to mint.
+///
+/// # Why the coverage map is not the released list read twice
+///
+/// [`MaterialClaimRoster::derive`] recomputes the expected roster from the
+/// portfolio and the frozen manifest, so it cannot shrink when a verdict is
+/// dropped. [`ClaimCoverageMap::build`] then compares that roster against the
+/// claim identities actually present in the verdicts, and
+/// [`crate::evidence_portfolio::require_complete_claim_coverage`] refuses a
+/// complete-audit claim while the two differ. An omitted claim is therefore a
+/// named, observable defect rather than a self-consistent list.
+struct RunClaimAudit {
+    /// One bound record per audited material claim, in canonical claim order.
+    records: Vec<ClaimAuditRecord>,
+    /// The coverage map over the independently derived expected roster.
+    coverage: ClaimCoverageMap,
+    /// Expected material-claim identities with no released verdict, sorted.
+    ///
+    /// Kept beside the records rather than derived from them on demand so the
+    /// terminal record and this struct cannot disagree about which claim is
+    /// unaudited.
+    unaccounted: Vec<String>,
+}
+
+/// Runs the per-claim audit over every material claim this run releases and
+/// builds the coverage map that gates a complete-audit claim.
+///
+/// # Errors
+///
+/// Returns [`InquiryError::Portfolio`] when the authorized manifest, the
+/// audit reference binding, the frozen claim identity, the audit itself or the
+/// coverage map cannot be built or re-proved. A run that cannot audit its
+/// material claims produces no record at all rather than a record whose audit
+/// field is silently absent.
+fn claim_audit_for_run(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+    account: &CoverageAccount,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<RunClaimAudit, InquiryError> {
+    let portfolio = audit_portfolio(profile, account, admissibility);
+    let binding = audit_binding(observation, account, &portfolio)?;
+    let roster =
+        MaterialClaimRoster::derive(&portfolio, &binding).map_err(InquiryError::AuditBinding)?;
+    let mut records = Vec::new();
+    let mut verdicts: Vec<ClaimVerdict> = Vec::new();
+    for claim_id in &roster.claim_ids {
+        let claim = released_material_claim(observation, claim_id);
+        // A claim with no verifiable frozen identity can never be released as
+        // supported, so the identity is frozen here from the statement the run
+        // actually releases rather than being trusted as a caller-supplied value.
+        let identity = claim.freeze_identity().map_err(InquiryError::from)?;
+        let claim = AuditedClaim {
+            frozen_identities: vec![identity],
+            ..claim
+        };
+        let verdict = audit_claim(&claim, &portfolio, &binding, observation.assessment_time_ms);
+        records.push(ClaimAuditRecord::bind(
+            &observation.inquiry_id,
+            profile,
+            binding.allowed_references(),
+            &observation.evidence_set_id,
+            verdict.clone(),
+        )?);
+        verdicts.push(verdict);
+    }
+    let coverage = ClaimCoverageMap::build(&roster, &binding, &verdicts)
+        .map_err(InquiryError::AuditBinding)?;
+    let unaccounted = crate::evidence_portfolio::require_complete_claim_coverage(&coverage)
+        .err()
+        .unwrap_or_default();
+    Ok(RunClaimAudit {
+        records,
+        coverage,
+        unaccounted,
+    })
+}
+
+/// Assembles the audited [`EvidencePortfolio`] over the exact records this run
+/// already assessed.
+///
+/// The records are the same [`SourceRecord`] values the source-admissibility
+/// stage decided on, carried whole rather than rebuilt, so the portfolio the
+/// audit reads is the portfolio the release published and not a second
+/// projection of it. The coverage accounting is the one the run already opened.
+fn audit_portfolio(
+    profile: &InquiryProtocolProfile,
+    account: &CoverageAccount,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> EvidencePortfolio {
+    let mut records = BTreeMap::new();
+    for record in admissibility {
+        if !record.is_admitted_to(profile) {
+            continue;
+        }
+        records.insert(record.record.handle.clone(), record.record.clone());
+    }
+    EvidencePortfolio {
+        inquiry_digest: profile.admitted_inquiry_digest.clone(),
+        records,
+        coverage: account.clone(),
+    }
+}
+
+/// Binds the audit job to the exact run and State Fence it may judge under.
+///
+/// The authorized manifest is frozen over exactly the material the run holds:
+/// the inquiry digest it was admitted under, the declared denominator, the
+/// canonical commitment of every record the audit may cite, the coverage
+/// accounting the release published, and the citable allowlist. It is frozen
+/// *here*, from admitted material, rather than being taken from a caller, so
+/// the authorization the audit ran under is the one the run's own evidence
+/// describes and not a claim about one.
+fn audit_binding(
+    observation: &InquiryObservation,
+    account: &CoverageAccount,
+    portfolio: &EvidencePortfolio,
+) -> Result<AuditReferenceBinding, InquiryError> {
+    let run_manifest = &observation.reference_manifest;
+    let mut sources = BTreeMap::new();
+    let mut allowlist: Vec<String> = Vec::new();
+    for (handle, record) in &portfolio.records {
+        allowlist.push(handle.clone());
+        sources.insert(
+            handle.clone(),
+            ManifestSource {
+                record_digest: record.digest().map_err(InquiryError::from)?,
+                content_digest: record.content_digest.clone(),
+                transformed_from: record.transformed_from.clone(),
+            },
+        );
+    }
+    if allowlist.is_empty() {
+        // `AuthorizedManifest::freeze` refuses an empty allowlist, and an
+        // unadmitted run has no citable material to audit. Refusing the whole
+        // projection here is the honest answer: this is not a failed audit of a
+        // release, it is a release with nothing released.
+        return Err(InquiryError::UnknownHandle {
+            field: "claim_audit.allowlist",
+        });
+    }
+    let authorized = AuthorizedManifest::freeze(AuthorizedManifestParams {
+        inquiry_digest: observation.inquiry_digest.clone(),
+        denominator_digest: observation.denominator_digest.clone(),
+        sources,
+        dependence_edges: BTreeSet::new(),
+        coverage_digest: account.digest(),
+        grade_limits: Vec::new(),
+        counterevidence: Vec::new(),
+        conflicts: Vec::new(),
+        unknowns: Vec::new(),
+        allowlist,
+        revoked: Vec::new(),
+        disclosure: observation.disclosure,
+        // The audit is judged at the same instant the coverage accounting was
+        // closed, so the authorization cannot outlive the evidence it covers.
+        expires_ms: observation.assessment_time_ms.saturating_add(1).max(1),
+        revision: 1,
+    })
+    .map_err(InquiryError::from)?;
+    AuditReferenceBinding::bind(
+        authorized,
+        run_manifest.clone(),
+        run_manifest.state_fence.clone(),
+    )
+    .map_err(InquiryError::AuditBinding)
+}
+
+/// Projects the one material claim an admitted source handle releases.
+///
+/// The statement is data, never executed: it names the question the inquiry is
+/// asking, the exact artifact commitment the run retained, and the scope the
+/// run was admitted for, so the audit judges a claim about a specific artifact
+/// under specific conditions rather than a bare assertion. The citation is the
+/// handle itself, and the counterclaim list is empty: `counterevidence_of` is
+/// not part of the canonical [`SourceRecord`] digest, so it is not trusted
+/// frozen data and a contradiction is never inferred from its presence or its
+/// absence.
+fn released_material_claim(observation: &InquiryObservation, claim_id: &str) -> AuditedClaim {
+    AuditedClaim {
+        claim_id: claim_id.to_owned(),
+        statement: format!(
+            "the retained provider artifact for inquiry {} contains evidence the question `{}` \
+             could be decided from within the admitted scope `{}`",
+            observation.inquiry_id, observation.question, observation.scope
+        ),
+        material: true,
+        domain: observation.scope.clone(),
+        citations: vec![claim_id.to_owned()],
+        precision: Vec::new(),
+        counterclaim_ids: Vec::new(),
+        unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
+    }
+}
+
 /// Observed degradation, coverage unknowns and the budget limitation of one run.
 struct RunDegradation {
     /// Typed provider degradation, empty for a clean run.
@@ -6815,6 +7121,139 @@ fn debt_kinds_wire(debts: &[ResearchDebt]) -> String {
     kinds.sort_unstable();
     kinds.dedup();
     kinds.join(",")
+}
+
+/// Renders an already-canonical member list for the terminal receipt line.
+///
+/// The A3 coverage map publishes three rosters — the independently derived
+/// expected one, the released one and the unaccounted remainder — and a count
+/// alone would leave a reader unable to see WHICH claim was unaudited. The
+/// Governor-facing source-admission request digests are rendered through this
+/// same function rather than through a second inline `join`, so a reader parses
+/// one list spelling on the receipt line instead of two.
+///
+/// The members are claim and source handles this record already decided on, so
+/// publishing them adds no provider prose, payload body or credential, and
+/// `none` is the honest spelling of an empty list.
+fn member_list_wire(members: &[&str]) -> String {
+    if members.is_empty() {
+        return "none".to_owned();
+    }
+    members.join(",")
+}
+
+/// The `claim_coverage=` value on the terminal receipt line.
+///
+/// A named projection rather than eight inline format arguments, so the receipt
+/// line keeps one field per value it publishes and the coverage detail is
+/// rendered in one place that cannot drift from the map it reads. Every value is
+/// an identity, a count, a digest or a boolean, and the two rosters are the
+/// claim/source handles this record already decided on; no provider prose,
+/// payload body or credential is reproduced.
+struct ClaimCoverageProjection<'a> {
+    /// The coverage map this record carries.
+    map: &'a ClaimCoverageMap,
+    /// The specific members the complete-audit gate refuses on.
+    unaccounted: &'a [String],
+}
+
+impl std::fmt::Display for ClaimCoverageProjection<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "digest={} expected_claim_ids={} released_claim_ids={} complete={} \
+             unaccounted_claim_ids={}",
+            self.map.digest(),
+            member_list_wire(&str_members(self.map.expected_material_claims())),
+            member_list_wire(&str_members(self.map.released_material_claims())),
+            bool_text(self.map.is_complete()),
+            member_list_wire(&str_members(self.unaccounted)),
+        )
+    }
+}
+
+/// Borrows an owned roster as the borrowed member list [`member_list_wire`] takes.
+///
+/// Both rosters are `Vec<String>` inside values this record already owns, and
+/// the receipt line only reads them, so the two spellings are the same data
+/// behind one rendering function rather than two renderers.
+fn str_members(members: &[String]) -> Vec<&str> {
+    members.iter().map(String::as_str).collect()
+}
+
+/// The `debt_restricted=` and `debt_restriction_refused=` values on the receipt
+/// line.
+///
+/// I21.12 makes a debt a typed object that states what it blocks, so the line
+/// publishes the restriction boolean beside the closed wire names of the
+/// dispositions the debts actually refuse. Rendering both from one owner means
+/// the boolean and the list cannot disagree about which debt kinds are present.
+struct DebtRestrictionProjection<'a> {
+    /// The restriction the registered debts imply.
+    restriction: &'a ResearchDebtRestriction,
+}
+
+impl std::fmt::Display for DebtRestrictionProjection<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "debt_restricted={} debt_restriction_refused={}",
+            bool_text(self.restriction.restricted),
+            self.restriction
+                .refused_dispositions
+                .iter()
+                .map(|disposition| disposition_wire(*disposition))
+                .collect::<Vec<&str>>()
+                .join(","),
+        )
+    }
+}
+
+/// The terminal-disposition and Governor-pair values on the receipt line.
+///
+/// A named projection rather than fourteen inline format arguments, so the
+/// receipt line keeps one field per value it publishes and the disposition half
+/// is rendered in one place that cannot drift from the terminal record it reads.
+/// The two request counts the Governor pair publishes are rendered here beside
+/// the digest list they belong to, because a count separated from its own values
+/// is the shape a reader cannot check.
+struct TerminalDispositionProjection<'a> {
+    /// The terminal typed disposition this record carries.
+    terminal: &'a InquiryTerminalRecord,
+    /// The Governor-facing source transition requests this record proposes.
+    source_admission_requests: &'a [GovernorSourceTransitionRequest],
+}
+
+impl std::fmt::Display for TerminalDispositionProjection<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let terminal = self.terminal;
+        write!(
+            formatter,
+            "disposition={} terminal_denominator_kind={} may_close={} \
+             acquisition_succeeded={} preserved_unknown={} narrower_claim={} \
+             next_probe={} reason={} authority_epoch={}/{} candidate_only={} \
+             source_admission_requests={} source_admission_request_digests={}",
+            disposition_wire(terminal.disposition),
+            terminal.denominator_kind,
+            bool_text(terminal.may_close()),
+            bool_text(terminal.acquisition_succeeded()),
+            bool_text(terminal.explicit_unknown.is_some()),
+            bool_text(terminal.narrower_claim.is_some()),
+            bool_text(terminal.next_probe.is_some()),
+            terminal.reason_code,
+            terminal.state_fence.authority_epoch.lineage_id,
+            terminal.state_fence.authority_epoch.sequence,
+            bool_text(terminal.candidate_only),
+            self.source_admission_requests.len(),
+            member_list_wire(
+                &self
+                    .source_admission_requests
+                    .iter()
+                    .map(|request| request.request_digest.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    }
 }
 
 /// Stable wire spelling of the canonical completion disposition.
