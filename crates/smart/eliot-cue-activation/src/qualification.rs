@@ -113,6 +113,33 @@ pub enum SpreadEnablement {
     },
 }
 
+/// The immutable facts a qualification binds, before admission.
+///
+/// Grouping these is not cosmetic: `SpreadQualification` is a record of WHAT
+/// was compared, and taking it as one value keeps every admitted fact named
+/// once at the call site instead of spread across a nine-argument list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualificationRecord {
+    /// Identity of the qualification itself.
+    pub qualification_id: String,
+    /// Digest of the profile the comparison was measured against.
+    pub profile_digest: Digest,
+    /// Relation-registry revision in force at measurement time.
+    pub registry_revision: String,
+    /// Normalization profile in force at measurement time.
+    pub normalization_profile: NormalizationProfile,
+    /// Runtime identity the measurement belongs to.
+    pub runtime_identity: String,
+    /// Work scope the qualification is bound to.
+    pub scope_id: WorkScopeId,
+    /// Where the comparison evidence lives.
+    pub evidence_reference: String,
+    /// Absolute expiry, in milliseconds since the Unix epoch.
+    pub expires_at_ms: i64,
+    /// The condition that revokes this qualification.
+    pub kill_condition: String,
+}
+
 impl SpreadQualification {
     /// Binds a qualification to the exact configuration it was measured
     /// against.
@@ -120,23 +147,16 @@ impl SpreadQualification {
     /// # Errors
     /// Rejects an empty, control-bearing or over-long text field and a
     /// non-positive expiry interval measured from the recorded issue time.
-    pub fn new(
-        qualification_id: String,
-        profile_digest: Digest,
-        registry_revision: String,
-        normalization_profile: NormalizationProfile,
-        runtime_identity: String,
-        scope_id: WorkScopeId,
-        evidence_reference: String,
-        expires_at_ms: i64,
-        kill_condition: String,
-    ) -> Result<Self, ActivationError> {
-        check_text(&qualification_id, "qualification.qualification_id")?;
-        check_text(&registry_revision, "qualification.registry_revision")?;
-        check_text(&runtime_identity, "qualification.runtime_identity")?;
-        check_text(&evidence_reference, "qualification.evidence_reference")?;
-        check_text(&kill_condition, "qualification.kill_condition")?;
-        if expires_at_ms <= 0 {
+    pub fn new(record: QualificationRecord) -> Result<Self, ActivationError> {
+        check_text(&record.qualification_id, "qualification.qualification_id")?;
+        check_text(&record.registry_revision, "qualification.registry_revision")?;
+        check_text(&record.runtime_identity, "qualification.runtime_identity")?;
+        check_text(
+            &record.evidence_reference,
+            "qualification.evidence_reference",
+        )?;
+        check_text(&record.kill_condition, "qualification.kill_condition")?;
+        if record.expires_at_ms <= 0 {
             return Err(ActivationError::Contract(
                 eliot_cue_contracts::CueContractError::InvalidText {
                     field: "qualification.expires_at_ms",
@@ -144,15 +164,15 @@ impl SpreadQualification {
             ));
         }
         Ok(Self {
-            qualification_id,
-            profile_digest,
-            registry_revision,
-            normalization_profile,
-            runtime_identity,
-            scope_id,
-            evidence_reference,
-            expires_at_ms,
-            kill_condition,
+            qualification_id: record.qualification_id,
+            profile_digest: record.profile_digest,
+            registry_revision: record.registry_revision,
+            normalization_profile: record.normalization_profile,
+            runtime_identity: record.runtime_identity,
+            scope_id: record.scope_id,
+            evidence_reference: record.evidence_reference,
+            expires_at_ms: record.expires_at_ms,
+            kill_condition: record.kill_condition,
             killed: false,
         })
     }
@@ -238,7 +258,9 @@ pub fn resolve_enablement(
 
 /// Rejects an empty, control-bearing or over-long qualification text field.
 fn check_text(value: &str, field: &'static str) -> Result<(), ActivationError> {
-    if value.trim().is_empty() || value.len() > MAX_TEXT_BYTES || value.chars().any(char::is_control)
+    if value.trim().is_empty()
+        || value.len() > MAX_TEXT_BYTES
+        || value.chars().any(char::is_control)
     {
         return Err(ActivationError::Contract(
             eliot_cue_contracts::CueContractError::InvalidText { field },

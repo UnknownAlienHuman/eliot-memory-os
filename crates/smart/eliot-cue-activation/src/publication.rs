@@ -307,7 +307,9 @@ fn limitation(limit: DirectReadLimit, binding: &'static str) -> DirectReadLimita
 
 /// Rejects an empty, control-bearing or over-long owner handle.
 fn check_handle(value: &str, field: &'static str) -> Result<(), ActivationError> {
-    if value.trim().is_empty() || value.len() > MAX_HANDLE_BYTES || value.chars().any(char::is_control)
+    if value.trim().is_empty()
+        || value.len() > MAX_HANDLE_BYTES
+        || value.chars().any(char::is_control)
     {
         return Err(map_text(value, field));
     }

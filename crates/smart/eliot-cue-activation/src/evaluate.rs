@@ -1104,7 +1104,12 @@ impl SpreadWork<'_> {
             return Ok(false);
         };
         if state.path.iter().any(|id| id == &edge.relation_edge_id)
-            || path_revisits(state, &arrival, &self.candidate.relation_edges, self.profile)
+            || path_revisits(
+                state,
+                &arrival,
+                &self.candidate.relation_edges,
+                self.profile,
+            )
         {
             return Ok(false);
         }
@@ -1306,7 +1311,11 @@ fn trace_state(
         let reached = arrival_of(profile, edge, &current).ok_or(ActivationError::Contract(
             CueContractError::BrokenActivationPath,
         ))?;
-        steps.push(TraceStep::new(Some(edge_id.clone()), depth, reached.clone()));
+        steps.push(TraceStep::new(
+            Some(edge_id.clone()),
+            depth,
+            reached.clone(),
+        ));
         current = reached;
     }
     Ok(())
@@ -1451,12 +1460,15 @@ fn arrival_of(
     from: &TargetHandle,
 ) -> Option<TargetHandle> {
     match profile.relation_direction(edge.kind)? {
-        RelationDirection::Forward if edge.from == *from => Some(edge.to.clone()),
-        RelationDirection::Reverse if edge.to == *from => Some(edge.from.clone()),
-        RelationDirection::Bidirectional if edge.from == *from => Some(edge.to.clone()),
-        RelationDirection::Bidirectional if edge.to == *from => Some(edge.from.clone()),
-        RelationDirection::Forward
-        | RelationDirection::Reverse
-        | RelationDirection::Bidirectional => None,
+        // Forward carries source-to-target only and Reverse target-to-source
+        // only, so each resolves the one side it admits. Bidirectional admits
+        // either end, so both `from` cases yield the other end.
+        RelationDirection::Forward | RelationDirection::Bidirectional if edge.from == *from => {
+            Some(edge.to.clone())
+        }
+        RelationDirection::Reverse | RelationDirection::Bidirectional if edge.to == *from => {
+            Some(edge.from.clone())
+        }
+        _ => None,
     }
 }

@@ -749,12 +749,9 @@ fn evaluate_under_publication(
     inputs: &CueActivationStage<'_>,
 ) -> Result<CueActivationEvaluation, PulseError> {
     match inputs.publication {
-        Some(grant) => evaluate_published_activation(
-            grant,
-            inputs.request,
-            inputs.profile,
-            &inputs.scope_id,
-        ),
+        Some(grant) => {
+            evaluate_published_activation(grant, inputs.request, inputs.profile, &inputs.scope_id)
+        }
         None => evaluate_activation(inputs.candidate, inputs.request, inputs.profile),
     }
     .map_err(|_| PulseError::CueActivation)

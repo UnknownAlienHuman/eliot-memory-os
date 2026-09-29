@@ -39,14 +39,12 @@ pub mod qualification;
 
 pub use advisory::{CueUse, blocking_evidence, classify, direct_activations};
 pub use error::ActivationError;
-pub use evaluate::{
-    CueActivationEvaluation, evaluate_activation, evaluate_published_activation,
-};
+pub use evaluate::{CueActivationEvaluation, evaluate_activation, evaluate_published_activation};
 pub use profile::{
     ACTIVATION_PROFILE_REVISION, ActivationProfile, MatchRule, RelationDirection, RelationRule,
 };
 pub use publication::{
-    DisclosureInfluenceState, DirectReadLimit, DirectReadLimitation, PublicationGrant,
+    DirectReadLimit, DirectReadLimitation, DisclosureInfluenceState, PublicationGrant,
 };
 pub use qualification::{
     QualificationRefusal, SpreadEnablement, SpreadQualification, resolve_enablement,

@@ -35,7 +35,9 @@ impl MatchRule {
 /// Direction is profile semantics, not traversal policy decided at runtime: a
 /// kind the profile admits is admitted in one named direction, and the
 /// evaluator reads that direction rather than assuming a forward walk.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RelationDirection {
