@@ -106,9 +106,11 @@ pub enum ProjectionError {
     /// error, because the offending value is a well-formed `true` and only the
     /// ceiling rejects it: collapsing it into [`Self::InvalidDigest`] or
     /// [`Self::InvalidIdentity`] would hide which guarantee failed.
-    #[error("forensic audit note in field {field} asserts restored active authority: a \
+    #[error(
+        "forensic audit note in field {field} asserts restored active authority: a \
              HostStateAuditFence is forensic only and never a lease, grant, or current-state \
-             assertion")]
+             assertion"
+    )]
     ActiveAuthorityInAuditFence { field: &'static str },
 }
 

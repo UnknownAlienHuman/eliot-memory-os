@@ -710,9 +710,9 @@ pub struct CleanupReport {
 /// declared Exclusive mutable scope; that owner correction is the exact
 /// blocker. Measured on the current main: `HostStateRecord`
 /// (`crates/kernel/eliot-host-state/src/model.rs`) carries
-/// Activation, Kernel, Dependency, Drain, DrainCommit, Wake,
-/// WakeCancellationBatch, Observation, ReadinessObservation, CleanMarker,
-/// EpochRetirement, StoreRebind, ReactiveContext and CutoverIntent — the last
+/// `Activation`, `Kernel`, `Dependency`, `Drain`, `DrainCommit`, `Wake`,
+/// `WakeCancellationBatch`, `Observation`, `ReadinessObservation`, `CleanMarker`,
+/// `EpochRetirement`, `StoreRebind`, `ReactiveContext` and `CutoverIntent` — the last
 /// added by #961, which is the precedent and the shape a preparation record
 /// would take. None of them is a destination-preparation record, and reusing one
 /// (for example appending a preparation intent as a `ReactiveContext` or
