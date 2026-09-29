@@ -11,8 +11,8 @@ use std::io::{self, Read, Write};
 use eliot_native_worker_core::{
     ActionEnvelopeCarrier, CapabilityAdmissionFacts, CapabilityAdmissionPort,
     ClaimAdmissionRequest, DurableCheckpointPort, DurableReplayPort, NativeWorkerClaim,
-    NativeWorkerRegistration, ReadinessSubmission, WorkerCore, WorkerError, WorkerEventEnvelope,
-    WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
+    NativeWorkerReadiness, NativeWorkerRegistration, ReadinessSubmission, WorkerCore, WorkerError,
+    WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use serde::{Deserialize, Serialize};
@@ -484,6 +484,43 @@ pub fn require_worker_cell_match(
     Ok(())
 }
 
+/// Requires a credential-bearing Ready verdict to predate the presenting
+/// registration's lease expiry.
+///
+/// Credential-lease negative (Implements #22 AC5): the readiness verdict
+/// travels to the drive before any lifecycle submit, so a Ready that still
+/// carries broker-issued credential references while its registration lease
+/// has already expired at declaration time is a refused presentation (typed
+/// exit 78 in the binary, never the missing-material deferral and never a
+/// drive). Lease loss revokes the credential authority; the owner re-issues
+/// it through a new admission, never a local repair in the worker. A
+/// `Blocked` verdict asserts no credential authority and passes; a report
+/// with an empty credential set passes with general lease liveness left to
+/// the claim deadline and admission revalidation. Credentials stay
+/// broker-bound per #23/User Broker: this pin compares the declaration time
+/// against the lease window only and carries no credential material.
+///
+/// # Errors
+///
+/// Returns [`NativeWorkerError::KernelAdmissionRequired`] when a
+/// credential-bearing Ready outlives its registration lease or answers
+/// another registration.
+pub fn require_ready_credential_lease_liveness(
+    registration: &NativeWorkerRegistration,
+    readiness: &ReadinessSubmission,
+) -> Result<(), NativeWorkerError> {
+    match readiness.readiness() {
+        NativeWorkerReadiness::Ready(report) => report
+            .validate_credential_lease(registration)
+            .map_err(|error| {
+                NativeWorkerError::KernelAdmissionRequired(format!(
+                    "credential-bearing Ready outlived its registration lease: {error}"
+                ))
+            }),
+        NativeWorkerReadiness::Blocked(_) => Ok(()),
+    }
+}
+
 /// Drives one admitted native-worker generation to `Ready`.
 ///
 /// Sequence: register, claim the exact authenticated unit, reconcile any
@@ -493,7 +530,8 @@ pub fn require_worker_cell_match(
 /// then submit readiness. Invalid admission fails before any factory or
 /// process start is invoked: the owner's ready-or-blocked verdict refuses
 /// paid work first (issue #1912), then the artifact/manifest pin, then
-/// the catalog-revision (W1) and cell-identity (W7) pins, then the lifecycle
+/// the catalog-revision (W1) and cell-identity (W7) pins, then the
+/// credential-lease pin (AC5), then the lifecycle
 /// transport refuses, and the claimed core gate refuses before
 /// P-03 starts anything. No coordinator
 /// verification is consumed here (T9-05 is not part of this contour); no user
@@ -525,9 +563,13 @@ where
     // registration submit, factory effect, or process start. The generation's
     // Module Catalog revision (W1) and capability cell (W7, #13 family) pins
     // refuse next: a rewired registration or join never reaches the transport.
+    // The credential-lease pin (AC5) refuses last: a Ready that still carries
+    // credential references past its registration lease expiry never reaches
+    // the transport either.
     require_artifact_manifest_match(admission.claim(), &hello)?;
     require_module_catalog_revision_match(registration, admission.claim())?;
     require_worker_cell_match(registration, admission.claim())?;
+    require_ready_credential_lease_liveness(registration, readiness)?;
     lifecycle.submit_registration(registration)?;
     lifecycle.submit_claim(admission)?;
     lifecycle.submit_reconcile(reconcile)?;
