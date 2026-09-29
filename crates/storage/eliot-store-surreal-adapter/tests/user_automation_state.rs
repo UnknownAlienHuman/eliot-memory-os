@@ -764,6 +764,7 @@ async fn lineage_and_key_conflicts_fail_closed() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            normalization_envelope("auto-1", "r-1").0,
         ))
         .parameters
     };
@@ -855,6 +856,7 @@ async fn failure_leg_records_converges_and_projects_last() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            normalization_envelope("auto-1", "r-1").0,
         ));
     apply(adapter, "create-1", request.parameters)
         .await
@@ -898,4 +900,148 @@ async fn failure_leg_records_converges_and_projects_last() {
         .expect("repeat converges");
     let repeat = read(adapter, "failure", Some("auto-1"), false).await;
     assert_eq!(repeat.get("failure"), payload.get("failure"));
+}
+
+/// Reads the retained normalization envelopes for one exact receipt identity.
+async fn read_normalization(
+    adapter: &SurrealStoreAdapter,
+    automation_id: &str,
+    revision: &str,
+    receipt_id: &str,
+) -> Vec<Value> {
+    let request = eliot_store_api::automation_normalization_read_request(
+        automation_id.to_owned(),
+        revision.to_owned(),
+        receipt_id.to_owned(),
+        fence(),
+    )
+    .expect("normalization read builds");
+    eliot_store_api::CanonicalStoreClient::execute_named(adapter, request)
+        .await
+        .expect("normalization read executes")
+        .payload
+        .get("normalization_envelopes")
+        .and_then(Value::as_array)
+        .cloned()
+        .expect("exact normalization projection")
+}
+
+/// The owner that performed the normalization retains its envelope durably and
+/// reads the same bytes back under the immutable revision's own identity.
+///
+/// This is the real provider edge for the retention owner: the envelope must
+/// survive the round trip as the bytes that were written, and selection must be
+/// by the envelope's content-derived identity rather than by row address, so a
+/// caller that guesses an identity reaches nothing.
+#[tokio::test]
+async fn owner_retains_and_reads_back_its_normalization_envelope() {
+    let harness = Harness::fresh("normalization").await;
+    let adapter = harness.adapter();
+    let first = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let (create_envelope, create_identity) = normalization_envelope("auto-1", "r-1");
+    let request =
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_create_params(
+            "auto-1".to_owned(),
+            "r-1".to_owned(),
+            eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
+            revision_json(&first),
+            create_envelope.clone(),
+        ));
+    apply(adapter, "create-1", request.parameters)
+        .await
+        .expect("create commits");
+
+    // The retained envelope comes back as the exact bytes the owner wrote.
+    let envelopes = read_normalization(adapter, "auto-1", "r-1", &create_identity).await;
+    assert_eq!(
+        envelopes.len(),
+        1,
+        "the owner's retained envelope survives the provider round trip"
+    );
+    assert_eq!(
+        envelopes[0].get("envelope_json").and_then(Value::as_str),
+        Some(create_envelope.as_str()),
+        "the durable readback returns the bytes the owner retained, not a re-derived value"
+    );
+    let returned: eliot_receipts::ReceiptEnvelope =
+        serde_json::from_str(create_envelope.as_str()).expect("retained bytes parse");
+    returned.validate().expect("retained envelope is real");
+    assert_eq!(
+        returned.identity.receipt_id.as_str(),
+        create_identity,
+        "the retained identity is genuinely content-derived"
+    );
+
+    // Selection is by that identity, not by row address.
+    let (_, other_identity) = normalization_envelope("auto-1", "r-9");
+    assert!(other_identity != create_identity);
+    assert!(
+        read_normalization(adapter, "auto-1", "r-1", &other_identity)
+            .await
+            .is_empty(),
+        "a receipt identity this revision never retained answers nothing"
+    );
+    assert!(
+        read_normalization(adapter, "auto-1", "r-9", &create_identity)
+            .await
+            .is_empty(),
+        "a receipt identity is not answerable under a revision that never retained it"
+    );
+    assert!(
+        read_normalization(adapter, "auto-2", "r-1", &create_identity)
+            .await
+            .is_empty(),
+        "a receipt identity is not answerable under another automation"
+    );
+
+    // The immutable revision row retains ONE envelope: replaying the leg with a
+    // different envelope for the same revision document is a divergent claim
+    // about that immutable row and must fail closed, not converge.
+    let mut replay = request.parameters.clone();
+    replay.insert(
+        eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON.to_owned(),
+        Value::String(normalization_envelope("auto-1", "r-1-other").0),
+    );
+    assert_eq!(
+        apply(adapter, "create-replay", replay)
+            .await
+            .map(|_| ()),
+        Err(StoreError::IdentityConflict),
+        "an immutable revision row cannot be re-bound to a different envelope"
+    );
+
+    // An edit retains its OWN envelope for the new revision, and the superseded
+    // revision keeps its own, separately answerable under this one owner.
+    let mut second = valid_revision("auto-1", "r-2", UserAutomationConfigurationState::Active);
+    second.supersedes = Some("r-1".to_owned());
+    second
+        .validate_supersedes(&first)
+        .expect("fixture lineage is valid");
+    let (edit_envelope, edit_identity) = normalization_envelope("auto-1", "r-2");
+    let request =
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_edit_params(
+            "auto-1".to_owned(),
+            "r-1".to_owned(),
+            "r-2".to_owned(),
+            eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
+            revision_json(&second),
+            edit_envelope.clone(),
+        ));
+    apply(adapter, "edit-1", request.parameters)
+        .await
+        .expect("edit commits");
+    let envelopes = read_normalization(adapter, "auto-1", "r-2", &edit_identity).await;
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(
+        envelopes[0].get("envelope_json").and_then(Value::as_str),
+        Some(edit_envelope.as_str()),
+        "the edit leg retains the envelope it minted for the new revision"
+    );
+    assert_eq!(
+        read_normalization(adapter, "auto-1", "r-1", &create_identity)
+            .await
+            .len(),
+        1,
+        "the superseded revision keeps its own retained envelope"
+    );
 }

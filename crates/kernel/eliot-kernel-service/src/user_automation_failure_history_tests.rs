@@ -409,15 +409,100 @@ impl super::user_automation_execution::UserAutomationNotificationPort for StubNo
     }
 }
 
+/// Issues a real normalization receipt envelope for the revision leg fixture.
+///
+/// `ReceiptEnvelope::issue` is the production constructor and derives the
+/// identity from the core, so the retained bytes are a genuine envelope and
+/// the wire leg's own validation accepts them without a bespoke exemption.
+fn normalization_envelope(automation_id: &str, revision_id: &str) -> String {
+    let request_id = eliot_contracts::RequestId::new("normalize-request").expect("request id");
+    let state_fence = metadata().state_fence;
+    let core = eliot_receipts::ReceiptCore {
+        contract: eliot_receipts::contract_identity().expect("receipt contract"),
+        kind: eliot_receipts::ReceiptKind::Verification,
+        work_scope: eliot_receipts::WorkScopeBinding {
+            scope_id: eliot_receipts::WorkScopeId::new("scope-1").expect("scope"),
+            product_id: eliot_contracts::ProductId::new("product-automation").expect("product"),
+            resource_generation: state_fence.resource_generation,
+            state_fence: state_fence.clone(),
+        },
+        task: None,
+        session: None,
+        causal: eliot_receipts::CausalBinding {
+            state_fence: state_fence.clone(),
+            transaction_sequence: eliot_contracts::TransactionSequence::genesis(),
+            parent_receipt_id: None,
+            predecessor_receipt_ids: Vec::new(),
+        },
+        request: eliot_receipts::RequestBinding {
+            metadata: eliot_receipts::RequestMetadata {
+                request_id: request_id.clone(),
+                session_id: None,
+                task_id: None,
+                product_id: eliot_contracts::ProductId::new("product-automation")
+                    .expect("product"),
+                source_id: eliot_contracts::SourceId::new("owner-1").expect("source"),
+                state_fence: state_fence.clone(),
+                clock: eliot_contracts::ClockReading::default(),
+            },
+            state_fence: state_fence.clone(),
+        },
+        operation: eliot_receipts::OperationBinding {
+            operation_id: eliot_contracts::OperationId::new(format!(
+                "normalize-{automation_id}-{revision_id}"
+            ))
+            .expect("operation"),
+            request_id,
+            idempotency_key: format!("normalize-{automation_id}-{revision_id}"),
+            operation_kind: "user-automation.schedule.normalize".to_owned(),
+            effect: eliot_receipts::EffectClass::Read,
+            state_fence: state_fence.clone(),
+        },
+        authority: eliot_receipts::AuthorityBinding {
+            authority_id: eliot_contracts::ContractId::new("automation-normalizer")
+                .expect("authority id"),
+            authority_owner: "human-1".to_owned(),
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+            allowed_effect: eliot_receipts::EffectClass::Read,
+            proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
+        },
+        artifacts: vec![eliot_receipts::ArtifactBinding {
+            artifact_id: format!("compiled-occurrences:{automation_id}:{revision_id}"),
+            sha256: "a".repeat(64),
+            role: eliot_receipts::ReceiptKind::Artifact,
+            source_revision: Some(
+                eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
+            ),
+        }],
+        verifier: None,
+        problem: None,
+        coordination: None,
+        disposition: eliot_receipts::ReceiptDisposition::Success {
+            proof: eliot_receipts::ProofCeiling::ScopedVerification,
+        },
+    };
+    serde_json::to_string(
+        &eliot_receipts::ReceiptEnvelope::issue(core).expect("envelope issues"),
+    )
+    .expect("envelope serializes")
+}
+
 /// Creates the owning revision directly through the reference contour.
 async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: &str) {
     let rev = revision(automation_id, revision_id);
     let document = serde_json::to_string(&rev).expect("revision serializes");
+    // The revision leg retains the owner-issued normalization envelope beside
+    // the document it attests; this suite is about the failure leg, so the
+    // fixture issues a real (if unused here) envelope to satisfy the leg
+    // contract rather than persisting a revision with no owner evidence.
+    let envelope = normalization_envelope(automation_id, revision_id);
     let parameters = automation_create_params(
         automation_id.to_owned(),
         revision_id.to_owned(),
         eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
         document,
+        envelope,
     );
     let context = metadata();
     let manifest_digest =
