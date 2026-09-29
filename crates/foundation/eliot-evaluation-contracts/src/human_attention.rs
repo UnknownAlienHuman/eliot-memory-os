@@ -49,6 +49,9 @@ pub struct HumanAttentionEvaluation {
     pub task_correctness_rework_and_human_attention: HumanAttentionMetricGroup,
     pub overtrust_undertrust_and_recoverability_observations: HumanAttentionMetricGroup,
     pub privacy_purpose_retention_and_disclosure_cost: HumanAttentionMetricGroup,
+    /// Conclusions drawn from the measurements. Every claim is conditional on
+    /// the metrics it names; no claim aggregates dimensions into a ranking.
+    pub claims: Vec<HumanAttentionClaim>,
     pub created_at: ClockReading,
     pub expires_at: ClockReading,
     pub predecessor: Option<HumanAttentionEvaluationRevisionRef>,
@@ -60,6 +63,7 @@ impl HumanAttentionEvaluation {
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         self.validate_metadata()?;
         self.validate_measurements()?;
+        self.validate_claims()?;
         self.validate_manifest_bindings_and_expiry()
     }
 
@@ -1260,6 +1264,337 @@ impl HumanAttentionMetricSourceRef {
             });
         }
         Ok(())
+    }
+}
+
+/// One conclusion drawn from the record's measurements.
+///
+/// A claim names the metrics it rests on; it never carries an aggregate
+/// ranking, and a difference, prevention, or false-negative claim is admissible
+/// only on a declared matched or paired profile with applicable task-risk and
+/// exposure context.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAttentionClaim {
+    pub claim_ref: String,
+    pub kind: HumanAttentionClaimKind,
+    pub statement: String,
+    /// Metrics this claim actually reads. Each must be measured by this record
+    /// with an observed value; an unknown cannot support a conclusion.
+    pub supporting_metrics: Vec<HumanAttentionMetric>,
+    pub basis: HumanAttentionClaimBasis,
+}
+
+/// Closed claim kinds. There is no superiority or overall-ranking kind, so a
+/// profile with fewer notifications cannot be recorded as simply better.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HumanAttentionClaimKind {
+    /// What was observed on the evaluated profile, with no control.
+    DescriptiveObservation,
+    /// An observed difference against the declared comparator profile.
+    ComparativeDifference,
+    /// Harm a stricter policy is credited with preventing.
+    AttributedPrevention,
+    /// Risk events a suppression policy failed to surface.
+    SuppressionFalseNegative,
+}
+
+impl HumanAttentionClaimKind {
+    /// The measured count a claim of this kind must name, so a prevented action
+    /// is credited from an observed pre-exposure prevention count and a
+    /// suppression false-negative rate from an observed missed-critical count,
+    /// never from a lower blocking, harm, or alert figure.
+    const fn required_evidence_metric(self) -> Option<HumanAttentionMetric> {
+        match self {
+            Self::DescriptiveObservation | Self::ComparativeDifference => None,
+            Self::AttributedPrevention => Some(HumanAttentionMetric::PreExposurePreventionEvents),
+            Self::SuppressionFalseNegative => Some(HumanAttentionMetric::MissedCriticalRiskEvents),
+        }
+    }
+}
+
+/// The evidence posture a claim requires.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
+pub enum HumanAttentionClaimBasis {
+    /// A descriptive record is useful on its own and asserts no difference.
+    Descriptive {
+        observation_window_ref: ContractId,
+    },
+    /// A comparative claim, conditional on the declared matched or paired
+    /// profile and on the task-risk and exposure context it applies to.
+    Comparative {
+        matched_profile_ref: String,
+        applicability: HumanAttentionClaimApplicability,
+        caveats: Vec<HumanAttentionClaimCaveat>,
+    },
+}
+
+/// The task-risk and exposure context a comparative conclusion applies to.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAttentionClaimApplicability {
+    pub task_risk_context: String,
+    pub exposure_context: String,
+}
+
+/// Selection bias, censoring, intervention effect, and alternative
+/// explanations are preserved on every comparative conclusion.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
+pub enum HumanAttentionClaimCaveat {
+    SelectionBias { statement: String },
+    Censoring { statement: String },
+    InterventionEffect { statement: String },
+    AlternativeExplanation { statement: String },
+}
+
+impl HumanAttentionClaimCaveat {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::SelectionBias { .. } => "selection_bias",
+            Self::Censoring { .. } => "censoring",
+            Self::InterventionEffect { .. } => "intervention_effect",
+            Self::AlternativeExplanation { .. } => "alternative_explanation",
+        }
+    }
+
+    fn statement(&self) -> &str {
+        match self {
+            Self::SelectionBias { statement }
+            | Self::Censoring { statement }
+            | Self::InterventionEffect { statement }
+            | Self::AlternativeExplanation { statement } => statement,
+        }
+    }
+}
+
+impl HumanAttentionClaim {
+    fn validate(
+        &self,
+        method: &HumanAttentionMethod,
+        window: &HumanAttentionObservationWindow,
+    ) -> Result<(), EvaluationContractError> {
+        text(&self.claim_ref, "human_attention.claim.claim_ref")?;
+        text(&self.statement, "human_attention.claim.statement")?;
+        if self.supporting_metrics.is_empty() {
+            return Err(EvaluationContractError::EmptyCollection {
+                field: "human_attention.claim.supporting_metrics",
+            });
+        }
+        let mut named = BTreeSet::new();
+        if self.supporting_metrics.iter().any(|m| !named.insert(*m)) {
+            return Err(EvaluationContractError::DuplicateIdentity {
+                field: "human_attention.claim.supporting_metrics",
+            });
+        }
+        match (&self.basis, self.kind) {
+            (
+                HumanAttentionClaimBasis::Descriptive {
+                    observation_window_ref,
+                },
+                HumanAttentionClaimKind::DescriptiveObservation,
+            ) => {
+                if *observation_window_ref != window.specification.window_id {
+                    return Err(EvaluationContractError::InvalidDependency {
+                        field: "human_attention.claim.basis.observation_window_ref",
+                        reason: "a descriptive claim must bind the record observation window",
+                    });
+                }
+            }
+            (
+                HumanAttentionClaimBasis::Comparative {
+                    matched_profile_ref,
+                    applicability,
+                    caveats,
+                },
+                kind,
+            ) => self.validate_comparative(
+                kind,
+                matched_profile_ref,
+                applicability,
+                caveats,
+                method,
+            ),
+            _ => {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "human_attention.claim.basis",
+                    reason: "only a descriptive observation may stand without a comparator profile",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_comparative(
+        &self,
+        kind: HumanAttentionClaimKind,
+        matched_profile_ref: &str,
+        applicability: &HumanAttentionClaimApplicability,
+        caveats: &[HumanAttentionClaimCaveat],
+        method: &HumanAttentionMethod,
+    ) -> Result<(), EvaluationContractError> {
+        if kind == HumanAttentionClaimKind::DescriptiveObservation {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "human_attention.claim.kind",
+                reason: "a comparator profile does not make a description a difference",
+            });
+        }
+        text(matched_profile_ref, "human_attention.claim.basis.matched_profile_ref")?;
+        if matches!(
+            method.comparison_basis,
+            ComparisonBasis::None | ComparisonBasis::NotApplicableWithReason
+        ) {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "human_attention.method.comparison_basis",
+                reason: "a comparative conclusion requires a declared comparison basis",
+            });
+        }
+        if !method
+            .comparator_profile_refs
+            .iter()
+            .any(|profile| profile == matched_profile_ref)
+        {
+            return Err(EvaluationContractError::InvalidDependency {
+                field: "human_attention.claim.basis.matched_profile_ref",
+                reason: "a comparative claim must name a profile declared by the record method",
+            });
+        }
+        text(
+            &applicability.task_risk_context,
+            "human_attention.claim.basis.applicability.task_risk_context",
+        )?;
+        text(
+            &applicability.exposure_context,
+            "human_attention.claim.basis.applicability.exposure_context",
+        )?;
+
+        for required in [
+            "selection_bias",
+            "censoring",
+            "intervention_effect",
+            "alternative_explanation",
+        ] {
+            if !caveats.iter().any(|caveat| caveat.label() == required) {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "human_attention.claim.basis.caveats",
+                    reason: "a comparative conclusion must preserve every declared caveat",
+                });
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for caveat in caveats {
+            if !seen.insert(caveat.label()) {
+                return Err(EvaluationContractError::DuplicateIdentity {
+                    field: "human_attention.claim.basis.caveats",
+                });
+            }
+            text(caveat.statement(), "human_attention.claim.basis.caveats.statement")?;
+        }
+
+        self.validate_kind_evidence(kind)
+    }
+
+    /// A prevented action is credited only from an observed pre-exposure
+    /// prevention count, and a suppression false-negative rate only from an
+    /// observed missed-critical count. Neither is inferred from a lower
+    /// blocking, harm, or alert figure.
+    fn validate_kind_evidence(
+        &self,
+        kind: HumanAttentionClaimKind,
+    ) -> Result<(), EvaluationContractError> {
+        if let Some(required_metric) = kind.required_evidence_metric()
+            && !self.supporting_metrics.contains(&required_metric)
+        {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "human_attention.claim.supporting_metrics",
+                reason: "the claim must name the measured risk or prevention count it rests on",
+            });
+        }
+        if self
+            .supporting_metrics
+            .iter()
+            .all(|m| m.is_volume_or_profile_shape())
+        {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "human_attention.claim.supporting_metrics",
+                reason: "volume and profile shape alone support no conclusion",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl HumanAttentionMetric {
+    /// Volume, delivery, and profile-shape metrics. They describe how much
+    /// attention a policy asked for, not what it achieved, so they can never
+    /// be the sole support of a comparative conclusion.
+    const fn is_volume_or_profile_shape(self) -> bool {
+        use HumanAttentionMetric as M;
+        matches!(
+            self,
+            M::DeduplicatedInboxItems
+                | M::DeliveryAttempts
+                | M::NotificationApprovalAndTelemetryProfile
+                | M::PolicyAndTaskRiskProfile
+        )
+    }
+}
+
+impl HumanAttentionEvaluation {
+    /// Every claim rests only on metrics this record measured with an observed
+    /// value; an unknown or not-applicable measurement supports no conclusion.
+    fn validate_claims(&self) -> Result<(), EvaluationContractError> {
+        let mut seen = BTreeSet::new();
+        for claim in &self.claims {
+            if !seen.insert(claim.claim_ref.as_str()) {
+                return Err(EvaluationContractError::DuplicateIdentity {
+                    field: "human_attention.claims.claim_ref",
+                });
+            }
+            claim.validate(&self.method, &self.observation_window)?;
+            for metric in &claim.supporting_metrics {
+                let Some(observation) = self.observation_for(*metric) else {
+                    return Err(EvaluationContractError::InvalidDependency {
+                        field: "human_attention.claim.supporting_metrics",
+                        reason: "the claim names a metric this record does not measure",
+                    });
+                };
+                if matches!(
+                    &observation.value,
+                    HumanAttentionMetricValue::Unknown { .. }
+                        | HumanAttentionMetricValue::NotApplicable { .. }
+                ) {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "human_attention.claim.supporting_metrics",
+                        reason: "an unknown measurement cannot support a conclusion",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn observation_for(
+        &self,
+        metric: HumanAttentionMetric,
+    ) -> Option<&HumanAttentionMetricObservation> {
+        [
+            &self.policy_and_task_risk_profile,
+            &self.notification_approval_and_telemetry_profile,
+            &self.missed_critical_and_false_critical_counts,
+            &self.pre_exposure_prevention_and_conditional_intervention,
+            &self.final_harm_and_residual_risk,
+            &self.benign_false_blocks_and_abandoned_work,
+            &self.interruption_and_resumption_time_quality,
+            &self.task_correctness_rework_and_human_attention,
+            &self.overtrust_undertrust_and_recoverability_observations,
+            &self.privacy_purpose_retention_and_disclosure_cost,
+        ]
+        .iter()
+        .flat_map(|group| group.metrics.iter())
+        .find(|observation| observation.metric == metric)
     }
 }
 
