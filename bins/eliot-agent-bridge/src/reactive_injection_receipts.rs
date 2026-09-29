@@ -485,6 +485,23 @@ impl ReactiveInjectionLedger {
         {
             return Err(ReactiveInjectionError::DuplicateSuppressed);
         }
+        // A new owner revision or assessed risk supersedes only this cue's
+        // delivered normal evidence. Sibling cues from the same source keep
+        // their session deduplication state.
+        if admission.admitted_severity == Severity::Normal {
+            for prior in self.items.values_mut() {
+                if prior.severity == Severity::Normal
+                    && prior.session_id == session_id
+                    && prior.cue.source == cue.source
+                    && prior.cue.cue_id == cue.cue_id
+                    && (prior.cue.source_revision != cue.source_revision
+                        || prior.admission.risk != admission.risk)
+                    && matches!(prior.state, ItemState::Delivered { .. })
+                {
+                    prior.invalidated = true;
+                }
+            }
+        }
         self.next_item_seq += 1;
         let item_id = format!("reactive-item-{}", self.next_item_seq);
         self.items.insert(
