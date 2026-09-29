@@ -3,8 +3,8 @@
 //! (issue #1221, wave A).
 //!
 //! This module is the single place that answers "is this `SurrealQL` DDL body
-//! executable by the current owner?". It publishes two closed, ordered
-//! denominators and one fail-closed resolution over both:
+//! executable by the current owner?". It publishes three closed, ordered
+//! denominators and one fail-closed resolution over all of them:
 //!
 //! - [`EMBEDDED_SCHEMA_BODIES`] — every DDL body this owner embeds, each
 //!   bound to its migration id, schema generation, predecessor generation,
@@ -17,12 +17,31 @@
 //!   the repository but that this owner never executes, each with its
 //!   disposition, rationale and named removal condition.
 //!
-//! Both are derived from the same [`crate::schema`] constants the executor
-//! applies. Neither restates DDL bytes, neither names a filesystem location
-//! as authority, and no caller can supply a migration directory: repository
-//! filename presence is not execution ownership. [`resolve_executable_body`]
-//! is the only admission entry point and refuses everything outside the
-//! executable set with a typed reason — never a default-allow.
+//! A third denominator completes the work-item W1 object classes that decide
+//! whether a path *outside* this module can select or execute one of those
+//! roots: [`SELECTION_PATHS`] — every migration executor, configuration path,
+//! package/release consumer and restore dependency that can reach a migration
+//! statement, each recorded with the exact repository `path::symbol` it names.
+//! Without it the two denominators above answer "which body and which root does
+//! the current owner hold?" while staying silent about the callers that could
+//! reach past them.
+//!
+//! The first two are derived from the same [`crate::schema`] constants the
+//! executor applies. The third names repository locations by design, because
+//! "which file outside this crate can still reach a migration statement" has no
+//! answer without naming them; naming one grants it nothing. None of the three
+//! treats a filesystem location as authority: no caller can supply a migration
+//! directory, and repository filename presence is not execution ownership.
+//!
+//! [`resolve_executable_body`] is the only admission entry point and refuses
+//! everything outside the executable set with a typed reason — never a
+//! default-allow. It refuses a presented identity naming a recorded
+//! [`SelectionPath`] as [`ExecutableBodyRefusal::SelectionPathNotExecutable`]
+//! rather than as an anonymous unknown identity, and it fails the whole gate
+//! closed with [`ExecutableBodyRefusal::SelectionPathClosure`] when
+//! [`validate_selection_path_closure`] finds the record not closed — a class
+//! with no instance, a selection path naming a root this owner has not declared
+//! non-executable, or two rows claiming one `path::symbol`.
 //!
 //! Maintenance invariant: every DDL constant declared in [`crate::schema`]
 //! must appear in exactly one inventory entry. Rust cannot reflect over
@@ -266,6 +285,326 @@ pub(crate) static NON_EXECUTABLE_MIGRATION_ROOTS: [NonExecutableRoot; 3] = [
     },
 ];
 
+// -- Selection paths (issue #1221 work item W1) ----------------------------
+//
+// The two denominators above record what the current owner *holds*: every
+// embedded DDL body and every migration root that exists in the tree but that
+// this owner never executes. Work item W1 also names the object classes that
+// decide whether a path *outside* this crate can reach a migration statement at
+// all — a migration executor, a configuration path, a package/release consumer
+// and a restore dependency. Without those classes the inventory would answer
+// "which body and which root?" while staying silent about the callers that can
+// reach past them, which is the smaller world the work item refuses.
+//
+// Every entry names a repository `path::symbol` that exists in the tree today,
+// and the two closure checks below keep the table honest: no entry may name a
+// root this owner has not declared non-executable, no two entries may claim one
+// `path::symbol`, and no class may be empty. A class that lost its last real
+// instance fails the gate instead of publishing an empty denominator.
+
+/// The class of object a [`SelectionPath`] names, one variant per object class
+/// work item W1 assigns to this inventory.
+///
+/// The class is the stable refusal identity: [`resolve_executable_body`] names
+/// it when a presented identity resolves to an entry, so the operator-visible
+/// error says *which kind* of outside path was refused and not only that some
+/// identity was unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectionPathClass {
+    /// A migration constructor or executor that can send migration statements
+    /// to a provider without passing this owner's admission gate.
+    MigrationExecutor,
+    /// A configuration field or key that can name a migration root directory.
+    ConfigPath,
+    /// A packaging, installation or release step that copies a root into an
+    /// installed tree or writes a root path into an installed configuration.
+    PackageReleaseConsumer,
+    /// A restore, snapshot or export path whose correctness depends on the
+    /// current schema generation and therefore on this owner's migration graph.
+    RestoreDependency,
+}
+
+/// One recorded outside path that can reach a migration statement.
+///
+/// This is deliberately not a second ownership claim. The current owner still
+/// holds every body in [`EMBEDDED_SCHEMA_BODIES`] and is still the only
+/// executor of them; what this row records is that a specific
+/// `path::symbol` elsewhere in the tree is a *reachable* path to migration
+/// statements, so the owner can state what that path is and what removes it
+/// instead of discovering it after the fact.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectionPath {
+    /// Which work-item-W1 object class this entry is.
+    pub(crate) class: SelectionPathClass,
+    /// Repository path of the file that owns the reachable path.
+    pub(crate) path: &'static str,
+    /// The item inside that file that performs the reaching.
+    pub(crate) symbol: &'static str,
+    /// The migration root directory this entry can select or execute, matched
+    /// against [`NON_EXECUTABLE_MIGRATION_ROOTS`] as an exact path or a `/`
+    /// separated prefix. `None` when the entry reaches the current owner's own
+    /// generation rather than a legacy root.
+    pub(crate) selects: Option<&'static str>,
+    /// Why the entry is recorded, with the disposition source it comes from.
+    pub(crate) rationale: &'static str,
+}
+
+/// Rationale shared by every entry that resolves nothing outside this owner.
+///
+/// A restore dependency is not an alternative migration root: it reads the
+/// generation and the table census the current owner already published and
+/// applies no DDL of its own. It is recorded because `A13.7` restore verifies
+/// schema and format compatibility, so the set of paths whose correctness rides
+/// on the migration graph is part of the graph's contract.
+const OWNER_GENERATION_DEPENDENCY: &str = "depends on the current owner's schema generation and table census rather than selecting a migration root; it applies no DDL of its own, and A13.7 restore verifies schema and format compatibility against exactly this generation, so it is recorded as a dependency of the one executable graph and never as a second root";
+
+/// Every outside path that can reach a migration statement.
+///
+/// Ordered by class so the table reads as the four work-item-W1 denominators in
+/// sequence: executors, then configuration paths, then package/release
+/// consumers, then restore dependencies. Every `path`/`symbol` pair is verified
+/// to exist in the tree; [`validate_selection_path_closure`] additionally
+/// requires each `selects` root to be one this owner already declares
+/// non-executable, so this table cannot name a root nobody has dispositioned.
+pub(crate) static SELECTION_PATHS: [SelectionPath; 13] = [
+    // -- Migration executors ------------------------------------------------
+    //
+    // The current owner's own executor is deliberately absent: it is
+    // `crate::apply::admit_migration` -> [`resolve_executable_body`], the one
+    // gate every body in [`EMBEDDED_SCHEMA_BODIES`] reaches a provider through,
+    // and it is the module this file is. Every row here is a path that reaches
+    // migration statements *without* passing it.
+    SelectionPath {
+        class: SelectionPathClass::MigrationExecutor,
+        path: "crates/eliot-store/src/migration.rs",
+        symbol: "MigrationRunner::run_all",
+        selects: None,
+        rationale: "a migration executor outside the current owner: run_all hands each caller-constructed CompiledMigration straight to SurrealStore::apply_migration as (migration_id, sql), so its statements are arbitrary caller text that never reaches this owner's gate and its only digest is the legacy blake3 checksum rather than the published SHA-256. No in-tree caller constructs a MigrationRunner, which is why the executor is recorded here with its owner rather than deleted from under it",
+    },
+    SelectionPath {
+        class: SelectionPathClass::MigrationExecutor,
+        path: "crates/eliot-store/src/surreal_store.rs",
+        symbol: "SurrealStore::apply_migration",
+        selects: None,
+        rationale: "the executor MigrationRunner::run_all reaches: it passes the caller-supplied sql argument straight to transport().query() with no admission, digest or generation check, which is the arbitrary raw SQL execution the #1221 assignment lists as forbidden and which this owner must therefore keep out of its own callers rather than route through resolve_executable_body",
+    },
+    SelectionPath {
+        class: SelectionPathClass::MigrationExecutor,
+        path: "crates/eliot-store/src/canonical_store.rs",
+        symbol: "CanonicalStore::migrate_schema",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "the legacy core's ordered schema executor: it runs eleven SchemaMigrate* named operations whose bodies are include_str! from the declared legacy src/surql root, and current eliot-app commands still call it directly, so the legacy root has a live named-operation consumer this owner refuses rather than one that merely sits on disk",
+    },
+    SelectionPath {
+        class: SelectionPathClass::MigrationExecutor,
+        path: "crates/eliot-store/src/surql/operation.rs",
+        symbol: "NamedSurqlOp::SchemaMigrate",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "the binding from a named operation to its exact legacy bytes: template() returns include_str!(\"000_schema.surql\") from the declared legacy root, so every legacy body has a compile-time consumer identity even where no configuration key selects the root; this owner refuses that identity and executes none of those bytes. Presenting the file path reaches the root refusal instead, which names the same root",
+    },
+    // -- Configuration paths -------------------------------------------------
+    //
+    // A config path names a root by *value*. The one current key that still
+    // carries a root-named value is `store.surql_dir`; the front door scans for
+    // it only to refuse it, and the refusal is recorded rather than the value.
+    SelectionPath {
+        class: SelectionPathClass::ConfigPath,
+        path: "crates/eliot-types/src/config.rs",
+        symbol: "StoreConfig::surql_dir",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "the one surviving configuration key that names a migration-root directory; its default is crates/eliot-store/src/surql and require_non_empty refuses an empty value, so a current document selects the declared legacy root by default. The migrations_dir key that also named a root is deleted and deny_unknown_fields keeps a document that still carries it a refusal, which is why exactly one surviving key is recorded",
+    },
+    SelectionPath {
+        class: SelectionPathClass::ConfigPath,
+        path: "crates/eliot-types/src/config.rs",
+        symbol: "StoreConfig",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "the [store] table itself: deny_unknown_fields refuses an unknown member, so surql_dir is the only way a document can name a root through it and a second key would be a refusal rather than a silent default; recorded as the enclosing shape so a future field is a stated addition to this table and not an unnoticed new selection path",
+    },
+    SelectionPath {
+        class: SelectionPathClass::ConfigPath,
+        path: "bins/eliot/src/legacy_governor_config.rs",
+        symbol: "detect_legacy_markers",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "the front door's legacy-configuration scan: it matches the [store] table, surql_dir and migrations_dir by text and rejects the document, so the retired governor configuration is a current path that reads both legacy root names. The refusal, not the value, is what keeps it from selecting one, and recording it states where that refusal lives rather than leaving the mention undiscovered",
+    },
+    // -- Package/release consumers -------------------------------------------
+    SelectionPath {
+        class: SelectionPathClass::PackageReleaseConsumer,
+        path: "crates/eliot-app/src/commands/operations.rs",
+        symbol: "run_daemon_init_default",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "a real packaging consumer of a root this owner declares LegacyRoot: it reads config.store.surql_dir, copies the whole configured tree into the installed <eliot_home>/resources/surql, and writes the copied path back into the installed config, so a legacy root survives installation and stays selectable from the installed document",
+    },
+    SelectionPath {
+        class: SelectionPathClass::PackageReleaseConsumer,
+        path: "crates/eliot-app/src/commands/operations.rs",
+        symbol: "copy_resource_tree",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "the copier run_daemon_init_default uses: it recursively reproduces whatever directory it is handed, so the installed legacy .surql tree is a byte copy of the declared root rather than a generated artifact, and its removal condition is the same as the root's",
+    },
+    SelectionPath {
+        class: SelectionPathClass::PackageReleaseConsumer,
+        path: "crates/eliot-app/src/dogfood.rs",
+        symbol: "init",
+        selects: Some("crates/eliot-store/src/surql"),
+        rationale: "a second instance of the packaging shape, distinct from run_daemon_init_default because it writes the path rather than copying the tree: it sets config.store.surql_dir to the project surql directory in the generated dogfood config, so an installed dogfood document names a root-shaped directory and the operator-visible difference from the daemon path is copy-versus-reference",
+    },
+    // -- Restore dependencies ------------------------------------------------
+    SelectionPath {
+        class: SelectionPathClass::RestoreDependency,
+        path: "crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs",
+        symbol: "admitted_generation_ddl",
+        selects: None,
+        rationale: OWNER_GENERATION_DEPENDENCY,
+    },
+    SelectionPath {
+        class: SelectionPathClass::RestoreDependency,
+        path: "crates/storage/eliot-store-surreal-adapter/src/client/backup_snapshot.rs",
+        symbol: "fixed_snapshot_statement",
+        selects: None,
+        rationale: OWNER_GENERATION_DEPENDENCY,
+    },
+    SelectionPath {
+        class: SelectionPathClass::RestoreDependency,
+        path: "crates/storage/eliot-store-surreal-adapter/src/backup_restore.rs",
+        symbol: "validate_restore_batch",
+        selects: None,
+        rationale: OWNER_GENERATION_DEPENDENCY,
+    },
+];
+
+/// Why the recorded selection paths are not closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectionPathClosure {
+    /// A [`SelectionPathClass`] has no entry, so the inventory would answer
+    /// for three classes of the four work item W1 names.
+    EmptyClass {
+        /// The class with no recorded instance.
+        class: SelectionPathClass,
+    },
+    /// An entry names a migration root this owner does not declare in
+    /// [`NON_EXECUTABLE_MIGRATION_ROOTS`], so the table would record a
+    /// reachable root nobody has dispositioned.
+    UndeclaredRoot {
+        /// The class of the offending entry.
+        class: SelectionPathClass,
+        /// Repository path of the offending entry.
+        path: &'static str,
+        /// Symbol of the offending entry.
+        symbol: &'static str,
+        /// The root the entry claims to select.
+        root: &'static str,
+    },
+    /// Two entries claim the same `path::symbol`.
+    DuplicateEntry {
+        /// The class of the duplicated entry.
+        class: SelectionPathClass,
+        /// Repository path claimed twice.
+        path: &'static str,
+        /// Symbol claimed twice.
+        symbol: &'static str,
+    },
+}
+
+impl fmt::Display for SelectionPathClosure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyClass { class } => {
+                write!(formatter, "no selection path is recorded for class {class:?}")
+            }
+            Self::UndeclaredRoot {
+                class,
+                path,
+                symbol,
+                root,
+            } => write!(
+                formatter,
+                "{path}::{symbol} is recorded as a {class:?} selecting {root}, which the current schema owner does not declare as a non-executable migration root"
+            ),
+            Self::DuplicateEntry { class, path, symbol } => write!(
+                formatter,
+                "the {class:?} selection path {path}::{symbol} is recorded more than once"
+            ),
+        }
+    }
+}
+
+/// Fails closed unless every work-item-W1 class is populated and every entry
+/// names a root this owner already declares non-executable.
+///
+/// Run on the same admission path that admits a real migration, for the same
+/// reason [`validate_legacy_table_mapping`] runs there: an incomplete record is
+/// an operator-visible refusal rather than a smaller published world. It reads
+/// [`SELECTION_PATHS`] only — it never consults the filesystem — so a record
+/// cannot claim an instance it has not verified; the verification is that every
+/// `path::symbol` in the table was confirmed to exist in the tree before it was
+/// written here, and this check keeps the table internally closed.
+fn validate_selection_path_closure() -> Result<(), SelectionPathClosure> {
+    for class in [
+        SelectionPathClass::MigrationExecutor,
+        SelectionPathClass::ConfigPath,
+        SelectionPathClass::PackageReleaseConsumer,
+        SelectionPathClass::RestoreDependency,
+    ] {
+        if !SELECTION_PATHS.iter().any(|entry| entry.class == class) {
+            return Err(SelectionPathClosure::EmptyClass { class });
+        }
+    }
+    for entry in &SELECTION_PATHS {
+        if SELECTION_PATHS
+            .iter()
+            .filter(|other| other.path == entry.path && other.symbol == entry.symbol)
+            .count()
+            > 1
+        {
+            return Err(SelectionPathClosure::DuplicateEntry {
+                class: entry.class,
+                path: entry.path,
+                symbol: entry.symbol,
+            });
+        }
+        if let Some(root) = entry.selects
+            && non_executable_root_for(root).is_none()
+        {
+            return Err(SelectionPathClosure::UndeclaredRoot {
+                class: entry.class,
+                path: entry.path,
+                symbol: entry.symbol,
+                root,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Returns the recorded selection path a presented identity names.
+///
+/// The arms mirror [`non_executable_root_for`]: the recorded `symbol`, the
+/// repository `path` alone, and the `path` directory prefix with its `/`
+/// separator. Matching on the path means a caller that presents the file
+/// holding a legacy executor is refused as that executor rather than as an
+/// anonymous unknown identity; where two entries share one file, the first in
+/// table order answers and the message is stable.
+///
+/// One entry's `path` arm is deliberately shadowed, and the shadow is a refusal
+/// rather than a gap. `crates/eliot-store/src/surql/operation.rs` sits inside a
+/// declared legacy root, so [`resolve_executable_body`] refuses it first as
+/// [`ExecutableBodyRefusal::NonExecutableRoot`], which names the root and its
+/// removal condition and so is the more precise answer; the entry's `symbol`
+/// arm still reaches this function for the bare operation name. A declared
+/// root's own path reaches no entry here at all, which is correct: a root is
+/// not an outside path to a migration statement.
+fn selection_path_for(identity: &str) -> Option<&'static SelectionPath> {
+    SELECTION_PATHS.iter().find(|entry| {
+        entry.path == identity
+            || entry.symbol == identity
+            || identity
+                .strip_prefix(entry.path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Typed reason a presented body is not executable by the current owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutableBodyRefusal {
@@ -297,6 +636,27 @@ pub(crate) enum ExecutableBodyRefusal {
         rationale: &'static str,
         /// The named condition under which the root leaves the tree.
         removal_condition: &'static str,
+    },
+    /// The presented identity names a recorded outside path: a migration
+    /// executor, a configuration path, a package/release consumer or a restore
+    /// dependency. Naming one is not itself the refusal — the current owner
+    /// simply does not execute through it — and the class makes the refusal
+    /// answer "which kind of outside path" rather than "unknown identity".
+    SelectionPathNotExecutable {
+        /// The class of the recorded path.
+        class: SelectionPathClass,
+        /// Repository path of the recorded path.
+        path: &'static str,
+        /// Symbol of the recorded path.
+        symbol: &'static str,
+        /// Why the entry is recorded.
+        rationale: &'static str,
+    },
+    /// The recorded selection paths are not closed, so the inventory cannot
+    /// answer the question it exists to answer and no body is admitted at all.
+    SelectionPathClosure {
+        /// The closure failure, stated rather than collapsed into a string.
+        omission: SelectionPathClosure,
     },
     /// The presented identity names a legacy table, which has a stated
     /// disposition but is never an executable migration body.
@@ -344,6 +704,18 @@ impl fmt::Display for ExecutableBodyRefusal {
             }
             Self::DeclaredNotAdmitted { const_name, note } => {
                 write!(formatter, "{const_name} is not admitted: {note}")
+            }
+            Self::SelectionPathNotExecutable {
+                class,
+                path,
+                symbol,
+                rationale,
+            } => write!(
+                formatter,
+                "{path}::{symbol} is a recorded {class:?} outside the current schema owner and is not executable through it: {rationale}"
+            ),
+            Self::SelectionPathClosure { omission } => {
+                write!(formatter, "the recorded selection paths are not closed: {omission}")
             }
             Self::NonExecutableRoot {
                 path,
@@ -1250,14 +1622,26 @@ fn non_executable_root_for(identity: &str) -> Option<&'static NonExecutableRoot>
 /// caller to name a different body, directory or DDL text. A declared
 /// non-executable root is refused as
 /// [`ExecutableBodyRefusal::NonExecutableRoot`] for the three spellings
-/// [`non_executable_root_for`] matches; any other identity that names no
-/// published body is refused as [`ExecutableBodyRefusal::UnknownIdentity`].
+/// [`non_executable_root_for`] matches; an identity naming a recorded outside
+/// path in [`SELECTION_PATHS`] is refused as
+/// [`ExecutableBodyRefusal::SelectionPathNotExecutable`]; and any other identity
+/// that names no published body is refused as
+/// [`ExecutableBodyRefusal::UnknownIdentity`].
+///
+/// The recorded selection paths are checked closed before anything is resolved:
+/// an inventory that lost a work-item-W1 class, duplicated a `path::symbol` or
+/// named an undeclared root cannot answer "can a current config, launch,
+/// packaging or restore path select or execute a legacy migration root?", so it
+/// admits nothing rather than answering from a smaller world.
 pub(crate) fn resolve_executable_body(
     identity: &str,
     statements: &str,
     generation: &str,
     checksum_sha256: &str,
 ) -> Result<&'static EmbeddedSchemaBody, ExecutableBodyRefusal> {
+    if let Err(omission) = validate_selection_path_closure() {
+        return Err(ExecutableBodyRefusal::SelectionPathClosure { omission });
+    }
     if let Some(body) = embedded_body_by_migration_id(identity) {
         return admit_published_body(body, statements, generation, checksum_sha256);
     }
@@ -1285,6 +1669,14 @@ pub(crate) fn resolve_executable_body(
             disposition: root.disposition,
             rationale: root.rationale,
             removal_condition: root.removal_condition,
+        });
+    }
+    if let Some(entry) = selection_path_for(identity) {
+        return Err(ExecutableBodyRefusal::SelectionPathNotExecutable {
+            class: entry.class,
+            path: entry.path,
+            symbol: entry.symbol,
+            rationale: entry.rationale,
         });
     }
     Err(ExecutableBodyRefusal::UnknownIdentity {
