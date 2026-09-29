@@ -94,7 +94,7 @@ pub use request_loop::{
     RESULT_PHASE_RECONCILE, RequestLoopReport, ServedResultReadback, WASM_HOST_REQUEST_WIRE_ID,
     WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID, WASM_HOST_RESULT_WIRE_VERSION,
     WasmHostRequest, WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame,
-    run_ordinary_request_loop, run_request_loop,
+    run_ordinary_request_loop, run_request_loop, validate_frame, validate_result_stream,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{

@@ -157,7 +157,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Merge Compile Run Manifest"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Repository: $env:GITHUB_REPOSITORY event=$env:GITHUB_EVENT_NAME ref=$env:GITHUB_REF Source SHA=$manifestSha"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Runner: os=$env:RUNNER_OS image=$env:ImageOS arch=$env:RUNNER_ARCH"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: $rustcIdentity / $cargoIdentity / dotnet $dotnetIdentity / $pythonIdentity"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: $rustcIdentity / $cargoIdentity / dotnet $dotnetIdentity / python $pythonIdentity"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Inputs: Cargo.lock=$lockHash rust-toolchain=$toolHash ci.yml=$ciHash verify.ps1=$profileHash"
           $gwfJson = Join-Path $env:RUNNER_TEMP 'gwf-actions.json'
           python scripts/verify-github-workflows.py --root . --json-out $gwfJson
@@ -179,3 +179,40 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "MERGE_COMPILE_SOURCE_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
+
+  repair-source-bootstrap:
+    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: bootstrap pinned repair workspace for R1-R4 (temporary source-only job)' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 15f023ceb884ff872a64d613e70331c2c3c8aafd
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Route repair scope without modifying product source
+        shell: bash
+        run: |
+          git switch -C main
+          git status --short --branch
+          git rev-parse HEAD
+          python scripts/docs_read.py read --path crates/governor/eliot-skill/src/activation.rs --path scripts/verify-standalone-crates.py --path scripts/provision-surrealdb-release.py --path scripts/verify-dependency-policy.py --path scripts/verify.ps1 --path .github/workflows/ci.yml --path scripts/audit_cue_kind_retirement.py --path bins/eliot-kernel/src/host_request_route.rs --path bins/eliotd/src/daemon_runtime.rs --topic "R1-R4 compile repair, cold-runner input preparation, State and Cue ownership" --output .eliot/repair-docs.md --receipt-out .eliot/repair-docs.json
+      - name: Retain exact main snapshot and generated reading evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/repair-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/repair-source/SOURCE_SHA"
+          git ls-files -s > "$RUNNER_TEMP/repair-source/tracked-blobs.txt"
+          tar --exclude='./.eliot' --exclude='./.git/hooks' -czf "$RUNNER_TEMP/repair-source/source.tar.gz" .
+          cp .eliot/repair-docs.* "$RUNNER_TEMP/repair-source/" || true
+          sha256sum "$RUNNER_TEMP/repair-source/source.tar.gz" > "$RUNNER_TEMP/repair-source/archive.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: repair-source-main-15f023ce
+          path: ${{ runner.temp }}/repair-source/
+          if-no-files-found: error
+          retention-days: 3
