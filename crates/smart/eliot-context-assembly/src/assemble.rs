@@ -187,11 +187,19 @@ where
         fence_digest: expected_fence_digest,
     };
     view.validate_against(admitted)?;
+    // Binding the boundary metadata into the output identity is a separate step so
+    // the three owner-produced inputs stay visible: the admission receipt sealed
+    // upstream, the rendered output identity, and the boundary envelopes with their
+    // ordered member relations. Altered boundary metadata therefore changes the
+    // bound output identity instead of being invisible to it.
+    let boundary_binding =
+        boundary::boundary_binding_digest(&admitted.economy.receipt_digest, &view.output_digest, &boundaries)?;
     Ok(ActiveUnderstandingViewResult {
         view,
         admitted: admitted.clone(),
         serialized_bytes: bytes,
         boundaries,
+        boundary_binding,
     })
 }
 
@@ -271,6 +279,44 @@ pub struct ActiveUnderstandingViewResult {
     /// This is the round-trip half of the assembly result: readback can compare the
     /// declared source identities, per-unit scope/fence and admitted source order
     /// against what it reconstructed, instead of trusting a concatenated string.
-    /// Its recorded digest is validated against the payload held.
+    /// Its recorded digest is validated against the payload held, and
+    /// `boundary_binding` binds it into the output identity together with the
+    /// upstream admission receipt digest.
     pub boundaries: eliot_context_contracts::BoundaryMetadataSet,
+    /// Exact digest binding the admission receipt, the rendered output identity,
+    /// and the boundary metadata into one output identity.
+    ///
+    /// A consumer re-checks it with `ActiveUnderstandingViewResult::verify_boundaries`
+    /// rather than trusting the field: it is recomputed from what the consumer holds.
+    pub boundary_binding: String,
+}
+
+impl ActiveUnderstandingViewResult {
+    /// Re-check this result's boundary binding against the values it holds.
+    ///
+    /// The digest is recomputed from the retained admission receipt, the rendered
+    /// output identity, and the boundary payload held here, so a substituted
+    /// envelope, a reordered member, or a foreign source revision fails even when
+    /// each object would still validate on its own.
+    pub fn verify_boundaries(&self) -> Result<(), AssemblyError> {
+        boundary::verify_boundary_binding(
+            &self.boundary_binding,
+            &self.admitted.economy.receipt_digest,
+            &self.view.output_digest,
+            &self.boundaries,
+        )?;
+        self.boundaries.validate(boundary::assembly_boundary_limits())?;
+        // Round-trip the packed bytes against `boundary_binding`, the value recorded at
+        // production before any transport and bound to the upstream admission
+        // receipt, not against a digest derived from the bytes being read back.
+        boundary::read_back_boundaries(
+            &self.boundaries.pack()?,
+            &self.boundary_binding,
+            &self.admitted.economy.receipt_digest,
+            &self.view.output_digest,
+            &self.view.rendered,
+        )
+        .map(|_| ())
+        .map_err(AssemblyError::Contract)
+    }
 }
