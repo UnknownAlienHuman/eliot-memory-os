@@ -672,8 +672,9 @@ impl KernelSupervisionLeaseAuthority {
     /// is resumed by identity; a staged ticket for any other operation is a
     /// typed conflict, never stomped.
     ///
-    /// STITCH caller: the Kernel supervision tick holding the admitted
-    /// contour (out of scope: `bins/eliot-kernel/src/lib.rs`).
+    /// Production caller: `KernelComposition::renew_current_supervision_with_progress`
+    /// (`bins/eliot-kernel/src/lib.rs`), on the renewal-refusal tick, for
+    /// both the progress-submit and probe paths.
     pub fn expire_past_due_lease(
         &self,
         supervision_lease_id: &str,

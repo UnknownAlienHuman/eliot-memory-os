@@ -3778,6 +3778,16 @@ impl KernelComposition {
                     OrsError::SupervisionLeaseBindingMismatch,
                 ))?;
         if now_ms >= current_snapshot.record.binding.expires_at_ms {
+            // I1.5 W4 (expiry): the refusal tick also records the proved
+            // expiry durably, so the ORS head reaches `Expired`/terminal
+            // instead of lingering `Active` past its validity interval and
+            // blocking exact-fence generation retirement. The tick clock and
+            // the supervised contour fence are the fresh evidence; a fence
+            // mismatch fails closed inside the authority owner. A commit
+            // failure replaces the refusal with the fenced authority error
+            // and is retried on the next tick through the staged-ticket
+            // resume.
+            authority.expire_past_due_lease(lease_id, &contour.state_fence, now_ms)?;
             return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
         }
         authority.verify_active_snapshot(&current_snapshot, lease_id, now_ms)?;
