@@ -638,6 +638,11 @@ pub enum BridgeError {
     /// A caller-supplied revision or range is option-like and refused before
     /// any process is launched (flag-injection guard).
     InvalidArgument(String),
+    /// Git returned output that cannot be treated as exact readback evidence.
+    InvalidReadbackOutput {
+        operation: &'static str,
+        reason: &'static str,
+    },
     /// A destructive invocation was requested or constructed.
     DestructiveOpRejected(&'static str),
     /// The process port failed.
@@ -664,6 +669,9 @@ impl fmt::Display for BridgeError {
             Self::DirtyWorktree(detail) => write!(f, "dirty worktree guard: {detail}"),
             Self::PatchCheckFailed(detail) => write!(f, "patch check failed: {detail}"),
             Self::InvalidArgument(detail) => write!(f, "invalid argument: {detail}"),
+            Self::InvalidReadbackOutput { operation, reason } => {
+                write!(f, "invalid Git readback output for {operation}: {reason}")
+            }
             Self::GitFailed {
                 invocation,
                 code,
@@ -790,6 +798,43 @@ pub struct StatusReceipt {
     pub dirty: bool,
     /// Parsed porcelain entries.
     pub entries: Vec<StatusEntry>,
+}
+
+/// Exact commit revision observed by a Git readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitReadbackHead {
+    /// Shared receipt fields for `git rev-parse --verify HEAD^{commit}`.
+    pub common: CommonReceipt,
+    /// Full Git object ID for the observed HEAD commit.
+    pub revision: String,
+}
+
+/// Full patch output handle from a Git readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitReadbackDiff {
+    /// Shared receipt fields for the exact `git diff` invocation.
+    /// `common.stdout` binds the complete observed patch bytes by length and
+    /// SHA-256; its preview is bounded and may be truncated.
+    pub common: CommonReceipt,
+    /// Content address for the observed patch bytes. This is a digest identity,
+    /// not a claim that this crate persists or can retrieve the patch payload.
+    pub diff_ref: String,
+}
+
+/// Read-only Git evidence for confirming a host or filesystem hint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitReadbackReceipt {
+    /// Exact repository HEAD observed by Git.
+    pub head: GitReadbackHead,
+    /// Typed porcelain status, including the raw-output digest and invocation.
+    pub status: StatusReceipt,
+    /// Full tracked-file diff output handle relative to `head.revision`.
+    pub diff: GitReadbackDiff,
+    /// Stable content-addressed identity for the complete readback evidence.
+    /// It binds every invocation, exit observation, and full output digest.
+    pub evidence_ref: String,
+    /// SHA-256 payload of `evidence_ref`.
+    pub evidence_sha256: String,
 }
 
 /// Typed `branch` receipt (read-only listing).
@@ -1383,6 +1428,176 @@ impl<R: ProcessRunner> GitBridge<R> {
         Ok(DiffReceipt { common, files })
     }
 
+    /// Reads an exact HEAD revision, porcelain status, and full tracked-file
+    /// diff through the injected process runner.
+    ///
+    /// Each command's invocation and full stdout/stderr digests are retained.
+    /// The aggregate evidence identity binds those observations to the SID,
+    /// repository root, lease, and exact argv. A readback is evidence of Git's
+    /// observed state only: it does not establish who caused a change or
+    /// provide an atomic filesystem snapshot. Untracked paths appear in status
+    /// but have no patch bytes in Git's `diff` output.
+    ///
+    /// # Errors
+    /// Identity/root/lease failures, runner or Git failures, or malformed
+    /// revision output.
+    pub fn reconciliation_readback(
+        &self,
+        identity: &ExecutionIdentity,
+        root: &RepoRoot,
+        admission: Option<AclAdmission>,
+        lease: Option<&Lease>,
+    ) -> Result<GitReadbackReceipt, BridgeError> {
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
+
+        let head_args = vec![
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "HEAD^{commit}".to_owned(),
+        ];
+        let (head_outcome, head_invocation, head_exit) = self.exec(head_args, &resolved)?;
+        Self::check_success(&head_outcome, &head_invocation)?;
+        let head_revision = parse_git_readback_revision(&head_outcome.stdout)?;
+
+        let status_args = vec![
+            "--no-pager".to_owned(),
+            "--no-optional-locks".to_owned(),
+            "-c".to_owned(),
+            "core.fsmonitor=false".to_owned(),
+            "status".to_owned(),
+            "--porcelain=v1".to_owned(),
+            "-b".to_owned(),
+            "--no-renames".to_owned(),
+            "--untracked-files=all".to_owned(),
+        ];
+        let (status_outcome, status_invocation, status_exit) =
+            self.exec(status_args, &resolved)?;
+        Self::check_success(&status_outcome, &status_invocation)?;
+        let status_text = std::str::from_utf8(&status_outcome.stdout).map_err(|_| {
+            BridgeError::InvalidReadbackOutput {
+                operation: "status",
+                reason: "porcelain output is not UTF-8",
+            }
+        })?;
+        let mut branch_line = None;
+        let mut entries = Vec::new();
+        for (index, line) in status_text.lines().enumerate() {
+            if index == 0 && line.starts_with("## ") {
+                branch_line = Some(line.to_owned());
+                continue;
+            }
+            let bytes = line.as_bytes();
+            if bytes.len() < 3 || bytes[2] != b' ' {
+                if line.is_empty() {
+                    continue;
+                }
+                return Err(BridgeError::InvalidReadbackOutput {
+                    operation: "status",
+                    reason: "porcelain entry is missing its status/path separator",
+                });
+            }
+            if branch_line.is_none() {
+                return Err(BridgeError::InvalidReadbackOutput {
+                    operation: "status",
+                    reason: "porcelain output is missing its branch header",
+                });
+            }
+            if !bytes[..2].iter().all(u8::is_ascii) {
+                return Err(BridgeError::InvalidReadbackOutput {
+                    operation: "status",
+                    reason: "porcelain status code is not ASCII",
+                });
+            }
+            if bytes.len() == 3 {
+                return Err(BridgeError::InvalidReadbackOutput {
+                    operation: "status",
+                    reason: "porcelain entry has an empty path",
+                });
+            }
+            entries.push(StatusEntry {
+                xy: line[..2].to_owned(),
+                path: line[3..].to_owned(),
+            });
+        }
+        if branch_line.is_none() {
+            return Err(BridgeError::InvalidReadbackOutput {
+                operation: "status",
+                reason: "porcelain output is missing its branch header",
+            });
+        }
+        let dirty = !entries.is_empty();
+        let status_common = Self::common(
+            identity,
+            resolved.clone(),
+            None,
+            lease.clone(),
+            status_invocation,
+            status_exit,
+            &status_outcome,
+            dirty,
+        );
+        let status = StatusReceipt {
+            common: status_common,
+            branch_line,
+            dirty,
+            entries,
+        };
+
+        let diff_args = vec![
+            "--no-pager".to_owned(),
+            "--no-optional-locks".to_owned(),
+            "diff".to_owned(),
+            "--no-color".to_owned(),
+            "--no-ext-diff".to_owned(),
+            "--no-textconv".to_owned(),
+            "--no-renames".to_owned(),
+            "--binary".to_owned(),
+            head_revision.clone(),
+            "--".to_owned(),
+        ];
+        let (diff_outcome, diff_invocation, diff_exit) = self.exec(diff_args, &resolved)?;
+        Self::check_success(&diff_outcome, &diff_invocation)?;
+
+        let head_common = Self::common(
+            identity,
+            resolved.clone(),
+            None,
+            lease.clone(),
+            head_invocation,
+            head_exit,
+            &head_outcome,
+            dirty,
+        );
+        let head = GitReadbackHead {
+            common: head_common,
+            revision: head_revision,
+        };
+        let diff_common = Self::common(
+            identity,
+            resolved,
+            None,
+            lease,
+            diff_invocation,
+            diff_exit,
+            &diff_outcome,
+            dirty,
+        );
+        let diff = GitReadbackDiff {
+            diff_ref: format!("git-diff:sha256:{}", diff_common.stdout.sha256),
+            common: diff_common,
+        };
+        let evidence_sha256 = git_readback_digest(&head.common, &status.common, &diff.common);
+        let evidence_ref = format!("git-readback:sha256:{evidence_sha256}");
+
+        Ok(GitReadbackReceipt {
+            head,
+            status,
+            diff,
+            evidence_ref,
+            evidence_sha256,
+        })
+    }
+
     /// Typed worktree create: isolated, non-destructive, lease-scoped.
     ///
     /// Runs a dirty-state preflight (recorded on the receipt; `require_clean`
@@ -1919,6 +2134,91 @@ fn reject_option_like(value: &str, what: &'static str) -> Result<(), BridgeError
 
 fn best_effort_canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+fn parse_git_readback_revision(stdout: &[u8]) -> Result<String, BridgeError> {
+    let text = std::str::from_utf8(stdout).map_err(|_| BridgeError::InvalidReadbackOutput {
+        operation: "rev-parse",
+        reason: "revision output is not UTF-8",
+    })?;
+    let mut lines = text.lines();
+    let revision = lines.next().unwrap_or_default();
+    if lines.next().is_some()
+        || !matches!(revision.len(), 40 | 64)
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(BridgeError::InvalidReadbackOutput {
+            operation: "rev-parse",
+            reason: "expected exactly one full Git object ID",
+        });
+    }
+    Ok(revision.to_ascii_lowercase())
+}
+
+fn git_readback_digest(
+    head: &CommonReceipt,
+    status: &CommonReceipt,
+    diff: &CommonReceipt,
+) -> String {
+    let mut material = b"eliot-git-readback-v1\0".to_vec();
+    append_readback_common(&mut material, head);
+    append_readback_common(&mut material, status);
+    append_readback_common(&mut material, diff);
+    sha256_hex(&material)
+}
+
+fn append_readback_field(material: &mut Vec<u8>, value: &[u8]) {
+    material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    material.extend_from_slice(value);
+}
+
+fn append_readback_path(material: &mut Vec<u8>, path: &Path) {
+    append_readback_field(material, path.as_os_str().as_encoded_bytes());
+}
+
+fn append_readback_optional_path(material: &mut Vec<u8>, path: Option<&Path>) {
+    if let Some(path) = path {
+        material.push(1);
+        append_readback_path(material, path);
+    } else {
+        material.push(0);
+    }
+}
+
+fn append_readback_common(material: &mut Vec<u8>, common: &CommonReceipt) {
+    append_readback_field(material, common.sid.as_bytes());
+    append_readback_path(material, &common.root);
+    append_readback_optional_path(material, common.worktree.as_deref());
+    match &common.lease {
+        Some(lease) => {
+            material.push(1);
+            append_readback_field(material, lease.id().as_bytes());
+            append_readback_field(material, lease.sid().as_bytes());
+            append_readback_path(material, lease.scope_root());
+            append_readback_optional_path(material, lease.worktree());
+            append_readback_field(material, lease.issued_by().as_bytes());
+        }
+        None => material.push(0),
+    }
+    append_readback_field(material, common.invocation.exe.as_bytes());
+    append_readback_field(
+        material,
+        common.invocation.cwd.as_os_str().as_encoded_bytes(),
+    );
+    append_readback_field(
+        material,
+        &(common.invocation.args.len() as u64).to_be_bytes(),
+    );
+    for arg in &common.invocation.args {
+        append_readback_field(material, arg.as_bytes());
+    }
+    append_readback_field(material, &common.exit.code.to_be_bytes());
+    material.push(u8::from(common.exit.success));
+    append_readback_field(material, &common.stdout.total_bytes.to_be_bytes());
+    append_readback_field(material, common.stdout.sha256.as_bytes());
+    append_readback_field(material, &common.stderr.total_bytes.to_be_bytes());
+    append_readback_field(material, common.stderr.sha256.as_bytes());
+    material.push(u8::from(common.source_dirty));
 }
 
 fn is_hex_prefix(line: &str) -> bool {
