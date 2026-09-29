@@ -60,9 +60,10 @@ use crate::evidence_portfolio::{
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
-    INQUIRY_LANES_CONTRACT, LaneRegistration, LaneRegistrationError, LaneRegistrationParams,
-    OrderedSubjectKind, OwnerOrderingReceipt, OwnerOrderingReceiptParams, PrimaryOutcomeRule,
-    RegistrationDigests, SealedBlindingMapping, SealedBlindingMappingParams,
+    INQUIRY_LANES_CONTRACT, InquiryLaneDiscipline, LaneEvidenceClass, LaneRegistration,
+    LaneRegistrationError, LaneRegistrationParams, OrderedSubjectKind, OwnerOrderingReceipt,
+    OwnerOrderingReceiptParams, PrimaryOutcomeRule, RegistrationDigests, SealedBlindingMapping,
+    SealedBlindingMappingParams,
 };
 use crate::inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationParams, InquiryObligationStatus,
@@ -4756,6 +4757,15 @@ pub struct InquiryGovernance {
     pub freeze: EvidenceFreeze,
     /// Registered research debts.
     pub research_debts: Vec<ResearchDebt>,
+    /// Lane class the lane discipline decided for this run.
+    ///
+    /// I21.2 keeps grade and status orthogonal, so the class is the only thing
+    /// that separates an exploratory finding from a confirmatory claim. It is
+    /// produced by running the [`InquiryLaneDiscipline`] over the frozen evidence
+    /// of this very record on the live path, so a reader learns the class from
+    /// the discipline that authorised it rather than from the profile's declared
+    /// lane alone.
+    pub lane_discipline: LaneDisciplineOutcome,
     /// Terminal typed inquiry disposition.
     pub terminal: InquiryTerminalRecord,
     /// Governor-facing profile admission request.
@@ -4856,6 +4866,11 @@ impl InquiryGovernance {
         // here means the run released no material claim, never that the audit was
         // skipped.
         let claim_audit = claim_audit_for_run(&observation, &profile, &account, &admissibility)?;
+        // The lane discipline runs on the live path, after the evidence is
+        // frozen and before the terminal record is built, so the class the
+        // terminal record publishes is the class the discipline decided over the
+        // real frozen evidence rather than a value re-derived beside it.
+        let lane_discipline = run_lane_discipline(&observation, &profile, &admissibility, &freeze)?;
         let terminal = terminal_record(
             &observation,
             &profile,
@@ -4887,6 +4902,7 @@ impl InquiryGovernance {
             obligations,
             freeze,
             research_debts,
+            lane_discipline,
             terminal,
             compilation_inputs,
         };
@@ -4956,6 +4972,7 @@ impl InquiryGovernance {
                 field: "inquiry.freeze_binding",
             });
         }
+        self.validate_lane_discipline_binding()?;
         self.validate_terminal_carried_bindings()?;
         // The claim-audit trail and the coverage map are re-proved here, not
         // carried on trust. A record that lost an audit between construction and
@@ -5084,6 +5101,55 @@ impl InquiryGovernance {
         Ok(())
     }
 
+    /// The lane class the discipline decided is bound to the same evidence the
+    /// record froze, so a class decided over one evidence revision cannot be
+    /// published beside another.
+    ///
+    /// The outcome's own digest is re-proved first: it is an artefact that leaves
+    /// this record, and a rewritten grade, lane, handle set or fence would
+    /// otherwise be published as the discipline's own decision. Every comparison
+    /// is by content — the recorded evidence revision against
+    /// [`EvidenceFreeze::digest`], the recorded profile revision against the
+    /// profile's own integrity digest — never by a timestamp and never by a
+    /// caller flag.
+    ///
+    /// I21.2 keeps the class as the only thing separating E3 exploratory from E3
+    /// confirmatory, so a confirmatory class may only be read back from a lane
+    /// that actually committed a registration: the check is on the profile's
+    /// `CommittedLaneRegistration`, which is unforgeable, rather than on
+    /// `registered_before_outcome_exposure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first lane field
+    /// that disagrees with the composite that produced it.
+    fn validate_lane_discipline_binding(&self) -> Result<(), InquiryError> {
+        if self.lane_discipline.compute_digest() != self.lane_discipline.digest
+            || self.lane_discipline.inquiry_id != self.inquiry_id
+            || self.lane_discipline.evidence_revision_digest != self.freeze.digest
+            || self.lane_discipline.profile_digest != self.profile.integrity_digest
+            || self.lane_discipline.produced_under_grade != self.profile.evidence_grade
+            || self.lane_discipline.produced_under_lane != self.profile.lane
+            || self.lane_discipline.state_fence != self.profile.state_fence
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.lane_discipline_binding",
+            });
+        }
+        if self.lane_discipline.evidence_class.is_confirmatory()
+            && self
+                .profile
+                .independence_and_blinding_policy
+                .lane_registration_digest
+                .is_none()
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.lane_discipline_confirmatory_without_registration",
+            });
+        }
+        Ok(())
+    }
+
     /// I21.7/I21.8: the terminal projection has to carry the evidence freeze and
     /// the unsupported-precision residue this run produced, not a copy that was
     /// restated while it was being bound. Comparing the two owners to what the
@@ -5160,6 +5226,8 @@ impl std::fmt::Display for InquiryGovernance {
              observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
              materialisable={} deferred={} certified={} compilation_inputs={} freeze={} \
+             lane_class={} lane_result={} lane_result_grade={} lane_result_lane={} \
+             lane_delivered_handles={} lane_discipline={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
              claim_audits={} claim_coverage={} \
              debts={} debt_kinds={} {} \
@@ -5206,6 +5274,12 @@ impl std::fmt::Display for InquiryGovernance {
             certified_obligations(&self.obligations),
             self.compilation_inputs.digest,
             self.freeze.digest,
+            self.lane_discipline.evidence_class.wire_name(),
+            self.lane_discipline.result_id,
+            self.lane_discipline.produced_under_grade,
+            self.lane_discipline.produced_under_lane.wire_name(),
+            self.lane_discipline.delivered_handle_count,
+            self.lane_discipline.digest,
             terminal.freeze.digest,
             terminal
                 .claim_audit
@@ -5289,6 +5363,258 @@ fn resolve_profile(
         None,
         "initial inquiry protocol resolution",
     )
+}
+
+/// The class of lane result one recorded inquiry run actually produced (I21.2/I21.4).
+///
+/// This is what the [`InquiryLaneDiscipline`] decided on the live path, and it is
+/// carried here so a reader of the governance record learns the lane class from
+/// the discipline that authorised it rather than from the profile's declared
+/// lane alone. The digest is over the same fields [`Display`] publishes, so the
+/// rendered line and the re-proved value cannot drift apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneDisciplineOutcome {
+    /// Class the release produced: a confirmatory claim or an exploratory
+    /// finding.
+    pub evidence_class: LaneEvidenceClass,
+    /// Stable identity of the released result.
+    pub result_id: String,
+    /// Inquiry the result belongs to.
+    pub inquiry_id: String,
+    /// Profile revision the result was produced under.
+    pub profile_id_and_revision: String,
+    /// Exact profile revision digest the result was produced under.
+    pub profile_digest: String,
+    /// Grade requirement the result was produced under.
+    pub produced_under_grade: EvidenceGrade,
+    /// Lane the result was produced under.
+    pub produced_under_lane: InquiryLane,
+    /// Exact evidence revision the result was produced from.
+    pub evidence_revision_digest: String,
+    /// Digest over the sorted delivered handles the release covered.
+    pub delivered_handle_digest: String,
+    /// Number of delivered handles the release covered.
+    pub delivered_handle_count: usize,
+    /// State Fence the result was produced under.
+    pub state_fence: StateFence,
+    /// Instant the result was recorded.
+    pub recorded_at_ms: i64,
+    /// Digest over the whole outcome.
+    pub digest: String,
+}
+
+impl LaneDisciplineOutcome {
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("inquiry-lane-discipline-outcome/v1;");
+        push_field(
+            &mut preimage,
+            "evidence_class",
+            self.evidence_class.wire_name(),
+        );
+        push_field(&mut preimage, "result_id", &self.result_id);
+        push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
+        push_field(
+            &mut preimage,
+            "profile_id_and_revision",
+            &self.profile_id_and_revision,
+        );
+        push_field(&mut preimage, "profile_digest", &self.profile_digest);
+        push_field(
+            &mut preimage,
+            "produced_under_grade",
+            &self.produced_under_grade.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "produced_under_lane",
+            self.produced_under_lane.wire_name(),
+        );
+        push_field(
+            &mut preimage,
+            "evidence_revision_digest",
+            &self.evidence_revision_digest,
+        );
+        push_field(
+            &mut preimage,
+            "delivered_handle_digest",
+            &self.delivered_handle_digest,
+        );
+        push_field(
+            &mut preimage,
+            "delivered_handle_count",
+            &self.delivered_handle_count.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
+        push_field(
+            &mut preimage,
+            "recorded_at_ms",
+            &self.recorded_at_ms.to_string(),
+        );
+        freeze(&preimage)
+    }
+}
+
+/// Renders exactly the fields `compute_digest` covers, so the published line and
+/// the re-proved value cannot drift apart.
+impl std::fmt::Display for LaneDisciplineOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "class={} result={} grade={} lane={} delivered_handles={} digest={}",
+            self.evidence_class.wire_name(),
+            self.result_id,
+            self.produced_under_grade,
+            self.produced_under_lane.wire_name(),
+            self.delivered_handle_count,
+            self.digest
+        )
+    }
+}
+
+/// Runs the [`InquiryLaneDiscipline`] over the result this run actually produced.
+///
+/// # Why this is on the live path
+///
+/// I21.4 is only an executed property if the machinery that enforces it is
+/// reached by a real run. The discipline is the one owner of the register
+/// itself — exposure, deviations, attempts, blinded deliveries, the release gate
+/// and the claim it authorises — and before this call nothing on the `R6` path
+/// ever entered it: a `LaneRegistration` was committed and published on the
+/// profile, but no lane was ever *run* against it, so the commit-before-exposure
+/// proof, the deviation classification and the release gate were code no run
+/// could execute.
+///
+/// # What it decides, and from what
+///
+/// Every input is a value this run already computed, so nothing here is
+/// asserted, guessed or supplied by a caller:
+///
+/// - the discipline is opened on the exact profile revision [`resolve_profile`]
+///   committed, which is what carries the committed lane registration;
+/// - the evidence revision released is [`EvidenceFreeze::digest`], i.e. the real
+///   frozen evidence revision, never a fresh digest computed for the release;
+/// - the delivered handles are the eligible source handles of the real
+///   admissibility disposition, which is the exact set a consumer of this record
+///   reads;
+/// - the fence is the profile's own State Fence, and the instant is the run's own
+///   assessment time.
+///
+/// # What it does NOT do
+///
+/// It mints a confirmatory claim only for a lane that actually committed a
+/// registration, and it never manufactures one. A purely exploratory lane — the
+/// only lane `select_lane` can currently produce for a governed provider run,
+/// because such a run admits no evaluator and no strong verifier — is released
+/// under [`LaneEvidenceClass::ExploratoryFinding`], which I21.4 defines as
+/// explicitly *not* a confirmation and as requiring no registration. A
+/// confirmatory release on this path additionally requires a committed
+/// registration, attested exposure coverage over every mandatory channel and
+/// blinded deliveries, none of which a single provider run can have.
+///
+/// # Errors
+///
+/// Returns the [`LaneRegistrationError`]-derived [`InquiryError`] when the
+/// discipline refuses, and [`InquiryError::IntegrityMismatch`] when the release
+/// it produced does not describe the evidence this record actually holds. The
+/// check is by content: the released evidence revision, the delivered handle
+/// count and the fence are compared against the freeze, the admissibility
+/// disposition and the profile, so a release that is merely produced and
+/// discarded cannot pass.
+fn run_lane_discipline(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+    admissibility: &[SourceAdmissibilityRecord],
+    evidence_freeze: &EvidenceFreeze,
+) -> Result<LaneDisciplineOutcome, InquiryError> {
+    let mut discipline = InquiryLaneDiscipline::open(profile.clone())?;
+    let delivered_handles: BTreeSet<String> = admissibility
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .map(|record| record.record.handle.clone())
+        .collect();
+    let current_fence = &profile.state_fence;
+    let release = discipline.release_outcome_material(
+        &evidence_freeze.digest,
+        &delivered_handles,
+        current_fence,
+    )?;
+    let Some(released) = release.exploratory_release() else {
+        // A confirmatory release on this path is a real authorization over a
+        // committed registration. It is not a failure, but this run has no claim
+        // to close from it here, so the record is refused rather than published
+        // with an authorization nothing consumed.
+        return Err(InquiryError::UnknownVocabulary {
+            field: "lane_discipline.confirmatory_release",
+        });
+    };
+    // The release is compared against the record by content, not by timestamp or
+    // by a caller boolean: the same evidence revision, the same count of
+    // delivered handles, the same fence. `build_exploratory_release` digests the
+    // sorted handle set, so the digest is recomputed here from the same
+    // independent source — the admissibility disposition — rather than read back
+    // from the release being checked.
+    let mut handle_preimage = String::from("lane-delivered-handles/v1;");
+    push_count(
+        &mut handle_preimage,
+        "delivered_handles",
+        delivered_handles.len(),
+    );
+    for handle in &delivered_handles {
+        push_field(&mut handle_preimage, "delivered_handle", handle);
+    }
+    if released.evidence_class != LaneEvidenceClass::ExploratoryFinding
+        || released.evidence_revision_digest != evidence_freeze.digest
+        || released.delivered_handle_count != delivered_handles.len()
+        || released.delivered_handle_digest != freeze(&handle_preimage)
+        || released.state_fence != profile.state_fence
+    {
+        return Err(InquiryError::IntegrityMismatch {
+            field: "lane_discipline.exploratory_release",
+        });
+    }
+    let result_id = format!("exploratory-finding/{}", observation.evidence_set_id);
+    let finding = discipline.record_exploratory_finding(
+        &result_id,
+        &evidence_freeze.digest,
+        observation.assessment_time_ms,
+        current_fence,
+    )?;
+    // The finding the discipline stored is re-proved against what this record is
+    // about to publish, so the class published is the class the discipline
+    // recorded and not a value recomputed beside it.
+    if finding.evidence_class() != LaneEvidenceClass::ExploratoryFinding
+        || finding.inquiry_id != observation.inquiry_id
+        || finding.profile_digest != profile.integrity_digest
+        || finding.evidence_revision_digest != evidence_freeze.digest
+        || finding.produced_under_grade != profile.evidence_grade
+        || finding.produced_under_lane != profile.lane
+        || finding.state_fence != profile.state_fence
+    {
+        return Err(InquiryError::IntegrityMismatch {
+            field: "lane_discipline.exploratory_finding",
+        });
+    }
+    let mut outcome = LaneDisciplineOutcome {
+        evidence_class: LaneEvidenceClass::ExploratoryFinding,
+        result_id,
+        inquiry_id: finding.inquiry_id.clone(),
+        profile_id_and_revision: profile.profile_id_and_revision(),
+        profile_digest: finding.profile_digest.clone(),
+        produced_under_grade: finding.produced_under_grade,
+        produced_under_lane: finding.produced_under_lane,
+        evidence_revision_digest: finding.evidence_revision_digest.clone(),
+        delivered_handle_digest: released.delivered_handle_digest.clone(),
+        delivered_handle_count: released.delivered_handle_count,
+        state_fence: finding.state_fence.clone(),
+        recorded_at_ms: finding.recorded_at_ms,
+        digest: String::new(),
+    };
+    outcome.digest = outcome.compute_digest();
+    Ok(outcome)
 }
 
 /// The contract owner that commits lane registrations into the ordering journal

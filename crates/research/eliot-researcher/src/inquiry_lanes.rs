@@ -4530,6 +4530,23 @@ impl LaneReleaseAuthorization {
             Self::Exploratory(_) => LaneEvidenceClass::ExploratoryFinding,
         }
     }
+
+    /// The exploratory release this authorization produced, or `None` when it
+    /// authorised a confirmation.
+    ///
+    /// This exists so a consumer can read the released material's own content —
+    /// which evidence revision it covers, exactly which handles were delivered
+    /// and under which State Fence — instead of taking the release on trust. A
+    /// release that is only ever counted proves nothing: a caller holding this
+    /// value can compare it against the record it is about to publish and refuse
+    /// the publication when the two disagree.
+    #[must_use]
+    pub fn exploratory_release(&self) -> Option<&ExploratoryRelease> {
+        match self {
+            Self::Confirmatory(_) => None,
+            Self::Exploratory(release) => Some(release),
+        }
+    }
 }
 
 /// Release of exploratory material, carrying no confirmation.
