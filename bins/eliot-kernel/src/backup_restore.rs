@@ -77,10 +77,10 @@ use eliot_backup::{
     CutoverAuthorization, DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence,
     RestoreAppliedEffect, RestoreArchiveDisposition, RestoreArchiveDispositionKind, RestoreContext,
     RestoreEffectReceipt, RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent,
-    RestoreJournalPort, RestoreObligationState, RestoreObligations, RestoreOwnerObligation,
-    RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
-    RestoredFence, RestoredSealedBlob, WrappedKeyManifest, issue_restoration_receipts,
-    suspended_recovery_entries, verify_portable_key_material,
+    RestoreJournalAdmission, RestoreJournalPort, RestoreObligationState, RestoreObligations,
+    RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation,
+    RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WrappedKeyManifest,
+    issue_restoration_receipts, suspended_recovery_entries, verify_portable_key_material,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -91,9 +91,10 @@ use serde::Serialize;
 
 use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
-    KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, PinnedDestinationAdmission,
-    RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts,
-    StagedCleanupRefusal, check_kernel_effect_fence, require_production_admitted,
+    KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, OrsRestoreJournalOwner,
+    PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
+    RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal, backup_to_kernel,
+    check_kernel_effect_fence, require_production_admitted,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -678,6 +679,61 @@ impl KernelBackupRestore {
         &self.work_root
     }
 
+    /// Issues the owner-issued journal admission for `plan` from the durable
+    /// owner (issue #962).
+    ///
+    /// This is the production entry to
+    /// [`RestoreJournalAdmission::issue_for_operation`]. The owner is
+    /// [`OrsRestoreJournalOwner`], built from the same composition-owned
+    /// [`RedbRecoveryStore`] handle, the same [`OrsRestoreBinding`] and the same
+    /// live effect fence [`restore_with_ors_journal`](Self::restore_with_ors_journal)
+    /// seals the journal's rows with, and the journal it proves is the same
+    /// durable ORS journal. Nothing here is a request field: the four
+    /// owner-issued references are read out of the ORS stream-binding row the
+    /// owner already committed, and `fixture_proof_only` is never set.
+    ///
+    /// The admission is issued against a journal that ALREADY holds `plan`'s
+    /// transaction, because an admission admits an existing durable journal and
+    /// existence and shape prove nothing. A stream the engine has not started
+    /// yet therefore refuses with [`BackupError::RestoreJournalRequired`]
+    /// surfaced as a typed [`KernelRestoreError::TargetFailed`] with its cause
+    /// intact; nothing is minted to make a fresh stream look admitted. Starting
+    /// the stream needs the plan's stream identity, which
+    /// `RestorePlan::journal_key` does not expose outside `eliot-backup`, so
+    /// that half is not reachable from this file.
+    ///
+    /// The returned value grants no cutover, no readiness and no activation
+    /// (A13.7: cutover requires separate authority).
+    ///
+    /// # Errors
+    ///
+    /// Refuses typed when the owner holds no durable record for this stream
+    /// ([`KernelRestoreError::TargetFailed`] carrying
+    /// [`BackupError::RestoreJournalRequired`]), when the durable record
+    /// disagrees with live composition
+    /// ([`KernelRestoreError::JournalBindingConflict`]), or when the
+    /// composition binding names no installation.
+    pub fn admit_restore_journal(
+        &self,
+        ors: &std::sync::Arc<RedbRecoveryStore>,
+        plan: &RestorePlan,
+        kernel_fence: &StateFence,
+        identity: &OrsRestoreBinding,
+    ) -> Result<RestoreJournalAdmission, KernelRestoreError> {
+        let owner =
+            OrsRestoreJournalOwner::production(std::sync::Arc::clone(ors), identity.clone(), kernel_fence)?;
+        let mut journal = OrsRestoreJournal::production(
+            std::sync::Arc::clone(ors),
+            kernel_fence,
+            identity.clone(),
+            self.work_root
+                .join(".eliot")
+                .join(RESTORE_JOURNAL_PAYLOAD_AREA),
+        )?;
+        RestoreJournalAdmission::issue_for_operation(&owner, &mut journal, plan)
+            .map_err(backup_to_kernel)
+    }
+
     /// Production execution path (issue #960): runs the restore with the
     /// composition-owned durable ORS journal as its
     /// [`RestoreJournalPort`](eliot_backup::RestoreJournalPort).
@@ -690,6 +746,15 @@ impl KernelBackupRestore {
     /// never name a different writer authority than the effect gate accepted,
     /// and no epoch or generation is minted here.
     ///
+    /// The journal admission is **not** taken from `ports`. It is issued here
+    /// by [`admit_restore_journal`](Self::admit_restore_journal) from the
+    /// durable owner, and the execution body runs against that issued value, so
+    /// a caller-presented admission cannot select the database, the
+    /// installation, the generation, the journal identity or the receipt of
+    /// this restore. `ports` still supplies the effect fence, key material,
+    /// blob scope, destination evidence and the rehearsal flag; only the
+    /// admission is replaced, and only by a stronger, owner-issued one.
+    ///
     /// [`restore`](Self::restore) stays available with its injected `J` seam
     /// unchanged: this method is an additional production entry over the same
     /// single phase engine, not a second engine and not a fallback.
@@ -701,8 +766,16 @@ impl KernelBackupRestore {
         ports: &RestorePorts<'_>,
         identity: &OrsRestoreBinding,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
-        check_ors_journal_binding(bundle, &target, ports, identity)?;
         check_ors_journal_budget(bundle)?;
+        // Compiling the plan is pure and effect-free; the execution body
+        // compiles the same plan again to build its target. The coordinator
+        // needs the plan here because the admission is bound to the plan's own
+        // operation and the plan is never a parameter of the issuer.
+        let plan = Self::compile_plan(bundle, target.clone())?;
+        let admission =
+            self.admit_restore_journal(ors, &plan, ports.kernel_fence, identity)?;
+        let admitted = admitted_restore_ports(ports, &admission);
+        check_ors_journal_binding(bundle, &target, &admitted, identity)?;
         let mut journal = OrsRestoreJournal::production(
             std::sync::Arc::clone(ors),
             ports.kernel_fence,
@@ -711,7 +784,7 @@ impl KernelBackupRestore {
                 .join(".eliot")
                 .join(RESTORE_JOURNAL_PAYLOAD_AREA),
         )?;
-        self.restore(bundle, target, ports, &mut journal)
+        self.restore(bundle, target, &admitted, &mut journal)
     }
 
     /// Compiles the governed plan for one archive and target context.
@@ -2275,6 +2348,30 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
 /// destination than the archive and target actually being restored (issue
 /// #960).
 ///
+/// Carries the owner-issued admission into the execution body.
+///
+/// Every other field is the caller's, moved across unchanged, so the ONLY
+/// difference between the bundle the caller presented and the bundle the
+/// restore runs on is the journal admission — and that one field is the value
+/// the durable owner issued for this exact plan. Nothing is defaulted and no
+/// field is dropped: an absent key manifest, blob scope or destination evidence
+/// stays absent, because "rehearsal without Host admission" is a supported
+/// production shape and inventing an empty stand-in for one would change the
+/// gate.
+fn admitted_restore_ports<'a>(
+    ports: &'a RestorePorts<'_>,
+    admission: &'a RestoreJournalAdmission,
+) -> RestorePorts<'a> {
+    RestorePorts {
+        journal_admission: admission,
+        kernel_fence: ports.kernel_fence,
+        keys: ports.keys,
+        blob_scope: ports.blob_scope,
+        manifest_evidence: ports.manifest_evidence.clone(),
+        rehearsal: ports.rehearsal,
+    }
+}
+
 /// The ORS binding is what every journal row is keyed to, so a binding that
 /// disagrees with the archive would file this transaction's durable rows under
 /// another source's, another class's or another destination's stream while the
