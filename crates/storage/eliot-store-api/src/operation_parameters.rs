@@ -1333,6 +1333,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyInstrumentRegistryState => "ApplyInstrumentRegistryState",
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
+        NamedMutationOperation::CommitSessionEpisode => "CommitSessionEpisode",
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
         NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
@@ -1365,6 +1366,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         }
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
+        b"CommitSessionEpisode" => Some(NamedMutationOperation::CommitSessionEpisode),
         b"ApplyBlackboardItem" => Some(NamedMutationOperation::ApplyBlackboardItem),
         b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
         b"RecordCapabilityEvidenceRecord" => {
@@ -1492,7 +1494,8 @@ pub const fn declared_read_parameters(
 /// `configuration_state`, `normalization_receipt_json`, `occurrence_id`,
 /// `invocation_json`; leg completeness is enforced by the
 /// automation-state contract);
-/// `CommitExperienceBank` and `CommitAgentFeedback` declare the six
+/// `CommitExperienceBank`, `CommitAgentFeedback` and `CommitSessionEpisode`
+/// declare the six
 /// required commit fields (`record_json`, `record_digest`,
 /// `record_revision` as its decimal string, `scope_digest`,
 /// `fence_digest`, `idempotency_key`; family bound by the operation
@@ -1540,7 +1543,8 @@ pub const fn declared_mutation_parameters(
             &APPLY_INSTRUMENT_REGISTRY_PARAMETERS
         }
         NamedMutationOperation::CommitExperienceBank
-        | NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
+        | NamedMutationOperation::CommitAgentFeedback
+        | NamedMutationOperation::CommitSessionEpisode => &COMMIT_EXPERIENCE_PARAMETERS,
         NamedMutationOperation::RecordLearningRecord => &COMMIT_LEARNING_PARAMETERS,
         NamedMutationOperation::RecordCapabilityEvidenceRecord => {
             &COMMIT_CAPABILITY_EVIDENCE_PARAMETERS

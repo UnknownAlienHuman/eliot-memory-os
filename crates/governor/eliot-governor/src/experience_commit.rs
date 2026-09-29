@@ -66,19 +66,31 @@
 //! The M1 product caller drives these functions with live admitted
 //! ingress in its own copy; this module never invents ingress,
 //! sessions, tasks, heads, or proof refs.
+//!
+//! Session episodes (issue #1778, I11.4/I12.37) join the same canonical
+//! write path as the bank and feedback legs. A public conversation is only
+//! durable once this leg returns a `Committed` owner receipt: a failed or
+//! rejected write leaves the episode in pending/failed publication and is
+//! never presented as a saved conversation, and the committed receipt proves
+//! transport of the verbatim admitted episode only — not message order,
+//! source cursor, portability, completeness, or any cognitive answer.
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::OperationId;
 use eliot_observation::bank_admission::{
-    ExperienceRevisionLedger, produce_bank_commit, produce_feedback_commit,
+    ExperienceRevisionLedger, SessionEpisodeAdmission, admit_session_episode,
+    produce_bank_commit, produce_feedback_commit, produce_session_episode_commit,
 };
-use eliot_observation_contracts::{AgentFeedbackRecord, ExperienceBankRecord};
+use eliot_observation_contracts::{
+    AgentFeedbackRecord, ExperienceBankRecord, SessionEpisodeRecord,
+};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationRequest, OrderingHeadExpectation,
     RevisionHeadExpectation, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
     WriteReceiptStatus, experience_bank_commit_params, experience_bank_mutation_request,
     experience_feedback_commit_params, experience_feedback_mutation_request,
+    experience_session_episode_commit_params, experience_session_episode_mutation_request,
     generated_operation_manifests, operation_manifest_set_digest,
 };
 
@@ -132,6 +144,31 @@ fn feedback_commit_leg(
         commit.fence_digest,
         commit.idempotency_key.clone(),
     ));
+    Ok(CommitLeg {
+        mutation,
+        idempotency_key: commit.idempotency_key,
+    })
+}
+
+/// Builds the closed session-episode commit leg. Same rule as the bank leg.
+fn session_episode_commit_leg(
+    record: &SessionEpisodeRecord,
+    ledger: &ExperienceRevisionLedger,
+) -> Result<CommitLeg, CompositionError> {
+    let commit = produce_session_episode_commit(ledger, record)
+        .map_err(|error| CompositionError::Owner(format!("episode commit payload: {error}")))?;
+    let record_json = serde_json::to_string(record)
+        .map_err(|error| CompositionError::Owner(format!("episode record encode: {error}")))?;
+    let mutation = experience_session_episode_mutation_request(
+        experience_session_episode_commit_params(
+            record_json,
+            commit.record_digest,
+            commit.record_revision,
+            commit.scope_digest,
+            commit.fence_digest,
+            commit.idempotency_key.clone(),
+        ),
+    );
     Ok(CommitLeg {
         mutation,
         idempotency_key: commit.idempotency_key,
@@ -368,6 +405,212 @@ pub async fn commit_experience_feedback<P: KernelGenerationPort + ?Sized>(
         record.scope.work_scope.as_str(),
         record.feedback_revision,
         "feedback",
+        record.handle.as_str(),
+        &leg.idempotency_key,
+        &scope_id,
+    )?;
+    let manifest_digest =
+        operation_manifest_set_digest(&generated_operation_manifests().map_err(|error| {
+            CompositionError::Owner(format!("operation manifest set unavailable: {error}"))
+        })?)
+        .map_err(|error| CompositionError::Owner(format!("operation manifest digest: {error}")))?;
+    let revision_expectations = expected_revision_heads.clone();
+    let ordering_expectations = expected_ordering_heads.clone();
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: operation_id.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: leg.idempotency_key.clone(),
+        scope_id,
+        task_id: record.scope.task_ref.clone(),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: record.digest.clone(),
+        operation_manifest_digest: manifest_digest,
+        semantic_commands: vec![leg.mutation],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: proof_refs,
+        expected_revision_heads,
+        expected_ordering_heads,
+    };
+    let receipt = composition.commit_canonical(identity, envelope).await?;
+    check_commit_freshness(
+        &receipt,
+        &operation_id,
+        &leg.idempotency_key,
+        &record.fence,
+        &revision_expectations,
+        &ordering_expectations,
+    )?;
+    Ok(receipt)
+}
+
+/// Durable publication state of one admitted public conversation
+/// (issue #1778, I11.4/I12.37).
+///
+/// The only way a conversation becomes saved is a `Committed` owner
+/// [`WriteReceipt`] for that exact episode revision. Everything else is
+/// explicitly pending: no variant reports a conversation as saved without a
+/// committed receipt, and none of them is a claim about any cognitive answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEpisodePublication {
+    /// The canonical owner committed this exact episode revision.
+    Published {
+        /// The owner `WriteReceipt` returned unmodified.
+        receipt: WriteReceipt,
+    },
+    /// The write did not commit, so the conversation is not saved yet.
+    PendingPublication {
+        /// The owner's own refusal or rejection reason, verbatim.
+        reason: String,
+    },
+}
+
+impl SessionEpisodePublication {
+    /// The committed owner receipt, when this episode is actually saved.
+    ///
+    /// `None` is the honest answer for pending publication: the existence or
+    /// shape of an admitted episode proves nothing about durability.
+    #[must_use]
+    pub fn published_receipt(&self) -> Option<&WriteReceipt> {
+        match self {
+            Self::Published { receipt } => Some(receipt),
+            Self::PendingPublication { .. } => None,
+        }
+    }
+}
+
+/// Admits the next `SessionEpisode` revision and commits it through the
+/// canonical owner, then reports whether the public conversation is actually
+/// saved (issue #1778, I11.4/I12.37).
+///
+/// This is the production durable-acceptance path for a public conversation:
+/// the episode is admitted model-free from already-normalized, privacy-
+/// admissible messages (merged against `retained` by stable source identity and
+/// cursor), and only then offered to the one canonical write path.
+///
+/// The entry is total, not fallible: a refused admission, a refused merge, an
+/// unready composition, a rejected commit, or a stale receipt all resolve to
+/// [`SessionEpisodePublication::PendingPublication`], because none of them
+/// saved a conversation. No path returns a saved conversation without a
+/// `Committed` owner receipt, and the committed receipt proves transport of the
+/// verbatim episode only — not message order, source cursor, portability,
+/// completeness, or any cognitive answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the caller joins the admission input and every handoff-required envelope input in one typed call"
+)]
+pub async fn persist_public_request_episode<P: KernelGenerationPort + ?Sized>(
+    composition: &GovernorComposition<P>,
+    identity: &RequestIdentity,
+    ledger: &mut ExperienceRevisionLedger,
+    retained: Option<&SessionEpisodeRecord>,
+    admission: SessionEpisodeAdmission,
+    scope_id: ScopeId,
+    proof_refs: Vec<String>,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+) -> SessionEpisodePublication {
+    let record = match admit_session_episode(ledger, retained, admission) {
+        Ok(record) => record,
+        // The owner refused to admit or merge this window. Nothing is durable,
+        // so the conversation is pending publication, not saved.
+        Err(error) => {
+            return SessionEpisodePublication::PendingPublication {
+                reason: error.to_string(),
+            };
+        }
+    };
+    commit_session_episode(
+        composition,
+        identity,
+        ledger,
+        &record,
+        scope_id,
+        proof_refs,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .await
+}
+
+/// Commits one ledger-sequenced model-free `SessionEpisode` record through
+/// the canonical owner, then reports whether the conversation is actually
+/// saved (issue #1778, I11.4/I12.37).
+///
+/// Same derivation, freshness check, and invocation rule as
+/// [`commit_experience_bank`]. The [`SessionEpisodePublication`] return exists
+/// because this is the durable-acceptance boundary for a public conversation:
+/// only a `Committed` owner receipt for this exact episode revision yields
+/// [`SessionEpisodePublication::Published`]. Every other outcome — a rejected
+/// commit, a refused ingress binding, a non-committed or stale receipt — is
+/// [`SessionEpisodePublication::PendingPublication`], so a failed write is
+/// never presented as a saved conversation. The publication state carries the
+/// owner's own reason verbatim and is never a completion claim about any
+/// cognitive answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the commit caller joins every handoff-required envelope input in one typed call"
+)]
+pub async fn commit_session_episode<P: KernelGenerationPort + ?Sized>(
+    composition: &GovernorComposition<P>,
+    identity: &RequestIdentity,
+    ledger: &ExperienceRevisionLedger,
+    record: &SessionEpisodeRecord,
+    scope_id: ScopeId,
+    proof_refs: Vec<String>,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+) -> SessionEpisodePublication {
+    match commit_session_episode_receipt(
+        composition,
+        identity,
+        ledger,
+        record,
+        scope_id,
+        proof_refs,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .await
+    {
+        Ok(receipt) => SessionEpisodePublication::Published { receipt },
+        // The owner refused or rejected the write. The episode is admitted in
+        // shape but not durable, so it is pending publication, not saved.
+        Err(error) => SessionEpisodePublication::PendingPublication {
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Commits one ledger-sequenced session-episode record and returns the owner
+/// receipt unmodified. Internal half of [`commit_session_episode`], which maps
+/// a refusal into pending publication instead of an error.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the commit caller joins every handoff-required envelope input in one typed call"
+)]
+async fn commit_session_episode_receipt<P: KernelGenerationPort + ?Sized>(
+    composition: &GovernorComposition<P>,
+    identity: &RequestIdentity,
+    ledger: &ExperienceRevisionLedger,
+    record: &SessionEpisodeRecord,
+    scope_id: ScopeId,
+    proof_refs: Vec<String>,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+) -> Result<WriteReceipt, CompositionError> {
+    let leg = session_episode_commit_leg(record, ledger)?;
+    let operation_id = bind_commit_identity(
+        identity,
+        &record.fence,
+        record.scope.work_scope.as_str(),
+        record.episode_revision,
+        "episode",
         record.handle.as_str(),
         &leg.idempotency_key,
         &scope_id,

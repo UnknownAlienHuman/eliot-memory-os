@@ -36,9 +36,18 @@
 //!   `TargetDisposition::RetentionBlocked` vocabulary and the I05-14
 //!   `RETENTION_BLOCKED` availability axis without importing the security
 //!   lane: no second retention owner is created here.
-//! - Store manifest declarations: [`BANK_COMMIT_OPERATION`] and
-//!   [`FEEDBACK_COMMIT_OPERATION`] name the closed named operations the
-//!   store bridge (#19 lane) registers; both bind
+//! - [`SessionEpisodeRecord`]: the I12.37 model-free, privacy-scoped
+//!   `SessionEpisode` — the durable public conversation record reconstructed
+//!   after UI/route restart. Capture is closed to `ModelFree` and
+//!   `DialogueProse`, the ingestion owner's source cursor is carried and
+//!   validated but never minted or advanced here, portability is local-private
+//!   unless an explicit policy ref promotes it, and a pruned or privacy-purged
+//!   source stays visibly unavailable instead of becoming a false, stale or
+//!   deleted record.
+//! - Store manifest declarations: [`BANK_COMMIT_OPERATION`],
+//!   [`FEEDBACK_COMMIT_OPERATION`] and [`SESSION_EPISODE_COMMIT_OPERATION`]
+//!   name the closed named operations the
+//!   store bridge (#19 lane) registers; all bind
 //!   [`COMMIT_TRANSITION_CLASS`] (`capture_candidate`) and
 //!   [`COMMIT_MAX_EFFECT`] (candidate-only: no support, influence,
 //!   lifecycle, or assertability change). This module performs no I/O and
@@ -53,8 +62,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ExperienceRecordRef, ObservationError, ObservationScope, PrivacyRetentionDisclosure,
-    ProducerTrace, ProjectionCoverage, SourceRevisionHandle,
+    CoverageDisposition, CoverageInterval, ExperienceRecordRef, ObservationError, ObservationScope,
+    PrivacyRetentionDisclosure, ProducerTrace, ProjectionCoverage, SourceRevisionHandle,
 };
 
 /// Contract version of the admitted bank/feedback record shapes owned here.
@@ -73,6 +82,19 @@ pub const MAX_FEEDBACK_NOTE_CHARS: usize = 1024;
 pub const MAX_CONSENT_REF_CHARS: usize = 256;
 /// Maximum Unicode scalar values accepted for one owner source identity.
 pub const MAX_RECORD_SOURCE_ID_CHARS: usize = 256;
+/// Maximum session/attempt refs carried by one episode record.
+pub const MAX_EPISODE_SESSION_REFS: usize = 64;
+/// Maximum entity refs carried by one episode record.
+pub const MAX_EPISODE_ENTITY_REFS: usize = 64;
+/// Maximum public messages carried by one episode record.
+///
+/// `MAX_SESSION_EPISODE_MESSAGES * MAX_SESSION_EPISODE_MESSAGE_CHARS` keeps
+/// the verbatim admitted document inside the store wire's bounded record
+/// document, so an admitted episode can never be rejected for size by its own
+/// commit leg.
+pub const MAX_SESSION_EPISODE_MESSAGES: usize = 64;
+/// Maximum Unicode scalar values accepted for one public episode message.
+pub const MAX_SESSION_EPISODE_MESSAGE_CHARS: usize = 1024;
 
 /// Closed named store operation for bank-record commit (declaration only).
 ///
@@ -82,6 +104,12 @@ pub const MAX_RECORD_SOURCE_ID_CHARS: usize = 256;
 pub const BANK_COMMIT_OPERATION: &str = "CommitExperienceBank";
 /// Closed named store operation for feedback-record commit (declaration only).
 pub const FEEDBACK_COMMIT_OPERATION: &str = "CommitAgentFeedback";
+/// Closed named store operation for session-episode commit (declaration only).
+///
+/// I12.37: the `SessionEpisode` is a typed `ExperienceRecord` in canonical
+/// memory, so its durable write travels the same `capture_candidate` ceiling
+/// as the other two admitted experience records.
+pub const SESSION_EPISODE_COMMIT_OPERATION: &str = "CommitSessionEpisode";
 /// Transition class both commit operations are declared under.
 pub const COMMIT_TRANSITION_CLASS: &str = "capture_candidate";
 /// Maximum epistemic/control effect of either commit operation.
@@ -574,6 +602,503 @@ impl AgentFeedbackRecord {
     }
 }
 
+/// Closed source-availability marker for one session episode.
+///
+/// `source unavailable` is not "record false", not "record current" and not
+/// "delete": a privacy-purged or provider-pruned source leaves the retained
+/// episode visibly unavailable here (I12.37).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionEpisodeSourceAvailability {
+    /// The source is present and its bytes were read.
+    Present,
+    /// The source was pruned by the provider; the episode is retained.
+    Pruned,
+    /// The source is unavailable to this owner.
+    Unavailable,
+    /// Availability is not established.
+    Unknown,
+}
+
+/// Closed portability marker for one session episode.
+///
+/// Local-private is the only default: a selected scope is not evidence of
+/// project sharing, so `Default` resolves to `LocalPrivate` and promotion
+/// requires the explicit policy reference the promoted variants carry
+/// (I12.37).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "portability", deny_unknown_fields)]
+pub enum SessionEpisodePortability {
+    /// Local-private episode; no sharing was inferred.
+    LocalPrivate,
+    /// Project-shareable under the named explicit policy.
+    ProjectShareable {
+        /// Explicit promotion policy reference; a scope never supplies it.
+        policy_ref: String,
+    },
+    /// Exportable after redaction under the named explicit policy.
+    ExportableRedacted {
+        /// Explicit promotion policy reference; a scope never supplies it.
+        policy_ref: String,
+    },
+}
+
+impl Default for SessionEpisodePortability {
+    /// Private by default: a selected scope is not sharing evidence.
+    fn default() -> Self {
+        Self::LocalPrivate
+    }
+}
+
+impl SessionEpisodePortability {
+    /// Validate a promotion's explicit policy reference.
+    fn validate(&self) -> Result<(), ObservationError> {
+        match self {
+            Self::LocalPrivate => Ok(()),
+            Self::ProjectShareable { policy_ref }
+            | Self::ExportableRedacted { policy_ref } => bounded_text(
+                policy_ref,
+                "session_episode.portability.policy_ref",
+                MAX_CONSENT_REF_CHARS,
+            ),
+        }
+    }
+}
+
+/// Closed capture-mode marker for one session episode.
+///
+/// The episode body is model-free normalized dialogue: no model output is
+/// admitted as episode content (I12.37 `capture_mode: model_free`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionEpisodeCaptureMode {
+    /// Model-free capture of normalized public messages.
+    ModelFree,
+}
+
+/// Closed body-kind marker for one session episode.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionEpisodeBodyKind {
+    /// Rendered dialogue prose plus handle-based artifact references.
+    DialogueProse,
+}
+
+/// One public message admitted into a session episode.
+///
+/// Ordering is the explicit `sequence`; `supersedes` records an edit or
+/// supersession against the stable `message_ref` it replaces. Material that
+/// stays out of the episode body — a raw tool dump, provider-forbidden hidden
+/// reasoning, a secret — is named only through `referenced_artifact_refs` and
+/// never duplicated into `text`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEpisodeMessage {
+    /// Stable source identity of this message within the episode.
+    pub message_ref: ArtifactId,
+    /// Zero-based position in the admitted public message order.
+    pub sequence: u64,
+    /// Bounded normalized public text for this message.
+    pub text: String,
+    /// Exact artifact refs this message points at instead of inlining them.
+    pub referenced_artifact_refs: Vec<ArtifactId>,
+    /// Message this one edits or supersedes, when the source declared one.
+    pub supersedes: Option<ArtifactId>,
+}
+
+impl SessionEpisodeMessage {
+    /// Validate the message's own bindings.
+    fn validate(&self, field: &'static str) -> Result<(), ObservationError> {
+        bounded_text(&self.text, field, MAX_SESSION_EPISODE_MESSAGE_CHARS)?;
+        let mut seen: Vec<&str> = Vec::with_capacity(self.referenced_artifact_refs.len());
+        for reference in &self.referenced_artifact_refs {
+            let id = reference.as_str();
+            if seen.contains(&id) {
+                return Err(ObservationError::Duplicate {
+                    field,
+                    value: id.to_owned(),
+                });
+            }
+            seen.push(id);
+        }
+        if self
+            .supersedes
+            .as_ref()
+            .is_some_and(|prior| prior == &self.message_ref)
+        {
+            return Err(ObservationError::InvalidField {
+                field,
+                reason: "a message cannot supersede itself",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One admitted `SessionEpisode`: the model-free, privacy-scoped durable
+/// record a public conversation is reconstructed from (I12.37).
+///
+/// Guarantees this record states, and does not approximate:
+///
+/// - `capture_mode` is closed to `ModelFree` and `body_kind` to
+///   `DialogueProse`, so no model-authored body and no tool-dump body can be
+///   admitted as an episode.
+/// - `source_ref` is the ingestion owner's cursor, carried verbatim and
+///   validated through its own `validate()`. This record never mints, advances
+///   or recomputes a source cursor: a projected index over episodes is
+///   rebuildable and cannot own it.
+/// - `portability` defaults to local-private and a promotion carries its own
+///   explicit policy ref, so a selected scope never infers project sharing.
+/// - `source_availability` keeps a pruned or privacy-purged source visibly
+///   unavailable instead of turning it into a false, stale, or deleted record.
+/// - `truncated` is an explicit observation: a partial window is never
+///   presented as a complete conversation.
+/// - Ordering is the explicit `sequence`, and every `supersedes` target must be
+///   an earlier message in this same episode, so an edit cannot silently
+///   reorder or vanish from history.
+///
+/// Shape-vs-durable split, identical to the bank and feedback records: this
+/// admits the record *shape* only. Durability is established by the
+/// [`SESSION_EPISODE_COMMIT_OPERATION`] commit leg, never by the existence of
+/// this value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEpisodeRecord {
+    /// Contract version this record was written against.
+    pub contract_version: ContractVersion,
+    /// Exact canonical handle of the episode.
+    pub handle: ArtifactId,
+    /// Owner revision counter assigned at admission; strictly increasing per
+    /// handle under one owner.
+    pub episode_revision: u64,
+    /// Session and attempt references this episode covers; non-empty, unique.
+    pub session_and_attempt_refs: Vec<ArtifactId>,
+    /// Closed capture mode; only `ModelFree` exists.
+    pub capture_mode: SessionEpisodeCaptureMode,
+    /// Closed body kind; only `DialogueProse` exists.
+    pub body_kind: SessionEpisodeBodyKind,
+    /// The ingestion owner's source cursor, carried verbatim. This record
+    /// validates it and never mints or advances it.
+    pub source_ref: SourceRevisionHandle,
+    /// Availability of the source behind `source_ref`.
+    pub source_availability: SessionEpisodeSourceAvailability,
+    /// Whether the episode body stands on its own without the source.
+    pub content_self_contained: bool,
+    /// Portability of this episode; local-private by default.
+    pub portability: SessionEpisodePortability,
+    /// Entity references the episode touched.
+    pub touched_entity_refs: Vec<ArtifactId>,
+    /// Observed cursor window of the admitted messages.
+    pub observed_window: CoverageInterval,
+    /// Explicit truncation observation; `true` is a partial window.
+    ///
+    /// Reconciled against the ingestion owner's independent coverage evidence
+    /// in [`SessionEpisodeRecord::validate`], never against a copy of this
+    /// record's own message list.
+    pub truncated: bool,
+    /// Owner coverage binding for the admitted message window.
+    ///
+    /// The ingestion owner, not this record, reports the observed volume and
+    /// the complete/partial posture; the record only reconciles its own
+    /// carried messages against that independent evidence.
+    pub coverage: ProjectionCoverage,
+    /// Public messages in admitted order.
+    pub messages: Vec<SessionEpisodeMessage>,
+    /// Read scope governing this record.
+    pub scope: ObservationScope,
+    /// Fence this record was admitted under, carried for edge gating.
+    pub fence: StateFence,
+    /// Producer origin of the admitted public messages.
+    pub provenance: ProducerTrace,
+    /// Privacy/retention/disclosure refs; policy is interpreted by the
+    /// retention owner, never here.
+    pub retention: PrivacyRetentionDisclosure,
+    /// Prior episode record this one supersedes, when retained lineage
+    /// applies. Must differ from `handle`.
+    pub predecessor: Option<ArtifactId>,
+    /// Measured canonical preimage byte length at admission.
+    pub byte_length: u64,
+    /// Frozen digest over the record shape, excluding this field and
+    /// `byte_length`.
+    pub digest: String,
+}
+
+impl SessionEpisodeRecord {
+    /// Admit an episode record: validate every binding, measure the canonical
+    /// preimage, and freeze the owner digest. The digest and byte length are
+    /// computed here, never caller-supplied, so the commit leg can only carry
+    /// bytes this owner admitted.
+    ///
+    /// The caller supplies `source_ref`; this owner validates it through its own
+    /// `validate()` and never recomputes, replaces, or advances it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit(
+        handle: ArtifactId,
+        episode_revision: u64,
+        session_and_attempt_refs: Vec<ArtifactId>,
+        source_ref: SourceRevisionHandle,
+        source_availability: SessionEpisodeSourceAvailability,
+        content_self_contained: bool,
+        portability: SessionEpisodePortability,
+        touched_entity_refs: Vec<ArtifactId>,
+        observed_window: CoverageInterval,
+        truncated: bool,
+        coverage: ProjectionCoverage,
+        messages: Vec<SessionEpisodeMessage>,
+        scope: ObservationScope,
+        fence: StateFence,
+        provenance: ProducerTrace,
+        retention: PrivacyRetentionDisclosure,
+        predecessor: Option<ArtifactId>,
+    ) -> Result<Self, ObservationError> {
+        let mut record = Self {
+            contract_version: EXPERIENCE_RECORD_CONTRACT_VERSION,
+            handle,
+            episode_revision,
+            session_and_attempt_refs,
+            capture_mode: SessionEpisodeCaptureMode::ModelFree,
+            body_kind: SessionEpisodeBodyKind::DialogueProse,
+            source_ref,
+            source_availability,
+            content_self_contained,
+            portability,
+            touched_entity_refs,
+            observed_window,
+            truncated,
+            coverage,
+            messages,
+            scope,
+            fence,
+            provenance,
+            retention,
+            predecessor,
+            byte_length: 0,
+            digest: String::new(),
+        };
+        let preimage = record.preimage_bytes()?;
+        record.byte_length = u64::try_from(preimage.len()).unwrap_or(u64::MAX);
+        if record.byte_length == 0 {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.byte_length",
+                reason: "admitted preimage must be non-empty",
+            });
+        }
+        record.digest = sha256_hex(&preimage);
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Canonical preimage bytes (digest and measured length excluded).
+    fn preimage_bytes(&self) -> Result<Vec<u8>, ObservationError> {
+        canonical_json_bytes(&(
+            &self.contract_version,
+            &self.handle,
+            self.episode_revision,
+            &self.session_and_attempt_refs,
+            &self.capture_mode,
+            &self.body_kind,
+            &self.source_ref,
+            &self.source_availability,
+            self.content_self_contained,
+            &self.portability,
+            &self.touched_entity_refs,
+            &self.observed_window,
+            self.truncated,
+            &self.coverage,
+            &self.messages,
+            &self.scope,
+            &self.fence,
+            &self.provenance,
+            &self.retention,
+            &self.predecessor,
+        ))
+        .map_err(|_| ObservationError::InvalidField {
+            field: "session_episode.digest",
+            reason: "record is not canonically encodable",
+        })
+    }
+
+    /// Validate bindings, message order, completeness, measured length, and
+    /// the frozen digest.
+    pub fn validate(&self) -> Result<(), ObservationError> {
+        if self.contract_version != EXPERIENCE_RECORD_CONTRACT_VERSION {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.contract_version",
+                reason: "unsupported contract version",
+            });
+        }
+        self.validate_shared_bindings()?;
+        self.validate_messages()?;
+        self.validate_completeness_against_owner_coverage()?;
+        let preimage = self.preimage_bytes()?;
+        let measured = u64::try_from(preimage.len()).unwrap_or(u64::MAX);
+        if self.byte_length != measured {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.byte_length",
+                reason: "does not match the canonical preimage length",
+            });
+        }
+        digest_shape(&self.digest, "session_episode.digest")?;
+        if self.digest != sha256_hex(&preimage) {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.digest",
+                reason: "does not match record preimage",
+            });
+        }
+        Ok(())
+    }
+
+    /// Reconcile the carried window against the ingestion owner's independent
+    /// coverage evidence.
+    ///
+    /// The expected set is `coverage.evidence`, which the owner reports from
+    /// its own source read; it is never reconstructed from this record's own
+    /// message list. Carrying more messages than the owner observed is always
+    /// inconsistent, and the owner's `Complete` disposition additionally
+    /// requires the exact count, no blind intervals, and no truncation — so a
+    /// partial window can never be presented as a complete conversation.
+    fn validate_completeness_against_owner_coverage(&self) -> Result<(), ObservationError> {
+        self.coverage
+            .validate()
+            .map_err(|_| ObservationError::InvalidField {
+                field: "session_episode.coverage",
+                reason: "owner coverage binding is invalid",
+            })?;
+        let carried = u64::try_from(self.messages.len()).unwrap_or(u64::MAX);
+        if carried > self.coverage.evidence.observed_count {
+            return Err(ObservationError::CoverageIncomplete {
+                reason: "admitted messages exceed the owner-observed volume",
+            });
+        }
+        if self.coverage.evidence.disposition == CoverageDisposition::Complete
+            && (carried != self.coverage.evidence.observed_count
+                || !self.coverage.evidence.blind_intervals.is_empty()
+                || self.truncated)
+        {
+            return Err(ObservationError::CoverageIncomplete {
+                reason: "complete owner coverage requires the exact count, no blind intervals and no truncation",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate the bindings shared with the other admitted experience records.
+    fn validate_shared_bindings(&self) -> Result<(), ObservationError> {
+        if self.session_and_attempt_refs.is_empty() {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.session_and_attempt_refs",
+                reason: "at least one session or attempt ref is required",
+            });
+        }
+        if self.session_and_attempt_refs.len() > MAX_EPISODE_SESSION_REFS {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.session_and_attempt_refs",
+                reason: "exceeds bounded length",
+            });
+        }
+        let mut seen: Vec<&str> = Vec::with_capacity(self.session_and_attempt_refs.len());
+        for reference in &self.session_and_attempt_refs {
+            let id = reference.as_str();
+            if seen.contains(&id) {
+                return Err(ObservationError::Duplicate {
+                    field: "session_episode.session_and_attempt_refs",
+                    value: id.to_owned(),
+                });
+            }
+            seen.push(id);
+        }
+        if self.touched_entity_refs.len() > MAX_EPISODE_ENTITY_REFS {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.touched_entity_refs",
+                reason: "exceeds bounded length",
+            });
+        }
+        let mut seen: Vec<&str> = Vec::with_capacity(self.touched_entity_refs.len());
+        for reference in &self.touched_entity_refs {
+            let id = reference.as_str();
+            if seen.contains(&id) {
+                return Err(ObservationError::Duplicate {
+                    field: "session_episode.touched_entity_refs",
+                    value: id.to_owned(),
+                });
+            }
+            seen.push(id);
+        }
+        if let Some(prior) = &self.predecessor
+            && prior == &self.handle
+        {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.predecessor",
+                reason: "predecessor must differ from the record handle",
+            });
+        }
+        self.source_ref
+            .validate()
+            .map_err(|_| ObservationError::InvalidField {
+                field: "session_episode.source_ref",
+                reason: "owner-issued source cursor is invalid",
+            })?;
+        self.portability.validate()?;
+        CoverageInterval::new(self.observed_window.start, self.observed_window.end)?;
+        self.scope.validate()?;
+        fence_shape(&self.fence, "session_episode.fence")?;
+        self.provenance.validate()?;
+        self.retention.validate()
+    }
+
+    /// Validate message order, uniqueness, and supersession linkage.
+    fn validate_messages(&self) -> Result<(), ObservationError> {
+        if self.messages.is_empty() {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.messages",
+                reason: "at least one public message is required",
+            });
+        }
+        if self.messages.len() > MAX_SESSION_EPISODE_MESSAGES {
+            return Err(ObservationError::InvalidField {
+                field: "session_episode.messages",
+                reason: "exceeds bounded length",
+            });
+        }
+        let mut refs: Vec<&str> = Vec::with_capacity(self.messages.len());
+        for (index, message) in self.messages.iter().enumerate() {
+            message.validate("session_episode.messages")?;
+            if message.sequence != u64::try_from(index).unwrap_or(u64::MAX) {
+                return Err(ObservationError::InvalidField {
+                    field: "session_episode.messages.sequence",
+                    reason: "message sequence must equal its admitted order position",
+                });
+            }
+            let id = message.message_ref.as_str();
+            if refs.contains(&id) {
+                return Err(ObservationError::Duplicate {
+                    field: "session_episode.messages.message_ref",
+                    value: id.to_owned(),
+                });
+            }
+            refs.push(id);
+        }
+        // A supersession target must already be admitted earlier in this same
+        // episode, so an edit can never point outside the recorded history.
+        for message in &self.messages {
+            if let Some(prior) = &message.supersedes {
+                let target = prior.as_str();
+                let earlier = self
+                    .messages
+                    .iter()
+                    .any(|candidate| candidate.message_ref.as_str() == target);
+                if !earlier {
+                    return Err(ObservationError::InvalidField {
+                        field: "session_episode.messages.supersedes",
+                        reason: "superseded message is not admitted in this episode",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Caller-supplied hold terms for a retention-blocked read.
 ///
 /// All refs are carried, never invented: the hold owner, policy, and
@@ -1037,10 +1562,33 @@ impl ExperienceCommitParameters {
         })
     }
 
+    /// Build commit parameters for one admitted session-episode record. Same
+    /// recompute rule as [`for_bank`](Self::for_bank).
+    pub fn for_session_episode(
+        record: &SessionEpisodeRecord,
+    ) -> Result<Self, ObservationError> {
+        record.validate()?;
+        Ok(Self {
+            operation: SESSION_EPISODE_COMMIT_OPERATION.to_owned(),
+            record_digest: record.digest.clone(),
+            record_revision: record.episode_revision,
+            scope_digest: canonical_shape_digest(&record.scope, "commit.scope")?,
+            fence_digest: canonical_shape_digest(&record.fence, "commit.fence")?,
+            idempotency_key: format!(
+                "episode:{}:{}",
+                record.handle.as_str(),
+                record.episode_revision
+            ),
+        })
+    }
+
     /// Validate the closed parameter shape: known operation, digest
     /// shapes, and a non-blank idempotency key.
     pub fn validate(&self) -> Result<(), ObservationError> {
-        if self.operation != BANK_COMMIT_OPERATION && self.operation != FEEDBACK_COMMIT_OPERATION {
+        if self.operation != BANK_COMMIT_OPERATION
+            && self.operation != FEEDBACK_COMMIT_OPERATION
+            && self.operation != SESSION_EPISODE_COMMIT_OPERATION
+        {
             return Err(ObservationError::InvalidField {
                 field: "commit.operation",
                 reason: "unknown experience commit operation",

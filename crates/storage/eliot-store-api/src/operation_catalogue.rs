@@ -455,7 +455,12 @@ struct ActivatedMutationDescriptor {
 /// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
 /// through the `CaptureCandidate` family (issue #223: Store-owned durable
 /// experience-bank/feedback rows with the closed experience typed
-/// contract); `ApplyBlackboardItem` persists `Candidate` through the same
+/// contract); `CommitSessionEpisode` persists `Candidate` through the same
+/// family (issue #1778, I11.4/I12.37: Store-owned durable model-free
+/// `SessionEpisode` rows with the same closed experience typed contract, so a
+/// committed episode proves transport only and never message order, source
+/// cursor, portability or completeness); `ApplyBlackboardItem` persists
+/// `Candidate` through the same
 /// family (issue #1822: a Kernel-admitted typed candidate revision with its
 /// closed blackboard contract); `RecordLearningRecord` persists `Candidate`
 /// through the `CaptureCandidate` family (issue #1868, I12.24: Store-owned
@@ -468,10 +473,10 @@ struct ActivatedMutationDescriptor {
 /// contract; the store issues the fenced row revision the Governor orders
 /// same-key evidence by, and the write itself grants no admission, support,
 /// influence, or lifecycle change). All
-/// activated mutation rows address no store scope, mirroring the scope-free read
+/// twenty-one address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 20] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 21] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -576,6 +581,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 20] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CommitAgentFeedback,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::CommitSessionEpisode,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
@@ -823,7 +834,7 @@ pub fn validate_read_against_catalogue(
 /// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`,
 /// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
-/// `CommitExperienceBank`, `CommitAgentFeedback`,
+/// `CommitExperienceBank`, `CommitAgentFeedback`, `CommitSessionEpisode`,
 /// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`,
 /// `ApplyProblemOwnerState`, and
 /// `RecordModuleCatalogSnapshot` have activated
@@ -905,7 +916,8 @@ pub fn validate_transition_against_catalogue(
                 crate::validate_automation_mutation_params(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::CommitExperienceBank
-            | NamedMutationOperation::CommitAgentFeedback => {
+            | NamedMutationOperation::CommitAgentFeedback
+            | NamedMutationOperation::CommitSessionEpisode => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
             }

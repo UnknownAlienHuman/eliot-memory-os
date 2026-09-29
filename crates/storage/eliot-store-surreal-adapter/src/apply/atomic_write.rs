@@ -113,6 +113,7 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "automation_invocation_conflict",
     "experience_bank_conflict",
     "experience_feedback_conflict",
+    "experience_session_episode_conflict",
     "learning_record_conflict",
 ];
 
@@ -1072,7 +1073,8 @@ fn append_automation_statements(
     Ok(())
 }
 
-/// Appends canonical experience bank/feedback row writes (issue #223).
+/// Appends canonical experience bank/feedback/session-episode row writes
+/// (issue #223; session episodes #1778, I11.4/I12.37).
 ///
 /// Same atomicity contract as the automation fragment: create-or-converge
 /// rows commit in the same transaction as the receipt and outbox rows.

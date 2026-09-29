@@ -1,13 +1,16 @@
-//! Canonical experience-bank/feedback execution for the `SurrealDB` bridge
-//! (issue #223).
+//! Canonical experience-bank/feedback/session-episode execution for the
+//! `SurrealDB` bridge (issue #223; session episodes #1778, I11.4/I12.37).
 //!
 //! Mirrors the reference contour's closed legs through the store-api wire
-//! contract, persisted in two tables: `experience_bank` holds one
+//! contract, persisted in three tables: `experience_bank` holds one
 //! immutable row per `(handle, revision)` carrying the verbatim
 //! Governor-admitted bank-record document; `experience_feedback` holds
 //! one immutable row per `(handle, revision)` carrying the verbatim
-//! admitted feedback-record document. Documents stay opaque: lineage,
-//! sequencing, and digest re-proof are Governor-owned, and this module
+//! admitted feedback-record document; `experience_session_episode` holds
+//! one immutable row per `(handle, revision)` carrying the verbatim
+//! admitted model-free `SessionEpisode` document. Documents stay opaque:
+//! lineage, sequencing, message order, source cursor, portability,
+//! completeness, and digest re-proof are Governor-owned, and this module
 //! arbitrates keys and immutability only. Concurrent writers arbitrate
 //! through the in-transaction compare-and-set inside the canonical
 //! transaction; retries recompute from fresh rows, never from stale
@@ -79,6 +82,26 @@ pub(crate) struct ExperienceFeedbackWrite {
     pub task_id: Option<String>,
 }
 
+/// One computed session-episode row write for the canonical transaction
+/// (issue #1778, I11.4/I12.37). Same field rule as the bank write.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExperienceSessionEpisodeWrite {
+    /// Exact canonical handle of the episode.
+    pub handle: String,
+    /// Owner revision of the episode.
+    pub revision: u64,
+    /// Verbatim canonical episode document.
+    pub record_json: String,
+    /// Presented digest of the admitted episode bytes.
+    pub record_digest: String,
+    /// Admission fence of the transition.
+    pub state_fence: StateFence,
+    /// Scope provenance from the transition envelope.
+    pub scope_id: String,
+    /// Task-binding provenance from the transition envelope, when bound.
+    pub task_id: Option<String>,
+}
+
 /// Computed experience row writes for one admitted transition.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ExperienceWrites {
@@ -86,6 +109,8 @@ pub(crate) struct ExperienceWrites {
     pub bank: Vec<ExperienceBankWrite>,
     /// Feedback-row creates in admitted command order.
     pub feedback: Vec<ExperienceFeedbackWrite>,
+    /// Session-episode row creates in admitted command order.
+    pub session_episode: Vec<ExperienceSessionEpisodeWrite>,
 }
 
 /// Stored bank row shape as projected by reads.
@@ -129,9 +154,10 @@ async fn ensure_experience_tables(
     config: &SurrealAdapterConfig,
 ) -> Result<(), AdapterError> {
     let sql = format!(
-        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
+        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
         crate::schema::table::EXPERIENCE_BANK,
-        crate::schema::table::EXPERIENCE_FEEDBACK
+        crate::schema::table::EXPERIENCE_FEEDBACK,
+        crate::schema::table::EXPERIENCE_SESSION_EPISODE
     );
     let mut response =
         client::query(db, config, "experience.ensure_tables", &sql, Map::new()).await?;
@@ -157,6 +183,7 @@ pub(crate) async fn prepare_experience_writes(
     for command in &transition.named_operations {
         if command.operation == NamedMutationOperation::CommitExperienceBank
             || command.operation == NamedMutationOperation::CommitAgentFeedback
+            || command.operation == NamedMutationOperation::CommitSessionEpisode
         {
             commanded = true;
         }
@@ -172,7 +199,8 @@ pub(crate) async fn prepare_experience_writes(
     for command in &transition.named_operations {
         let decoded = match command.operation {
             NamedMutationOperation::CommitExperienceBank
-            | NamedMutationOperation::CommitAgentFeedback => {
+            | NamedMutationOperation::CommitAgentFeedback
+            | NamedMutationOperation::CommitSessionEpisode => {
                 decode_experience_mutation(command.operation, &command.parameters)
                     .map_err(AdapterError::Store)?
             }
@@ -209,6 +237,21 @@ pub(crate) async fn prepare_experience_writes(
                 scope_id: transition.scope_id.to_string(),
                 task_id: transition.task_id.clone(),
             }),
+            DecodedExperienceMutation::SessionEpisode {
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ..
+            } => writes.session_episode.push(ExperienceSessionEpisodeWrite {
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                state_fence: transition.state_fence.clone(),
+                scope_id: transition.scope_id.to_string(),
+                task_id: transition.task_id.clone(),
+            }),
         }
     }
     Ok(writes)
@@ -218,7 +261,8 @@ pub(crate) async fn prepare_experience_writes(
 ///
 /// Row writes are create-or-converge: missing rows create, identical rows
 /// pass silently, divergent rows abort the transaction. Drift surfaces
-/// the `experience_bank_conflict` / `experience_feedback_conflict`
+/// the `experience_bank_conflict` / `experience_feedback_conflict` /
+/// `experience_session_episode_conflict`
 /// markers so the apply loop retries with fresh rows. Rows commit in the
 /// same transaction as the receipt and outbox rows, so rows, receipt,
 /// and outbox stay atomic.
@@ -232,6 +276,9 @@ pub(crate) fn experience_write_statements(
     }
     for (index, write) in writes.feedback.iter().enumerate() {
         append_feedback_statement(&mut sql, &mut bindings, index, write);
+    }
+    for (index, write) in writes.session_episode.iter().enumerate() {
+        append_session_episode_statement(&mut sql, &mut bindings, index, write);
     }
     (sql, bindings)
 }
@@ -315,16 +362,57 @@ fn append_feedback_statement(
     );
 }
 
+/// Appends one session-episode-row create-or-converge fragment. Same
+/// create-or-converge rule as the bank fragment.
+fn append_session_episode_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    index: usize,
+    write: &ExperienceSessionEpisodeWrite,
+) {
+    let suffix = format!("session_episode_{index}");
+    sql.push_str(
+            "LET $experience_current_{s} = (SELECT record_json FROM ONLY type::record($experience_table_{s}, $experience_key_{s})); IF type::is_object($experience_current_{s}) { IF $experience_current_{s}.record_json != $experience_expected_{s} { THROW 'experience_session_episode_conflict'; }; } ELSE { CREATE type::record($experience_table_{s}, $experience_key_{s}) CONTENT $experience_record_{s}; };"
+                .replace("{s}", &suffix)
+                .as_str(),
+        );
+    bindings.insert(
+        format!("experience_table_{suffix}"),
+        json!(schema::table::EXPERIENCE_SESSION_EPISODE),
+    );
+    bindings.insert(
+        format!("experience_key_{suffix}"),
+        json!(experience_row_key(&write.handle, write.revision)),
+    );
+    bindings.insert(
+        format!("experience_expected_{suffix}"),
+        json!(&write.record_json),
+    );
+    bindings.insert(
+        format!("experience_record_{suffix}"),
+        json!({
+            "handle": write.handle,
+            "revision": write.revision,
+            "record_json": write.record_json,
+            "record_digest": write.record_digest,
+            "state_fence": write.state_fence,
+            "scope_id": write.scope_id,
+            "task_id": write.task_id,
+        }),
+    );
+}
+
 /// Reports whether a provider statement error observes a missing
 /// experience table. Missing tables read as empty, never as failure:
-/// every error must narrate a nonexistent table naming one of the two
+/// every error must narrate a nonexistent table naming one of the
 /// experience tables.
 pub(crate) fn missing_experience_table(errors: &[String]) -> bool {
     !errors.is_empty()
         && errors.iter().all(|error| {
             error.contains("does not exist")
                 && (error.contains(schema::table::EXPERIENCE_BANK)
-                    || error.contains(schema::table::EXPERIENCE_FEEDBACK))
+                    || error.contains(schema::table::EXPERIENCE_FEEDBACK)
+                    || error.contains(schema::table::EXPERIENCE_SESSION_EPISODE))
         })
 }
 

@@ -12,10 +12,13 @@
 //!
 //! Wire identity: [`EXPERIENCE_STORE_SCHEMA_V1`]
 //! (`eliot.experience.state.v1`). Mutation operations:
-//! `CommitExperienceBank`, `CommitAgentFeedback`. Read operations:
+//! `CommitExperienceBank`, `CommitAgentFeedback`, `CommitSessionEpisode`.
+//! Read operations:
 //! `GetExperienceBankRange`, `GetAgentFeedbackRange`. Transition class:
 //! `CaptureCandidate` with a `Candidate` ceiling (no support, influence,
-//! lifecycle, or assertability change).
+//! lifecycle, or assertability change). A committed episode is transport proof
+//! only: message order, source cursor, portability and completeness stay
+//! Governor-owned inside the verbatim document.
 //!
 //! Record documents travel as opaque JSON strings: the store preserves
 //! them verbatim and validates shape/bounds/closed family membership
@@ -48,6 +51,12 @@ pub const EXPERIENCE_STORE_SCHEMA_V1: &str = "eliot.experience.state.v1";
 pub const EXPERIENCE_BANK_MUTATION_NAME: &str = "CommitExperienceBank";
 /// Closed mutation operation name for feedback-record writes.
 pub const EXPERIENCE_FEEDBACK_MUTATION_NAME: &str = "CommitAgentFeedback";
+/// Closed mutation operation name for session-episode writes.
+///
+/// Must stay byte-identical to the Governor commit producer's
+/// `SESSION_EPISODE_COMMIT_OPERATION` (issue #1778, I11.4/I12.37); the name
+/// maps in `operation_parameters` bind this same spelling.
+pub const EXPERIENCE_SESSION_EPISODE_MUTATION_NAME: &str = "CommitSessionEpisode";
 /// Closed read operation name for bank-record range reads.
 pub const EXPERIENCE_BANK_READ_NAME: &str = "GetExperienceBankRange";
 /// Closed read operation name for feedback-record range reads.
@@ -168,6 +177,24 @@ pub enum DecodedExperienceMutation {
         /// Deterministic commit idempotency key.
         idempotency_key: String,
     },
+    /// Persist one immutable session-episode row. Same field rule as bank; the
+    /// admitted document is the verbatim model-free `SessionEpisode`.
+    SessionEpisode {
+        /// Exact canonical handle of the episode.
+        handle: String,
+        /// Owner revision of the episode.
+        revision: u64,
+        /// Verbatim canonical episode document.
+        record_json: String,
+        /// Presented digest of the admitted episode bytes.
+        record_digest: String,
+        /// Digest over the canonical admission-scope bytes.
+        scope_digest: String,
+        /// Digest over the canonical admission-fence bytes.
+        fence_digest: String,
+        /// Deterministic commit idempotency key.
+        idempotency_key: String,
+    },
 }
 
 /// Decoded range read with its closed page bound.
@@ -253,6 +280,36 @@ pub fn experience_feedback_mutation_request(
     }
 }
 
+/// Builds a session-episode commit-leg parameter map. Same field rule as bank.
+pub fn experience_session_episode_commit_params(
+    record_json: String,
+    record_digest: String,
+    record_revision: u64,
+    scope_digest: String,
+    fence_digest: String,
+    idempotency_key: String,
+) -> BTreeMap<String, Value> {
+    experience_bank_commit_params(
+        record_json,
+        record_digest,
+        record_revision,
+        scope_digest,
+        fence_digest,
+        idempotency_key,
+    )
+}
+
+/// Builds the closed `CommitSessionEpisode` mutation request.
+#[must_use]
+pub fn experience_session_episode_mutation_request(
+    params: BTreeMap<String, Value>,
+) -> NamedMutationRequest {
+    NamedMutationRequest {
+        operation: NamedMutationOperation::CommitSessionEpisode,
+        parameters: params,
+    }
+}
+
 /// Builds a closed experience range-read request over one scope.
 pub fn experience_bank_read_request(
     scope_id: ScopeId,
@@ -311,6 +368,7 @@ pub fn validate_experience_mutation_params(
 ) -> Result<(), StoreError> {
     if operation != NamedMutationOperation::CommitExperienceBank
         && operation != NamedMutationOperation::CommitAgentFeedback
+        && operation != NamedMutationOperation::CommitSessionEpisode
     {
         return Err(StoreError::UnknownOperation);
     }
@@ -326,10 +384,10 @@ pub fn validate_experience_mutation_params(
             field: "experience.record_json",
             reason: "record document must be a JSON object",
         })?;
-    let revision_field = if operation == NamedMutationOperation::CommitExperienceBank {
-        "bank_revision"
-    } else {
-        "feedback_revision"
+    let revision_field = match operation {
+        NamedMutationOperation::CommitExperienceBank => "bank_revision",
+        NamedMutationOperation::CommitAgentFeedback => "feedback_revision",
+        _ => "episode_revision",
     };
     let document_revision =
         document
@@ -448,6 +506,17 @@ pub fn decode_experience_mutation(
             fence_digest: leg.fence_digest,
             idempotency_key: leg.idempotency_key,
         }),
+        NamedMutationOperation::CommitSessionEpisode => {
+            Ok(DecodedExperienceMutation::SessionEpisode {
+                handle: leg.handle,
+                revision: leg.revision,
+                record_json: leg.record_json,
+                record_digest: leg.record_digest,
+                scope_digest: leg.scope_digest,
+                fence_digest: leg.fence_digest,
+                idempotency_key: leg.idempotency_key,
+            })
+        }
         _ => Err(StoreError::UnknownOperation),
     }
 }

@@ -93,16 +93,28 @@
 //! always sends a scope), and provider shaping are mutually compatible
 //! as they stand — no layer changes. Bank/feedback reads stay genuinely
 //! scope-addressed and unchanged.
+//!
+//! Session episodes (issue #1778, I11.4/I12.37): [`admit_session_episode`]
+//! builds the model-free, privacy-scoped durable conversation record from
+//! already-normalized public messages and never from a model, a tool dump, or
+//! a minted source cursor; [`merge_session_episode`] merges by stable source
+//! identity and cursor, idempotently for a repeated cursor and fail-closed
+//! against dropped or reordered history; [`produce_session_episode_commit`] is
+//! the owner-sequenced durable-write join, so a failed write stays
+//! pending/failed publication rather than a saved conversation, and a repeated
+//! admitted identity cannot create a second episode revision.
 
 use std::collections::BTreeMap;
 
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_observation_contracts::{
-    AgentFeedbackRecord, BankProjection, ExperienceBankRecord, ExperienceCommitParameters,
-    ExperienceRecordRef, ExperienceRetentionReadPosture, FeedbackClass, FeedbackProjection,
-    JournalProjection, ObservationKind, ObservationScope, PrivacyRetentionDisclosure,
-    ProducerTrace, ProjectionCoverage, ProjectionOmission, ProjectionOmissionClass, RetentionHold,
-    RetentionSchedule, SystemObservationJournalRecord, bank_record_ref, feedback_record_ref,
+    AgentFeedbackRecord, BankProjection, CoverageInterval, ExperienceBankRecord,
+    ExperienceCommitParameters, ExperienceRecordRef, ExperienceRetentionReadPosture, FeedbackClass,
+    FeedbackProjection, JournalProjection, ObservationKind, ObservationScope,
+    PrivacyRetentionDisclosure, ProducerTrace, ProjectionCoverage, ProjectionOmission,
+    ProjectionOmissionClass, RetentionHold, RetentionSchedule, SessionEpisodeMessage,
+    SessionEpisodePortability, SessionEpisodeRecord, SessionEpisodeSourceAvailability,
+    SourceRevisionHandle, SystemObservationJournalRecord, bank_record_ref, feedback_record_ref,
     resolve_bank_ref, resolve_feedback_ref, resolve_retention_read,
 };
 
@@ -129,6 +141,7 @@ pub const FEEDBACK_SOURCE_ID: &str = "governor.agent-feedback";
 pub struct ExperienceRevisionLedger {
     bank: BTreeMap<String, u64>,
     feedback: BTreeMap<String, u64>,
+    session_episode: BTreeMap<String, u64>,
 }
 
 impl ExperienceRevisionLedger {
@@ -161,6 +174,21 @@ impl ExperienceRevisionLedger {
                 .or_insert(0);
             if record.feedback_revision > *entry {
                 *entry = record.feedback_revision;
+            }
+        }
+    }
+
+    /// Rebuild session-episode sequencing from admitted records (greatest
+    /// revision wins per handle). Idempotent: rebuilding twice changes
+    /// nothing. Issue #1778, I12.37.
+    pub fn rebuild_session_episodes(&mut self, records: &[SessionEpisodeRecord]) {
+        for record in records {
+            let entry = self
+                .session_episode
+                .entry(record.handle.as_str().to_owned())
+                .or_insert(0);
+            if record.episode_revision > *entry {
+                *entry = record.episode_revision;
             }
         }
     }
@@ -203,6 +231,27 @@ impl ExperienceRevisionLedger {
         }
     }
 
+    /// Check a session-episode revision against the tracked greatest and
+    /// track it. Same strictly-greater rule as the bank family: a repeated
+    /// admitted identity never creates a second episode revision.
+    pub fn track_session_episode(
+        &mut self,
+        handle: &ArtifactId,
+        revision: u64,
+    ) -> Result<(), GovernorObservationError> {
+        match self.session_episode.get(handle.as_str()) {
+            Some(last) if revision <= *last => Err(GovernorObservationError::InvalidField {
+                field: "session_episode.episode_revision",
+                reason: "revision is not strictly greater than the tracked revision",
+            }),
+            _ => {
+                self.session_episode
+                    .insert(handle.as_str().to_owned(), revision);
+                Ok(())
+            }
+        }
+    }
+
     /// Greatest tracked bank revision for one handle, when admitted
     /// through this owner. The commit producer requires an exact match:
     /// only the current revision of each handle may enter the durable
@@ -214,6 +263,11 @@ impl ExperienceRevisionLedger {
     /// Greatest tracked feedback revision for one handle.
     pub fn tracked_feedback_revision(&self, handle: &ArtifactId) -> Option<u64> {
         self.feedback.get(handle.as_str()).copied()
+    }
+
+    /// Greatest tracked session-episode revision for one handle.
+    pub fn tracked_session_episode_revision(&self, handle: &ArtifactId) -> Option<u64> {
+        self.session_episode.get(handle.as_str()).copied()
     }
 }
 
@@ -308,6 +362,192 @@ pub fn admit_feedback_record(
     .map_err(GovernorObservationError::Observation)?;
     ledger.track_feedback(&record.handle, record.feedback_revision)?;
     Ok(record)
+}
+
+/// Everything one public conversation contributes to its next `SessionEpisode`
+/// revision (issue #1778, I11.4/I12.37).
+///
+/// The caller supplies only already-normalized, privacy-admissible material and
+/// the ingestion owner's own observations. It never supplies a model answer, a
+/// raw tool dump, or a computed digest: a tool flood travels in
+/// `messages[].referenced_artifact_refs`, and `source_ref` / `coverage` are
+/// the ingestion owner's cursor and observation, carried unchanged.
+#[derive(Clone, Debug)]
+pub struct SessionEpisodeAdmission {
+    /// Stable episode identity the messages belong to.
+    pub handle: ArtifactId,
+    /// Owner revision this admission claims for the episode.
+    pub episode_revision: u64,
+    /// Session and attempt references the episode covers.
+    pub session_and_attempt_refs: Vec<ArtifactId>,
+    /// The ingestion owner's source cursor for this window.
+    pub source_ref: SourceRevisionHandle,
+    /// Availability of the source behind `source_ref`.
+    pub source_availability: SessionEpisodeSourceAvailability,
+    /// Whether the episode body stands on its own without the source.
+    pub content_self_contained: bool,
+    /// Explicit portability decision; local-private unless the caller says
+    /// otherwise, so a selected scope never infers project sharing.
+    pub portability: SessionEpisodePortability,
+    /// Entity references the episode touched.
+    pub touched_entity_refs: Vec<ArtifactId>,
+    /// Observed cursor window of the admitted messages.
+    pub observed_window: CoverageInterval,
+    /// Explicit truncation observation for the window.
+    pub truncated: bool,
+    /// The ingestion owner's independent coverage evidence for the window.
+    pub coverage: ProjectionCoverage,
+    /// Public messages in admitted order, edits and supersessions included.
+    pub messages: Vec<SessionEpisodeMessage>,
+    /// Read scope governing the episode.
+    pub scope: ObservationScope,
+    /// Fence the episode is admitted under.
+    pub fence: StateFence,
+    /// Producer origin of the admitted public messages.
+    pub provenance: ProducerTrace,
+    /// Privacy/retention/disclosure refs for the episode.
+    pub retention: PrivacyRetentionDisclosure,
+    /// Prior episode record this revision supersedes, when lineage applies.
+    pub predecessor: Option<ArtifactId>,
+}
+
+/// Admit the next model-free `SessionEpisode` revision (issue #1778,
+/// I11.4/I12.37).
+///
+/// This is the durable-acceptance precondition for a public conversation. It
+/// builds the episode record from already-normalized, privacy-admissible
+/// public messages and nothing else: never a model, never an inlined tool dump
+/// (those travel as `referenced_artifact_refs`), and never a minted or
+/// recomputed source cursor.
+///
+/// When `retained` is the previously admitted revision, the incoming window is
+/// first merged by [`merge_session_episode`], so a repeated cursor is an
+/// idempotent no-op and a shortened or reordered window fails closed. The
+/// revision is tracked in `ledger` only after the shape admits, exactly as for
+/// the bank and feedback families, so a failed admission never pollutes
+/// sequencing and the same admitted identity cannot create a second revision.
+pub fn admit_session_episode(
+    ledger: &mut ExperienceRevisionLedger,
+    retained: Option<&SessionEpisodeRecord>,
+    admission: SessionEpisodeAdmission,
+) -> Result<SessionEpisodeRecord, GovernorObservationError> {
+    let SessionEpisodeAdmission {
+        handle,
+        episode_revision,
+        session_and_attempt_refs,
+        source_ref,
+        source_availability,
+        content_self_contained,
+        portability,
+        touched_entity_refs,
+        observed_window,
+        truncated,
+        coverage,
+        messages,
+        scope,
+        fence,
+        provenance,
+        retention,
+        predecessor,
+    } = admission;
+    let candidate = SessionEpisodeRecord::admit(
+        handle,
+        episode_revision,
+        session_and_attempt_refs,
+        source_ref,
+        source_availability,
+        content_self_contained,
+        portability,
+        touched_entity_refs,
+        observed_window,
+        truncated,
+        coverage,
+        messages,
+        scope,
+        fence,
+        provenance,
+        retention,
+        predecessor,
+    )
+    .map_err(GovernorObservationError::Observation)?;
+    let record = match retained {
+        Some(previous) => merge_session_episode(previous, &candidate)?,
+        None => candidate,
+    };
+    ledger.track_session_episode(&record.handle, record.episode_revision)?;
+    Ok(record)
+}
+
+/// Merge an incoming episode into the retained one by stable source identity
+/// and source cursor (issue #1778, I12.37 append-only cursored session).
+///
+/// Rules, each a real check rather than a presence claim:
+///
+/// - The episode identity must be the same handle: a different handle is a
+///   different episode, never a continuation of this one.
+/// - The source identity must be the same `source_ref.source_id`. A different
+///   ingestion source is not a merge of this episode.
+/// - An identical source cursor is an idempotent replay: the retained record is
+///   returned unchanged, so re-reading the same cursor window never creates a
+///   second episode revision or duplicates a message.
+/// - Otherwise the incoming record must be exactly the next revision, and it
+///   must retain every message the previous record already recorded, in the
+///   same relative order. Dropping or reordering recorded history fails closed
+///   rather than silently shortening the conversation.
+///
+/// The merge returns the already-admitted incoming record; the caller still
+/// admits it through [`admit_session_episode`], which is what tracks the new
+/// revision and gates the durable commit.
+pub fn merge_session_episode(
+    previous: &SessionEpisodeRecord,
+    incoming: &SessionEpisodeRecord,
+) -> Result<SessionEpisodeRecord, GovernorObservationError> {
+    previous
+        .validate()
+        .map_err(GovernorObservationError::Observation)?;
+    incoming
+        .validate()
+        .map_err(GovernorObservationError::Observation)?;
+    if previous.handle != incoming.handle {
+        return Err(GovernorObservationError::InvalidField {
+            field: "session_episode.handle",
+            reason: "merge requires the same episode handle",
+        });
+    }
+    if previous.source_ref.source_id != incoming.source_ref.source_id {
+        return Err(GovernorObservationError::InvalidField {
+            field: "session_episode.source_ref",
+            reason: "merge requires the same stable source identity",
+        });
+    }
+    if previous.source_ref == incoming.source_ref {
+        // Same cursor: idempotent merge, no new revision and no duplicate.
+        return Ok(previous.clone());
+    }
+    if incoming.episode_revision != previous.episode_revision.saturating_add(1) {
+        return Err(GovernorObservationError::InvalidField {
+            field: "session_episode.episode_revision",
+            reason: "merge requires the next episode revision",
+        });
+    }
+    let mut retained = previous.messages.iter();
+    for message in &incoming.messages {
+        if let Some(earlier) = retained.next()
+            && earlier.message_ref != message.message_ref
+        {
+            return Err(GovernorObservationError::InvalidField {
+                field: "session_episode.messages.message_ref",
+                reason: "merge would drop or reorder already recorded history",
+            });
+        }
+    }
+    if retained.next().is_some() {
+        return Err(GovernorObservationError::InvalidField {
+            field: "session_episode.messages.message_ref",
+            reason: "merge would drop already recorded history",
+        });
+    }
+    Ok(incoming.clone())
 }
 
 /// Supply owner-issued opaque refs for admitted bank records.
@@ -1339,6 +1579,34 @@ pub fn produce_feedback_commit(
         }
     }
     ExperienceCommitParameters::for_feedback(record).map_err(GovernorObservationError::Observation)
+}
+
+/// Produce the durable commit payload for one admitted session-episode record.
+///
+/// Same owner-sequencing gate as [`produce_bank_commit`]: the exact revision
+/// must be tracked by `ledger` as admitted through this owner, so a superseded
+/// revision and a never-admitted record both fail closed before the
+/// `capture_candidate` commit path is reachable. Publication of the durable
+/// conversation is therefore gated on this owner, not on the caller: a
+/// rejected payload is pending/failed publication, never a saved conversation.
+pub fn produce_session_episode_commit(
+    ledger: &ExperienceRevisionLedger,
+    record: &SessionEpisodeRecord,
+) -> Result<ExperienceCommitParameters, GovernorObservationError> {
+    record
+        .validate()
+        .map_err(GovernorObservationError::Observation)?;
+    match ledger.tracked_session_episode_revision(&record.handle) {
+        Some(tracked) if tracked == record.episode_revision => {}
+        _ => {
+            return Err(GovernorObservationError::InvalidField {
+                field: "session_episode.episode_revision",
+                reason: "record revision was not admitted through this owner",
+            });
+        }
+    }
+    ExperienceCommitParameters::for_session_episode(record)
+        .map_err(GovernorObservationError::Observation)
 }
 
 /// Decode bridge range-payload records into admitted bank records.

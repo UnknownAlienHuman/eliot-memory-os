@@ -1313,6 +1313,58 @@ impl DaemonComposition {
         Ok(receipt)
     }
 
+    /// Admits and durably commits one model-free `SessionEpisode` revision for
+    /// a public conversation (issue #1778, I11.4/I12.37).
+    ///
+    /// Outbound-only and the same shape as
+    /// [`Self::commit_experience_bank_record`]: this method owns no Store
+    /// client, opens no second durability path, and takes no semantic
+    /// shortcut. The public message is admitted model-free by the observation
+    /// owner — merged against `retained` by stable source identity and cursor
+    /// — and only then written through the retained neutral Kernel port,
+    /// reached via [`eliot_governor::persist_public_request_episode`]. The
+    /// resulting owner change is published with the same refresh/stale
+    /// discipline.
+    ///
+    /// The returned [`eliot_governor::SessionEpisodePublication`] is the
+    /// durable-acceptance signal: only `Published { .. }` means a `Committed`
+    /// owner receipt exists for this exact episode revision, and
+    /// `PendingPublication { .. }` is a refused or failed write — never a
+    /// saved conversation, and never a completion claim about any cognitive
+    /// answer.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the composition root passes the admission input through to the Governor owner unchanged"
+    )]
+    pub async fn persist_public_request_episode(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        ledger: &mut eliot_observation::bank_admission::ExperienceRevisionLedger,
+        retained: Option<&eliot_observation_contracts::SessionEpisodeRecord>,
+        admission: eliot_observation::bank_admission::SessionEpisodeAdmission,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> eliot_governor::SessionEpisodePublication {
+        let publication = eliot_governor::persist_public_request_episode(
+            &self.governor,
+            identity,
+            ledger,
+            retained,
+            admission,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        publication
+    }
+
     /// Applies one narrowed dependency change to the held capability-admission
     /// view and commits every record it limited, then publishes the resulting
     /// owner change (issue #1773, I3.4, W2).

@@ -288,13 +288,15 @@ pub use experience_store::{
     EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE, EXPERIENCE_PAGE_TRUNCATED,
     EXPERIENCE_PARAM_FENCE_DIGEST, EXPERIENCE_PARAM_IDEMPOTENCY_KEY, EXPERIENCE_PARAM_MAX_RECORDS,
     EXPERIENCE_PARAM_RECORD_DIGEST, EXPERIENCE_PARAM_RECORD_JSON, EXPERIENCE_PARAM_RECORD_REVISION,
-    EXPERIENCE_PARAM_SCOPE_DIGEST, EXPERIENCE_STORE_SCHEMA_V1, ExperienceContractError,
-    ExperienceRangePage, MAX_EXPERIENCE_HANDLE_BYTES, MAX_EXPERIENCE_IDEMPOTENCY_BYTES,
-    MAX_EXPERIENCE_PAGE_RECORDS, MAX_EXPERIENCE_RECORD_JSON_BYTES, audit_cursor_issue,
-    audit_cursor_parse, audit_envelope_candidate, audit_heads_digest, decode_experience_mutation,
+    EXPERIENCE_PARAM_SCOPE_DIGEST, EXPERIENCE_SESSION_EPISODE_MUTATION_NAME,
+    EXPERIENCE_STORE_SCHEMA_V1, ExperienceContractError, ExperienceRangePage,
+    MAX_EXPERIENCE_HANDLE_BYTES, MAX_EXPERIENCE_IDEMPOTENCY_BYTES, MAX_EXPERIENCE_PAGE_RECORDS,
+    MAX_EXPERIENCE_RECORD_JSON_BYTES, audit_cursor_issue, audit_cursor_parse,
+    audit_envelope_candidate, audit_heads_digest, decode_experience_mutation,
     experience_bank_commit_params, experience_bank_mutation_request, experience_bank_read_request,
     experience_feedback_commit_params, experience_feedback_mutation_request,
-    experience_feedback_read_request, validate_experience_mutation_params,
+    experience_feedback_read_request, experience_session_episode_commit_params,
+    experience_session_episode_mutation_request, validate_experience_mutation_params,
     validate_experience_read_params,
 };
 
@@ -3875,6 +3877,17 @@ pub enum NamedMutationOperation {
     /// Canonical agent-feedback commit (issue #223). Same durable rule
     /// as the bank commit leg.
     CommitAgentFeedback,
+    /// Canonical session-episode commit (issue #1778, I11.4/I12.37).
+    ///
+    /// Durable model-free `SessionEpisode` persistence only: the prepared
+    /// transition must carry [`TransitionClass::CaptureCandidate`], the
+    /// declared candidate-only effect ceiling, and the closed experience typed
+    /// parameters (verbatim episode record document, presented digests, owner
+    /// revision, idempotency key). The store bridge persists the document
+    /// verbatim, arbitrates handle/revision keys with convergent replay, and
+    /// never derives message order, source cursor, portability, completeness
+    /// or privacy: a committed episode proves transport only.
+    CommitSessionEpisode,
     /// Canonical typed blackboard candidate persistence (issue #1822).
     /// Persists a Kernel-admitted candidate revision under the candidate-only
     /// ceiling; it does not perform decisions, truth promotion, acceptance,
@@ -3930,6 +3943,7 @@ impl NamedMutationOperation {
             | Self::RecordLearningRecord
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
+            | Self::CommitSessionEpisode
             | Self::ApplyBlackboardItem
             | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,

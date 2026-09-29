@@ -214,6 +214,7 @@
 //! | `RecordLearningRecord` | F1 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `CommitExperienceBank` | F1 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `CommitAgentFeedback` | F7 | `CaptureCandidate` | `Candidate` | 4 |
+//! | `CommitSessionEpisode` | F7 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `ApplyBlackboardItem` | F7 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `ApplyEpistemicRevision` | F3 | `Epistemic` | `Candidate` | 4 |
 //! | `UpdateTaskState` | F2 | `TaskControl` | `ReversibleMutation` | 4 |

@@ -82,6 +82,11 @@ pub(crate) mod table {
     /// Immutable agent-feedback row per handle + owner revision
     /// (issue #223). Same create-only rule as the bank rows.
     pub(crate) const EXPERIENCE_FEEDBACK: &str = "experience_feedback";
+    /// Immutable model-free session-episode row per handle + owner revision
+    /// (issue #1778, I11.4/I12.37). Same create-only rule as the bank rows;
+    /// the row proves transport of the verbatim admitted episode and never
+    /// derives message order, source cursor, portability or completeness.
+    pub(crate) const EXPERIENCE_SESSION_EPISODE: &str = "experience_session_episode";
     /// Immutable learning-record row per record kind + handle + record
     /// digest (issue #1868). One row per joined
     /// `(record_kind, handle, record_digest)` key carrying the verbatim
@@ -119,7 +124,7 @@ pub(crate) mod table {
     ///   `automation_continuation` are declared without generation DDL;
     ///   continuations create their schemaless table only during explicit
     ///   truncated-page issuance.
-    pub(crate) const ALL_TABLES: [&str; 25] = [
+    pub(crate) const ALL_TABLES: [&str; 26] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -144,6 +149,7 @@ pub(crate) mod table {
         AUTOMATION_CONTINUATION,
         EXPERIENCE_BANK,
         EXPERIENCE_FEEDBACK,
+        EXPERIENCE_SESSION_EPISODE,
         LEARNING_RECORD,
     ];
 }

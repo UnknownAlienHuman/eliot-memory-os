@@ -1546,8 +1546,44 @@ fn experience_row_key(handle: &str, revision: u64) -> String {
     format!("{handle}\x1f{revision:020}")
 }
 
-/// Executes admitted experience bank/feedback legs on already-locked state
-/// (issue #223).
+/// Closed experience row family; selects the immutable row table the
+/// create-or-converge write lands in. It adds no semantic: the verbatim
+/// document and its presented digest are identical for every family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExperienceFamily {
+    /// Experience-bank family (issue #223).
+    Bank,
+    /// Agent-feedback family (issue #223).
+    Feedback,
+    /// Model-free session-episode family (issue #1778, I11.4/I12.37).
+    SessionEpisode,
+}
+
+/// Applies one create-or-converge experience row write.
+///
+/// Missing keys create, identical stored documents converge silently, and a
+/// divergent rewrite of the same joined key fails closed as an identity
+/// conflict. The row shape is identical across families, so this is the single
+/// convergence rule every experience leg uses.
+fn converge_experience_row(
+    rows: &mut BTreeMap<String, ExperienceRow>,
+    key: &str,
+    row: &ExperienceRow,
+) -> Result<(), StoreError> {
+    match rows.get(key) {
+        Some(existing) if existing.record_json != row.record_json => {
+            Err(StoreError::IdentityConflict)
+        }
+        Some(_) => Ok(()),
+        None => {
+            rows.insert(key.to_owned(), row.clone());
+            Ok(())
+        }
+    }
+}
+
+/// Executes admitted experience bank/feedback/session-episode legs on
+/// already-locked state (issue #223; session episodes issue #1778).
 ///
 /// Runs beside [`dispatch_apply_automation_state`] under the same lock as
 /// the receipt commit: one identity, one receipt, recoverable replay
@@ -1568,6 +1604,7 @@ fn dispatch_apply_experience_state(
             command.operation,
             NamedMutationOperation::CommitExperienceBank
                 | NamedMutationOperation::CommitAgentFeedback
+                | NamedMutationOperation::CommitSessionEpisode
         )
     });
     if !has_experience_op {
@@ -1581,71 +1618,68 @@ fn dispatch_apply_experience_state(
     for command in &transition.named_operations {
         let decoded = match command.operation {
             NamedMutationOperation::CommitExperienceBank
-            | NamedMutationOperation::CommitAgentFeedback => {
+            | NamedMutationOperation::CommitAgentFeedback
+            | NamedMutationOperation::CommitSessionEpisode => {
                 eliot_store_api::decode_experience_mutation(command.operation, &command.parameters)?
             }
             _ => continue,
         };
-        let (handle, revision, record_json, record_digest, table_is_bank) = match decoded {
+        let (handle, revision, record_json, record_digest, family) = match decoded {
             eliot_store_api::DecodedExperienceMutation::Bank {
                 handle,
                 revision,
                 record_json,
                 record_digest,
                 ..
-            } => (handle, revision, record_json, record_digest, true),
+            } => (handle, revision, record_json, record_digest, ExperienceFamily::Bank),
             eliot_store_api::DecodedExperienceMutation::Feedback {
                 handle,
                 revision,
                 record_json,
                 record_digest,
                 ..
-            } => (handle, revision, record_json, record_digest, false),
+            } => (
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ExperienceFamily::Feedback,
+            ),
+            eliot_store_api::DecodedExperienceMutation::SessionEpisode {
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ..
+            } => (
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ExperienceFamily::SessionEpisode,
+            ),
         };
         let key = experience_row_key(&handle, revision);
         let row_json = serde_json::to_value(&record_json)
             .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        if table_is_bank {
-            match state.experience_bank_rows.get(&key) {
-                Some(existing) if existing.record_json != record_json => {
-                    return Err(StoreError::IdentityConflict);
-                }
-                Some(_) => {}
-                None => {
-                    state.experience_bank_rows.insert(
-                        key,
-                        ExperienceBankRow {
-                            handle,
-                            revision,
-                            record_json: record_json.clone(),
-                            record_digest,
-                            state_fence: transition.state_fence.clone(),
-                            scope_id: transition.scope_id.to_string(),
-                            task_id: transition.task_id.clone(),
-                        },
-                    );
-                }
+        let row = ExperienceRow {
+            handle,
+            revision,
+            record_json: record_json.clone(),
+            record_digest,
+            state_fence: transition.state_fence.clone(),
+            scope_id: transition.scope_id.to_string(),
+            task_id: transition.task_id.clone(),
+        };
+        match family {
+            ExperienceFamily::Bank => {
+                converge_experience_row(&mut state.experience_bank_rows, &key, &row)?
             }
-        } else {
-            match state.experience_feedback_rows.get(&key) {
-                Some(existing) if existing.record_json != record_json => {
-                    return Err(StoreError::IdentityConflict);
-                }
-                Some(_) => {}
-                None => {
-                    state.experience_feedback_rows.insert(
-                        key,
-                        ExperienceFeedbackRow {
-                            handle,
-                            revision,
-                            record_json: record_json.clone(),
-                            record_digest,
-                            state_fence: transition.state_fence.clone(),
-                            scope_id: transition.scope_id.to_string(),
-                            task_id: transition.task_id.clone(),
-                        },
-                    );
-                }
+            ExperienceFamily::Feedback => {
+                converge_experience_row(&mut state.experience_feedback_rows, &key, &row)?
+            }
+            ExperienceFamily::SessionEpisode => {
+                converge_experience_row(&mut state.experience_session_episode_rows, &key, &row)?
             }
         }
         let payload_digest = sha256_hex(
@@ -5277,27 +5311,15 @@ struct ResourceSnapshotRow {
     task_id: Option<String>,
 }
 
-/// One immutable experience-bank row: the verbatim Governor-admitted
+/// One immutable experience row: the verbatim Governor-admitted
 /// record document for one handle + owner revision with its presented
-/// digest, admission fence, and task-binding provenance (issue #223).
-/// Rows are create-only; divergent rewrites fail closed and identical
-/// replays converge.
+/// digest, admission fence, and task-binding provenance (issue #223 for
+/// bank/feedback; issue #1778, I11.4/I12.37 for the model-free
+/// `SessionEpisode`). Rows are create-only; divergent rewrites fail closed
+/// and identical replays converge. The row shape is identical across the
+/// families, so one type backs every experience table.
 #[derive(Clone, Debug, PartialEq)]
-struct ExperienceBankRow {
-    handle: String,
-    revision: u64,
-    record_json: String,
-    record_digest: String,
-    state_fence: StateFence,
-    scope_id: String,
-    task_id: Option<String>,
-}
-
-/// One immutable agent-feedback row (issue #223). Same durable rule as
-/// the bank rows: verbatim document, presented digest, create-only keyed
-/// by joined handle and owner revision.
-#[derive(Clone, Debug, PartialEq)]
-struct ExperienceFeedbackRow {
+struct ExperienceRow {
     handle: String,
     revision: u64,
     record_json: String,
@@ -5481,10 +5503,16 @@ struct MemoryState {
     /// (issue #223). Verbatim Governor-admitted record documents with
     /// presented digests, driven only through the closed experience legs
     /// under the held transaction lock; divergent rewrites fail closed.
-    experience_bank_rows: BTreeMap<String, ExperienceBankRow>,
+    experience_bank_rows: BTreeMap<String, ExperienceRow>,
     /// Immutable agent-feedback rows keyed by joined `(handle, revision)`
     /// (issue #223). Same durable rule as the bank rows.
-    experience_feedback_rows: BTreeMap<String, ExperienceFeedbackRow>,
+    experience_feedback_rows: BTreeMap<String, ExperienceRow>,
+    /// Immutable model-free session-episode rows keyed by joined
+    /// `(handle, revision)` (issue #1778, I11.4/I12.37). Same durable rule as
+    /// the bank rows: the row proves transport of the verbatim admitted
+    /// episode and never derives message order, source cursor, portability or
+    /// completeness from its bytes.
+    experience_session_episode_rows: BTreeMap<String, ExperienceRow>,
     /// Immutable learning-record rows keyed by joined
     /// `(record_kind, handle, record_digest)` (issue #1868, I12.24).
     /// Verbatim Governor-admitted record documents with presented digests
@@ -5536,6 +5564,7 @@ impl PartialEq for MemoryState {
             && self.automation_last_failure == other.automation_last_failure
             && self.experience_bank_rows == other.experience_bank_rows
             && self.experience_feedback_rows == other.experience_feedback_rows
+            && self.experience_session_episode_rows == other.experience_session_episode_rows
             && self.learning_record_rows == other.learning_record_rows
             && self.capability_evidence_rows == other.capability_evidence_rows
             && self.next_commit_sequence == other.next_commit_sequence
@@ -5581,6 +5610,7 @@ impl Default for MemoryState {
             next_continuation_terminal_revision: 1,
             experience_bank_rows: BTreeMap::new(),
             experience_feedback_rows: BTreeMap::new(),
+            experience_session_episode_rows: BTreeMap::new(),
             learning_record_rows: BTreeMap::new(),
             capability_evidence_rows: BTreeMap::new(),
             next_commit_sequence: 1,

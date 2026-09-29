@@ -55,7 +55,10 @@ pub use cue_composition::{
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
-pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
+pub use experience_commit::{
+    SessionEpisodePublication, commit_experience_bank, commit_experience_feedback,
+    commit_session_episode, persist_public_request_episode,
+};
 pub use finish_attempt::{
     FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,
     PreparedKernelExchange,

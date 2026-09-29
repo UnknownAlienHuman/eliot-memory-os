@@ -693,6 +693,13 @@ pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::EXPERIENCE_FEEDBACK,
     },
+    // Session-episode rows are the same create-or-converge experience family and
+    // are declared outside the admitted generation for the same reason: the
+    // pinned baseline does not define them, so a capture must not read them
+    // until a future generation admits the table.
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::EXPERIENCE_SESSION_EPISODE,
+    },
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::LEARNING_RECORD,
     },
@@ -757,7 +764,10 @@ fn admitted_generation_ddl(generation: &str) -> Option<&'static str> {
 /// `resource_snapshot`, the three captured automation tables, `experience_bank`
 /// and `experience_feedback`, so OR-ing it in would make every one of those
 /// declared classes read as admitted and the census would refuse every capture
-/// before any provider I/O. The marker carries the trailing space, so
+/// before any provider I/O. `experience_session_episode` is outside that
+/// baseline for the same reason — the pinned generation does not define it —
+/// and is declared outside rather than captured. The marker carries the
+/// trailing space, so
 /// `relation_record_extra` can never satisfy `relation_record`.
 ///
 /// The v3 baseline is additive over v2 and re-defines the two erasure tables, so
