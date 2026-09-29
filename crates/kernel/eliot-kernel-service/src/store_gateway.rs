@@ -4747,7 +4747,6 @@ impl KernelStoreGateway {
                 Ok(response)
             }
             Err(DreamerCommitEvidence::Refused(error)) => {
-            Err(DreamerCommitEvidence::Refused(error)) => {
                 // A refused send mutated nothing, so the provisional claim is
                 // released and no Ordering Scope is left paused.
                 if let (Some(ors), Some(claim)) =
