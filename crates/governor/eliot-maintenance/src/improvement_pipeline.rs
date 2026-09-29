@@ -118,13 +118,18 @@
 //! external effect and carries the [`improvement_retry_permitted`] gate so an
 //! unknown activation or effect outcome cannot be retried blindly. Revision `7`
 //! removes the caller-supplied reconciliation reference from that obligation
-//! and helper. Revision `8` binds that obligation to the effect owner's own
-//! validated [`EffectReceipt`] — the existing receipt owner, reused rather than
-//! duplicated — and reads the retry answer off that stored value: an absent,
-//! foreign, still-unknown, committed or compensated outcome stays denied, a
-//! completed effect reconciles the result its owner already retained instead of
+//! and helper. The obligation is then bound to the effect owner's own validated
+//! [`EffectReceipt`] — the existing receipt owner, reused rather than duplicated
+//! — and the retry answer is read off that stored value: an absent, foreign,
+//! still-unknown, committed or compensated outcome stays denied, a completed
+//! effect reconciles the result its owner already retained instead of
 //! authorizing a second execution, and only a proved non-effect admitted under
-//! this obligation's exact operation identity permits a retry.
+//! this obligation's exact operation identity permits a retry. That binding is
+//! NOT a wire revision: the owner outcome is skipped on serialize and defaults
+//! to absent on deserialize, so [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] stays `7`
+//! and the bytes of an already-written obligation are unchanged. The absent
+//! default is the denying direction, so a re-read obligation is unresolved until
+//! its owner reattaches its receipt.
 //!
 //! Deserialization is fail-closed: bytes written before the current revision no
 //! longer decode, so a stale disposition cannot be read as a current one.
