@@ -3743,6 +3743,7 @@ impl KernelComposition {
             StoreError::Security(_) => "STORE_SECURITY",
             StoreError::Receipt(_) => "STORE_RECEIPT",
             StoreError::UnknownOperation => "STORE_UNKNOWN_OPERATION",
+            StoreError::UnknownOutcome { .. } => "STORE_UNKNOWN_OUTCOME",
             StoreError::ManifestMismatch => "STORE_MANIFEST_MISMATCH",
             StoreError::TransitionClassExceeded => "STORE_TRANSITION_CLASS_EXCEEDED",
             StoreError::EffectCeilingExceeded => "STORE_EFFECT_CEILING_EXCEEDED",
@@ -4926,7 +4927,18 @@ impl KernelComposition {
             OrsError::Storage(_) => "ORS_STORAGE",
             OrsError::Encoding(_) => "ORS_ENCODING",
             OrsError::StagingNotDurable(_) => "ORS_STAGING_NOT_DURABLE",
+            OrsError::StagingCommitOutcomeUnknown { .. } => "ORS_STAGING_COMMIT_OUTCOME_UNKNOWN",
             OrsError::RecoveryProblemRetained { .. } => "ORS_RECOVERY_PROBLEM_RETAINED",
+            OrsError::BridgeRecoveryWindowCapacityExceeded => {
+                "ORS_BRIDGE_RECOVERY_WINDOW_CAPACITY_EXCEEDED"
+            }
+            OrsError::BridgeRecoveryCutCapacityExceeded => {
+                "ORS_BRIDGE_RECOVERY_CUT_CAPACITY_EXCEEDED"
+            }
+            OrsError::RecoverySnapshotMoved { .. } => "ORS_RECOVERY_SNAPSHOT_MOVED",
+            OrsError::AlreadyTerminalWrite(..) => "ORS_ALREADY_TERMINAL_WRITE",
+            OrsError::HostRequestAttemptLimitExceeded => "ORS_HOST_REQUEST_ATTEMPT_LIMIT_EXCEEDED",
+            OrsError::HostRequestAttemptExpired => "ORS_HOST_REQUEST_ATTEMPT_EXPIRED",
         }
     }
 
