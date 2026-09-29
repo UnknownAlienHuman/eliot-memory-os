@@ -229,6 +229,7 @@ fn ledger_request(tag: &str) -> ReactiveLedgerRequest {
         context: context(),
         state_fence: live_fence(),
         session_id: "session-live-1".to_owned(),
+        expected_revision: 0,
         ledger_json: ledger_json(),
     }
 }
@@ -473,6 +474,7 @@ fn ledger_payload() -> Value {
     json!({
         "session_id": "session-live-1",
         "ledger_json": ledger_json(),
+        "ledger_revision": 1,
         "revision": 1,
         "state_fence": serde_json::to_value(live_fence()).expect("fence"),
     })
