@@ -31,6 +31,7 @@ mod portable_adapters;
 mod portable_recovery;
 mod product_command;
 mod product_run;
+mod restore_journal_admission;
 mod restore_runner;
 
 pub use ecxf_export::{
@@ -62,6 +63,9 @@ pub use product_command::{
     preview_backup_create, preview_restore,
 };
 pub use product_run::{IssueReport, RestoreEpochSpec, RestoreRunReport, issue_backup, run_restore};
+pub use restore_journal_admission::{
+    DurableJournalRecord, RestoreJournalAdmissionOwner,
+};
 pub use restore_runner::{
     FileRestoreJournal, FileRestoreTarget, RunnerOutcome, execute_isolated_restore,
 };
