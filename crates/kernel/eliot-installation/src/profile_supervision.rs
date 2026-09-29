@@ -281,11 +281,28 @@ pub fn prove_no_service_profile_authority_dependency(
     // The profile anchor is the only root in this selection the OS lease
     // contract admits as a retainable object. `portable_dev` names an already
     // retained current-user directory, so the provider opens and holds a real
-    // no-follow handle to it for the whole proof. `user_mode` anchors on the
-    // OS-known-folder `LocalAppData` contour, which the adapter proves by
-    // known-folder lookup and reparse rejection rather than by a user-owned
-    // lease, so no lease is retained for it and no role is counted as verified
-    // against a retained object for that profile.
+    // no-follow handle to it for the whole proof.
+    //
+    // `user_mode` anchors on the OS-known-folder `LocalAppData` contour, and no
+    // lease is retained for it. This is NOT an adapter capability choice and
+    // must not be "fixed" by relaxing the user-owned lease precondition. The
+    // anchor is the OS folder itself, shared machine-wide across every per-user
+    // application, and `UserOwnedRootReadLease::open_existing` requires a
+    // protected two-ACE DACL owned by the current SID
+    // (`user_owned_leases.rs::verify_user_owned_opened_handle_read_only`). A
+    // stock `%LocalAppData%` root is inheritable (`D:AI`) and carries AppContainer
+    // capability, `Users` and `BA` ACEs, so it can never satisfy that contract.
+    // Provisioning it to satisfy the contract would strip those ACEs from a
+    // shared OS folder and break unrelated software, and the read lease
+    // structurally never requests `WRITE_DAC`, so it cannot do so itself.
+    //
+    // The consequence is that `user_mode` reports zero verified root roles. That
+    // is the honest number, not a defect to be papered over: the derived
+    // per-user roots under the anchor are Eliot-owned and become leaseable via
+    // this same unmodified `retain_root` path once an installer effect
+    // provisions them. Until then no role is counted, because counting a role
+    // against a constructed path string rather than a retained object would
+    // claim a verification this code does not perform.
     let retained_anchor = match governed.profile {
         InstallationProfile::SystemService => unreachable!("service profile rejected above"),
         InstallationProfile::PortableDev => {
