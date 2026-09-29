@@ -51,21 +51,17 @@ pub(crate) enum ProviderProofKind {
     Reassignment,
     Result,
     UnknownOutcome,
-    /// Authenticates the exact start correlation of one provider execution
-    /// unit before it is bound to an admitted attempt (issue #361 S2). This
-    /// is a sealed extension of the same verifier path: no public trait, no
-    /// caller-implementable or always-verified verifier. The plan-only
-    /// constructor still installs only the typed `PLAN_GAP` verifier; closed
-    /// production binding arrives only through `new_with_admitted_provider`
-    /// on daemon-supplied Kernel capability data.
+    /// Requires the original owner receipt for one provider execution unit
+    /// before it is bound to an admitted attempt (issue #361 S2). The
+    /// verifier is sealed; until owner proof lookup is wired, the production
+    /// adapter returns a typed G11 gap for this operation.
     Binding,
 }
 
 /// Sealed inside this crate so callers cannot implement an "always verified"
-/// provider. The closed production adapter (`provider_admission`) is added
-/// here and binds daemon-supplied Kernel capability data to its own
-/// authenticated receipts. The plan-only constructor still installs only a
-/// typed `PLAN_GAP` verifier.
+/// provider. The production adapter keeps a typed G11 gap until original
+/// per-operation owner receipts can be checked. The plan-only constructor
+/// installs a typed PLAN_GAP verifier.
 pub(crate) trait ProviderVerifier: Send + Sync {
     fn binding(&self) -> ProviderBindingSnapshot;
     fn minimum_event_sequence(&self) -> u64;
@@ -826,12 +822,11 @@ impl AgentCoordinator {
     /// Creates a closed production coordinator on daemon-supplied Kernel
     /// admission (T9-05, issue #1108).
     ///
-    /// The `capability` is plain validated data extracted by the daemon
-    /// caller from its authenticated Kernel session (durable ORS claim row
-    /// plus observed Governor currentness): the coordinator performs no I/O
-    /// and launches nothing. Every proof re-runs the T9-04 pure Kernel
-    /// verifier, so stale, revoked, foreign, or conflicting evidence fails
-    /// closed exactly like the plan-only gap, but with live Kernel backing.
+    /// The capability is plain validated data supplied by the daemon.
+    /// The coordinator performs no I/O and launches nothing. The production
+    /// verifier keeps a typed G11 gap until it can compare each operation's
+    /// proof with its original owner receipt; this constructor alone grants
+    /// no effect authority.
     pub fn new_with_admitted_provider(
         config: CoordinatorConfig,
         capability: AdmittedProviderCapability,
@@ -2740,11 +2735,10 @@ impl AgentCoordinator {
     /// Closed production restore on freshly supplied Kernel admission (T9-05,
     /// issue #1108).
     ///
-    /// The daemon re-queries Kernel and passes a fresh `capability`: the
-    /// snapshot's stored binding must equal the live binding derived from it,
-    /// and every replayed event re-verifies through the T9-04 pure verifier,
-    /// so a serialized `Verified` label alone never restores authority and
-    /// revoked or stale Kernel evidence fails closed.
+    /// The snapshot's stored binding must match the supplied verifier
+    /// binding. The production verifier currently keeps a typed G11 gap
+    /// until original per-operation owner receipts are available, so a
+    /// serialized Verified label cannot restore effect authority.
     pub fn restore_with_admitted_provider(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
@@ -2806,8 +2800,8 @@ impl AgentCoordinator {
     /// bypasses legacy-wire classification), this entry decodes through
     /// [`Self::decode_snapshot_wire`], so pre-candidate-only wires and
     /// misdirected result wires fail with structured errors before any replay.
-    /// Every replayed event then re-verifies through the admitted provider
-    /// exactly as [`Self::restore_with_admitted_provider`] does.
+    /// Replay uses the same fail-closed provider verifier as
+    /// restore_with_admitted_provider.
     /// STITCH (#370 W24/W25/W26/A2/A28): the daemon JSON-restore path
     /// stitches its real persisted-snapshot ingress here; BLOCKED-BY the
     /// durable fabric-restore driver (#1108 lane). Forbidden: serializing
