@@ -26,9 +26,8 @@ use eliot_learning_contracts::{
     CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind,
     CampaignPositionRef, CampaignSourceBinding, CampaignSourceRequirement,
     CampaignSourceResolution, CampaignSourceResolutionStatus, CampaignSourceRevisionRef,
-    CampaignSourceRole, CampaignViewRebuildReason, Completeness, LearningStateViewRecipe,
-    MemberId, OwnerDisagreement, OwnerId, SlotDisposition, SlotId,
-    TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    CampaignSourceRole, CampaignViewRebuildReason, Completeness, LearningStateViewRecipe, MemberId,
+    OwnerDisagreement, OwnerId, SlotDisposition, SlotId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_learning_state_view::{
     CampaignHistoryPlanInput, CampaignLearningStateCompilationInput,
