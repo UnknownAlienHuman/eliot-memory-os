@@ -117,12 +117,31 @@ pub enum HostEventReconciliation {
 /// Why a terminal host event could not be reconciled at all.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReconcileFailure {
+    // Display is implemented below: the reconciliation path reports a failure
+    // on the operator's stderr line rather than refusing an admission, and a
+    // typed failure must stay typed on the way out — never stringified into the
+    // variant itself.
     /// The event owner is unattached, so nothing can be verified against it.
     OwnerUnavailable,
     /// The event joined a correlation but the owner's own log refused the
     /// resulting revision, so no current assessment exists.
     RevisionRefused(String),
 }
+
+impl std::fmt::Display for ReconcileFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OwnerUnavailable => {
+                formatter.write_str("event owner unattached; nothing verified against it")
+            }
+            Self::RevisionRefused(detail) => {
+                write!(formatter, "owner's log refused the revision: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReconcileFailure {}
 
 /// One retained emission record plus its own bounded assessment chain.
 #[derive(Clone, Debug)]
@@ -144,8 +163,7 @@ impl CorrelationTracker {
     /// Records one emission, reporting whether an older record rotated out.
     fn track(&mut self, record: TrackedCorrelation) -> CorrelationTrackOutcome {
         if let Some(existing) = self.records.iter_mut().find(|held| {
-            held.emission.identity.identity_digest
-                == record.emission.identity.identity_digest
+            held.emission.identity.identity_digest == record.emission.identity.identity_digest
         }) {
             // Same identity. The owner refuses a changed replay under one
             // event identity before this point, so replacing the retained
@@ -254,7 +272,7 @@ pub fn observe_mcp_emission(
     tool_name: Option<&str>,
     outcome: StdioEmissionOutcome,
     deadline_unix_ms: Option<u64>,
-) -> Result<CorrelationTrackOutcome, BridgeError> {
+) -> Result<CorrelationTrackOutcome, Box<BridgeError>> {
     let params = request.get("params").unwrap_or(&Value::Null);
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
     let operation = OperationIdentity::from_hints(
@@ -380,9 +398,9 @@ impl BridgeRunner {
         canonical: CanonicalDisposition,
         binding: Option<OwnerValidatedOperationBinding>,
         deadline_unix_ms: Option<u64>,
-    ) -> Result<CorrelationTrackOutcome, BridgeError> {
+    ) -> Result<CorrelationTrackOutcome, Box<BridgeError>> {
         let Some(view) = self.core.attach_view() else {
-            return Err(BridgeError::NotAttached);
+            return Err(Box::new(BridgeError::NotAttached));
         };
         let fence = view.binding().state_fence().clone();
         let generation = ResourceGeneration::new(fence.generation().get())
@@ -393,7 +411,7 @@ impl BridgeRunner {
         let envelope = EventEnvelope {
             stream_id: format!("{MCP_EMISSION_OWNER}.mcp-emissions"),
             producer_id: MCP_EMISSION_PRODUCER_ID.to_owned(),
-            producer_generation: generation.clone(),
+            producer_generation: generation,
             authority_epoch: fence.authority_epoch().clone(),
             // The correlation identity digest IS the event identity. That is
             // what lets a later host event name this exact correlation, and
@@ -493,6 +511,10 @@ impl BridgeRunner {
                 // retained correlation, not an error.
                 Err(_) => continue,
             };
+            // Read before the mutable borrow: `owner_sequence` needs
+            // `&self.correlations` and `&self.core`, and neither can be read
+            // while a `&mut` into `self.correlations` is live.
+            let sequence = self.correlations.owner_sequence(&self.core);
             let record = &mut self.correlations.records_mut()[index];
             let digest = record.emission.identity.identity_digest.clone();
             let state = assessment.state;
@@ -500,11 +522,15 @@ impl BridgeRunner {
                 .assessments
                 .append(&digest, assessment)
                 .map_err(|error| ReconcileFailure::RevisionRefused(error.to_string()))?;
-            let sequence = self.correlations.owner_sequence(&self.core);
-            let edge_filed = match record.assessments.latest() {
+            // The appended revision is cloned out of the correlations store
+            // before the bridge core is borrowed mutably: the two fields are
+            // disjoint, but a live `&mut` into `self.correlations` across
+            // `&mut self.core` is a borrow error, not a race.
+            let latest = record.assessments.latest().cloned();
+            let edge_filed = match latest {
                 Some(revision) => {
                     matches!(
-                        submit_derived_fault(&mut self.core, revision, sequence),
+                        submit_derived_fault(&mut self.core, &revision, sequence),
                         FaultEdgeSubmission::Submitted
                     )
                 }
@@ -546,6 +572,9 @@ impl BridgeRunner {
             if assessment.state.is_pending() {
                 continue;
             }
+            // Read before the mutable borrow, for the same reason as in
+            // `reconcile_terminal_host_event`.
+            let sequence = self.correlations.owner_sequence(&self.core);
             let record = &mut self.correlations.records_mut()[index];
             let digest = record.emission.identity.identity_digest.clone();
             if record
@@ -555,9 +584,12 @@ impl BridgeRunner {
             {
                 continue;
             }
-            let sequence = self.correlations.owner_sequence(&self.core);
-            if let Some(revision) = record.assessments.latest() {
-                let _ = submit_derived_fault(&mut self.core, revision, sequence);
+            // Cloned out for the same reason as in
+            // `reconcile_terminal_host_event`: a live `&mut` into
+            // `self.correlations` cannot cross `&mut self.core`.
+            let latest = record.assessments.latest().cloned();
+            if let Some(revision) = latest {
+                let _ = submit_derived_fault(&mut self.core, &revision, sequence);
             }
             swept.push((digest, assessment.state));
         }

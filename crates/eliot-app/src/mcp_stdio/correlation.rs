@@ -471,5 +471,3 @@ fn request_id_string(id: Option<&Value>) -> String {
         Some(other) => other.to_string(),
     }
 }
-
-
