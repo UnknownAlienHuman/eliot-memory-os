@@ -15,11 +15,10 @@
 //! Caller capability arrives as plain-data input flags
 //! ([`SwarmCommandCallerBinding::capability_present`] plus a capability scope
 //! text that must equal the command account scope). This module never imports
-//! `AccessBinding`, `ActionCapability`, or `ControlBoardError` from
-//! `eliot-controlboard`: the dependency direction is one-way
-//! `eliot-controlboard -> eliot-agent-coordinator`, so real capability
-//! verification stays owned by the authenticated `ControlBoard` edge (MGR01
-//! lane) while this compiler only admits the plain-data flag.
+//! `AccessBinding`, `ActionCapability`, or `ControlBoardError`: the
+//! `eliot-controlboard` package was removed by #1213 (no real production
+//! consumer), so no `ControlBoard` edge owns verification anymore and this
+//! compiler only admits the plain-data flag.
 //!
 //! The output is structurally candidate-only: `candidate_only` is true,
 //! `dispatch_authority` is false, execution counters are zero, and the value
@@ -33,7 +32,8 @@
 //!
 //! Proof ceiling:
 //! `AUTHENTICATED_SWARM_COMMAND_CANDIDATE_PACKAGE_PROOF_ONLY`. Real
-//! `AccessBinding` verification inside `ControlBoard` remains residual.
+//! `AccessBinding` verification has no `ControlBoard` edge anymore (package
+//! removed by #1213); the candidate stays proof-only.
 
 use eliot_agent_api::{AttemptId, StateFence};
 use eliot_contracts::fences_match_exact;
