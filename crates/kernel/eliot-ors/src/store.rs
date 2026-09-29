@@ -15905,12 +15905,11 @@ impl RedbRecoveryStore {
         let outcome = Self::insert_bridge_event_row_checked(
             write, access, stage, staging, provenance, now_ms,
         )?;
-        let next_recovery_revision =
-            Self::bump_bridge_recovery_revision_in(
-                write,
-                &access.namespace,
-                BridgeRecoveryMutationImpact::Sequence(stage.sequence),
-            )?;
+        let next_recovery_revision = Self::bump_bridge_recovery_revision_in(
+            write,
+            &access.namespace,
+            BridgeRecoveryMutationImpact::Sequence(stage.sequence),
+        )?;
         Self::rebind_bridge_handoff_reconcile_progress_in(
             write,
             &access.namespace,
@@ -16774,15 +16773,14 @@ impl RedbRecoveryStore {
                         record_type: "bridge_event_recovery_revision",
                         reason: "acknowledgement advance lost its recovery revision".to_owned(),
                     })?;
-                let updated_revision =
-                    Self::bump_bridge_recovery_revision_in(
-                        &write,
-                        &access.namespace,
-                        BridgeRecoveryMutationImpact::Interval {
-                            start: prior_acked.saturating_add(1),
-                            end: acked,
-                        },
-                    )?;
+                let updated_revision = Self::bump_bridge_recovery_revision_in(
+                    &write,
+                    &access.namespace,
+                    BridgeRecoveryMutationImpact::Interval {
+                        start: prior_acked.saturating_add(1),
+                        end: acked,
+                    },
+                )?;
                 Self::rebind_bridge_handoff_reconcile_progress_in(
                     &write,
                     &access.namespace,
@@ -17328,15 +17326,14 @@ impl RedbRecoveryStore {
             gaps.insert(key.as_str(), encode(&row)?.as_str())
                 .map_err(storage)?;
         }
-        let updated_revision =
-            Self::bump_bridge_recovery_revision_in(
-                &write,
-                &row.owner_namespace,
-                BridgeRecoveryMutationImpact::Interval {
-                    start: row.start_sequence,
-                    end: row.end_sequence,
-                },
-            )?;
+        let updated_revision = Self::bump_bridge_recovery_revision_in(
+            &write,
+            &row.owner_namespace,
+            BridgeRecoveryMutationImpact::Interval {
+                start: row.start_sequence,
+                end: row.end_sequence,
+            },
+        )?;
         Self::rebind_bridge_handoff_reconcile_progress_in(
             &write,
             &row.owner_namespace,
@@ -17540,12 +17537,11 @@ impl RedbRecoveryStore {
                         .insert(key.as_str(), encode(&row)?.as_str())
                         .map_err(storage)?;
                 }
-                let updated_revision =
-                    Self::bump_bridge_recovery_revision_in(
-                        &write,
-                        &access.namespace,
-                        BridgeRecoveryMutationImpact::Sequence(sequence),
-                    )?;
+                let updated_revision = Self::bump_bridge_recovery_revision_in(
+                    &write,
+                    &access.namespace,
+                    BridgeRecoveryMutationImpact::Sequence(sequence),
+                )?;
                 Self::rebind_bridge_handoff_reconcile_progress_in(
                     &write,
                     &access.namespace,
@@ -18664,15 +18660,14 @@ impl RedbRecoveryStore {
             None
         };
         if terminalized > 0 {
-            let updated_revision =
-                Self::bump_bridge_recovery_revision_in(
-                    write,
-                    &access.namespace,
-                    BridgeRecoveryMutationImpact::Interval {
-                        start: 1,
-                        end: terminalized_boundary,
-                    },
-                )?;
+            let updated_revision = Self::bump_bridge_recovery_revision_in(
+                write,
+                &access.namespace,
+                BridgeRecoveryMutationImpact::Interval {
+                    start: 1,
+                    end: terminalized_boundary,
+                },
+            )?;
             if let Some(scan) = &mut next_scan {
                 scan.recovery_revision = updated_revision;
             }
