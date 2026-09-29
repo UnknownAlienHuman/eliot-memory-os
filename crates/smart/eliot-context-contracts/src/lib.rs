@@ -50,6 +50,7 @@ pub use boundary::{
     BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryTransformRelation,
     BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ExactSourceRange,
 };
+
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
     ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS,
