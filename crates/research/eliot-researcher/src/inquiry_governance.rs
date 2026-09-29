@@ -55,8 +55,8 @@ use crate::evidence_portfolio::{
     EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, NoMatchEvaluation,
     ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
     SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank,
-    push_count, push_field, reject_vague, text,
+    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name,
+    grade_rank, push_count, push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -3073,8 +3073,8 @@ impl CoverageReceipt {
         let absence_evidence_digest = absence_evidence
             .map(|evidence| evidence.evaluation.canonical_digest())
             .transpose()?;
-        let absence_proof_ceiling_grade = absence_evidence
-            .and_then(|evidence| evidence.evaluation.proof_ceiling_grade());
+        let absence_proof_ceiling_grade =
+            absence_evidence.and_then(|evidence| evidence.evaluation.proof_ceiling_grade());
         let counter_search_status = if profile.hypothesis_policy.requires_counter_search() {
             CounterSearchStatus::RequiredAndOpen
         } else {
@@ -3244,9 +3244,7 @@ impl CoverageReceipt {
             None => push_field(&mut preimage, "absence_evidence", "absent"),
         }
         match self.absence_proof_ceiling_grade {
-            Some(ceiling) => {
-                push_field(&mut preimage, "absence_ceiling", &ceiling.to_string())
-            }
+            Some(ceiling) => push_field(&mut preimage, "absence_ceiling", &ceiling.to_string()),
             None => push_field(&mut preimage, "absence_ceiling", "unknown"),
         }
         push_field(
