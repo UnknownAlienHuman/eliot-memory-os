@@ -388,18 +388,23 @@ impl GovernedAdmission {
 /// compilation, or instantiation: this function takes no artifact bytes,
 /// performs no filesystem access, and builds no engine.
 ///
+/// The artifact digest is the digest the caller bound under policy before the
+/// call, or `None` when no digest was bound: an explicit governed attempt
+/// carries no admission channel, so the gate denies before any acquisition
+/// could consult a digest.
+///
 /// Denial order: absent admission yields `KERNEL_ADMISSION_REQUIRED`; a
 /// caller-supplied artifact path on the governed lane is denied the same
 /// way (no arbitrary path/URL acquisition, no fallback to the experimental
 /// mode); a malformed record yields the owned `LIMIT_DENIED` denial; a
-/// world or artifact-digest disagreement yields the owned
-/// `ADMISSION_MISMATCH` denial. A well-formed record is still denied with
-/// `KERNEL_ADMISSION_REQUIRED`: this host binds no live Kernel admission
-/// channel to re-anchor freshness against, so staleness cannot be proven
-/// fresh (an old request not listed in a committed record is stale).
+/// world disagreement or a missing/mismatched artifact-digest binding yields
+/// the owned `ADMISSION_MISMATCH` denial. A well-formed record is still
+/// denied with `KERNEL_ADMISSION_REQUIRED`: this host binds no live Kernel
+/// admission channel to re-anchor freshness against, so staleness cannot be
+/// proven fresh (an old request not listed in a committed record is stale).
 pub fn check_governed_admission(
     world: TypedWorld,
-    artifact_digest: &Sha256Digest,
+    artifact_digest: Option<&Sha256Digest>,
     artifact_source: Option<&Path>,
     admission: Option<&GovernedAdmission>,
 ) -> Result<(), TypedExecutionError> {
@@ -411,10 +416,13 @@ pub fn check_governed_admission(
     if admitted.world != world {
         return Err(TypedExecutionError::AdmissionMismatch("world".to_owned()));
     }
-    if admitted.artifact_digest != *artifact_digest {
-        return Err(TypedExecutionError::AdmissionMismatch(
-            "artifact-digest".to_owned(),
-        ));
+    match artifact_digest {
+        Some(digest) if *digest == admitted.artifact_digest => {}
+        _ => {
+            return Err(TypedExecutionError::AdmissionMismatch(
+                "artifact-digest".to_owned(),
+            ));
+        }
     }
     Err(TypedExecutionError::GovernedAdmissionRequired)
 }

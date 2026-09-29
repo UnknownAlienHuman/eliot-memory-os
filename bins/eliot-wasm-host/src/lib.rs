@@ -103,9 +103,10 @@ pub use typed_bindings::{
     export_matches_interface, typed_wit_digest,
 };
 pub use typed_execution::{
-    ExecutionMode, TypedDescriptor, TypedDomainAdmission, TypedDomainError, TypedDomainOutcome,
-    TypedDomainRequest, TypedDomainResult, TypedExecutionError, TypedReceipt, TypedStage,
-    default_experimental_limits, execute_describe_experimental, execute_domain_experimental,
+    ExecutionMode, GovernedAdmission, TypedDescriptor, TypedDomainAdmission, TypedDomainError,
+    TypedDomainOutcome, TypedDomainRequest, TypedDomainResult, TypedExecutionError, TypedReceipt,
+    TypedStage, check_governed_admission, default_experimental_limits,
+    execute_capsule_domain_experimental, execute_describe_experimental, execute_domain_experimental,
     execute_governed_refusal,
 };
 pub use wasmtime_provider::{
