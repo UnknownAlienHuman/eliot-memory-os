@@ -120,16 +120,39 @@
 //! removes the caller-supplied reconciliation reference from that obligation
 //! and helper. The obligation is then bound to the effect owner's own validated
 //! [`EffectReceipt`] — the existing receipt owner, reused rather than duplicated
-//! — and the retry answer is read off that stored value: an absent, foreign,
-//! still-unknown, committed or compensated outcome stays denied, a completed
-//! effect reconciles the result its owner already retained instead of
-//! authorizing a second execution, and only a proved non-effect admitted under
-//! this obligation's exact operation identity permits a retry. That binding is
-//! NOT a wire revision: the owner outcome is skipped on serialize and defaults
-//! to absent on deserialize, so [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] stays `7`
-//! and the bytes of an already-written obligation are unchanged. The absent
-//! default is the denying direction, so a re-read obligation is unresolved until
-//! its owner reattaches its receipt.
+//! — and both answers are read off that stored value. The retry gate denies an
+//! absent, unsettled, foreign, still-unknown, committed or compensated outcome,
+//! and requires positive owner evidence rather than a bare discriminant: a
+//! `Rejected` outcome the owner never settled against a canonical receipt is
+//! denied too. A completed effect is not denied and forgotten either — it is
+//! reconciled from the result its owner already retained through
+//! [`retained_improvement_completion`] instead of authorizing a second
+//! execution. A retry is permitted only by an owner-settled non-success
+//! terminal outcome: an [`EffectOutcome::Rejected`] the owner validated against
+//! its own canonical receipt whose disposition is `FAILURE` or `CANCELLED`,
+//! bound to this obligation's exact operation identity.
+//!
+//! That is precisely what the gate establishes, and the module claims no more.
+//! A `FAILURE` or `CANCELLED` disposition records what the owner observed about
+//! its own operation; it is **not** proof that nothing was applied externally —
+//! `ReceiptDisposition::Partial` exists precisely to name sub-effects and
+//! artifacts that did apply while other gaps remain, and nothing here inspects
+//! the disposition to assert a whole-world non-effect. A permitted retry is
+//! therefore a *newly admitted* operation under the same identity and the same
+//! commitments, never a replay of the rejected receipt and never a second
+//! opinion about what that attempt left behind.
+//!
+//! The stored value is reachable only through the checked attaching seam
+//! [`ImprovementUnknownEffect::with_settled_owner_outcome`], which re-checks the
+//! binding before it accepts anything; the field itself is private, so no caller
+//! can hand-build a receipt that opens either gate. That binding is NOT a wire
+//! revision: the owner outcome is skipped on serialize and defaults to absent on
+//! deserialize, so [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] stays `7` and the bytes
+//! of an already-written obligation are unchanged. The absent default is the
+//! denying direction, so a re-read obligation is unresolved until its owner
+//! reattaches its receipt — and nothing in this workspace performs that attach
+//! today, so the gate denies every obligation it builds until the external
+//! effect owner settles one.
 //!
 //! Deserialization is fail-closed: bytes written before the current revision no
 //! longer decode, so a stale disposition cannot be read as a current one.
@@ -141,7 +164,7 @@ use std::collections::BTreeSet;
 
 use eliot_authority::{EffectOutcome, EffectReceipt};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_receipts::ReceiptEnvelope;
+use eliot_receipts::{OperationBinding, ReceiptEnvelope};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -905,18 +928,38 @@ pub struct ImprovementCanaryHandoff {
 /// forward-repair and invalidation bindings that cover it.
 ///
 /// A retry is a *new* attempt only after this obligation is discharged, and the
-/// discharge is an owner-validated outcome rather than an assertion.
-/// [`owner_outcome`](Self::owner_outcome) carries the effect owner's own
-/// [`EffectReceipt`] for this obligation's exact operation, or `None` while the
-/// owner has not settled the effect. That value is the existing receipt owner's,
-/// not a re-derivation: the owner binds the outcome to the authorized operation
-/// id, idempotency key and state fence when it builds it, so this module adds no
-/// second reconciliation, no second digest and no second persistence owner.
-/// [`Self::retry_permitted`] reads that stored outcome and nothing else, and a
-/// completed effect is settled by reconciling the result its owner retained
-/// through [`Self::retained_effect_result`] rather than by running again. Naming
-/// a rollback contract, supplying a caller string, or using a proposal, new
-/// identity, or new idempotency key discharges nothing.
+/// discharge is an owner-validated outcome rather than an assertion. The private
+/// `owner_outcome` field holds the effect owner's own [`EffectReceipt`] for this
+/// obligation's exact operation, or `None` while the owner has not settled the
+/// effect. That value is the existing receipt owner's, not a re-derivation: the
+/// owner binds the outcome to the authorized operation id, idempotency key and
+/// state fence when it builds it, so this module adds no second reconciliation,
+/// no second digest and no second persistence owner. It is not writable from
+/// outside this module; the only way in is
+/// [`Self::with_settled_owner_outcome`], which re-checks the binding and refuses
+/// a receipt that names another operation, carries no canonical receipt, or is
+/// still unknown. [`Self::retry_permitted`] then reads that stored outcome and
+/// nothing else, and a completed effect is settled by reconciling the result its
+/// owner retained through [`retained_improvement_completion`] rather than by
+/// running again. Naming a rollback contract, supplying a caller string, or
+/// using a proposal, new identity, or new idempotency key discharges nothing.
+///
+/// What the retry gate establishes is exactly this: the owner settled a
+/// non-success terminal outcome, validated by the owner itself against a
+/// canonical receipt whose disposition is `FAILURE` or `CANCELLED`, for this
+/// obligation's exact operation identity. It is not a proof that nothing was
+/// applied externally, and this type never claims to be one — a `PARTIAL`
+/// disposition is the repository's own way of saying that named sub-effects did
+/// apply while other gaps remain, and the gate does not and cannot rule that
+/// out. The consequence is a bounded, honest one: a permitted retry is a newly
+/// admitted operation under the same identity, never a replay of the receipt
+/// that was rejected and never a second execution of a settled effect.
+///
+/// Both mechanisms depend on the effect owner, and that dependency is the honest
+/// limit of this type. The owner attaches its own receipt through
+/// [`Self::with_settled_owner_outcome`]; nothing in this workspace performs that
+/// attach, so every obligation this crate builds is unresolved and every gate
+/// here denies until the external effect owner settles one.
 ///
 /// The forward-repair and invalidation bindings are copied from the checked
 /// [`RollbackContract`], never from the caller. They make the repair path part
@@ -950,6 +993,14 @@ pub struct ImprovementUnknownEffect {
     /// authorization and canonical receipt do not enlarge the obligation the
     /// disposition already holds behind one pointer.
     ///
+    /// The field is private on purpose. `EffectReceipt` is an open struct whose
+    /// fields are all public, so a public field here would let any caller write
+    /// `{ outcome: Rejected, canonical_receipt: None, .. }` directly and open
+    /// the retry gate without ever reaching the owner's validating constructor.
+    /// The only writer is [`Self::with_settled_owner_outcome`], which re-checks
+    /// the binding; the only direct writer is this module's single construction
+    /// site [`unknown_effect_of`], which stores `None`.
+    ///
     /// The value is not part of this obligation's wire form. The owner's receipt
     /// type carries no serializable projection here, and inventing one would be
     /// a second claim about an effect this module does not own, so a decoded
@@ -957,10 +1008,79 @@ pub struct ImprovementUnknownEffect {
     /// reattaches its value.
     #[serde(skip)]
     #[schemars(skip)]
-    pub owner_outcome: Option<Box<EffectReceipt>>,
+    owner_outcome: Option<Box<EffectReceipt>>,
 }
 
 impl ImprovementUnknownEffect {
+    /// Attaches the effect owner's settled outcome to this obligation.
+    ///
+    /// The one way a value ever reaches the private `owner_outcome` field from
+    /// outside this module, and a checked seam rather than an assignment: the
+    /// binding is re-verified here even though the field starts empty and
+    /// nothing else can write it, because a receipt is an untrusted input at this
+    /// boundary. Four conditions must hold together, and each refusal is a typed
+    /// [`UnboundOwnerOutcome`] rather than a silently dropped value:
+    ///
+    /// 1. the outcome is terminal — an `UnknownOutcome` is a still-unsettled
+    ///    effect, never a discharge;
+    /// 2. a canonical receipt is present — an outcome the owner merely carried
+    ///    without settling it against a receipt is not owner evidence, and this
+    ///    is the exact case that must not open the retry gate;
+    /// 3. the receipt's authorized effect names this obligation's own operation
+    ///    id and idempotency key;
+    /// 4. the canonical receipt itself names that same operation id and
+    ///    idempotency key, so a receipt bound elsewhere cannot ride in on an
+    ///    authorized effect that happens to match.
+    ///
+    /// It borrows `&mut self` rather than consuming `self`. The obligation is
+    /// held by its owning disposition behind a `Box` and its owner updates it in
+    /// place as evidence arrives, so a consuming setter would force every caller
+    /// to move the value out of its disposition just to offer it a receipt, and
+    /// would then have to carry the whole obligation back inside the error to
+    /// avoid dropping a named external debt. Borrowing keeps the debt in place on
+    /// both paths, so a refusal cannot lose it: the obligation stays owed and
+    /// the gate stays closed. Consuming would also buy no extra guarantee, since
+    /// the obligation is `Clone` and a caller can keep a copy of the unsettled
+    /// value either way — what actually matters is that the field cannot be
+    /// written un-checked, and that is the field's privacy plus the re-checks
+    /// above, not the borrow.
+    ///
+    /// The identity compared here is the same one the read side
+    /// (`owning_outcome`, which re-checks the authorized effect on every query)
+    /// uses, so a receipt that could not be attached is also a receipt that could
+    /// never have been believed.
+    pub fn with_settled_owner_outcome(
+        &mut self,
+        receipt: EffectReceipt,
+    ) -> Result<(), UnboundOwnerOutcome> {
+        if matches!(&receipt.outcome, EffectOutcome::UnknownOutcome { .. }) {
+            return Err(UnboundOwnerOutcome::StillUnsettled);
+        }
+        let observed = &receipt
+            .canonical_receipt
+            .as_ref()
+            .ok_or(UnboundOwnerOutcome::UnsettledEffect)?
+            .core
+            .operation;
+        let authorized = &receipt.authorized_effect.proposal.operation;
+        if !self.binds_operation(authorized) {
+            return Err(UnboundOwnerOutcome::ForeignOperation {
+                side: "authorized_effect",
+                operation_id: authorized.operation_id.as_str().to_owned(),
+                idempotency_key: authorized.idempotency_key.as_str().to_owned(),
+            });
+        }
+        if !self.binds_operation(observed) {
+            return Err(UnboundOwnerOutcome::ForeignOperation {
+                side: "canonical_receipt",
+                operation_id: observed.operation_id.as_str().to_owned(),
+                idempotency_key: observed.idempotency_key.as_str().to_owned(),
+            });
+        }
+        self.owner_outcome = Some(Box::new(receipt));
+        Ok(())
+    }
+
     /// Returns whether a new attempt is allowed after an unknown effect.
     ///
     /// The answer is read from the effect owner's stored validated outcome and
@@ -968,29 +1088,70 @@ impl ImprovementUnknownEffect {
     /// presence of a lookup reference. An outcome the owner has not settled yet,
     /// a stored outcome whose bound operation is foreign to this obligation, and
     /// a still-unknown outcome all deny. A completed effect denies as well: a
-    /// committed or compensated outcome must be reconciled from its retained
-    /// result through [`Self::retained_effect_result`], never authorized a
-    /// second time. Only a proved non-effect, in a receipt the owner bound to
-    /// this obligation's exact operation identity, opens the gate, and the
-    /// attempt it permits runs under that same identity.
+    /// committed or compensated outcome is reconciled from the result its owner
+    /// already retained through [`retained_improvement_completion`], never
+    /// authorized a second time.
+    ///
+    /// Opening the gate requires positive owner evidence, not a bare
+    /// discriminant: the outcome must be `Rejected` *and* the owner must have
+    /// actually settled the effect against a canonical receipt. A `Rejected`
+    /// discriminant carrying no canonical receipt is precisely the
+    /// merely-present-and-never-validated case, and it denies. A settled
+    /// `Rejected` outcome is an owner-validated terminal outcome whose canonical
+    /// receipt disposition is `FAILURE` or `CANCELLED`.
+    ///
+    /// That is the whole of the guarantee, and it is stated rather than
+    /// overstated: a non-success disposition is not by itself proof that nothing
+    /// was applied externally — `ReceiptDisposition::Partial` is how this
+    /// repository names sub-effects that did apply while other gaps remain, and
+    /// the gate does not inspect the disposition to exclude that. So the attempt
+    /// this permits is a newly admitted operation under this obligation's exact
+    /// identity and commitments, never a replay of the receipt that was rejected
+    /// and never a second execution of a settled effect.
     #[must_use]
     pub fn retry_permitted(&self) -> bool {
-        self.owning_outcome()
-            .is_some_and(|receipt| matches!(&receipt.outcome, EffectOutcome::Rejected))
+        self.owning_outcome().is_some_and(|receipt| {
+            matches!(&receipt.outcome, EffectOutcome::Rejected)
+                && receipt.canonical_receipt.is_some()
+        })
     }
 
-    /// Returns the result the effect owner retained for the effect this
-    /// obligation names, once the owner has settled it under this obligation's
-    /// exact operation identity.
+    /// Returns the retained result of a COMPLETED effect, or `None`.
     ///
-    /// The owner's canonical receipt is borrowed as it stands: it is neither
-    /// copied nor revalidated here, so reconciling a completed effect reads the
-    /// result its owner already holds. An unsettled, foreign, or still-unknown
-    /// outcome has no retained result to hand back.
+    /// The private half of [`retained_improvement_completion`]: the single read
+    /// of the owner's retained [`ReceiptEnvelope`], and the only public name for
+    /// that read is that crate entry point. It is deliberately narrower than
+    /// "any receipt that happens to carry a canonical receipt": only a `Committed`
+    /// or `Compensated` outcome is a completion, so an unsettled, foreign,
+    /// still-unknown, or merely non-success outcome has no completion to
+    /// reconcile. The envelope is borrowed as the owner wrote it — neither copied
+    /// nor revalidated here — so reconciling a completed effect reads the result
+    /// its owner already holds.
     #[must_use]
-    pub fn retained_effect_result(&self) -> Option<&ReceiptEnvelope> {
-        self.owning_outcome()
-            .and_then(|receipt| receipt.canonical_receipt.as_ref())
+    fn settled_completion_result(&self) -> Option<&ReceiptEnvelope> {
+        let receipt = self.owning_outcome()?;
+        if !matches!(
+            &receipt.outcome,
+            EffectOutcome::Committed | EffectOutcome::Compensated
+        ) {
+            return None;
+        }
+        receipt.canonical_receipt.as_ref()
+    }
+
+    /// Returns whether one owner-side operation binding is this obligation's own.
+    ///
+    /// The single identity comparison of this type, shared by the write side
+    /// ([`Self::with_settled_owner_outcome`], which checks both the authorized
+    /// effect and the retained canonical receipt) and the read side
+    /// ([`Self::owning_outcome`], which re-checks the authorized effect on every
+    /// query). Sharing it is deliberate: if the two sides could disagree about
+    /// what "this obligation's operation" means, a receipt could be accepted at
+    /// the seam and then silently ignored by the gate, which is a decision that
+    /// rests on a private helper rather than on the identity.
+    fn binds_operation(&self, operation: &OperationBinding) -> bool {
+        operation.operation_id.as_str() == self.commitment.operation_ref.as_str()
+            && operation.idempotency_key.as_str() == self.commitment.idempotency_key.as_str()
     }
 
     /// Returns the stored owner outcome only when the operation it was bound to
@@ -1000,18 +1161,50 @@ impl ImprovementUnknownEffect {
     /// The two comparable identities are the owner-side operation id and
     /// idempotency key against this obligation's committed logical operation and
     /// idempotency namespace: the same pair the receipt owner itself binds a
-    /// terminal outcome to. The owner's effect payload digest is deliberately
-    /// not compared here because it digests the effect payload, while
-    /// [`ProposalCommitment::digest`] digests the whole normalized proposal
-    /// envelope, so the two are not the same preimage and matching them would
-    /// assert an identity neither owner defines.
+    /// terminal outcome to, and the same pair the attaching seam refuses on. The
+    /// owner's effect payload digest is deliberately not compared here because it
+    /// digests the effect payload, while [`ProposalCommitment::digest`] digests
+    /// the whole normalized proposal envelope, so the two are not the same
+    /// preimage and matching them would assert an identity neither owner defines.
     fn owning_outcome(&self) -> Option<&EffectReceipt> {
-        self.owner_outcome.as_deref().filter(|receipt| {
-            let operation = &receipt.authorized_effect.proposal.operation;
-            operation.operation_id.as_str() == self.commitment.operation_ref.as_str()
-                && operation.idempotency_key.as_str() == self.commitment.idempotency_key.as_str()
-        })
+        self.owner_outcome
+            .as_deref()
+            .filter(|receipt| self.binds_operation(&receipt.authorized_effect.proposal.operation))
     }
+}
+
+/// Why a receipt was refused as this obligation's settled owner outcome.
+///
+/// Every variant is a refusal to *believe* something, so none of them discharges
+/// the obligation: the debt stays owed and the retry gate stays closed. They are
+/// distinct because they are distinct facts about the receipt — a still-unknown
+/// effect, an effect the owner never settled against a receipt, and a receipt
+/// that belongs to a different operation are three different things a caller has
+/// to go and fix.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum UnboundOwnerOutcome {
+    /// The outcome is still `UnknownOutcome`, so the effect is not settled at
+    /// all. The owner must reconcile it first.
+    #[error("improvement owner outcome is still unknown: the effect is unsettled")]
+    StillUnsettled,
+    /// The outcome carries no canonical receipt, so the owner never validated it
+    /// against one. Presence of an outcome is not evidence of anything.
+    #[error("improvement owner outcome carries no canonical receipt: the owner never settled the effect")]
+    UnsettledEffect,
+    /// The receipt is bound to a different operation than this obligation's.
+    /// `side` names which part of the receipt disagrees: the authorized effect
+    /// the owner settled, or the canonical receipt it retained.
+    #[error(
+        "improvement owner outcome {side} is bound to another operation: {operation_id} / {idempotency_key}"
+    )]
+    ForeignOperation {
+        /// Which side of the receipt carries the foreign identity.
+        side: &'static str,
+        /// Operation id that side of the receipt is bound to.
+        operation_id: String,
+        /// Idempotency key that side of the receipt is bound to.
+        idempotency_key: String,
+    },
 }
 
 /// Terminal disposition for one improvement candidate pipeline run.
@@ -1056,10 +1249,18 @@ pub enum ImprovementTerminalDisposition {
     /// from it, so no wording of the reason can be reinterpreted as a
     /// reconciliation. The obligation also carries the effect owner's own
     /// validated outcome, and [`ImprovementUnknownEffect::retry_permitted`]
-    /// answers from that value: it denies while the owner has not settled the
-    /// effect, denies a foreign or still-unknown outcome, denies a completed
-    /// effect whose retained result must be reconciled instead, and permits only
-    /// a proved non-effect under this obligation's exact operation identity.
+    /// answers from that value alone: it denies while the owner has not settled
+    /// the effect, denies a receipt carrying no canonical receipt, denies a
+    /// foreign or still-unknown outcome, and denies a completed effect, whose
+    /// retained result is read instead through
+    /// [`retained_improvement_completion`]. It permits a retry only from an
+    /// owner-settled non-success terminal outcome — a `Rejected` outcome the
+    /// owner validated against a canonical receipt whose disposition is `FAILURE`
+    /// or `CANCELLED`, bound to this obligation's exact operation identity. That
+    /// is what the gate establishes and no more: a non-success disposition is not
+    /// itself proof that nothing was applied externally, so a permitted retry is
+    /// a newly admitted operation under that same identity, never a replay of the
+    /// rejected receipt.
     UnknownRequiresReconciliation {
         /// Exact unresolved external effect owed by its owner.
         obligation: Box<ImprovementUnknownEffect>,
@@ -1070,12 +1271,13 @@ pub enum ImprovementTerminalDisposition {
     /// variant: it receives a rollback contract, never a rollback execution or
     /// result receipt, so a bare `contract_ref` names no validated result. When
     /// an owner has validated one, the value is reached through the unknown
-    /// effect's own outcome — the receipt owner settles an effect and the
-    /// obligation carries that receipt — and a completed effect there is
-    /// reconciled from its retained result rather than restated as a disposition
-    /// variant. Bytes written under this variant stay readable so history is
-    /// preserved, but they are an unqualified historical observation and must
-    /// not be presented as newly verified completed effects.
+    /// effect's own outcome — the receipt owner settles an effect, the
+    /// obligation carries that receipt, and
+    /// [`retained_improvement_completion`] reads the retained result off it —
+    /// rather than by restating a completion as a disposition variant. Bytes
+    /// written under this variant stay readable so history is preserved, but
+    /// they are an unqualified historical observation and must not be presented
+    /// as newly verified completed effects.
     RolledBack {
         /// Rollback contract reference owning the repair.
         contract_ref: String,
@@ -1863,10 +2065,10 @@ pub enum ImprovementReplayAssessment {
 /// reconciliation decision reaches, built by the same single construction site.
 /// Routing it anywhere else would make a disposition variant, not the owner's
 /// validated outcome, decide whether the effect may be attempted again. The
-/// built obligation carries the owner from the prior decision, and its
-/// [`owner_outcome`](ImprovementUnknownEffect::owner_outcome) starts unresolved:
-/// the checked records this run holds contain no owner-validated outcome, so
-/// the effect owner attaches one and
+/// built obligation carries the owner from the prior decision, and its private
+/// `owner_outcome` field starts unresolved: the checked records this run holds
+/// contain no owner-validated outcome, so the effect owner attaches one through
+/// [`ImprovementUnknownEffect::with_settled_owner_outcome`] and
 /// [`ImprovementUnknownEffect::retry_permitted`] then answers from that value
 /// alone.
 pub fn reconcile_unknown_activation(
@@ -1931,8 +2133,12 @@ pub fn reconcile_unknown_activation(
 /// The owner's outcome starts absent because the checked records hold none:
 /// this run admits a candidate, it does not observe an effect, so supplying a
 /// reconciled outcome here would be a fabricated observation. Absent is the
-/// denying value, and the effect owner attaches its own validated receipt to
-/// discharge the obligation.
+/// denying value, and the effect owner attaches its own validated receipt
+/// through [`ImprovementUnknownEffect::with_settled_owner_outcome`] to discharge
+/// the obligation. This is why the private field is still written literally
+/// here: this is the module's only construction site, it is inside the module so
+/// privacy does not bar it, and the only value it may ever write is the absent
+/// one — there is no code path from a checked record to a settled receipt.
 fn unknown_effect_of(
     current: &ImprovementCurrentProposal,
     rollback: &RollbackContract,
@@ -1985,6 +2191,65 @@ pub fn improvement_retry_permitted(disposition: &ImprovementTerminalDisposition)
         | ImprovementTerminalDisposition::NoProgress { .. }
         | ImprovementTerminalDisposition::Blocked { .. }
         | ImprovementTerminalDisposition::CanaryAdmitted { .. } => true,
+    }
+}
+
+/// Returns the owner's retained result for a COMPLETED effect, or `None`.
+///
+/// The reconciliation half of the unknown-effect debt, and the one public way to
+/// reach the owner's retained [`ReceiptEnvelope`]. A completed effect is not
+/// retried and is not re-executed: it is reconciled from the result its owner
+/// already settled and retained, and this function is where that result is read.
+/// The crate owns the obligation, so the crate owns the read; nothing outside
+/// this module can re-derive, substitute, or synthesize the retained result, and
+/// there is no second reader of the field behind it.
+///
+/// `Some` is returned only when all of the following hold, and each is decided
+/// from the receipt rather than from prose or a flag:
+///
+/// - the disposition carries an [`ImprovementUnknownEffect`] obligation;
+/// - the owner attached a settled outcome through
+///   [`ImprovementUnknownEffect::with_settled_owner_outcome`];
+/// - that outcome is a completion — `Committed` or `Compensated` — rather than an
+///   unsettled, still-unknown, or merely non-success outcome; and
+/// - the receipt is bound to this obligation's exact operation identity, so a
+///   receipt for another operation can never be handed back as this effect's
+///   result.
+///
+/// Every other disposition, and every unsettled or non-completion outcome, is
+/// `None`. `None` is the denying direction throughout: it means this crate holds
+/// no owner-settled completion to reconcile, never that one happened.
+///
+/// The envelope is borrowed exactly as the owner wrote it. It is not copied,
+/// re-validated, or re-classified here, so this function adds no second
+/// judgement about the effect; reconciling it remains the owner's work, and this
+/// hands the owner the bytes it already holds.
+///
+/// Nothing in this workspace attaches a receipt to an obligation, so in practice
+/// this returns `None` for every disposition this module produces until the
+/// external effect owner settles one and attaches it.
+#[must_use]
+pub fn retained_improvement_completion(
+    disposition: &ImprovementTerminalDisposition,
+) -> Option<&ReceiptEnvelope> {
+    match disposition {
+        // The one disposition that carries an obligation, and therefore the only
+        // place a retained owner result can exist at all.
+        ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation } => {
+            obligation.settled_completion_result()
+        }
+        // A bare `contract_ref` is not an owner-validated result, exactly as for
+        // the retry gate: naming the arm is what keeps that refusal explicit
+        // instead of inherited from an unexamined wildcard.
+        ImprovementTerminalDisposition::RolledBack { .. } => None,
+        // Every other disposition describes a decision about the candidate, not
+        // an observed external effect, so it retains no owner result to read.
+        ImprovementTerminalDisposition::Rejected { .. }
+        | ImprovementTerminalDisposition::Inconclusive { .. }
+        | ImprovementTerminalDisposition::RegressionRejected { .. }
+        | ImprovementTerminalDisposition::NoProgress { .. }
+        | ImprovementTerminalDisposition::Blocked { .. }
+        | ImprovementTerminalDisposition::CanaryAdmitted { .. } => None,
     }
 }
 
@@ -2676,7 +2941,8 @@ fn map_decision(
         // candidate, experiment, commitment, repair bindings and owner this run
         // checked. The run observed no effect, so the obligation carries no
         // owner outcome yet and `improvement_retry_permitted` denies until the
-        // effect owner supplies its own validated receipt.
+        // effect owner supplies its own validated receipt through the checked
+        // attaching seam.
         ImprovementAdmissionDecision::RequiresReconciliation { owner_id, .. } => {
             ImprovementTerminalDisposition::UnknownRequiresReconciliation {
                 obligation: Box::new(unknown_effect_of(
