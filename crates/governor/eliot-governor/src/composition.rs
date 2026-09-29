@@ -7686,6 +7686,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// from the durable closure, so an exact replay of one operation resolves
     /// to the same receipt while the same operation under a changed payload
     /// conflicts at the store instead of reconciling to a different closure.
+    ///
+    /// The grant-revocation arm runs through
+    /// [`Self::apply_admitted_authority_revocation`], which admits the
+    /// presented operation against the live composition generation before
+    /// the saga starts. Live status: production seam for all four authority
+    /// families; the daemon composition root's authority pass is its one
+    /// production caller (BLOCKED-BY authority-transport: that pass does not
+    /// yet build one of these requests from an admitted canonical source).
     pub async fn apply_authority_request<L, C>(
         &mut self,
         request: PresentedAuthorityRequest,
@@ -7703,7 +7711,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 .activate_grant(&request)
                 .map(AuthorityActionReceipt::Activation),
             PresentedAuthorityRequest::GrantRevocation(request) => self
-                .revoke_grant_and_reconcile(
+                .apply_admitted_authority_revocation(
                     &request,
                     canonical_operation_id,
                     canonical_request_identity,
@@ -7724,6 +7732,111 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 .activate_root_transition(&request)
                 .map(|receipt| AuthorityActionReceipt::RootTransitionActivation(Box::new(receipt))),
         }
+    }
+
+    /// Applies one admitted grant revocation through the complete
+    /// Kernel-first saga under the live composition generation (#686).
+    ///
+    /// This is the production ingress for the revocation half of
+    /// [`Self::apply_authority_request`], and the only entry that reaches
+    /// [`Self::revoke_grant_and_reconcile`] and through it
+    /// [`Self::revoke_grant`], the `GrantGraph` closure revoke, and the
+    /// `RetainedAuthorityRequest` unknown-outcome surface. It admits nothing
+    /// itself: the daemon composition root still builds the
+    /// [`GrantRevocationRequest`] and both canonical identities from its own
+    /// admitted ingress, and both durable boundary ports are still the
+    /// existing owners that hold the ORS first-phase row and the
+    /// Kernel-issued receipt. No second graph, ledger, authority machine or
+    /// Store client is introduced here.
+    ///
+    /// Fail-closed order, all of it ahead of any transport:
+    /// - The composition must be `Ready` and must still retain a live P-07
+    ///   port. A degraded composition issues no right and starts no saga.
+    /// - The presented binding State Fence must equal the live composition
+    ///   State Fence, and the admitted canonical request identity must carry
+    ///   that same fence. An operation compiled against a superseded
+    ///   generation refuses here instead of being presented to the current
+    ///   Kernel owner and retained against a different owner snapshot
+    ///   (A00-03: restoration of revoked influence after recovery is a hard
+    ///   boundary; I6.15 keeps the Governor the owner of the semantic gating
+    ///   around the receipts this port returns).
+    /// - A retained presentation for the same grant must carry the exact
+    ///   same bytes. Changed content under a retained operation identity
+    ///   returns `IdentityConflict` and performs no transition (I5.27), so a
+    ///   lost acknowledgement can never become a second, differently shaped
+    ///   revocation, and a replay of the exact bytes still resolves to the
+    ///   retained receipt rather than minting a new identity.
+    /// - A pending stricter canonical revocation for the same grant must
+    ///   name the same snapshot. Re-presenting that exact operation resumes
+    ///   its unfinished second phase under the same canonical operation
+    ///   identity; presenting different content under an already fenced
+    ///   grant returns `IdentityConflict` instead of a fresh blind retry, and
+    ///   the retained record is never cleared by a refusal.
+    ///
+    /// Everything past admission is the existing saga, unchanged: Kernel
+    /// fences the exact graph revision first, the durable closure is read
+    /// back and validated against this request's snapshot and fence, the
+    /// canonical envelope is compiled from that closure and committed, and
+    /// the Store-issued receipt identity is linked to the immutable
+    /// first-phase row and read back. The returned record is only ever the
+    /// evidence those owners supplied.
+    ///
+    /// Live status: production ingress for the revocation half; the daemon
+    /// composition root's polled authority pass is its one production caller
+    /// (BLOCKED-BY authority-revocation-transport: that pass builds no
+    /// revocation request and holds no `GrantClosureReceiptPort` /
+    /// `GrantClosureCanonicalLinkPort` adapter yet).
+    pub async fn apply_admitted_authority_revocation<L, C>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        durable_link: &L,
+        closure_source: &C,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    where
+        L: GrantClosureCanonicalLinkPort + ?Sized,
+        C: GrantClosureReceiptPort + ?Sized,
+    {
+        self.require_ready_for_authority()?;
+        // Resolve the retained port here as well: a diagnosed degradation must
+        // refuse before the saga starts, never half-way through it.
+        self.authority_port()?;
+        let live_fence = self.snapshot.state_fence();
+        if request.binding.state_fence != live_fence {
+            return Err(CompositionError::Recovery(
+                "admitted grant revocation is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        if canonical_request_identity.request.metadata.state_fence != live_fence {
+            return Err(CompositionError::Provider(
+                "admitted canonical request identity is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        let ledger_key = presented.ledger_key();
+        if let Some(retained) = self.authority_presentations.get(ledger_key.as_str())
+            && retained.request() != &presented
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        if let Some(pending) = self
+            .pending_canonical_revocations
+            .get(request.grant_id.as_str())
+            && pending.snapshot_id != request.snapshot_id.as_str()
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        self.revoke_grant_and_reconcile(
+            request,
+            canonical_operation_id,
+            canonical_request_identity,
+            durable_link,
+            closure_source,
+        )
+        .await
     }
 
     /// Presents one canonical grant activation to the retained P-07 port and
@@ -7908,6 +8021,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// a later activation is refused, and a failed retry never clears it. The
     /// record is removed only when the second-phase link commits, which is the
     /// one outcome that proves canonical reconciliation completed.
+    ///
+    /// Its one production ingress is [`Self::apply_admitted_authority_revocation`],
+    /// which admits the presented operation against the live composition
+    /// generation before the Kernel first phase is struck;
+    /// [`Self::apply_authority_request`] reaches it through the
+    /// `GrantRevocation` arm.
     pub async fn revoke_grant_and_reconcile<
         L: GrantClosureCanonicalLinkPort + ?Sized,
         C: GrantClosureReceiptPort + ?Sized,
