@@ -22,7 +22,8 @@ use crate::{client, schema, schema_inventory};
 #[cfg(test)]
 use eliot_store_api::{CONTRACT_VERSION, validate_genesis_receipt_envelope};
 use eliot_store_api::{
-    CommittedCanonicalTransition, ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT,
+    CommittedCanonicalTransition, ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT,
     ERASURE_PARAM_SURFACES, ExactJsonBytes, NamedMutationOperation, ORDERING_LINK_GENESIS_HASH,
     OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
@@ -1714,12 +1715,14 @@ pub(crate) fn erasure_template_ordering(
 /// Builds the recorded erasure intent verbatim from the admitted named
 /// operation (issue #1712).
 ///
-/// The bridge applies only the recorded plan: subject, scope, fence, and
-/// surfaces are copied verbatim from the admitted `ApplyErasure` parameters
-/// into the local intent, never derived. The stable intent identity must
-/// equal the transition identity, binding record, execution, and receipt
-/// under one identity; divergence is an identity conflict with no
-/// destructive effect.
+/// The bridge applies only the recorded plan: subject, payload/blob handle,
+/// encryption key, deadline, scope, fence, and surfaces are copied verbatim
+/// from the admitted `ApplyErasure` parameters into the local intent, never
+/// derived. The stable intent identity must equal the transition identity,
+/// binding record, execution, and receipt under one identity; the recorded row
+/// comparison in `TX_ERASURE_INTENT` then refuses a same-identity request
+/// naming a different subject, payload, key, or deadline. Divergence is an
+/// identity conflict with no destructive effect.
 fn surreal_intent_from_transition(
     transition: &eliot_store_api::PreparedTransition,
 ) -> Result<atomic_write::SurrealErasureIntent, AdapterError> {
@@ -1743,6 +1746,16 @@ fn surreal_intent_from_transition(
             }))
     };
     let subject = text_param(ERASURE_PARAM_SUBJECT)?;
+    let payload_ref = text_param(ERASURE_PARAM_PAYLOAD_REF)?;
+    let encryption_key_ref = text_param(ERASURE_PARAM_ENCRYPTION_KEY_REF)?;
+    let deadline_unix_ms = text_param(ERASURE_PARAM_DEADLINE_UNIX_MS)?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: ERASURE_PARAM_DEADLINE_UNIX_MS,
+                reason: "must be a decimal Unix millisecond deadline",
+            })
+        })?;
     let surfaces_value = text_param(ERASURE_PARAM_SURFACES)?;
     let operation_id = text_param(ERASURE_PARAM_OPERATION_ID)?;
     if operation_id != transition.identity.operation_id.to_string() {
@@ -1757,6 +1770,9 @@ fn surreal_intent_from_transition(
     Ok(atomic_write::SurrealErasureIntent {
         operation_id: operation_id.to_owned(),
         subject: subject.to_owned(),
+        payload_ref: payload_ref.to_owned(),
+        encryption_key_ref: encryption_key_ref.to_owned(),
+        deadline_unix_ms,
         scope_id: transition.scope_id.clone(),
         surfaces,
         state_fence: transition.state_fence.clone(),
@@ -2547,6 +2563,12 @@ mod admitted_operation_gate_tests {
             operation: NamedMutationOperation::ApplyErasure,
             parameters: BTreeMap::from([
                 ("subject".to_owned(), json!("subject-gate")),
+                ("payload_ref".to_owned(), json!("payload:blob-gate")),
+                ("encryption_key_ref".to_owned(), json!("key:erasure-gate")),
+                (
+                    "erasure_deadline_unix_ms".to_owned(),
+                    json!("1700000000000"),
+                ),
                 ("surfaces".to_owned(), json!("CanonicalPayload,Index")),
                 ("reason".to_owned(), json!("user requested deletion")),
                 ("requester".to_owned(), json!("user:test")),
@@ -2700,6 +2722,9 @@ mod erasure_execution_tests {
         Ok(SurrealErasureIntent {
             operation_id: "erasure-op-1".to_owned(),
             subject: "evidence-alpha".to_owned(),
+            payload_ref: "payload:blob-erasure-1".to_owned(),
+            encryption_key_ref: "key:erasure-1".to_owned(),
+            deadline_unix_ms: 1_700_000_000_000,
             scope_id: eliot_store_api::ScopeId::new("scope-1")
                 .map_err(|error| format!("valid test scope: {error:?}"))?,
             surfaces: vec![

@@ -1661,17 +1661,31 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), StoreWireError>
 /// Closed neutral erasure dispatch wrapper (issue #688).
 ///
 /// Carries operation identity, the durable [`ErasureIntentRecord`] recorded
-/// before dispatch, and the selected surfaces in deterministic canonical
-/// order. `validate` runs before any destructive call: the intent must
-/// validate, the selected surfaces must exactly equal the intent's planned
+/// before dispatch, the exact payload/blob, encryption-key and deadline
+/// identities the dispatcher presents, and the selected surfaces in
+/// deterministic canonical order. `validate` runs before any destructive
+/// call: the intent must validate, the presented target identities must
+/// exactly equal the recorded intent's own subject/payload/key/deadline
+/// values, the selected surfaces must exactly equal the intent's planned
 /// surfaces in canonical order, and the store must advertise
-/// [`CAPABILITY_ERASURE_INTENT`]. A request without that intent capability
-/// refuses with [`StoreError::UnknownOperation`] and zero destructive calls.
+/// [`CAPABILITY_ERASURE_INTENT`]. A request naming a different subject,
+/// payload, key, or deadline than the recorded plan is refused with
+/// [`StoreError::IdentityConflict`] and zero destructive calls. A request
+/// without that intent capability refuses with [`StoreError::UnknownOperation`]
+/// and zero destructive calls.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErasureSurfaceRequest {
     pub identity: OperationIdentity,
     pub intent: ErasureIntentRecord,
+    /// Exact target subject the dispatcher presents for this effect.
+    pub subject: String,
+    /// Exact payload/blob handle identity the dispatcher presents.
+    pub payload_ref: String,
+    /// Exact encryption-key identity the dispatcher presents.
+    pub encryption_key_ref: String,
+    /// Exact deadline identity, in Unix milliseconds, the dispatcher presents.
+    pub deadline_unix_ms: u64,
     pub surfaces: Vec<ErasureSurfaceKind>,
 }
 
@@ -1740,6 +1754,18 @@ fn validate_erasure_surface_request(
     request.intent.validate()?;
     if request.identity.operation_id != request.intent.operation_id
         || request.identity.canonical_request_hash != request.intent.request_digest
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    // The presented target must be the recorded plan's own target. A
+    // well-formed request naming a different subject, payload, encryption key,
+    // or deadline is refused here, before any destructive call, because its
+    // content differs from the recorded value rather than because a field is
+    // empty.
+    if request.subject != request.intent.subject
+        || request.payload_ref != request.intent.payload_ref
+        || request.encryption_key_ref != request.intent.encryption_key_ref
+        || request.deadline_unix_ms != request.intent.deadline_unix_ms
     {
         return Err(StoreError::IdentityConflict);
     }

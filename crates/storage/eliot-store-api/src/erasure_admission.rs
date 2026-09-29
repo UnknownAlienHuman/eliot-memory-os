@@ -12,8 +12,9 @@
 //! The builder preserves the original privacy, visibility, retention, and
 //! provenance context by carrying the caller's [`SecurityContext`] unchanged
 //! into the transition. The store bridge applies only the recorded plan: the
-//! subject, scope, and surface denominator below are copied verbatim from the
-//! admitted parameters at dispatch, never derived.
+//! subject, payload/blob handle, encryption key, deadline, scope, and surface
+//! denominator below are copied verbatim from the admitted parameters at
+//! dispatch, never derived.
 //!
 //! Surface denominator encoding: `surfaces` carries the handler-surface names
 //! in deterministic canonical (sorted, comma-joined) order. Closed-enum
@@ -45,6 +46,14 @@ pub const ERASURE_PARAM_REASON: &str = "reason";
 pub const ERASURE_PARAM_REQUESTER: &str = "requester";
 /// Typed parameter binding the stable intent/execution identity.
 pub const ERASURE_PARAM_OPERATION_ID: &str = "erasure_operation_id";
+/// Typed parameter carrying the exact payload/blob handle identity erased.
+pub const ERASURE_PARAM_PAYLOAD_REF: &str = "payload_ref";
+/// Typed parameter carrying the exact encryption-key identity erased.
+pub const ERASURE_PARAM_ENCRYPTION_KEY_REF: &str = "encryption_key_ref";
+/// Typed parameter carrying the exact deadline identity, in Unix
+/// milliseconds, as its decimal string (the same spelling every other
+/// numeric store parameter uses).
+pub const ERASURE_PARAM_DEADLINE_UNIX_MS: &str = "erasure_deadline_unix_ms";
 
 /// Encodes handler-surface names into the canonical denominator string.
 ///
@@ -113,6 +122,16 @@ pub struct ErasureAdmissionRequest {
     pub state_fence: StateFence,
     /// Exact admitted target subject.
     pub subject: String,
+    /// Exact payload/blob handle identity this erasure removes. A well-formed
+    /// request naming a different payload is refused by the recorded-intent
+    /// identity comparison, not by field emptiness.
+    pub payload_ref: String,
+    /// Exact encryption-key identity whose destruction this erasure
+    /// authorises. Never a key chosen by the effect layer.
+    pub encryption_key_ref: String,
+    /// Exact deadline identity, in Unix milliseconds, after which this erasure
+    /// performs no effect.
+    pub deadline_unix_ms: u64,
     /// Handler-surface denominator (validated canonical shape here, closed
     /// membership at dispatch).
     pub surfaces: Vec<String>,
@@ -138,6 +157,14 @@ impl ErasureAdmissionRequest {
     pub fn validate(&self) -> Result<(), StoreError> {
         self.identity.validate()?;
         super::validate_text(&self.subject, "erasure.subject")?;
+        super::validate_text(&self.payload_ref, "erasure.payload_ref")?;
+        super::validate_text(&self.encryption_key_ref, "erasure.encryption_key_ref")?;
+        if self.deadline_unix_ms == 0 {
+            return Err(StoreError::InvalidField {
+                field: "erasure.deadline_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
         if self.surfaces.is_empty() {
             return Err(StoreError::Empty {
                 field: "erasure.surfaces",
@@ -195,6 +222,18 @@ pub fn admit_erasure_transition(
     parameters.insert(
         ERASURE_PARAM_SUBJECT.to_owned(),
         Value::String(request.subject.clone()),
+    );
+    parameters.insert(
+        ERASURE_PARAM_PAYLOAD_REF.to_owned(),
+        Value::String(request.payload_ref.clone()),
+    );
+    parameters.insert(
+        ERASURE_PARAM_ENCRYPTION_KEY_REF.to_owned(),
+        Value::String(request.encryption_key_ref.clone()),
+    );
+    parameters.insert(
+        ERASURE_PARAM_DEADLINE_UNIX_MS.to_owned(),
+        Value::String(request.deadline_unix_ms.to_string()),
     );
     parameters.insert(ERASURE_PARAM_SURFACES.to_owned(), Value::String(surfaces));
     parameters.insert(

@@ -3201,6 +3201,18 @@ mod tests {
                 parameters: std::collections::BTreeMap::from([
                     ("subject".to_owned(), serde_json::json!("subject-bridge")),
                     (
+                        "payload_ref".to_owned(),
+                        serde_json::json!("payload:blob-bridge"),
+                    ),
+                    (
+                        "encryption_key_ref".to_owned(),
+                        serde_json::json!("key:erasure-bridge"),
+                    ),
+                    (
+                        "erasure_deadline_unix_ms".to_owned(),
+                        serde_json::json!("1700000000000"),
+                    ),
+                    (
                         "surfaces".to_owned(),
                         serde_json::json!("CanonicalPayload,Index"),
                     ),
