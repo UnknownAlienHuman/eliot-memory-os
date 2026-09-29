@@ -1466,7 +1466,8 @@ impl InstallationTransaction {
                 )
             {
                 return Err(InstallationError::IncompleteObservation(
-                    "an adopted transaction cannot retain an unreconciled guard composite".to_owned(),
+                    "an adopted transaction cannot retain an unreconciled guard composite"
+                        .to_owned(),
                 ));
             }
         }
@@ -2506,7 +2507,7 @@ impl InstallationTransaction {
     /// Returns [`InstallationError::IdentityConflict`] when a composite is
     /// already retained, and any error from the composite's own `validate()`
     /// or the transaction's own invariants.
-    pub fn record_guard_revert(
+    pub(crate) fn record_guard_revert(
         &mut self,
         outcome: GuardRevertOutcome,
     ) -> Result<InstallationStepOutcome, InstallationError> {
@@ -2534,13 +2535,12 @@ impl InstallationTransaction {
                 // the retained reference still records the uncertainty.
                 Err(InstallationError::IllegalTransition { .. }) => {
                     self.pending_external_changes = evidence_refs.clone();
-                    self.revision =
-                        self.revision
-                            .checked_add(1)
-                            .ok_or_else(|| InstallationError::InvalidField {
-                                field: "revision".to_owned(),
-                                reason: "overflow".to_owned(),
-                            })?;
+                    self.revision = self.revision.checked_add(1).ok_or_else(|| {
+                        InstallationError::InvalidField {
+                            field: "revision".to_owned(),
+                            reason: "overflow".to_owned(),
+                        }
+                    })?;
                     self.validate()?;
                 }
                 Err(error) => return Err(error),
@@ -2583,7 +2583,7 @@ impl InstallationTransaction {
     /// Returns [`InstallationError::IncompleteObservation`] when this
     /// transaction retains no composite, and any error from the transaction's
     /// own invariants.
-    pub fn reconcile_guard_revert_evidence(
+    pub(crate) fn reconcile_guard_revert_evidence(
         &mut self,
         retained: &[u8],
     ) -> Result<TerminalContainmentReadback, InstallationError> {
