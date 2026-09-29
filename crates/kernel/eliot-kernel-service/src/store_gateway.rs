@@ -3121,8 +3121,15 @@ impl KernelStoreGateway {
     /// set and can never carry the digest `assemble` requires.
     ///
     /// Selection is by the envelope's own content-derived identity — exactly the
-    /// id the immutable revision names — so a caller cannot reach an envelope by
-    /// predicting a row address, and the binding is then closed by
+    /// id the immutable revision names — and that comparison happens HERE rather
+    /// than in the owner. The owner is a store: it retains the envelope on the
+    /// row it wrote and answers with those bytes verbatim, because a storage
+    /// adapter that resolved a field inside a receipt would be interpreting a
+    /// value it was only asked to hold. This leg parses the returned bytes,
+    /// validates them through the envelope's own `validate()`, and requires the
+    /// PARSED `identity.receipt_id` to be the id the revision names, so a caller
+    /// cannot reach an envelope by predicting a row address and cannot pass a
+    /// bare name off as an identity. The binding is then closed by
     /// [`UserAutomationPreflightProjection::assemble`], which validates the
     /// envelope through its own `validate()` and requires its canonical bytes to
     /// carry the revision's compiled-occurrence digest. An owner that retained no
@@ -3250,7 +3257,8 @@ impl KernelStoreGateway {
         // The schedule normalization envelope the revision names is owner
         // evidence over the compiled occurrence set, so it is read from the
         // automation owner that minted and retained it rather than assembled
-        // here. The read selects the envelope by its own content-derived
+        // here. The owner answers with the revision's retained bytes verbatim and
+        // the projection selects them by the envelope's own content-derived
         // identity; assembly then re-checks that envelope's canonical bytes name
         // the compiled occurrence digest, so a self-asserted digest cannot
         // satisfy the binding. An owner that has retained no such envelope leaves

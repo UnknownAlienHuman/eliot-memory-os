@@ -248,17 +248,29 @@ impl<C> CanonicalUserAutomationStore<C> {
     /// Projects the owner's retained normalization receipt envelopes for one
     /// exact immutable revision.
     ///
+    /// This is where the CONTENT-DERIVED identity binding is closed, because it
+    /// is the first contour on the readback that can see inside the retained
+    /// bytes. The owner stores a value it was handed and returns it verbatim, so
+    /// it never names a field inside a `ReceiptEnvelope`; this contour already
+    /// depends on `eliot-receipts` and is the subsystem the receipt is about, so
+    /// it is the right place to read the envelope's own identity.
+    ///
     /// Each returned envelope is the owner's own retained bytes, parsed back
     /// into the typed [`ReceiptEnvelope`] and validated through its own
     /// `validate()`, which re-derives the content-derived identity from the
     /// canonical core. A projected envelope therefore cannot be a substituted
     /// or re-signed claim: if the owner returned bytes that do not hash to the
     /// identity they were selected by, this refuses instead of handing a
-    /// plausible-looking envelope to preflight. The binding between the envelope
-    /// and the revision's compiled occurrence set is NOT closed here — that is
-    /// `UserAutomationPreflightProjection::assemble`'s job, against the
-    /// authenticated revision, so this method proves only that the envelope is
-    /// real and is the one the revision names.
+    /// plausible-looking envelope to preflight. The comparison is against the
+    /// PARSED `identity.receipt_id`, never against a bare string the owner could
+    /// have echoed, so it stays a content comparison rather than a name
+    /// comparison: predicting an identity reaches no envelope, and naming the
+    /// wrong one is a typed conflict rather than a plausible answer.
+    ///
+    /// The binding between the envelope and the revision's compiled occurrence
+    /// set is NOT closed here — that is `UserAutomationPreflightProjection::assemble`'s
+    /// job, against the authenticated revision, so this method proves only that
+    /// the envelope is real and is the one the revision names.
     pub fn project_normalization_receipts(
         request: &NamedReadRequest,
         response: NamedReadResponse,
@@ -280,6 +292,22 @@ impl<C> CanonicalUserAutomationStore<C> {
                 field: "automation.receipt_id",
                 reason: "normalization read lost its exact receipt identity selector",
             })?;
+        let requested_automation_id = request
+            .parameters
+            .get(eliot_store_api::AUTOMATION_PARAM_AUTOMATION_ID)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "normalization read lost its exact automation selector",
+            })?;
+        let requested_revision = request
+            .parameters
+            .get(eliot_store_api::AUTOMATION_PARAM_REVISION)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "normalization read lost its exact immutable revision selector",
+            })?;
         let mut envelopes = Vec::with_capacity(entries.len());
         for entry in entries {
             let document = entry.get("envelope_json").and_then(Value::as_str).ok_or(
@@ -291,18 +319,20 @@ impl<C> CanonicalUserAutomationStore<C> {
             let envelope: ReceiptEnvelope = serde_json::from_str(document)
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             envelope.validate().map_err(StoreError::Receipt)?;
-            // Selection is by the envelope's OWN identity, and it is re-checked
-            // here on the way out: an owner that returned an envelope other
-            // than the one the immutable revision names is answered as a
-            // conflict rather than passed to preflight as if it were the claim.
-            let selected = entry.get("receipt_id").and_then(Value::as_str).ok_or(
-                StoreError::InvalidField {
-                    field: "automation.receipt_id",
-                    reason: "retained normalization envelope is missing its identity",
-                },
-            )?;
-            if envelope.identity.receipt_id.as_str() != selected || selected != requested_receipt_id
+            // The answer must be about the exact immutable revision this read
+            // named. A row address the owner repeated is not a receipt identity,
+            // so it can satisfy neither the automation nor the revision half of
+            // the address on its own.
+            if entry.get("automation_id").and_then(Value::as_str) != Some(requested_automation_id)
+                || entry.get("revision").and_then(Value::as_str) != Some(requested_revision)
             {
+                return Err(StoreError::IdentityConflict);
+            }
+            // Selection is by the envelope's OWN content-derived identity, read
+            // out of the returned bytes and compared to the identity the
+            // immutable revision names. An owner that answered with some other
+            // envelope is a conflict, not a plausible answer to pass to preflight.
+            if envelope.identity.receipt_id.as_str() != requested_receipt_id {
                 return Err(StoreError::IdentityConflict);
             }
             envelopes.push(envelope);
