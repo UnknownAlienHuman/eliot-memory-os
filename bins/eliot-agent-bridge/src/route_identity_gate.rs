@@ -123,8 +123,7 @@ pub fn classify_bridge_route_reconnect(
     let retained_diverged = registry.receipt(&route.route_id).is_some_and(|receipt| {
         receipt.requested_fingerprint != *prior || receipt.requested_fingerprint != live
     });
-    if retained_diverged
-        || classify_bridge_route_resume(prior, &live) == ContinuityKind::Rehydrated
+    if retained_diverged || classify_bridge_route_resume(prior, &live) == ContinuityKind::Rehydrated
     {
         ContinuityKind::Rehydrated
     } else {
