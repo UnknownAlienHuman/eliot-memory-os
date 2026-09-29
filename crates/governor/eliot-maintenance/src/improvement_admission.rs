@@ -25,8 +25,8 @@ use thiserror::Error;
 
 use super::improvement_pipeline::{
     ImprovementCurrentProposal, ImprovementMaterialEquality, ImprovementReplayAssessment,
-    ProposalCommitment, RetainedImprovementProposal, UnestablishedPriorCause,
-    assess_improvement_progress,
+    ProposalCommitment, RetainedImprovementProposal, UncheckedRecordIdentity,
+    UnestablishedPriorCause, assess_improvement_progress,
 };
 
 /// Improvement closure cell identity (mirrors `meta.learning.closure`).
@@ -600,6 +600,14 @@ pub enum ImprovementAdmissionError {
         /// What widened.
         detail: String,
     },
+    /// The current checked record does not carry this build's checked identity,
+    /// so the gate refuses to derive any assessment from it.
+    ///
+    /// Carried whole so the refusal stays a disagreement about a named identity
+    /// component rather than collapsing into a progress verdict, a no-progress
+    /// reason, or a substituted digest.
+    #[error("improvement admission record identity is unchecked: {0}")]
+    UncheckedRecordIdentity(#[from] UncheckedRecordIdentity),
 }
 
 /// Admit one improvement candidate for bounded experiment or dispose it.
@@ -712,7 +720,7 @@ pub fn admit_improvement_candidate(
     // the unknown-outcome branch above, which no prior record, no new
     // discriminator, and no named rollback contract may clear.
     let assessment =
-        assess_improvement_progress(evidence.retained_prior_proposal.as_ref(), current);
+        assess_improvement_progress(evidence.retained_prior_proposal.as_ref(), current)?;
     if let Some(outcome) = replay_forced_outcome(&assessment, &policy.external_owner_id) {
         return outcome;
     }
