@@ -22,7 +22,7 @@ mod commit_recovery;
 pub use commit_recovery::{
     CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, MAX_OBSERVED_OPEN_COMMITS,
     PauseLedgerBinding, PauseReleaseOutcome, PauseScopeView, PausedScopeEntry, PausedScopeMirror,
-    PausedScopeSnapshot, classify_commit_receipt, paused_ordering_scope_view,
+    PausedScopeSnapshot, RecoveredCommit, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
 mod capacity_evidence;

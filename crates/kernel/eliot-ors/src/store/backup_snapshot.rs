@@ -1173,6 +1173,22 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             RowDisposition::NonrestorableHistorical,
             "a derived lookup index over HOST_REQUESTS; it is rebuilt from those rows and holds no row of its own",
         ),
+        // A derived complete-open-set index over UNKNOWN_COMMIT_RECOVERY. It
+        // is backfilled from that authoritative family under the receiving
+        // owner's own revision and must never be restored as another owner's
+        // clearance state.
+        excluded(
+            super::UNKNOWN_COMMIT_PAUSE_INDEX,
+            RowDisposition::NonrestorableHistorical,
+            "a derived open-set index over UNKNOWN_COMMIT_RECOVERY; it is rebuilt under the receiving owner's own revision and is never restored as clearance state",
+        ),
+        // Unresolved send claims belong to the exact Kernel/ORS instance and
+        // cannot be imported into another owner as executable admissions.
+        excluded(
+            super::UNKNOWN_COMMIT_SEND_CLAIMS,
+            RowDisposition::NonrestorableHistorical,
+            "unresolved pre-send claims are instance-bound admissions; restore must rebuild owner state and must never replay another installation's send authority",
+        ),
         // ---- Explicit source-bound exclusions: superseded or committed ----
         // Superseded by `GRANT_CLOSURE_CURRENT` (v2). Its bytes are an explicit
         // startup-migration input and are removed by that migration, so a

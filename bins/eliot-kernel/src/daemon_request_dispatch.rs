@@ -6547,14 +6547,15 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => {
+            Ok(recovered) => {
+                let receipt = &recovered.receipt;
                 if !campaign_source_publications.is_empty() {
                     if receipt.status == WriteReceiptStatus::Committed {
                         if let Err(error) = self.p07_ors.commit_campaign_source_publications(
                             &campaign_source_operation_id,
                             &campaign_source_request_digest,
                             &campaign_source_publications,
-                            &receipt,
+                            receipt,
                         ) {
                             // Keep the source reservation. An exact replay of
                             // this same canonical operation obtains the
@@ -6575,7 +6576,10 @@ impl KernelComposition {
                         ));
                     }
                 }
-                Ok(store_apply_response(&receipt, verified_correction.as_ref()))
+                Ok(store_apply_recovered_response(
+                    &recovered,
+                    verified_correction.as_ref(),
+                ))
             }
             Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
         }
@@ -6680,7 +6684,7 @@ impl KernelComposition {
             notification_state_read_selectors(&operation.transition)?;
         let state_fence = operation.transition.state_fence.clone();
         let gateway = self.retained_store_gateway()?;
-        let receipt = match gateway
+        let recovered = match gateway
             .apply(
                 &operation.context,
                 operation.transition,
@@ -6697,6 +6701,7 @@ impl KernelComposition {
                 ));
             }
         };
+        let receipt = &recovered.receipt;
         if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
             return Ok(Self::store_error_response_text(
                 NOTIFICATION_STATE_RESPONSE_KIND,
@@ -6729,7 +6734,7 @@ impl KernelComposition {
                 "kind": NOTIFICATION_STATE_RESPONSE_KIND,
                 "value": { "receipt": receipt, "page": page },
             },
-            "recovery": null,
+            "recovery": pause_release_response(recovered.pause_release.as_ref()),
         }))
     }
 
@@ -9035,6 +9040,50 @@ fn store_apply_response(
         });
     }
     response
+}
+
+#[cfg(windows)]
+fn store_apply_recovered_response(
+    recovered: &eliot_kernel_service::RecoveredCommit,
+    verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
+) -> serde_json::Value {
+    let mut response = store_apply_response(&recovered.receipt, verified_correction);
+    response["recovery"] = pause_release_response(recovered.pause_release.as_ref());
+    response
+}
+
+#[cfg(windows)]
+fn pause_release_response(
+    release: Option<&eliot_kernel_service::PauseReleaseOutcome>,
+) -> serde_json::Value {
+    match release {
+        Some(eliot_kernel_service::PauseReleaseOutcome::Released {
+            scopes,
+            retained,
+            superseded,
+            binding,
+            revision,
+        }) => serde_json::json!({
+            "kind": "released",
+            "scopes": scopes,
+            "retained": retained,
+            "superseded": superseded,
+            "owner_generation": binding.owner_generation.as_deref(),
+            "owner_revision": binding.revision,
+            "revision": revision,
+        }),
+        Some(eliot_kernel_service::PauseReleaseOutcome::RefreshUnavailable { scopes, detail }) => {
+            serde_json::json!({
+                "kind": "refresh_unavailable",
+                "scopes": scopes,
+                "detail": detail,
+            })
+        }
+        Some(eliot_kernel_service::PauseReleaseOutcome::NothingToRelease) => {
+            serde_json::json!({ "kind": "nothing_to_release" })
+        }
+        None => serde_json::Value::Null,
+    }
 }
 
 /// Requires a local-read store request to be the closed evidence-pack read.

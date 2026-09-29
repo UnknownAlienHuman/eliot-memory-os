@@ -24,6 +24,7 @@ use eliot_runtime_contracts::{
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -31,8 +32,8 @@ use uuid::Uuid;
 #[path = "persistence_codec.rs"]
 pub(crate) mod persistence_codec;
 use persistence_codec::{
-    LegacyGrantClosureRecord, LegacyGrantClosureState, decode, decode_legacy_grant_closure_record,
-    decode_named, encode, is_current_grant_closure_shape,
+    LegacyGrantClosureRecord, LegacyGrantClosureState, PersistedValue, decode,
+    decode_legacy_grant_closure_record, decode_named, encode, is_current_grant_closure_shape,
 };
 
 #[path = "store/persistence_models.rs"]
@@ -213,6 +214,29 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
 const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_unknown_commit_recovery_v1");
+const UNKNOWN_COMMIT_SEND_CLAIMS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_unknown_commit_send_claims_v1");
+const UNKNOWN_COMMIT_PAUSE_INDEX: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_unknown_commit_pause_index_v1");
+const UNKNOWN_COMMIT_PAUSE_STATE_KEY: &str = "unknown_commit_pause_index_v1";
+const UNKNOWN_COMMIT_PAUSE_BACKFILL_PAGE: usize = 256;
+pub const MAX_UNKNOWN_COMMIT_PAUSE_SNAPSHOT_RECORDS: usize = 4096;
+
+fn unknown_commit_pause_index_key(idempotency_key: &str) -> String {
+    format!("u::{idempotency_key}")
+}
+
+fn unknown_commit_send_claim_index_key(idempotency_key: &str) -> String {
+    format!("c::{idempotency_key}")
+}
+
+fn ordering_scopes_overlap(left: &[String], right: &[String]) -> bool {
+    left.is_empty()
+        || right.is_empty()
+        || left
+            .iter()
+            .any(|left_scope| right.iter().any(|right_scope| left_scope == right_scope))
+}
 /// Durable scan disclosure rows (issue #2900): one row per
 /// `scan-disclosure:<installation>:<operation>` identity holding the exact
 /// canonical receipt bytes under their digest plus the owner-admitted write
@@ -4071,6 +4095,112 @@ pub struct RedbRecoveryStore {
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
 }
 
+/// Coverage of an owner-issued unknown-commit pause observation.
+///
+/// This has one success value on purpose: an incomplete migration, an exhausted
+/// record bound, or any inconsistent row is an error and can never be
+/// represented as an empty complete set.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum UnknownCommitPauseCoverage {
+    Complete,
+}
+
+/// Bounded complete open-set observation issued by the durable ORS owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq)]
+pub struct UnknownCommitPauseSnapshot {
+    /// Durable identity of this store owner, retained across restart.
+    pub owner_generation: String,
+    /// Monotone owner revision. Every open-set change advances it atomically.
+    pub revision: u64,
+    /// Explicit completeness discriminator for future compatible extensions.
+    pub coverage: UnknownCommitPauseCoverage,
+    /// Every open record, in durable key order, when coverage is complete.
+    pub records: Vec<UnknownCommitRecord>,
+    /// Every unresolved pre-send claim, in durable key order.
+    pub claims: Vec<UnknownCommitSendClaimRecord>,
+}
+
+/// Durable pre-send claim and its exact State Fence binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownCommitSendClaimRecord {
+    /// Exact admitted operation and dependent ordering scopes.
+    pub record: UnknownCommitRecord,
+    /// The Kernel-issued fence observed for the claim.
+    pub state_fence: StateFenceSnapshot,
+    /// Unique durable owner revision that issued this claim, preventing an
+    /// old handle from releasing a later same-key claim after an ABA cycle.
+    pub claim_revision: u64,
+}
+
+impl persistence_codec::PersistedValue for UnknownCommitSendClaimRecord {
+    const RECORD_TYPE: &'static str = "unknown_commit_send_claim";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.record.validate()?;
+        self.state_fence.validate()?;
+        if !self.record.is_open() || self.claim_revision == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "a pre-send claim must bind an open attempt and nonzero revision"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exact handle returned after ORS durably reserves the operation scopes.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq)]
+pub struct UnknownCommitSendClaim {
+    /// Durable identity of the ORS owner that issued the claim.
+    pub owner_generation: String,
+    /// Owner revision after the claim became visible in the pause set.
+    pub revision: u64,
+    /// Exact persisted binding required to release or promote this claim.
+    pub claim: UnknownCommitSendClaimRecord,
+}
+
+/// Result of staging an unknown commit together with its durable owner order.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq)]
+pub struct UnknownCommitStageResult {
+    /// Existing durable winner for an exact replay; `None` when newly staged.
+    pub existing: Option<UnknownCommitRecord>,
+    /// Durable identity of the ORS owner that issued this result.
+    pub owner_generation: String,
+    /// Owner revision that includes the returned staged state.
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UnknownCommitPauseIndexState {
+    schema: String,
+    version: u16,
+    owner_generation: String,
+    revision: u64,
+    backfill_after_key: Option<String>,
+    backfill_complete: bool,
+    pause_count: u64,
+}
+
+impl persistence_codec::PersistedValue for UnknownCommitPauseIndexState {
+    const RECORD_TYPE: &'static str = "unknown_commit_pause_index_state";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        if self.schema != "eliot_ors_unknown_commit_pause_index"
+            || self.version != 1
+            || self.revision == 0
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "index state schema, version, revision, or count is invalid".to_owned(),
+            });
+        }
+        crate::model::validate_digest(&self.owner_generation, "unknown_commit_owner_generation")
+    }
+}
+
 /// Narrow durable port for scan disclosure records (issue #2900).
 ///
 /// The installation-bound scan-disclosure adapter writes, replays, reads and
@@ -5416,8 +5546,845 @@ impl RedbRecoveryStore {
         Ok(records)
     }
 
+    /// Loads the durable owner state for the open-pause index, creating its
+    /// initial generation and revision in this transaction when absent.
+    /// The enclosing mutation persists any state changes before commit.
+    fn ensure_unknown_commit_pause_state(
+        write: &redb::WriteTransaction,
+    ) -> Result<UnknownCommitPauseIndexState, OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        if let Some(value) = meta.get(UNKNOWN_COMMIT_PAUSE_STATE_KEY).map_err(storage)? {
+            return decode(value.value());
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| OrsError::Storage(error.to_string()))?
+            .as_nanos();
+        let generation_seed = format!(
+            "eliot-ors-unknown-commit-owner-v1:{now}:{}:{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let state = UnknownCommitPauseIndexState {
+            schema: "eliot_ors_unknown_commit_pause_index".to_owned(),
+            version: 1,
+            owner_generation: crate::model::sha256_hex(generation_seed.as_bytes()),
+            revision: 1,
+            backfill_after_key: None,
+            backfill_complete: false,
+            pause_count: 0,
+        };
+        state.validate_persisted()?;
+        let encoded = encode(&state)?;
+        meta.insert(UNKNOWN_COMMIT_PAUSE_STATE_KEY, encoded.as_str())
+            .map_err(storage)?;
+        Ok(state)
+    }
+
+    fn persist_unknown_commit_pause_state(
+        write: &redb::WriteTransaction,
+        state: &UnknownCommitPauseIndexState,
+    ) -> Result<(), OrsError> {
+        state.validate_persisted()?;
+        let encoded = encode(state)?;
+        write
+            .open_table(META)
+            .map_err(storage)?
+            .insert(UNKNOWN_COMMIT_PAUSE_STATE_KEY, encoded.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    fn advance_unknown_commit_pause_index(&self) -> Result<(), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut state = Self::ensure_unknown_commit_pause_state(&write)?;
+        if state.backfill_complete {
+            write.commit().map_err(storage)?;
+            return Ok(());
+        }
+
+        let source_page = {
+            let source = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+            let rows = match state.backfill_after_key.as_deref() {
+                Some(after_key) => source
+                    .range::<&str>((Bound::Excluded(after_key), Bound::Unbounded))
+                    .map_err(storage)?,
+                None => source.range::<&str>(..).map_err(storage)?,
+            };
+            let mut page = Vec::new();
+            let mut more = false;
+            for (offset, entry) in rows
+                .take(UNKNOWN_COMMIT_PAUSE_BACKFILL_PAGE + 1)
+                .enumerate()
+            {
+                if offset == UNKNOWN_COMMIT_PAUSE_BACKFILL_PAGE {
+                    more = true;
+                    break;
+                }
+                let (key, value) = entry.map_err(storage)?;
+                let record: UnknownCommitRecord = decode(value.value())?;
+                if key.value() != record.record_key() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_recovery",
+                        reason: "row key does not match the durable record key".to_owned(),
+                    });
+                }
+                page.push((key.value().to_owned(), record));
+            }
+            (page, more)
+        };
+
+        let mut index = write
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        for (key, record) in &source_page.0 {
+            let index_key = unknown_commit_pause_index_key(key);
+            let indexed = index.get(index_key.as_str()).map_err(storage)?.is_some();
+            if record.is_open() {
+                if !indexed {
+                    index
+                        .insert(index_key.as_str(), "unknown")
+                        .map_err(storage)?;
+                    state.pause_count = state.pause_count.checked_add(1).ok_or_else(|| {
+                        OrsError::IntegrityProblem {
+                            record_type: "unknown_commit_pause_index_state",
+                            reason: "open record count overflow".to_owned(),
+                        }
+                    })?;
+                }
+            } else if indexed {
+                index.remove(index_key.as_str()).map_err(storage)?;
+                state.pause_count =
+                    state
+                        .pause_count
+                        .checked_sub(1)
+                        .ok_or_else(|| OrsError::IntegrityProblem {
+                            record_type: "unknown_commit_pause_index_state",
+                            reason: "open record count underflow".to_owned(),
+                        })?;
+            }
+            state.backfill_after_key = Some(key.clone());
+        }
+        drop(index);
+        if !source_page.1 {
+            state.backfill_complete = true;
+        }
+        state.revision =
+            state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "owner revision overflow".to_owned(),
+                })?;
+        Self::persist_unknown_commit_pause_state(&write, &state)?;
+        write.commit().map_err(storage)?;
+        if source_page.1 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn read_unknown_commit_pause_snapshot(
+        &self,
+    ) -> Result<Option<UnknownCommitPauseSnapshot>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        let state = meta
+            .get(UNKNOWN_COMMIT_PAUSE_STATE_KEY)
+            .map_err(storage)?
+            .map(|value| decode::<UnknownCommitPauseIndexState>(value.value()))
+            .transpose()?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        if !state.backfill_complete {
+            return Ok(None);
+        }
+        let count =
+            usize::try_from(state.pause_count).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        if count > MAX_UNKNOWN_COMMIT_PAUSE_SNAPSHOT_RECORDS {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let unknown = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        let claims_table = read
+            .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+            .map_err(storage)?;
+        let index = read
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        let mut records = Vec::with_capacity(count);
+        let mut claims = Vec::new();
+        for entry in index.iter().map_err(storage)?.take(count + 1) {
+            let (key, value) = entry.map_err(storage)?;
+            if let Some(idempotency_key) = key.value().strip_prefix("u::") {
+                if value.value() != "unknown" {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "unknown-commit index value is invalid".to_owned(),
+                    });
+                }
+                let bytes = unknown
+                    .get(idempotency_key)
+                    .map_err(storage)?
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "index key has no authoritative recovery row".to_owned(),
+                    })?;
+                let record: UnknownCommitRecord = decode(bytes.value())?;
+                if !record.is_open() || record.record_key() != idempotency_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "index key does not identify an open authoritative row".to_owned(),
+                    });
+                }
+                records.push(record);
+            } else if let Some(idempotency_key) = key.value().strip_prefix("c::") {
+                if value.value() != "claim" {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "send-claim index value is invalid".to_owned(),
+                    });
+                }
+                let bytes = claims_table
+                    .get(idempotency_key)
+                    .map_err(storage)?
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "claim index key has no authoritative claim row".to_owned(),
+                    })?;
+                let claim: UnknownCommitSendClaimRecord = decode(bytes.value())?;
+                if claim.record.record_key() != idempotency_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "claim index key does not match its operation binding".to_owned(),
+                    });
+                }
+                claims.push(claim);
+            } else {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index",
+                    reason: "index key has an unknown type prefix".to_owned(),
+                });
+            }
+        }
+        if records.len() + claims.len() != count {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "indexed pause count differs from durable metadata".to_owned(),
+            });
+        }
+        Ok(Some(UnknownCommitPauseSnapshot {
+            owner_generation: state.owner_generation,
+            revision: state.revision,
+            coverage: UnknownCommitPauseCoverage::Complete,
+            records,
+            claims,
+        }))
+    }
+
+    /// Returns a bounded, complete open-set snapshot with an ORS-issued
+    /// durable generation and revision. Legacy rows are indexed in bounded
+    /// pages; callers must treat every error as unavailable, never as empty.
+    pub fn observe_open_unknown_commits(&self) -> Result<UnknownCommitPauseSnapshot, OrsError> {
+        if let Some(snapshot) = self.read_unknown_commit_pause_snapshot()? {
+            return Ok(snapshot);
+        }
+        self.advance_unknown_commit_pause_index()?;
+        self.read_unknown_commit_pause_snapshot()?
+            .ok_or(OrsError::ProjectionLimitExceeded)
+    }
+
+    /// Atomically claims the exact open-set revision immediately before a
+    /// dependent send. The claim itself becomes a pause and reservation for
+    /// overlapping scopes until it is released or promoted to unknown.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction must validate the complete revision, conflicts, and durable claim atomically"
+    )]
+    pub fn claim_unknown_commit_send(
+        &self,
+        snapshot: &UnknownCommitPauseSnapshot,
+        record: &UnknownCommitRecord,
+        state_fence: &StateFenceSnapshot,
+    ) -> Result<UnknownCommitSendClaim, OrsError> {
+        record.validate()?;
+        state_fence.validate()?;
+        if !record.is_open() {
+            return Err(OrsError::InvalidField {
+                field: "unknown_commit_outcome",
+                reason: "a send claim requires an open attempt",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut state = Self::ensure_unknown_commit_pause_state(&write)?;
+        if !state.backfill_complete
+            || snapshot.coverage != UnknownCommitPauseCoverage::Complete
+            || snapshot.owner_generation != state.owner_generation
+            || snapshot.revision != state.revision
+        {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+        let pause_count =
+            usize::try_from(state.pause_count).map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        if pause_count >= MAX_UNKNOWN_COMMIT_PAUSE_SNAPSHOT_RECORDS {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+
+        let idempotency_key = record.record_key();
+        let unknown = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        let retained = unknown
+            .get(idempotency_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<UnknownCommitRecord>(value.value()))
+            .transpose()?;
+        if let Some(retained) = &retained
+            && (!retained.is_open() || !retained.same_binding(record))
+        {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+        let claim_key = unknown_commit_send_claim_index_key(&idempotency_key);
+        let unknown_key = unknown_commit_pause_index_key(&idempotency_key);
+        let mut claims = write
+            .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+            .map_err(storage)?;
+        if claims
+            .get(idempotency_key.as_str())
+            .map_err(storage)?
+            .is_some()
+        {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+
+        let index = write
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        match (
+            retained.is_some(),
+            index.get(unknown_key.as_str()).map_err(storage)?,
+        ) {
+            (true, Some(value)) if value.value() == "unknown" => {}
+            (false, None) => {}
+            (true, _) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index",
+                    reason: "retained open record is absent from the complete pause index"
+                        .to_owned(),
+                });
+            }
+            (false, Some(_)) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index",
+                    reason: "pause index has a key without its authoritative unknown row"
+                        .to_owned(),
+                });
+            }
+        }
+        let mut observed_count = 0usize;
+        for entry in index
+            .iter()
+            .map_err(storage)?
+            .take(MAX_UNKNOWN_COMMIT_PAUSE_SNAPSHOT_RECORDS + 1)
+        {
+            if observed_count == MAX_UNKNOWN_COMMIT_PAUSE_SNAPSHOT_RECORDS {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            let (key, value) = entry.map_err(storage)?;
+            observed_count += 1;
+            let existing_scopes = if let Some(existing_key) = key.value().strip_prefix("u::") {
+                if value.value() != "unknown" {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "unknown-commit index value is invalid".to_owned(),
+                    });
+                }
+                let bytes = unknown.get(existing_key).map_err(storage)?.ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "index key has no authoritative recovery row".to_owned(),
+                    }
+                })?;
+                let existing: UnknownCommitRecord = decode(bytes.value())?;
+                if !existing.is_open() || existing.record_key() != existing_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "index key does not identify an open authoritative row".to_owned(),
+                    });
+                }
+                if existing_key == idempotency_key {
+                    if !existing.same_binding(record) {
+                        return Err(OrsError::OrderingHeadMismatch);
+                    }
+                    continue;
+                }
+                existing.ordering_scopes
+            } else if let Some(existing_key) = key.value().strip_prefix("c::") {
+                if value.value() != "claim" {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "send-claim index value is invalid".to_owned(),
+                    });
+                }
+                let bytes = claims.get(existing_key).map_err(storage)?.ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "claim index key has no authoritative claim row".to_owned(),
+                    }
+                })?;
+                let existing: UnknownCommitSendClaimRecord = decode(bytes.value())?;
+                if existing.record.record_key() != existing_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "claim index key does not match its operation binding".to_owned(),
+                    });
+                }
+                if existing_key == idempotency_key {
+                    return Err(OrsError::OrderingHeadMismatch);
+                }
+                existing.record.ordering_scopes
+            } else {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index",
+                    reason: "index key has an unknown type prefix".to_owned(),
+                });
+            };
+            if ordering_scopes_overlap(&record.ordering_scopes, &existing_scopes) {
+                return Err(OrsError::OrderingHeadMismatch);
+            }
+        }
+        drop(index);
+        if observed_count != pause_count {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "indexed pause count differs from durable metadata".to_owned(),
+            });
+        }
+        let claim = UnknownCommitSendClaimRecord {
+            record: record.clone(),
+            state_fence: state_fence.clone(),
+            claim_revision: state.revision.checked_add(1).ok_or_else(|| {
+                OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "owner revision overflow".to_owned(),
+                }
+            })?,
+        };
+        let encoded = encode(&claim)?;
+        claims
+            .insert(idempotency_key.as_str(), encoded.as_str())
+            .map_err(storage)?;
+        drop(claims);
+        let mut index = write
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        index.insert(claim_key.as_str(), "claim").map_err(storage)?;
+        state.pause_count =
+            state
+                .pause_count
+                .checked_add(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "pause count overflow".to_owned(),
+                })?;
+        state.revision = claim.claim_revision;
+        let result = UnknownCommitSendClaim {
+            owner_generation: state.owner_generation.clone(),
+            revision: state.revision,
+            claim,
+        };
+        drop(index);
+        drop(unknown);
+        Self::persist_unknown_commit_pause_state(&write, &state)?;
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Releases a claim after the caller has established a determinate
+    /// `Ok`/`Refused` response under `StoreClient`'s typed contract. An exact
+    /// retained open unknown record for the same operation remains paused.
+    pub fn release_unknown_commit_send_claim(
+        &self,
+        claim: &UnknownCommitSendClaim,
+    ) -> Result<bool, OrsError> {
+        claim.claim.validate_persisted()?;
+        let idempotency_key = claim.claim.record.record_key();
+        let index_key = unknown_commit_send_claim_index_key(&idempotency_key);
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut state = Self::ensure_unknown_commit_pause_state(&write)?;
+        if state.owner_generation != claim.owner_generation
+            || claim.revision != claim.claim.claim_revision
+        {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let mut claims = write
+            .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+            .map_err(storage)?;
+        let stored_bytes = claims
+            .get(idempotency_key.as_str())
+            .map_err(storage)?
+            .map(|value| value.value().to_owned());
+        let Some(bytes) = stored_bytes else {
+            drop(claims);
+            let index = write
+                .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+                .map_err(storage)?;
+            let claim_index_exists = index.get(index_key.as_str()).map_err(storage)?.is_some();
+            drop(index);
+            if claim_index_exists {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index",
+                    reason: "claim index exists without its authoritative claim row".to_owned(),
+                });
+            }
+            write.commit().map_err(storage)?;
+            return Ok(false);
+        };
+        let stored: UnknownCommitSendClaimRecord = decode(&bytes)?;
+        if stored != claim.claim {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+        claims.remove(idempotency_key.as_str()).map_err(storage)?;
+        drop(claims);
+        let mut index = write
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        if index
+            .get(index_key.as_str())
+            .map_err(storage)?
+            .is_none_or(|value| value.value() != "claim")
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "claim row is absent from the durable pause index".to_owned(),
+            });
+        }
+        index.remove(index_key.as_str()).map_err(storage)?;
+        state.pause_count =
+            state
+                .pause_count
+                .checked_sub(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "pause count underflow".to_owned(),
+                })?;
+        state.revision =
+            state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "owner revision overflow".to_owned(),
+                })?;
+        drop(index);
+        Self::persist_unknown_commit_pause_state(&write, &state)?;
+        write.commit().map_err(storage)?;
+        Ok(true)
+    }
+
+    /// Conservatively promotes an uncertain claim into the existing open
+    /// unknown-commit owner record without an unpaused interval.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction must replace a claim with its open pause row without an admission gap"
+    )]
+    pub fn promote_unknown_commit_send_claim(
+        &self,
+        claim: &UnknownCommitSendClaim,
+    ) -> Result<UnknownCommitRecord, OrsError> {
+        claim.claim.validate_persisted()?;
+        let idempotency_key = claim.claim.record.record_key();
+        let claim_index_key = unknown_commit_send_claim_index_key(&idempotency_key);
+        let unknown_index_key = unknown_commit_pause_index_key(&idempotency_key);
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut state = Self::ensure_unknown_commit_pause_state(&write)?;
+        if state.owner_generation != claim.owner_generation
+            || claim.revision != claim.claim.claim_revision
+        {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let mut claims = write
+            .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+            .map_err(storage)?;
+        let Some(claim_bytes) = claims
+            .get(idempotency_key.as_str())
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Err(OrsError::OrderingHeadMismatch);
+        };
+        let stored_claim: UnknownCommitSendClaimRecord = decode(&claim_bytes)?;
+        if stored_claim != claim.claim {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+        let mut unknown = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        let existing = unknown
+            .get(idempotency_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<UnknownCommitRecord>(value.value()))
+            .transpose()?;
+        if let Some(existing) = &existing
+            && (!existing.is_open() || !existing.same_binding(&claim.claim.record))
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_recovery",
+                reason: "promoted claim conflicts with the retained operation binding".to_owned(),
+            });
+        }
+        let mut index = write
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        if index
+            .get(claim_index_key.as_str())
+            .map_err(storage)?
+            .is_none_or(|value| value.value() != "claim")
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "claim row is absent from the durable pause index".to_owned(),
+            });
+        }
+        if existing.is_none() {
+            if index
+                .get(unknown_index_key.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index",
+                    reason: "unknown index exists without its authoritative recovery row"
+                        .to_owned(),
+                });
+            }
+            let encoded = encode(&claim.claim.record)?;
+            unknown
+                .insert(idempotency_key.as_str(), encoded.as_str())
+                .map_err(storage)?;
+            index
+                .insert(unknown_index_key.as_str(), "unknown")
+                .map_err(storage)?;
+        } else if index
+            .get(unknown_index_key.as_str())
+            .map_err(storage)?
+            .is_none_or(|value| value.value() != "unknown")
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "retained open record is absent from the complete pause index".to_owned(),
+            });
+        }
+        index.remove(claim_index_key.as_str()).map_err(storage)?;
+        claims.remove(idempotency_key.as_str()).map_err(storage)?;
+        if existing.is_some() {
+            state.pause_count =
+                state
+                    .pause_count
+                    .checked_sub(1)
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index_state",
+                        reason: "pause count underflow".to_owned(),
+                    })?;
+        }
+        state.revision =
+            state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "owner revision overflow".to_owned(),
+                })?;
+        let promoted = existing.unwrap_or_else(|| claim.claim.record.clone());
+        drop(index);
+        drop(unknown);
+        drop(claims);
+        Self::persist_unknown_commit_pause_state(&write, &state)?;
+        write.commit().map_err(storage)?;
+        Ok(promoted)
+    }
+
+    /// Validates and reconciles an exact canonical receipt against a durable
+    /// claim, including claims left behind by a process crash.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction must validate exact receipt evidence and atomically settle claim and pause indexes"
+    )]
+    pub fn reconcile_unknown_commit_send_claim(
+        &self,
+        claim: &UnknownCommitSendClaim,
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<UnknownCommitRecord, OrsError> {
+        claim.claim.validate_persisted()?;
+        receipt
+            .validate()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "unknown_commit_send_claim_receipt",
+                reason: error.to_string(),
+            })?;
+        let expected = &claim.claim.record;
+        if receipt.operation_id.as_str() != expected.operation_id.as_str()
+            || receipt.idempotency_key != expected.idempotency_key
+            || receipt.canonical_request_hash != expected.canonical_request_hash
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_send_claim_receipt",
+                reason: "receipt identity differs from the claimed operation".to_owned(),
+            });
+        }
+        let outcome = match receipt.status {
+            eliot_store_api::WriteReceiptStatus::Committed => UnknownCommitOutcome::Committed,
+            eliot_store_api::WriteReceiptStatus::Rejected
+            | eliot_store_api::WriteReceiptStatus::Cancelled => match receipt.resubmission {
+                eliot_store_api::Resubmission::None => UnknownCommitOutcome::RolledBack,
+                eliot_store_api::Resubmission::NewIdentityAfterCondition => {
+                    UnknownCommitOutcome::NewIdentityRequired
+                }
+            },
+            eliot_store_api::WriteReceiptStatus::DeadLetter => UnknownCommitOutcome::DeadLetter,
+        };
+        let receipt_bytes =
+            serde_json::to_vec(receipt).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let evidence_digest = crate::model::sha256_hex(&receipt_bytes);
+        let idempotency_key = expected.record_key();
+        let claim_index_key = unknown_commit_send_claim_index_key(&idempotency_key);
+        let unknown_index_key = unknown_commit_pause_index_key(&idempotency_key);
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut state = Self::ensure_unknown_commit_pause_state(&write)?;
+        if state.owner_generation != claim.owner_generation {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        if claim.revision != claim.claim.claim_revision {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+        let mut claims = write
+            .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+            .map_err(storage)?;
+        let stored_claim = claims
+            .get(idempotency_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<UnknownCommitSendClaimRecord>(value.value()))
+            .transpose()?;
+        if stored_claim
+            .as_ref()
+            .is_some_and(|stored_claim| stored_claim != &claim.claim)
+        {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+        let mut unknown = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        let existing = unknown
+            .get(idempotency_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<UnknownCommitRecord>(value.value()))
+            .transpose()?;
+        if let Some(existing) = &existing
+            && !existing.same_binding(expected)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_recovery",
+                reason: "receipt claim conflicts with the retained operation binding".to_owned(),
+            });
+        }
+        let existing_was_open = existing.as_ref().is_some_and(UnknownCommitRecord::is_open);
+        if stored_claim.is_none()
+            && existing.as_ref().is_some_and(|record| {
+                record.outcome == Some(outcome)
+                    && record.evidence_receipt_digest.as_deref() == Some(&evidence_digest)
+            })
+        {
+            if let Some(existing) = existing {
+                return Ok(existing);
+            }
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_recovery",
+                reason: "receipt replay matched without a retained record".to_owned(),
+            });
+        }
+        if stored_claim.is_none() {
+            return Err(OrsError::OrderingHeadMismatch);
+        }
+        let mut index = write
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        if index
+            .get(claim_index_key.as_str())
+            .map_err(storage)?
+            .is_none_or(|value| value.value() != "claim")
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "claim row is absent from the durable pause index".to_owned(),
+            });
+        }
+        if existing_was_open
+            && index
+                .get(unknown_index_key.as_str())
+                .map_err(storage)?
+                .is_none_or(|value| value.value() != "unknown")
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "retained open row is absent from the durable pause index".to_owned(),
+            });
+        }
+        let mut resolved = existing.clone().unwrap_or_else(|| expected.clone());
+        if let Some(existing) = &existing
+            && !existing.is_open()
+            && (existing.outcome != Some(outcome)
+                || existing.evidence_receipt_digest.as_deref() != Some(&evidence_digest))
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_recovery",
+                reason: "resolved operation conflicts with exact receipt evidence".to_owned(),
+            });
+        }
+        resolved.outcome = Some(outcome);
+        resolved.evidence_receipt_digest = Some(evidence_digest);
+        resolved.validate()?;
+        let encoded = encode(&resolved)?;
+        unknown
+            .insert(idempotency_key.as_str(), encoded.as_str())
+            .map_err(storage)?;
+        if stored_claim.is_some() {
+            claims.remove(idempotency_key.as_str()).map_err(storage)?;
+            index.remove(claim_index_key.as_str()).map_err(storage)?;
+            state.pause_count =
+                state
+                    .pause_count
+                    .checked_sub(1)
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index_state",
+                        reason: "pause count underflow".to_owned(),
+                    })?;
+        }
+        if existing_was_open {
+            index.remove(unknown_index_key.as_str()).map_err(storage)?;
+            state.pause_count =
+                state
+                    .pause_count
+                    .checked_sub(1)
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index_state",
+                        reason: "pause count underflow".to_owned(),
+                    })?;
+        }
+        state.revision =
+            state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "owner revision overflow".to_owned(),
+                })?;
+        drop(index);
+        drop(unknown);
+        drop(claims);
+        Self::persist_unknown_commit_pause_state(&write, &state)?;
+        write.commit().map_err(storage)?;
+        Ok(resolved)
+    }
+
     /// Stages one Kernel-owned unknown-commit recovery record before the
-    /// commit send (I14.21, issue #1690).
+    /// commit send (I14.21, issue #1690), returning only the existing-row
+    /// projection for compatibility with callers that do not need the owner
+    /// revision.
     ///
     /// The record must be open (no outcome, no evidence). An exact replay
     /// under the same idempotency key returns the durably stored record
@@ -5427,6 +6394,19 @@ impl RedbRecoveryStore {
         &self,
         record: &UnknownCommitRecord,
     ) -> Result<Option<UnknownCommitRecord>, OrsError> {
+        Ok(self.stage_unknown_commit_with_revision(record)?.existing)
+    }
+
+    /// Stages an unknown-commit record and returns the durable owner revision
+    /// that includes it, allowing Kernel mirrors to distinguish stale reads.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction must stage the authoritative row and advance its owner index and revision together"
+    )]
+    pub fn stage_unknown_commit_with_revision(
+        &self,
+        record: &UnknownCommitRecord,
+    ) -> Result<UnknownCommitStageResult, OrsError> {
         record.validate()?;
         if !record.is_open() {
             return Err(OrsError::InvalidField {
@@ -5436,33 +6416,112 @@ impl RedbRecoveryStore {
         }
         let write = self.database.begin_write().map_err(storage)?;
         let key = record.record_key();
-        let stored = {
-            let mut table = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
-            let staged_bytes = table
-                .get(key.as_str())
-                .map_err(storage)?
-                .map(|value| value.value().to_owned());
-            let Some(bytes) = staged_bytes else {
-                let payload = encode(record)?;
-                table
-                    .insert(key.as_str(), payload.as_str())
-                    .map_err(storage)?;
-                drop(table);
-                write.commit().map_err(storage)?;
-                return Ok(None);
+        let stored =
+            {
+                let table = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+                let staged_bytes = table
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| value.value().to_owned());
+                let Some(bytes) = staged_bytes else {
+                    drop(table);
+                    let claims = write
+                        .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+                        .map_err(storage)?;
+                    let claim_exists = claims.get(key.as_str()).map_err(storage)?.is_some();
+                    drop(claims);
+                    let index_key = unknown_commit_pause_index_key(&key);
+                    let claim_index_key = unknown_commit_send_claim_index_key(&key);
+                    let index = write
+                        .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+                        .map_err(storage)?;
+                    let unknown_index_exists =
+                        index.get(index_key.as_str()).map_err(storage)?.is_some();
+                    let claim_index_exists = index
+                        .get(claim_index_key.as_str())
+                        .map_err(storage)?
+                        .is_some();
+                    drop(index);
+                    if claim_exists || claim_index_exists {
+                        return Err(OrsError::OrderingHeadMismatch);
+                    }
+                    if unknown_index_exists {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "unknown_commit_pause_index",
+                            reason: "unknown index exists without its authoritative recovery row"
+                                .to_owned(),
+                        });
+                    }
+                    let mut table = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+                    let payload = encode(record)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    drop(table);
+                    let mut state = Self::ensure_unknown_commit_pause_state(&write)?;
+                    let mut index = write
+                        .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+                        .map_err(storage)?;
+                    let index_key = unknown_commit_pause_index_key(&key);
+                    if index.get(index_key.as_str()).map_err(storage)?.is_none() {
+                        index
+                            .insert(index_key.as_str(), "unknown")
+                            .map_err(storage)?;
+                        state.pause_count = state.pause_count.checked_add(1).ok_or_else(|| {
+                            OrsError::IntegrityProblem {
+                                record_type: "unknown_commit_pause_index_state",
+                                reason: "open record count overflow".to_owned(),
+                            }
+                        })?;
+                    }
+                    drop(index);
+                    state.revision = state.revision.checked_add(1).ok_or_else(|| {
+                        OrsError::IntegrityProblem {
+                            record_type: "unknown_commit_pause_index_state",
+                            reason: "owner revision overflow".to_owned(),
+                        }
+                    })?;
+                    Self::persist_unknown_commit_pause_state(&write, &state)?;
+                    write.commit().map_err(storage)?;
+                    return Ok(UnknownCommitStageResult {
+                        existing: None,
+                        owner_generation: state.owner_generation,
+                        revision: state.revision,
+                    });
+                };
+                let existing: UnknownCommitRecord = decode(&bytes)?;
+                existing.validate()?;
+                if !existing.same_binding(record) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_recovery",
+                        reason: "existing unknown-commit binding conflicts".to_owned(),
+                    });
+                }
+                existing
             };
-            let existing: UnknownCommitRecord = decode(&bytes)?;
-            existing.validate()?;
-            if !existing.same_binding(record) {
+        let state = Self::ensure_unknown_commit_pause_state(&write)?;
+        if state.backfill_complete && stored.is_open() {
+            let index = write
+                .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+                .map_err(storage)?;
+            let index_key = unknown_commit_pause_index_key(&key);
+            if index
+                .get(index_key.as_str())
+                .map_err(storage)?
+                .is_none_or(|value| value.value() != "unknown")
+            {
                 return Err(OrsError::IntegrityProblem {
-                    record_type: "unknown_commit_recovery",
-                    reason: "existing unknown-commit binding conflicts".to_owned(),
+                    record_type: "unknown_commit_pause_index",
+                    reason: "open recovery row is absent from complete index".to_owned(),
                 });
             }
-            existing
-        };
+        }
         write.commit().map_err(storage)?;
-        Ok(Some(stored))
+        Ok(UnknownCommitStageResult {
+            existing: Some(stored),
+            owner_generation: state.owner_generation,
+            revision: state.revision,
+        })
     }
 
     /// Loads one unknown-commit recovery record by exact idempotency key.
@@ -5481,6 +6540,73 @@ impl RedbRecoveryStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Loads one durable pre-send claim by its exact idempotency key.
+    ///
+    /// This point lookup is independent of the pause-index backfill state, so
+    /// crash recovery can reconcile a same-key claim before classifying the
+    /// retained unknown-commit row. A missing authoritative row is empty only
+    /// when its C-index entry is absent too.
+    pub fn load_unknown_commit_send_claim(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<UnknownCommitSendClaim>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        let state = meta
+            .get(UNKNOWN_COMMIT_PAUSE_STATE_KEY)
+            .map_err(storage)?
+            .map(|value| decode::<UnknownCommitPauseIndexState>(value.value()))
+            .transpose()?;
+        let claims = read
+            .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+            .map_err(storage)?;
+        let index = read
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        let index_key = unknown_commit_send_claim_index_key(idempotency_key);
+        let claim = claims
+            .get(idempotency_key)
+            .map_err(storage)?
+            .map(|value| decode::<UnknownCommitSendClaimRecord>(value.value()))
+            .transpose()?;
+        match (claim, index.get(index_key.as_str()).map_err(storage)?) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "claim index exists without its authoritative claim row".to_owned(),
+            }),
+            (Some(_), None) => Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "authoritative claim row is absent from its durable index".to_owned(),
+            }),
+            (Some(claim), Some(index_value)) => {
+                if index_value.value() != "claim" || claim.record.record_key() != idempotency_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index",
+                        reason: "claim row and durable index binding differ".to_owned(),
+                    });
+                }
+                let state = state.ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "claim exists without durable owner metadata".to_owned(),
+                })?;
+                state.validate_persisted()?;
+                if claim.claim_revision > state.revision {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index_state",
+                        reason: "claim issuance revision is newer than owner metadata".to_owned(),
+                    });
+                }
+                let revision = claim.claim_revision;
+                Ok(Some(UnknownCommitSendClaim {
+                    owner_generation: state.owner_generation,
+                    revision,
+                    claim,
+                }))
+            }
+        }
     }
 
     /// Lists every still-open unknown-commit record: the visible Problem
@@ -5547,6 +6673,36 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
             next
         };
+        let mut state = Self::ensure_unknown_commit_pause_state(&write)?;
+        let mut index = write
+            .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+            .map_err(storage)?;
+        let index_key = unknown_commit_pause_index_key(idempotency_key);
+        if index.remove(index_key.as_str()).map_err(storage)?.is_some() {
+            state.pause_count =
+                state
+                    .pause_count
+                    .checked_sub(1)
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "unknown_commit_pause_index_state",
+                        reason: "open record count underflow".to_owned(),
+                    })?;
+        } else if state.backfill_complete {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "unknown_commit_pause_index",
+                reason: "resolved open row was absent from complete index".to_owned(),
+            });
+        }
+        drop(index);
+        state.revision =
+            state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_pause_index_state",
+                    reason: "owner revision overflow".to_owned(),
+                })?;
+        Self::persist_unknown_commit_pause_state(&write, &state)?;
         write.commit().map_err(storage)?;
         Ok(Some(resolved))
     }
@@ -24662,6 +25818,16 @@ impl RedbRecoveryStore {
         );
         drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
         drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
+        drop(
+            write
+                .open_table(UNKNOWN_COMMIT_SEND_CLAIMS)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(UNKNOWN_COMMIT_PAUSE_INDEX)
+                .map_err(storage)?,
+        );
         // #2802: part of the base family, materialized empty on every open like
         // every other base table, so a lookup on a store that never verified an
         // archive reads authoritatively absent. No row is backfilled or inferred.

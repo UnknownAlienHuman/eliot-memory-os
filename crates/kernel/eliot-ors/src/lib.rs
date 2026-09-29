@@ -112,8 +112,10 @@ pub use status_projection::{
     SupervisionStatusReason,
 };
 pub use store::{
-    CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
-    ScanDisclosureRecordOwner,
+    CanonicalEvidenceProvider, MAX_UNKNOWN_COMMIT_PAUSE_SNAPSHOT_RECORDS, OperationalRecoveryStore,
+    OrsCoordinator, RedbRecoveryStore, ScanDisclosureRecordOwner, UnknownCommitPauseCoverage,
+    UnknownCommitPauseSnapshot, UnknownCommitSendClaim, UnknownCommitSendClaimRecord,
+    UnknownCommitStageResult,
 };
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,
