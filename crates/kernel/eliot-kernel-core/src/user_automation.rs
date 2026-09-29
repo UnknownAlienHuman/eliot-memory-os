@@ -3556,7 +3556,7 @@ mod tests {
             clock: ClockReading::default(),
         };
         ReceiptCore {
-            contract: contract_identity().expect("receipt contract"),
+            contract: user_automation_contract_identity().expect("receipt contract"),
             kind: ReceiptKind::Verification,
             work_scope: WorkScopeBinding {
                 scope_id: eliot_receipts::WorkScopeId::new("scope-1").expect("scope"),
@@ -3619,13 +3619,13 @@ mod tests {
             start_at: "2026-09-21T00:00:00Z".to_owned(),
             end_at: None,
             next_occurrences: Vec::new(),
-            normalization_receipt: ScheduleNormalizationReceipt {
+            normalization_receipt: Box::new(ScheduleNormalizationReceipt {
                 receipt_id: String::new(),
                 normalizer_authority: String::new(),
                 source_digest: String::new(),
                 zone_database_revision: PINNED_ZONE_DATABASE_REVISION.to_owned(),
                 occurrences_digest: String::new(),
-            },
+            }),
         };
         let source_digest = schedule.source_digest().expect("source digest");
         let mut schedule = schedule;
@@ -3641,7 +3641,7 @@ mod tests {
         // unrelated occurrence set is refused.
         let mut normalization_core = normalization_receipt_core();
         normalization_core.artifacts = vec![eliot_receipts::ArtifactBinding {
-            artifact_id: eliot_receipts::ArtifactId::new("compiled-occurrences")
+            artifact_id: eliot_contracts::ArtifactId::new("compiled-occurrences")
                 .expect("artifact id"),
             sha256: schedule.compiled_occurrences_digest().expect("set digest"),
             role: eliot_receipts::ReceiptKind::Artifact,
