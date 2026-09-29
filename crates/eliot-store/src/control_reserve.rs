@@ -235,7 +235,7 @@ impl StorePermitOperation {
 /// presents its own generation alongside. Profile revision, issue and expiry
 /// are composition-supplied current evidence echoed into the permit; this
 /// owner records them and the Kernel composition validates them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct StorePermitRequest<'a> {
     /// Requesting owner label (validated non-blank, bounded).
     pub owner: &'a str,
@@ -805,6 +805,19 @@ fn validate_label(value: &str, field: &'static str) -> Result<(), StoreReserveEr
     Ok(())
 }
 
+/// Disjoint partition capacities and live availability for one claimed row.
+///
+/// Bundles the four `u64` cells [`StoreReserve::publish_claimed_rows`]
+/// reports per dimension so the private row builder stays within the argument
+/// limit; every value keeps its exact meaning (partition totals and live
+/// available amounts, never a shared pool).
+struct ClaimedCapacities {
+    normal_capacity: u64,
+    protected_capacity: u64,
+    normal_available: u64,
+    protected_available: u64,
+}
+
 impl StoreReserve {
     /// Validates the caller-presented bindings before any partition counter
     /// is touched. Nil generations are refused: a bridge generation is a live
@@ -826,13 +839,13 @@ impl StoreReserve {
                 reason: "must be a live generation, never nil",
             });
         }
-        if let Some(expires_at_ms) = request.expires_at_ms {
-            if expires_at_ms <= request.issued_at_ms {
-                return Err(StoreReserveError::InvalidField {
-                    field: "store_permit.expires_at_ms",
-                    reason: "must be after issued_at_ms",
-                });
-            }
+        if let Some(expires_at_ms) = request.expires_at_ms
+            && expires_at_ms <= request.issued_at_ms
+        {
+            return Err(StoreReserveError::InvalidField {
+                field: "store_permit.expires_at_ms",
+                reason: "must be after issued_at_ms",
+            });
         }
         Ok(())
     }
@@ -1331,30 +1344,36 @@ impl StoreReserve {
                 owner,
                 owner_generation_ref,
                 proof_profile_ref,
-                self.inner.connection_normal_capacity,
-                self.inner.connection_protected_capacity,
-                self.available_normal_connections(),
-                self.available_protected_connections(),
+                ClaimedCapacities {
+                    normal_capacity: self.inner.connection_normal_capacity,
+                    protected_capacity: self.inner.connection_protected_capacity,
+                    normal_available: self.available_normal_connections(),
+                    protected_available: self.available_protected_connections(),
+                },
             )?,
             Self::claimed_row(
                 StoreDimension::TransactionSlots,
                 owner,
                 owner_generation_ref,
                 proof_profile_ref,
-                self.inner.transaction_normal_capacity,
-                self.inner.transaction_protected_capacity,
-                self.available_normal_transactions(),
-                self.available_protected_transactions(),
+                ClaimedCapacities {
+                    normal_capacity: self.inner.transaction_normal_capacity,
+                    protected_capacity: self.inner.transaction_protected_capacity,
+                    normal_available: self.available_normal_transactions(),
+                    protected_available: self.available_protected_transactions(),
+                },
             )?,
             Self::claimed_row(
                 StoreDimension::PendingWriteMemory,
                 owner,
                 owner_generation_ref,
                 proof_profile_ref,
-                self.inner.pending_normal_capacity_bytes,
-                self.inner.pending_protected_capacity_bytes,
-                self.available_normal_pending_bytes(),
-                self.available_protected_pending_bytes(),
+                ClaimedCapacities {
+                    normal_capacity: self.inner.pending_normal_capacity_bytes,
+                    protected_capacity: self.inner.pending_protected_capacity_bytes,
+                    normal_available: self.available_normal_pending_bytes(),
+                    protected_available: self.available_protected_pending_bytes(),
+                },
             )?,
         ];
         Ok(rows)
@@ -1367,25 +1386,23 @@ impl StoreReserve {
         owner: &'static str,
         owner_generation_ref: &str,
         proof_profile_ref: &str,
-        normal_capacity: u64,
-        protected_capacity: u64,
-        normal_available: u64,
-        protected_available: u64,
+        capacities: ClaimedCapacities,
     ) -> Result<BottleneckCapacityProfile, StoreReserveError> {
         let bottleneck = dimension.bottleneck();
         let unit = bottleneck.unit();
-        let normal_quantity =
-            NonZeroU64::new(normal_capacity).ok_or(StoreReserveError::InvalidField {
+        let normal_quantity = NonZeroU64::new(capacities.normal_capacity)
+            .ok_or(StoreReserveError::InvalidField {
                 field: "store_reserve.normal_limit",
                 reason: "the normal partition of a claimed row is positive",
             })?;
-        let protected_quantity =
-            NonZeroU64::new(protected_capacity).ok_or(StoreReserveError::InvalidField {
+        let protected_quantity = NonZeroU64::new(capacities.protected_capacity)
+            .ok_or(StoreReserveError::InvalidField {
                 field: "store_reserve.protected_limit",
                 reason: "the protected partition of a claimed row is positive",
             })?;
-        let physical_total = normal_capacity
-            .checked_add(protected_capacity)
+        let physical_total = capacities
+            .normal_capacity
+            .checked_add(capacities.protected_capacity)
             .and_then(NonZeroU64::new)
             .ok_or(StoreReserveError::InvalidField {
                 field: "store_reserve.physical_total_limit",
@@ -1414,8 +1431,10 @@ impl StoreReserve {
             enforcement: Some(CapacityEnforcement::PhysicalPartition),
             proof_profile_ref: proof_profile_ref.to_owned(),
             evidence_refs: vec![format!(
-                "store-reserve/{}/bridge-gen-{owner_generation_ref}/normal-avail-{normal_available}/protected-avail-{protected_available}",
+                "store-reserve/{}/bridge-gen-{owner_generation_ref}/normal-avail-{}/protected-avail-{}",
                 bottleneck.as_contract_str(),
+                capacities.normal_available,
+                capacities.protected_available,
             )],
             invalidation_set: vec![
                 "store-reserve/bridge-generation-change".to_owned(),
