@@ -62,6 +62,14 @@ pub(crate) async fn initialize_genesis(
 ) -> Result<WriteReceipt, AdapterError> {
     // S-CONC-EXECUTE (issue #993): genesis runs through the exclusive
     // drain gate when a generation is installed, mirroring migrations.
+    //
+    // Issue #67 (R3/A6): the exclusive permit is taken here, outside the
+    // generation branch, so first-generation genesis also excludes ordinary
+    // canonical applies when no generation is installed. The drain gate
+    // alone covers only the scheduler; the leftover `write_lock` inside
+    // `initialize_genesis_direct` excludes nothing, because ordinary applies
+    // no longer acquire it.
+    let _admission = adapter.exclusive_admission.exclusive_operation().await;
     let Some(execution) = adapter.execution_handle() else {
         return genesis::initialize_genesis_direct(adapter, context, request).await;
     };
@@ -634,6 +642,13 @@ pub(crate) async fn apply_migration(
     observed_clock: &eliot_platform::ClockObservation,
     state_fence: &StateFence,
 ) -> Result<MigrationReceipt, AdapterError> {
+    // Issue #67 (R3/A6): the exclusive permit is taken here, outside the
+    // generation branch, so a migration excludes ordinary canonical applies
+    // in both profiles. Without a generation the drain gate has no scheduler
+    // to quiesce and the leftover `write_lock` inside `apply_migration_direct`
+    // excludes nothing, so an ordinary apply could otherwise run concurrently
+    // with the DDL/schema replacement this operation performs.
+    let _admission = adapter.exclusive_admission.exclusive_operation().await;
     let Some(execution) = adapter.execution_handle() else {
         return apply_migration_direct(adapter, migration, observed_clock, state_fence).await;
     };
@@ -661,6 +676,11 @@ async fn apply_migration_direct(
         .validate()
         .map_err(|r| AdapterError::Config(r.to_owned()))?;
     admit_migration(migration)?;
+    // Issue #67 (R3/A6): the caller `apply_migration` already holds the
+    // exclusive `exclusive_admission` permit for this whole operation, so
+    // the ordinary-write path is already closed here. This `write_lock` is
+    // the retained exclusive-entrypoint guard; it is not ordinary-write
+    // protection, because ordinary applies no longer acquire it.
     let _guard = adapter.write_lock.lock().await;
     state_fence.validate().map_err(StoreError::Foundation)?;
     let existing = read_schema_meta(db, &adapter.config).await?;
@@ -800,6 +820,14 @@ pub(crate) async fn apply_prepared_with_authority(
 
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
+
+    // Issue #67 (R3/A6): a shared permit for the whole canonical
+    // transaction. It is taken after validation and readiness and released
+    // only after the last attempt returns, so a migration or first-generation
+    // genesis never observes a partially applied canonical write. Shared
+    // permits do not exclude each other, so ordinary applies still overlap:
+    // this is not a new full-duration application-global gate.
+    let _admission = adapter.exclusive_admission.ordinary_write().await;
 
     // Boxed: the retry future holds the multi-kilobyte canonical
     // `PreparedTransition` across provider awaits, exceeding the default
@@ -1620,6 +1648,14 @@ pub(crate) async fn apply_surreal_erasure(
     let intent = record_surreal_erasure_intent(intent.clone())?;
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
+    // Issue #67 (R3/A6): this leg is dispatched from inside an ordinary
+    // canonical apply, so it already runs under that apply's shared
+    // `exclusive_admission` permit and is covered by it. It deliberately
+    // does not request the exclusive permit — the same task already holds
+    // the shared one, and a non-reentrant exclusive request from inside it
+    // would self-deadlock. The `write_lock` below is the retained
+    // exclusive-entrypoint mutual-exclusion guard; since ordinary applies
+    // no longer acquire it, it is not what excludes them from this leg.
     let _guard = adapter.write_lock.lock().await;
     atomic_write::write_erasure_transaction(db, &adapter.config, &intent).await
 }
