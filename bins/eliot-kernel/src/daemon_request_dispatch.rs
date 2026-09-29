@@ -9000,9 +9000,7 @@ fn restore_pre_stage_corrections(
     if guard.is_empty() {
         // Validated merge: an inconsistent snapshot is refused without
         // partial mutation, so the cache stays empty for the next attempt.
-        if guard.restore(snapshot).is_err() {
-            return;
-        }
+        let _ = guard.restore(snapshot);
     }
 }
 
@@ -9052,9 +9050,8 @@ fn persist_pre_stage_corrections(
     if pending != Some(snapshot.revision()) {
         return JournalPersistOutcome::Superseded;
     }
-    let bytes = match serde_json::to_vec_pretty(snapshot) {
-        Ok(bytes) => bytes,
-        Err(_) => return JournalPersistOutcome::SerializeFailed,
+    let Ok(bytes) = serde_json::to_vec_pretty(snapshot) else {
+        return JournalPersistOutcome::SerializeFailed;
     };
     let path = pre_stage_correction_journal_path(work_root);
     if path
