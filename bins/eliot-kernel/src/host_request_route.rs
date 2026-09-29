@@ -2409,8 +2409,7 @@ impl KernelComposition {
                         && candidate.request_digest == envelope.envelope_sha256
                 })
                 .map(|_| connection_id.as_str())
-        })
-            && existing_connection != envelope.connection_id
+        }) && existing_connection != envelope.connection_id
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -2572,15 +2571,16 @@ impl KernelComposition {
         if existing_connection != envelope.connection_id {
             return Err(TransportError::IdentityConflict);
         }
-        let already_retained = index
-            .get(existing_connection)
-            .into_iter()
-            .flatten()
-            .any(|candidate| {
-                candidate.operation_id == operation_id
-                    && candidate.request_digest == envelope.envelope_sha256
-                    && candidate.local_read_envelope.is_some()
-            });
+        let already_retained =
+            index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.local_read_envelope.is_some()
+                });
         if already_retained {
             return Ok(LocalReadEnqueueDisposition::AlreadyRetained);
         }
@@ -2702,13 +2702,7 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
         }
         let refs = index.entry(envelope.connection_id.clone()).or_default();
-        Self::retain_charged_local_read_pair(
-            refs,
-            envelope,
-            tool,
-            operation_id,
-            charge,
-        );
+        Self::retain_charged_local_read_pair(refs, envelope, tool, operation_id, charge);
         // Issue #1837: durable audit evidence for queue admission.
         self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
         // I16.5 (issue #1841): the queue gauges are read from the owner's own
@@ -3147,9 +3141,7 @@ impl KernelComposition {
                 let retiring = candidate.operation_id == operation_id
                     && candidate.request_digest == request_digest
                     && candidate.local_read_envelope.is_some();
-                if retiring
-                    && let Some(charge) = candidate.local_read_charge
-                {
+                if retiring && let Some(charge) = candidate.local_read_charge {
                     spent.push(charge);
                 }
                 !retiring
@@ -3242,9 +3234,7 @@ impl KernelComposition {
                 // An expired pair can never complete, so it is owner-safe to
                 // release now. The charge returns the bytes recorded at its
                 // own admission.
-                if expiring
-                    && let Some(charge) = candidate.local_read_charge
-                {
+                if expiring && let Some(charge) = candidate.local_read_charge {
                     spent.push(charge);
                 }
                 !expiring

@@ -458,10 +458,7 @@ impl KernelComposition {
         // projection. Matching settles the borrow of `binding` before the
         // projection itself is moved out, so the view returns the owner's value
         // as-is — no clone, and no second binding to re-derive the status.
-        let status = match binding
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-        {
+        let status = match binding.get("status").and_then(serde_json::Value::as_str) {
             Some("bound") => "bound",
             Some("unbound") => "unbound",
             _ => "unknown",

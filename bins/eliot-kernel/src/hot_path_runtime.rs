@@ -31,10 +31,10 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use eliot_runtime_contracts::{
-    AdmittedHotPathManifest, HotPathBindingIdentity, HotPathBoundStatus,
-    HotPathManifestFileError, HotPathQueueCapacity, RegisteredOperation, RegisteredQueueSettings,
-    RuntimeContractError, RunningBuildRegistration, admit_hot_path_manifest,
-    bind_hot_path_manifest_set, hot_path_bound_status,
+    AdmittedHotPathManifest, HotPathBindingIdentity, HotPathBoundStatus, HotPathManifestFileError,
+    HotPathQueueCapacity, RegisteredOperation, RegisteredQueueSettings, RunningBuildRegistration,
+    RuntimeContractError, admit_hot_path_manifest, bind_hot_path_manifest_set,
+    hot_path_bound_status,
 };
 
 use crate::KernelComposition;
@@ -240,11 +240,12 @@ impl HotPathCapacityLedger {
     /// through, so an unbound queue refuses on the same path as a bound one
     /// that cannot admit the requested bytes — never more weakly.
     fn acquire(&mut self, queue: HotPathQueueId, bytes: u64) -> Result<(), HotPathError> {
-        let capacity = self.queues.get_mut(&queue).ok_or_else(|| {
-            HotPathError::UnboundDeclaration {
-                reason: format!("no declared queue '{}' is bound", queue.as_str()),
-            }
-        })?;
+        let capacity =
+            self.queues
+                .get_mut(&queue)
+                .ok_or_else(|| HotPathError::UnboundDeclaration {
+                    reason: format!("no declared queue '{}' is bound", queue.as_str()),
+                })?;
         capacity.acquire(bytes)?;
         Ok(())
     }
@@ -258,11 +259,9 @@ impl HotPathCapacityLedger {
 
     /// The current held item/byte count, for the audit surface.
     fn held(&self, queue: HotPathQueueId) -> (u64, u64) {
-        self.queues
-            .get(&queue)
-            .map_or((0, 0), |capacity| {
-                (capacity.held_items(), capacity.held_bytes())
-            })
+        self.queues.get(&queue).map_or((0, 0), |capacity| {
+            (capacity.held_items(), capacity.held_bytes())
+        })
     }
 }
 
