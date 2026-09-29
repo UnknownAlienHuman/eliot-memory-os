@@ -72,17 +72,21 @@ fn manifest_cells(eliot: &toml::Value) -> Result<Vec<String>, String> {
     let refs = eliot
         .get("functional_cell_refs")
         .and_then(toml::Value::as_array)
-        .ok_or_else(|| "baked eliotd declaration carries no functional_cell_refs array".to_owned())?;
+        .ok_or_else(|| {
+            "baked eliotd declaration carries no functional_cell_refs array".to_owned()
+        })?;
     if refs.is_empty() {
         return Err("baked eliotd declaration names no capability cell".to_owned());
     }
     let mut cells: Vec<String> = Vec::new();
     for cell in refs {
-        let cell = cell
-            .as_str()
-            .ok_or_else(|| "baked eliotd functional_cell_refs carries a non-string cell".to_owned())?;
+        let cell = cell.as_str().ok_or_else(|| {
+            "baked eliotd functional_cell_refs carries a non-string cell".to_owned()
+        })?;
         if cells.iter().any(|known| known == cell) {
-            return Err(format!("baked eliotd declaration names capability cell {cell} twice"));
+            return Err(format!(
+                "baked eliotd declaration names capability cell {cell} twice"
+            ));
         }
         cells.push(cell.to_owned());
     }
@@ -91,14 +95,13 @@ fn manifest_cells(eliot: &toml::Value) -> Result<Vec<String>, String> {
 
 /// Reads the mutable-state owners: exactly one owner per declared cell,
 /// every row names a declared cell, no shared owner across cells.
-fn manifest_owners(
-    eliot: &toml::Value,
-    cells: &[String],
-) -> Result<Vec<(String, String)>, String> {
+fn manifest_owners(eliot: &toml::Value, cells: &[String]) -> Result<Vec<(String, String)>, String> {
     let owner_rows = eliot
         .get("functional_cell_state_owners")
         .and_then(toml::Value::as_array)
-        .ok_or_else(|| "baked eliotd declaration carries no functional_cell_state_owners array".to_owned())?;
+        .ok_or_else(|| {
+            "baked eliotd declaration carries no functional_cell_state_owners array".to_owned()
+        })?;
     let mut owners: Vec<(String, String)> = Vec::new();
     for row in owner_rows {
         let cell = row
@@ -173,7 +176,9 @@ fn check_contract_mirror(
             ));
         }
         if projected.iter().any(|(known, _)| known == cell) {
-            return Err(format!("baked cell contract projects capability cell {cell} twice"));
+            return Err(format!(
+                "baked cell contract projects capability cell {cell} twice"
+            ));
         }
         projected.push((cell.to_owned(), owner.to_owned()));
     }
