@@ -12,7 +12,6 @@
 //! and must not mint a second journal — so this module is the typed seam the
 //! owning process calls with its live bridge:
 //!
-//! - [`submit_host_event`] journals one host event through `forward_hook`;
 //! - [`submit_derived_fault`] files one derived transport edge;
 //! - [`read_host_coverage`] projects the owner's coverage denominator;
 //! - [`reconcile_terminal_event`] joins a nominated host event onto the live
@@ -37,41 +36,28 @@
 //! `TERMINAL_JOURNAL_CAPACITY` with an explicit eviction policy (the oldest
 //! entry rotates out and the owner raises its incomplete-coverage flag, which
 //! makes [`read_host_coverage`] report indeterminacy rather than a clean
-//! interval), and the per-invocation `AssessmentLog` in `super::correlation`,
+//! interval), and the per-invocation `AssessmentLog` in `crate::mcp_correlation`,
 //! capped by `MAX_ASSESSMENT_REVISIONS` and dropped with its invocation. There
 //! is no facade-side table: nothing in this module is a second store, and no
 //! terminal host fact is produced without an owner journal entry behind it.
 
-use eliot_agent_bridge_core::{
+use crate::{
     AgentBridgeCore, HostEventEnvelope, RouteFingerprint, TransportEdge, TransportEdgeKind,
 };
-
-use super::correlation::{
+use crate::mcp_correlation::{
     Assessment, AssessmentInputs, AssessmentLog, AssessmentRevision, CanonicalDisposition,
     CoverageIndeterminacy, CoverageProof, EliotEmissionObservation, HostTerminalObservation,
     ObservationWindow, OwnerValidatedOperationBinding, PartialObservation, assess_correlation,
     sha256_hex,
 };
-use super::host_observation::{
+use crate::mcp_host_observation::{
     HostEventJoinKeys, HostObservationReject, HostOwnerBinding, check_event_replay,
     normalize_terminal_observation,
 };
 
-/// Submits one host event through the existing admitted event route.
-///
-/// Journals the event in the owner's transport history and forwards it via
-/// the admitted port. Fails closed when the bridge is unattached or the
-/// event violates the owner contract.
-pub(crate) fn submit_host_event(
-    bridge: &mut AgentBridgeCore,
-    event: &HostEventEnvelope,
-) -> anyhow::Result<()> {
-    Ok(bridge.forward_hook(event)?)
-}
-
 /// Whether a derived fault filed a bridge transport edge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FaultEdgeSubmission {
+pub enum FaultEdgeSubmission {
     /// A transport edge was filed for the derived fault.
     Submitted,
     /// The assessment state files no edge (pending, completed, local-only).
@@ -86,12 +72,22 @@ pub(crate) enum FaultEdgeSubmission {
 /// journaled host event itself, and local failures are not bridge transport
 /// facts. The owner supplies the edge sequence from its live journal; zero
 /// fails closed in the owner constructor.
-pub(crate) fn submit_derived_fault(
+///
+/// The return type is the plain outcome, not `Result<_, BridgeError>`. Filing
+/// a derived edge is a best-effort annotation of an already-derived
+/// assessment, and every production caller asks only whether the edge was
+/// filed: no caller inspects, propagates or logs the owner's error, so
+/// returning it would be returning a large value every caller immediately
+/// discards. A rejected edge therefore reports
+/// [`FaultEdgeSubmission::NoEdgeForState`], which is exactly the honest
+/// meaning: the owner holds no edge for this revision. It is never reported as
+/// a host fact and never advances a fault conclusion.
+pub fn submit_derived_fault(
     bridge: &mut AgentBridgeCore,
     revision: &AssessmentRevision,
     sequence: u64,
-) -> anyhow::Result<FaultEdgeSubmission> {
-    use super::correlation::CorrelationAssessmentState;
+) -> FaultEdgeSubmission {
+    use crate::mcp_correlation::CorrelationAssessmentState;
     let assessment = &revision.assessment;
     let kind = match assessment.state {
         CorrelationAssessmentState::HostRespondingStuckAfterDeadline => TransportEdgeKind::Timeout,
@@ -103,14 +99,14 @@ pub(crate) fn submit_derived_fault(
         | CorrelationAssessmentState::ResponseMisclassifiedByHost
         | CorrelationAssessmentState::TransportOutcomeUnknown
         | CorrelationAssessmentState::EliotEmissionFailed => {
-            return Ok(FaultEdgeSubmission::NoEdgeForState);
+            return FaultEdgeSubmission::NoEdgeForState;
         }
     };
     let event_ref = assessment.evidence.host_event.as_ref().map_or_else(
         || format!("correlation:{}", revision.identity_digest),
         |evidence| evidence.event_id.clone(),
     );
-    let edge = TransportEdge::record(
+    let Ok(edge) = TransportEdge::record(
         kind,
         event_ref,
         sequence,
@@ -120,20 +116,24 @@ pub(crate) fn submit_derived_fault(
             revision.revision,
             assessment.state.as_str()
         ),
-    )?;
-    bridge.record_transport_edge(edge)?;
-    Ok(FaultEdgeSubmission::Submitted)
+    ) else {
+        return FaultEdgeSubmission::NoEdgeForState;
+    };
+    if bridge.record_transport_edge(edge).is_err() {
+        return FaultEdgeSubmission::NoEdgeForState;
+    }
+    FaultEdgeSubmission::Submitted
 }
 
 /// Host-event coverage projected from the live owner journal.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BridgeHostCoverage {
+pub struct BridgeHostCoverage {
     /// Owner-proven coverage over the host-event interval.
-    pub(crate) coverage: CoverageProof,
+    pub coverage: CoverageProof,
     /// Journaled host events observed.
-    pub(crate) history_len: usize,
+    pub history_len: usize,
     /// Whether the owner noted a stale UI disposition.
-    pub(crate) stale_ui_noted: bool,
+    pub stale_ui_noted: bool,
 }
 
 /// Projects the host-event coverage denominator from the live owner journal.
@@ -152,7 +152,7 @@ pub(crate) struct BridgeHostCoverage {
 /// yields `Indeterminate`, and a gap yields
 /// [`CoverageProof::CursorGap`], so no assessment downstream can read a bounded
 /// but incomplete interval as complete coverage.
-pub(crate) fn read_host_coverage(bridge: &AgentBridgeCore) -> BridgeHostCoverage {
+pub fn read_host_coverage(bridge: &AgentBridgeCore) -> BridgeHostCoverage {
     let Some(inputs) = bridge.terminal_reduction_inputs() else {
         return BridgeHostCoverage {
             coverage: CoverageProof::Indeterminate {
@@ -207,7 +207,7 @@ pub(crate) fn read_host_coverage(bridge: &AgentBridgeCore) -> BridgeHostCoverage
 
 /// Why terminal-event reconciliation was refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ReconcileError {
+pub enum ReconcileError {
     /// The event owner is unattached; no journal exists to verify against.
     OwnerUnattached,
     /// The event owner has observed no route fingerprint, so the candidate's
@@ -304,13 +304,13 @@ impl std::error::Error for ReconcileError {
 }
 
 /// Owner request to reconcile one nominated terminal host event.
-pub(crate) struct TerminalReconcileRequest<'a> {
+pub struct TerminalReconcileRequest<'a> {
     /// Immutable ELIOT-side emission observation being reconciled.
-    pub(crate) emission: &'a EliotEmissionObservation,
+    pub emission: &'a EliotEmissionObservation,
     /// Owner-nominated candidate host event from the live journal.
-    pub(crate) candidate: &'a HostEventEnvelope,
+    pub candidate: &'a HostEventEnvelope,
     /// Exact join keys the owner attests for the candidate.
-    pub(crate) keys: &'a HostEventJoinKeys,
+    pub keys: &'a HostEventJoinKeys,
     /// This correlation's own append-only assessment chain.
     ///
     /// This is the independent expected set for a later event: the join reads
@@ -318,15 +318,15 @@ pub(crate) struct TerminalReconcileRequest<'a> {
     /// retained revisions and compares the new candidate against that record.
     /// It is not a caller-supplied expected set — accepting a caller-presented
     /// `None` would let one correlation close once per event.
-    pub(crate) assessments: &'a AssessmentLog,
+    pub assessments: &'a AssessmentLog,
     /// Owner-validated operation binding, when a tool owner minted one.
-    pub(crate) operation_binding: Option<&'a OwnerValidatedOperationBinding>,
+    pub operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
-    pub(crate) canonical: &'a CanonicalDisposition,
+    pub canonical: &'a CanonicalDisposition,
     /// Whether the owner confirms a stale UI for this invocation.
-    pub(crate) ui_confirmed_stale: bool,
+    pub ui_confirmed_stale: bool,
     /// Owner clock at assessment time, when the owner supplied one.
-    pub(crate) now_unix_ms: Option<u64>,
+    pub now_unix_ms: Option<u64>,
 }
 
 /// Reconciles one nominated terminal host event against an emission.
@@ -357,7 +357,7 @@ pub(crate) struct TerminalReconcileRequest<'a> {
 /// Only then is the event assessed, with the owner's live coverage
 /// denominator. Stale, foreign, duplicated, reordered, and out-of-order host
 /// events each close nothing current.
-pub(crate) fn reconcile_terminal_event(
+pub fn reconcile_terminal_event(
     bridge: &AgentBridgeCore,
     request: &TerminalReconcileRequest<'_>,
 ) -> Result<Assessment, ReconcileError> {
@@ -491,17 +491,17 @@ fn journal_binding<'a>(
 }
 
 /// Owner request to assess the stuck/pending boundary without a terminal event.
-pub(crate) struct DeadlineSweepRequest<'a> {
+pub struct DeadlineSweepRequest<'a> {
     /// Immutable ELIOT-side emission observation being assessed.
-    pub(crate) emission: &'a EliotEmissionObservation,
+    pub emission: &'a EliotEmissionObservation,
     /// Applicable observation deadline admitted by the owner, when one exists.
-    pub(crate) deadline_unix_ms: Option<u64>,
+    pub deadline_unix_ms: Option<u64>,
     /// Owner-validated operation binding, when a tool owner minted one.
-    pub(crate) operation_binding: Option<&'a OwnerValidatedOperationBinding>,
+    pub operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
-    pub(crate) canonical: &'a CanonicalDisposition,
+    pub canonical: &'a CanonicalDisposition,
     /// Owner clock at assessment time, when the owner supplied one.
-    pub(crate) now_unix_ms: Option<u64>,
+    pub now_unix_ms: Option<u64>,
 }
 
 /// Assesses the stuck/pending boundary from the live journal, no terminal.
@@ -509,7 +509,7 @@ pub(crate) struct DeadlineSweepRequest<'a> {
 /// With no terminal event, only an owner-proven complete interval past the
 /// admitted deadline establishes stuck; every other denominator stays
 /// pending or unknown. Never files edges and never invents host completion.
-pub(crate) fn reconcile_deadline_sweep(
+pub fn reconcile_deadline_sweep(
     bridge: &AgentBridgeCore,
     request: &DeadlineSweepRequest<'_>,
 ) -> Assessment {

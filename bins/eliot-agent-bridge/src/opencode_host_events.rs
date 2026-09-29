@@ -468,7 +468,7 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                         HostEventAdmissionFailure::Unavailable,
                     ));
                 }
-                Ok(HostEventAdmissionReceipt {
+                let admitted = HostEventAdmissionReceipt {
                     stream_id: submission.stream_id.clone(),
                     event_id: submission.event_id.clone(),
                     phase: phase_text(phase).to_owned(),
@@ -486,13 +486,74 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                     // returned here so a retry after a lost response reconciles
                     // the original decision instead of evaluating a second one.
                     replayed_decision: self.committed_decisions.get(&submission.event_id).cloned(),
-                })
+                };
+                // #2899: the event is now in the owner's live journal, so a
+                // terminal invocation can be joined against the correlation it
+                // names. This is the competent host evidence the correlation was
+                // waiting for; nothing before this point could have resolved it.
+                self.reconcile_admitted_event(submission, &admitted);
+                Ok(admitted)
             }
             EventForwardStatus::BestEffortForwarded
             | EventForwardStatus::BestEffortGapSignalled { .. } => Err(
                 HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable),
             ),
         }
+    }
+
+    /// Joins a just-admitted terminal host event onto the correlation it names.
+    ///
+    /// #2899: the host event is now in the OWNER's live journal, so this is
+    /// the first point at which a competent host terminal state exists. The
+    /// join verifies the candidate against that journal, the owner's attach
+    /// binding and the owner's observed route before deriving anything, so a
+    /// stale, foreign, duplicated or reordered event closes nothing current.
+    ///
+    /// A reconciliation failure never fails the admission: the host event is
+    /// already durable, and refusing to admit it because a correlation could
+    /// not be closed would discard a competent observation. The failure is
+    /// reported on stderr instead.
+    fn reconcile_admitted_event(
+        &mut self,
+        submission: &HostEventSubmission,
+        receipt: &HostEventAdmissionReceipt,
+    ) {
+        let Some(inputs) = self.runner.terminal_reduction_inputs() else {
+            return;
+        };
+        let Some(journaled) = inputs
+            .history()
+            .iter()
+            .find(|event| event.event_id.as_str() == receipt.event_id.as_str())
+        else {
+            return;
+        };
+        let now = crate::mcp_correlation::owner_now_unix_ms().unwrap_or(0);
+        let outcome =
+            self.runner
+                .reconcile_terminal_host_event(journaled, &submission.producer_id, now);
+        let (correlation_digest, state, edge_filed, failure) = match outcome {
+            Ok(crate::mcp_correlation::HostEventReconciliation::Resolved {
+                correlation_digest,
+                state,
+                edge_filed,
+            }) => (correlation_digest, state.as_str(), edge_filed, String::new()),
+            Ok(crate::mcp_correlation::HostEventReconciliation::NotTerminal) => {
+                (String::new(), "not_terminal", false, String::new())
+            }
+            Ok(crate::mcp_correlation::HostEventReconciliation::NoTrackedCorrelation) => {
+                (String::new(), "no_tracked_correlation", false, String::new())
+            }
+            Err(error) => (String::new(), "unreconciled", false, error.to_string()),
+        };
+        tracing::info!(
+            host_event_id = %receipt.event_id,
+            correlation_digest = %correlation_digest,
+            assessment_state = state,
+            transport_edge_filed = edge_filed,
+            reconcile_failure = %failure,
+            "mcp host-event correlation reconciliation"
+        );
     }
 
     fn commit_decision(
