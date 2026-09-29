@@ -1377,12 +1377,15 @@ pub fn observe_live_cutover_dispatch(
                 "stale_cutover_registration"
             }
         }
-        (_, Some(crate::BackupDispatchTarget::Prepare)) => "admission_not_required",
-        // The status/reconciliation read: it carries no cutover admission and
-        // can never reach the `Cutover` arm, so it reports the same
-        // "no cutover admission required" category as the preparation path and
-        // adds no cutover word of its own.
-        (_, Some(crate::BackupDispatchTarget::Reconcile)) => "admission_not_required",
+        // `Prepare` and `Reconcile` share this category on purpose. The
+        // status/reconciliation read carries no cutover admission and can never
+        // reach the `Cutover` arm, so it reports the same "no cutover admission
+        // required" category as the preparation path and adds no cutover word of
+        // its own.
+        (
+            _,
+            Some(crate::BackupDispatchTarget::Prepare | crate::BackupDispatchTarget::Reconcile),
+        ) => "admission_not_required",
     };
     observe_cutover_progress(LIVE_CUTOVER_OP, outcome, "none", 0);
 }

@@ -5672,7 +5672,7 @@ struct BackupDispatchHandoff {
 /// the one seam between them: the owner submits an admitted request here and
 /// blocks for the answer, and
 /// [`HostComposition::process_backup_dispatch_requests`] — reached from the
-/// service loop, the same place the UserAutomation owner queue is drained — runs
+/// service loop, the same place the `UserAutomation` owner queue is drained - runs
 /// the owner operation against this composition's real retained state.
 ///
 /// It is a channel, not a second `HostComposition`, not a global mutex and not a
@@ -6100,9 +6100,11 @@ impl HostComposition {
                             "this Host retains no isolated-restore preparation for the admitted operation",
                         ))
                     }
-                    Ok(crate::backup_preparation::ReconcileDisposition::AdmittedWithoutResult {
-                        ..
-                    }) => Err(BackupDispatchRefusal::new(
+                    Ok(
+                        crate::backup_preparation::ReconcileDisposition::AdmittedWithoutResult {
+                            ..
+                        },
+                    ) => Err(BackupDispatchRefusal::new(
                         operation,
                         "the admitted preparation is durable without a recorded result and must be reconciled, never re-prepared",
                     )),
