@@ -153,9 +153,11 @@ fn main() {
         // external consumer of this wire family decodes with
         // `WasmHostResultFrame` and rejects with the producer's own validator
         // instead of re-deriving a weaker local check. That consumer must be
-        // written against result wire version 3: every event now names the
-        // command that produced it, and a control event names the exact owner
-        // delivery it answers, where version 2 carried neither.
+        // written against the current `WASM_HOST_RESULT_WIRE_VERSION`:
+        // every event now names the command that produced it
+        // (`command_sequence`, the #2785 handover token), and a control event
+        // admitted from an owner delivery names that exact delivery and the
+        // acknowledgement the child staged for it (`delivery_ack`, #2786).
         // `emit_receipt` stays for the separate experimental describe mode
         // only.
         Ok(_) => {}

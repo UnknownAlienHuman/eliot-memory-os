@@ -137,6 +137,7 @@ use crate::dispatch_drive::{
 use crate::dispatch_material::{
     ControlAckPhase, ControlFileClass, ExpectedControlBinding, MaterialError,
     ValidatedDispatchMaterial, WASM_CONTROL_ACK_WIRE_ID, WASM_CONTROL_ACK_WIRE_VERSION,
+    WASM_CONTROL_KIND_CANCEL, WASM_CONTROL_KIND_RECONCILE, WASM_CONTROL_KIND_SHUTDOWN,
     WASM_CONTROL_MAX_DETAIL_BYTES, WASM_CONTROL_SPOOL_MAX_DELIVERIES, WASM_CONTROL_SPOOL_SCAN_CAP,
     WASM_HOST_CONTROL_FILE_NAME, WasmControlAck, WasmControlDelivery, WasmControlKind,
     admitted_material_path, control_ack_name, control_delivery_name, join_control_delivery,
@@ -778,10 +779,17 @@ pub struct ControlDeliveryAcknowledgement {
     /// Lowercase digest of the exact validated delivery bytes (hex).
     pub delivery_digest: String,
     /// Acknowledgement phase the child actually staged for this delivery
-    /// (`enqueued`, `completed`, `refused`), or `None` while the delivery is
-    /// still unacknowledged. An event that observed a control outcome always
-    /// staged a terminal phase, so it names one here; absence means the
-    /// delivery was never confirmed, never that the ack was refused.
+    /// before this event was projected, or `None` while the delivery was
+    /// still unacknowledged at that moment.
+    ///
+    /// The only phase that can be present here is `enqueued` (see
+    /// [`ACK_PHASE_ENQUEUED`]): the child stages its `completed` ack only
+    /// AFTER this event is projected and retained, so an emitted event can
+    /// never attest to a phase that had not been written when these bytes
+    /// were produced. Absence therefore says exactly what the child knew at
+    /// emission time — the delivery was not confirmed yet — and never that an
+    /// ack was refused: a refused delivery never reaches the worker and so
+    /// never produced an observation at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_phase: Option<String>,
 }
@@ -1166,17 +1174,15 @@ fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), 
 /// and that command produced exactly one handover, so an event that observed
 /// a command must carry the token and an event that observed none must not.
 /// A frame claiming the handover of a command it also says never ran is a
-/// contradiction, and a token of zero is not a token this loop ever stamps
-/// (`COMMAND_SEQUENCE` starts at 1).
+/// contradiction. No value is refused beyond that pairing: the token is the
+/// producer's own [`COMMAND_SEQUENCE`] handover number, and judging its
+/// magnitude would be a policy this contract does not own.
 fn validate_command_coordination(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
-    match (frame.worker_command.as_deref(), frame.command_sequence) {
-        (Some(_), Some(0)) => Err(invalid("command-sequence")),
+    match (frame.worker_command.is_some(), frame.command_sequence.is_some()) {
         // Observed command with no token: the producer must report the
         // handover it stamped, never leave the ordering evidence absent.
-        (Some(_), None) => Err(invalid("command-sequence")),
-        // No command ran, so no handover exists and none may be claimed.
-        (None, Some(_)) => Err(invalid("command-sequence")),
-        (None, None) => Ok(()),
+        (true, false) | (false, true) => Err(invalid("command-sequence")),
+        (true, true) | (false, false) => Ok(()),
     }
 }
 
@@ -1185,9 +1191,13 @@ fn validate_command_coordination(frame: &WasmHostResultFrame) -> Result<(), Loop
 /// A delivery acknowledgement may only be carried by a control observation:
 /// the delivery-set `Execute` and a loop-derived containment/reconciliation
 /// follow-up answer no owner delivery, so naming one would bind the event to
-/// a delivery slot it never came from. Every identity field is copied from
-/// the owner's validated bytes, so each must be well formed: a non-blank
-/// control kind from the closed vocabulary, and two lowercase digests.
+/// a delivery slot it never came from. The named delivery must also answer the
+/// SAME control the observed command was: an event that observed a `reconcile`
+/// and names a `cancel` delivery binds two different operations together, which
+/// is the exact contradiction a consumer must not have to detect. Every
+/// identity field is copied from the owner's validated bytes, so each must be
+/// well formed: a control kind from the closed vocabulary, and two lowercase
+/// digests.
 fn validate_delivery_acknowledgement(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
     let Some(ack) = frame.delivery_ack.as_ref() else {
         return Ok(());
@@ -1199,10 +1209,16 @@ fn validate_delivery_acknowledgement(frame: &WasmHostResultFrame) -> Result<(), 
     if !control_is_delivery || frame.worker_command.is_none() {
         return Err(invalid("delivery-ack"));
     }
-    if !matches!(
-        ack.control_kind.as_str(),
-        "cancel" | "reconcile" | "shutdown"
-    ) {
+    // The delivery's own kind must be the operation this event answers, so
+    // the exact owner spool slot it names is the slot that produced this
+    // command. The operation vocabulary and the owner control vocabulary are
+    // the same three words, one `to_owned` mapping each.
+    let expected_kind = match frame.operation.as_str() {
+        OP_CANCEL => WASM_CONTROL_KIND_CANCEL,
+        OP_RECONCILE => WASM_CONTROL_KIND_RECONCILE,
+        _ => WASM_CONTROL_KIND_SHUTDOWN,
+    };
+    if ack.control_kind != expected_kind {
         return Err(invalid("delivery-ack"));
     }
     for digest in [ack.replay_key.as_str(), ack.delivery_digest.as_str()] {
@@ -2668,7 +2684,13 @@ impl KernelControlReader {
     /// the command was loop-derived, or arrived over the legacy fixed file
     /// that carries no owner identity — and the result event then names none.
     fn accepted_delivery(&self, operation: &str) -> Option<ControlDeliveryAcknowledgement> {
-        let (control, ack_phase) = match self
+        // The enqueue-confirmed [`Self::accepted`] slot outranks the transient
+        // slots, exactly as it does in [`Self::confirm_completed`], so a
+        // delivery whose outcome the child is about to observe is the one
+        // named. Its identity is read directly off the retained slot rather
+        // than rebuilt as a `PendingControl`, because the slot already holds
+        // exactly those values.
+        if let Some(accepted) = self
             .accepted
             .as_ref()
             .filter(|accepted| control_operation(accepted.kind) == operation)
@@ -2677,50 +2699,44 @@ impl KernelControlReader {
             // (an un-staged one is retried by the next bounded poll, so a
             // false value here means the write is still owed and nothing is
             // claimed).
-            Some(accepted) => (
-                PendingControl::Spool {
-                    kind: accepted.kind,
-                    sequence: accepted.sequence,
-                    replay_key: accepted.replay_key.clone(),
-                    delivery_digest: accepted.delivery_digest.clone(),
-                    operation_id: accepted.operation_id.clone(),
-                    generation: accepted.generation,
-                },
-                accepted.ack_staged.then_some(ACK_PHASE_ENQUEUED),
-            ),
-            None => {
-                // No confirmed delivery: the retained `Shutdown` slot outranks
-                // the transient pending one, because its enqueue is proven in
-                // the drain and not on the tick that yielded it.
-                let control = self
-                    .shutdown
+            return Some(ControlDeliveryAcknowledgement {
+                control_kind: accepted.kind.as_str().to_owned(),
+                owner_sequence: accepted.sequence,
+                replay_key: accepted.replay_key.clone(),
+                delivery_digest: accepted.delivery_digest.clone(),
+                ack_phase: accepted.ack_staged.then(|| ACK_PHASE_ENQUEUED.to_owned()),
+            });
+        }
+        // No confirmed delivery: the retained `Shutdown` slot outranks the
+        // transient pending one, because its enqueue is proven in the drain
+        // and not on the tick that yielded it. Either slot names the delivery
+        // only when it really is a spool delivery — the legacy fixed file
+        // carries no owner identity, so it names none.
+        let control = self
+            .shutdown
+            .as_ref()
+            .filter(|shutdown| shutdown.operation() == operation)
+            .or_else(|| {
+                self.pending
                     .as_ref()
-                    .filter(|shutdown| shutdown.operation() == operation)
-                    .or_else(|| {
-                        self.pending
-                            .as_ref()
-                            .filter(|pending| pending.operation() == operation)
-                    })?;
-                (control, None)
-            }
-        };
-        let PendingControl::Spool {
-            kind,
-            sequence,
-            replay_key,
-            delivery_digest,
-            ..
-        } = control
-        else {
-            return None;
-        };
-        Some(ControlDeliveryAcknowledgement {
-            control_kind: kind.as_str().to_owned(),
-            owner_sequence: sequence,
-            replay_key: replay_key.clone(),
-            delivery_digest: delivery_digest.clone(),
-            ack_phase: ack_phase.map(str::to_owned),
-        })
+                    .filter(|pending| pending.operation() == operation)
+            })?;
+        match control {
+            PendingControl::Spool {
+                kind,
+                sequence,
+                replay_key,
+                delivery_digest,
+                ..
+            } => Some(ControlDeliveryAcknowledgement {
+                control_kind: kind.as_str().to_owned(),
+                owner_sequence: *sequence,
+                replay_key: replay_key.clone(),
+                delivery_digest: delivery_digest.clone(),
+                ack_phase: None,
+            }),
+            PendingControl::Legacy { .. } => None,
+        }
     }
 
     /// Stages one ack at its exact generation/sequence name.
@@ -3076,7 +3092,6 @@ fn command_name(command: WorkerCommand) -> &'static str {
 /// `None` is not a missing value but a fact — that command answered no owner
 /// delivery, so it acknowledges none.
 type ObservedCommandIdentity = Option<(u64, Option<ControlDeliveryAcknowledgement>)>;
-
 
 impl std::str::FromStr for WorkerCommand {
     type Err = ();
