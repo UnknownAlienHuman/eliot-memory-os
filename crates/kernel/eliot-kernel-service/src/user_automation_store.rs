@@ -47,15 +47,16 @@ use eliot_kernel_core::user_automation::{
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
-    ReceiptCore, ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, TaskBinding,
-    WorkScopeBinding, WorkScopeId,
+    ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptError, ReceiptKind, RequestBinding,
+    SessionBinding, TaskBinding, WorkScopeBinding, WorkScopeId,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OrderingScopeId, PreparedTransition, RevisionHead, ScopeId, SecurityContext,
     StateFence, StoreError, TransitionClass, USER_AUTOMATION_SCOPE, WriteReceipt,
     WriteReceiptStatus, audit_heads_digest, automation_create_params, automation_edit_params,
-    automation_invocation_read_request, automation_mutation_request, automation_read_request,
+    automation_invocation_read_request, automation_mutation_request,
+    automation_normalization_read_request, automation_read_request,
     automation_revision_read_request, automation_run_now_params,
     automation_state_transition_params, canonical_json_bytes, canonical_request_hash,
     generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
@@ -224,6 +225,95 @@ impl<C> CanonicalUserAutomationStore<C> {
         state_fence: StateFence,
     ) -> Result<NamedReadRequest, StoreError> {
         automation_invocation_read_request(automation_id, occurrence_id, state_fence)
+    }
+
+    /// Builds the exact retained normalization-envelope read for one immutable
+    /// revision under the preflight request's own State Fence.
+    ///
+    /// This is the read counterpart of the Create/Edit writer legs above: the
+    /// same adapter that mints the envelope on the revision leg is the one that
+    /// reads it back, because it is the subsystem that performed the
+    /// normalization transition. The selector is the envelope's own
+    /// content-derived identity — the exact id the immutable revision names — so
+    /// the read cannot be answered by guessing a row address.
+    pub fn normalization_read_request(
+        automation_id: String,
+        revision: String,
+        receipt_id: String,
+        state_fence: StateFence,
+    ) -> Result<NamedReadRequest, StoreError> {
+        automation_normalization_read_request(automation_id, revision, receipt_id, state_fence)
+    }
+
+    /// Projects the owner's retained normalization receipt envelopes for one
+    /// exact immutable revision.
+    ///
+    /// Each returned envelope is the owner's own retained bytes, parsed back
+    /// into the typed [`ReceiptEnvelope`] and validated through its own
+    /// `validate()`, which re-derives the content-derived identity from the
+    /// canonical core. A projected envelope therefore cannot be a substituted
+    /// or re-signed claim: if the owner returned bytes that do not hash to the
+    /// identity they were selected by, this refuses instead of handing a
+    /// plausible-looking envelope to preflight. The binding between the envelope
+    /// and the revision's compiled occurrence set is NOT closed here — that is
+    /// `UserAutomationPreflightProjection::assemble`'s job, against the
+    /// authenticated revision, so this method proves only that the envelope is
+    /// real and is the one the revision names.
+    pub fn project_normalization_receipts(
+        request: &NamedReadRequest,
+        response: NamedReadResponse,
+    ) -> Result<Vec<ReceiptEnvelope>, StoreError> {
+        validate_named_response(request, &response)?;
+        let entries = response
+            .payload
+            .get(eliot_store_api::AUTOMATION_PAGE_NORMALIZATION_ENVELOPES)
+            .and_then(Value::as_array)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.normalization_envelopes",
+                reason: "exact normalization projection malformed",
+            })?;
+        let requested_receipt_id = request
+            .parameters
+            .get(eliot_store_api::AUTOMATION_PARAM_RECEIPT_ID)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.receipt_id",
+                reason: "normalization read lost its exact receipt identity selector",
+            })?;
+        let mut envelopes = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let document =
+                entry
+                    .get("envelope_json")
+                    .and_then(Value::as_str)
+                    .ok_or(StoreError::InvalidField {
+                        field: "automation.envelope_json",
+                        reason: "retained normalization envelope is missing its verbatim bytes",
+                    })?;
+            let envelope: ReceiptEnvelope =
+                serde_json::from_str(document).map_err(|error| {
+                    StoreError::Serialization(error.to_string())
+                })?;
+            envelope.validate().map_err(StoreError::Receipt)?;
+            // Selection is by the envelope's OWN identity, and it is re-checked
+            // here on the way out: an owner that returned an envelope other
+            // than the one the immutable revision names is answered as a
+            // conflict rather than passed to preflight as if it were the claim.
+            let selected = entry
+                .get("receipt_id")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "automation.receipt_id",
+                    reason: "retained normalization envelope is missing its identity",
+                })?;
+            if envelope.identity.receipt_id.as_str() != selected
+                || selected != requested_receipt_id
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+            envelopes.push(envelope);
+        }
+        Ok(envelopes)
     }
 
     /// Projects one exact owner-issued invocation response.
@@ -1751,7 +1841,8 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 // revision therefore never names a receipt the owner did not
                 // mint over this exact occurrence set.
                 let revision = &**revision;
-                let normalized = revision_with_owner_normalization_receipt(request, revision)?;
+                let (normalized, envelope) =
+                    revision_with_owner_normalization_receipt(request, revision)?;
                 let document = serde_json::to_string(&normalized)
                     .map_err(|error| StoreError::Serialization(error.to_string()))?;
                 Ok(automation_create_params(
@@ -1759,6 +1850,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                     revision.revision.clone(),
                     state_wire(revision.configuration_state),
                     document,
+                    retained_envelope_json(&envelope)?,
                 ))
             }
             UserAutomationOperation::Edit {
@@ -1766,7 +1858,8 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 revision,
             } => {
                 let revision = &**revision;
-                let normalized = revision_with_owner_normalization_receipt(request, revision)?;
+                let (normalized, envelope) =
+                    revision_with_owner_normalization_receipt(request, revision)?;
                 let document = serde_json::to_string(&normalized)
                     .map_err(|error| StoreError::Serialization(error.to_string()))?;
                 Ok(automation_edit_params(
@@ -1775,6 +1868,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                     revision.revision.clone(),
                     state_wire(revision.configuration_state),
                     document,
+                    retained_envelope_json(&envelope)?,
                 ))
             }
             UserAutomationOperation::Pause {
@@ -2131,20 +2225,22 @@ const AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str = "eliot-user-automation:sched
 /// envelope to `UserAutomationPreflightProjection::assemble`, which validates it
 /// and requires its canonical bytes to carry the stored set's compiled digest.
 ///
-/// Minting is not retention, and this leg does not claim to be both. The set
-/// `read_run_now_normalization_receipts` selects from is the canonical Store's
-/// own retained `WriteReceipt` history, one envelope per committed operation,
-/// issued by the Store receipt owner from the committed plan; a Kernel caller
-/// cannot append a second envelope to it, and a Store-issued envelope for this
-/// transition binds the committed plan rather than the compiled occurrence set,
-/// so it can never carry the digest `assemble` requires. This leg therefore
-/// mints the identity the revision names and leaves its retention to the Store
-/// receipt owner, and a run-now occurrence whose envelope that owner has not
-/// retained stays unadmitted by name instead of being admitted on a digest.
+/// Minting is not retention, and this leg now does both because it is the one
+/// subsystem that performed the transition. I05.19:96 binds a durable receipt's
+/// envelope to the subsystem that performed the transition, and the canonical
+/// Store's retained `WriteReceipt` history is NOT that subsystem here: those
+/// envelopes are issued by the Store receipt owner from the committed plan, so
+/// they bind the committed plan rather than the compiled occurrence set and can
+/// never carry the digest `assemble` requires, and a Kernel caller cannot append
+/// a second envelope to them. The subsystem that compiled the occurrence set is
+/// this automation Store leg, so the envelope is retained on the revision row
+/// this leg writes and read back through the closed `normalization` read. A
+/// run-now occurrence whose envelope this owner has not retained stays
+/// unadmitted by name instead of being admitted on a digest.
 fn revision_with_owner_normalization_receipt(
     request: &UserAutomationStoreRequest,
     revision: &UserAutomationRevision,
-) -> Result<UserAutomationRevision, StoreError> {
+) -> Result<(UserAutomationRevision, ReceiptEnvelope), StoreError> {
     let state_fence = request.context.state_fence.clone();
     // The owner-issued task/session bindings mirror the canonical Store
     // receipt owner: a request that carries a task without the fence revision
@@ -2242,14 +2338,46 @@ fn revision_with_owner_normalization_receipt(
     };
     let receipt = revision
         .schedule
-        .issue_normalization_receipt(core, &request.authenticated_principal)
+        .issue_normalization_receipt(core.clone(), &request.authenticated_principal)
         .map_err(|_| StoreError::InvalidField {
             field: "automation.schedule.normalization_receipt",
             reason: "owner-issued normalization receipt was refused",
         })?;
+    // RETENTION. `issue_normalization_receipt` returns the typed payload and
+    // keeps the envelope it derived, so this leg re-issues the SAME immutable
+    // core to obtain the envelope bytes it must retain. That is not a second
+    // issuance authority: `ReceiptEnvelope::issue` is a pure function of the
+    // core, so the re-issued envelope is byte-identical to the one whose
+    // identity the payload already names, and the identity equality asserted
+    // below is what proves it rather than assuming it. Minting without
+    // retaining left the identity the immutable revision names unanswerable by
+    // any owner, which is exactly the gap the run-now readback closes.
+    let envelope = ReceiptEnvelope::issue(core).map_err(StoreError::Receipt)?;
+    if envelope.identity.receipt_id.as_str() != receipt.receipt_id {
+        return Err(StoreError::Receipt(ReceiptError::IdentityMismatch));
+    }
     let mut owned = revision.clone();
     owned.schedule.normalization_receipt = receipt;
-    Ok(owned)
+    Ok((owned, envelope))
+}
+
+/// Renders the owner-minted normalization receipt envelope into the verbatim
+/// bytes the automation revision row retains.
+///
+/// I05.19:96 makes the envelope the property of the subsystem that performed
+/// the normalization transition, and that subsystem is this automation Store
+/// leg, so the envelope is retained HERE on the revision row this leg already
+/// writes rather than in a second receipt store. The bytes are the envelope's
+/// own canonical serialization and are validated by
+/// `ReceiptEnvelope::validate` at the wire boundary, which re-derives the
+/// content-derived identity; the readback then returns exactly these bytes, so
+/// the envelope the run-now preflight validates is the envelope that was
+/// minted, not one recomputed on the way out.
+fn retained_envelope_json(envelope: &ReceiptEnvelope) -> Result<String, StoreError> {
+    envelope.validate().map_err(StoreError::Receipt)?;
+    let bytes = canonical_json_bytes(envelope)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|error| StoreError::Serialization(error.to_string()))
 }
 
 /// Returns the automation identity scoping one intent's ordering stream.

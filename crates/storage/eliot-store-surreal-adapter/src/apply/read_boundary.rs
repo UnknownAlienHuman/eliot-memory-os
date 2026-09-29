@@ -2148,6 +2148,9 @@ async fn automation_state_payload(
         eliot_store_api::AUTOMATION_QUERY_FAILURE => {
             automation_failure_payload(db, config, state_fence, &decoded).await
         }
+        eliot_store_api::AUTOMATION_QUERY_NORMALIZATION => {
+            automation_normalization_payload(db, config, state_fence, &decoded).await
+        }
         _ => Err(AdapterError::Store(StoreError::UnknownOperation)),
     }
 }
@@ -2198,6 +2201,37 @@ fn require_automation_id(
         .ok_or(AdapterError::Store(StoreError::InvalidField {
             field: "automation.automation_id",
             reason: "exact automation selector is required",
+        }))
+}
+
+/// Requires the exact immutable-revision selector carried by a decoded query.
+fn require_automation_revision(
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<String, AdapterError> {
+    decoded
+        .requested_revision
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.revision",
+            reason: "exact immutable revision selector is required",
+        }))
+}
+
+/// Requires the exact content-derived receipt-identity selector carried by a
+/// decoded query.
+///
+/// This is an identity, not a row address: the value names the envelope the
+/// immutable revision already claims, and the owner answers only by comparing
+/// it against each retained envelope's own parsed `identity.receipt_id`.
+fn require_automation_receipt_id(
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<String, AdapterError> {
+    decoded
+        .requested_receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.receipt_id",
+            reason: "exact receipt identity selector is required",
         }))
 }
 
@@ -2964,6 +2998,66 @@ async fn automation_failure_payload(
     Ok(json!({
         "failure": failure,
         "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Projects the retained schedule normalization receipt envelope the
+/// automation leg minted for one immutable revision (issue #1779).
+///
+/// This is a read of the ONE subsystem that performed the normalization
+/// transition: the envelope is retained on the automation revision row that leg
+/// wrote, and it is returned here as the bytes it was stored as. I05.19:96
+/// makes the envelope the property of the performing subsystem, so this is the
+/// same owner answering about itself, not a second receipt store and not a
+/// projection over the generic Store receipt history.
+///
+/// Selection is by the envelope's OWN parsed content-derived
+/// `identity.receipt_id`, which is exactly the identity the immutable revision
+/// names — never a row name, so predicting the row address reaches nothing. The
+/// fence gate is applied BEFORE the identity comparison, so an envelope
+/// retained under a different admission era is not answerable here at all, and
+/// an absent or cross-fence row projects an empty array rather than another
+/// era's envelope.
+async fn automation_normalization_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let revision = require_automation_revision(decoded)?;
+    let receipt_id = require_automation_receipt_id(decoded)?;
+    let mut envelopes = Vec::new();
+    if let Some(row) =
+        super::surreal_automation::read_revision_for_read(db, config, &automation_id, &revision)
+            .await?
+    {
+        if row.automation_id == automation_id
+            && row.revision == revision
+            && row.state_fence == *state_fence
+        {
+            // The retained envelope is parsed only far enough to read its OWN
+            // identity for selection. Validation and the binding to the compiled
+            // occurrence set stay with
+            // `UserAutomationPreflightProjection::assemble`, which closes them
+            // against the authenticated revision.
+            let retained: eliot_receipts::ReceiptEnvelope =
+                serde_json::from_str(&row.normalization_envelope_json).map_err(|error| {
+                    AdapterError::Store(StoreError::Serialization(error.to_string()))
+                })?;
+            if retained.identity.receipt_id.as_str() == receipt_id {
+                envelopes.push(json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "receipt_id": retained.identity.receipt_id.as_str(),
+                    "envelope_json": row.normalization_envelope_json,
+                }));
+            }
+        }
+    }
+    Ok(json!({
+        "normalization_envelopes": envelopes,
         "state_fence": state_fence,
     }))
 }

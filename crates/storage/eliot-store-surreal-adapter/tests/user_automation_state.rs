@@ -182,6 +182,86 @@ fn revision_json(revision: &UserAutomationRevision) -> String {
     serde_json::to_string(revision).expect("fixture serializes")
 }
 
+/// Builds the verbatim normalization receipt envelope a revision leg must
+/// retain, plus the identity those bytes carry.
+///
+/// The fixture issues a real envelope through the production
+/// `ReceiptEnvelope::issue` constructor, so the bytes written to the provider
+/// are the kind the owner actually stores and the identity is genuinely derived
+/// from the core rather than asserted.
+fn normalization_envelope(automation_id: &str, revision: &str) -> (String, String) {
+    let request_id = RequestId::new("normalize-request").expect("request id");
+    let metadata = eliot_receipts::RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new("product-automation").expect("product"),
+        source_id: SourceId::new("owner-1").expect("source"),
+        state_fence: fence(),
+        clock: eliot_contracts::ClockReading::default(),
+    };
+    let core = eliot_receipts::ReceiptCore {
+        contract: eliot_receipts::contract_identity().expect("receipt contract"),
+        kind: eliot_receipts::ReceiptKind::Verification,
+        work_scope: eliot_receipts::WorkScopeBinding {
+            scope_id: eliot_receipts::WorkScopeId::new("scope-1").expect("scope"),
+            product_id: metadata.product_id.clone(),
+            resource_generation: ResourceGeneration::new(1).expect("generation"),
+            state_fence: fence(),
+        },
+        task: None,
+        session: None,
+        causal: eliot_receipts::CausalBinding {
+            state_fence: fence(),
+            transaction_sequence: eliot_contracts::TransactionSequence::genesis(),
+            parent_receipt_id: None,
+            predecessor_receipt_ids: Vec::new(),
+        },
+        request: eliot_receipts::RequestBinding {
+            metadata,
+            state_fence: fence(),
+        },
+        operation: eliot_receipts::OperationBinding {
+            operation_id: OperationId::new(format!("normalize-{automation_id}-{revision}"))
+                .expect("operation"),
+            request_id,
+            idempotency_key: format!("normalize-{automation_id}-{revision}"),
+            operation_kind: "user-automation.schedule.normalize".to_owned(),
+            effect: EffectClass::Read,
+            state_fence: fence(),
+        },
+        authority: eliot_receipts::AuthorityBinding {
+            authority_id: eliot_contracts::ContractId::new("automation-normalizer")
+                .expect("authority id"),
+            authority_owner: "human-1".to_owned(),
+            authority_epoch: fence().authority_epoch,
+            state_fence: fence(),
+            allowed_effect: EffectClass::Read,
+            proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
+        },
+        artifacts: vec![eliot_receipts::ArtifactBinding {
+            artifact_id: format!("compiled-occurrences:{automation_id}:{revision}"),
+            sha256: "a".repeat(64),
+            role: eliot_receipts::ReceiptKind::Artifact,
+            source_revision: Some(
+                eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
+            ),
+        }],
+        verifier: None,
+        problem: None,
+        coordination: None,
+        disposition: eliot_receipts::ReceiptDisposition::Success {
+            proof: eliot_receipts::ProofCeiling::ScopedVerification,
+        },
+    };
+    let envelope = eliot_receipts::ReceiptEnvelope::issue(core).expect("envelope issues");
+    let identity = envelope.identity.receipt_id.as_str().to_owned();
+    (
+        serde_json::to_string(&envelope).expect("envelope serializes"),
+        identity,
+    )
+}
+
 fn invocation_for(automation_id: &str, revision: &str, nonce: &str) -> (String, String) {
     let invocation = UserAutomationInvocation {
         automation_id: automation_id.to_owned(),
@@ -477,6 +557,7 @@ async fn lifecycle_persists_lineage_with_pointer_cas() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            normalization_envelope("auto-1", "r-1").0,
         ));
     let receipt = apply(adapter, "create-1", request.parameters)
         .await
@@ -504,6 +585,7 @@ async fn lifecycle_persists_lineage_with_pointer_cas() {
             "r-2".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&second),
+            normalization_envelope("auto-1", "r-2").0,
         ));
     apply(adapter, "edit-1", request.parameters)
         .await
@@ -613,6 +695,7 @@ async fn run_now_records_invocations_by_occurrence() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            normalization_envelope("auto-1", "r-1").0,
         ));
     apply(adapter, "create-1", request.parameters)
         .await
@@ -705,6 +788,7 @@ async fn lineage_and_key_conflicts_fail_closed() {
                 "r-2",
                 UserAutomationConfigurationState::Active,
             )),
+            normalization_envelope("auto-1", "r-2").0,
         ));
     assert_eq!(
         apply(adapter, "edit-stale", request.parameters)

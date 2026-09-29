@@ -3106,14 +3106,23 @@ impl KernelStoreGateway {
         Ok(())
     }
 
-    /// Reads the schedule normalization receipt envelopes this fence retains in
-    /// the canonical Store receipt history.
+    /// Reads the schedule normalization receipt envelopes the automation owner
+    /// retained on the revision this occurrence runs under.
     ///
     /// The normalization receipt is owner evidence over the compiled occurrence
-    /// set, so it is read from the owner that retained it and is never assembled,
-    /// derived or defaulted here. Selection is by the envelope's own
-    /// content-derived identity — exactly the id the immutable revision names —
-    /// and the binding is then closed by
+    /// set, so it is read from the owner that performed that transition and is
+    /// never assembled, derived or defaulted here. I05.19:96 binds a durable
+    /// receipt's envelope to the subsystem that performed the transition: that
+    /// subsystem is the automation Store leg, which mints the envelope on the
+    /// Create/Edit leg and retains it on the immutable revision row it writes.
+    /// The generic Store receipt history is therefore NOT the owner of this
+    /// envelope — its entries are issued by the Store receipt owner from the
+    /// committed plan, so they bind the plan rather than the compiled occurrence
+    /// set and can never carry the digest `assemble` requires.
+    ///
+    /// Selection is by the envelope's own content-derived identity — exactly the
+    /// id the immutable revision names — so a caller cannot reach an envelope by
+    /// predicting a row address, and the binding is then closed by
     /// [`UserAutomationPreflightProjection::assemble`], which validates the
     /// envelope through its own `validate()` and requires its canonical bytes to
     /// carry the revision's compiled-occurrence digest. An owner that retained no
@@ -3122,32 +3131,35 @@ impl KernelStoreGateway {
     async fn read_run_now_normalization_receipts(
         &self,
         state_fence: &StateFence,
+        automation_id: &str,
+        revision: &str,
         declared: &eliot_kernel_core::user_automation::ScheduleNormalizationReceipt,
     ) -> Result<Vec<eliot_receipts::ReceiptEnvelope>, RunNowPreflightAssembly> {
-        let recovery = self
-            .recovery(StoreRecoveryRequest {
-                contract_version: eliot_store_api::CONTRACT_VERSION,
-                state_fence: state_fence.clone(),
-                records: Vec::new(),
-                include_receipts: true,
-                include_jobs: false,
-            })
+        let request =
+            CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::normalization_read_request(
+                automation_id.to_owned(),
+                revision.to_owned(),
+                declared.receipt_id.clone(),
+                state_fence.clone(),
+            )
+            .map_err(|error| {
+                RunNowPreflightAssembly::Unknown(format!(
+                    "the retained normalization-envelope read is not constructible: {error}"
+                ))
+            })?;
+        let response = self
+            .execute_named_with_error(request.clone())
             .await
-            .map_err(RunNowPreflightAssembly::Unavailable)?;
-        if recovery.state_fence != *state_fence {
-            return Err(RunNowPreflightAssembly::Unknown(
-                "retained UserAutomation receipt history does not bind to the request fence"
-                    .to_owned(),
-            ));
-        }
-        Ok(recovery
-            .receipts
-            .into_iter()
-            .filter_map(|receipt| receipt.envelope)
-            .filter(|envelope| {
-                envelope.identity.receipt_id.as_str() == declared.receipt_id.as_str()
-            })
-            .collect())
+            .map_err(|error| {
+                RunNowPreflightAssembly::Unavailable(format!(
+                    "the automation owner that retains the normalization envelope did not answer: \
+                     {error}"
+                ))
+            })?;
+        CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_normalization_receipts(
+            &request,
+            response,
+        )
     }
 
     /// Assembles the complete preflight projection for one committed `RunNow`
@@ -3232,14 +3244,16 @@ impl KernelStoreGateway {
         }
         // The schedule normalization envelope the revision names is owner
         // evidence over the compiled occurrence set, so it is read from the
-        // canonical Store receipt history rather than assembled here. The read
-        // selects the envelope by its own content-derived identity; assembly then
-        // re-checks that envelope's canonical bytes name the compiled occurrence
-        // digest, so a self-asserted digest cannot satisfy the binding. An owner
-        // that has retained no such envelope leaves the occurrence unadmitted by
-        // name instead of substituting a receipt.
+        // automation owner that minted and retained it rather than assembled
+        // here. The read selects the envelope by its own content-derived
+        // identity; assembly then re-checks that envelope's canonical bytes name
+        // the compiled occurrence digest, so a self-asserted digest cannot
+        // satisfy the binding. An owner that has retained no such envelope leaves
+        // the occurrence unadmitted by name instead of substituting a receipt.
         let normalization_receipts = Box::pin(self.read_run_now_normalization_receipts(
             state_fence,
+            &owner.automation_id,
+            &owner.revision.revision,
             &owner.revision.schedule.normalization_receipt,
         ))
         .await?;

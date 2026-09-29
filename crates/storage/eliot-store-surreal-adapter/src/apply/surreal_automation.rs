@@ -59,6 +59,11 @@ pub(crate) struct AutomationRevisionWrite {
     pub revision: String,
     /// Verbatim canonical revision document.
     pub revision_json: String,
+    /// Verbatim normalization receipt envelope the automation leg minted for
+    /// this revision's compiled occurrence set. It is retained on the row that
+    /// owns the transition (I05.19:96) and is written as issued; no digest is
+    /// re-derived on this contour.
+    pub normalization_envelope_json: String,
     /// Admission fence of the transition.
     pub state_fence: StateFence,
     /// Scope provenance from the transition envelope.
@@ -162,6 +167,8 @@ pub(crate) struct StoredAutomationRevision {
     pub revision: String,
     /// Verbatim canonical revision document.
     pub revision_json: String,
+    /// Verbatim retained normalization receipt envelope.
+    pub normalization_envelope_json: String,
     /// Admission fence.
     pub state_fence: StateFence,
 }
@@ -1328,6 +1335,7 @@ impl PrepareContext<'_> {
                 automation_id,
                 revision,
                 revision_json,
+                normalization_envelope_json,
                 configuration_state,
             } => {
                 self.apply_create(
@@ -1335,6 +1343,7 @@ impl PrepareContext<'_> {
                     automation_id,
                     revision,
                     revision_json,
+                    normalization_envelope_json,
                     configuration_state,
                 )
                 .await
@@ -1344,6 +1353,7 @@ impl PrepareContext<'_> {
                 previous_revision,
                 revision,
                 revision_json,
+                normalization_envelope_json,
                 configuration_state,
             } => {
                 self.apply_edit(
@@ -1352,6 +1362,7 @@ impl PrepareContext<'_> {
                     previous_revision,
                     revision,
                     revision_json,
+                    normalization_envelope_json,
                     configuration_state,
                 )
                 .await
@@ -1416,6 +1427,7 @@ impl PrepareContext<'_> {
         automation_id: String,
         revision: String,
         revision_json: String,
+        normalization_envelope_json: String,
         configuration_state: String,
     ) -> Result<(), AdapterError> {
         require_absent_revision(self.db, self.config, &automation_id, &revision).await?;
@@ -1425,6 +1437,7 @@ impl PrepareContext<'_> {
             automation_id: automation_id.clone(),
             revision: revision.clone(),
             revision_json,
+            normalization_envelope_json,
             state_fence: state_fence.clone(),
             scope_id: scope_id.clone(),
             task_id: task_id.clone(),
@@ -1449,6 +1462,7 @@ impl PrepareContext<'_> {
         previous_revision: String,
         revision: String,
         revision_json: String,
+        normalization_envelope_json: String,
         configuration_state: String,
     ) -> Result<(), AdapterError> {
         let current =
@@ -1463,6 +1477,11 @@ impl PrepareContext<'_> {
             automation_id: automation_id.clone(),
             revision: revision.clone(),
             revision_json,
+            // The edit leg mints its own normalization envelope over the NEW
+            // revision's compiled occurrence set, so the row that owns this
+            // transition retains that envelope (I05.19:96) exactly as the
+            // create leg does for the revision it introduces.
+            normalization_envelope_json,
             state_fence: state_fence.clone(),
             scope_id: scope_id.clone(),
             task_id: task_id.clone(),
@@ -1844,6 +1863,10 @@ fn decode_revision_row(value: &Value) -> Result<StoredAutomationRevision, Adapte
         automation_id: text_row_field(object, "automation_id")?,
         revision: text_row_field(object, "revision")?,
         revision_json: text_row_field(object, "revision_json")?,
+        // The row that owns the normalization transition retains the envelope
+        // the automation leg minted for it, so the decode reads those bytes
+        // back verbatim instead of re-deriving them from the revision.
+        normalization_envelope_json: text_row_field(object, "normalization_envelope_json")?,
         state_fence: fence_row_field(object)?,
     })
 }
@@ -1939,7 +1962,7 @@ fn append_revision_statement(
 ) {
     let suffix = format!("revision_{index}");
     sql.push_str(
-            "LET $automation_current_{s} = (SELECT revision_json FROM ONLY type::record($automation_table_{s}, $automation_key_{s})); IF type::is_object($automation_current_{s}) { IF $automation_current_{s}.revision_json != $automation_expected_{s} { THROW 'automation_revision_conflict'; }; } ELSE { CREATE type::record($automation_table_{s}, $automation_key_{s}) CONTENT $automation_record_{s}; };"
+            "LET $automation_current_{s} = (SELECT revision_json, normalization_envelope_json FROM ONLY type::record($automation_table_{s}, $automation_key_{s})); IF type::is_object($automation_current_{s}) { IF $automation_current_{s}.revision_json != $automation_expected_{s} { THROW 'automation_revision_conflict'; }; IF $automation_current_{s}.normalization_envelope_json != $automation_expected_normalization_{s} { THROW 'automation_revision_conflict'; }; } ELSE { CREATE type::record($automation_table_{s}, $automation_key_{s}) CONTENT $automation_record_{s}; };"
                 .replace("{s}", &suffix)
                 .as_str(),
         );
@@ -1955,12 +1978,22 @@ fn append_revision_statement(
         format!("automation_expected_{suffix}"),
         json!(&write.revision_json),
     );
+    // The revision row is immutable, and the retained envelope is part of what
+    // that row asserts: a repeat that carries a different envelope for the same
+    // revision document is a divergent claim about the same immutable row, so
+    // it conflicts instead of converging. Comparing the stored bytes is enough
+    // because the envelope identity is derived from its own core.
+    bindings.insert(
+        format!("automation_expected_normalization_{suffix}"),
+        json!(&write.normalization_envelope_json),
+    );
     bindings.insert(
         format!("automation_record_{suffix}"),
         json!({
             "automation_id": write.automation_id,
             "revision": write.revision,
             "revision_json": write.revision_json,
+            "normalization_envelope_json": write.normalization_envelope_json,
             "state_fence": write.state_fence,
             "scope_id": write.scope_id,
             "task_id": write.task_id,
@@ -2260,6 +2293,7 @@ mod template_tests {
                 automation_id: "auto-1".to_owned(),
                 revision: "r-1".to_owned(),
                 revision_json: r#"{"revision":"r-1"}"#.to_owned(),
+                normalization_envelope_json: r#"{"identity":{"receipt_id":"receipt-a"}}"#.to_owned(),
                 state_fence: test_fence(),
                 scope_id: "user-automation".to_owned(),
                 task_id: None,
@@ -2359,6 +2393,7 @@ mod template_tests {
             "automation_key_revision_0",
             "automation_record_revision_0",
             "automation_expected_revision_0",
+            "automation_expected_normalization_revision_0",
             "pointer_table_current_0",
             "pointer_key_current_0",
             "pointer_record_current_0",

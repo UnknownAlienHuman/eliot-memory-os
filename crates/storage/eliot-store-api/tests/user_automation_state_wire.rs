@@ -9,12 +9,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 
+use eliot_contracts::{
+    ClockReading, EpochId, EpochLineageId, ProductId, ResourceGeneration, SourceId, StateFence,
+};
 use eliot_store_api::{
     AUTOMATION_OPERATION_CREATE, AUTOMATION_OPERATION_PAUSE, AUTOMATION_OPERATION_REMOVE,
     AUTOMATION_OPERATION_RESUME, AUTOMATION_OPERATION_RUN_NOW, AUTOMATION_QUERY_CURRENT,
     AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS,
-    AUTOMATION_QUERY_LIST, AUTOMATION_STATE_ACTIVE, AUTOMATION_STATE_PAUSED,
+    AUTOMATION_QUERY_LIST, AUTOMATION_QUERY_NORMALIZATION, AUTOMATION_STATE_ACTIVE,
+    AUTOMATION_STATE_PAUSED,
     AUTOMATION_STATE_RETIRED, DecodedAutomationMutation, EffectClass, MAX_AUTOMATION_PAGE_RECORDS,
     NamedMutationOperation, NamedReadOperation, OperationKind, StoreError, TransitionClass,
     USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
@@ -44,6 +49,100 @@ fn invocation_json(automation_id: &str, revision: &str, nonce: &str) -> String {
         "trigger_origin": "HUMAN",
     }))
     .expect("fixture serializes")
+}
+
+/// Builds the verbatim normalization receipt envelope bytes a revision leg
+/// must retain, and the identity those bytes carry.
+///
+/// The wire contract requires the retained value to be one well-formed
+/// `ReceiptEnvelope`, so the fixture issues a real one through the same
+/// `ReceiptEnvelope::issue` constructor the production owner uses rather than
+/// hand-writing JSON that merely looks like an envelope.
+fn normalization_envelope(automation_id: &str, revision: &str) -> (String, String) {
+    use eliot_receipts::{
+        ArtifactBinding, AuthorityBinding, CausalBinding, ContractId, EffectClass, OperationBinding,
+        OperationId, ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind,
+        RequestBinding, RequestId, RequestMetadata, ResourceGeneration, TransactionSequence,
+        WorkScopeBinding, WorkScopeId,
+    };
+    let state_fence = wire_fence();
+    let request_id = RequestId::new("normalize-request").expect("request id");
+    let metadata = RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new("product-automation").expect("product"),
+        source_id: SourceId::new("owner-1").expect("source"),
+        state_fence: state_fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let core = ReceiptCore {
+        contract: eliot_receipts::contract_identity().expect("receipt contract"),
+        kind: ReceiptKind::Verification,
+        work_scope: WorkScopeBinding {
+            scope_id: WorkScopeId::new("scope-1").expect("scope"),
+            product_id: metadata.product_id.clone(),
+            resource_generation: ResourceGeneration::new(1).expect("generation"),
+            state_fence: state_fence.clone(),
+        },
+        task: None,
+        session: None,
+        causal: CausalBinding {
+            state_fence: state_fence.clone(),
+            transaction_sequence: TransactionSequence::genesis(),
+            parent_receipt_id: None,
+            predecessor_receipt_ids: Vec::new(),
+        },
+        request: RequestBinding {
+            metadata,
+            state_fence: state_fence.clone(),
+        },
+        operation: OperationBinding {
+            operation_id: OperationId::new(format!("normalize-{automation_id}-{revision}"))
+                .expect("operation"),
+            request_id,
+            idempotency_key: format!("normalize-{automation_id}-{revision}"),
+            operation_kind: "user-automation.schedule.normalize".to_owned(),
+            effect: EffectClass::Read,
+            state_fence: state_fence.clone(),
+        },
+        authority: AuthorityBinding {
+            authority_id: ContractId::new("automation-normalizer").expect("authority id"),
+            authority_owner: "human-1".to_owned(),
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+            allowed_effect: EffectClass::Read,
+            proof_ceiling: ProofCeiling::ScopedVerification,
+        },
+        artifacts: vec![ArtifactBinding {
+            artifact_id: format!("compiled-occurrences:{automation_id}:{revision}"),
+            sha256: "a".repeat(64),
+            role: ReceiptKind::Artifact,
+            source_revision: Some(
+                eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
+            ),
+        }],
+        verifier: None,
+        problem: None,
+        coordination: None,
+        disposition: ReceiptDisposition::Success {
+            proof: ProofCeiling::ScopedVerification,
+        },
+    };
+    let envelope = ReceiptEnvelope::issue(core).expect("envelope issues");
+    let identity = envelope.identity.receipt_id.as_str().to_owned();
+    (serde_json::to_string(&envelope).expect("envelope serializes"), identity)
+}
+
+fn wire_fence() -> StateFence {
+    StateFence::new(
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            NonZeroU64::new(1).expect("sequence"),
+        )
+        .expect("epoch"),
+        ResourceGeneration::new(1).expect("generation"),
+    )
 }
 
 #[test]
@@ -111,11 +210,13 @@ fn catalogue_activates_both_automation_operations() {
 
 #[test]
 fn create_and_edit_legs_validate_positive_and_negative() {
+    let (create_envelope, _) = normalization_envelope("auto-1", "r-1");
     let params = automation_create_params(
         "auto-1".to_owned(),
         "r-1".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json("auto-1", "r-1"),
+        create_envelope.clone(),
     );
     assert_eq!(
         params
@@ -139,13 +240,55 @@ fn create_and_edit_legs_validate_positive_and_negative() {
         ),
         "decode carries the create leg"
     );
+    // The retained envelope is required on the leg, is carried verbatim, and
+    // a leg that omits it or supplies something that is not a real envelope is
+    // refused — the owner never persists an unattested revision row.
+    assert_eq!(
+        params
+            .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON)
+            .and_then(Value::as_str),
+        Some(create_envelope.as_str()),
+        "the retained envelope travels verbatim on the revision leg"
+    );
+    let mut without_envelope = params.clone();
+    without_envelope.remove(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON);
+    assert!(
+        validate_automation_mutation_params(
+            NamedMutationOperation::ApplyUserAutomationState,
+            &without_envelope
+        )
+        .is_err(),
+        "a revision leg without its owner-issued envelope is rejected"
+    );
+    let mut forged_envelope = params.clone();
+    forged_envelope.insert(
+        eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON.to_owned(),
+        Value::String(
+            serde_json::to_string(&json!({
+                "identity": {"receipt_id": "receipt-forged", "canonical_sha256": "a"},
+                "core": {},
+            }))
+            .expect("forgery serializes"),
+        ),
+    );
+    assert!(
+        validate_automation_mutation_params(
+            NamedMutationOperation::ApplyUserAutomationState,
+            &forged_envelope
+        )
+        .is_err(),
+        "a self-asserted envelope whose identity does not derive from its core is rejected"
+    );
+
     // Edit requires the superseded base.
+    let (edit_envelope, _) = normalization_envelope("auto-1", "r-2");
     let mut edit = automation_edit_params(
         "auto-1".to_owned(),
         "r-1".to_owned(),
         "r-2".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json("auto-1", "r-2"),
+        edit_envelope,
     );
     validate_automation_mutation_params(NamedMutationOperation::ApplyUserAutomationState, &edit)
         .unwrap();
@@ -193,6 +336,10 @@ fn create_and_edit_legs_validate_positive_and_negative() {
         eliot_store_api::AUTOMATION_PARAM_REVISION_JSON.to_owned(),
         Value::String("[1,2]".to_owned()),
     );
+    foreign.insert(
+        eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON.to_owned(),
+        Value::String(create_envelope.clone()),
+    );
     assert!(
         validate_automation_mutation_params(
             NamedMutationOperation::ApplyUserAutomationState,
@@ -210,6 +357,7 @@ fn create_and_edit_legs_validate_positive_and_negative() {
                 "r-1".to_owned(),
                 AUTOMATION_STATE_ACTIVE.to_owned(),
                 revision_json("auto-1", "r-1"),
+                create_envelope.clone(),
             )
         ),
         Err(StoreError::UnknownOperation)
@@ -311,6 +459,7 @@ fn state_transition_and_run_now_legs_validate() {
                 "r-2".to_owned(),
                 AUTOMATION_STATE_ACTIVE.to_owned(),
                 revision_json("auto-1", "r-2"),
+                normalization_envelope("auto-1", "r-2").0,
             )
         )
         .is_ok_and(|decoded| matches!(
@@ -380,6 +529,61 @@ fn read_queries_decode_with_closed_selectors() {
     assert!(
         validate_automation_read_params(&over.parameters).is_err(),
         "over-bound pages are rejected"
+    );
+}
+
+#[test]
+fn normalization_read_requires_exact_receipt_identity() {
+    let (_, receipt_id) = normalization_envelope("auto-1", "r-1");
+    let request = eliot_store_api::automation_normalization_read_request(
+        "auto-1".to_owned(),
+        "r-1".to_owned(),
+        receipt_id.clone(),
+        test_fence(),
+    )
+    .expect("the exact retained-envelope read is constructible");
+    let decoded = validate_automation_read_params(&request.parameters).unwrap();
+    assert_eq!(decoded.query, AUTOMATION_QUERY_NORMALIZATION);
+    assert_eq!(decoded.automation_id.as_deref(), Some("auto-1"));
+    assert_eq!(decoded.requested_revision.as_deref(), Some("r-1"));
+    assert_eq!(
+        decoded.requested_receipt_id.as_deref(),
+        Some(receipt_id.as_str()),
+        "the read is selected by the envelope's own content-derived identity"
+    );
+    // The receipt selector belongs to the normalization read alone: on any
+    // other leg it is refused rather than silently ignored, so it can never
+    // become a general-purpose address for a retained row.
+    for query in [
+        AUTOMATION_QUERY_CURRENT,
+        AUTOMATION_QUERY_HISTORY,
+        AUTOMATION_QUERY_INVOCATIONS,
+        AUTOMATION_QUERY_FAILURE,
+    ] {
+        let mut foreign = automation_read_request(
+            query.to_owned(),
+            Some("auto-1".to_owned()),
+            false,
+            10,
+            test_fence(),
+        )
+        .unwrap();
+        foreign.parameters.insert(
+            eliot_store_api::AUTOMATION_PARAM_RECEIPT_ID.to_owned(),
+            Value::String(receipt_id.clone()),
+        );
+        assert!(
+            validate_automation_read_params(&foreign.parameters).is_err(),
+            "the receipt identity selector is closed to the normalization read"
+        );
+    }
+    // A normalization read without the exact identity is refused: the owner is
+    // never asked for "any envelope on this revision".
+    let mut unidentified = request.parameters.clone();
+    unidentified.remove(eliot_store_api::AUTOMATION_PARAM_RECEIPT_ID);
+    assert!(
+        validate_automation_read_params(&unidentified).is_err(),
+        "a normalization read without an exact receipt identity is rejected"
     );
 }
 
