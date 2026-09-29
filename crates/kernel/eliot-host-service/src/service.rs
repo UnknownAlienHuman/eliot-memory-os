@@ -17,6 +17,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::foreign_occupant_recovery::{
+    AdmittedCollisionOperation, ForeignOccupantRecoveryDirective, ManagedTreeObservation,
+};
+
 /// Host activation states. These are the operational states persisted by the
 /// Host state owner; they never imply semantic or project authority.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -274,6 +278,12 @@ pub enum HostServiceError {
     /// Kernel handoff/readiness was not accepted.
     #[error("Kernel handoff: {0}")]
     KernelHandoff(String),
+    /// A foreign occupant holds the planned dependency identity. The typed
+    /// directive names the classified origin, the precise permitted and
+    /// blocked operations, the missing ownership evidence and the safe next
+    /// action; the occupant itself is left untouched.
+    #[error("foreign occupant holds the planned dependency identity: {0}")]
+    ForeignOccupant(ForeignOccupantRecoveryDirective),
     /// The installation-wide Host owner lease could not be acquired or
     /// released by this service instance.
     #[error("Host owner lease: {0}")]
@@ -554,6 +564,14 @@ where
     }
 
     /// Starts one independent managed dependency and records its observed process lineage.
+    ///
+    /// A live occupant on the planned identity that is not the admitted owner
+    /// is a foreign-occupant collision (`I3.3`): it is returned as a typed
+    /// [`ForeignOccupantRecoveryDirective`] that names the classified origin,
+    /// the read-only operations still permitted, the destructive and
+    /// adoption-grade operations blocked, the exact missing ownership evidence
+    /// and one safe next action. Host never stops, adopts, reuses or migrates
+    /// that occupant, and it persists no lineage for it.
     pub fn start_dependency(
         &mut self,
         context: &RequestMetadata,
@@ -603,6 +621,25 @@ where
                     ready_process(started, &plan.service, &plan.expected_owner)?,
                     false,
                 )
+            }
+            // A live process holds the planned identity without proving it is
+            // the admitted owner. That is an observation about a foreign
+            // occupant, not a readiness failure and not permission to act on
+            // it: the caller receives the typed directive and the process is
+            // left running. `ServiceProcessRecord` carries no managed-tree
+            // membership, so the origin stays unclassified here.
+            PortOutcome::Known(observation) if observation.process.is_some() => {
+                let directive = ForeignOccupantRecoveryDirective::for_observed_occupant(
+                    AdmittedCollisionOperation::FreshDependencyStart,
+                    &plan.service,
+                    &observation,
+                    ManagedTreeObservation::Unavailable,
+                )
+                .map_err(|_error| HostServiceError::InvalidField {
+                    field: "dependency.foreign_occupant_directive",
+                    reason: "observed occupant evidence was not complete enough to classify",
+                })?;
+                return Err(HostServiceError::ForeignOccupant(directive));
             }
             PortOutcome::Known(_) => return Err(HostServiceError::ReadinessNotProven),
             PortOutcome::Partial { .. } => return Err(HostServiceError::IncompleteObservation),
