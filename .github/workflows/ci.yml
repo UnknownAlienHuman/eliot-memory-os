@@ -180,57 +180,46 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
 
-  hot-path-4042-proof:
-    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run bounded 4042 shipped-manifest proof') }}
+  cold-composition-4042:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run bounded 4042 cold-composition discriminator') }}
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: 92000ee16a07bdb08ba15865ec50223dd6d32e63
           fetch-depth: 1
           persist-credentials: false
-      - name: Check shipped manifests before and after the bounded repair
+      - name: Execute the unchanged cold-composition case before and after repair
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git switch -C main
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $root = Join-Path $env:RUNNER_TEMP 'cold-4042-inputs'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
           $inputs = @{
-            'hot-path-4042-proof.py' = '2818a185bf0b751ab6170425112845f3acffe0ff'
-            'hot-path-4042-test.rs' = '09cf088ea1a8903497403e4dc7023e5c725001d9'
+            'runner.py' = '311f8cc7eedc702dcea3124e251c0cecab4376b4'
+            '0.input' = 'b7d4522b3b5bfc7a62e6a2efe4d51e22a150cc39'
+            '1.input' = '277bad9d18035c8c98586abf1b1f7a1cbed9a1b0'
+            '2.input' = '5253ae8e9c2d80fb0423a0b5d6a323c28b7b0afc'
+            '3.input' = 'fbdc308a5a6f5b1ea5a0844f221978b1b3cbd33d'
           }
           foreach ($name in $inputs.Keys) {
             $blob = $inputs[$name]
             $data = Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$blob" -Headers $headers
-            $path = Join-Path $env:RUNNER_TEMP $name
+            $path = Join-Path $root $name
             [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($data.content))
             if ((((git hash-object $path) | Out-String).Trim()) -ne $blob) { throw 'Proof input identity mismatch' }
           }
-          # Both earlier runs stopped before source mutation. Required source
-          # documents matched; the route changed with optional Cargo.toml.
-          # The workflow bundle additionally binds verify.ps1's Windows CRLF
-          # bytes. The complete receipts below were downloaded, compared and
-          # reproduced locally against those exact bytes before this attempt.
-          $scriptPath = Join-Path $env:RUNNER_TEMP 'hot-path-4042-proof.py'
-          $scriptText = [IO.File]::ReadAllText($scriptPath)
-          $expectations = @{
-            'c7f4b8e9fc3e97c811b7f35804e26667e30d90b353e08e478761b922e9ae5025' = '99bf5e26295a8d410ae37260253569af22fc03719d170bee057c4f847bbde3ae'
-            'efa742d93e005208d94d878fc8e55a066b5d7931da924ce851b46fded07582f8' = '12f0232c39be76bc2e80b228fefea9a5b6143bee20e995112fb6d800f9f96e14'
-          }
-          foreach ($old in $expectations.Keys) {
-            if (-not $scriptText.Contains($old)) { throw 'Unexpected documentation expectation source' }
-            $scriptText = $scriptText.Replace($old, $expectations[$old])
-          }
-          [IO.File]::WriteAllText($scriptPath, $scriptText, [Text.UTF8Encoding]::new($false))
           Remove-Item Env:GH_TOKEN
-          python $scriptPath (Join-Path $env:RUNNER_TEMP 'hot-path-4042-test.rs')
+          python (Join-Path $root 'runner.py') $root
           exit $LASTEXITCODE
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: hot-path-4042-proof-92000ee1
-          path: ${{ runner.temp }}/hot-path-4042-evidence/
+          name: cold-composition-4042-92000ee1
+          path: ${{ runner.temp }}/cold-composition-4042/
           if-no-files-found: error
           retention-days: 5
