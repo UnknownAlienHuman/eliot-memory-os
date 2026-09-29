@@ -18,12 +18,15 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
-use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
+use crate::finish_attempt::{
+    GOVERNOR_SCOPE_ID, PreparedFinishDecision, PreparedKernelExchange,
+};
 use crate::negative_memory_gate::{
     self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
 };
 use crate::negative_memory_probe::{
     NegativeMemoryProbeExecutor, admit_negative_memory_probe, execute_negative_memory_probe,
+};
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
@@ -79,7 +82,8 @@ use eliot_instrument_nextest::{
 };
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, MaintenanceController, MaintenanceError,
-    MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenanceStateStore,
+    MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenancePolicyEvidence,
+    MaintenanceStateStore,
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
@@ -93,8 +97,10 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeRevisionView, StoreHealth, WriteReceipt,
+    CanonicalReadClient, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+    NamedMutationRequest, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    ScopeId, ScopeRevisionView, SecurityContext, StoreHealth, TransitionClass, WriteReceipt,
+    WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -3579,6 +3585,254 @@ impl<P: KernelDurableJobPort + ?Sized> MaintenanceStateStore for KernelDurableJo
     }
 }
 
+/// Policy revision marker used while no Human maintenance-policy owner has
+/// published a revision (#1692 unpublished provenance, never a guessed
+/// policy version).
+pub const UNPUBLISHED_POLICY_REVISION: &str = "unpublished";
+
+/// #1694 W4: Governor-owned durable maintenance-trigger decision commit.
+///
+/// The authenticated daemon resolves the current #1692 policy
+/// ([`MaintenancePolicyEvidence`]) and submits the #1688 decision
+/// ([`AutomationTriggerDecision`]) through Governor `PreparedTransition` →
+/// Kernel → the named `RecordMaintenanceTriggerDecision` Store transaction.
+/// This value binds trigger identity/hash, evaluation/policy revision,
+/// affected scope, and job/recommendation/wake intent references into the
+/// exact ten declared Store parameters.
+///
+/// A decision plus a durable downstream intent is distinct from an executed
+/// job or a delivered notification: the commit records references that the
+/// existing outbox/reconciliation owner retains; it never executes them.
+/// Execution evidence comes only from the respective execution owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceTriggerDecisionCommit {
+    /// Stable source event/trigger identity (deduplication + evidence binding).
+    pub trigger_id: String,
+    /// SHA-256 over the exact canonical decision bytes (identity/hash binding).
+    pub operation_hash: String,
+    /// Owner-issued trigger revision for this delivery identity. The first
+    /// decision for a trigger uses revision 1; materially new policy/source
+    /// evidence creates an explicitly linked next revision, never an
+    /// overwrite of the old result.
+    pub trigger_revision: u64,
+    /// #1688 evaluator revision that produced the decision.
+    pub evaluation_revision: String,
+    /// #1692 policy revision in force, or [`UNPUBLISHED_POLICY_REVISION`]
+    /// while no Human policy owner has published one.
+    pub policy_revision: String,
+    /// Affected scope the decision concerns.
+    pub scope_ref: String,
+    /// Durable downstream intent: admitted job reference (an `ADMITTED` job
+    /// identity is a retained intent, never proof of execution).
+    pub job_ref: Option<String>,
+    /// Durable downstream intent: Human-board recommendation reference.
+    pub recommendation_ref: Option<String>,
+    /// Durable downstream intent: wake/occurrence reference.
+    pub wake_ref: Option<String>,
+    /// Exact canonical bytes of the decision, as UTF-8 JSON.
+    pub decision_json: String,
+}
+
+impl MaintenanceTriggerDecisionCommit {
+    /// Binds one #1688 decision to the #1692 policy evidence resolved for it.
+    ///
+    /// The policy evidence must concern the same family and scope as the
+    /// decision; a resolution for another family/scope fails closed instead
+    /// of authorizing foreign work. `operation_hash` is the SHA-256 over the
+    /// exact canonical decision bytes, so the Store row binds the bytes the
+    /// evaluator actually produced. At least one downstream intent reference
+    /// is required: the Store decision contract records the reference and
+    /// does not execute a job or deliver a recommendation/wake.
+    pub fn for_decision(
+        decision: &AutomationTriggerDecision,
+        trigger_revision: u64,
+        policy: &MaintenancePolicyEvidence,
+        job_ref: Option<String>,
+        recommendation_ref: Option<String>,
+        wake_ref: Option<String>,
+    ) -> Result<Self, CompositionError> {
+        if policy.family != decision.family || policy.scope_ref != decision.scope_ref {
+            return Err(CompositionError::Owner(
+                "maintenance policy evidence does not concern the decided family and scope"
+                    .to_owned(),
+            ));
+        }
+        let decision_bytes = canonical_json_bytes(decision)
+            .map_err(|error| CompositionError::Owner(format!("maintenance decision bytes: {error}")))?;
+        let decision_json = String::from_utf8(decision_bytes.clone()).map_err(|_| {
+            CompositionError::Owner("maintenance decision bytes are not UTF-8".to_owned())
+        })?;
+        let contract = eliot_maintenance::CONTRACT_VERSION;
+        let commit = Self {
+            trigger_id: decision.trigger_id.clone(),
+            operation_hash: sha256_hex(&decision_bytes),
+            trigger_revision,
+            evaluation_revision: format!("{}.{}.{}", contract.0, contract.1, contract.2),
+            policy_revision: policy.revision.map_or_else(
+                || UNPUBLISHED_POLICY_REVISION.to_owned(),
+                |revision| revision.to_string(),
+            ),
+            scope_ref: decision.scope_ref.clone(),
+            job_ref,
+            recommendation_ref,
+            wake_ref,
+            decision_json,
+        };
+        commit.validate()?;
+        Ok(commit)
+    }
+
+    fn validate(&self) -> Result<(), CompositionError> {
+        for (value, field) in [
+            (&self.trigger_id, "trigger_id"),
+            (&self.evaluation_revision, "evaluation_revision"),
+            (&self.policy_revision, "policy_revision"),
+            (&self.scope_ref, "scope_ref"),
+            (&self.decision_json, "decision_json"),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(CompositionError::Owner(format!(
+                    "maintenance decision commit {field} is blank or contains control characters"
+                )));
+            }
+        }
+        if !is_sha256(&self.operation_hash) {
+            return Err(CompositionError::Owner(
+                "maintenance decision commit operation_hash is not a lowercase SHA-256 digest"
+                    .to_owned(),
+            ));
+        }
+        if self.trigger_revision == 0 {
+            return Err(CompositionError::Owner(
+                "maintenance decision commit trigger_revision must be positive".to_owned(),
+            ));
+        }
+        if serde_json::from_str::<serde_json::Value>(&self.decision_json).is_err() {
+            return Err(CompositionError::Owner(
+                "maintenance decision commit decision_json is not JSON".to_owned(),
+            ));
+        }
+        let mut intents = 0u32;
+        for (reference, field) in [
+            (&self.job_ref, "job_ref"),
+            (&self.recommendation_ref, "recommendation_ref"),
+            (&self.wake_ref, "wake_ref"),
+        ] {
+            if let Some(reference) = reference {
+                if reference.trim().is_empty() || reference.chars().any(char::is_control) {
+                    return Err(CompositionError::Owner(format!(
+                        "maintenance decision commit {field} is blank or contains control characters"
+                    )));
+                }
+                intents += 1;
+            }
+        }
+        if intents == 0 {
+            return Err(CompositionError::Owner(
+                "maintenance decision commit carries no downstream intent reference".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Deterministic operation identity for one trigger revision. Stable
+    /// across exact retries — the same trigger, revision, and decision bytes
+    /// yield the same identity, so a lost commit response replays
+    /// convergently — and unique across revisions and decisions.
+    pub fn operation_id(&self) -> Result<OperationId, CompositionError> {
+        OperationId::new(format!(
+            "maintenance-trigger-decision-{}-{}-{}",
+            self.trigger_id, self.trigger_revision, self.operation_hash
+        ))
+        .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Renders the exact ten declared `RecordMaintenanceTriggerDecision`
+    /// parameters. The Store catalogue re-validates them (positive decimal
+    /// revision, at least one intent reference); this constructor never
+    /// invents a Store operation or parameter.
+    pub fn mutation_request(&self) -> Result<NamedMutationRequest, CompositionError> {
+        self.validate()?;
+        let mut parameters = BTreeMap::new();
+        for (name, value) in [
+            ("trigger_id", self.trigger_id.clone()),
+            ("operation_hash", self.operation_hash.clone()),
+            ("trigger_revision", self.trigger_revision.to_string()),
+            ("evaluation_revision", self.evaluation_revision.clone()),
+            ("policy_revision", self.policy_revision.clone()),
+            ("scope_ref", self.scope_ref.clone()),
+            ("decision_json", self.decision_json.clone()),
+        ] {
+            parameters.insert(name.to_owned(), serde_json::Value::String(value));
+        }
+        for (name, reference) in [
+            ("job_ref", &self.job_ref),
+            ("recommendation_ref", &self.recommendation_ref),
+            ("wake_ref", &self.wake_ref),
+        ] {
+            if let Some(reference) = reference {
+                parameters.insert(name.to_owned(), serde_json::Value::String(reference.clone()));
+            }
+        }
+        let request = NamedMutationRequest {
+            operation: NamedMutationOperation::RecordMaintenanceTriggerDecision,
+            parameters,
+        };
+        request.validate().map_err(|error| {
+            CompositionError::Owner(format!("maintenance decision mutation request: {error}"))
+        })?;
+        Ok(request)
+    }
+}
+
+/// Validates the exact canonical receipt before the trigger ack (#1694 W4).
+///
+/// An arbitrary receipt ID or a bare `Ok(())` is insufficient: the receipt
+/// must validate, carry `Committed` status, and bind the submitted operation
+/// identity, idempotency key, fence, transition class, manifest digest, and
+/// the recomputed admission/plan digests of the prepared transition. The
+/// applied commands prove the decision row persisted; they do not prove a
+/// job executed or a recommendation/wake delivered.
+pub fn check_maintenance_trigger_decision_receipt(
+    receipt: &WriteReceipt,
+    transition: &PreparedTransition,
+) -> Result<(), CompositionError> {
+    receipt.validate().map_err(|error| {
+        CompositionError::Recovery(format!("maintenance decision receipt invalid: {error}"))
+    })?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(CompositionError::Recovery(format!(
+            "maintenance decision receipt status is {:?}, not committed",
+            receipt.status
+        )));
+    }
+    if receipt.operation_id != transition.identity.operation_id
+        || receipt.idempotency_key != transition.identity.idempotency_key
+        || receipt.state_fence != transition.state_fence
+    {
+        return Err(CompositionError::Recovery(
+            "maintenance decision receipt does not bind the committed trigger decision identity"
+                .to_owned(),
+        ));
+    }
+    if receipt.transition_class != TransitionClass::RecoverySchema
+        || receipt.transition_class != transition.transition_class
+    {
+        return Err(CompositionError::Recovery(
+            "maintenance decision receipt has the wrong transition class".to_owned(),
+        ));
+    }
+    if receipt.operation_manifest_digest != transition.operation_manifest_digest
+        || receipt.admission_digest != transition.admission_digest
+        || receipt.mutation_plan_digest != transition.mutation_plan_digest
+    {
+        return Err(CompositionError::Recovery(
+            "maintenance decision receipt does not bind the committed canonical digests".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// All N4 owners, each represented by one field and one mutable projection.
 pub struct GovernorOwners<P: ?Sized> {
     /// `WorkScope` identity/binding owner.
@@ -7001,6 +7255,62 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 missing_inputs,
             }),
         }
+    }
+
+    /// Commits one retained trigger decision before its delivery ack (#1694 W4).
+    ///
+    /// Builds the Governor `PreparedTransition` (through the Canonical owner)
+    /// → Kernel → named `RecordMaintenanceTriggerDecision` Store transaction
+    /// from the typed commit, then validates the exact canonical receipt
+    /// before returning it. The caller acks the trigger only on this
+    /// receipt; a transport acknowledgement is never sufficient. A lost or
+    /// ambiguous commit response stays pending/reconciling: the caller looks
+    /// the decision up by [`MaintenanceTriggerDecisionCommit::operation_id`]
+    /// instead of committing again blindly.
+    pub async fn commit_maintenance_trigger_decision(
+        &self,
+        identity: &RequestIdentity,
+        commit: &MaintenanceTriggerDecisionCommit,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let request = commit.mutation_request()?;
+        let operation_id = commit.operation_id()?;
+        let manifest_digest =
+            operation_manifest_set_digest(&generated_operation_manifests().map_err(|error| {
+                CompositionError::Owner(format!("operation manifest set unavailable: {error}"))
+            })?)
+            .map_err(|error| CompositionError::Owner(format!("operation manifest digest: {error}")))?;
+        let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let envelope = CanonicalWriteEnvelope {
+            operation_id: operation_id.clone(),
+            request: identity.request.metadata.clone(),
+            idempotency_key: identity.idempotency_key.clone(),
+            scope_id,
+            task_id: None,
+            transition_class: TransitionClass::RecoverySchema,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: commit.operation_hash.clone(),
+            operation_manifest_digest: manifest_digest,
+            semantic_commands: vec![request],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        };
+        // Expected digests recomputed from the exact envelope the Canonical
+        // owner prepares: the receipt must bind these, not an arbitrary ID.
+        let prepared = self.owners.canonical.prepare(&envelope)?;
+        let receipt = self.commit_canonical(identity, envelope).await?;
+        check_maintenance_trigger_decision_receipt(&receipt, &prepared)?;
+        Ok(receipt)
     }
 
     /// Checks the task, session, and `WorkScope` owners backing a native
