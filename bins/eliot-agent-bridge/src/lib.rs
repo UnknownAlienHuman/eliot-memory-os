@@ -49,11 +49,15 @@ use eliot_contracts::{
     BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
     RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_governor::{
+    CapabilityRouteRegistry, ExecutionIdentity, RouteBehaviorFingerprint, RouteInstallationIdentity,
+    RuntimeRoute,
+};
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
-    AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
-    AgentBridgePeerChallenge, EncodingProfile, EventEnvelope, Frame, FrameKind, MessageType,
-    ProtocolPayload, ProtocolVersion, RequestIdentity,
+    AGENT_BRIDGE_MODULE_ID, AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
+    AgentBridgePeerChallenge, ContinuityKind, EncodingProfile, EventEnvelope, Frame, FrameKind,
+    MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
 use eliot_runtime::{Runtime, RuntimeConfig};
@@ -79,6 +83,7 @@ pub use bridge_contract::{
 };
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, parse_args};
+use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_resume};
 use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
@@ -4715,6 +4720,35 @@ pub struct BridgeRunner {
     /// over records the OWNER already holds durably, never a second store, and
     /// a rotated correlation is unknown rather than degraded.
     correlations: mcp_correlation::CorrelationTracker,
+    /// Retained bridge capability registry (issue #1816, W1).
+    ///
+    /// The Governor owns the registry types and validators; the bridge owns
+    /// only this retained call into them. Every launch is defined through
+    /// [`admit_bridge_route_launch`] before it runs, so an `interactive_user`
+    /// contour route without its User Broker delegation is refused here
+    /// instead of launching.
+    route_registry: CapabilityRouteRegistry,
+    /// The contour's own declared route (see [`bridge_contour_declaration`]).
+    bridge_route: RuntimeRoute,
+    /// The contour's own installation identity (see [`bridge_contour_declaration`]).
+    route_installation: RouteInstallationIdentity,
+    /// User Broker class the contour launch resolved to, if any.
+    ///
+    /// Always `None`: the contour launch path (declaration, front-door
+    /// handshake, Kernel activation) performs no User Broker delegation, so
+    /// there is no delegation to thread. This is a true statement about the
+    /// path, not a default: an `interactive_user` declaration therefore
+    /// refuses through [`admit_bridge_route_launch`], exactly as I10.3
+    /// requires.
+    delegated_user_broker_class: Option<String>,
+    /// Fingerprint persisted for the last admitted launch (issue #1816, W3).
+    ///
+    /// The complete W3 material returned by [`admit_bridge_route_launch`].
+    /// [`BridgeRunner::reconnect`] classifies resume against it through
+    /// [`classify_bridge_route_resume`], so a fingerprint move can never
+    /// silently continue. Process memory only, like the rest of the attach
+    /// state: a new process admits a new launch.
+    active_route_fingerprint: Option<RouteBehaviorFingerprint>,
 }
 
 /// Owner-supplied bootstrap inputs sealed to the live attach binding.
@@ -4906,6 +4940,117 @@ fn attach_route_payload_measurement(bootstrap: &mut UnderstandingBootstrap) {
     ));
 }
 
+/// Declares the bridge contour's own route, installation, and delegation (issue #1816).
+///
+/// The contour is one route endpoint: this binary's launch path attaches
+/// sessions and its resume path reconnects them, so the gate needs the
+/// contour's own declared material. Every facet below is either threaded
+/// from an existing owner or an explicit labelled assumption; nothing is a
+/// second scheme and no host, caller, or wire text is trusted for any of it.
+///
+/// Threaded from existing owners (never invented):
+///
+/// - `route_id` and `adapter_id`: [`AGENT_BRIDGE_MODULE_ID`] plus
+///   [`Profile::as_str`], the admitted contour identity.
+/// - `privacy_classes` / `quota_sources`: empty. The contour claims no
+///   privacy or quota scope of its own; empty lists are vacuously
+///   well-formed, so this declares nothing instead of inventing some.
+/// - `adapter_version` / `runtime_version`: `CARGO_PKG_VERSION`. The
+///   contour's adapter and runtime are this binary, so its crate version pins
+///   both; a version bump moves the fingerprint and forces re-admission.
+/// - `host_family` / `os_architecture`: `std::env::consts::OS` /
+///   `std::env::consts::ARCH`, the observed target values.
+/// - `transport_kind`: the admitted Kernel transport is always the
+///   front-door named pipe (`kernel_ports_with_declaration` connects exactly
+///   one `NamedPipeTransport`). The agent-facing transport varies by
+///   composition and is owned by `main.rs`, so it is not pinned here (see
+///   residual below).
+/// - `feature_flags_and_behavior_affecting_profiles`: [`Profile::as_str`].
+///   The two compiled profiles are cfg-gated behavior selectors
+///   (`Profile::is_compiled`), so the profile name is the contour's real
+///   behavior flag.
+///
+/// Explicit assumptions (docs-silent facets, stable contour-namespaced
+/// markers so this fingerprint can never collide with an adapter route's):
+///
+/// - `execution_identity = service` (ASSUMPTION): I10.3 admits
+///   `interactive_user` launches only through the authorized User Broker of
+///   I1.3, and this contour's launch path performs no User Broker delegation
+///   (no broker symbol exists anywhere in the bridge launch flow), so the
+///   contour cannot honestly declare `interactive_user`; it is not remote
+///   either (every contour transport is local: remote transports are
+///   forbidden by `CliError::RemoteTransportForbidden`). A future
+///   `interactive_user` declaration without delegation still refuses.
+/// - `required_user_broker_class = "eliot-user-broker"` (ASSUMPTION): names
+///   the real I1.3 owner (`bins/eliot-user-broker`) without claiming any
+///   delegation; unused for a `service` route.
+/// - `retention_policy = "...process-memory-only"` (ASSUMPTION): the contour
+///   retains nothing durable; replay, session, and receipt state are process
+///   memory only and die with this process.
+/// - `network_policy = "...local-only-no-remote"` (ASSUMPTION): grounded in
+///   the CLI contract's remote-transport ban; every admissible contour
+///   transport is local.
+/// - `session_locator_semantics = "...kernel-issued-activation"`
+///   (ASSUMPTION): sessions arrive only from Kernel activation and are never
+///   minted locally.
+/// - `workspace_scope_policy = "...activation-bound-scope"` (ASSUMPTION):
+///   scope arrives via the activation-resolved task binding; the contour
+///   mints none.
+/// - `serializer_fingerprint = "...frame-json-v1"` (ASSUMPTION): names the
+///   contour's actual frame encoding (`EncodingProfile::JsonV1`); the contour
+///   defines no reasoning serializer.
+/// - `provider_and_model_request`, `auth_profile_class`, `billing_mode`,
+///   `required_capability_profile_ref`, `adapter_hash`, `runtime_hash`, `protocol_kind`,
+///   `tool_call_id_and_role_ordering`,
+///   `reasoning_continuation_and_compaction` (ASSUMPTIONs): the contour is
+///   provider-agnostic transport and owns none of these; each carries a
+///   stable marker naming the real contour mechanism where one exists
+///   (front-door admission, process identity, crate version, the
+///   MCP-stdio-to-Kernel-IPC boundary) so the fingerprint is stable per
+///   binary and profile.
+///
+/// Residual (not widened by this turn): the agent-facing transport profile
+/// (stdio vs loopback HTTP) is owned by the composition root and is not
+/// pinned in this fingerprint; threading it is future scope.
+fn bridge_contour_declaration(
+    profile: Profile,
+) -> (RuntimeRoute, RouteInstallationIdentity, Option<String>) {
+    let contour = AGENT_BRIDGE_MODULE_ID;
+    let version = env!("CARGO_PKG_VERSION").to_owned();
+    let route = RuntimeRoute {
+        route_id: format!("{}.{}", contour, profile.as_str()),
+        adapter_id: contour.to_owned(),
+        provider_and_model_request: format!("{}.no-provider-request", contour),
+        auth_profile_class: format!("{}.front-door-admission", contour),
+        billing_mode: format!("{}.no-billing", contour),
+        account_mode: format!("{}.process-identity", contour),
+        execution_identity: ExecutionIdentity::Service,
+        required_user_broker_class: "eliot-user-broker".to_owned(),
+        retention_policy: format!("{}.process-memory-only", contour),
+        network_policy: format!("{}.local-only-no-remote", contour),
+        session_locator_semantics: format!("{}.kernel-issued-activation", contour),
+        workspace_scope_policy: format!("{}.activation-bound-scope", contour),
+        serializer_fingerprint: format!("{}.frame-json-v1", contour),
+        privacy_classes: Vec::new(),
+        quota_sources: Vec::new(),
+        required_capability_profile_ref: format!("{}.kernel-front-door-admission", contour),
+    };
+    let installation = RouteInstallationIdentity {
+        host_family: std::env::consts::OS.to_owned(),
+        adapter_version: version.clone(),
+        adapter_hash: version.clone(),
+        protocol_kind: format!("{}.mcp-stdio-to-kernel-ipc", contour),
+        transport_kind: format!("{}.kernel-named-pipe", contour),
+        runtime_version: version.clone(),
+        runtime_hash: version,
+        os_architecture: std::env::consts::ARCH.to_owned(),
+        tool_call_id_and_role_ordering: format!("{}.no-contour-tool-ordering", contour),
+        reasoning_continuation_and_compaction: format!("{}.no-contour-reasoning", contour),
+        feature_flags_and_behavior_affecting_profiles: profile.as_str().to_owned(),
+    };
+    (route, installation, None)
+}
+
 impl BridgeRunner {
     pub fn new(
         profile: Profile,
@@ -4945,6 +5090,8 @@ impl BridgeRunner {
             DURABLE_OBSERVATION_CURSOR_PHASE,
         )
         .map_err(RuntimeBuildError::BridgeContract)?;
+        let (bridge_route, route_installation, delegated_user_broker_class) =
+            bridge_contour_declaration(profile);
         Ok(Self {
             profile,
             runtime,
@@ -4953,6 +5100,11 @@ impl BridgeRunner {
             bootstrap_session: BootstrapSession::default(),
             bootstrap_snapshot: None,
             correlations: mcp_correlation::CorrelationTracker::default(),
+            route_registry: CapabilityRouteRegistry::new(),
+            bridge_route,
+            route_installation,
+            delegated_user_broker_class,
+            active_route_fingerprint: None,
         })
     }
     #[must_use]
@@ -4975,12 +5127,49 @@ impl BridgeRunner {
                 .map_err(|e| BridgeError::ProviderContract(e.to_string()))?,
         ))
     }
+    /// Attaches one demand: the real bridge route launch path (issue #1816, W1).
+    ///
+    /// The contour route is admitted through [`admit_bridge_route_launch`]
+    /// against the retained registry BEFORE the core attaches, so a refused
+    /// route never launches. The persisted fingerprint is retained for
+    /// [`BridgeRunner::reconnect`].
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
+        let fingerprint = admit_bridge_route_launch(
+            &mut self.route_registry,
+            &self.bridge_route,
+            &self.route_installation,
+            self.delegated_user_broker_class.as_deref(),
+        )
+        .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         let view = self.core.attach(request)?;
+        self.active_route_fingerprint = Some(fingerprint);
         self.reset_bootstrap_gate_on_session_change();
         Ok(view)
     }
+    /// Reconnects under a replacement connection: the real bridge resume path
+    /// (issue #1816, W4).
+    ///
+    /// The live route is classified against the launch fingerprint through
+    /// [`classify_bridge_route_resume`]. An unchanged fingerprint keeps
+    /// native resume; any divergence refuses with an explicit
+    /// rehydrated/new-attempt state instead of silently continuing under the
+    /// previous session identity.
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
+        let route_moved = match &self.active_route_fingerprint {
+            Some(prior) => {
+                let next =
+                    RouteBehaviorFingerprint::of(&self.bridge_route, &self.route_installation);
+                classify_bridge_route_resume(prior, &next) == ContinuityKind::Rehydrated
+            }
+            None => false,
+        };
+        if route_moved {
+            return Err(BridgeError::ProviderContract(
+                "bridge route fingerprint moved since launch: resume refuses silent \
+                 continuity; re-attach for an explicit rehydrated new attempt"
+                    .to_owned(),
+            ));
+        }
         self.core.reconnect(request)
     }
     pub fn reconcile_external(&mut self) -> Result<AttachView, BridgeError> {
