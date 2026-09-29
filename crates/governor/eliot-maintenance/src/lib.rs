@@ -31,8 +31,8 @@ mod trigger_intake;
 
 pub use result_obligation::{
     FOLLOW_UP_PENDING_REASON, MAINTENANCE_OBLIGATION_CONTRACT_VERSION, MAX_RESULT_OBLIGATIONS,
-    NOT_APPLICABLE_REASON, SOURCE_EVALUATION_METHOD, SOURCE_EVALUATION_METHOD_REVISION,
-    MaintenanceResultObligation, maintenance_observation_record,
+    MaintenanceResultObligation, NOT_APPLICABLE_REASON, SOURCE_EVALUATION_METHOD,
+    SOURCE_EVALUATION_METHOD_REVISION, maintenance_observation_record,
 };
 
 pub use end_of_activity::{
@@ -602,9 +602,7 @@ pub fn decision_result_obligation(
     state_fence: &StateFence,
 ) -> MaintenanceResultObligation {
     let decision_ref = maintenance_decision_ref(decision);
-    let publication_id = format!(
-        "maintenance-result:{decision_ref}:not-attempted"
-    );
+    let publication_id = format!("maintenance-result:{decision_ref}:not-attempted");
     MaintenanceResultObligation {
         contract_version: result_obligation::MAINTENANCE_OBLIGATION_CONTRACT_VERSION,
         publication_id: publication_id.clone(),
@@ -620,8 +618,7 @@ pub fn decision_result_obligation(
         actual_effect_refs: Vec::new(),
         checkpoint_refs: Vec::new(),
         reconciliation_refs: Vec::new(),
-        execution_outcome:
-            eliot_observation_contracts::MaintenanceExecutionOutcome::NotAttempted,
+        execution_outcome: eliot_observation_contracts::MaintenanceExecutionOutcome::NotAttempted,
         delivery: eliot_observation_contracts::MaintenanceDeliveryState::Pending {
             obligation_ref: publication_id,
         },

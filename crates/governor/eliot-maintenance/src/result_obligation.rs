@@ -310,7 +310,12 @@ pub(crate) fn append_result_obligation(
         match execution_outcome {
             MaintenanceExecutionOutcome::Completed | MaintenanceExecutionOutcome::Failed => {
                 let reference = job.outcome_ref.clone();
-                (reference.clone(), reference.into_iter().collect(), Vec::new(), Vec::new())
+                (
+                    reference.clone(),
+                    reference.into_iter().collect(),
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
             MaintenanceExecutionOutcome::Partial => (
                 None,
@@ -325,7 +330,12 @@ pub(crate) fn append_result_obligation(
                 // The evidence that made the outcome unknown is reconciliation
                 // evidence, not an effect the attempt produced.
                 let reference = job.outcome_ref.clone();
-                (reference.clone(), Vec::new(), Vec::new(), reference.into_iter().collect())
+                (
+                    reference.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    reference.into_iter().collect(),
+                )
             }
             _ => (None, Vec::new(), Vec::new(), Vec::new()),
         };
@@ -339,7 +349,10 @@ pub(crate) fn append_result_obligation(
         job_ref: Some(job.job_id.clone()),
         // Derived from the same source facts as the publication identity, so the
         // two can never disagree about which attempt produced this result.
-        attempt_ref: Some(format!("maintenance-attempt:{}:{}", job.job_id, job.attempts)),
+        attempt_ref: Some(format!(
+            "maintenance-attempt:{}:{}",
+            job.job_id, job.attempts
+        )),
         execution_receipt_ref,
         state_fence: job.state_fence.clone(),
         source_outcome_revision: format!("{}:{}", job.state, job.attempts),
@@ -416,9 +429,7 @@ pub(crate) fn append_reconciliation_obligation(
 }
 
 /// The obligation this job most recently appended, if any.
-pub(crate) fn latest_obligation(
-    job: &MaintenanceJob,
-) -> Option<&MaintenanceResultObligation> {
+pub(crate) fn latest_obligation(job: &MaintenanceJob) -> Option<&MaintenanceResultObligation> {
     job.result_obligations.last()
 }
 
@@ -566,7 +577,11 @@ pub fn maintenance_observation_record(
         },
         producer_generation_and_trace: ProducerTrace {
             producer: crate::CONTRACT_NAME.to_owned(),
-            generation: obligation.state_fence.resource_generation.value().to_string(),
+            generation: obligation
+                .state_fence
+                .resource_generation
+                .value()
+                .to_string(),
             trace_ref: Some(obligation.publication_id.clone()),
         },
         kind: ObservationKind::Maintenance,

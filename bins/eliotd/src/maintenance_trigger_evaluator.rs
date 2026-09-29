@@ -38,10 +38,10 @@ use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_governor::{CompositionError, KernelPortError, KernelTransitionPort};
 use eliot_maintenance::{
     AutomationTriggerDecision, CONTRACT_NAME, CONTRACT_VERSION, MaintenanceBrokerEvidence,
-    MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily,
-    MaintenancePolicyEvidence, MaintenanceResultObligation, MaintenanceRouteEvidence,
-    MaintenanceSafetyEvidence, MaintenanceScheduleEvidence, MaintenanceTrigger,
-    MaintenanceTriggerInput, decision_result_obligation, maintenance_observation_record,
+    MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily, MaintenancePolicyEvidence,
+    MaintenanceResultObligation, MaintenanceRouteEvidence, MaintenanceSafetyEvidence,
+    MaintenanceScheduleEvidence, MaintenanceTrigger, MaintenanceTriggerInput,
+    decision_result_obligation, maintenance_observation_record,
 };
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
@@ -377,8 +377,10 @@ fn publication_identity(
     state_fence: &eliot_contracts::StateFence,
 ) -> Result<eliot_protocol::RequestIdentity, ProtocolError> {
     let now = crate::unix_ms_i64();
-    let operation_text =
-        format!("{}:maintenance-result:{publication_id}", crate::SERVICE_NAME);
+    let operation_text = format!(
+        "{}:maintenance-result:{publication_id}",
+        crate::SERVICE_NAME
+    );
     let invalid = |field: &'static str| ProtocolError::InvalidField {
         field,
         reason: "maintenance result publication identity is not a valid contract value",
