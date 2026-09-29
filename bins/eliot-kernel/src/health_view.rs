@@ -438,6 +438,29 @@ impl KernelComposition {
         }
     }
 
+    /// Projects the auditable I12.14 hot-spine binding (issue #1733, step 7).
+    ///
+    /// View-only: the section is exactly the bound projection the hot-path
+    /// runtime owner produces, and it re-binds on every read, so a queue or
+    /// operation revision that changed after startup is reported as
+    /// `unbound` rather than as a still-valid binding. An unbound spine is
+    /// reported as `unbound`, never as an idle-but-healthy hot path
+    /// (I16.11): the absence of a validated declaration is itself the finding.
+    /// The projection carries only bounded privacy-safe fields — operation
+    /// names, contract versions, the numeric bounds this process enforces and
+    /// the owner's closed-vocabulary degradation codes.
+    #[must_use]
+    #[cfg(windows)]
+    pub fn hot_path_binding_projection(&self) -> serde_json::Value {
+        let binding = self.bound_hot_path_binding();
+        let status = binding
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        observe_health("kernel.health.hot_path_binding_projected", status);
+        binding
+    }
+
     /// Projects the restricted Recovery View for surviving Host/Watchdog
     /// interactions while the Kernel is unavailable (I1.13).
     ///

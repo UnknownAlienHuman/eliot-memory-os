@@ -53,6 +53,8 @@
 //! deadline is `Timeout`. No error prose drives routing.
 
 use super::diagnostic_brief::DiagnosticTrigger;
+use super::hot_path_runtime;
+use super::hot_path_runtime::HotPathCharge;
 use super::kernel_audit::AuditEventDraft;
 use super::trace_manifest::TraceManifest;
 use super::{
@@ -231,23 +233,14 @@ const BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED: &str = "rejected";
 /// against the constant this module really enforces rather than a second copy.
 pub(super) const MAX_QUEUED_LOCAL_READS: usize = 64;
 
-/// Measures the exact retained bytes of one local-read admission.
+/// The retained queued local-read bound, as the hot spine's registration sees
+/// it.
 ///
-/// I12.14 requires the request-byte bound to be checked *before* expensive
-/// decoding, so this measures the admitted envelope and tool payload the owner
-/// already received and nothing is interpreted from them. The measurement is a
-/// canonical serialization length, not a digest: a digest would be opaque where
-/// the bound needs a size, and a size can never stand in for the exact value the
-/// owner later releases.
-fn local_read_request_bytes(
-    envelope: &HostRequestEnvelope,
-    tool: &serde_json::Value,
-) -> Result<u64, TransportError> {
-    let envelope_bytes = serde_json::to_vec(envelope).map_err(|_| TransportError::SessionFenced)?;
-    let tool_bytes = serde_json::to_vec(tool).map_err(|_| TransportError::SessionFenced)?;
-    u64::try_from(envelope_bytes.len() + tool_bytes.len())
-        .map_err(|_| TransportError::SessionFenced)
-}
+/// I12.14 binds the checked-in declaration against the bound this route
+/// actually enforces, so the running-build side reads it from here rather than
+/// from the declaration. A declaration that names a different item bound fails
+/// the bind instead of being enforced as written.
+pub(crate) const KERNEL_HOT_PATH_MAX_QUEUED_LOCAL_READS: u64 = MAX_QUEUED_LOCAL_READS as u64;
 
 /// Returns whether the operation string selects the P-04 host-request route.
 ///
@@ -323,11 +316,27 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) request_digest: String,
     pub(crate) local_read_envelope: Option<HostRequestEnvelope>,
     pub(crate) local_read_tool: Option<serde_json::Value>,
-    /// The exact byte count this pair's admission acquired from the I12.14
-    /// bound ledger. It is recorded at admission and never recomputed, so the
-    /// owner-safe release returns what was actually charged rather than a
-    /// fresh measurement that could differ.
-    pub(crate) local_read_held_bytes: u64,
+    /// The I12.14 hot-spine charge this pair holds, minted at its own
+    /// admission.
+    ///
+    /// The bound is over pending *plus* claimed/in-flight items, so the charge
+    /// is retained from admission until this pair is retired, fenced or
+    /// expired — never dropped when the daemon claims it. The recorded byte
+    /// count is the value reserved at admission, so the release returns that
+    /// same value rather than recomputing it from a body that may since have
+    /// changed. `None` on a pair that was admitted before the spine bound, and
+    /// on every pair that is not a local-read pair.
+    ///
+    /// A charge is set on this field in exactly one place — the local-read
+    /// enqueue — and it is only ever set together with `local_read_envelope`.
+    /// Every lane's enqueue refuses the other lanes' kinds, so a retained
+    /// record carries exactly one lane and a charge can never ride along on a
+    /// pair that another lane's eviction or retirement then drops. That
+    /// single-lane invariant is what makes the lane-specific removal paths
+    /// (`refs.remove` / `retain` in the observe, campaign-packet, task-
+    /// controller and finish owners) safe to leave unreleased: a record those
+    /// paths drop never held a charge in the first place.
+    pub(crate) local_read_charge: Option<HotPathCharge>,
     /// Governed attempt ownership for an admitted query or Skill lifecycle
     /// pair. This queue is never used for campaign packets.
     pub(crate) local_read_attempt: LocalReadAttemptState,
@@ -374,6 +383,20 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) finish_envelope: Option<HostRequestEnvelope>,
     pub(crate) finish_tool: Option<serde_json::Value>,
     pub(crate) finish_attempt: LocalReadAttemptState,
+}
+
+/// Whether a charged enqueue kept its reservation or adopted one.
+///
+/// A second admission of an already-retained pair is idempotent, so it must
+/// not stack a second charge on the same queue slot. The disposition is what
+/// tells the caller which of the two happened, so the redundant reservation
+/// is returned at the value recorded for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalReadEnqueueDisposition {
+    /// The charged pair was retained, and now holds this charge.
+    ChargeAdopted,
+    /// The identical pair was already retained, so this charge is redundant.
+    AlreadyRetained,
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -1493,30 +1516,41 @@ impl KernelComposition {
     /// is fenced to `Unknown` under the same owner-continuation rules as the
     /// per-connection fence. Like revocation, this never fails.
     pub(super) fn fence_all_host_requests(&self) -> Result<(), TransportError> {
-        let (outstanding, poisoned) = match self.host_request_connection_index.lock() {
-            Ok(mut index) => (
-                std::mem::take(&mut *index)
-                    .into_values()
-                    .flatten()
-                    .collect::<Vec<_>>(),
-                false,
-            ),
-            Err(poisoned) => {
-                let mut index = poisoned.into_inner();
+        let drained = match self.host_request_connection_index.lock() {
+            Ok(mut index) => {
+                let charges = Self::drain_local_read_charges(&index);
                 (
                     std::mem::take(&mut *index)
                         .into_values()
                         .flatten()
                         .collect::<Vec<_>>(),
+                    charges,
+                    false,
+                )
+            }
+            Err(poisoned) => {
+                let mut index = poisoned.into_inner();
+                let charges = Self::drain_local_read_charges(&index);
+                (
+                    std::mem::take(&mut *index)
+                        .into_values()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                    charges,
                     true,
                 )
             }
         };
-        // I12.14 step 5: this promotion takes the whole index, so these pairs'
-        // admission charges are returned here from the byte counts recorded at
-        // admission. Without this the ledger would keep charging for pairs the
-        // index no longer holds and the bound would ratchet down to refusal.
-        self.release_local_read_capacity_for_refs(&outstanding);
+        let (outstanding, charges, poisoned) = drained;
+        // I12.14: this path takes the entire index, so every charge it removes
+        // is released here — at the value recorded at each pair's own
+        // admission. Fencing a profile promotion is an owner-safe release:
+        // the drained pairs are fenced to `Unknown` and can never complete,
+        // so holding their capacity would ratchet the bound to permanent
+        // refusal with no work behind it.
+        for charge in charges {
+            self.release_local_read_charge(charge);
+        }
         for operation_ref in &outstanding {
             fence_one_host_request(self, operation_ref);
         }
@@ -1537,18 +1571,32 @@ impl KernelComposition {
     /// rules. Revocation never fails: every store error is contained because
     /// fencing must hold even when the store is unavailable.
     pub(super) fn fence_host_requests_for_connection(&self, connection_id: &str) {
-        let outstanding = match self.host_request_connection_index.lock() {
-            Ok(mut index) => index.remove(connection_id).unwrap_or_default(),
+        let drained = match self.host_request_connection_index.lock() {
+            Ok(mut index) => {
+                let removed = index.remove(connection_id).unwrap_or_default();
+                let charges = removed
+                    .iter()
+                    .filter_map(|candidate| candidate.local_read_charge)
+                    .collect::<Vec<_>>();
+                (removed, charges)
+            }
             Err(poisoned) => {
                 let mut index = poisoned.into_inner();
-                index.remove(connection_id).unwrap_or_default()
+                let removed = index.remove(connection_id).unwrap_or_default();
+                let charges = removed
+                    .iter()
+                    .filter_map(|candidate| candidate.local_read_charge)
+                    .collect::<Vec<_>>();
+                (removed, charges)
             }
         };
-        // I12.14 step 5: fencing removes these pairs from the index, so their
-        // admission charges are returned here from the byte counts recorded at
-        // admission. Without this the ledger would keep charging for pairs the
-        // index no longer holds and the bound would ratchet down to refusal.
-        self.release_local_read_capacity_for_refs(&outstanding);
+        let (outstanding, charges) = drained;
+        // A disconnected connection's pairs are fenced to `Unknown` and can
+        // never complete, so this is an owner-safe release: each drained
+        // charge returns at the value recorded at its own admission.
+        for charge in charges {
+            self.release_local_read_charge(charge);
+        }
         for operation_ref in &outstanding {
             fence_one_host_request(self, operation_ref);
         }
@@ -2376,7 +2424,7 @@ impl KernelComposition {
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: None,
                 local_read_tool: None,
-                local_read_held_bytes: 0,
+                local_read_charge: None,
                 local_read_attempt: LocalReadAttemptState::default(),
                 observe_envelope: None,
                 observe_tool: None,
@@ -2427,72 +2475,7 @@ impl KernelComposition {
     }
 }
 
-/// What the live index already holds for an incoming local-read enqueue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocalReadReplay {
-    /// The same operation and envelope are staged on a different connection.
-    ConflictingConnection,
-    /// The same operation and envelope are already staged on this connection.
-    AlreadyStaged,
-    /// Nothing matching is staged; the pair is a fresh admission.
-    Fresh,
-}
-
-impl std::fmt::Display for LocalReadReplay {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ConflictingConnection => {
-                formatter.write_str("the same local read is staged on another connection")
-            }
-            Self::AlreadyStaged => formatter.write_str("the local read is already staged"),
-            Self::Fresh => formatter.write_str("the local read is a fresh admission"),
-        }
-    }
-}
-
 impl KernelComposition {
-    /// Classifies an enqueue against the pair the live index already holds.
-    ///
-    /// The comparison is by content, never by name: the same operation id and
-    /// the same envelope digest, staged on a different connection, is a
-    /// conflict rather than a replay. Extracted so the enqueue path keeps its
-    /// capacity accounting in one readable block; the logic is unchanged.
-    fn classify_local_read_replay(
-        index: &std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
-        envelope: &HostRequestEnvelope,
-        operation_id: &str,
-    ) -> LocalReadReplay {
-        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
-            refs.iter()
-                .find(|candidate| {
-                    candidate.operation_id == operation_id
-                        && candidate.request_digest == envelope.envelope_sha256
-                })
-                .map(|_| connection_id.clone())
-        });
-        let Some(existing_connection) = existing_connection.as_deref() else {
-            return LocalReadReplay::Fresh;
-        };
-        if existing_connection != envelope.connection_id {
-            return LocalReadReplay::ConflictingConnection;
-        }
-        let already_staged =
-            index
-                .get(existing_connection)
-                .into_iter()
-                .flatten()
-                .any(|candidate| {
-                    candidate.operation_id == operation_id
-                        && candidate.request_digest == envelope.envelope_sha256
-                        && candidate.local_read_envelope.is_some()
-                });
-        if already_staged {
-            LocalReadReplay::AlreadyStaged
-        } else {
-            LocalReadReplay::Fresh
-        }
-    }
-
     fn enqueue_local_read_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
@@ -2504,6 +2487,68 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         }
+        // I12.14: the declared byte bound is checked against the *wire* size,
+        // before the pair is retained and before any read work is claimed, so
+        // an over-sized request is refused rather than queued and bounded
+        // afterwards. The charge is minted here and travels with this pair
+        // until its own owner-safe release, which is what makes the bound
+        // cover pending *plus* claimed/in-flight items.
+        let charge = self.charge_local_read_admission(envelope)?;
+        match self.enqueue_local_read_pair_charged(envelope, tool, charge) {
+            Ok(LocalReadEnqueueDisposition::ChargeAdopted) => Ok(()),
+            // A pair this composition already retains holds the charge minted
+            // at *its* admission, so this one is redundant and is returned
+            // immediately rather than stacked on the same queue slot.
+            Ok(LocalReadEnqueueDisposition::AlreadyRetained) => {
+                self.release_local_read_charge(charge);
+                Ok(())
+            }
+            Err(error) => {
+                // A pair that was not retained holds no work, so its
+                // reservation is returned immediately at the value recorded
+                // for it.
+                self.release_local_read_charge(charge);
+                Err(error)
+            }
+        }
+    }
+
+    /// Reserves the I12.14 claim-queue capacity for one incoming pair.
+    ///
+    /// Returns the existing typed backpressure rather than a generic failure
+    /// when the bound is saturated, so a caller waiting on the hot path sees
+    /// the existing `RecoveryDirective` path instead of a detached retry.
+    fn charge_local_read_admission(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<HotPathCharge, TransportError> {
+        let Some(spine) = self.hot_spine.as_ref() else {
+            // No bound spine means this composition advertises no validated
+            // hot path. It does not mean the queue became unbounded: the
+            // route's own `MAX_QUEUED_LOCAL_READS` bound still applies below.
+            return Err(TransportError::Backpressure);
+        };
+        // The charged size is the exact canonical admission payload this
+        // request reserves, not a digest string: a digest is a fixed width and
+        // would make the byte bound independent of the request actually
+        // queued. An envelope that cannot produce its canonical bytes is
+        // refused rather than admitted at a guessed size.
+        let wire_bytes = envelope
+            .canonical_unsigned_bytes()
+            .map_err(|_| TransportError::SessionFenced)?
+            .len();
+        let wire_bytes = u64::try_from(wire_bytes).map_err(|_| TransportError::SessionFenced)?;
+        spine
+            .charge(hot_path_runtime::LOCAL_READ_CLAIM_QUEUE, wire_bytes)
+            .map_err(|_| TransportError::Backpressure)
+    }
+
+    fn enqueue_local_read_pair_charged(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        charge: HotPathCharge,
+    ) -> Result<LocalReadEnqueueDisposition, TransportError> {
         let _admission_owner = self
             .agent_activation_pending
             .lock()
@@ -2514,26 +2559,36 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         let operation_id = host_request_operation_id(envelope);
-        match Self::classify_local_read_replay(&index, envelope, &operation_id) {
-            LocalReadReplay::ConflictingConnection => {
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.clone())
+        });
+        if let Some(existing_connection) = existing_connection.as_deref() {
+            if existing_connection != envelope.connection_id {
                 return Err(TransportError::IdentityConflict);
             }
-            LocalReadReplay::AlreadyStaged => return Ok(()),
-            LocalReadReplay::Fresh => {}
+            if index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.local_read_envelope.is_some()
+                })
+            {
+                return Ok(LocalReadEnqueueDisposition::AlreadyRetained);
+            }
         }
         let queued = index
             .values()
             .flatten()
             .filter(|candidate| candidate.local_read_envelope.is_some())
             .count();
-        // I12.14 step 5: the bound is enforced at the real owner. The exact
-        // retained request bytes are measured and admitted against the bound
-        // ledger BEFORE the pair is staged, so an oversized request is refused
-        // without an expensive decode and without partially acquiring capacity.
-        // The permit is retained until the owner retires the pair, so a claimed
-        // or in-flight item still occupies its slot.
-        let request_bytes = local_read_request_bytes(envelope, tool)?;
-        self.hot_spine.acquire_local_read_capacity(request_bytes)?;
         if queued >= MAX_QUEUED_LOCAL_READS {
             let mut evicted = None;
             for refs in index.values_mut() {
@@ -2541,19 +2596,25 @@ impl KernelComposition {
                     candidate.local_read_envelope.is_some()
                         && !candidate.local_read_attempt.is_live()
                 }) {
-                    evicted = Some(refs.remove(position).local_read_held_bytes);
+                    // An evicted pair held the charge minted at its own
+                    // admission. Dropping the pair without returning it would
+                    // ratchet the bound to permanent refusal, so its exact
+                    // recorded charge is carried out and released once the
+                    // index guard is dropped — the spine ledger is never
+                    // acquired while the index lock is held.
+                    evicted = refs.remove(position).local_read_charge;
                     break;
                 }
             }
-            // Every exit from here must return the permit it just acquired:
-            // an admission that stages nothing must not stay charged. The
-            // evicted pair is an owner-safe release too, and it returns the
-            // byte count recorded at ITS admission, never a recomputed one.
-            let Some(evicted_bytes) = evicted else {
-                self.hot_spine.release_local_read(request_bytes);
+            let Some(evicted_charge) = evicted else {
                 return Err(TransportError::Backpressure);
             };
-            self.hot_spine.release_local_read(evicted_bytes);
+            drop(index);
+            self.release_local_read_charge(evicted_charge);
+            index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
         }
         let refs = index.entry(envelope.connection_id.clone()).or_default();
         let local_read_attempt = LocalReadAttemptState {
@@ -2571,12 +2632,7 @@ impl KernelComposition {
         }) {
             candidate.local_read_envelope = Some(envelope.clone());
             candidate.local_read_tool = Some(tool.clone());
-            // An existing ref is re-staged rather than freshly pushed, so its
-            // previous charge is returned before this admission's charge is
-            // recorded; the ledger then holds exactly one permit for this pair.
-            self.hot_spine
-                .release_local_read(candidate.local_read_held_bytes);
-            candidate.local_read_held_bytes = request_bytes;
+            candidate.local_read_charge = Some(charge);
             candidate.local_read_attempt = local_read_attempt;
         } else {
             refs.push(HostRequestOperationRef {
@@ -2584,7 +2640,7 @@ impl KernelComposition {
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: Some(envelope.clone()),
                 local_read_tool: Some(tool.clone()),
-                local_read_held_bytes: request_bytes,
+                local_read_charge: Some(charge),
                 local_read_attempt,
                 observe_envelope: None,
                 observe_tool: None,
@@ -2607,7 +2663,37 @@ impl KernelComposition {
         // live index at admission, so a sample measures the current contour
         // rather than a total carried forward.
         observe_local_read_queue_gauges(&index, queued);
-        Ok(())
+        Ok(LocalReadEnqueueDisposition::ChargeAdopted)
+    }
+
+    /// Returns one local-read pair's hot-spine charge to the bound queue.
+    ///
+    /// The bytes come from the charge recorded at that pair's own admission,
+    /// never from a recomputation of the body, so a pair that was mutated,
+    /// re-validated or rebuilt between admission and release cannot corrupt
+    /// the ledger. A pair admitted without a spine holds no charge and this
+    /// is a no-op, which is what keeps the absent spine from inventing
+    /// capacity.
+    pub(crate) fn release_local_read_charge(&self, charge: HotPathCharge) {
+        if let Some(spine) = self.hot_spine.as_ref() {
+            spine.release(charge);
+        }
+    }
+
+    /// Returns every local-read charge currently retained in the index.
+    ///
+    /// Used by the whole-index fence paths, which drain the index in one step
+    /// and must return each drained pair's own recorded charge. Collecting
+    /// first and releasing afterwards keeps the spine ledger out of the
+    /// index lock's scope.
+    fn drain_local_read_charges(
+        index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
+    ) -> Vec<HotPathCharge> {
+        index
+            .values()
+            .flatten()
+            .filter_map(|candidate| candidate.local_read_charge)
+            .collect()
     }
 
     /// Revalidates a queued operation's claimed application binding against
@@ -2999,59 +3085,31 @@ impl KernelComposition {
             operation_id,
             request_digest,
         ));
+        let mut released = Vec::new();
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return;
         };
-        self.release_local_read_capacity_locked(&mut index, |candidate| {
-            !(candidate.operation_id == operation_id
-                && candidate.request_digest == request_digest
-                && candidate.local_read_envelope.is_some())
-        });
-    }
-
-    /// Returns the I12.14 bound charge for every local-read pair `remove`
-    /// excludes, and releases exactly that charge.    ///
-    /// I12.14 step 5 makes release an owner action, not a receipt action: the
-    /// byte count returned is the one recorded at each pair's own admission
-    /// (`local_read_held_bytes`) and is never recomputed from the pair's current
-    /// contents, which could differ. The caller owns the `retain` predicate, so
-    /// this releases exactly the pairs that predicate removes and no other —
-    /// there is one release per removed pair and no release for a kept one, so
-    /// the ledger cannot drift away from the index it bounds.
-    fn release_local_read_capacity_locked(
-        &self,
-        index: &mut BTreeMap<String, Vec<HostRequestOperationRef>>,
-        remove: impl Fn(&HostRequestOperationRef) -> bool,
-    ) {
-        let mut released_bytes = 0_u64;
         for refs in index.values_mut() {
+            let mut spent = Vec::new();
             refs.retain(|candidate| {
-                if remove(candidate) {
-                    released_bytes = released_bytes.saturating_add(candidate.local_read_held_bytes);
-                    return false;
+                let retiring = candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.local_read_envelope.is_some();
+                if retiring
+                    && let Some(charge) = candidate.local_read_charge
+                {
+                    spent.push(charge);
                 }
-                true
+                !retiring
             });
+            released.extend(spent);
         }
-        self.hot_spine.release_local_read(released_bytes);
-    }
-
-    /// Returns the I12.14 bound charge for pairs already taken out of the index.
-    ///
-    /// Fencing removes a whole connection's pairs (or the whole index) before it
-    /// can walk them, so there is no `retain` left to observe. The charge is the
-    /// one each pair recorded at its own admission (`local_read_held_bytes`) and
-    /// is never recomputed from the pair's current contents, which could differ.
-    /// Every taken pair is released exactly once, and only local-read pairs carry
-    /// a charge, so the ledger still tracks the index it bounds.
-    fn release_local_read_capacity_for_refs(&self, operation_refs: &[HostRequestOperationRef]) {
-        let released_bytes = operation_refs
-            .iter()
-            .filter(|candidate| candidate.local_read_envelope.is_some())
-            .fold(0_u64, |released, candidate| {
-                released.saturating_add(candidate.local_read_held_bytes)
-            });
-        self.hot_spine.release_local_read(released_bytes);
+        // The spine ledger is released only after the index guard is dropped,
+        // and each charge returns the bytes recorded at its own admission.
+        drop(index);
+        for charge in released {
+            self.release_local_read_charge(charge);
+        }
     }
 
     /// Audits one claimed-lease expiry and retires the dead queue pair.
@@ -3106,18 +3164,14 @@ impl KernelComposition {
         operation_id: &str,
         request_digest: &str,
     ) -> bool {
+        let mut released = Vec::new();
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return false;
         };
-        // I12.14 step 5: a deadline-expired pair is an owner-safe release too. It
-        // can never complete, so the charge its admission took is returned
-        // through the same ledger, from the byte count recorded at that
-        // admission — accumulated in this same pass, so the removal below still
-        // decides `removed` exactly as before and cannot double-release.
-        let mut released_bytes = 0_u64;
         let mut removed = false;
         for refs in index.values_mut() {
             let before = refs.len();
+            let mut spent = Vec::new();
             refs.retain(|candidate| {
                 let lane_present = match lane {
                     ExpiryRetireLane::LocalRead => candidate.local_read_envelope.is_some(),
@@ -3130,22 +3184,25 @@ impl KernelComposition {
                     }
                     ExpiryRetireLane::Finish => candidate.finish_envelope.is_some(),
                 };
-                if candidate.operation_id == operation_id
+                let expiring = candidate.operation_id == operation_id
                     && candidate.request_digest == request_digest
-                    && lane_present
+                    && lane_present;
+                // An expired pair can never complete, so it is owner-safe to
+                // release now. The charge returns the bytes recorded at its
+                // own admission.
+                if expiring
+                    && let Some(charge) = candidate.local_read_charge
                 {
-                    if matches!(lane, ExpiryRetireLane::LocalRead) {
-                        released_bytes =
-                            released_bytes.saturating_add(candidate.local_read_held_bytes);
-                    }
-                    return false;
+                    spent.push(charge);
                 }
-                true
+                !expiring
             });
+            released.extend(spent);
             removed |= refs.len() != before;
         }
-        if matches!(lane, ExpiryRetireLane::LocalRead) {
-            self.hot_spine.release_local_read(released_bytes);
+        drop(index);
+        for charge in released {
+            self.release_local_read_charge(charge);
         }
         if removed {
             // Issue #1837 orphan record reused for expiry cleanup (issue
@@ -3903,7 +3960,7 @@ impl KernelComposition {
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: None,
                 local_read_tool: None,
-                local_read_held_bytes: 0,
+                local_read_charge: None,
                 local_read_attempt: LocalReadAttemptState::default(),
                 observe_envelope: None,
                 observe_tool: None,

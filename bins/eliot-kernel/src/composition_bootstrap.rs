@@ -1482,12 +1482,6 @@ impl KernelComposition {
             EntrypointStage::Composition,
             "kernel.composition.constructed_not_ready",
         );
-        // I12.14 step 4: bind the approved hot-path declaration against the
-        // running build's real registered queue settings before the composition
-        // is constructed. A declaration that does not bind is refused here, so
-        // a composition that exists can only advertise a validated hot spine.
-        #[cfg(windows)]
-        let hot_spine = Self::bind_hot_spine()?;
         observe_entrypoint(EntrypointStage::Composition);
         Ok(Self {
             p07_owner: Mutex::new(None),
@@ -1575,7 +1569,7 @@ impl KernelComposition {
             #[cfg(windows)]
             host_request_connection_index: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]
-            hot_spine,
+            hot_spine: super::hot_path_runtime::bind_kernel_hot_spine(),
             #[cfg(windows)]
             local_read_claim_boot_nonce: {
                 use std::collections::hash_map::DefaultHasher;

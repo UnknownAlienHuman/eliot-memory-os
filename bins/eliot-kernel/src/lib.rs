@@ -275,10 +275,17 @@ mod generation_control;
 mod generation_recovery;
 mod health_view;
 pub use health_view::KernelActivationView;
-#[cfg(windows)]
-mod host_request_route;
+// Issue #1733 (I12.14): the hot-spine binding owner. Gated with the rest of
+// the Kernel transport runtime because the spine it binds is read from
+// `host_request_route`'s retained admission index, and that index only exists
+// on the Windows composition — an ungated module here would compile the whole
+// ledger on a target that can never charge it.
 #[cfg(windows)]
 mod hot_path_runtime;
+#[cfg(windows)]
+use hot_path_runtime::KernelHotSpine;
+#[cfg(windows)]
+mod host_request_route;
 pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
@@ -732,14 +739,14 @@ pub struct KernelComposition {
     /// `Unknown` without enumerating the store.
     #[cfg(windows)]
     host_request_connection_index: Mutex<BTreeMap<String, Vec<HostRequestOperationRef>>>,
-    /// The live I12.14 hot-spine binding and the queue capacity it enforces
-    /// (issue #1733). Bound once during composition assembly against the
-    /// running build's real registered settings, so a composition that exists
-    /// is one whose hot-path declaration genuinely bound. `#[cfg(windows)]`
-    /// because the bounded local-read queue it enforces is itself the
-    /// Windows-only agent-bridge carrier.
+    /// The bound I12.14 hot spine (issue #1733). Holds the admitted
+    /// service-local declaration, the registration it was bound against, and
+    /// the capacity the real admission points charge and the real owner-safe
+    /// release points return. `None` means this composition could not bind its
+    /// own declaration, so it advertises no validated hot path — the absent
+    /// spine never falls back to an unbounded queue.
     #[cfg(windows)]
-    hot_spine: hot_path_runtime::KernelHotSpine,
+    hot_spine: Option<KernelHotSpine>,
     /// Boot-unique seed for local-read attempt identities. Minted once per
     /// composition so attempt IDs never repeat across restarts: a capability
     /// serialized before a restart can never match a claim record minted after

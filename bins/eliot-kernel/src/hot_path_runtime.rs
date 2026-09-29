@@ -1,331 +1,563 @@
-//! I12.14 runtime binding and bound enforcement for the Kernel hot spine.
+//! Runtime binding and capacity enforcement for the I12.14 hot spine.
 //!
-//! Two jobs, both at the real owner, neither a declaration:
+//! `bins/eliot-kernel/hot-path.toml` is the declaration and
+//! `eliot_runtime_contracts::admit_hot_path_manifest` is its only loader, but a
+//! declaration that merely parses admits nothing. This module is the running
+//! side: it binds the approved declaration against the queue and port settings
+//! this process actually enforces
+//! ([`bind_hot_path_manifest_set`](eliot_runtime_contracts::bind_hot_path_manifest_set)),
+//! and it owns the per-queue capacity the real admission points charge and the
+//! real owner-safe release points return.
 //!
-//! 1. **Load and bind at runtime without build tooling** (I12.14 step 4).
-//!    [`KernelHotSpine::bind`] reads this crate's own `hot-path.toml` bytes once
-//!    during composition assembly, admits them through the shared loader, and
-//!    binds the admitted set against the queue settings *this running build*
-//!    registered. No Cargo, no filesystem discovery and no dependency analysis
-//!    happens here or on any later request: the only inputs are the
-//!    compiled-in declaration bytes and the already-registered transport and
-//!    queue limits. A changed queue, profile or operation revision therefore
-//!    cannot keep an old binding, because the binding is recomputed from those
-//!    exact values and refuses a mismatch in either direction.
+//! Three properties this module exists to hold:
 //!
-//! 2. **Enforce the declared bounds at the real owner** (I12.14 step 5).
-//!    [`KernelHotSpine`] holds the one [`HotPathQueueCapacity`] for the Kernel's
-//!    bounded local-read queue. The queue admits through
-//!    [`KernelHotSpine::acquire_local_read_capacity`] before any pair is staged,
-//!    and the charge is retained until the owner retires the pair — not released
-//!    on receipt, and not released on claim, so a claimed or in-flight item
-//!    still occupies its slot. Release happens exactly at the owner's
-//!    safe-release points (completion retire, deadline-expiry retire, and both
-//!    fencing paths that take a whole connection or the whole index out of the
-//!    index), so a saturated queue returns the existing typed
-//!    `TransportError::Backpressure` rather than growing a waiter list, a
-//!    detached retry or a silent eviction. Every release returns the byte count
-//!    recorded at that pair's own admission, never a recomputed one, so the
-//!    ledger cannot drift away from the index it bounds.
-//!
-//! The request-byte bound is checked here, at admission, from the exact bytes
-//! the owner received — before the expensive decode of the retained tool payload
-//! happens — and a refusal never partially acquires, so the owner is never
-//! charged for work it did not admit.
+//! - **A bound must not heal itself shut.** The ledger's limits come from the
+//!   bound declaration and from nothing else, and a failed bind is a refusal
+//!   to advertise rather than a relaxed bound. A poisoned ledger keeps refusing
+//!   rather than being reset into an empty one that would report free capacity
+//!   the process does not have.
+//! - **A charge is released with the value recorded at that pair's own
+//!   admission.** [`HotPathCharge`] is minted once, at admission, and travels
+//!   with the queued pair. Release returns the bytes that charge recorded,
+//!   never a fresh computation of the body.
+//! - **A missing or invalid profile is not permission to skip work.** An
+//!   operation whose #1734 profile is absent still enforces its bound; it
+//!   simply reports as unqualified
+//!   ([`KernelHotSpine::declared_profile_refs`]). Qualification is a claim and
+//!   the bound is a guarantee, so the bound never depends on the claim.
 
-use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use eliot_runtime_contracts::{
-    AdmittedHotPathManifest, HotPathDegradation, HotPathQueueCapacity, RegisteredOperation,
-    RegisteredQueueSettings, RunningBuildRegistration, admit_hot_path_manifest,
-    bind_hot_path_manifest_set, hot_path_manifest_path,
+    AdmittedHotPathManifest, HotPathBindingIdentity, HotPathBoundStatus,
+    HotPathManifestFileError, HotPathQueueCapacity, RegisteredOperation, RegisteredQueueSettings,
+    RuntimeContractError, RunningBuildRegistration, admit_hot_path_manifest,
+    bind_hot_path_manifest_set, hot_path_bound_status,
 };
 
-use super::kernel_diagnostics::{EntrypointStage, KERNEL_DIAGNOSTICS_TARGET, bound_field};
-use super::{IpcImplementation, TransportError};
+use crate::KernelComposition;
 
-/// The compiled-in bytes of this crate's own service-local I12.14 declaration.
+/// The service identity this composition registers its own hot operations
+/// under. The declaration file spells `owning_service = "eliot-kernel"`, so
+/// the running-build side must use the same name or the bind refuses.
+const KERNEL_HOT_PATH_SERVICE: &str = "eliot-kernel";
+
+/// The checked-in service-local declaration, read once at compile time.
 ///
-/// `include_str!` resolves at compile time, so a running Kernel never locates
-/// or discovers the file: the declaration travels with the binary and the
-/// digest the admission records is the digest of exactly these bytes. A
-/// deployment that replaced the file on disk therefore cannot change what this
-/// process believes it declared, and a caller cannot upload a permissive
-/// manifest to a running build.
-const KERNEL_HOT_PATH_MANIFEST: &str = include_str!("../hot-path.toml");
+/// The declaration is a build input of the Kernel binary, not a file this
+/// process discovers: `include_str!` names the one authoritative source the
+/// manifest owner already maintains, so admission never touches the
+/// filesystem and never runs Cargo or dependency analysis. The path is
+/// retained only so the admitted record can name the exact file its bytes
+/// came from.
+const DECLARED_MANIFEST_PATH: &str = "bins/eliot-kernel/hot-path.toml";
 
-/// Exact service identity the running Kernel registers itself as.
-const KERNEL_HOT_SPINE_SERVICE: &str = "eliot-kernel";
+/// The exact bytes of the service-local declaration this binary was built
+/// from.
+const DECLARED_MANIFEST_BYTES: &[u8] = include_bytes!("../hot-path.toml");
 
-/// The bounded queue identity the Kernel's local-read pairs are admitted against.
-const LOCAL_READ_QUEUE_ID: &str = "local_read_claim";
-
-/// Observed hot-spine outcomes. Closed, bounded control codes — never prose,
-/// never a claim about a bound this process did not actually hit.
-const OUTCOME_BOUND: &str = "bound";
-const OUTCOME_REFUSED: &str = "refused";
-const OUTCOME_ADMITTED: &str = "admitted";
-const OUTCOME_RELEASED: &str = "released";
-
-/// Publishes one bounded hot-spine observation.
-fn observe_hot_spine(operation: &str, outcome: &'static str, limit: u64, held: u64) {
-    tracing::info!(
-        target: KERNEL_DIAGNOSTICS_TARGET,
-        event = "kernel.hot_spine.bound",
-        operation = bound_field(operation).text(),
-        outcome = bound_field(outcome).text(),
-        limit = limit,
-        held = held,
-        "hot-spine bound observation"
-    );
+/// The declaration row a single admitted queue is registered under.
+///
+/// The ids are the declaration's own queue ids. Interning them keeps a
+/// [`HotPathCharge`] `Copy` and comparable without borrowing the ledger, and
+/// a charge can only ever name a queue the bound declaration already declared.
+///
+/// The type itself is crate-visible because [`LOCAL_READ_CLAIM_QUEUE`] names
+/// one of its variants in a signature the real admission point calls; the
+/// variants stay private, so the only queue a caller can name is the one the
+/// declaration wired to that admission point.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum HotPathQueueId {
+    /// The retained queued local-read pairs the daemon claim leg drains.
+    LocalReadClaim,
+    /// The in-flight bounded named read.
+    LocalRead,
+    /// The retained result leg that binds a daemon result to its caller.
+    LocalReadResult,
 }
 
-/// The failure a runtime hot-spine bind or capacity acquisition produces.
+/// The retained queued local-read queue the claim leg charges its admission
+/// against.
 ///
-/// Both cases are refusals of the same shape and the same size, so the error
-/// carries no large variant: a bind failure names only its own case and a
-/// saturated capacity names only its own case.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HotSpineError {
-    /// The approved declaration is not admissible against the running build.
-    DeclarationRefused,
-    /// The declared byte or item bound is saturated, or the request is larger
-    /// than the bound permits.
-    BoundSaturated,
-}
+/// The real admission point names this one queue, so it is the only
+/// `pub(crate)` name on the enumeration: the other two queue ids are reached
+/// through the registration this spine builds, not by a caller picking a
+/// bound out of thin air. Exposing all three here would let any holder charge
+/// a bound the declaration never wired to the point that spent it.
+pub(crate) const LOCAL_READ_CLAIM_QUEUE: HotPathQueueId = HotPathQueueId::LocalReadClaim;
 
-impl HotSpineError {
-    /// The bounded wire code for this refusal.
+/// The declared operation ids the registration binds, in declaration order.
+///
+/// These are the exact strings `hot-path.toml` declares as `operation`, and
+/// the registration below registers under the same three. Naming them once
+/// keeps the registration and the diagnostics projection from drifting apart:
+/// a projection row keyed by a misspelled id would silently read as
+/// "unregistered" instead of reporting the queue the process really enforces.
+const LOCAL_READ_CLAIM_OPERATION: &str = "local_read_claim";
+const LOCAL_READ_OPERATION: &str = "local_read";
+const LOCAL_READ_RESULT_OPERATION: &str = "local_read_result";
+
+impl HotPathQueueId {
+    /// The exact queue id the declaration and the running build both spell.
     const fn as_str(self) -> &'static str {
         match self {
-            Self::DeclarationRefused => "declaration_refused",
-            Self::BoundSaturated => "bound_saturated",
+            Self::LocalReadClaim => "local_read_claim",
+            Self::LocalRead => "local_read",
+            Self::LocalReadResult => "local_read_result",
         }
     }
+
+    /// Every queue the Kernel hot spine owns, in declaration order.
+    const ALL: [Self; 3] = [Self::LocalReadClaim, Self::LocalRead, Self::LocalReadResult];
 }
 
-impl From<HotSpineError> for TransportError {
-    /// Maps a hot-spine refusal onto the route's existing typed backpressure.
-    ///
-    /// An unbound declaration and a saturated bound are the same bounded
-    /// outcome to a caller: this operation is not admitted right now and the
-    /// caller retries through its own existing recovery directive. Neither is
-    /// degraded to a success, and neither starts a module, a waiter list or a
-    /// detached retry.
-    fn from(error: HotSpineError) -> Self {
-        match error {
-            HotSpineError::DeclarationRefused | HotSpineError::BoundSaturated => {
-                TransportError::Backpressure
+/// A charge against one bound hot-path queue, minted at admission.
+///
+/// The recorded byte count is the value the queue reserved at that pair's own
+/// admission. Release returns exactly this value, so the ledger cannot drift
+/// when the retained body is later re-validated against a different count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HotPathCharge {
+    queue: HotPathQueueId,
+    bytes: u64,
+}
+
+/// A hot-path request this composition cannot admit or cannot advertise.
+///
+/// Every variant is a *refusal to proceed*, never a relaxation: a spine that
+/// cannot be built yields no spine at all, so nothing downstream can read a
+/// bound that was never enforced. `Display` is written by hand rather than
+/// derived because this crate does not depend on a derive-error crate, and the
+/// owner-side reason is already a bounded message the contract owns.
+#[derive(Clone, Debug)]
+pub(crate) enum HotPathError {
+    /// The service-local declaration could not be read, parsed or bound
+    /// against the running build's real registration.
+    UnboundDeclaration {
+        /// The owner's own reason. Bounded, and never a payload from the file.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for HotPathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnboundDeclaration { reason } => {
+                write!(
+                    formatter,
+                    "the hot-path declaration is not bound to this running build: {reason}"
+                )
             }
         }
     }
 }
 
-/// The Kernel's live I12.14 binding plus the capacity it enforces.
+impl std::error::Error for HotPathError {}
+
+impl From<RuntimeContractError> for HotPathError {
+    fn from(error: RuntimeContractError) -> Self {
+        Self::UnboundDeclaration {
+            reason: error.to_string(),
+        }
+    }
+}
+
+/// The declaration loader reports a file-level failure, which the contract
+/// deliberately does not funnel into [`RuntimeContractError`] because a
+/// malformed declaration file is a different class of refusal from a
+/// contract-invalid value. Both refuse to bind, so both land on the one
+/// `HotPathError` variant and neither is downgraded to a laxer bound.
+impl From<HotPathManifestFileError> for HotPathError {
+    fn from(error: HotPathManifestFileError) -> Self {
+        Self::UnboundDeclaration {
+            reason: error.to_string(),
+        }
+    }
+}
+
+/// The capacity of every bound hot-path queue, keyed by the declared queue id.
 ///
-/// Construction happens once, during composition assembly, and requires the
-/// declaration to bind against the real registered settings. A composition that
-/// could not bind is never constructed, so no later request can observe an
-/// unbound hot spine.
+/// This is a thin owner-side map over [`HotPathQueueCapacity`], which already
+/// refuses an over-large request without partially acquiring and saturates a
+/// double release at zero. The map adds only the queue-id lookup the real
+/// owners need; it holds no limit of its own, so it cannot widen a bound.
+#[derive(Debug, Default)]
+struct HotPathCapacityLedger {
+    queues: BTreeMap<HotPathQueueId, HotPathQueueCapacity>,
+}
+
+impl HotPathCapacityLedger {
+    /// Builds the ledger from the bound declaration's own limits.
+    ///
+    /// A queue the declaration does not declare is not created, so an
+    /// admission against it is refused rather than bounded by a default. A
+    /// declared queue that is missing *either* the item or the byte dimension
+    /// is likewise not created: coercing an absent bound to zero would look
+    /// like a live queue with a zero limit in the diagnostics surface, and it
+    /// would refuse every admission for a reason the declaration never gave.
+    /// Refusing the queue outright reports the real reason — the declaration
+    /// did not bound this queue — instead of inventing a bound.
+    fn from_manifest(manifest_set: &eliot_runtime_contracts::HotPathManifestSetV1) -> Self {
+        let mut queues = BTreeMap::new();
+        for manifest in &manifest_set.supported_operations {
+            for declared in &manifest.queues_and_capacity {
+                let Some(queue) = queue_id_for(declared.queue_id.as_str()) else {
+                    continue;
+                };
+                let (Some(max_items), Some(max_bytes)) =
+                    (declared.bounds.max_items, declared.bounds.max_bytes)
+                else {
+                    continue;
+                };
+                // A queue declared twice keeps the tighter bound: `min` cannot
+                // loosen a limit, so a later row can only ever tighten it.
+                let capacity = HotPathQueueCapacity::new(queue.as_str(), max_items, max_bytes);
+                queues
+                    .entry(queue)
+                    .and_modify(|existing: &mut HotPathQueueCapacity| {
+                        let tightened = HotPathQueueCapacity::new(
+                            queue.as_str(),
+                            existing.max_items().min(capacity.max_items()),
+                            existing.max_bytes().min(capacity.max_bytes()),
+                        );
+                        *existing = tightened;
+                    })
+                    .or_insert(capacity);
+            }
+        }
+        Self { queues }
+    }
+
+    /// Charges one admission, or refuses it leaving the ledger untouched.
+    fn acquire(&mut self, queue: HotPathQueueId, bytes: u64) -> Result<(), RuntimeContractError> {
+        self.queues
+            .get_mut(&queue)
+            .ok_or_else(|| {
+                RuntimeContractError::InvalidField {
+                    field: "queues_and_capacity",
+                    reason: format!("no declared queue '{}' is bound", queue.as_str()),
+                }
+            })?
+            .acquire(bytes)
+    }
+
+    /// Returns one admission's recorded bytes at its owner-safe release point.
+    fn release(&mut self, queue: HotPathQueueId, bytes: u64) {
+        if let Some(capacity) = self.queues.get_mut(&queue) {
+            capacity.release(bytes);
+        }
+    }
+
+    /// The current held item/byte count, for the audit surface.
+    fn held(&self, queue: HotPathQueueId) -> (u64, u64) {
+        self.queues
+            .get(&queue)
+            .map_or((0, 0), |capacity| {
+                (capacity.held_items(), capacity.held_bytes())
+            })
+    }
+}
+
+/// Maps a declared queue id onto the owner-side enumeration.
+///
+/// A queue id the Kernel hot spine does not own has no mapping, which is what
+/// makes an undeclared queue a refusal instead of a silently bounded default.
+fn queue_id_for(declared: &str) -> Option<HotPathQueueId> {
+    HotPathQueueId::ALL
+        .into_iter()
+        .find(|queue| queue.as_str() == declared)
+}
+
+/// The running hot spine: the admitted declaration, the registration it was
+/// bound against, and the capacity the real owners hold.
 pub(crate) struct KernelHotSpine {
-    /// The admitted declaration set with the digest of its exact bytes.
     admitted: AdmittedHotPathManifest,
-    /// The bound operation identities, one per admitted supported operation.
-    bound_operations: Vec<String>,
-    /// The one capacity ledger the bounded local-read queue is admitted against.
-    local_read: Mutex<HotPathQueueCapacity>,
+    registration: RunningBuildRegistration,
+    capacity: Mutex<HotPathCapacityLedger>,
 }
 
 impl KernelHotSpine {
-    /// Binds this crate's own declaration against the running build's settings.
+    /// Binds the checked-in service-local declaration against the settings
+    /// `registration` reports as actually enforced, and builds the capacity
+    /// ledger from the bound declaration.
     ///
-    /// The registration is built from values this process actually enforces —
-    /// the transport limits the front-door session selected and the constant the
-    /// local-read queue is bounded by — and never from the declaration itself,
-    /// so a declaration that claims a looser or tighter bound than the build
-    /// really uses is refused instead of being taken at its word.
-    pub(crate) fn bind() -> Result<Self, HotSpineError> {
-        let path = hot_path_manifest_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-            .map_err(|_| HotSpineError::DeclarationRefused)?;
-        let admitted = admit_hot_path_manifest(&path, KERNEL_HOT_PATH_MANIFEST.as_bytes())
-            .map_err(|_| HotSpineError::DeclarationRefused)?;
-        let registration = kernel_running_registration();
-        let bound = bind_hot_path_manifest_set(&admitted.set, &registration)
-            .map_err(|_| HotSpineError::DeclarationRefused)?;
-        let bound_operations = bound
-            .into_iter()
-            .map(|identity| identity.operation)
-            .collect::<Vec<_>>();
-        let local_read = Mutex::new(HotPathQueueCapacity::new(
-            LOCAL_READ_QUEUE_ID,
-            super::host_request_route::MAX_QUEUED_LOCAL_READS as u64,
-            IpcImplementation::registered_queue_bytes() as u64,
-        ));
+    /// The registration is the authoritative side: a declaration that parses
+    /// but names an operation the running build does not register, or a queue
+    /// bound the running build does not enforce, is refused here rather than
+    /// advertised. A caller that cannot produce a registration therefore never
+    /// gets a spine.
+    pub(crate) fn bind(
+        declaration_bytes: &[u8],
+        registration: RunningBuildRegistration,
+    ) -> Result<Self, HotPathError> {
+        let admitted =
+            admit_hot_path_manifest(Path::new(DECLARED_MANIFEST_PATH), declaration_bytes)?;
+        // A bind failure means this process cannot advertise the declaration
+        // it was given. It is surfaced, never downgraded to a laxer bound.
+        bind_hot_path_manifest_set(&admitted.set, &registration)?;
+        let capacity = HotPathCapacityLedger::from_manifest(&admitted.set);
         Ok(Self {
             admitted,
-            bound_operations,
-            local_read,
+            registration,
+            capacity: Mutex::new(capacity),
         })
     }
 
-    /// The exact operation identities this running build bound.
-    pub(crate) fn bound_operations(&self) -> &[String] {
-        &self.bound_operations
-    }
-
-    /// The digest of the exact declaration bytes this process admitted.
-    pub(crate) fn manifest_digest(&self) -> &str {
-        &self.admitted.manifest_file_digest
-    }
-
-    /// The bounded degradation this process returns for a saturated queue.
+    /// The exact identities the bind produced, for status and diagnostics.
     ///
-    /// The value is the *declared* degradation of the operation whose queue
-    /// saturated, read from the admitted set, so the caller never spells the
-    /// result itself and a changed declaration changes what is returned.
-    pub(crate) fn saturated_degradation(&self) -> HotPathDegradation {
+    /// Re-deriving them is cheap and re-checks the registration each call, so
+    /// a registration that changed after the bind cannot be reported as
+    /// still bound.
+    pub(crate) fn bound_identities(&self) -> Result<Vec<HotPathBindingIdentity>, HotPathError> {
+        Ok(bind_hot_path_manifest_set(
+            &self.admitted.set,
+            &self.registration,
+        )?)
+    }
+
+    /// The #1734 profile reference each declared operation carries, keyed by
+    /// operation id.
+    ///
+    /// This is the declaration's own *reference*, never a qualification
+    /// decision: at this base no kernel operation declares a profile, so the
+    /// map is empty and the diagnostics surface reports "unqualified" rather
+    /// than inventing a pass. It is read straight off the admitted manifest
+    /// instead of being re-validated here, because a qualification verdict
+    /// requires profile evidence (#1734) that this process does not produce —
+    /// deriving one from an absent reference would be a fabricated
+    /// measurement, and an absent measurement is not a qualification. The
+    /// bound itself is enforced regardless of what this map says.
+    #[must_use]
+    pub(crate) fn declared_profile_refs(
+        &self,
+    ) -> BTreeMap<&str, &eliot_runtime_contracts::HotPathProfileRef> {
         self.admitted
             .set
             .supported_operations
             .iter()
-            .find(|manifest| {
-                manifest
-                    .queues_and_capacity
-                    .iter()
-                    .any(|queue| queue.queue_id == LOCAL_READ_QUEUE_ID)
-            })
-            .map_or(HotPathDegradation::Unknown, |manifest| {
-                manifest.fallback_or_degradation.clone()
-            })
+            .map(|manifest| (manifest.operation.as_str(), &manifest.hot_path_profile_ref))
+            .collect()
     }
 
-    /// Admits one local-read request of `bytes`, or refuses it.
-    ///
-    /// The byte bound is checked against the exact request size before any
-    /// capacity is acquired, so an oversized request never partially acquires
-    /// and never reaches the expensive decode that would follow. A refusal is
-    /// the owner's typed backpressure: the caller retries through its own
-    /// existing directive, and nothing is queued, detached or evicted here.
-    ///
-    /// Success returns no permit: the ledger itself is the retained capacity and
-    /// it is returned only at the owner's safe-release points through
-    /// [`KernelHotSpine::release_local_read`], from the byte count the owner
-    /// recorded at this very admission. That is what makes the bound cover
-    /// pending *plus* claimed/in-flight items rather than pending only.
-    pub(crate) fn acquire_local_read_capacity(&self, bytes: u64) -> Result<(), HotSpineError> {
-        let mut capacity = self
-            .local_read
-            .lock()
-            .map_err(|_| HotSpineError::BoundSaturated)?;
-        capacity
-            .acquire(bytes)
-            .map_err(|_| HotSpineError::BoundSaturated)?;
-        observe_hot_spine(
-            LOCAL_READ_QUEUE_ID,
-            OUTCOME_ADMITTED,
-            capacity.max_bytes(),
-            capacity.held_bytes(),
-        );
-        Ok(())
+    /// The queue registration this process actually enforces, so a caller can
+    /// read the physical bound rather than the declared one.
+    pub(crate) fn registered(&self, operation: &str) -> Option<&RegisteredQueueSettings> {
+        self.registration.queue_for(operation)
     }
 
-    /// Releases one retained local-read permit at an owner-safe release point.
+    /// Charges one admission against the named queue's bound.
     ///
-    /// Releasing is idempotent at zero: a double release saturates rather than
-    /// wrapping, so an over-release can never manufacture extra capacity.
-    pub(crate) fn release_local_read(&self, bytes: u64) {
-        let Ok(mut capacity) = self.local_read.lock() else {
-            return;
-        };
-        capacity.release(bytes);
-        observe_hot_spine(
-            LOCAL_READ_QUEUE_ID,
-            OUTCOME_RELEASED,
-            capacity.max_items(),
-            capacity.held_items(),
-        );
+    /// This is the single admission-time charge point. The caller passes the
+    /// *wire* byte count, taken before any expensive decoding, so a request
+    /// larger than the bound is refused before the work happens. A refusal
+    /// leaves the ledger untouched, so a saturated queue never partially
+    /// acquires and a refused request is never charged for.
+    pub(crate) fn charge(
+        &self,
+        queue: HotPathQueueId,
+        wire_bytes: u64,
+    ) -> Result<HotPathCharge, HotPathError> {
+        self.lock_capacity().acquire(queue, wire_bytes)?;
+        Ok(HotPathCharge {
+            queue,
+            bytes: wire_bytes,
+        })
+    }
+
+    /// Returns one admission's charge at its owner-safe release point.
+    ///
+    /// The bytes come from the charge, never from a recomputation of the body.
+    /// A double release cannot manufacture capacity: the ledger saturates at
+    /// zero, and the caller spends the charge it returns.
+    pub(crate) fn release(&self, charge: HotPathCharge) {
+        self.lock_capacity().release(charge.queue, charge.bytes);
+    }
+
+    /// The auditable binding status of every declared operation.
+    ///
+    /// Each row names the operation, the bound manifest revision, the queue
+    /// settings the *running build* actually enforces, the declared snapshot
+    /// dependencies and the operation's declared degradation — so a reader
+    /// can audit which bound is in force rather than inferring it. A
+    /// registration that no longer matches the declaration fails the re-bind
+    /// here, which is what keeps a changed queue or operation revision from
+    /// being reported as still bound.
+    pub(crate) fn bound_status(&self) -> Result<Vec<HotPathBoundStatus>, HotPathError> {
+        Ok(hot_path_bound_status(
+            &self.admitted.set,
+            &self.registration,
+        )?)
+    }
+
+    /// The live held item/byte gauges for the queues the claim leg spends.
+    ///
+    /// Read at request time from the ledger itself, never accumulated into a
+    /// second counter store, so the reported occupancy cannot disagree with
+    /// the bound that is actually enforced. Both members of the pair are
+    /// always read under one lock, so a reader never sees a held-item count
+    /// paired with a held-byte count from two different instants.
+    #[must_use]
+    pub(crate) fn claim_queue_held(&self) -> (u64, u64) {
+        self.lock_capacity().held(LOCAL_READ_CLAIM_QUEUE)
+    }
+
+    /// Locks the capacity ledger without ever healing a poisoned one.
+    ///
+    /// A poisoned ledger is recovered *in place*, so the counts stay truthful
+    /// and release keeps working, but it is never reset to empty: admission
+    /// continues to be governed by the same declared limits. Restarting the
+    /// process is what clears the poison.
+    fn lock_capacity(&self) -> MutexGuard<'_, HotPathCapacityLedger> {
+        self.capacity.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// The running build's own registration for the bounded hot operations.
+/// Builds the running-build registration for this composition's own hot
+/// operations, from the settings the real owners enforce.
 ///
-/// Every value here is read from a constant or selected limit this process
-/// actually enforces, never from the declaration file. That makes the running
-/// build the authoritative side of the bind: a manifest can only bind an
-/// operation this list already contains, and only at the settings this list
-/// already carries.
-fn kernel_running_registration() -> RunningBuildRegistration {
-    let queued_items = super::host_request_route::MAX_QUEUED_LOCAL_READS as u64;
+/// The values are the owners', not the declaration's: the frame and queue byte
+/// limits come from the front door's own transport limits, and the retained
+/// queued local-read count comes from the host-request route's own bound. The
+/// declaration is compared against these, so a declaration that drifts from the
+/// running build is refused rather than silently enforced.
+pub(crate) fn kernel_running_build_registration(
+    max_frame_bytes: u64,
+    queue_bytes: u64,
+    max_queued_local_reads: u64,
+) -> RunningBuildRegistration {
     RunningBuildRegistration {
-        service: KERNEL_HOT_SPINE_SERVICE.to_owned(),
+        service: KERNEL_HOT_PATH_SERVICE.to_owned(),
         operations: vec![
             RegisteredOperation {
-                operation: "local_read_claim".to_owned(),
+                operation: LOCAL_READ_CLAIM_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
-                    queue_id: LOCAL_READ_QUEUE_ID.to_owned(),
-                    max_items: queued_items,
-                    max_bytes: IpcImplementation::registered_queue_bytes() as u64,
+                    queue_id: HotPathQueueId::LocalReadClaim.as_str().to_owned(),
+                    max_items: max_queued_local_reads,
+                    max_bytes: queue_bytes,
                 },
             },
             RegisteredOperation {
-                operation: "local_read_result".to_owned(),
+                operation: LOCAL_READ_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
-                    queue_id: "local_read_result".to_owned(),
-                    max_items: queued_items,
-                    max_bytes: IpcImplementation::registered_frame_bytes() as u64,
+                    queue_id: HotPathQueueId::LocalRead.as_str().to_owned(),
+                    max_items: max_queued_local_reads,
+                    max_bytes: max_frame_bytes,
+                },
+            },
+            RegisteredOperation {
+                operation: LOCAL_READ_RESULT_OPERATION.to_owned(),
+                queue: RegisteredQueueSettings {
+                    queue_id: HotPathQueueId::LocalReadResult.as_str().to_owned(),
+                    max_items: max_queued_local_reads,
+                    max_bytes: max_frame_bytes,
                 },
             },
         ],
     }
 }
 
-impl super::KernelComposition {
-    /// Binds the I12.14 hot spine once, during composition assembly.
+/// Binds the Kernel's own hot spine at composition assembly.
+///
+/// The registration is built from the real owners' own settings — the front
+/// door's transport limits and the host-request route's retained queue bound —
+/// so the declaration is compared against what this process actually enforces.
+/// A failure returns `None` rather than an unbounded substitute: a Kernel
+/// that cannot bind its declaration advertises no validated hot path.
+#[cfg(windows)]
+pub(crate) fn bind_kernel_hot_spine() -> Option<KernelHotSpine> {
+    KernelHotSpine::bind(
+        DECLARED_MANIFEST_BYTES,
+        kernel_running_build_registration(
+            crate::front_door_session::KERNEL_HOT_PATH_MAX_FRAME_BYTES,
+            crate::front_door_session::KERNEL_HOT_PATH_QUEUE_BYTES,
+            crate::host_request_route::KERNEL_HOT_PATH_MAX_QUEUED_LOCAL_READS,
+        ),
+    )
+    .ok()
+}
+
+/// The service name the Kernel hot spine binds under, for diagnostics.
+#[cfg(windows)]
+pub(crate) const fn kernel_hot_path_service() -> &'static str {
+    KERNEL_HOT_PATH_SERVICE
+}
+
+impl KernelComposition {
+    /// The auditable I12.14 hot-spine binding projection (issue #1733, step 7).
     ///
-    /// Assembly fails closed when the approved declaration does not bind against
-    /// the running build's real registered settings, so a composition that
-    /// exists is one whose hot spine is genuinely bound. This is the only place
-    /// the declaration is read; no request path re-reads it, re-validates it or
-    /// performs any build-time analysis.
-    pub(crate) fn bind_hot_spine() -> Result<KernelHotSpine, super::KernelBuildError> {
-        super::kernel_diagnostics::observe_entrypoint_with_detail(
-            EntrypointStage::Composition,
-            "kernel.hot_spine.bind_started",
-        );
-        let hot_spine = KernelHotSpine::bind().map_err(|error| {
-            observe_hot_spine(LOCAL_READ_QUEUE_ID, OUTCOME_REFUSED, 0, 0);
-            tracing::error!(
-                target: KERNEL_DIAGNOSTICS_TARGET,
-                outcome = error.as_str(),
-                "the approved hot-path declaration does not bind against the running build"
-            );
-            super::KernelBuildError::Service(
-                "the approved hot-path declaration does not bind against the running build"
-                    .to_owned(),
-            )
-        })?;
-        observe_hot_spine(LOCAL_READ_QUEUE_ID, OUTCOME_BOUND, 0, 0);
-        // I12.14 step 7: the binding is auditable from the running process
-        // itself. The record carries the exact operation identities this build
-        // bound, the digest of the exact declaration bytes it admitted and the
-        // degradation the declaration names for the bounded queue, so a later
-        // status read can tell WHICH declaration is live without re-reading the
-        // file and without a build-time inventory.
-        let degradation = bound_field(&format!("{:?}", hot_spine.saturated_degradation()));
-        for operation in hot_spine.bound_operations() {
-            tracing::info!(
-                target: KERNEL_DIAGNOSTICS_TARGET,
-                event = "kernel.hot_spine.binding",
-                operation = bound_field(operation).text(),
-                manifest_digest = bound_field(hot_spine.manifest_digest()).text(),
-                degradation = degradation.text(),
-                "the approved hot-path declaration bound against this running build"
-            );
-        }
-        super::kernel_diagnostics::observe_entrypoint_with_detail(
-            EntrypointStage::Composition,
-            "kernel.hot_spine.bound",
-        );
-        Ok(hot_spine)
+    /// This is the single status/diagnostics surface the health view consumes
+    /// (`health_view`'s `hot_path_binding_projection` on `KernelComposition`).
+    /// It reports what the running process actually enforces rather than what
+    /// the declaration asked for: the bound identities and per-operation
+    /// bound-status rows come from a re-bind against the live registration, so
+    /// a queue or operation revision that changed after the bind is reported
+    /// as `unbound` instead of as still valid. The live held gauges are read
+    /// from the ledger itself, so the reported occupancy cannot drift from the
+    /// bound being enforced.
+    ///
+    /// Every field is bounded and privacy-safe: identities are operation names
+    /// and the contract's own version, the registered settings are the numeric
+    /// bounds this process enforces, and a degradation reason is the owner's
+    /// closed-vocabulary code. A refused bind projects the contract's own
+    /// reason text rather than a synthesized "degraded", so a reader can see
+    /// *which* check failed. An unbound spine projects `"status": "unbound"`
+    /// — never a zeroed, valid-looking binding.
+    #[must_use]
+    #[cfg(windows)]
+    pub(crate) fn bound_hot_path_binding(&self) -> serde_json::Value {
+        let service = kernel_hot_path_service();
+        let Some(spine) = self.hot_spine.as_ref() else {
+            return serde_json::json!({
+                "status": "unbound",
+                "service": service,
+            });
+        };
+        let identities = match spine.bound_identities() {
+            Ok(identities) => serde_json::to_value(&identities).unwrap_or(serde_json::Value::Null),
+            Err(error) => {
+                return serde_json::json!({
+                    "status": "unbound",
+                    "service": service,
+                    "reason": error.to_string(),
+                });
+            }
+        };
+        let status_rows = match spine.bound_status() {
+            Ok(rows) => serde_json::to_value(&rows).unwrap_or(serde_json::Value::Null),
+            Err(error) => serde_json::json!({"status": "unbound", "reason": error.to_string()}),
+        };
+        // The declared admission and result limits are read from the
+        // registration, so the projection names the *physical* bound rather
+        // than the declared one for each leg the claim path actually uses.
+        let (held_items, held_bytes) = spine.claim_queue_held();
+        let claim_queue = spine.registered(LOCAL_READ_CLAIM_OPERATION);
+        let read_queue = spine.registered(LOCAL_READ_OPERATION);
+        let result_queue = spine.registered(LOCAL_READ_RESULT_OPERATION);
+        // Qualification is reported, never inferred. Every declared operation
+        // carries an absent #1734 profile reference at this base, so this
+        // projects `unqualified` rather than a pass — an absent measurement is
+        // not a qualification, and the bound below is enforced either way.
+        let qualified = spine
+            .declared_profile_refs()
+            .values()
+            .all(|profile_ref| profile_ref.is_available());
+        serde_json::json!({
+            "status": "bound",
+            "service": service,
+            "qualified": qualified,
+            "identities": identities,
+            "operations": status_rows,
+            "claim_queue_held": {
+                "items": held_items,
+                "bytes": held_bytes,
+            },
+            "registered_queues": {
+                LOCAL_READ_CLAIM_OPERATION: claim_queue,
+                LOCAL_READ_OPERATION: read_queue,
+                LOCAL_READ_RESULT_OPERATION: result_queue,
+            },
+        })
     }
 }
