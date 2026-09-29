@@ -30,8 +30,12 @@
 //! ```text
 //! prepare/finalize ......... kernel-restore-owner (destination staging,
 //!                              fence gate, observed evidence);
-//! purge .................... purge owner (`apply_purge_ledger`, staged
-//!                              purge-first before any import);
+//! purge .................... purge owner (`apply_purge_ledger`, each entry
+//!                              applied to the ORS owner so the ledger-wide
+//!                              revision is the one the owner allocated, staged
+//!                              purge-first before any import; an absent owner
+//!                              refuses rather than staging an unallocated
+//!                              revision);
 //! canonical/receipt/
 //! projection/rebuild/verify . canonical owner (`import_*`, chain + count
 //!                              verification over observed destination state);
@@ -143,6 +147,11 @@ mod owners {
     /// a ledger `subject_ref` to archive member identities, so per-member
     /// suppression cannot be computed here. Backlog to M2.
     pub const PURGE_MEMBER_SUPPRESSION: &str = "purge-member-suppression";
+    /// Missing live ORS purge-owner channel (#960): the purge-ledger revision
+    /// is allocated by the ORS owner inside the write transaction that makes a
+    /// row durable, so a restore that cannot reach that owner cannot record a
+    /// revision it did not observe and refuses instead of staging one.
+    pub const PURGE_OWNER_CHANNEL: &str = "purge-owner-channel";
 }
 
 /// Purge owner client: validates the purge ledger through the owner's
@@ -711,7 +720,13 @@ impl KernelBackupRestore {
                 .join(".eliot")
                 .join(RESTORE_JOURNAL_PAYLOAD_AREA),
         )?;
-        self.restore(bundle, target, ports, &mut journal)
+        self.restore_with_purge_owner(
+            bundle,
+            target,
+            ports,
+            &mut journal,
+            Some(std::sync::Arc::clone(ors)),
+        )
     }
 
     /// Compiles the governed plan for one archive and target context.
@@ -759,17 +774,37 @@ impl KernelBackupRestore {
     /// replaced, and a resume, a foreign admission, a destination that left
     /// the isolated area, and every path this execution did not write are
     /// preserved rather than removed.
-    #[allow(clippy::too_many_lines)]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "RestoreContext is moved into compile_plan and the isolated destination; the by-value seam keeps the single audited validation gate"
-    )]
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
         target: RestoreContext,
         ports: &RestorePorts<'_>,
         journal: &mut J,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        // The injected-journal seam is given no ORS handle, so a restore that
+        // must apply a purge ledger refuses at `apply_purge_ledger` instead of
+        // staging a ledger whose revisions no owner allocated. This is an
+        // absence, not a weaker owner.
+        self.restore_with_purge_owner(bundle, target, ports, journal, None)
+    }
+
+    /// The one phase engine, carrying the canonical ORS purge owner.
+    ///
+    /// `restore` and `restore_with_ors_journal` both reach this body; the only
+    /// difference is whether the owner is present. There is no second engine
+    /// and no fallback path.
+    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "RestoreContext is moved into compile_plan and the isolated destination; the by-value seam keeps the single audited validation gate"
+    )]
+    fn restore_with_purge_owner<J: RestoreJournalPort>(
+        &self,
+        bundle: &BackupBundle,
+        target: RestoreContext,
+        ports: &RestorePorts<'_>,
+        journal: &mut J,
+        ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
         bundle
             .validate()
@@ -840,9 +875,15 @@ impl KernelBackupRestore {
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?,
             None => Vec::new(),
         };
-        let mut target_impl =
-            KernelRestoreTarget::new(&self.work_root, &destination, bundle, ports, receipts)
-                .map_err(KernelRestoreError::TargetFailed)?;
+        let mut target_impl = KernelRestoreTarget::new(
+            &self.work_root,
+            &destination,
+            bundle,
+            ports,
+            receipts,
+            ors,
+        )
+        .map_err(KernelRestoreError::TargetFailed)?;
         let receipt = match plan.execute_with_journal(bundle, &mut target_impl, journal) {
             Ok(receipt) => receipt,
             Err(primary) => {
@@ -1187,6 +1228,14 @@ struct KernelRestoreTarget<'a> {
     kernel_fence: StateFence,
     keys: Option<&'a eliot_backup::WrappedKeyManifest>,
     blob_scope: Option<&'a DestinationScope>,
+    /// The canonical ORS purge owner this restore may apply its ledger to.
+    ///
+    /// `None` is an ABSENCE, never a fallback: it is the state of the injected
+    /// `restore` seam, which was given no owner handle. `apply_purge_ledger`
+    /// refuses in that case instead of writing a staged ledger that records no
+    /// owner-allocated revision. Only `restore_with_ors_journal` supplies the
+    /// owner, and it supplies the very store the composition already opened.
+    ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     receipts: Vec<BlobRestorationReceipt>,
     manifest_evidence: Option<DestinationManifestEvidence>,
     calls: Vec<String>,
@@ -1209,6 +1258,7 @@ impl<'a> KernelRestoreTarget<'a> {
         bundle: &BackupBundle,
         ports: &RestorePorts<'a>,
         receipts: Vec<BlobRestorationReceipt>,
+        ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     ) -> Result<Self, BackupError> {
         Ok(Self {
             root: destination.root().to_path_buf(),
@@ -1217,6 +1267,7 @@ impl<'a> KernelRestoreTarget<'a> {
             kernel_fence: ports.kernel_fence.clone(),
             keys: ports.keys,
             blob_scope: ports.blob_scope,
+            ors,
             receipts,
             manifest_evidence: ports.manifest_evidence.clone(),
             calls: Vec::new(),
@@ -2144,8 +2195,43 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
         Ok(())
     }
 
+    /// Applies the archive's purge ledger to the canonical ORS purge owner and
+    /// stages the validated evidence of what the owner consumed.
+    ///
+    /// The owner allocates the ledger-wide revision inside the same exclusive
+    /// write transaction that makes each row durable, so the revision this
+    /// returns is the revision the owner actually consumed, not one computed
+    /// from the caller's entry list. An exact replay returns that entry's
+    /// durable revision and consumes none.
+    ///
+    /// Without an owner this REFUSES. Staging a ledger whose revisions no owner
+    /// allocated is exactly the false proof this arm exists to remove, so an
+    /// absent owner is a typed capability refusal and never a fabricated count.
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
         PurgeOwnerClient::bind(entries).validate_entries()?;
+        if !entries.is_empty() {
+            let ors = self.ors.as_ref().ok_or(BackupError::RestoreCapabilityUnsupported {
+                capability: owners::PURGE_OWNER_CHANNEL,
+            })?;
+            let mut consumed = 0;
+            for entry in entries {
+                consumed = ors
+                    .apply_purge_ledger_entry(entry)
+                    .map_err(|error| BackupError::Target(error.to_string()))?;
+            }
+            // The owner's current revision must be at least the revision this
+            // purge consumed. Ahead is ordinary (other purges may have landed);
+            // behind would mean the owner did not durably keep what it just
+            // reported, which is refused rather than staged.
+            let current = ors
+                .purge_ledger_revision()
+                .map_err(|error| BackupError::Target(error.to_string()))?;
+            if current < consumed {
+                return Err(BackupError::FenceMismatch {
+                    subject: "purge_ledger_revision".to_owned(),
+                });
+            }
+        }
         let bytes = canonical_json_bytes(&entries)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file("purge_ledger.json", &bytes)?;
