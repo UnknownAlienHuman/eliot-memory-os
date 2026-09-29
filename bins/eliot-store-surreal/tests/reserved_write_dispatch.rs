@@ -338,6 +338,7 @@ fn transition() -> PreparedTransition {
     let entries = eliot_store_api::generated_operation_manifests().unwrap();
     let set_digest = eliot_store_api::operation_manifest_set_digest(&entries).unwrap();
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-991-d1").unwrap(),
             idempotency_key: "idem-991-d1".to_owned(),

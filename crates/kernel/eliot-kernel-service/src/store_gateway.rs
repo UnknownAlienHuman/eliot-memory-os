@@ -7413,8 +7413,20 @@ fn refuse_determinate_reserved_write(
 /// visible recovery work: it is refused with an explicit unsupported error
 /// and is never reinterpreted, widened, or translated under new code. A
 /// staged transition therefore survives daemon replacement only when the
-/// replacement Kernel explicitly supports its recorded contract digest and
-/// operation manifest.
+/// replacement Kernel explicitly supports its recorded protocol revision and
+/// operation manifest. The protocol half is decided by CONTENT against this
+/// build's own live revision through [`PreparedTransition::validate`], which
+/// refuses any recorded revision other than the [`eliot_store_api::CONTRACT_VERSION`]
+/// this Kernel implements; the manifest half is decided by
+/// `validate_against_catalogue` against the generated manifests.
+///
+/// `admission_contract_set_digest` is deliberately NOT claimed here: it is
+/// carried and hash-bound like every other plan field, but this boundary holds
+/// no live contract-set value to compare it against, because I05-15 records that
+/// no generated authoritative catalogue exists yet
+/// (`ImplementationSupport = TARGET`). Inventing one here would be exactly the
+/// invented authority this gate must not create. When that catalogue lands,
+/// this is where the comparison belongs.
 ///
 /// The gate ORDER is load-bearing and unchanged: every gate below runs before
 /// any store send, and this is the *unreserved* admission point, so a refusal
@@ -7788,6 +7800,7 @@ mod tests {
         let entries = generated_operation_manifests().unwrap_or_else(|_| unreachable!());
         let set_digest = operation_manifest_set_digest(&entries).unwrap_or_else(|_| unreachable!());
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-1927-1").unwrap_or_else(|_| unreachable!()),
                 idempotency_key: "idem-1927-1".to_owned(),
@@ -8627,6 +8640,7 @@ mod live_surreal_evidence_pack_e2e {
         let entries = generated_operation_manifests().expect("operation catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new(format!("op-t11-live-{tag}"))
                     .expect("operation identity"),

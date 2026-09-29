@@ -409,6 +409,7 @@ async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: 
         operation_manifest_set_digest(&generated_operation_manifests().expect("catalogue"))
             .expect("set digest");
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-create-{automation_id}-{revision_id}"))
                 .expect("operation"),

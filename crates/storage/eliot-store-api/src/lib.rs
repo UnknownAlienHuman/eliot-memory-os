@@ -4586,6 +4586,19 @@ impl OperationIdentity {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedTransition {
+    /// Wire revision of the `eliot.storage.store-api` contract this plan was
+    /// produced and admitted under, always [`CONTRACT_VERSION`] on the
+    /// producing side.
+    ///
+    /// Recorded ON the plan so a replacement Kernel or store bridge decides
+    /// support for the EXACT recorded revision through its own
+    /// [`PreparedTransition::validate`] instead of inferring it from the
+    /// operation-manifest set alone. It is covered by
+    /// [`prepared_transition_digest`] because that digest is taken over the
+    /// canonical bytes of this whole value, so a post-staging edit of the
+    /// revision is a typed digest mismatch rather than a silently executed
+    /// plan.
+    pub contract_version: ContractVersion,
     pub identity: OperationIdentity,
     pub state_fence: StateFence,
     pub scope_id: ScopeId,
@@ -4627,8 +4640,15 @@ pub struct PreparedTransition {
 }
 
 impl PreparedTransition {
-    /// Validates identity, operation closure, fences and effect ceilings.
+    /// Validates the recorded contract revision, identity, operation closure,
+    /// fences and effect ceilings.
     pub fn validate(&self) -> Result<(), StoreError> {
+        // The recorded revision is checked FIRST, through the same validator
+        // every other contract-revision-bearing value in this crate uses: an
+        // unknown revision fails closed before any of the plan's content is
+        // interpreted, so a staged plan from an unsupported contract is never
+        // partially understood under newer code.
+        validate_recovery_contract_version(self.contract_version)?;
         self.identity.validate()?;
         self.state_fence
             .validate()
@@ -4888,6 +4908,7 @@ pub fn genesis_transition(
     request.validate_for_context(context)?;
     let manifest = genesis_manifest()?;
     let mut transition = PreparedTransition {
+        contract_version: crate::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: request.operation_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
@@ -6311,6 +6332,7 @@ mod tests {
         let mut operations = BTreeMap::new();
         operations.insert("subject".to_owned(), serde_json::json!("observation-1"));
         let transition = PreparedTransition {
+            contract_version: crate::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: id("op-1")?,
                 idempotency_key: "retry-1".to_owned(),

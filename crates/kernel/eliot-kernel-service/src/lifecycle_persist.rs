@@ -887,6 +887,7 @@ fn mutation_transition_for(
                 .command()
                 .map_err(LifecyclePersistError::from_store)?;
             let mut transition = PreparedTransition {
+                contract_version: eliot_store_api::CONTRACT_VERSION,
                 identity: input.identity.clone(),
                 state_fence: bindings.fence.clone(),
                 scope_id: ScopeId::new(payload.candidate.scope.as_str()).map_err(|_| {
@@ -966,6 +967,7 @@ fn transition_for(
     spec: TransitionSpec,
 ) -> Result<PreparedTransition, LifecyclePersistError> {
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: identity.clone(),
         state_fence: bindings.fence.clone(),
         scope_id: bindings.scope.clone(),

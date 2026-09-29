@@ -203,6 +203,7 @@ fn transition_with(
         operation_manifest_set_digest(&generated_operation_manifests().expect("catalogue"))
             .expect("set digest");
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-notify-live-{tag}")).expect("operation"),
             idempotency_key: format!("idem-notify-live-{tag}"),

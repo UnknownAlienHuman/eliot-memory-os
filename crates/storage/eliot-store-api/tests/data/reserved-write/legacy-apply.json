@@ -24,6 +24,11 @@
     }
   },
   "transition": {
+    "contract_version": {
+      "major": 1,
+      "minor": 0,
+      "patch": 0
+    },
     "identity": {
       "operation_id": "op-991-1",
       "idempotency_key": "idem-991-1",

@@ -1770,6 +1770,7 @@ mod tests {
         let fence = test_fence();
         let context = test_context(&fence);
         let mut transition = PreparedTransition {
+            contract_version: crate::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-authority").expect("operation id"),
                 idempotency_key: "idem-authority".to_owned(),

@@ -5623,6 +5623,7 @@ mod tests {
         // non-empty expected heads must rebind via `transition_with_heads`.
         let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
         let mut prepared = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: eliot_store_api::OperationIdentity {
                 operation_id,
                 idempotency_key: format!("idem-{operation}"),
@@ -7467,6 +7468,7 @@ mod tests {
     ) -> Result<PreparedTransition, StoreError> {
         let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
         let mut prepared = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: eliot_store_api::OperationIdentity {
                 operation_id,
                 idempotency_key: format!("idem-{operation}"),

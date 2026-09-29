@@ -242,6 +242,7 @@ mod idempotency_tests {
             clock: eliot_contracts::ClockReading::default(),
         };
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new("op-idem").expect("operation"),
                 idempotency_key: "idem-key".to_owned(),

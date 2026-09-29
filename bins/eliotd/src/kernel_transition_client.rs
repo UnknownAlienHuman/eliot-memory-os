@@ -460,6 +460,7 @@ mod tests {
         let entries = generated_operation_manifests().expect("catalogue");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-daemon-1").expect("operation id"),
                 idempotency_key: "idem-daemon-1".to_owned(),
