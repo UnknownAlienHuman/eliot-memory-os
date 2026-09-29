@@ -3213,6 +3213,52 @@ fn validate_installation_runtime_preflight(
     )
 }
 
+fn record_or_validate_profile_selection_receipt(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+) -> std::result::Result<InstallationTransaction, InstallationError> {
+    if transaction.profile != InstallationProfile::UserMode
+        && transaction.profile != InstallationProfile::PortableDev
+    {
+        return Ok(transaction.clone());
+    }
+    let request = eliot_installation::profile_root_request_for_launch(
+        &transaction.candidate_manifest.runtime_launch,
+    )?;
+    let leases = eliot_platform_windows::profile_supervision::open_profile_root_leases(&request)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let current = leases.selection().clone();
+    if let Some(original) = transaction.profile_selection_receipt.as_ref() {
+        let matches = eliot_installation::profile_selection_receipts_match_retained_roots(
+            original, &current,
+        )?;
+        if !matches {
+            return Err(InstallationError::IdentityConflict);
+        }
+        leases
+            .verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        return Ok(transaction.clone());
+    }
+    let recorded = RedbInstallationTransactionStore::record_profile_selection_receipt_at_exact_path(
+        store_path,
+        &transaction.transaction_id,
+        current,
+    )?;
+    leases
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    if recorded.profile_selection_receipt.is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "profile root identities were not retained in the durable transaction".to_owned(),
+        ));
+    }
+    Ok(recorded)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the CLI keeps coordinator reopen, sealed readback and bounded outcome output in one auditable boundary"
@@ -3466,6 +3512,7 @@ fn run_installation_effect(
         }
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
+    let mut user_mode_pending = false;
     let outcome = if recover {
         if preflight_transaction.has_activation_projection_intent() {
             rollback_with_activation_owner(
@@ -3622,6 +3669,131 @@ fn run_installation_effect(
             }
             outcome => outcome,
         }
+    } else if preflight_transaction.profile == InstallationProfile::UserMode {
+        match coordinator.drive_until_host_bootstrap(&transaction_id) {
+            Ok(InstallationStepOutcome::Applied {
+                evidence_refs: bootstrap_evidence,
+                ..
+            }) => {
+                let current = match coordinator.store().load(&transaction_id) {
+                    Ok(Some(transaction)) => transaction,
+                    Ok(None) => {
+                        write_installation_error(
+                            "INSTALLATION_STATE_UNAVAILABLE",
+                            "UserMode bootstrap prefix applied but the transaction record is gone",
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "UserMode bootstrap prefix applied but transaction readback failed: {error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let current = match record_or_validate_profile_selection_receipt(
+                    store_path,
+                    &current,
+                ) {
+                    Ok(transaction) => transaction,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "UserMode root/package prefix applied but its original retained root receipt could not be established: {error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let host_state_root = Path::new(
+                    current
+                        .candidate_manifest
+                        .runtime_launch
+                        .runtime_state_roots
+                        .host_state_root
+                        .as_str(),
+                );
+                let host_root = match UserOwnedRootLease::open_existing(host_state_root) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("retained UserMode Host root could not be reopened: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                match host_root.canonical_path() {
+                    Ok(path) if eliot_platform_windows::windows_paths_equal(&path, host_state_root) => {}
+                    Ok(_) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            "retained UserMode Host root differs from the exact transaction binding",
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("canonicalize retained UserMode Host root: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                if let Err(error) = host_root.verify_stable_identity() {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &format!("retained UserMode Host root identity changed: {error}"),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                let registry = match RedbInstallationRegistry::open_user_owned_at(
+                    host_root,
+                    InstallationProfile::UserMode,
+                ) {
+                    Ok(registry) => registry,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("UserMode pending registry could not be opened: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let expected_revision = match registry.load() {
+                    Ok(registry) => registry.revision(),
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!("UserMode pending registry preflight failed: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                if let Err(error) = coordinator.stage_bootstrap_pending_activation(
+                    &registry,
+                    &transaction_id,
+                    expected_revision,
+                ) {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &format!("UserMode pending registry projection failed: {error}"),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                drop(registry);
+                user_mode_pending = true;
+                Ok(InstallationStepOutcome::Applied {
+                    stage: InstallationStage::Activating,
+                    evidence_refs: bootstrap_evidence,
+                })
+            }
+            outcome => outcome,
+        }
     } else {
         coordinator.drive_all_effects_until_blocked(&transaction_id)
     };
@@ -3743,15 +3915,21 @@ fn run_installation_effect(
     // activation is pending and the next invocation will query-reconcile the
     // Host receipt rather than retrying materialization.
     let phase_b_pending = !recover
-        && transaction.profile == InstallationProfile::SystemService
         && transaction.stage() == InstallationStage::Activating
-        && matches!(effective_outcome, InstallationStepOutcome::Rejected);
+        && ((transaction.profile == InstallationProfile::SystemService
+            && matches!(effective_outcome, InstallationStepOutcome::Rejected))
+            || (transaction.profile == InstallationProfile::UserMode && user_mode_pending));
     let staging = if phase_b_pending {
         InstallationStagingDisposition {
             disposition: "PENDING_RUNTIME",
             reason: Some(
-                "Host Phase-B response is unresolved; activation remains fenced and the next command will query-reconcile the exact receipt"
-                    .to_owned(),
+                if transaction.profile == InstallationProfile::UserMode {
+                    "UserMode pending registry projection is staged; Host Phase-B bootstrap and current-user task activation remain pending"
+                        .to_owned()
+                } else {
+                    "Host Phase-B response is unresolved; activation remains fenced and the next command will query-reconcile the exact receipt"
+                        .to_owned()
+                },
             ),
             registry: None,
         }
