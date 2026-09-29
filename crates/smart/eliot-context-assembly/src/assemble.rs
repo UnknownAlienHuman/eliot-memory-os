@@ -5,7 +5,7 @@ use eliot_context_contracts::{
     QualityOperation, QualityRefusalKind, QualityScorecard, SerializedContextMeasurement,
 };
 
-use crate::{AssemblyError, bounds, measurement, render};
+use crate::{AssemblyError, boundary, bounds, measurement, render};
 
 /// Stable local ordering revision for the A-15 canonical rendered payload.
 pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
@@ -136,6 +136,11 @@ where
     if policy.fence_digest != expected_fence_digest {
         return Err(AssemblyError::Contract(ContextError::InvalidFence));
     }
+    // Preserve boundaries before presentation sorting. This projection is the
+    // membership-changing transform the shared boundary contract is about: it emits
+    // one envelope per rendered unit plus the exact input-to-output member relation,
+    // keyed to the admitted source order rather than the role/provider sort below.
+    let boundaries = boundary::project_assembly_boundaries(admitted, recipe)?;
     let rendered = render::render(admitted);
     let (output_digest, bytes) = measurement::canonical_matches(
         &admitted.binding,
@@ -186,6 +191,7 @@ where
         view,
         admitted: admitted.clone(),
         serialized_bytes: bytes,
+        boundaries,
     })
 }
 
@@ -260,4 +266,11 @@ pub struct ActiveUnderstandingViewResult {
     pub admitted: AdmittedContextSet,
     /// Exact bytes handed to the measurement callback.
     pub serialized_bytes: Vec<u8>,
+    /// Boundary metadata for every rendered unit, plus the exact member relation.
+    ///
+    /// This is the round-trip half of the assembly result: readback can compare the
+    /// declared source identities, per-unit scope/fence and admitted source order
+    /// against what it reconstructed, instead of trusting a concatenated string.
+    /// Its recorded digest is validated against the payload held.
+    pub boundaries: eliot_context_contracts::BoundaryMetadataSet,
 }
