@@ -913,10 +913,7 @@ impl PublicationPort for KernelArchiveOwner {
 }
 
 /// Refuses an unbounded or malformed publication identity.
-fn check_publication_id(
-    value: &str,
-    field: &'static str,
-) -> Result<(), KernelCaptureError> {
+fn check_publication_id(value: &str, field: &'static str) -> Result<(), KernelCaptureError> {
     non_blank(value, field)?;
     if value.len() > MAX_PUBLICATION_ID_LEN {
         return Err(KernelCaptureError::InvalidInput {
@@ -952,7 +949,7 @@ fn write_owned(
                 KernelCaptureError::PublicationUnknown(operation_id.to_owned())
             }
             _ => KernelCaptureError::OwnerEvidenceInvalid(format!(
-                "publication body could not be created: {error}"
+                "publication file could not be created: {error}"
             )),
         })?;
     file.write_all(bytes).map_err(|error| {
