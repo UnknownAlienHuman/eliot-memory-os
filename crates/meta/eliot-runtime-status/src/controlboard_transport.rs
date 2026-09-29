@@ -403,6 +403,8 @@ mod tests {
             ],
             notifications: NotificationInbox {
                 rows: Vec::new(),
+                unresolved_critical: Vec::new(),
+                failed_delivery: Vec::new(),
                 metrics: NotificationMetrics::default(),
             },
             observed_count: 7,
