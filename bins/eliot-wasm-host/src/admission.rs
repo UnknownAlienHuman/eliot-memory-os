@@ -407,6 +407,10 @@ fn admitted_lease(
         state_fence: fence.clone(),
         // The material binder already refuses every spelling but "active".
         state: LeaseState::Active,
+        // The admitted lease expires exactly when the owner grant does; the
+        // same value drives the live-authority window below, so the lease
+        // and the authority it mirrors can never disagree on expiry.
+        expires_at_ms: material.grant.expires_at,
     }
 }
 

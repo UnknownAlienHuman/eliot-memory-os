@@ -651,6 +651,7 @@ mod tests {
             authority_epoch: test_epoch(),
             state_fence: fence.clone(),
             state: LeaseState::Active,
+            expires_at_ms: 4_000_000_000_000,
         }
     }
 

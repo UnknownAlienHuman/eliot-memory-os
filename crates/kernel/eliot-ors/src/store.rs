@@ -210,12 +210,13 @@ const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
 /// Durable `RuntimeLease` current rows for the #1918 ACT-1/A4 retirement
 /// census (I1.5). Keyed by lease identity; one row per exact-fence durable
-/// runtime lease the Kernel may retire. The durable issuance writer belongs
-/// to #1751; until it lands, the table holds no rows and the census reports
-/// that observed store fact rather than a default. This is one more table in
-/// the existing ORS table family, owned by the same `RedbRecoveryStore` and
-/// written through the same `persistence_codec`; it is not a second journal
-/// or table owner.
+/// runtime lease the Kernel may retire. The durable issuance writer is
+/// [`RedbRecoveryStore::record_runtime_lease_current`], called by the Kernel
+/// when it grants activation; an absent table still reads as the observed
+/// empty set rather than a default. This is one more table in the existing
+/// ORS table family, owned by the same `RedbRecoveryStore` and written
+/// through the same `persistence_codec`; it is not a second journal or
+/// table owner.
 const RUNTIME_LEASE_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_runtime_lease_current_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
@@ -24221,6 +24222,31 @@ impl RedbRecoveryStore {
         }
         runtime_leases.sort_by(|first, second| first.lease_id.cmp(&second.lease_id));
         Ok(runtime_leases)
+    }
+
+    /// Records (or re-records) the current `RuntimeLease` row for one lease
+    /// identity (issue #1918; I18.53 ACT-1/ACT-4).
+    ///
+    /// The durable issuance writer for the activation-granted runtime lease:
+    /// the Kernel records the row when it grants activation and re-records it
+    /// on renewal or terminal transition, keyed by the lease identity exactly
+    /// like the supervision-lease current projection. The row is validated
+    /// before the write, so a blank identity or a zero expiry fails closed
+    /// without touching the table.
+    pub fn record_runtime_lease_current(&self, lease: &RuntimeLease) -> Result<(), OrsError> {
+        lease
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let encoded = encode(lease)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut current = write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+            current
+                .insert(lease.lease_id.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(())
     }
 
     /// Loads the recorded effect operation lease for one exact authorized

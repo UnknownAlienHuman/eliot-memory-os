@@ -740,6 +740,34 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
             _ => None,
         };
+        // I18.53 ACT-1 (#1918 A4): a granted activation issues its durable
+        // runtime lease. The row is keyed by the stable activation operation
+        // identity, fenced exactly like the activation itself, and expires
+        // after the validity window; the retirement census reads it back
+        // through the canonical ORS owner. No lock is held across the ORS
+        // write: the service lock above is released before this statement.
+        if let (KernelControlCommand::Activate(_), Some(receipt)) =
+            (&request.command, &activation_receipt)
+        {
+            let expires_at_ms = crate::unix_ms()
+                .checked_add(RUNTIME_LEASE_VALIDITY_MS)
+                .ok_or(TransportError::SessionFenced)?;
+            let lease = RuntimeLease {
+                lease_id: receipt.operation_id.as_str().to_owned(),
+                scope_ref: request.candidate.activation_id.as_str().to_owned(),
+                authority_epoch: receipt.authority_epoch.clone(),
+                state_fence: StateFence::new(
+                    request.candidate.kernel_epoch.clone(),
+                    request.generation,
+                ),
+                state: LeaseState::Active,
+                expires_at_ms,
+            };
+            self.generation_gateway
+                .ors
+                .record_runtime_lease_current(&lease)
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
         #[cfg(windows)]
         if matches!(&request.command, KernelControlCommand::Activate(_))
             && self
@@ -1358,6 +1386,14 @@ const fn disposition_code(disposition: DrainWakeDisposition) -> &'static str {
 
 /// Stable domain for the ACT-4 boot identity derivation.
 const RESUME_BOOT_ID_DOMAIN: &str = "eliot-kernel.resume-boot.v1";
+
+/// Validity window in milliseconds for an activation-granted runtime lease
+/// (I18.53 ACT-1, #1918 A4). The lease blocks the retirement census while
+/// non-terminal and unexpired; afterwards the census observes it as expired
+/// without rewriting it. Mirrors the supervision renewal policy's 60-second
+/// validity in the same drain gate: one window for both halves of ACT-1, so
+/// neither half can outlive the other's proof.
+const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
 
 /// What the Kernel's own supervision-lease authority actually observed for the
 /// lease identity a resume presents.
