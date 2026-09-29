@@ -715,6 +715,15 @@ pub fn disposition_for_parts(
         crate::registry::RegistryError::Contract(inner) => ProviderDisposition::Unavailable {
             rule: format!("registry contract: {inner}"),
         },
+        crate::registry::RegistryError::Disposition(inner) => ProviderDisposition::Unavailable {
+            rule: format!("registry disposition: {inner}"),
+        },
+        crate::registry::RegistryError::IdentitySlotBlank { instrument, .. }
+        | crate::registry::RegistryError::IdentitySlotDrift { instrument, .. } => {
+            ProviderDisposition::Unavailable {
+                rule: format!("{instrument}: profile identity slot is unbound or drifted"),
+            }
+        }
     }
 }
 
