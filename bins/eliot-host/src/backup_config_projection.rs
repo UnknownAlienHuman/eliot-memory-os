@@ -9,7 +9,7 @@
 //!
 //! # What the owner actually proves
 //!
-//! On the production path the owner proves six things, and each reaches the
+//! On the production path the owner proves seven things, and each reaches the
 //! record as an owner-issued value rather than as a copied claim:
 //!
 //! - the **owner lease reference**, issued by `OwnerEvidence` from the
@@ -28,36 +28,41 @@
 //! - the **approved profile token**, compared against the same validated
 //!   approved record inside
 //!   `crate::backup_preparation::DelegatedPreparation::prepare`;
+//! - the **purge-ledger revision**, the owner-issued counter from the ORS owner
+//!   read through the read-only, schema-checked purge-ledger reader published
+//!   beside `eliot_ors::read_current_supervision_lease_read_only`
+//!   (`crates/kernel/eliot-ors/src/status.rs:657`) and handed to the projector
+//!   as `owner_purge_ledger_revision`;
 //! - the **state fence**, which is the committed activation fence's authority
 //!   state fence.
 //!
-//! The generation, configuration digest, artifact digest and owner-lease
-//! comparisons are presented-vs-owner: a caller that names a different value is
-//! refused with [`ProjectionError::StaleEvidence`] naming the exact field, so a
-//! stale or mixed claim cannot reach the record. The record itself is filled
-//! from the owner side of each comparison, never from the presented side.
+//! The generation, configuration digest, artifact digest, purge-ledger and
+//! owner-lease comparisons are presented-vs-owner: a caller that names a
+//! different value is refused with [`ProjectionError::StaleEvidence`] naming the
+//! exact field, so a stale or mixed claim cannot reach the record. The record
+//! itself is filled from the owner side of each comparison, never from the
+//! presented side.
 //!
-//! For one further field this path still has no owner evidence at all: the
-//! purge-ledger revision. That gap is a **producer** gap, proved below, and it
-//! is not closed by any value this composition could compute for itself.
+//! The purge-ledger revision is **owner-issued** on the production path, and the
+//! seam that made that possible is named here so the boundary stays visible:
 //!
 //! - The purge-ledger revision is owner-issued by the ORS owner
 //!   (`RedbRecoveryStore::purge_ledger_revision`, and its historical
-//!   `backup_verification_purge_ledger_revision` binding). This composition
-//!   holds no ORS handle and must not take one: `crates/storage/AGENTS.md`
-//!   forbids a **second mutable** root owner, and a Host-side read of the ORS
-//!   `META` counter would additionally be a second copy of the owner's own rule
-//!   (`META` and `PURGE_LEDGER_REVISION_KEY` are private to
-//!   `crates/kernel/eliot-ors/src/store.rs`). What is missing is exactly one
-//!   seam, and the tree already shows the accepted shape of it: `eliot-ors`
-//!   publishes short-lived, read-only, schema-checked readers
-//!   (`eliot_ors::read_current_supervision_lease_read_only`,
-//!   `crates/kernel/eliot-ors/src/status.rs:657`) that this very bin already
-//!   consumes read-only over a retained `ProtectedRuntimePathLease`
-//!   (`crate::watchdog_publication`, `watchdog_publication.rs:170`) without
-//!   becoming a store owner. No such reader exists for the purge-ledger counter,
-//!   and adding one means editing `crates/kernel/eliot-ors`, which is outside
-//!   this issue's mutable scope. That is the whole unblocking precondition.
+//!   `backup_verification_purge_ledger_revision` binding). **This contour still
+//!   holds no ORS store handle and is not a store owner, and must not become
+//!   one**: `crates/storage/AGENTS.md` forbids a **second mutable** root owner,
+//!   and a Host-side read of the ORS `META` counter would additionally be a
+//!   second copy of the owner's own rule (`META` and
+//!   `PURGE_LEDGER_REVISION_KEY` are private to
+//!   `crates/kernel/eliot-ors/src/store.rs`). What it consumes instead is the
+//!   owner's own reading, published as a short-lived, read-only,
+//!   schema-checked purge-ledger reader beside
+//!   `eliot_ors::read_current_supervision_lease_read_only`
+//!   (`crates/kernel/eliot-ors/src/status.rs:657`), the same retained-lease shape
+//!   this bin already consumes read-only in `crate::watchdog_publication`
+//!   (`watchdog_publication.rs:170`). The number reaching this projector is
+//!   therefore the owner's, observed by the owner, and this function only
+//!   compares against it; it never reads, opens or owns a store to obtain it.
 //! - The forensic audit note is **owner-issued**, from the owner that did
 //!   observe the installation lineage: `OwnerEvidence` holds the validated
 //!   registry projection, its active approved generation and its committed
@@ -75,13 +80,15 @@
 //!   fence forensic and never restored as active authority, and that ceiling is
 //!   unchanged.
 //!
-//! The purge-ledger revision is the one remaining uncorroborable presented claim.
-//! It is **refused** with [`ProjectionError::OwnerEvidenceUnavailable`], which
-//! names the missing owner obligation, instead of being copied into an
-//! owner-issued projection and its digest. With no claim presented the record
-//! carries the absence and the digest binds that absence explicitly: I5.27
-//! forbids silently omitting or defaulting a field that affects authority, in
-//! either direction.
+//! A presented purge-ledger revision is a **claim**, checked against the
+//! owner-issued one and refused with [`ProjectionError::StaleEvidence`] when it
+//! differs, exactly like the lease-reference and audit-note arms. Because the
+//! field is a `u64` with no distinct absent value, **zero is the "no claim"
+//! reading** — the same admission the empty lease reference gets — and the
+//! owner-issued value is what the record and the digest carry in either case.
+//! I5.27 is honoured in both directions: the field is never silently omitted or
+//! defaulted to an absent marker, and it is never defaulted to a presented
+//! value.
 //!
 //! The presented source installation identity is bounded presented text. The
 //! only owner-issued installation identity on this contour is the launch
@@ -123,11 +130,10 @@
 //! audit claim at all, because its text is not restated into a receipt.
 //!
 //! [`project_backup_config`] is the current-authority-snapshot variant. It has
-//! no production caller, and deliberately so: its [`AuthoritySnapshot`] needs a
-//! purge-ledger revision, and the installation registry, [`ApprovedGeneration`]
-//! and the activation commit fence carry none. See
-//! [`project_backup_config_owner_bound`] for the refusal that replaces that
-//! comparison on the production path.
+//! no production caller, and deliberately so: its [`AuthoritySnapshot`] has no
+//! production constructor, so nothing in production assembles the whole set it
+//! compares against. See [`project_backup_config_owner_bound`] for the
+//! production comparison it stands in for.
 
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_installation::{ActivationCommitFence, ActivePhaseBRebind, ApprovedGeneration};
@@ -326,19 +332,24 @@ fn note_config_error(op: &'static str, error: ProjectionError) -> ProjectionErro
 /// is the `authority_from_valid` test fixture helper in
 /// `bins/eliot-host/tests/backup_preparation.rs`, and the only function that
 /// consumes it, [`project_backup_config`], therefore has no production caller
-/// either. Nothing in the installation registry, [`ApprovedGeneration`] or the
-/// activation commit fence carries `purge_ledger_revision`, so producing this
-/// struct from a production path would mean copying that value out of the
-/// request being checked, which would turn the comparison into a
-/// self-comparison that can never fail.
+/// either. That remains true for a reason that is no longer about the purge
+/// ledger: no production code assembles this **whole** set, because no single
+/// owner-issued read produces all five fields at once — the lease reference, the
+/// approved record and the purge counter are three separate owner reads. The
+/// purge counter in particular is no longer an obstacle, because the owner-issued
+/// value now reaches the production projection as the
+/// `owner_purge_ledger_revision` argument of
+/// [`project_backup_config_owner_bound`] rather than through this struct. No
+/// production constructor was invented for it here.
 ///
 /// The production path is [`project_backup_config_owner_bound`]. It compares
-/// every field this struct carries except `purge_ledger_revision`, and
-/// **refuses** a presented purge-ledger revision with
-/// [`ProjectionError::OwnerEvidenceUnavailable`] instead of comparing it
-/// against a value the same caller supplied. This struct is retained as the
-/// snapshot-shaped comparison set for that variant; it is not, and must not be
-/// read as, a description of evidence a production caller supplies.
+/// every field this struct carries, each against a separately owner-issued
+/// value, and **refuses** a presented `purge_ledger_revision` that differs from
+/// the owner-issued one with [`ProjectionError::StaleEvidence`], rather than
+/// comparing it against a value the same caller supplied. This struct is
+/// retained as the snapshot-shaped comparison set for that variant; it is not,
+/// and must not be read as, a description of evidence a production caller
+/// supplies.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritySnapshot {
     /// Owner lease reference (opaque bounded text, never a secret value).
@@ -362,10 +373,9 @@ pub struct AuthoritySnapshot {
 /// the projector refuses the presented value itself with
 /// [`ProjectionError::OwnerEvidenceUnavailable`].
 /// [`project_backup_config_owner_bound`] compares `owner_lease_ref`,
-/// `manifest_digest`, `build_digests`, `generation` and `audit` against
-/// owner-issued values and refuses a presented `purge_ledger_revision`;
-/// [`project_backup_config`] compares all five against an
-/// [`AuthoritySnapshot`] that has no production constructor.
+/// `manifest_digest`, `build_digests`, `generation`, `purge_ledger_revision`
+/// and `audit` against owner-issued values; [`project_backup_config`] compares
+/// all six against an [`AuthoritySnapshot`] that has no production constructor.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackupConfigRequest {
     /// Source installation identity (bounded text).
@@ -403,16 +413,21 @@ pub struct BackupConfigRequest {
     pub build_digests: Vec<String>,
     /// Purge-ledger revision claimed.
     ///
-    /// Refused on the owner-bound production path: the purge-ledger revision is
-    /// owner-issued by the ORS owner
-    /// (`RedbRecoveryStore::purge_ledger_revision`), and Host backup preparation
-    /// opens no ORS store — sourcing it here would make this composition root a
-    /// second store owner, which `crates/storage/AGENTS.md` forbids. No
-    /// installation record, approved generation, commit fence or host-state
-    /// record reachable from Host issues a revision, so any presented value is
-    /// uncorroborated and is refused with
-    /// [`ProjectionError::OwnerEvidenceUnavailable`]. The snapshot variant
-    /// still compares it against its [`AuthoritySnapshot`].
+    /// On the owner-bound production path this is a *claim* about the owner's
+    /// revision, never the source of one, and it is checked exactly like the
+    /// lease reference: because the field is a `u64` with no distinct absent
+    /// value, **zero is the "no claim" reading** and is admitted, and any other
+    /// presented value must equal the owner-issued revision the projector was
+    /// handed, or it is refused with [`ProjectionError::StaleEvidence`]. The
+    /// record and the projection digest carry the **owner-issued** revision in
+    /// either case, so a claim can never become the evidence. I5.27 forbids
+    /// silently omitting or defaulting this field in either direction, and
+    /// neither happens: an absent claim is visible as the owner's own number,
+    /// not as a substituted zero. The owner-issued value comes from the ORS
+    /// owner's read-only, schema-checked purge-ledger reader, observed by the
+    /// owner; this composition still holds no ORS store handle and is not a
+    /// store owner. The snapshot variant still compares it against its
+    /// [`AuthoritySnapshot`].
     pub purge_ledger_revision: u64,
     /// Optional forensic audit note; never authority (case 958/3).
     ///
@@ -596,14 +611,17 @@ pub struct BackupConfigProjection {
     /// [`AuthoritySnapshot`] comparison is equality against a caller-built
     /// value and narrowing it would weaken that arm.
     pub build_digests: Vec<String>,
-    /// Purge-ledger revision. Always **zero** on the owner-bound production
-    /// path: the revision is owner-issued by the ORS owner, this composition
-    /// holds no ORS handle (it must not, `crates/storage/AGENTS.md` forbids a
-    /// second mutable root owner), and no record reachable from Host issues a
-    /// revision, so a presented one is refused with
-    /// [`ProjectionError::OwnerEvidenceUnavailable`] and the record states the
-    /// absence. The snapshot variant fills this from its
-    /// [`AuthoritySnapshot`].
+    /// Purge-ledger revision, **owner-issued** on the production path.
+    ///
+    /// The value is the revision the ORS owner read through its read-only,
+    /// schema-checked purge-ledger reader, never a presented number. A presented
+    /// `purge_ledger_revision` is a claim about it: zero is "no claim" and is
+    /// admitted, and any other value must equal the owner-issued revision or it
+    /// is refused with [`ProjectionError::StaleEvidence`]. The record carries
+    /// the owner-issued side either way, which is what a backup receipt has to
+    /// bind so a restore compares against the ledger that actually held the
+    /// purged data rather than against a number a caller supplied. The snapshot
+    /// variant fills this from its [`AuthoritySnapshot`].
     pub purge_ledger_revision: u64,
     /// State fence bound at projection time.
     ///
@@ -772,15 +790,15 @@ pub fn describe_audit_fence(note: &AuditFenceNote) -> String {
 /// comparison shape, for the case where one owner-issued value is available for
 /// every field at once. A snapshot assembled from the very request it checks
 /// compares only with itself, which is why its purge-ledger arm is unreachable
-/// from any production path today and why the production projector refuses that
-/// field instead of comparing it.
+/// from any production path today and why the production projector takes the
+/// revision from its own owner-issued argument instead.
 ///
 /// The production path is [`project_backup_config_owner_bound`], which compares
-/// against the owner-issued lease reference, generation, configuration digest
-/// and artifact digests of the active approved record and its committed fence.
-/// Its digest domain separator is therefore distinct from this function's,
-/// because the two constructions bind different fields: this path is
-/// `snapshot.v3`, the owner-bound path is `v6`.
+/// against the owner-issued lease reference, generation, configuration digest,
+/// artifact digests, purge-ledger revision and forensic note. Its digest domain
+/// separator is therefore distinct from this function's, because the two
+/// constructions bind different fields: this path is `snapshot.v3`, the
+/// owner-bound path is `v7`.
 ///
 /// Validates shapes and bounds, then requires field-for-field equality with
 /// the supplied snapshot. Any stale or mixed field fails with
@@ -931,17 +949,20 @@ pub fn project_backup_config(
 /// the owner-issued numeric authority generation of the same record, never a
 /// caller-chosen number.
 ///
-/// The lease reference, the installation identity, the purge-ledger revision and
-/// the target build/profile comparison itself stay outside this record: the
-/// lease reference is issued separately by the owner that holds the lease (see
+/// The lease reference, the installation identity and the target build/profile
+/// comparison itself stay outside this record: the lease reference is issued
+/// separately by the owner that holds the lease (see
 /// `crate::backup_preparation::OwnerEvidence::owner_lease_ref`), the
-/// installation identity and the purge-ledger revision have no owner source
-/// reachable from Host backup preparation and are refused by
-/// [`project_backup_config_owner_bound`], and the last is compared in
+/// installation identity is compared at
+/// `HostComposition::prepare_backup_destination`, and the last is compared in
 /// `crate::backup_preparation::DelegatedPreparation::prepare` against
 /// [`ApprovedBuildBinding::generation_handle`] and
 /// [`ApprovedBuildBinding::approved_profile`], the two owner-issued names a
-/// presented target may equal.
+/// presented target may equal. The purge-ledger revision is owner-issued too,
+/// but from a different owner over a different read, so it is not a field of
+/// this struct either: it reaches the projection as the separate
+/// `owner_purge_ledger_revision` argument of
+/// [`project_backup_config_owner_bound`].
 ///
 /// **Provenance is a property of the constructor, not of the type.** Every field
 /// is `pub` and the type is not `#[non_exhaustive]`, so a caller can construct
@@ -1204,7 +1225,7 @@ pub fn bind_approved_build(
 /// deliberate: an EMPTY presented `owner_lease_ref` is legal here and means "no
 /// claim", where the snapshot variant treats empty as an invalid identity.
 ///
-/// Then four presented fields must agree with owner-issued ones, each failing
+/// Then five presented fields must agree with owner-issued ones, each failing
 /// with [`ProjectionError::StaleEvidence`] naming the exact field:
 ///
 /// - `owner_lease_ref`, when presented, must be bounded text and must equal the
@@ -1215,17 +1236,23 @@ pub fn bind_approved_build(
 ///   the owner-issued numeric authority generation of the approved record;
 /// - `manifest_digest` must equal the owner-issued configuration digest;
 /// - every presented `build_digests` entry must be one of the owner-issued
-///   artifact digests.
+///   artifact digests;
+/// - `purge_ledger_revision`, when non-zero, must equal the
+///   `owner_purge_ledger_revision` argument. Zero is "no claim" — the `u64` has
+///   no distinct absent value — and the record carries the owner-issued revision
+///   either way.
 ///
-/// The generation arm runs first among the owner comparisons on purpose: it is
-/// the scope every other owner-issued fact belongs to, so a request that mixes
-/// one generation's digest into another generation's claim is refused as a
-/// generation mismatch rather than as a digest mismatch. The uncorroborable-field
-/// refusals run before all of them, because a value nothing can check is
-/// not evidence in any generation.
+/// The generation arm runs before the configuration and artifact comparisons on
+/// purpose: it is the scope the other approved-record owner facts belong to, so a
+/// request that mixes one generation's digest into another generation's claim is
+/// refused as a generation mismatch rather than as a digest mismatch. The
+/// lease-reference and purge-ledger arms run ahead of it because each has its own
+/// "no claim" admission that must be settled first; they compare against owner
+/// reads from a different owner and are not scoped by the approved generation.
 ///
 /// The record is then filled from the **owner side** of every comparison:
-/// `owner_lease_ref` is the owner-issued reference, `generation` and
+/// `owner_lease_ref` is the owner-issued reference, `purge_ledger_revision` is
+/// the owner-issued revision, `generation` and
 /// `manifest_digest` are the owner-issued values the comparisons just forced to
 /// agree, and `build_digests` is the complete owner-issued approved artifact
 /// set rather than the presented subset. So the projection states the exact
@@ -1233,29 +1260,33 @@ pub fn bind_approved_build(
 /// caller's narrowing of that evidence can neither become the record nor change
 /// the digest.
 ///
-/// # The one field the owner cannot issue is refused, not copied
+/// # The purge-ledger revision is compared, not refused
 ///
-/// One presented field has no owner evidence anywhere on this path, so a
-/// presented value is refused with [`ProjectionError::OwnerEvidenceUnavailable`]
-/// rather than compared against the caller's own value or carried into an
-/// owner-issued record: a non-zero `purge_ledger_revision`. The revision is
-/// owner-issued by the ORS owner (`RedbRecoveryStore::purge_ledger_revision`,
-/// with its historical `backup_verification_purge_ledger_revision` binding).
-/// This composition holds no ORS handle, and it must not open one:
-/// `crates/storage/AGENTS.md` forbids a **second mutable** root owner, so the
-/// absence of an owner source is a real boundary and not a gap this lane may
-/// paper over by reading the ORS `META` counter itself. **Unblocking
-/// precondition**, named here so the next reader does not re-derive it: one
-/// read-only, schema-checked purge-ledger reader beside
-/// `eliot_ors::read_current_supervision_lease_read_only`
-/// (`crates/kernel/eliot-ors/src/status.rs:657`), consumed by this bin the way
-/// `crate::watchdog_publication` already consumes that one — a short-lived read
-/// over a retained `ProtectedRuntimePathLease`, not a store owner. That is an
-/// edit to `crates/kernel/eliot-ors`, outside this issue's mutable scope.
+/// The purge-ledger revision is **owner-issued**: the ORS owner issues it
+/// (`RedbRecoveryStore::purge_ledger_revision`, with its historical
+/// `backup_verification_purge_ledger_revision` binding), and this bin obtains
+/// that value from the read-only, schema-checked purge-ledger reader published
+/// beside `eliot_ors::read_current_supervision_lease_read_only`
+/// (`crates/kernel/eliot-ors/src/status.rs:657`) and receives it as the
+/// `owner_purge_ledger_revision` argument. So a presented revision is a
+/// presented-versus-owner **claim**, refused with
+/// [`ProjectionError::StaleEvidence`] when it differs — the same shape as the
+/// lease reference and the forensic note.
 ///
-/// The refusal names that exact owner obligation. With no claim presented, the
-/// record states the absence and the digest binds that absence explicitly, so an
-/// absent owner value is as visible as a present one.
+/// This composition still holds no ORS store handle and is not a store owner,
+/// and it must not open one: `crates/storage/AGENTS.md` forbids a **second
+/// mutable** root owner, so reading the ORS `META` counter here would be a
+/// second copy of the owner's own rule rather than evidence. What it consumes is
+/// the owner's reading over a short-lived read, the same retained-lease shape
+/// `crate::watchdog_publication` already consumes for the supervision lease.
+///
+/// The refusal that stood here previously is gone, and nothing is weakened by
+/// its removal: before, a presented revision could never reach the record, and
+/// the record stated the absence; now a revision reaches the record only when it
+/// equals the owner-issued one, and what reaches it is always the **owner's**
+/// number rather than the presented one. A no-claim request produces exactly
+/// the record the refusal produced, except that the owner-issued revision is
+/// stated instead of an absence.
 ///
 /// The forensic audit note is no longer in that category: it is **owner-issued**,
 /// from `owner_audit`, which is
@@ -1284,17 +1315,19 @@ pub fn bind_approved_build(
 /// reference, the owner-issued forensic note and the complete owner-issued
 /// artifact digest set, in addition to the presented fields, so a receipt cannot
 /// migrate across installations, authority generations, retained configuration
-/// byte sets or installation lineages. Its domain separator is `v6`, distinct
+/// byte sets or installation lineages. Its domain separator is `v7`, distinct
 /// from [`project_backup_config`]'s `snapshot.v3` and from this path's earlier
-/// `v3`, `v4` and `v5`: `v3` hashed the caller's lease reference and
+/// `v3`, `v4`, `v5` and `v6`: `v3` hashed the caller's lease reference and
 /// purge-ledger revision as if they were evidence, `v4` bound an *absent* lease
-/// reference plus only the caller's chosen subset of the approved artifacts, and
-/// `v5` bound an *absent* forensic note, so a stored receipt under any of them
-/// must not silently match a `v6` digest over the same logical input (I5.27).
-/// `v5` **has** shipped on `main`, so the `v5`-era claim that no stored `v5`
-/// receipt exists is no longer true and this binding genuinely changes what a
-/// digest commits to: under `v5` two preparations whose installation lineage
-/// differed hashed identically, and under `v6` they do not.
+/// reference plus only the caller's chosen subset of the approved artifacts, `v5`
+/// bound an *absent* forensic note, and `v6` bound an *absent* purge-ledger
+/// revision, so a stored receipt under any of them must not silently match a
+/// `v7` digest over the same logical input (I5.27). `v5` and `v6` **have**
+/// shipped on `main`, so this binding genuinely changes what a digest commits
+/// to: under `v5` two preparations whose installation lineage differed hashed
+/// identically, and under `v6` a digest said nothing whatsoever about the purge
+/// ledger, so neither a stored `v5` nor a stored `v6` receipt may be accepted
+/// as evidence about either fact.
 ///
 /// `CONFIG_PROJECTION_VERSION` is the serialized record schema version, not the
 /// digest revision, and does not move: the record shape is unchanged, because
@@ -1320,12 +1353,13 @@ pub fn bind_approved_build(
 /// destination receipt binds.
 ///
 /// The refusals below are owner comparisons only when `binding` came from
-/// [`bind_approved_build`] and `owner_lease_ref` came from the owner. Both are
-/// plain public values, so a caller that constructs them directly supplies the
-/// values the refusals are measured against; on that path the arms degrade to
-/// shape guards. The one production caller obtains its binding from
-/// `bind_approved_build` over an owner-validated [`ApprovedGeneration`] and its
-/// committed [`ActivationCommitFence`], and its lease reference from
+/// [`bind_approved_build`], `owner_lease_ref` came from the owner and
+/// `owner_purge_ledger_revision` came from the owner. All three are plain public
+/// values, so a caller that constructs them directly supplies the values the
+/// refusals are measured against; on that path the arms degrade to shape guards.
+/// The one production caller obtains its binding from `bind_approved_build` over
+/// an owner-validated [`ApprovedGeneration`] and its committed
+/// [`ActivationCommitFence`], its lease reference and purge-ledger revision from
 /// `OwnerEvidence`, whose fields are all private and constructible only by
 /// `OwnerEvidence::inspect`. The delegated path is therefore the owner
 /// comparison these arms are written for.
@@ -1337,6 +1371,7 @@ pub fn project_backup_config_owner_bound(
     request: &BackupConfigRequest,
     binding: &ApprovedBuildBinding,
     owner_lease_ref: &str,
+    owner_purge_ledger_revision: &u64,
     owner_audit: &AuditFenceNote,
     fence: &StateFence,
 ) -> Result<BackupConfigProjection, ProjectionError> {
@@ -1380,28 +1415,6 @@ pub fn project_backup_config_owner_bound(
     for digest in &binding.artifact_digests {
         check_digest(digest, "approved_artifact_digests[]")
             .map_err(|error| note_config_error("project_owner_bound", error))?;
-    }
-    // The one uncorroborable presented claim, refused before any owner
-    // comparison runs. It names the exact owner obligation that is missing, and
-    // nothing on this path can compare it against owner evidence: the
-    // alternatives would be a self-comparison against the caller's own value or
-    // an owner field invented only to make a check pass, both refused by design.
-    if request.purge_ledger_revision != 0 {
-        return Err(note_config_error(
-            "project_owner_bound",
-            ProjectionError::OwnerEvidenceUnavailable {
-                field: "purge_ledger_revision",
-                obligation: "the purge-ledger owner must issue the revision observed by Host backup \
-                     preparation; it is issued by the ORS owner \
-                     (`RedbRecoveryStore::purge_ledger_revision`) and this composition holds no ORS \
-                     handle, because `crates/storage/AGENTS.md` forbids a second mutable root owner; \
-                     no registry, approved-generation, commit-fence or host-state record observed \
-                     here carries one, and the unblocking seam is a read-only, schema-checked \
-                     purge-ledger reader beside \
-                     `eliot_ors::read_current_supervision_lease_read_only` in \
-                     `crates/kernel/eliot-ors/src/status.rs`",
-            },
-        ));
     }
     // The forensic audit note is OWNER-ISSUED here, not refused and not
     // caller-authored. The note this function was handed is the one
@@ -1452,6 +1465,47 @@ pub fn project_backup_config_owner_bound(
             },
         ));
     }
+    // Owner-issued purge-ledger revision, refused before any digest is named.
+    // The revision this function was handed is the ORS owner's own reading,
+    // obtained by `OwnerEvidence` through the read-only, schema-checked
+    // purge-ledger reader published beside
+    // `eliot_ors::read_current_supervision_lease_read_only`. This contour holds
+    // no ORS store handle and is not a store owner: it compares against the
+    // owner's number, it never reads the ORS `META` counter itself, because
+    // `crates/storage/AGENTS.md` forbids a second mutable root owner.
+    //
+    // A presented revision is a CLAIM, not the source, exactly like the lease
+    // reference above. There is no shape check to add on either side because the
+    // owner-issued value is a plain number, not text: there is nothing to
+    // length-prefix-validate, and no ceiling or "must be non-zero" rule is
+    // invented here, because the owner states no such bound and this function
+    // must not invent authority it was not given.
+    //
+    // NO-CLAIM RULE, chosen deliberately: **zero is "no claim" and is admitted**,
+    // mirroring the empty lease reference and the `None` audit note, and
+    // mirroring the fact that zero was previously this path's by-construction
+    // value. The field is a `u64` with no distinct absent marker, so a request
+    // that observed nothing about the purge ledger has no other way to say so;
+    // requiring every presented value to equal the owner's would make "I have
+    // no claim" inexpressible and would force a caller to echo a number it cannot
+    // observe. This rule cannot let an uncorroborated value reach the record or
+    // the digest: the record and the digest below carry
+    // `*owner_purge_ledger_revision` unconditionally, so an admitted zero
+    // changes only whether a claim was *checked*, never what is *recorded*. A
+    // non-zero claim that is not the owner's is refused naming the exact field,
+    // so a caller can never substitute its own revision for the observed one —
+    // and, because the owner's number is bound either way, the projection can
+    // never claim a revision weaker than the one the owner actually read.
+    if request.purge_ledger_revision != 0
+        && request.purge_ledger_revision != *owner_purge_ledger_revision
+    {
+        return Err(note_config_error(
+            "project_owner_bound",
+            ProjectionError::StaleEvidence {
+                field: "purge_ledger_revision",
+            },
+        ));
+    }
     // Owner-issued numeric authority generation, refused before any digest is
     // named. `DestinationAdmission` in `crate::backup_preparation` already
     // requires the presented `approved_generation` to equal the presented
@@ -1491,29 +1545,35 @@ pub fn project_backup_config_owner_bound(
             ));
         }
     }
-    // The two refusals above run before any digest is computed: nothing that
-    // reaches this point carries a caller-declared purge-ledger revision or
-    // audit note, so neither can reach the record below. A caller-declared lease
-    // reference *can* reach it, but only after the lease arm above proved it
-    // equal to the owner-issued one, and the digest below binds the owner-issued
-    // side regardless.
+    // Every arm above runs before any digest is computed, so nothing that
+    // reaches this point carries a caller-declared purge-ledger revision, lease
+    // reference or audit note that the owner did not first corroborate. A
+    // caller-declared lease reference and revision *can* reach the record, but
+    // only after their arms above proved them equal to the owner-issued values,
+    // and the digest below binds the owner-issued side regardless.
     let mut hasher = Sha256::new();
-    // v6 on this path only. The retired revisions, each named so a stored
+    // v7 on this path only. The retired revisions, each named so a stored
     // receipt over the same logical request cannot silently match a later
     // digest (I5.27): v3 hashed the presented lease reference and purge-ledger
     // revision as if they were evidence; v4 bound an *absent* lease reference
-    // plus only the caller's chosen subset of the approved artifacts; and v5
-    // bound an *absent* forensic note, because at that revision nothing on this
-    // path could observe the installation lineage. v6 binds the owner-issued
-    // note instead, so two preparations whose lineage differs now produce
-    // different digests where v5 produced one identical digest — a stored v5
-    // receipt must not be accepted as evidence about a lineage it never named.
+    // plus only the caller's chosen subset of the approved artifacts; v5 bound
+    // an *absent* forensic note, because at that revision nothing on this path
+    // could observe the installation lineage; and v6 bound the literal
+    // `absent` for the purge-ledger revision, a field the owner had not yet
+    // issued. v6 therefore says NOTHING about the purge ledger, so a stored v6
+    // receipt over the same logical request must not be accepted as evidence
+    // about one — v7 binds the owner-issued number instead. This is a real
+    // change in what a digest commits to, not a cosmetic bump: under v6 two
+    // preparations whose purge ledger differed hashed identically, and under v7
+    // they do not.
     // `CONFIG_PROJECTION_VERSION` is the serialized record schema version, not
     // the digest revision, and does not move: the record shape is unchanged
-    // (the note is bound in the digest, and is not a new record field).
+    // (the owner-issued note is bound in the digest, and is not a new record
+    // field; the purge-ledger revision was already a record field and is filled
+    // with the owner-issued value instead of an absence).
     // See [`project_backup_config`] for the snapshot variant, whose coverage is
-    // unchanged and which stays at `snapshot.v3`.
-    hasher.update(b"eliot.backup.config-projection.v6\0");
+    // unchanged and whose separator is untouched at `snapshot.v3`.
+    hasher.update(b"eliot.backup.config-projection.v7\0");
     hasher.update(CONFIG_PROJECTION_VERSION.to_le_bytes());
     hash_field(
         &mut hasher,
@@ -1572,7 +1632,19 @@ pub fn project_backup_config_owner_bound(
     for digest in &binding.artifact_digests {
         hash_field(&mut hasher, b"approved_artifact_digest", digest.as_bytes());
     }
-    hash_field(&mut hasher, b"purge_ledger_revision", b"absent");
+    // The OWNER-ISSUED purge-ledger revision, hashed as a number under the
+    // same label and in the same position the absent marker used to occupy, so
+    // the field order is byte-identical and only its meaning changes. v6 bound
+    // the literal `absent` here; v7 commits to the revision the ORS owner
+    // actually read. The arm above refused any non-zero presented value that
+    // differs from it, so binding this is what makes the digest say which side
+    // supplied the number and keeps that true if that arm is ever reordered or
+    // weakened. It is the owner-issued value even when no claim was presented.
+    hash_field(
+        &mut hasher,
+        b"purge_ledger_revision",
+        &owner_purge_ledger_revision.to_le_bytes(),
+    );
     hash_state_fence(&mut hasher, fence)
         .map_err(|error| note_config_error("project_owner_bound", error))?;
     // The OWNER-ISSUED forensic note, never the presented one. The arm above
@@ -1582,14 +1654,17 @@ pub fn project_backup_config_owner_bound(
     hash_audit_note(&mut hasher, Some(owner_audit));
     let projection_digest = format!("{:x}", hasher.finalize());
     // Observed owner-bound projection only, never authority. Numeric facts
-    // come from the produced value; the refused field carries no observation.
+    // come from the produced value, and the purge revision observed here is the
+    // owner-issued one — a caller-presented number is never reported as an
+    // observation. A refused projection carries no numeric observation at all,
+    // because every arm above returns before this point.
     // `audit_present` names only that the owner-issued note was BOUND, never
     // its content: it is forensic text that must never be logged.
     observe_config_progress(
         "project_owner_bound",
         "projected_owner_bound",
         request.generation,
-        0,
+        *owner_purge_ledger_revision,
         backup_config_count(binding.artifact_digests.len()),
         true,
     );
@@ -1604,8 +1679,9 @@ pub fn project_backup_config_owner_bound(
         // The complete owner-issued approved artifact set, never the caller's
         // subset of it.
         build_digests: binding.artifact_digests.clone(),
-        // Zero by construction: a presented value was refused above.
-        purge_ledger_revision: 0,
+        // The owner-issued revision, never the presented number: the arm above
+        // refused any non-zero presented value that differs from it.
+        purge_ledger_revision: *owner_purge_ledger_revision,
         state_fence: fence.clone(),
         projection_digest,
     })
