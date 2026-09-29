@@ -1622,11 +1622,12 @@ fn cleanup_store_recovery_evidence_for_receipt(
     // removed, so every interruption leaves a loader-accepted state with the
     // durable receipt still authorizing resume. Unknown, corrupt, or
     // conflicting receipts fail closed without touching evidence.
-    let receipt = read_store_recovery_receipt(host_state_root, mutation_digest)?.ok_or_else(|| {
-        HostError::RecoveryRequired(
-            "Store recovery cleanup requires the exact durable terminal receipt".to_owned(),
-        )
-    })?;
+    let receipt =
+        read_store_recovery_receipt(host_state_root, mutation_digest)?.ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery cleanup requires the exact durable terminal receipt".to_owned(),
+            )
+        })?;
     let dir = store_recovery_store_dir(host_state_root);
     sync_store_recovery_dir(&dir)?;
     #[cfg(all(test, windows))]
@@ -1717,14 +1718,14 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
                         "store recovery store contains a non-file entry".to_owned(),
                     ));
                 }
-                let file_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| {
-                        HostError::RecoveryRequired(
-                            "store recovery store contains a non-text filename".to_owned(),
-                        )
-                    })?;
+                let file_name =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            HostError::RecoveryRequired(
+                                "store recovery store contains a non-text filename".to_owned(),
+                            )
+                        })?;
                 if let Some(digest) = file_name
                     .strip_suffix(".receipt.json")
                     .filter(|digest| valid_sha256_text(digest))
@@ -1734,17 +1735,18 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
                 }
                 let is_supporting = file_name
                     .strip_suffix(".pending.json")
-                    .filter(|digest| valid_sha256_text(digest))
-                    .is_some()
+                    .is_some_and(valid_sha256_text)
                     || file_name
                         .strip_suffix(".termination.json")
-                        .filter(|digest| valid_sha256_text(digest))
-                        .is_some()
+                        .is_some_and(valid_sha256_text)
                     || file_name
                         .strip_suffix(".inner.json")
-                        .filter(|digest| valid_sha256_text(digest))
-                        .is_some()
-                    || (file_name.starts_with('.') && file_name.ends_with(".tmp"));
+                        .is_some_and(valid_sha256_text)
+                    || (file_name.starts_with('.')
+                        && std::path::Path::new(file_name)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext == "tmp"));
                 if !is_supporting {
                     return Err(HostError::RecoveryRequired(format!(
                         "store recovery store contains an unknown or wrongly named record: {file_name}"
