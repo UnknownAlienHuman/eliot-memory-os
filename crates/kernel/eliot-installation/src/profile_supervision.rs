@@ -31,10 +31,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::profile_governed_roots::ProfileGovernedRoots;
-use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
+use super::runtime_root_contract::{
+    InstallationProfile, RuntimeRootLease, RuntimeRootLeaseProvider, RuntimeStateRoots,
+};
 use super::{
     InstallationError, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider, joined_windows_path,
-    text,
+    same_windows_root, text,
 };
 
 /// The supervision path a selected profile is intended to use.
