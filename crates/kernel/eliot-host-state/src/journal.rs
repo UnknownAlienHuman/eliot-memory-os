@@ -11,7 +11,8 @@ use crate::model::{
     EpochRetirementRecord, HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity,
     PredecessorRetirementRelation, RecordFence, RecoveryLineageReason, activation_transition,
     backup_preparation_transition, dependency_transition, drain_transition,
-    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition, wake_transition,
+    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
+    wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,

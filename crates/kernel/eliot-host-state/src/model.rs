@@ -2346,7 +2346,10 @@ impl BackupPreparationRecord {
             &self.admission_digest,
             "backup_preparation.admission_digest",
         )?;
-        handle(&self.destination_root, "backup_preparation.destination_root")?;
+        handle(
+            &self.destination_root,
+            "backup_preparation.destination_root",
+        )?;
         digest(&self.destination_id, "backup_preparation.destination_id")?;
         digest(
             &self.config_projection_digest,
@@ -2435,11 +2438,7 @@ pub(crate) fn backup_preparation_transition(
         return Err(JournalError::IdempotencyConflict);
     }
     if current.state == BackupPreparationState::Prepared {
-        return Err(illegal(
-            "backup_preparation",
-            current.state,
-            next.state,
-        ));
+        return Err(illegal("backup_preparation", current.state, next.state));
     }
     Ok(())
 }
