@@ -660,13 +660,13 @@ impl ObservationWindow {
     /// clean pending interval. The other variants are already about this
     /// route and pass through unchanged.
     pub fn bounded_coverage(&self) -> CoverageProof {
-        match (self.coverage, self.required_seq) {
+        match (&self.coverage, self.required_seq) {
             (CoverageProof::CompleteInterval { to_seq, .. }, Some(required_seq))
-                if to_seq < required_seq =>
+                if *to_seq < required_seq =>
             {
                 CoverageProof::Indeterminate {
                     cause: CoverageIndeterminacy::CorrelationIntervalNotObserved {
-                        last_proven_seq: to_seq,
+                        last_proven_seq: *to_seq,
                         required_seq,
                     },
                 }
