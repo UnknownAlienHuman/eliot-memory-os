@@ -1700,8 +1700,7 @@ fn validate_reference_closure_against(
         // obligation domain. This holds for every disposition: an edge naming
         // nothing in the batch is refused rather than excused.
         let named_target = batch.members.iter().any(|target| {
-            target.content_digest == reference
-                && target.residency.domain == member.residency.domain
+            target.content_digest == reference && target.residency.domain == member.residency.domain
         });
         if !named_target {
             return Err(StoreError::IdentityConflict);
