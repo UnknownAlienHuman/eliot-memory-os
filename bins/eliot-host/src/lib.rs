@@ -7925,6 +7925,29 @@ impl HostComposition {
         }
     }
 
+    /// (Re)binds the pending activation record's held supervision-lease
+    /// reference from the published Kernel-signed supervision-lease mirror.
+    ///
+    /// I1.5 W4 (SupervisionLease issuance/renewal, Host leg): a transition
+    /// into a live state holds exactly the supervision lease the mirror
+    /// proves live for this activation generation right now — no synthesised
+    /// identity, no carried predecessor. When the mirror proves no live
+    /// obligation, the held reference lapses to empty instead of blocking
+    /// drain or retirement on a dead lease; terminal coverage stays in the
+    /// `DrainCommitRecord` snapshot taken at linearization. A mirror read
+    /// failure fails the transition closed rather than entering a live
+    /// state on uncertain supervision.
+    fn refresh_supervision_lease_binding(
+        &self,
+        next: &mut eliot_host_state::EliotActivationRecord,
+    ) -> Result<(), HostError> {
+        next.supervision_lease_refs = self
+            .live_supervision_obligation_for(next)?
+            .into_iter()
+            .collect();
+        Ok(())
+    }
+
     fn transition_activation(
         &mut self,
         state: ActivationState,
@@ -7933,9 +7956,14 @@ impl HostComposition {
         let current = self.journal.snapshot()?.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
-        self.append_record(HostStateRecord::Activation(transition_activation_record(
-            &current, state, label,
-        )?))?;
+        let mut next = transition_activation_record(&current, state, label)?;
+        if matches!(
+            state,
+            ActivationState::ControlReady | ActivationState::Active
+        ) {
+            self.refresh_supervision_lease_binding(&mut next)?;
+        }
+        self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
     }
 
@@ -7966,9 +7994,15 @@ impl HostComposition {
         let current = snapshot.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
-        self.append_record(HostStateRecord::Activation(
-            transition_activation_record_with_evidence(&current, state, label, &evidence)?,
-        ))?;
+        let mut next =
+            transition_activation_record_with_evidence(&current, state, label, &evidence)?;
+        if matches!(
+            state,
+            ActivationState::ControlReady | ActivationState::Active
+        ) {
+            self.refresh_supervision_lease_binding(&mut next)?;
+        }
+        self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
     }
 
