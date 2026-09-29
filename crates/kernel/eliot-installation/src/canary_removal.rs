@@ -57,10 +57,10 @@ use super::{
 /// wait mandatory. Version 3 adds the `UserMode` supervision-authority credential
 /// as a typed resource in the frozen removal graph. Version 4 gives the
 /// repository-local `PortableDev` supervision authority its own removal
-/// category. Its original typed receipt is retained by the install
-/// transaction, but canary removal remains unsupported until the installation
-/// effect port provides provider-specific exact deletion and readback. Older
-/// records require explicit migration; neither deadlines nor resource
+/// category. PortableDev authority, current-user Task registration, and
+/// current-user Store credentials are removable only when the original typed
+/// receipt reconstructs an exact rollback request and independent readback.
+/// Older records require explicit migration; neither deadlines nor resource
 /// classifications are synthesized as defaults.
 pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 
@@ -110,17 +110,18 @@ pub enum CanaryRemovalResource {
     UserModeAuthorityCredential,
     /// The repository-local `PortableDev` supervision-authority key provisioned
     /// by this generation. Its typed write receipt is retained by the install
-    /// transaction; removal remains unsupported while the installation effect
-    /// port lacks provider-specific exact deletion and readback.
+    /// transaction. Removal is supported only when the exact original typed
+    /// receipt reconstructs a rollback request for the provider's exact delete
+    /// and independent readback path.
     PortableDevSupervisionAuthority,
     /// One canonical SCM service registration admitted for this generation.
     ServiceRegistration,
     /// One canonical SCM service start admitted for this generation.
     ServiceStart,
     /// The current-user Task Scheduler registration owned by this generation.
-    /// Its typed receipt is retained by the install transaction; removal stays
-    /// unsupported until the installation effect request carries that receipt
-    /// and its port performs exact unregister and readback.
+    /// Its typed request and receipt are retained by the install transaction;
+    /// removal is supported only when both reconstruct an exact rollback request
+    /// for provider unregister and independent readback.
     CurrentUserTaskRegistration,
     /// One installer-owned root created below the installation root.
     InstallationRoot,
@@ -1793,7 +1794,7 @@ fn freeze_effect_graph(
                 CanaryRemovalResource::StoreCredential,
                 applied_identity(progress)?,
                 false,
-                true,
+                false,
             ),
             InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => (
                 CanaryRemovalResource::UserModeAuthorityCredential,
@@ -1831,7 +1832,21 @@ fn freeze_effect_graph(
         } else {
             Vec::new()
         };
-        let action = classify_action(origin, !reference_users.is_empty(), removal_supported);
+        let referenced = !reference_users.is_empty();
+        let removal_supported = if created
+            && !referenced
+            && matches!(
+                effect,
+                InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+                    | InstallerEffectPlan::RegisterCurrentUserTask { .. }
+                    | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+            )
+        {
+            receipt_backed_removal_supported(install, index, effect, &identity)?
+        } else {
+            removal_supported
+        };
+        let action = classify_action(origin, referenced, removal_supported);
         rows.push(CanaryRemovalEffect {
             effect_id: effect.effect_id().clone(),
             category,
@@ -1875,6 +1890,190 @@ fn classify_action(
     } else {
         CanaryRemovalAction::Unsupported
     }
+}
+
+/// Admits receipt-backed cleanup paths only when the original transaction can
+/// reconstruct the exact rollback request the Windows port validates before
+/// deletion. The port's post-effect reconcile and the independent terminal
+/// readback remain authoritative for absence.
+fn receipt_backed_removal_supported(
+    install: &InstallationTransaction,
+    index: usize,
+    effect: &InstallerEffectPlan,
+    identity: &PlatformHandle,
+) -> Result<bool, InstallationError> {
+    let progress = install
+        .effect_progress()
+        .get(index)
+        .ok_or(InstallationError::IdentityConflict)?;
+    let Some(precondition) = progress.admitted_precondition.as_ref() else {
+        return Ok(false);
+    };
+    let original_receipt_present = match effect {
+        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. } => {
+            progress.portable_dev_authority_receipt.is_some()
+                && precondition.portable_dev_authority_snapshot.is_some()
+        }
+        InstallerEffectPlan::RegisterCurrentUserTask { .. } => {
+            progress.current_user_task_request.is_some()
+                && progress.current_user_task_receipt.is_some()
+                && precondition.current_user_task_snapshot.is_some()
+        }
+        InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. } => {
+            progress.store_credential.as_ref().is_some_and(|credential| {
+                credential.lifecycle == super::StoreCredentialLifecycle::Active
+                    && credential.receipt.is_some()
+            }) && precondition.credential_snapshot.is_some()
+        }
+        _ => return Ok(false),
+    };
+    if !original_receipt_present {
+        return Ok(false);
+    }
+
+    let request = effect_request(
+        install,
+        index,
+        1,
+        InstallationEffectAction::Rollback,
+        Some(identity.clone()),
+    )?;
+    let effect = install
+        .installer_effects
+        .get(index)
+        .ok_or(InstallationError::IdentityConflict)?;
+    if request.action != InstallationEffectAction::Rollback
+        || request.effect_id != *effect.effect_id()
+        || request.plan.effect_id() != effect.effect_id()
+        || request.expected_external_identity.as_ref() != Some(identity)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+
+    match effect {
+        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. } => {
+            let (InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { provision, .. }, Some(receipt)) =
+                (&request.plan, request.portable_dev_authority_receipt.as_ref())
+            else {
+                return Ok(false);
+            };
+            if receipt.request != **provision
+                || super::portable_dev_key_identity(receipt)
+                    .map_err(|_| InstallationError::IdentityConflict)?
+                    != *identity
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            Ok(true)
+        }
+        InstallerEffectPlan::RegisterCurrentUserTask { .. } => {
+            let (
+                InstallerEffectPlan::RegisterCurrentUserTask { .. },
+                Some(task_request),
+                Some(task_receipt),
+            ) = (
+                &request.plan,
+                request.current_user_task_request.as_ref(),
+                request.current_user_task_receipt.as_ref(),
+            ) else {
+                return Ok(false);
+            };
+            if task_receipt.request != *task_request
+                || super::task_xml_handle(&task_receipt.task_xml_sha256)? != *identity
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            Ok(true)
+        }
+        InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. } => {
+            current_user_store_receipt_matches(&request, identity)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Binds a CurrentUser Store rollback to the receipt and precondition admitted
+/// by the original effect, including the exact Host Provision or Reconcile
+/// request and the identity persisted as Applied. This deliberately does not
+/// admit a LocalService receipt for a CurrentUser effect.
+fn current_user_store_receipt_matches(
+    request: &InstallationEffectRequest,
+    identity: &PlatformHandle,
+) -> Result<bool, InstallationError> {
+    let InstallerEffectPlan::ProvisionCurrentUserStoreCredential {
+        effect_id,
+        provision,
+    } = &request.plan
+    else {
+        return Ok(false);
+    };
+    let Some(progress) = request.store_credential.as_ref() else {
+        return Ok(false);
+    };
+    let Some(receipt) = progress.receipt.as_ref() else {
+        return Ok(false);
+    };
+    let Some(snapshot) = request.precondition.credential_snapshot.as_ref() else {
+        return Ok(false);
+    };
+    let Some(selection) = request.profile_selection_receipt.as_ref() else {
+        return Ok(false);
+    };
+
+    if request.action != InstallationEffectAction::Rollback
+        || request.effect_id != *effect_id
+        || request.profile == super::InstallationProfile::SystemService
+        || progress.lifecycle != super::StoreCredentialLifecycle::Active
+        || provision.scope != super::StoreCredentialScope::CurrentUser
+        || receipt.scope != super::StoreCredentialScope::CurrentUser
+        || provision.provider != super::StoreCredentialProvider::WindowsCredentialManager
+        || receipt.provider != provision.provider
+        || receipt.transaction_id != request.transaction_id
+        || receipt.effect_id != *effect_id
+        || receipt.generation != provision.generation
+        || receipt.config_digest != provision.config_digest
+        || receipt.target != provision.target
+        || receipt.principal_sid != provision.expected_principal_sid
+        || selection.owner_sid.as_str() != receipt.principal_sid.as_str()
+    {
+        return Ok(false);
+    }
+    snapshot.validate()?;
+    receipt.validate()?;
+
+    let original_request_matches = [
+        super::HostCredentialControlOperation::Provision,
+        super::HostCredentialControlOperation::Reconcile,
+    ]
+    .into_iter()
+    .any(|operation| {
+        super::HostCredentialControlIntent::new(
+            operation,
+            request.transaction_id.clone(),
+            request.effect_id.clone(),
+            provision.clone(),
+            request.plan_digest.clone(),
+        )
+        .is_ok_and(|intent| receipt.request_digest == intent.request_digest)
+    });
+    if !original_request_matches {
+        return Err(InstallationError::IdentityConflict);
+    }
+
+    let receipt_bytes = serde_json::to_vec(receipt).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "canary_removal.store_credential.receipt".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    let receipt_identity = handle_ref(&format!(
+        "store-credential:{}",
+        sha256_hex(&receipt_bytes)
+    ))?;
+    if receipt_identity != *identity {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(true)
 }
 
 fn applied_identity(
@@ -2399,6 +2598,7 @@ where
         InstallationEffectAction::Rollback,
         Some(row.resource_identity.clone()),
     )?;
+    require_exact_removal_request(&request, &row)?;
     let InstallationCoordinator { port, store } = coordinator;
     match port.reconcile(&request) {
         PortOutcome::Known(observed) => match classify_observation(&observed, &row) {
@@ -2500,6 +2700,75 @@ fn classify_observation(
         }
         InstallationEffectObservation::Mismatch { .. } => RowClassification::Conflict,
     }
+}
+
+/// Refuses a removal or its final readback unless the exact original typed
+/// receipt is carried by the transaction-derived rollback request.
+///
+/// The request builder validates each receipt against the original plan and
+/// transaction. This row-level check keeps canary removal from relying on a
+/// plan classification alone if a receipt is missing from the reconstructed
+/// effect request.
+fn require_exact_removal_request(
+    request: &InstallationEffectRequest,
+    row: &CanaryRemovalEffect,
+) -> Result<(), InstallationError> {
+    if row.action != CanaryRemovalAction::Remove
+        || request.action != InstallationEffectAction::Rollback
+        || request.effect_id != row.effect_id
+        || request.plan.effect_id() != &row.effect_id
+        || request.expected_external_identity.as_ref() != Some(&row.resource_identity)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+
+    match row.category {
+        CanaryRemovalResource::PortableDevSupervisionAuthority => {
+            if request.portable_dev_authority_receipt.is_none() {
+                return Err(InstallationError::IncompleteObservation(
+                    "PortableDev supervision-key removal requires the original typed key receipt"
+                        .to_owned(),
+                ));
+            }
+        }
+        CanaryRemovalResource::CurrentUserTaskRegistration => {
+            let task_request = request
+                .current_user_task_request
+                .as_ref()
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "current-user Task removal requires the original typed task request"
+                            .to_owned(),
+                    )
+                })?;
+            let task_receipt = request
+                .current_user_task_receipt
+                .as_ref()
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "current-user Task removal requires the original typed task receipt"
+                            .to_owned(),
+                    )
+                })?;
+            if task_receipt.request != *task_request {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        _ => {}
+    }
+
+    if matches!(
+        &request.plan,
+        InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+    ) && !current_user_store_receipt_matches(request, &row.resource_identity)?
+    {
+        return Err(InstallationError::IncompleteObservation(
+            "current-user Store credential removal requires its exact original receipt and absent-readback binding"
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn exhausted_bound_ref(row: &CanaryRemovalEffect) -> Result<PlatformHandle, InstallationError> {
@@ -2619,17 +2888,22 @@ fn readback_request(
     install: &InstallationTransaction,
     row: &CanaryRemovalEffect,
 ) -> Result<Option<InstallationEffectRequest>, InstallationError> {
+    if row.action != CanaryRemovalAction::Remove {
+        return Ok(None);
+    }
     let Some(index) = row.install_effect_index else {
         return Ok(None);
     };
     let install_index = usize::try_from(index).map_err(|_| InstallationError::IdentityConflict)?;
-    Ok(Some(effect_request(
+    let request = effect_request(
         install,
         install_index,
         row.bound.attempt,
         InstallationEffectAction::Rollback,
         Some(row.resource_identity.clone()),
-    )?))
+    )?;
+    require_exact_removal_request(&request, row)?;
+    Ok(Some(request))
 }
 
 /// Finishes by independent readback, then commits the terminal registry
