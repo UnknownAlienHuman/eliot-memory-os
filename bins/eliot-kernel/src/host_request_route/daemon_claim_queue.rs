@@ -111,7 +111,6 @@ impl KernelComposition {
                 return Ok(());
             }
         }
-        // I7.24 W3/A2: a materially repeated call is refused, never staged.
         if campaign_staged_repeat_without_progress(&index, envelope, tool) {
             return Err(TransportError::IdentityConflict);
         }
