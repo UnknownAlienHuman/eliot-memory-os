@@ -1310,6 +1310,7 @@ pub(crate) mod support {
             "research-evidence-bundle/v1",
             "gen-24-slice-a",
             test_operation_id(),
+            "cancel-24-slice-a",
             DIGEST_A,
             DIGEST_B,
             COVERAGE_GOAL,
