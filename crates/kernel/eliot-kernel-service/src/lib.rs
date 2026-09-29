@@ -268,6 +268,7 @@ pub use user_automation_execution::{
     UserAutomationExecutionRequest, UserAutomationFailureHistory, UserAutomationFailureHistoryPort,
     UserAutomationFailurePublication, UserAutomationFailureRecord, UserAutomationHorizonTrigger,
     UserAutomationNotificationDelivery, UserAutomationNotificationPort,
+    UserAutomationProviderRouteObservation, UserAutomationProviderRouteObservationRequest,
     UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition,
     UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationReadback, UserAutomationWakeCancellationTarget,

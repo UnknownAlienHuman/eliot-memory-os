@@ -38,8 +38,9 @@ use super::user_automation::{
 use super::user_automation_execution::{
     UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobMaterial,
     UserAutomationDurableJobPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
-    UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationHorizonTrigger, UserAutomationProviderRouteObservation,
+    UserAutomationProviderRouteObservationRequest, UserAutomationRuntimeAdmission,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
     UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
     UserAutomationWakeReadRequest, UserAutomationWakeReadback,
@@ -1812,6 +1813,37 @@ where
             "the canonical failure-history and B3 notification owners are not reachable from the \
              UserAutomation operator route; the blocked occurrence stays unnotified and \
              unreconciled"
+                .to_owned(),
+        ))
+    }
+
+    /// The production answer to the run-now preflight's provider-route question.
+    ///
+    /// This override is load-bearing for the same reason
+    /// [`UserAutomationWakePort::publish_wake_horizon`] is: the preflight asks
+    /// the port, so the answer it receives is this adapter's own refusal with
+    /// its exact missing owner, never a trait default that a later contour
+    /// could mistake for a positive observation.
+    ///
+    /// `USER_AUTOMATION_RUNTIME_OPERATION` carries no provider-route
+    /// observation operation, exactly as it carries no failure-delivery
+    /// operation above. The product's one runtime route observation is
+    /// `eliot_agent_api::PhysicalRouteObservationReceipt`, and the production
+    /// adapter that mints it records `observed_route: None` with
+    /// `eliot_agent_claude::execution::CLAUDE_UNOBSERVED_ROUTE_REASON` — the
+    /// requested route is retained without synthesis — and issues it only after
+    /// the provider execution it observes, which is strictly after this
+    /// preflight. Reporting a fingerprint here would claim an observation no
+    /// owner made, so the port refuses with the exact missing owner instead.
+    async fn observe_provider_route(
+        &self,
+        _request: UserAutomationProviderRouteObservationRequest,
+    ) -> Result<UserAutomationProviderRouteObservation, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "no provider-route observation owner is reachable from the UserAutomation operator \
+             route: the authenticated Host execution channel carries no such operation, and the \
+             product's runtime route observation is issued by the agent adapter only after the \
+             provider execution it observes, which the deterministic preflight precedes"
                 .to_owned(),
         ))
     }

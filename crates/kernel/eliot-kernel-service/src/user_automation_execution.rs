@@ -16,9 +16,10 @@ use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
     AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,
     AutomationOccurrenceIdentity, AutomationReconciliationCause, AutomationReconciliationReference,
-    AutomationResourceCeiling, AutomationWorkClass, DeliveryChannel, ProviderFingerprintPolicy,
-    UserAutomationConfigurationState, UserAutomationError, UserAutomationExecutionMode,
-    UserAutomationExecutionProjection, UserAutomationFailureProjection, UserAutomationInvocation,
+    AutomationResourceCeiling, AutomationWorkClass, DeliveryChannel, ProviderFingerprint,
+    ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
+    UserAutomationExecutionMode, UserAutomationExecutionProjection,
+    UserAutomationFailureProjection, UserAutomationInvocation,
     UserAutomationPreflightContext, UserAutomationPreflightDecision,
     UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
     UserAutomationTrigger, UserAutomationTriggerOrigin,
@@ -3196,6 +3197,140 @@ pub trait UserAutomationRuntimePort: Send + Sync {
         &self,
         request: UserAutomationFailureRecord,
     ) -> Result<UserAutomationFailurePublication, UserAutomationRuntimeError>;
+
+    /// Reads the provider/model/adapter identity the composed provider-route
+    /// observation owner actually exposed for one occurrence.
+    ///
+    /// I11.12 makes the provider/model/adapter fingerprint a preflight input
+    /// and requires that unexpected provider/model drift fail closed unless
+    /// the Human policy already admitted the observed compatible set, so the
+    /// member can only be filled from an owner-issued OBSERVATION. It is asked
+    /// for here, on the port the production composition already binds, rather
+    /// than derived at the preflight boundary: this trait grants no provider
+    /// access, and the request it accepts carries the occurrence only, so a
+    /// caller cannot present a fingerprint here and have it read back as that
+    /// caller's own observation.
+    ///
+    /// The default refuses with a named reason instead of answering. That is the
+    /// fail-closed direction — an implementation that does not own a route
+    /// observation can only leave the evidence member absent — and it is why
+    /// `ProviderFingerprintPolicy::admits` is not widened to accept an absent
+    /// observation for an exact allowed set: a substituted answer would make
+    /// provider/model drift undetectable, which is what I11.12:47 forbids.
+    async fn observe_provider_route(
+        &self,
+        _request: UserAutomationProviderRouteObservationRequest,
+    ) -> Result<UserAutomationProviderRouteObservation, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "the composed UserAutomation runtime port binds no provider-route observation owner, \
+             so no observed provider/model/adapter identity is readable at the preflight boundary"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Exact authenticated question asked of a provider-route observation owner.
+///
+/// The request carries only the occurrence the owner must answer about: the
+/// authenticated request metadata, the principal Kernel authenticated, the
+/// committed parent operation identity, and the owner-issued invocation read
+/// back from the canonical owner. It deliberately has NO
+/// provider/model/adapter member, so the only value that can reach the
+/// preflight evidence is one the observation owner itself issues.
+///
+/// This value never crosses a process boundary: the observation the preflight
+/// consumes is already typed, already owner-issued, and validated again by its
+/// owner's own validator before the Kernel reads it, so there is no wire
+/// encoding to keep in step with one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserAutomationProviderRouteObservationRequest {
+    /// Authenticated parent request metadata and State Fence.
+    pub context: RequestMetadata,
+    /// Principal authenticated by Kernel/Host.
+    pub authenticated_principal: String,
+    /// Exact committed parent operation identity.
+    pub identity: OperationIdentity,
+    /// Invocation read back from the canonical UserAutomation owner.
+    pub invocation: UserAutomationInvocation,
+}
+
+impl UserAutomationProviderRouteObservationRequest {
+    /// Validates the request and returns the exact occurrence it asks about.
+    pub fn validate(&self) -> Result<String, UserAutomationExecutionError> {
+        self.context
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        self.identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        validate_text(
+            &self.authenticated_principal,
+            "provider_route_observation.authenticated_principal",
+        )?;
+        self.invocation.validate()?;
+        if self.invocation.principal_ref != self.authenticated_principal {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "provider route observation principal",
+            ));
+        }
+        self.invocation
+            .occurrence_identity()
+            .map_err(UserAutomationExecutionError::Contract)
+    }
+}
+
+/// What the composed provider-route observation owner actually exposed for one
+/// occurrence.
+///
+/// `Unobserved` is the explicit absence and it is a COMPLETE answer about the
+/// evidence, not an unreadable one: the owner reports that it exposes no
+/// provider/model/adapter identity for this occurrence, and the preflight
+/// member then stays `None` exactly as deterministic mode requires. The variant
+/// carries the owner's own closed reason, so a boundary that cannot reach an
+/// owner at all stays distinguishable from one that reached an owner and found
+/// nothing, and neither is ever a slot a caller fills.
+///
+/// No constructor derives one member from another or from the revision's own
+/// declared `provider_policy`: the observed set and the expected set are the two
+/// halves of the same check and folding them together is exactly what would
+/// make drift undetectable (I11.12:47).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UserAutomationProviderRouteObservation {
+    /// The owner issued an observed provider/model/adapter identity.
+    Observed {
+        /// Identity the observation owner issued for this occurrence.
+        fingerprint: ProviderFingerprint,
+    },
+    /// The owner exposes no observation for this occurrence.
+    Unobserved {
+        /// Closed reason naming the owner's own boundary.
+        reason: String,
+    },
+}
+
+impl UserAutomationProviderRouteObservation {
+    /// Validates the closed observation shape without granting any admission.
+    pub fn validate(&self) -> Result<(), UserAutomationExecutionError> {
+        match self {
+            Self::Observed { fingerprint } => {
+                fingerprint.validate().map_err(UserAutomationExecutionError::Contract)
+            }
+            Self::Unobserved { reason } => {
+                validate_text(reason, "provider_route_observation.reason")
+            }
+        }
+    }
+
+    /// Returns the owner-issued observation, or `None` when the owner exposed
+    /// none.
+    #[must_use]
+    pub fn observed(&self) -> Option<&ProviderFingerprint> {
+        match self {
+            Self::Observed { fingerprint } => Some(fingerprint),
+            Self::Unobserved { .. } => None,
+        }
+    }
 }
 
 /// Canonical failure-history result returned by the existing Store owner.
@@ -3467,6 +3602,11 @@ pub trait UserAutomationNotificationPort: Send + Sync {
 /// history, and the authenticated B3 notification route. The failure path
 /// records history before notification so a notification retry can reconcile
 /// against one immutable history identity.
+///
+/// None of those four ports observes a provider/model/adapter identity, so the
+/// inherited [`UserAutomationRuntimePort::observe_provider_route`] refusal is
+/// the correct answer here rather than a gap in this adapter: a composition
+/// that binds no route observation can only leave the preflight member absent.
 pub struct UserAutomationRuntimeComposition<'a, D: ?Sized, W: ?Sized, H: ?Sized, N: ?Sized> {
     durable_job: &'a D,
     wake: &'a W,

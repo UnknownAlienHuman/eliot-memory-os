@@ -76,6 +76,7 @@ use crate::store_write_reservation::{
 };
 use crate::user_automation_execution::{
     UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
+    UserAutomationProviderRouteObservation, UserAutomationProviderRouteObservationRequest,
     UserAutomationRemovalResult, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
@@ -3150,6 +3151,10 @@ impl KernelStoreGateway {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete owner-member join and its per-member provenance live in one frame"
+    )]
     /// Assembles the complete preflight projection for one committed `RunNow`
     /// occurrence from its owner members.
     ///
@@ -3160,16 +3165,21 @@ impl KernelStoreGateway {
     /// capability of the declared channels are readable from owners this
     /// boundary already holds, so an active deterministic revision assembles the
     /// complete projection. The one member with no Kernel-side owner — the
-    /// observed provider/model/adapter fingerprint an agent revision needs —
-    /// stays absent and is reported as the named missing owner rather than
-    /// synthesized. No model, provider, scheduler, or notification call is
+    /// observed provider/model/adapter fingerprint an agent revision needs — is
+    /// asked of the composed runtime port and used exactly as that owner issues
+    /// it, so it is neither left unattested nor synthesized from the revision's
+    /// own policy. No model, provider, scheduler, or notification call is
     /// reachable from this join.
-    async fn assemble_run_now_preflight_projection(
+    async fn assemble_run_now_preflight_projection<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
         owner: &UserAutomationOwnerSnapshot,
         invocation: &UserAutomationInvocation,
-    ) -> Result<UserAutomationPreflightProjection, RunNowPreflightAssembly> {
+        runtime: &R,
+    ) -> Result<UserAutomationPreflightProjection, RunNowPreflightAssembly>
+    where
+        R: UserAutomationRuntimePort + ?Sized,
+    {
         let state_fence = &sealed.context.state_fence;
         if invocation.automation_id != owner.automation_id
             || invocation.automation_revision != owner.revision.revision
@@ -3210,25 +3220,50 @@ impl KernelStoreGateway {
             ),
             _ => None,
         };
-        // Live evidence below the Kernel decoding boundary. The run-now path
-        // issues no provider call before preflight, so the only honest provider
-        // observation here is none — which is exactly what deterministic mode
-        // requires (I11.12:49) and what an agent revision still cannot obtain
-        // at this boundary. The exact Tool Definitions are the Tool-Definition
-        // half of the closure the canonical owner revision already declares, so
-        // they are read from that same owner instead of being left unattested.
-        // Delivery capability is a named observation of the declared channels,
-        // not an inference from an adapter result.
+        // Live evidence below the Kernel decoding boundary. The provider/model/
+        // adapter identity an agent revision needs is the one member no Kernel
+        // route can produce, so it is read from the composed runtime port — the
+        // same owner this operation already uses for the Durable Job, wake and
+        // notification legs — and never from the revision's own
+        // `provider_policy`. The request names the occurrence only, so no
+        // caller-supplied value can reach the member, and the answer is used
+        // exactly as issued. It is read only for an active agent revision:
+        // deterministic mode requires the ABSENCE of any provider observation
+        // (I11.12:49), so asking its owner for one would destroy the evidence
+        // the deterministic preflight checks.
+        //
+        // The exact Tool Definitions are the Tool-Definition half of the closure
+        // the canonical owner revision already declares, so they are read from
+        // that same owner instead of being left unattested. Delivery capability
+        // is a named observation of the declared channels, not an inference from
+        // an adapter result.
+        let agent_arm =
+            owner.current_configuration_state == UserAutomationConfigurationState::Active
+                && owner.revision.mode == UserAutomationExecutionMode::Agent;
+        let provider_route_observation = if agent_arm {
+            Some(
+                Self::read_run_now_provider_route_observation(sealed, owner, invocation, runtime)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let evidence = UserAutomationPreflightEvidence {
-            observed_provider_fingerprint: None,
+            observed_provider_fingerprint: provider_route_observation
+                .as_ref()
+                .and_then(UserAutomationProviderRouteObservation::observed)
+                .cloned(),
             trusted_tool_definition_refs: owner.revision.trusted_tool_definition_refs.clone(),
             delivery_available: Self::read_run_now_delivery_capability(&owner.revision),
             failure,
         };
-        if owner.current_configuration_state == UserAutomationConfigurationState::Active
-            && owner.revision.mode == UserAutomationExecutionMode::Agent
-        {
-            Self::require_run_now_agent_evidence(owner, &execution, &evidence)?;
+        if agent_arm {
+            Self::require_run_now_agent_evidence(
+                owner,
+                &execution,
+                &evidence,
+                provider_route_observation.as_ref(),
+            )?;
         }
         // The schedule normalization envelope the revision names is owner
         // evidence over the compiled occurrence set, so it is read from the
@@ -3262,18 +3297,86 @@ impl KernelStoreGateway {
         .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))
     }
 
+    /// Asks the composed runtime port for the owner-issued provider/model/
+    /// adapter observation of one committed `RunNow` occurrence.
+    ///
+    /// The port is the existing runtime composition owner: the same owner this
+    /// operation already uses for Durable Job admission, wake readback, and the
+    /// authenticated notification route, so no new channel and no new transport
+    /// is introduced. The request names the occurrence, its authenticated
+    /// principal and its State Fence and nothing else, so a caller cannot carry
+    /// a fingerprint in and have it read back as that caller's own observation.
+    ///
+    /// An owner that cannot be reached and an owner that reached its state and
+    /// exposes no observation are both reported as `Unobserved`, carrying the
+    /// owner's own closed reason verbatim. For the preflight member they are the
+    /// same fact — there is no observed identity to admit against — and folding
+    /// them at this boundary is not a guess: the reason text still names which of
+    /// the two happened, and neither answer ever produces a fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunNowPreflightAssembly::Unknown`] when the question itself
+    /// does not bind to the committed occurrence, or when the owner returns a
+    /// malformed observation. A closed owner refusal is not an error here: it is
+    /// the `Unobserved` answer the policy check below consumes.
+    async fn read_run_now_provider_route_observation<R>(
+        sealed: &UserAutomationServiceRequest,
+        owner: &UserAutomationOwnerSnapshot,
+        invocation: &UserAutomationInvocation,
+        runtime: &R,
+    ) -> Result<UserAutomationProviderRouteObservation, RunNowPreflightAssembly>
+    where
+        R: UserAutomationRuntimePort + ?Sized,
+    {
+        let request = UserAutomationProviderRouteObservationRequest {
+            context: sealed.context.clone(),
+            authenticated_principal: sealed.authenticated_principal.clone(),
+            identity: sealed.identity.clone(),
+            invocation: invocation.clone(),
+        };
+        request
+            .validate()
+            .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))?;
+        if request.invocation.automation_id != owner.automation_id
+            || request.invocation.automation_revision != owner.revision.revision
+        {
+            return Err(RunNowPreflightAssembly::Unknown(
+                "the provider-route observation question does not bind to the current owner \
+                 revision"
+                    .to_owned(),
+            ));
+        }
+        let observation =
+            match UserAutomationRuntimePort::observe_provider_route(runtime, request).await {
+                Ok(observation) => observation,
+                Err(error) => UserAutomationProviderRouteObservation::Unobserved {
+                    reason: error.to_string(),
+                },
+            };
+        observation
+            .validate()
+            .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))?;
+        Ok(observation)
+    }
+
     /// Requires the live evidence an active **agent** revision still lacks.
     ///
     /// Deterministic mode reaches the Durable Job owner from the revision and
     /// the named delivery observation alone, so this arm exists only for the
     /// one member no Kernel-side route can produce: the observed
-    /// provider/model/adapter fingerprint. The observed set lives in the
-    /// Governor route registry (`ObservedRoute` /
-    /// `RouteBehaviorFingerprint`), which is outside this crate's dependency
-    /// graph, and `provider_and_model_request` there is a request rather than an
-    /// observation, so the Kernel cannot derive it. That absence is reported
-    /// with its exact owner instead of being filled with the policy's own
-    /// expectation, which would make drift undetectable (I11.12:47).
+    /// provider/model/adapter fingerprint. It arrives from the composed runtime
+    /// port as that port's own answer, and a revision whose policy admits only
+    /// an exact observed set admits it only when the observation the owner
+    /// issued is itself a member of that set.
+    ///
+    /// Nothing here fills the member from the revision's own
+    /// `provider_policy`. That expectation is the other half of this very
+    /// check: reading it back as the observation would make the check
+    /// tautological and provider/model drift undetectable, which is what
+    /// I11.12:47 forbids. An owner that exposes no observation therefore leaves
+    /// the member absent and the occurrence unadmitted, reported with the
+    /// owner's own reason rather than a Kernel guess.
     ///
     /// The unresolved-prior-effect refusal stays here because it is an
     /// execution fact, not an evidence fact: I14.21 reconciliation owns that
@@ -3282,6 +3385,7 @@ impl KernelStoreGateway {
         owner: &UserAutomationOwnerSnapshot,
         execution: &eliot_kernel_core::user_automation::UserAutomationExecutionProjection,
         evidence: &UserAutomationPreflightEvidence,
+        provider_route_observation: Option<&UserAutomationProviderRouteObservation>,
     ) -> Result<(), RunNowPreflightAssembly> {
         if execution.requires_reconciliation() {
             return Err(RunNowPreflightAssembly::Unavailable(
@@ -3312,14 +3416,27 @@ impl KernelStoreGateway {
             .provider_policy
             .admits(evidence.observed_provider_fingerprint.as_ref())
         {
-            return Err(RunNowPreflightAssembly::Unavailable(
-                "no provider-route observer issues an observed fingerprint at the Kernel \
-                 preflight boundary: the run-now path makes no provider call before \
-                 preflight, and the observed route set lives in the Governor route \
-                 registry outside this crate, so an agent revision whose policy admits only \
-                 an observed compatible set stays unadmitted"
+            let owner_answer = provider_route_observation.map_or_else(
+                || "the composed runtime port exposes no provider-route observation for this \
+                      occurrence"
                     .to_owned(),
-            ));
+                |observation| match observation {
+                    UserAutomationProviderRouteObservation::Observed { .. } => {
+                        "the provider-route observation owner issued an identity the revision's \
+                         exact allowed set does not contain"
+                            .to_owned()
+                    }
+                    UserAutomationProviderRouteObservation::Unobserved { reason } => format!(
+                        "the provider-route observation owner exposed no identity: {reason}"
+                    ),
+                },
+            );
+            return Err(RunNowPreflightAssembly::Unavailable(format!(
+                "{owner_answer}. The run-now path issues no provider call before preflight, so an \
+                 agent revision whose policy admits only an observed compatible set stays \
+                 unadmitted, and the revision's own declared policy is never substituted for the \
+                 missing observation"
+            )));
         }
         Ok(())
     }
@@ -5107,7 +5224,7 @@ impl KernelStoreGateway {
         };
         let wake_intent = readback.intent.clone();
         let projection = match self
-            .assemble_run_now_preflight_projection(sealed, &owner, &invocation)
+            .assemble_run_now_preflight_projection(sealed, &owner, &invocation, runtime)
             .await
         {
             Ok(projection) => projection,
