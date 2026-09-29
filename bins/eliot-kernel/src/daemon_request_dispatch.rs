@@ -7077,10 +7077,12 @@ impl KernelComposition {
     /// transport, pipe, or listener. Rejection happens before reading —
     /// linkage plus closed selectors are proven (pure, no IO), then the full
     /// admission gate runs, then an exact replay of a resulted operation
-    /// serves its stored bounded body without re-dispatch and without Gateway
-    /// IO, then the presented attempt capability is proven current against
-    /// the live claim record before any Gateway IO. Only a fresh admitted
-    /// query with a current attempt reaches the Gateway, over the admitted
+    /// serves its stored bounded body without re-dispatch — rejoined first to
+    /// the current source revisions its own lineage records, which is one
+    /// bounded head read and never a re-execution — then the presented
+    /// attempt capability is proven current against the live claim record
+    /// before any Gateway IO. Only a fresh admitted
+    /// query with a current attempt reaches the evidence Gateway, over the admitted
     /// fence with the explicit scope, exact subject, and catalogue-bound
     /// `max_records`; the bounded answer is projected through the MCP
     /// evidence-pack projection and completed through the shared submit gate
@@ -7132,6 +7134,15 @@ impl KernelComposition {
         if let Some(replayed) =
             host_request_route::local_read_replay_response(&receipt, &record, &envelope)?
         {
+            // Replay preserves the original execution and result identity, but
+            // the retained answer is a dependent branch: it was derived from
+            // the source revisions its own lineage records. Rejoining that
+            // branch to the CURRENT source revisions is what revokes it when a
+            // source moved (I15.7); nothing is re-executed, overwritten, or
+            // narrowed here. The observed heads come from the Store's own head
+            // read, so this is a causal join rather than a self-match.
+            self.check_retained_local_read_source_revisions(&record, &envelope)
+                .await?;
             return Ok(replayed);
         }
         // No bypass: the presented attempt must be the live claim-record
@@ -7288,6 +7299,70 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
         Err(TransportError::SessionFenced)
+    }
+
+    /// Revalidates one retained local-read result against the CURRENT source
+    /// revision it was derived from (issue #1809 item 5).
+    ///
+    /// A retained read is a dependent retrieval branch: the answer, its
+    /// ranking and its counts all descend from the source revisions the
+    /// result's own retained lineage names. I15.7 makes final-result filtering
+    /// defense in depth, not the boundary — "If such content participated in a
+    /// retrieval/scoring branch, the whole contaminated branch … is discarded
+    /// and replanned under the latest grant/policy". So the branch is rejoined
+    /// to the source revision, not filtered down to a permitted row.
+    ///
+    /// The observation is a bounded owner read: the keys come from the durable
+    /// row's own recorded lineage, never from the presenting request, and the
+    /// comparison happens against the Store's current heads under the same
+    /// admitted fence the result was served under. A row that records no
+    /// source revision names no join, so nothing is read for it and the
+    /// existing result-class refusals keep owning that case.
+    ///
+    /// This never re-executes the read, never rewrites the retained record,
+    /// never erases an earlier delivery, and never spends another budget: a
+    /// moved source simply fails the replay closed, leaving the original
+    /// result identity and its evidence intact for its owner to replan.
+    #[cfg(windows)]
+    async fn check_retained_local_read_source_revisions(
+        &self,
+        record: &eliot_ors::HostRequestRecord,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), TransportError> {
+        let keys = host_request_route::retained_source_revision_keys(record)?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let gateway = self.retained_store_gateway()?;
+        let response = gateway
+            .execute_named_with_error(NamedReadRequest {
+                operation: NamedReadOperation::GetRevisionHeads,
+                scope_id: None,
+                consistency: ReadConsistency::ExactFence,
+                state_fence: envelope.state_fence.clone(),
+                parameters: BTreeMap::new(),
+            })
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        if response.operation != NamedReadOperation::GetRevisionHeads
+            || response.state_fence != envelope.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut observed = Vec::with_capacity(keys.len());
+        for key in keys {
+            // A key the Store no longer reports is a changed source, not an
+            // absent proof of agreement: the head read is the completeness
+            // side, so nothing is inferred from the request's own key list.
+            let head = response
+                .revision_heads
+                .iter()
+                .find(|head| head.key == key)
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            observed.push(head);
+        }
+        host_request_route::check_retained_source_revisions(record, &observed)
     }
 
     /// Publishes one owner-side WASM dispatch bundle on the admitted path
