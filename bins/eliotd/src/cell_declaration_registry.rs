@@ -17,7 +17,7 @@
 use thiserror::Error;
 
 /// Manifest declaration baked at compile time.
-const MANIFEST_TEXT: &str = include_str!("../../Cargo.toml");
+const MANIFEST_TEXT: &str = include_str!("../Cargo.toml");
 /// #13 contract text baked at compile time.
 const CONTRACT_TEXT: &str =
     include_str!("../../../workstreams/core-daemons/capability-cell-registry.contract.toml");
@@ -370,7 +370,7 @@ fn owner_rows(section: &[&str]) -> Result<Vec<ManifestCell>, CellRegistryError> 
         for pair in split_pairs(table) {
             let (key, value) =
                 quoted_pair(&pair).ok_or_else(|| malformed("pair is not key = \"value\""))?;
-            match key {
+            match key.as_str() {
                 "cell" if cell.is_none() => cell = Some(value),
                 "state" if state.is_none() => state = Some(value),
                 "owner" if owner.is_none() => owner = Some(value),
@@ -544,7 +544,7 @@ fn parse_contract(text: &str) -> Result<Vec<ContractCell>, CellRegistryError> {
 
 /// Value of one top-level `key = "value"` contract line.
 fn keyed_value(line: &str, key: &str) -> Option<String> {
-    let (name, value) = line.split_once('=')?;
+    let (name, _) = line.split_once('=')?;
     if name.trim() != key {
         return None;
     }
