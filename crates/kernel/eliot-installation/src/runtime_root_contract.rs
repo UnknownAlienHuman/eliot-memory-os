@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     InstallationError, PlatformHandle, WindowsPathIdentity, current_user_local_app_data_root,
     joined_windows_path, protected_program_data_root, runtime_sha256_handle, same_windows_root,
-    sha256_hex, text, valid_installation_key, validate_installation_key,
+    sha256_hex, text, validate_installation_key,
 };
 
 /// The supported installation supervision and path profiles.
@@ -298,18 +298,28 @@ impl RuntimeStateRoots {
         Self::derived(profile, profile_anchor_root, installation_root)
     }
 
-    /// Derives `PortableDev` roots below one explicit retained disposable root.
+    /// Derives `PortableDev` roots below one explicit retained repository root.
+    /// The repository remains the profile anchor; mutable durable/runtime state
+    /// is confined to the exact `.eliot-dev\\state` child.
     pub fn derive_portable(
-        retained_portable_root: PlatformHandle,
+        retained_repository_root: PlatformHandle,
     ) -> Result<Self, InstallationError> {
         Self::validate_profile_anchor_path_os(
             InstallationProfile::PortableDev,
-            &retained_portable_root,
+            &retained_repository_root,
         )?;
+        let installation_root = PlatformHandle::new(joined_windows_path(
+            retained_repository_root.as_str(),
+            ".eliot-dev\\state",
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "runtime_state_roots.installation_root".to_owned(),
+            reason: error.to_string(),
+        })?;
         Self::derived(
             InstallationProfile::PortableDev,
-            retained_portable_root.clone(),
-            retained_portable_root,
+            retained_repository_root,
+            installation_root,
         )
     }
 
@@ -415,7 +425,14 @@ impl RuntimeStateRoots {
                     reason: error.to_string(),
                 })
             }
-            InstallationProfile::PortableDev => Ok(self.installation_root.clone()),
+            InstallationProfile::PortableDev => PlatformHandle::new(joined_windows_path(
+                self.profile_anchor_root.as_str(),
+                ".eliot-dev",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.profile_root".to_owned(),
+                reason: error.to_string(),
+            }),
         }
     }
 
@@ -449,8 +466,8 @@ impl RuntimeStateRoots {
     }
 
     /// Returns the exact one-leaf-at-a-time hierarchy admitted by the
-    /// installer. System/User plans include every missing shared and runtime
-    /// parent; `PortableDev` intentionally retains its pre-existing contour.
+    /// installer. Profile plans include every exact missing shared and runtime
+    /// parent while keeping immutable binaries outside mutable roots.
     pub(super) fn installer_root_hierarchy(
         &self,
     ) -> Result<Vec<(&'static str, PlatformHandle)>, InstallationError> {
@@ -462,24 +479,123 @@ impl RuntimeStateRoots {
                     "profiled roots require a deterministic packages root".to_owned(),
                 )
             })?;
-            let installations_root =
-                PlatformHandle::new(joined_windows_path(profile_root.as_str(), "installations"))
-                    .map_err(|error| InstallationError::InvalidField {
-                        field: "runtime_state_roots.installations_root".to_owned(),
-                        reason: error.to_string(),
-                    })?;
             hierarchy.push(("profile_root", profile_root));
             hierarchy.push(("packages_root", packages_root));
-            hierarchy.push(("installations_root", installations_root));
+            if self.profile == InstallationProfile::SystemService {
+                let installations_root = PlatformHandle::new(joined_windows_path(
+                    profile_root.as_str(),
+                    "installations",
+                ))
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "runtime_state_roots.installations_root".to_owned(),
+                    reason: error.to_string(),
+                })?;
+                hierarchy.push(("installations_root", installations_root));
+            } else {
+                let data_root =
+                    PlatformHandle::new(joined_windows_path(profile_root.as_str(), "data"))
+                        .map_err(|error| InstallationError::InvalidField {
+                            field: "runtime_state_roots.user_data_root".to_owned(),
+                            reason: error.to_string(),
+                        })?;
+                let data_installations_root = PlatformHandle::new(joined_windows_path(
+                    data_root.as_str(),
+                    "installations",
+                ))
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "runtime_state_roots.user_installations_root".to_owned(),
+                    reason: error.to_string(),
+                })?;
+                let user_config_root =
+                    PlatformHandle::new(joined_windows_path(profile_root.as_str(), "config"))
+                        .map_err(|error| InstallationError::InvalidField {
+                            field: "runtime_state_roots.user_config_root".to_owned(),
+                            reason: error.to_string(),
+                        })?;
+                let user_cache_root =
+                    PlatformHandle::new(joined_windows_path(profile_root.as_str(), "cache"))
+                        .map_err(|error| InstallationError::InvalidField {
+                            field: "runtime_state_roots.user_cache_root".to_owned(),
+                            reason: error.to_string(),
+                        })?;
+                hierarchy.push(("user_data_root", data_root));
+                hierarchy.push(("user_installations_root", data_installations_root));
+                hierarchy.push(("user_config_root", user_config_root));
+                hierarchy.push(("user_cache_root", user_cache_root));
+            }
         }
-        hierarchy.push(("installation_root", self.installation_root.clone()));
         if self.profile == InstallationProfile::PortableDev {
+            hierarchy.push(("portable_profile_root", self.installer_profile_root()?));
+            let build_root = PlatformHandle::new(joined_windows_path(
+                self.profile_anchor_root.as_str(),
+                "target",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.build_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            hierarchy.push(("build_root", build_root));
+            let immutable_parent = PlatformHandle::new(joined_windows_path(
+                self.profile_anchor_root.as_str(),
+                "target\\eliot-dev",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.immutable_parent_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            hierarchy.push(("immutable_parent_root", immutable_parent));
+            let user_config_root = PlatformHandle::new(joined_windows_path(
+                self.profile_anchor_root.as_str(),
+                ".eliot-dev\\config",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.user_config_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            let user_cache_root = PlatformHandle::new(joined_windows_path(
+                self.profile_anchor_root.as_str(),
+                ".eliot-dev\\cache",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.user_cache_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            hierarchy.push(("user_config_root", user_config_root));
+            hierarchy.push(("user_cache_root", user_cache_root));
+            hierarchy.push(("installation_root", self.installation_root.clone()));
+            let kernel_root = PlatformHandle::new(joined_windows_path(
+                self.installation_root.as_str(),
+                "kernel",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.kernel_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            let store_root = PlatformHandle::new(joined_windows_path(
+                self.installation_root.as_str(),
+                "store",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.store_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            hierarchy.push(("host_state_root", self.host_state_root.clone()));
+            hierarchy.push(("kernel_root", kernel_root));
+            hierarchy.push(("kernel_ors_root", self.kernel_ors_root.clone()));
+            hierarchy.push(("kernel_work_root", self.kernel_work_root.clone()));
+            hierarchy.push(("store_root", store_root));
             hierarchy.extend(
-                self.root_fields()
-                    .into_iter()
-                    .map(|(field, root)| (field, root.clone())),
+                [
+                    ("store_data_root", &self.store_data_root),
+                    ("store_work_root", &self.store_work_root),
+                    ("store_temp_root", &self.store_temp_root),
+                    ("watchdog_state_root", &self.watchdog_state_root),
+                ]
+                .into_iter()
+                .map(|(field, root)| (field, root.clone())),
             );
         } else {
+            hierarchy.push(("installation_root", self.installation_root.clone()));
             hierarchy.push(("canary_evidence_root", self.canary_evidence_root()?));
             let kernel_root = PlatformHandle::new(joined_windows_path(
                 self.installation_root.as_str(),
@@ -598,22 +714,21 @@ impl RuntimeStateRoots {
                 }
             }
             InstallationProfile::PortableDev => {
-                if anchor != installation {
+                let expected_installation = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(
+                        self.profile_anchor_root.as_str(),
+                        ".eliot-dev\\state",
+                    ),
+                    "runtime_state_roots.expected_portable_installation_root",
+                )?;
+                if !anchor.contains(&installation)
+                    || anchor == installation
+                    || installation != expected_installation
+                {
                     return Err(InstallationError::ProfileViolation(
-                        "portable_dev installation root must equal its retained portable root"
+                        "portable_dev requires its exact state root below the retained repository anchor"
                             .to_owned(),
                     ));
-                }
-                if installation.components.len() >= 3 {
-                    let last = installation.components.last().map_or("", String::as_str);
-                    if valid_installation_key(last)
-                        && installation.ends_with(&["eliot", "installations", last])
-                    {
-                        return Err(InstallationError::ProfileViolation(
-                            "portable_dev must not alias a profiled durable installation root"
-                                .to_owned(),
-                        ));
-                    }
                 }
             }
         }
