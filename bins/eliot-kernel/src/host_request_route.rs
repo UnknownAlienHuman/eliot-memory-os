@@ -2422,6 +2422,73 @@ impl KernelComposition {
         let _transition = self.agent_bridge_transition_read()?;
         self.enqueue_local_read_pair_under_transition(envelope, tool)
     }
+}
+
+/// What the live index already holds for an incoming local-read enqueue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalReadReplay {
+    /// The same operation and envelope are staged on a different connection.
+    ConflictingConnection,
+    /// The same operation and envelope are already staged on this connection.
+    AlreadyStaged,
+    /// Nothing matching is staged; the pair is a fresh admission.
+    Fresh,
+}
+
+impl std::fmt::Display for LocalReadReplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConflictingConnection => {
+                formatter.write_str("the same local read is staged on another connection")
+            }
+            Self::AlreadyStaged => formatter.write_str("the local read is already staged"),
+            Self::Fresh => formatter.write_str("the local read is a fresh admission"),
+        }
+    }
+}
+
+impl KernelComposition {
+    /// Classifies an enqueue against the pair the live index already holds.
+    ///
+    /// The comparison is by content, never by name: the same operation id and
+    /// the same envelope digest, staged on a different connection, is a
+    /// conflict rather than a replay. Extracted so the enqueue path keeps its
+    /// capacity accounting in one readable block; the logic is unchanged.
+    fn classify_local_read_replay(
+        index: &std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
+        envelope: &HostRequestEnvelope,
+        operation_id: &str,
+    ) -> LocalReadReplay {
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.clone())
+        });
+        let Some(existing_connection) = existing_connection.as_deref() else {
+            return LocalReadReplay::Fresh;
+        };
+        if existing_connection != envelope.connection_id {
+            return LocalReadReplay::ConflictingConnection;
+        }
+        let already_staged =
+            index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.local_read_envelope.is_some()
+                });
+        if already_staged {
+            LocalReadReplay::AlreadyStaged
+        } else {
+            LocalReadReplay::Fresh
+        }
+    }
 
     fn enqueue_local_read_pair_under_transition(
         &self,
@@ -2444,30 +2511,12 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         let operation_id = host_request_operation_id(envelope);
-        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
-            refs.iter()
-                .find(|candidate| {
-                    candidate.operation_id == operation_id
-                        && candidate.request_digest == envelope.envelope_sha256
-                })
-                .map(|_| connection_id.clone())
-        });
-        if let Some(existing_connection) = existing_connection.as_deref() {
-            if existing_connection != envelope.connection_id {
+        match Self::classify_local_read_replay(&index, envelope, &operation_id) {
+            LocalReadReplay::ConflictingConnection => {
                 return Err(TransportError::IdentityConflict);
             }
-            if index
-                .get(existing_connection)
-                .into_iter()
-                .flatten()
-                .any(|candidate| {
-                    candidate.operation_id == operation_id
-                        && candidate.request_digest == envelope.envelope_sha256
-                        && candidate.local_read_envelope.is_some()
-                })
-            {
-                return Ok(());
-            }
+            LocalReadReplay::AlreadyStaged => return Ok(()),
+            LocalReadReplay::Fresh => {}
         }
         let queued = index
             .values()
@@ -2950,14 +2999,11 @@ impl KernelComposition {
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return;
         };
-        self.release_local_read_capacity_locked(
-            &mut index,
-            |candidate| {
-                !(candidate.operation_id == operation_id
-                    && candidate.request_digest == request_digest
-                    && candidate.local_read_envelope.is_some())
-            },
-        );
+        self.release_local_read_capacity_locked(&mut index, |candidate| {
+            !(candidate.operation_id == operation_id
+                && candidate.request_digest == request_digest
+                && candidate.local_read_envelope.is_some())
+        });
     }
 
     /// Returns the I12.14 bound charge for every local-read pair `remove`

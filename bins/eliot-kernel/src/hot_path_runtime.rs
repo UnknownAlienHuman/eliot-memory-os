@@ -145,9 +145,8 @@ impl KernelHotSpine {
     /// so a declaration that claims a looser or tighter bound than the build
     /// really uses is refused instead of being taken at its word.
     pub(crate) fn bind() -> Result<Self, HotSpineError> {
-        let path =
-            hot_path_manifest_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-                .map_err(|_| HotSpineError::DeclarationRefused)?;
+        let path = hot_path_manifest_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+            .map_err(|_| HotSpineError::DeclarationRefused)?;
         let admitted = admit_hot_path_manifest(&path, KERNEL_HOT_PATH_MANIFEST.as_bytes())
             .map_err(|_| HotSpineError::DeclarationRefused)?;
         let registration = kernel_running_registration();
@@ -312,10 +311,7 @@ impl super::KernelComposition {
         // degradation the declaration names for the bounded queue, so a later
         // status read can tell WHICH declaration is live without re-reading the
         // file and without a build-time inventory.
-        let degradation = bound_field(&format!(
-            "{:?}",
-            hot_spine.saturated_degradation()
-        ));
+        let degradation = bound_field(&format!("{:?}", hot_spine.saturated_degradation()));
         for operation in hot_spine.bound_operations() {
             tracing::info!(
                 target: KERNEL_DIAGNOSTICS_TARGET,
