@@ -92,6 +92,9 @@ const JOB_OBSERVER_POLL_TIMEOUT_MS: u32 = 10;
 static LEGACY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
 const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
+const INSTALLATION_DELIVERY_LOCK_FILE: &str = ".eliot-wasm-delivery.lock";
+const INSTALLATION_DELIVERY_LOCK_BINDING_PREFIX: &[u8] = b"ELIOT-INSTALLATION-DELIVERY-LOCK\0v1\0";
+const INSTALLATION_DELIVERY_LOCK_MAX_BYTES: usize = 32 * 1024;
 
 /// Typed outcome of one asynchronous Windows I/O operation (issue #789,
 /// implementation-requirements paragraph 4).
@@ -3162,6 +3165,134 @@ pub fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> 
         std::thread::sleep(Duration::from_millis(25));
     }
     unreachable!("bounded atomic replacement loop always returns")
+}
+
+/// Cross-process exclusion for all fixed-name WASM delivery publication,
+/// claim, marker, result and reclamation transitions under one approved
+/// installation root. The persistent lock file is never removed: callers
+/// hold this guard only across bounded local filesystem I/O, and the OS
+/// releases the exclusive lock when the handle closes.
+///
+/// The file body binds the lock to the canonical installation root. The
+/// handle is opened without delete sharing and with reparse-point opening,
+/// so a held guard cannot silently switch to another lock file or follow a
+/// replaced link. A mismatched or incomplete binding fails closed.
+pub struct InstallationDeliveryFileLock {
+    file: File,
+    install_root: PathBuf,
+}
+
+impl InstallationDeliveryFileLock {
+    /// Takes the nonblocking installation-scoped OS lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the installation root or lock file is invalid,
+    /// another process holds the lock, or the persistent root binding differs.
+    pub fn acquire(install_root: &Path) -> io::Result<Self> {
+        let install_root = std::fs::canonicalize(install_root)?;
+        let root_metadata = std::fs::symlink_metadata(&install_root)?;
+        if !root_metadata.is_dir()
+            || root_metadata.file_type().is_symlink()
+            || root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "installation delivery lock root is not a real directory",
+            ));
+        }
+
+        let lock_path = install_root.join(INSTALLATION_DELIVERY_LOCK_FILE);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&lock_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installation delivery lock is not a regular file",
+            ));
+        }
+        file.try_lock()?;
+
+        let binding = installation_delivery_lock_binding(&install_root);
+        file.seek(SeekFrom::Start(0))?;
+        let mut observed = Vec::new();
+        let mut bounded = std::io::Read::take(
+            &mut file,
+            (INSTALLATION_DELIVERY_LOCK_MAX_BYTES + 1) as u64,
+        );
+        bounded.read_to_end(&mut observed)?;
+        if observed.len() > INSTALLATION_DELIVERY_LOCK_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installation delivery lock binding is oversized",
+            ));
+        }
+        if observed.is_empty() {
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&binding)?;
+            file.set_len(binding.len() as u64)?;
+            file.sync_all()?;
+        } else if observed != binding {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installation delivery lock root binding conflicts",
+            ));
+        }
+
+        Ok(Self { file, install_root })
+    }
+
+    /// Verifies that a caller's installation directory resolves to the root
+    /// bound by this held lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path cannot be canonicalized or names a
+    /// different installation root.
+    pub fn validate_root(&self, install_root: &Path) -> io::Result<()> {
+        let candidate = std::fs::canonicalize(install_root)?;
+        if candidate == self.install_root {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "installation delivery lock used for another root",
+            ))
+        }
+    }
+
+    /// Returns the canonical root whose lock this guard holds.
+    #[must_use]
+    pub fn install_root(&self) -> &Path {
+        &self.install_root
+    }
+}
+
+impl Drop for InstallationDeliveryFileLock {
+    fn drop(&mut self) {
+        // Closing the handle releases the OS lock even if explicit unlock
+        // reports an error; never remove or rotate the shared lock file.
+        let _ = self.file.unlock();
+    }
+}
+
+fn installation_delivery_lock_binding(install_root: &Path) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        INSTALLATION_DELIVERY_LOCK_BINDING_PREFIX.len() + install_root.as_os_str().len() * 2,
+    );
+    bytes.extend_from_slice(INSTALLATION_DELIVERY_LOCK_BINDING_PREFIX);
+    for unit in install_root.as_os_str().encode_wide() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 
 fn nul_terminated_wide_file_path(path: &Path) -> io::Result<Vec<u16>> {
