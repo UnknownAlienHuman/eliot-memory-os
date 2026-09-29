@@ -910,6 +910,39 @@ pub enum ManagedChangeAdmissionError {
     Installation(#[from] InstallationError),
 }
 
+/// The exact installation, publication, authority, platform and instant one
+/// accepted catalogue revision is resolved against.
+///
+/// These six values travel together at every level of the accepted-catalogue
+/// path, so they are grouped here to bind the load, the survey and the compiled
+/// plan to *one* admission context by construction rather than by six separate
+/// arguments a caller could pair inconsistently.
+///
+/// The grouping is a naming change and admits nothing on its own. This context
+/// carries the installation's own durable store, the transaction whose retained
+/// publication is read, the installation-pinned anchor those retained bytes are
+/// verified against, the already-admitted authority whose confirmed owner must
+/// have signed them, the platform the installation was actually observed on,
+/// and the instant expiry is judged at. Every admission rule still lives in
+/// [`load_accepted_catalogue`]: a context value is not an accepted catalogue,
+/// not a capability, and not permission to install.
+pub struct AcceptedCatalogueContext<'a> {
+    /// The durable owner the retained signed publication is read from.
+    pub store: &'a RedbInstallationTransactionStore,
+    /// Transaction whose retained initial snapshot carries that publication.
+    pub transaction_id: &'a PlatformHandle,
+    /// Installation-pinned trust anchor the retained bytes are verified
+    /// against.
+    pub anchor: &'a InitialConfigSnapshotTrustAnchor,
+    /// The already-admitted authority whose confirmed owner must have signed
+    /// that publication.
+    pub authority: &'a VerifiedSetupBinding,
+    /// The platform the installation was actually observed on.
+    pub observed_platform: &'a PlatformHandle,
+    /// The instant catalogue expiry is judged at, in Unix milliseconds.
+    pub now_ms: u64,
+}
+
 /// Admits the accepted catalogue revision, surveys it in the mandatory order,
 /// and compiles one request against that exact survey and that exact approval.
 ///
@@ -928,12 +961,7 @@ pub enum ManagedChangeAdmissionError {
 /// the observed platform, when the survey or catalogue refuses, or when the
 /// request cannot be compiled against that exact survey and approval.
 pub fn admit_installation_survey_and_compile_change(
-    store: &RedbInstallationTransactionStore,
-    transaction_id: &PlatformHandle,
-    anchor: &InitialConfigSnapshotTrustAnchor,
-    authority: &VerifiedSetupBinding,
-    observed_platform: &PlatformHandle,
-    now_ms: u64,
+    context: &AcceptedCatalogueContext<'_>,
     source: &dyn SurveyObservationSource,
     request: &super::ManagedEnvironmentChangeRequest,
 ) -> Result<
@@ -943,20 +971,12 @@ pub fn admit_installation_survey_and_compile_change(
     ),
     ManagedChangeAdmissionError,
 > {
-    let admitted = survey_accepted_installation(
-        store,
-        transaction_id,
-        anchor,
-        authority,
-        observed_platform,
-        now_ms,
-        source,
-    )?;
+    let admitted = survey_accepted_installation(context, source)?;
     let plan = super::compile_managed_change_plan(
         request,
         &admitted.accepted,
         &admitted.survey,
-        authority,
+        context.authority,
     )?;
     Ok((admitted, plan))
 }
@@ -1001,22 +1021,10 @@ pub struct AcceptedInstallationSurvey {
 /// for the observed platform, or when the catalogue or the observation source
 /// refuses the survey.
 pub fn survey_accepted_installation(
-    store: &RedbInstallationTransactionStore,
-    transaction_id: &PlatformHandle,
-    anchor: &InitialConfigSnapshotTrustAnchor,
-    authority: &VerifiedSetupBinding,
-    observed_platform: &PlatformHandle,
-    now_ms: u64,
+    context: &AcceptedCatalogueContext<'_>,
     source: &dyn SurveyObservationSource,
 ) -> Result<AcceptedInstallationSurvey, CatalogueAdmissionError> {
-    let accepted = load_accepted_catalogue(
-        store,
-        transaction_id,
-        anchor,
-        authority,
-        observed_platform,
-        now_ms,
-    )?;
+    let accepted = load_accepted_catalogue(context)?;
     let survey = super::survey_installation(accepted.catalogue(), source, &[])?;
     // The probe stage is deliberately answered with an empty answer set: this
     // coordinator runs no process, so the mandatory `I3.3` order ends in
@@ -1047,8 +1055,8 @@ pub fn survey_accepted_installation(
 
 /// Loads one bounded, System Owner accepted discovery catalogue revision.
 ///
-/// The load reads the retained signed configuration publication for
-/// `transaction_id` through the existing durable owner
+/// The load reads the retained signed configuration publication named by the
+/// supplied [`AcceptedCatalogueContext`] through the existing durable owner
 /// ([`RedbInstallationTransactionStore::load_initial_snapshot`]) — the actual
 /// retained bytes, not a caller-supplied digest — and admits them only when
 /// every one of the following holds:
@@ -1060,7 +1068,7 @@ pub fn survey_accepted_installation(
 ///    an authority that never admitted this installation;
 /// 3. the decoded catalogue validates, accounts for the whole independent
 ///    `I3.3.1` seed set, and declares the observed platform;
-/// 4. the catalogue is not expired against `now_ms`.
+/// 4. the catalogue is not expired against the context's `now_ms`.
 ///
 /// Nothing here installs software, grants a credential, mutates PATH or
 /// advertises a capability, and an absent publication is an explicit refusal
@@ -1072,34 +1080,33 @@ pub fn survey_accepted_installation(
 /// installation owner, expired, or does not account for the seed set on the
 /// observed platform.
 pub fn load_accepted_catalogue(
-    store: &RedbInstallationTransactionStore,
-    transaction_id: &PlatformHandle,
-    anchor: &InitialConfigSnapshotTrustAnchor,
-    authority: &VerifiedSetupBinding,
-    observed_platform: &PlatformHandle,
-    now_ms: u64,
+    context: &AcceptedCatalogueContext<'_>,
 ) -> Result<AcceptedIntegrationCatalogue, CatalogueAdmissionError> {
-    handle(observed_platform, "catalogue.observed_platform")?;
-    let Some(snapshot) = store.load_initial_snapshot(transaction_id)? else {
+    handle(context.observed_platform, "catalogue.observed_platform")?;
+    let Some(snapshot) = context.store.load_initial_snapshot(context.transaction_id)? else {
         return Err(CatalogueAdmissionError::NotPublished);
     };
-    if snapshot.payload.installation_id != authority.installation_id() {
+    if snapshot.payload.installation_id != context.authority.installation_id() {
         return Err(CatalogueAdmissionError::ForeignInstallation);
     }
     // Verify the ACTUAL retained bytes against the installation-pinned anchor
     // under the exact context the admitted setup binding already confirmed.
-    let context = InitialSnapshotVerificationContext {
-        installation_id: authority.installation_id().to_owned(),
-        profile_ref: profile_ref(authority.profile())?,
-        runtime_state_roots_digest: authority.runtime_state_roots_digest().as_str().to_owned(),
-        key_identity: authority.confirmed_owner().as_str().to_owned(),
-        setup_revision: authority.setup_revision(),
+    let verification_context = InitialSnapshotVerificationContext {
+        installation_id: context.authority.installation_id().to_owned(),
+        profile_ref: profile_ref(context.authority.profile())?,
+        runtime_state_roots_digest: context
+            .authority
+            .runtime_state_roots_digest()
+            .as_str()
+            .to_owned(),
+        key_identity: context.authority.confirmed_owner().as_str().to_owned(),
+        setup_revision: context.authority.setup_revision(),
     };
-    let verified = anchor.verify(&snapshot, &context)?;
+    let verified = context.anchor.verify(&snapshot, &verification_context)?;
     // The retained publication is only this installation's own when the
     // System Owner who signed it is the System Owner that admitted this
     // installation. A revision or origin label proves nothing on its own.
-    if verified.signer_id() != authority.confirmed_owner().as_str() {
+    if verified.signer_id() != context.authority.confirmed_owner().as_str() {
         return Err(CatalogueAdmissionError::ForeignInstallation);
     }
     let signed_publication_ref =
@@ -1112,7 +1119,7 @@ pub fn load_accepted_catalogue(
 
     let Some(catalogue) = decode_catalogue_setting(
         verified.payload().snapshot.settings.as_slice(),
-        authority.confirmed_owner(),
+        context.authority.confirmed_owner(),
     )?
     else {
         return Err(CatalogueAdmissionError::NotPublished);
@@ -1122,20 +1129,20 @@ pub fn load_accepted_catalogue(
     if !catalogue
         .supported_platforms
         .iter()
-        .any(|supported| supported == observed_platform)
+        .any(|supported| supported == context.observed_platform)
     {
         return Err(InstallationError::ProfileViolation(format!(
             "accepted discovery catalogue revision {} is not valid for platform {}",
             catalogue.revision,
-            observed_platform.as_str()
+            context.observed_platform.as_str()
         ))
         .into());
     }
-    if catalogue.accepted_by != *authority.confirmed_owner() {
+    if catalogue.accepted_by != *context.authority.confirmed_owner() {
         return Err(CatalogueAdmissionError::ForeignInstallation);
     }
     if let Some(expires_at_ms) = catalogue.expires_at_ms
-        && now_ms >= expires_at_ms
+        && context.now_ms >= expires_at_ms
     {
         return Err(CatalogueAdmissionError::Expired(expires_at_ms));
     }

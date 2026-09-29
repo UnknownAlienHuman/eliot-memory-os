@@ -116,6 +116,68 @@ impl ManagedEnvironmentChangePlan {
     /// a second copy of those rules.
     pub fn validate(&self) -> Result<(), InstallationError> {
         self.request.validate()?;
+        self.validate_bound_values()?;
+        if self.family_id != self.request.target_family {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.confirmed_owner != self.request.required_owner {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // The catalogue acceptance and the installation approval are two
+        // different authorities. A plan whose catalogue was accepted by one
+        // System Owner and whose installation was approved by another is not a
+        // coherent plan, and neither is a plan whose acceptance is not
+        // attributable to the retained signed publication it names.
+        if self.catalogue_accepted_by != self.confirmed_owner {
+            return Err(InstallationError::IdentityConflict);
+        }
+        for pair in self.observed_target_identities.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(InstallationError::InvalidField {
+                    field: "managed_change_plan.observed_target_identities".to_owned(),
+                    reason: "must be sorted ascending and distinct".to_owned(),
+                });
+            }
+        }
+        for identity in &self.observed_target_identities {
+            handle(identity, "managed_change_plan.observed_target_identities")?;
+        }
+        // The action decides whether this request names something already
+        // surveyed, and the identity is required to be one of the observed
+        // identities rather than merely well-formed: a name the survey never
+        // resolved to an identity is not a current installation.
+        match (&self.request.action, &self.target_identity) {
+            (ManagedEnvironmentAction::Install, None) => Ok(()),
+            (ManagedEnvironmentAction::Install, Some(_)) => Err(InstallationError::InvalidField {
+                field: "managed_change_plan.target_identity".to_owned(),
+                reason: "an install request resolves no current target identity".to_owned(),
+            }),
+            (_, None) => Err(InstallationError::IncompleteObservation(
+                "a non-install request must name a target identity the survey observed".to_owned(),
+            )),
+            (_, Some(identity)) => {
+                if !self.observed_target_identities.contains(identity) {
+                    return Err(InstallationError::IncompleteObservation(
+                        "the requested target identity was not observed by this survey".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+        }?;
+        self.validate_target_probe()
+    }
+
+    /// Checks the plan's own bound values: that each is a well-formed handle,
+    /// that the survey digest is a real lowercase SHA-256, and that the two
+    /// revision counters the plan claims to have been compiled under are
+    /// non-zero.
+    ///
+    /// These checks read nothing but the plan, so a caller can prove a frozen
+    /// plan is self-consistent without holding the survey, the catalogue or the
+    /// authority it was compiled from. They assert shape only: that a value is
+    /// well-formed proves nothing about whether it is the *right* value, which
+    /// is what the cross-checks in [`Self::validate`] establish.
+    fn validate_bound_values(&self) -> Result<(), InstallationError> {
         for (value, field) in [
             (
                 &self.survey_content_digest,
@@ -164,70 +226,34 @@ impl ManagedEnvironmentChangePlan {
                 reason: "must be non-zero".to_owned(),
             });
         }
-        if self.family_id != self.request.target_family {
+        Ok(())
+    }
+
+    /// Checks the frozen probe, when there is one, is the probe this plan
+    /// resolved for this family and this exact target identity.
+    ///
+    /// A frozen probe is only meaningful against the identity it was resolved
+    /// for, on the family it was resolved from. A probe that names any other
+    /// family, or any other executable identity than the plan's
+    /// `target_identity`, is a contract for something other than the change
+    /// this plan describes.
+    fn validate_target_probe(&self) -> Result<(), InstallationError> {
+        let Some(probe) = &self.target_probe else {
+            return Ok(());
+        };
+        handle(&probe.probe_id, "managed_change_plan.target_probe.probe_id")?;
+        handle(
+            &probe.executable_identity,
+            "managed_change_plan.target_probe.executable_identity",
+        )?;
+        handle(
+            &probe.working_area,
+            "managed_change_plan.target_probe.working_area",
+        )?;
+        if probe.family_id != self.family_id
+            || self.target_identity.as_ref() != Some(&probe.executable_identity)
+        {
             return Err(InstallationError::IdentityConflict);
-        }
-        if self.confirmed_owner != self.request.required_owner {
-            return Err(InstallationError::IdentityConflict);
-        }
-        // The catalogue acceptance and the installation approval are two
-        // different authorities. A plan whose catalogue was accepted by one
-        // System Owner and whose installation was approved by another is not a
-        // coherent plan, and neither is a plan whose acceptance is not
-        // attributable to the retained signed publication it names.
-        if self.catalogue_accepted_by != self.confirmed_owner {
-            return Err(InstallationError::IdentityConflict);
-        }
-        for pair in self.observed_target_identities.windows(2) {
-            if pair[0] >= pair[1] {
-                return Err(InstallationError::InvalidField {
-                    field: "managed_change_plan.observed_target_identities".to_owned(),
-                    reason: "must be sorted ascending and distinct".to_owned(),
-                });
-            }
-        }
-        for identity in &self.observed_target_identities {
-            handle(identity, "managed_change_plan.observed_target_identities")?;
-        }
-        // The action decides whether this request names something already
-        // surveyed, and the identity is required to be one of the observed
-        // identities rather than merely well-formed: a name the survey never
-        // resolved to an identity is not a current installation.
-        match (&self.request.action, &self.target_identity) {
-            (ManagedEnvironmentAction::Install, None) => Ok(()),
-            (ManagedEnvironmentAction::Install, Some(_)) => Err(InstallationError::InvalidField {
-                field: "managed_change_plan.target_identity".to_owned(),
-                reason: "an install request resolves no current target identity".to_owned(),
-            }),
-            (_, None) => Err(InstallationError::IncompleteObservation(
-                "a non-install request must name a target identity the survey observed".to_owned(),
-            )),
-            (_, Some(identity)) => {
-                if !self.observed_target_identities.contains(identity) {
-                    return Err(InstallationError::IncompleteObservation(
-                        "the requested target identity was not observed by this survey".to_owned(),
-                    ));
-                }
-                Ok(())
-            }
-        }?;
-        // A frozen probe is only meaningful against the target identity it was
-        // resolved for, on the family it was resolved from.
-        if let Some(probe) = &self.target_probe {
-            handle(&probe.probe_id, "managed_change_plan.target_probe.probe_id")?;
-            handle(
-                &probe.executable_identity,
-                "managed_change_plan.target_probe.executable_identity",
-            )?;
-            handle(
-                &probe.working_area,
-                "managed_change_plan.target_probe.working_area",
-            )?;
-            if probe.family_id != self.family_id
-                || self.target_identity.as_ref() != Some(&probe.executable_identity)
-            {
-                return Err(InstallationError::IdentityConflict);
-            }
         }
         Ok(())
     }
