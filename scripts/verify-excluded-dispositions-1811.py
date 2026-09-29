@@ -53,8 +53,13 @@ inventoried package is admitted; every other edge, and any inventoried package
 present in the root `Cargo.lock`, still fails closed — membership in the root
 workspace deletes the row instead of qualifying it.
 
-Discovery never trusts the inventory: the denominator is derived from the tree
-with the same rule as scripts/verify-standalone-crates.py. The declared
+Discovery never trusts the inventory. The denominator is not re-derived here: it
+is read from the accepted Cargo/package discovery owner
+`scripts/verify-standalone-crates.py`, whose `workspace_paths` and
+`standalone_crates` own root workspace members, root excludes and the
+independently rooted package set. An owner that is missing, unloadable or
+API-changed refuses the gate, because an empty denominator reads as "no
+standalone packages" and is a false proof. The declared
 `standalone_package_count` is checked against both the unique inventory rows
 and the discovered set, so a stale count fails closed instead of passing
 silently.
@@ -78,6 +83,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -85,9 +91,12 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 ALLOWED = {"KEEP", "WRAP", "EXTRACT", "REWORK", "REPLACE", "RETIRE", "UNKNOWN"}
-# Denominator discovery, identical to scripts/verify-standalone-crates.py.
+# Consumer-scan manifest enumeration only. The DENOMINATOR is no longer derived
+# from a local re-parse of these parts: it is read from the accepted discovery
+# owner (see `owner_denominator`).
 IGNORED_PARTS = {"target", "testdata", "fixtures"}
 # The consumer scan never skips test/fixture inputs on principle: a real build
 # can run a build script or a packaging script from either location. Only
@@ -98,6 +107,10 @@ DOCUMENTATION_SUFFIXES = {".md", ".txt", ".rst", ".adoc"}
 INVENTORY_REL = Path("workstreams/security/standalone-crate-dispositions.toml")
 GATE_REL = Path("scripts/verify-excluded-dispositions-1811.py")
 DISCOVERY_OWNER_REL = Path("scripts/verify-standalone-crates.py")
+# The exact owner entry points the denominator is read through: root workspace
+# members/excludes, and the independently rooted package set. Their absence is a
+# refusal, never a locally recomputed fallback.
+DISCOVERY_OWNER_SYMBOLS = ("workspace_paths", "standalone_crates")
 ROOT_MANIFEST_REL = Path("Cargo.toml")
 LOCK_REL = Path("Cargo.lock")
 TOOLCHAIN_REL = Path("rust-toolchain.toml")
@@ -258,30 +271,87 @@ def load_inventory(root: Path) -> dict:
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
-def workspace_sets(root: Path) -> tuple[set[str], set[str]]:
-    data = tomllib.loads((root / ROOT_MANIFEST_REL).read_text(encoding="utf-8"))["workspace"]
-    return set(data.get("members", [])), set(data.get("exclude", []))
+def load_discovery_owner(root: Path) -> Any:
+    """The accepted Cargo/package discovery owner, loaded or refused.
+
+    `scripts/verify-standalone-crates.py` is the one accepted owner of root
+    workspace members, root `workspace.exclude` and the tree-derived
+    independently rooted package set (its own docstring names Cargo the owner of
+    `[workspace] members` and refuses an empty set when Cargo cannot resolve it).
+    This gate reads the denominator from that owner instead of re-parsing the root
+    manifest here, because a second in-tool re-parse is a denominator that can
+    silently disagree with the owner it claims to reflect.
+
+    A missing, unloadable or API-changed owner is a refusal, never an empty set:
+    an empty denominator reads as "there are no standalone packages", which is a
+    false proof, not a measurement.
+    """
+    script = root / DISCOVERY_OWNER_REL
+    if not script.is_file():
+        raise SystemExit(
+            "EXCLUDED_DISPOSITIONS: FAIL missing the Cargo/package discovery owner "
+            f"{DISCOVERY_OWNER_REL.as_posix()}; the denominator cannot be derived"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "verify_standalone_crates", script
+    )
+    if spec is None or spec.loader is None:
+        raise SystemExit(
+            "EXCLUDED_DISPOSITIONS: FAIL discovery owner "
+            f"{DISCOVERY_OWNER_REL.as_posix()} is not importable; the denominator "
+            "cannot be derived"
+        )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # a broken owner is a refusal, not an empty set
+        raise SystemExit(
+            "EXCLUDED_DISPOSITIONS: FAIL discovery owner "
+            f"{DISCOVERY_OWNER_REL.as_posix()} failed to load ({error}); the "
+            "denominator cannot be derived"
+        ) from error
+    for symbol in DISCOVERY_OWNER_SYMBOLS:
+        if not callable(getattr(module, symbol, None)):
+            raise SystemExit(
+                "EXCLUDED_DISPOSITIONS: FAIL discovery owner "
+                f"{DISCOVERY_OWNER_REL.as_posix()} exposes no callable "
+                f"{symbol}(root); the denominator cannot be derived"
+            )
+    return module
 
 
-def discover_standalone(root: Path) -> dict[str, str]:
-    """Tree-derived denominator, identical to scripts/verify-standalone-crates.py."""
-    members, exclude = workspace_sets(root)
-    found: dict[str, str] = {}
-    for manifest in sorted(root.rglob(ROOT_MANIFEST_REL.name)):
-        if any(part in IGNORED_PARTS for part in manifest.parts):
-            continue
-        if manifest == root / ROOT_MANIFEST_REL:
-            continue
-        if "[workspace]" not in manifest.read_text(encoding="utf-8"):
-            continue
-        relative = manifest.parent.relative_to(root).as_posix()
-        if relative in members or relative in exclude:
-            continue
-        parsed = tomllib.loads(manifest.read_text(encoding="utf-8"))
-        if "package" not in parsed:
-            continue
-        found[relative] = str(parsed["package"]["name"])
-    return found
+def owner_denominator(root: Path) -> tuple[set[str], set[str], dict[str, str]]:
+    """The one current denominator, read from the accepted discovery owner.
+
+    Root workspace members and root `workspace.exclude` come from the owner's
+    `workspace_paths`, and the independently rooted package set comes from its
+    `standalone_crates`. The package NAME of each selected crate is then read from
+    that crate's own manifest, because the owner returns crate directories and a
+    package identity is a property of the package, not of this gate.
+    """
+    owner = load_discovery_owner(root)
+    members, exclude = owner.workspace_paths(root)
+    discovered: dict[str, str] = {}
+    for crate in owner.standalone_crates(root):
+        relative = crate.relative_to(root).as_posix()
+        manifest = crate / ROOT_MANIFEST_REL.name
+        try:
+            parsed = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise SystemExit(
+                "EXCLUDED_DISPOSITIONS: FAIL discovery owner selected "
+                f"{relative} but its own manifest is unreadable ({error}); the "
+                "denominator cannot be derived"
+            ) from error
+        package = parsed.get("package")
+        if not isinstance(package, dict) or not str(package.get("name", "")).strip():
+            raise SystemExit(
+                "EXCLUDED_DISPOSITIONS: FAIL discovery owner selected "
+                f"{relative} but its own manifest declares no package name; the "
+                "denominator cannot be derived"
+            )
+        discovered[relative] = str(package["name"])
+    return set(members), set(exclude), discovered
 
 
 def is_proc_macro(root: Path, rel_dir: str) -> bool:
@@ -947,8 +1017,9 @@ def build_receipt(
     states: list[str],
     evidence_state: str,
     decisions: list[dict],
+    members: set[str],
+    exclude: set[str],
 ) -> dict:
-    members, exclude = workspace_sets(root)
     rows = {str(row.get("path")): row for row in data.get("crate", [])}
     packages = [
         {
@@ -1009,6 +1080,7 @@ def build_receipt(
                 "nor a root workspace.exclude entry"
             ),
             "discovery_owner": DISCOVERY_OWNER_REL.as_posix(),
+            "discovery_owner_symbols": list(DISCOVERY_OWNER_SYMBOLS),
             "standalone_package_count": len(packages),
             "workspace_member_count": len(members),
             "root_exclude_count": len(exclude),
@@ -1163,8 +1235,7 @@ def main() -> int:
             f"duplicate inventory package identities: {sorted({n for n in declared_names if declared_names.count(n) > 1})}"
         )
 
-    discovered = discover_standalone(root)
-    members, exclude = workspace_sets(root)
+    members, exclude, discovered = owner_denominator(root)
 
     # 1. denominator: inventory must equal tree discovery
     if set(by_path) != set(discovered):
@@ -1261,6 +1332,8 @@ def main() -> int:
         states,
         evidence_state,
         decisions,
+        members,
+        exclude,
     )
     if args.receipt is not None:
         recheck_receipt(root, args.receipt, receipt, failures)
