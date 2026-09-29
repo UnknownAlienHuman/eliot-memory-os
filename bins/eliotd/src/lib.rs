@@ -3153,6 +3153,73 @@ impl DaemonComposition {
             .map_err(DaemonError::Composition)
     }
 
+    /// Re-reads one compiled cold-start surface at the authenticated attach
+    /// boundary (issue #1746 W5; #8 W1).
+    ///
+    /// This is an owner readback adapter, not a second cold-start compiler:
+    /// the input must carry the Governor-issued lease and its complete prior
+    /// surface. The method checks the full lease key/epoch/deadline/terminal
+    /// state, compares the supplied fence to the Governor's current snapshot, then
+    /// asks the Governor for the exact terminal under that key. It returns the
+    /// surface only if every projected frozen field is equal to the expected
+    /// owner projection. Expiry uses the daemon's internal Unix-millisecond
+    /// clock, so the caller cannot extend a lease by supplying an older tick. A moved fence, changed receipt,
+    /// session, scope/task/source/profile revision, or projection fails closed.
+    /// The bridge activation ticket is not an input because it carries only
+    /// correlation identity.
+    ///
+    /// `caller: STITCH`. The authenticated Kernel/attach producer must supply
+    /// the actual lease/surface pair and observed fence; the current activation
+    /// route does not carry those semantic owner values. This method never
+    /// derives them from host fields or creates a replacement receipt.
+    pub fn read_cold_start_surface_for_attach(
+        &self,
+        input: &task_binding_admission::ColdStartAttachInput,
+    ) -> Result<eliot_governor::ColdStartSurfaceView, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        input.lease.validate().map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "cold-start attach lease is invalid: {error}"
+            )))
+        })?;
+        if !matches!(
+            input.lease.state,
+            eliot_workscope::OnboardingLeaseState::Ready
+                | eliot_workscope::OnboardingLeaseState::Ambiguous
+                | eliot_workscope::OnboardingLeaseState::Failed
+        ) || !input.matches_lease()
+        {
+            return Err(DaemonError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if input.state_fence != live_fence
+            || input.expected_surface.state_fence != live_fence
+            || input.expected_surface.lease_deadline < unix_ms()
+        {
+            return Err(DaemonError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+
+        let (current_lease, current_surface) = self.governor.cold_start_owner_readback_for_lease(
+            &input.lease.lineage_candidate_ref,
+            &input.lease.workspace_instance_candidate_ref,
+            input.lease.privacy_class,
+            input.lease.governing_source_generation,
+        )?;
+        if current_lease != input.lease || current_surface != input.expected_surface {
+            return Err(DaemonError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+        Ok(current_surface)
+    }
+
     /// Admits one explicit workspace instance as an attach to the retained
     /// `WorkScope` binding (issue #1929, I04.4 attach trigger).
     ///

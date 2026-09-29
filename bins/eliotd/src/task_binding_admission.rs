@@ -145,13 +145,15 @@ use std::path::{Path, PathBuf};
 use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
-    CanonicalWriteEnvelope, GoverningSourceSet, PrivacyProfile, ScopeBinding, WorkScopeDescriptor,
-    derive_observed_resources,
+    CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
+    WorkScopeDescriptor, derive_observed_resources,
 };
 use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
-use eliot_workscope::{ObservedScopeResources, OnboardingReadinessReceipt, TaskBindingState};
+use eliot_workscope::{
+    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt, TaskBindingState,
+};
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -977,7 +979,53 @@ pub fn observe_and_admit_task(
     )
 }
 
-/// Authenticated attach ingress payload assembled from owned evidence.
+/// Exact retained cold-start tuple presented to the daemon attach boundary.
+///
+/// This carries an existing Governor lease and its previously returned
+/// `ColdStartSurfaceView`; it is not an authority or a receipt constructor.
+/// `DaemonComposition::read_cold_start_surface_for_attach` re-reads the
+/// retained terminal for this exact lease key and returns it only when the
+/// complete surface, lease reference/deadline, and supplied `StateFence` still
+/// match. In particular the equality covers principal/session, scope and
+/// descriptor revision, instance/lineage, task binding, source set/generation,
+/// governance/route profiles, serializer/tokenizer identities, and projection
+/// source/revision. No field is derived from an activation ticket or a display
+/// label.
+///
+/// The producer remains the authenticated attach/onboarding owner. The type
+/// itself does not authenticate these values; a caller must pass the exact
+/// owner-issued lease/surface pair and the fence it observed at the same
+/// boundary. Without that producer, there is deliberately no live daemon
+/// caller.
+#[derive(Clone, Debug)]
+pub struct ColdStartAttachInput {
+    /// The exact single-flight lease whose terminal is being attached.
+    pub lease: OnboardingLease,
+    /// The complete prior projection returned by the Governor for this lease.
+    pub expected_surface: ColdStartSurfaceView,
+    /// Fence observed by the authenticated attach boundary.
+    pub state_fence: StateFence,
+}
+
+impl ColdStartAttachInput {
+    /// Checks the key fields projected into the surface before the adapter
+    /// performs the full retained-lease comparison.
+    #[must_use]
+    pub fn matches_lease(&self) -> bool {
+        self.expected_surface.lease_ref == self.lease.lease_ref
+            && self.expected_surface.lease_deadline == self.lease.deadline
+            && self.expected_surface.scope.lineage_ref.as_deref()
+                == Some(self.lease.lineage_candidate_ref.as_str())
+            && self.expected_surface.scope.instance_ref
+                == self.lease.workspace_instance_candidate_ref
+            && self.expected_surface.instance.instance_ref
+                == self.lease.workspace_instance_candidate_ref
+            && self.expected_surface.governing_source_generation
+                == self.lease.governing_source_generation
+    }
+}
+
+/// Authenticated scope-attach ingress payload assembled from owned evidence.
 ///
 /// The attach trigger builds exactly one of these per attach attempt from
 /// evidence it already owns — never inferred from the activation ticket
