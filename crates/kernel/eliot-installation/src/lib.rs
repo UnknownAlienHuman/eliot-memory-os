@@ -25,6 +25,7 @@ use eliot_platform::{
 };
 pub use eliot_platform::{HostProcessNonce, PlatformHandle};
 pub use eliot_platform_windows::UserOwnedRootLease;
+use eliot_platform_windows::profile_supervision::{ProfileSelection, ProfileSelectionReceipt};
 use eliot_platform_windows::{
     AgentBridgeSecurityConvergenceReceipt as PlatformAgentBridgeSecurityConvergenceReceipt,
     AgentBridgeStagePrepared as PlatformAgentBridgeStagePrepared,
@@ -42,21 +43,24 @@ use eliot_platform_windows::{
     InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
-    InstallerSecretObservation, PreparedUserModeSupervisionAuthorityCredential, ProtectedPathLease,
-    ProtectedRootLease, ProtectedRuntimePathLease, ServiceAbsentProof, ServiceAccount,
-    ServiceBootstrapArguments, ServiceInspectionUnknownDetail, ServiceRegistrationCurrent,
-    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
-    ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
-    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
-    TerminalContainmentReadback, UserModeSupervisionAuthorityCredentialObservation,
+    InstallerSecretObservation, PortableDevSupervisionAuthorityKeyObservation,
+    PortableDevSupervisionAuthorityKeyReceipt, PreparedUserModeSupervisionAuthorityCredential,
+    ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease, ServiceAbsentProof,
+    ServiceAccount, ServiceBootstrapArguments, ServiceInspectionUnknownDetail,
+    ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
+    ServiceRegistrationRuntimeInspection, ServiceRegistrationRuntimeReadback, ServiceStartMode,
+    ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, TerminalContainmentReadback,
+    UserModeSupervisionAuthorityCredentialObservation,
     UserModeSupervisionAuthorityCredentialReceipt, UserModeSupervisionAuthorityCredentialRequest,
     UserModeSupervisionAuthorityCredentialTargetObservation,
     UserModeSupervisionAuthorityCredentialWriteOutcome, UserOwnedPathLease,
     WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
-    WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
-    WindowsUserModeSupervisionAuthorityCredentialProvider, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
+    WindowsPortableDevSupervisionAuthorityKeyProvider, WindowsStoreCredentialTargetGenerator,
+    WindowsSupervisionAuthorityKeyStore, WindowsUserModeSupervisionAuthorityCredentialProvider,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -218,11 +222,11 @@ pub use credential_provision::{
     StoreCredentialProgress, StoreCredentialProvider, StoreCredentialProvisionPlan,
     StoreCredentialScope, credential_absent_response_digest, credential_control_request_frame,
     credential_control_response_frame, credential_deleted_response_digest,
-    credential_matching_response_digest, decode_credential_control_request_frame,
-    decode_credential_control_response_frame, dispatch_credential_target_for_store_target,
-    phase_b_credential_receipt_digest, phase_b_host_state_root_digest,
-    phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest,
-    provider_bootstrap_credential_target_for_store_target,
+    credential_matching_response_digest, current_user_credential_control_pipe,
+    decode_credential_control_request_frame, decode_credential_control_response_frame,
+    dispatch_credential_target_for_store_target, phase_b_credential_receipt_digest,
+    phase_b_host_state_root_digest, phase_b_static_template_for_candidate,
+    phase_b_watchdog_selector_digest, provider_bootstrap_credential_target_for_store_target,
     validate_provider_bootstrap_credential_target, validate_store_credential_target,
 };
 pub use package::{PackageObservationSnapshot, PackageObservedFile};
@@ -241,8 +245,8 @@ pub use package_planner::{
 };
 pub use plan::{
     InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole,
-    PackageArtifactDigest, PlannedChange, SupervisionAuthorityProvisionPlan,
-    UserModeSupervisionAuthorityProvisionPlan,
+    PackageArtifactDigest, PhaseBSupervisionAuthorityProvisionPlan, PlannedChange,
+    SupervisionAuthorityProvisionPlan, UserModeSupervisionAuthorityProvisionPlan,
 };
 use plan::{
     validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings,
@@ -2872,6 +2876,34 @@ impl UserModeAuthorityAbsentSnapshot {
     }
 }
 
+/// Repository-object and relative-key absence observed before one PortableDev authority write.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDevAuthorityAbsentSnapshot {
+    /// Exact selected repository-root file identity retained in the plan.
+    pub repository_root_identity: FileIdentity,
+    /// Exact disposable key location below the repository state root.
+    pub relative_path: String,
+}
+
+impl PortableDevAuthorityAbsentSnapshot {
+    fn validate(&self) -> Result<(), InstallationError> {
+        if self.repository_root_identity.volume_serial_number == 0
+            || self.repository_root_identity.file_index == 0
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        eliot_runtime_contracts::PortableDevSupervisionKeyReference::new(
+            self.relative_path.clone(),
+        )
+        .map_err(|error| InstallationError::InvalidField {
+            field: "effect.precondition.portable_dev_authority_snapshot.relative_path".to_owned(),
+            reason: error.to_string(),
+        })?;
+        Ok(())
+    }
+}
+
 /// Exact precondition bound into an effect intent.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2886,6 +2918,9 @@ pub struct InstallationEffectPrecondition {
     pub package_snapshot: Option<PackageObservationSnapshot>,
     /// Exact current-user `UserMode` authority-target absence observation.
     pub user_mode_authority_snapshot: Option<UserModeAuthorityAbsentSnapshot>,
+    /// Exact disposable repository-key absence observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_dev_authority_snapshot: Option<PortableDevAuthorityAbsentSnapshot>,
     /// Digest binding the planned references and typed snapshots in order.
     pub digest: PlatformHandle,
 }
@@ -2920,8 +2955,23 @@ impl InstallationEffectPrecondition {
         &self,
         snapshot: UserModeAuthorityAbsentSnapshot,
     ) -> Result<Self, InstallationError> {
-        Self::new_with_user_mode_authority_snapshot(
+        Self::new_with_authority_snapshots(
             self.evidence_refs.clone(),
+            None,
+            None,
+            None,
+            Some(snapshot),
+            None,
+        )
+    }
+
+    fn with_portable_dev_authority_snapshot(
+        &self,
+        snapshot: PortableDevAuthorityAbsentSnapshot,
+    ) -> Result<Self, InstallationError> {
+        Self::new_with_authority_snapshots(
+            self.evidence_refs.clone(),
+            None,
             None,
             None,
             None,
@@ -2935,21 +2985,23 @@ impl InstallationEffectPrecondition {
         credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
         package_snapshot: Option<PackageObservationSnapshot>,
     ) -> Result<Self, InstallationError> {
-        Self::new_with_user_mode_authority_snapshot(
+        Self::new_with_authority_snapshots(
             evidence_refs,
             os_snapshot,
             credential_snapshot,
             package_snapshot,
             None,
+            None,
         )
     }
 
-    fn new_with_user_mode_authority_snapshot(
+    fn new_with_authority_snapshots(
         evidence_refs: Vec<PlatformHandle>,
         os_snapshot: Option<InstallationRootAbsentSnapshot>,
         credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
         package_snapshot: Option<PackageObservationSnapshot>,
         user_mode_authority_snapshot: Option<UserModeAuthorityAbsentSnapshot>,
+        portable_dev_authority_snapshot: Option<PortableDevAuthorityAbsentSnapshot>,
     ) -> Result<Self, InstallationError> {
         #[derive(Serialize)]
         struct DigestInput<'a> {
@@ -2958,6 +3010,8 @@ impl InstallationEffectPrecondition {
             credential_snapshot: &'a Option<StoreCredentialAbsentSnapshot>,
             package_snapshot: &'a Option<PackageObservationSnapshot>,
             user_mode_authority_snapshot: &'a Option<UserModeAuthorityAbsentSnapshot>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            portable_dev_authority_snapshot: Option<&'a PortableDevAuthorityAbsentSnapshot>,
         }
         let digest = PlatformHandle::new(sha256_hex(
             &serde_json::to_vec(&DigestInput {
@@ -2966,6 +3020,7 @@ impl InstallationEffectPrecondition {
                 credential_snapshot: &credential_snapshot,
                 package_snapshot: &package_snapshot,
                 user_mode_authority_snapshot: &user_mode_authority_snapshot,
+                portable_dev_authority_snapshot: portable_dev_authority_snapshot.as_ref(),
             })
             .map_err(|error| InstallationError::InvalidField {
                 field: "effect.precondition".to_owned(),
@@ -2979,6 +3034,7 @@ impl InstallationEffectPrecondition {
             credential_snapshot,
             package_snapshot,
             user_mode_authority_snapshot,
+            portable_dev_authority_snapshot,
             digest,
         };
         value.validate()?;
@@ -2993,6 +3049,8 @@ impl InstallationEffectPrecondition {
             credential_snapshot: &'a Option<StoreCredentialAbsentSnapshot>,
             package_snapshot: &'a Option<PackageObservationSnapshot>,
             user_mode_authority_snapshot: &'a Option<UserModeAuthorityAbsentSnapshot>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            portable_dev_authority_snapshot: Option<&'a PortableDevAuthorityAbsentSnapshot>,
         }
 
         handles(
@@ -3012,10 +3070,14 @@ impl InstallationEffectPrecondition {
         if let Some(snapshot) = &self.user_mode_authority_snapshot {
             snapshot.validate()?;
         }
+        if let Some(snapshot) = &self.portable_dev_authority_snapshot {
+            snapshot.validate()?;
+        }
         let snapshot_count = u8::from(self.os_snapshot.is_some())
             + u8::from(self.credential_snapshot.is_some())
             + u8::from(self.package_snapshot.is_some())
-            + u8::from(self.user_mode_authority_snapshot.is_some());
+            + u8::from(self.user_mode_authority_snapshot.is_some())
+            + u8::from(self.portable_dev_authority_snapshot.is_some());
         if snapshot_count > 1 {
             return Err(InstallationError::InvalidField {
                 field: "effect.precondition.snapshot".to_owned(),
@@ -3030,6 +3092,7 @@ impl InstallationEffectPrecondition {
                 credential_snapshot: &self.credential_snapshot,
                 package_snapshot: &self.package_snapshot,
                 user_mode_authority_snapshot: &self.user_mode_authority_snapshot,
+                portable_dev_authority_snapshot: self.portable_dev_authority_snapshot.as_ref(),
             })
             .map_err(|error| InstallationError::InvalidField {
                 field: "effect.precondition".to_owned(),
@@ -3101,6 +3164,9 @@ pub struct InstallationEffectRequest {
     pub profile: InstallationProfile,
     /// Exact profile installation root from the durable runtime-root descriptor.
     pub installation_root: PlatformHandle,
+    /// Original current-user profile selection retained before external effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_selection_receipt: Option<ProfileSelectionReceipt>,
     /// Effect identity echoed outside the tagged plan for adapter routing.
     pub effect_id: PlatformHandle,
     /// Non-zero attempt durably committed before execution.
@@ -3119,6 +3185,9 @@ pub struct InstallationEffectRequest {
     /// permitted Credential Manager write and used to reconcile the exact
     /// transaction/effect target.
     pub user_mode_authority_receipt: Option<UserModeSupervisionAuthorityCredentialReceipt>,
+    /// Original disposable repository-key receipt persisted before its first write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_dev_authority_receipt: Option<PortableDevSupervisionAuthorityKeyReceipt>,
     /// Apply or exact-identity rollback.
     pub action: InstallationEffectAction,
     /// Required exact identity for rollback; absent for apply.
@@ -3171,6 +3240,30 @@ impl InstallationEffectRequest {
                         "PortableDev effect installation_root must be the selected repository .eliot-dev/state root".to_owned(),
                     ));
                 }
+            }
+        }
+        if let Some(selection) = &self.profile_selection_receipt {
+            profile_roots::validate_profile_selection_receipt_shape(selection, "effect")?;
+            let expected_profile = match self.profile {
+                InstallationProfile::UserMode => ProfileSelection::UserMode,
+                InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+                InstallationProfile::SystemService => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            };
+            let selected_installation_root = selection
+                .roots
+                .iter()
+                .find(|observation| observation.role == "runtime_state_roots.installation_root");
+            if selection.profile != expected_profile
+                || !selected_installation_root.is_some_and(|observation| {
+                    eliot_platform_windows::windows_paths_equal(
+                        &observation.canonical_path,
+                        Path::new(self.installation_root.as_str()),
+                    )
+                })
+            {
+                return Err(InstallationError::IdentityConflict);
             }
         }
         handle(&self.effect_id, "effect.effect_id")?;
@@ -3259,6 +3352,92 @@ impl InstallationEffectRequest {
                     || receipt.request.key_id != provision.key_id.as_str()
                     || receipt.request.owner_sid != provision.owner_sid.as_str()
                 {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            (
+                InstallerEffectPlan::MaterializePhaseB {
+                    supervision_authority,
+                    ..
+                },
+                InstallationEffectAction::Apply,
+                None,
+                Some(receipt),
+            ) if matches!(
+                supervision_authority.as_ref(),
+                PhaseBSupervisionAuthorityProvisionPlan::UserMode(_)
+            ) && self.profile == InstallationProfile::UserMode =>
+            {
+                receipt
+                    .validate()
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "effect.user_mode_authority_receipt".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                if receipt.request.transaction_id != self.transaction_id.as_str() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            (_, _, None, None) => {}
+            _ => return Err(InstallationError::IdentityConflict),
+        }
+        match (
+            &self.plan,
+            self.action,
+            &self.precondition.portable_dev_authority_snapshot,
+            &self.portable_dev_authority_receipt,
+        ) {
+            (
+                InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. },
+                InstallationEffectAction::Apply,
+                None,
+                None,
+            ) if self.attempt == 1 => {}
+            (
+                InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { provision, .. },
+                InstallationEffectAction::Apply,
+                Some(snapshot),
+                None,
+            ) if self.profile == InstallationProfile::PortableDev
+                && snapshot.repository_root_identity == provision.repository_root_identity
+                && snapshot.relative_path == provision.relative_path => {}
+            (
+                InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { provision, .. },
+                InstallationEffectAction::Apply | InstallationEffectAction::Rollback,
+                Some(snapshot),
+                Some(receipt),
+            ) if self.profile == InstallationProfile::PortableDev
+                && snapshot.repository_root_identity == provision.repository_root_identity
+                && snapshot.relative_path == provision.relative_path
+                && receipt.request == **provision =>
+            {
+                receipt
+                    .validate()
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "effect.portable_dev_authority_receipt".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+            }
+            (
+                InstallerEffectPlan::MaterializePhaseB {
+                    supervision_authority,
+                    ..
+                },
+                InstallationEffectAction::Apply,
+                None,
+                Some(receipt),
+            ) if matches!(
+                supervision_authority.as_ref(),
+                PhaseBSupervisionAuthorityProvisionPlan::PortableDev(_)
+            ) && self.profile == InstallationProfile::PortableDev =>
+            {
+                receipt
+                    .validate()
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "effect.portable_dev_authority_receipt".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                if receipt.request.transaction_id != self.transaction_id.as_str() {
                     return Err(InstallationError::IdentityConflict);
                 }
             }
@@ -3946,6 +4125,7 @@ struct WindowsInstallationEffectPort {
     store_target_generator: WindowsStoreCredentialTargetGenerator,
     supervision_keys: WindowsSupervisionAuthorityKeyStore,
     user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider,
+    portable_dev_supervision_keys: WindowsPortableDevSupervisionAuthorityKeyProvider,
 }
 
 struct PreparedOwnershipSecret {
@@ -3965,6 +4145,7 @@ impl WindowsInstallationEffectPort {
             supervision_keys: WindowsSupervisionAuthorityKeyStore::new(),
             user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider::new(
             ),
+            portable_dev_supervision_keys: WindowsPortableDevSupervisionAuthorityKeyProvider::new(),
         }
     }
 
@@ -4415,8 +4596,12 @@ impl WindowsInstallationEffectPort {
         operation: HostCredentialControlOperation,
         ownership_key: Vec<u8>,
     ) -> Result<HostCredentialControlRequest, PortError> {
-        let InstallerEffectPlan::ProvisionStoreCredential { provision, .. } = &request.plan else {
-            return Err(PortError::InvalidRequestMetadata);
+        let provision = match &request.plan {
+            InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
+            | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { provision, .. } => {
+                provision
+            }
+            _ => return Err(PortError::InvalidRequestMetadata),
         };
         let intent = HostCredentialControlIntent::new(
             operation,
@@ -4481,54 +4666,133 @@ impl WindowsInstallationEffectPort {
             .map_err(|_| PortError::InvalidRequestMetadata)?;
         let credential_receipt_digest = phase_b_credential_receipt_digest(receipt)
             .map_err(|_| PortError::InvalidRequestMetadata)?;
-        let mut ownership_key = self.credential_secret(request)?;
-        let host_service_sid =
-            resolve_service_sid(supervision_authority.host_service_name.as_str())
-                .map_err(secret_port_error)?;
-        let profile_anchor =
-            protected_program_data_root().map_err(|_| PortError::InvalidRequestMetadata)?;
-        let spec = InstallerRootPrimitiveSpec {
-            root: PathBuf::from(supervision_authority.kernel_root.as_str()),
-            installation_root: PathBuf::from(request.installation_root.as_str()),
-            profile_anchor,
-            profile: InstallerRootProfile::SystemService,
-        };
-        let key_request = SupervisionAuthorityKeyStoreRequest {
-            transaction_id: request.transaction_id.as_str().to_owned(),
-            effect_id: request.effect_id.as_str().to_owned(),
-            installation_plan_digest: request.plan_digest.as_str().to_owned(),
-            installation_id: supervision_authority.installation_id.as_str().to_owned(),
-            candidate_generation: supervision_authority
-                .candidate_generation
-                .as_str()
-                .to_owned(),
-            authority_generation: supervision_authority.authority_generation,
-            supervision_lease_scope_id: supervision_authority
-                .supervision_lease_scope_id
-                .as_str()
-                .to_owned(),
-            signer_id: supervision_authority.signer_id.as_str().to_owned(),
-            key_id: supervision_authority.key_id.as_str().to_owned(),
-            kernel_root: PathBuf::from(supervision_authority.kernel_root.as_str()),
-            relative_path: supervision_authority
-                .sealed_key_relative_path
-                .as_str()
-                .to_owned(),
-            expected_host_service_sid: host_service_sid,
-        };
-        let provisioned_result = match operation {
-            HostCredentialControlOperation::MaterializePhaseB => self
-                .supervision_keys
-                .create_or_reconcile(&spec, &key_request, &ownership_key),
-            HostCredentialControlOperation::ReconcilePhaseB => {
-                self.supervision_keys
-                    .inspect(&spec, &key_request, &ownership_key)
+        let provisioned_supervision_authority = match supervision_authority.as_ref() {
+            PhaseBSupervisionAuthorityProvisionPlan::SystemService(authority) => {
+                let mut ownership_key = self.credential_secret(request)?;
+                let host_service_sid = resolve_service_sid(authority.host_service_name.as_str())
+                    .map_err(secret_port_error)?;
+                let profile_anchor =
+                    protected_program_data_root().map_err(|_| PortError::InvalidRequestMetadata)?;
+                let spec = InstallerRootPrimitiveSpec {
+                    root: PathBuf::from(authority.kernel_root.as_str()),
+                    installation_root: PathBuf::from(request.installation_root.as_str()),
+                    profile_anchor,
+                    profile: InstallerRootProfile::SystemService,
+                };
+                let key_request = SupervisionAuthorityKeyStoreRequest {
+                    transaction_id: request.transaction_id.as_str().to_owned(),
+                    effect_id: request.effect_id.as_str().to_owned(),
+                    installation_plan_digest: request.plan_digest.as_str().to_owned(),
+                    installation_id: authority.installation_id.as_str().to_owned(),
+                    candidate_generation: authority.candidate_generation.as_str().to_owned(),
+                    authority_generation: authority.authority_generation,
+                    supervision_lease_scope_id: authority
+                        .supervision_lease_scope_id
+                        .as_str()
+                        .to_owned(),
+                    signer_id: authority.signer_id.as_str().to_owned(),
+                    key_id: authority.key_id.as_str().to_owned(),
+                    kernel_root: PathBuf::from(authority.kernel_root.as_str()),
+                    relative_path: authority.sealed_key_relative_path.as_str().to_owned(),
+                    expected_host_service_sid: host_service_sid,
+                };
+                let result = match operation {
+                    HostCredentialControlOperation::MaterializePhaseB => self
+                        .supervision_keys
+                        .create_or_reconcile(&spec, &key_request, &ownership_key),
+                    HostCredentialControlOperation::ReconcilePhaseB => self
+                        .supervision_keys
+                        .inspect(&spec, &key_request, &ownership_key),
+                    _ => return Err(PortError::InvalidRequestMetadata),
+                };
+                ownership_key.fill(0);
+                result.map_err(supervision_key_port_error)?
             }
-            _ => return Err(PortError::InvalidRequestMetadata),
+            PhaseBSupervisionAuthorityProvisionPlan::UserMode(authority) => {
+                if request.profile != InstallationProfile::UserMode {
+                    return Err(PortError::InvalidRequestMetadata);
+                }
+                let original = request
+                    .user_mode_authority_receipt
+                    .as_ref()
+                    .ok_or(PortError::InvalidRequestMetadata)?;
+                original.validate().map_err(supervision_key_port_error)?;
+                if original.request.transaction_id != request.transaction_id.as_str()
+                    || original.request.installation_id != authority.installation_id.as_str()
+                    || original.request.candidate_generation
+                        != authority.candidate_generation.as_str()
+                    || original.request.authority_generation != authority.authority_generation
+                    || original.request.supervision_lease_scope_id
+                        != authority.supervision_lease_scope_id.as_str()
+                    || original.request.signer_id != authority.signer_id.as_str()
+                    || original.request.key_id != authority.key_id.as_str()
+                    || original.request.owner_sid != authority.owner_sid.as_str()
+                    || original.target != authority.target
+                {
+                    return Err(PortError::InvalidRequestMetadata);
+                }
+                match self
+                    .user_mode_supervision_keys
+                    .inspect(original)
+                    .map_err(supervision_key_port_error)?
+                {
+                    UserModeSupervisionAuthorityCredentialObservation::Matching { .. } => {}
+                    _ => return Err(PortError::InvalidRequestMetadata),
+                }
+                let owner_sid = eliot_runtime_contracts::SupervisionOwnerSidReceipt::new(
+                    original.request.owner_sid.clone(),
+                )
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+                let reference = eliot_runtime_contracts::UserModeSupervisionKeyReference::new(
+                    original.target.as_str(),
+                    owner_sid,
+                )
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+                ProvisionedSupervisionAuthority::new(
+                    authority.supervision_lease_scope_id.as_str(),
+                    authority.candidate_generation.as_str(),
+                    authority.authority_generation,
+                    reference,
+                    original.trust_anchor.clone(),
+                )
+                .map_err(|_| PortError::InvalidRequestMetadata)?
+            }
+            PhaseBSupervisionAuthorityProvisionPlan::PortableDev(authority) => {
+                if request.profile != InstallationProfile::PortableDev {
+                    return Err(PortError::InvalidRequestMetadata);
+                }
+                let original = request
+                    .portable_dev_authority_receipt
+                    .as_ref()
+                    .ok_or(PortError::InvalidRequestMetadata)?;
+                original.validate().map_err(supervision_key_port_error)?;
+                if original.request != **authority
+                    || original.request.transaction_id != request.transaction_id.as_str()
+                {
+                    return Err(PortError::InvalidRequestMetadata);
+                }
+                match self
+                    .portable_dev_supervision_keys
+                    .inspect(original)
+                    .map_err(supervision_key_port_error)?
+                {
+                    PortableDevSupervisionAuthorityKeyObservation::Matching { .. } => {}
+                    _ => return Err(PortError::InvalidRequestMetadata),
+                }
+                let reference = eliot_runtime_contracts::PortableDevSupervisionKeyReference::new(
+                    authority.relative_path.clone(),
+                )
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+                ProvisionedSupervisionAuthority::new(
+                    &authority.supervision_lease_scope_id,
+                    &authority.candidate_generation,
+                    authority.authority_generation,
+                    reference,
+                    original.trust_anchor.clone(),
+                )
+                .map_err(|_| PortError::InvalidRequestMetadata)?
+            }
         };
-        ownership_key.fill(0);
-        let provisioned_supervision_authority =
-            provisioned_result.map_err(supervision_key_port_error)?;
         let phase_b = HostPhaseBMaterializationIntent::new(
             request.transaction_id.clone(),
             request.effect_id.clone(),
@@ -4580,7 +4844,7 @@ impl WindowsInstallationEffectPort {
             Ok(request) => request,
             Err(error) => return PortOutcome::Error(error),
         };
-        match self.call_credential_host(&host_request) {
+        match self.call_credential_host(request, &host_request) {
             Ok(HostCredentialControlResponse::PhaseBReady { receipt })
                 if operation == HostCredentialControlOperation::ReconcilePhaseB =>
             {
@@ -4707,7 +4971,7 @@ impl WindowsInstallationEffectPort {
                 if finalize_request.validate().is_err() {
                     return PortOutcome::Unknown(UnknownReason::Indeterminate);
                 }
-                match self.call_credential_host(&finalize_request) {
+                match self.call_credential_host(request, &finalize_request) {
                     Ok(HostCredentialControlResponse::PhaseBReady { receipt })
                         if receipt.validate().is_ok() =>
                     {
@@ -4850,25 +5114,135 @@ impl WindowsInstallationEffectPort {
     )]
     fn call_credential_host(
         &self,
+        effect: &InstallationEffectRequest,
         request: &HostCredentialControlRequest,
     ) -> Result<HostCredentialControlResponse, PortError> {
-        let binding = observe_running_eliot_host_process().map_err(secret_port_error)?;
-        if !eliot_platform_windows::windows_paths_equal(
-            Path::new(request.intent.provision.expected_host_executable.as_str()),
-            Path::new(binding.image_path()),
-        ) {
-            return Err(PortError::IdentityConflict);
-        }
-        let host_process_digest =
-            PlatformHandle::new(sha256_hex(binding.identity().stable_key().as_bytes()))
+        let provision = &request.intent.provision;
+        let (pipe_name, expectation, selected_session, retained_user_image) = match effect.profile {
+            InstallationProfile::SystemService => {
+                if effect.profile_selection_receipt.is_some()
+                    || provision.scope != StoreCredentialScope::LocalService
+                {
+                    return Err(PortError::IdentityConflict);
+                }
+                let binding = observe_running_eliot_host_process().map_err(secret_port_error)?;
+                if !eliot_platform_windows::windows_paths_equal(
+                    Path::new(provision.expected_host_executable.as_str()),
+                    Path::new(binding.image_path()),
+                ) {
+                    return Err(PortError::IdentityConflict);
+                }
+                let expectation =
+                    eliot_platform_windows::NamedPipePeerExpectation::new_with_process_binding(
+                        LOCAL_SERVICE_SID,
+                        0,
+                        binding,
+                    )
+                    .map_err(secret_port_error)?;
+                (
+                    HOST_CREDENTIAL_CONTROL_PIPE.to_owned(),
+                    expectation,
+                    None,
+                    None,
+                )
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let selection = effect
+                    .profile_selection_receipt
+                    .as_ref()
+                    .ok_or(PortError::InvalidRequestMetadata)?;
+                let expected_profile = match effect.profile {
+                    InstallationProfile::UserMode => ProfileSelection::UserMode,
+                    InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+                    InstallationProfile::SystemService => unreachable!(),
+                };
+                if selection.profile != expected_profile
+                    || provision.scope != StoreCredentialScope::CurrentUser
+                    || provision.expected_principal_sid.as_str() != selection.owner_sid
+                {
+                    return Err(PortError::IdentityConflict);
+                }
+                let observed_root = selection
+                    .roots
+                    .iter()
+                    .find(|root| root.role == "immutable_binaries")
+                    .ok_or(PortError::InvalidRequestMetadata)?;
+                let root = UserOwnedRootLease::open_existing(&observed_root.canonical_path)
+                    .map_err(|_| PortError::IdentityConflict)?;
+                if root.current_user_sid() != selection.owner_sid
+                    || root.identity() != observed_root.identity
+                    || !eliot_platform_windows::windows_paths_equal(
+                        &root
+                            .canonical_path()
+                            .map_err(|_| PortError::IdentityConflict)?,
+                        &observed_root.canonical_path,
+                    )
+                {
+                    return Err(PortError::IdentityConflict);
+                }
+                let observed_host_root = selection
+                    .roots
+                    .iter()
+                    .find(|candidate| candidate.role == "runtime_state_roots.host_state_root")
+                    .ok_or(PortError::InvalidRequestMetadata)?;
+                let host_root = UserOwnedRootLease::open_existing(Path::new(
+                    provision.host_state_root.as_str(),
+                ))
+                .map_err(|_| PortError::IdentityConflict)?;
+                if host_root.current_user_sid() != selection.owner_sid
+                    || host_root.identity() != observed_host_root.identity
+                    || !eliot_platform_windows::windows_paths_equal(
+                        &host_root
+                            .canonical_path()
+                            .map_err(|_| PortError::IdentityConflict)?,
+                        &observed_host_root.canonical_path,
+                    )
+                {
+                    return Err(PortError::IdentityConflict);
+                }
+                let executable = UserOwnedPathLease::open_existing(
+                    &root,
+                    Path::new(provision.expected_host_executable.as_str()),
+                )
+                .map_err(|_| PortError::IdentityConflict)?;
+                let bytes = executable
+                    .read_bounded(512 * 1024 * 1024)
+                    .map_err(|_| PortError::IdentityConflict)?;
+                if sha256_hex(&bytes) != provision.expected_host_executable_sha256.as_str() {
+                    return Err(PortError::IdentityConflict);
+                }
+                root.verify_stable_identity()
+                    .and_then(|()| root.verify_path_identity())
+                    .and_then(|()| host_root.verify_stable_identity())
+                    .and_then(|()| host_root.verify_path_identity())
+                    .and_then(|()| executable.verify_stable_identity())
+                    .and_then(|()| executable.verify_path_identity())
+                    .map_err(|_| PortError::IdentityConflict)?;
+                let expectation =
+                    eliot_platform_windows::NamedPipePeerExpectation::new_for_dynamic_process(
+                        &selection.owner_sid,
+                        provision.expected_host_executable.as_str(),
+                        executable.identity(),
+                    )
+                    .map_err(secret_port_error)?;
+                let installation_id = PlatformHandle::new(&selection.installation_id)
+                    .map_err(|_| PortError::InvalidRequestMetadata)?;
+                let owner_sid = PlatformHandle::new(&selection.owner_sid)
+                    .map_err(|_| PortError::InvalidRequestMetadata)?;
+                let pipe_name = current_user_credential_control_pipe(
+                    effect.profile,
+                    &installation_id,
+                    &owner_sid,
+                )
                 .map_err(|_| PortError::InvalidRequestMetadata)?;
-        let expectation =
-            eliot_platform_windows::NamedPipePeerExpectation::new_with_process_binding(
-                LOCAL_SERVICE_SID,
-                0,
-                binding,
-            )
-            .map_err(secret_port_error)?;
+                (
+                    pipe_name,
+                    expectation,
+                    Some((selection.owner_sid.clone(), selection.session_id)),
+                    Some((root, host_root, executable)),
+                )
+            }
+        };
         std::thread::scope(|scope| {
             scope
                 .spawn(move || {
@@ -4880,12 +5254,46 @@ impl WindowsInstallationEffectPort {
                     runtime.block_on(async {
                         let timeout = std::time::Duration::from_secs(5);
                         let mut transport = NamedPipeTransport::connect_authenticated(
-                            HOST_CREDENTIAL_CONTROL_PIPE,
+                            &pipe_name,
                             timeout,
                             &expectation,
                         )
                         .await
                         .map_err(|_| host_port_error())?;
+                        let peer = transport.peer_identity();
+                        let peer_process =
+                            peer.process_binding().ok_or(PortError::IdentityConflict)?;
+                        if !eliot_platform_windows::windows_paths_equal(
+                            Path::new(peer_process.image_path()),
+                            Path::new(provision.expected_host_executable.as_str()),
+                        ) {
+                            return Err(PortError::IdentityConflict);
+                        }
+                        if let Some((selected_sid, selected_session_id)) = &selected_session {
+                            let eliot_ipc::PeerIdentity::Authenticated {
+                                user_identity,
+                                session_identity,
+                                ..
+                            } = peer
+                            else {
+                                return Err(PortError::IdentityConflict);
+                            };
+                            if user_identity != selected_sid
+                                || session_identity != &selected_session_id.to_string()
+                            {
+                                return Err(PortError::IdentityConflict);
+                            }
+                        }
+                        let host_process_digest = PlatformHandle::new(sha256_hex(
+                            format!(
+                                "windows-pid:{}:start:{}:image:{}",
+                                peer_process.process_id(),
+                                peer_process.start_time_100ns(),
+                                peer_process.image_path(),
+                            )
+                            .as_bytes(),
+                        ))
+                        .map_err(|_| PortError::InvalidRequestMetadata)?;
                         let frame = credential_control_request_frame(
                             request.intent.request_digest.as_str(),
                             request,
@@ -4926,6 +5334,15 @@ impl WindowsInstallationEffectPort {
                         };
                         if !process_matches {
                             return Err(PortError::IdentityConflict);
+                        }
+                        if let Some((root, host_root, executable)) = &retained_user_image {
+                            root.verify_stable_identity()
+                                .and_then(|()| root.verify_path_identity())
+                                .and_then(|()| host_root.verify_stable_identity())
+                                .and_then(|()| host_root.verify_path_identity())
+                                .and_then(|()| executable.verify_stable_identity())
+                                .and_then(|()| executable.verify_path_identity())
+                                .map_err(|_| PortError::IdentityConflict)?;
                         }
                         Ok(response)
                     })
@@ -5810,7 +6227,7 @@ impl WindowsInstallationEffectPort {
             self.credential_secret(request)?
         };
         let host_request = Self::host_credential_request(request, operation, ownership_key)?;
-        let response = self.call_credential_host(&host_request)?;
+        let response = self.call_credential_host(request, &host_request)?;
         match response {
             HostCredentialControlResponse::Absent {
                 snapshot,
@@ -5919,7 +6336,7 @@ impl WindowsInstallationEffectPort {
             HostCredentialControlOperation::Inspect,
             Vec::new(),
         )?;
-        match self.call_credential_host(&inspect_request)? {
+        match self.call_credential_host(request, &inspect_request)? {
             HostCredentialControlResponse::Absent {
                 snapshot,
                 response_digest,
@@ -5962,7 +6379,7 @@ impl WindowsInstallationEffectPort {
             Ok(request) => request,
             Err(error) => return PortOutcome::Error(error),
         };
-        match self.call_credential_host(&host_request) {
+        match self.call_credential_host(request, &host_request) {
             Ok(HostCredentialControlResponse::Matching { receipt })
                 if operation == HostCredentialControlOperation::Provision
                     && receipt.matches_intent(&host_request.intent) =>
@@ -7114,12 +7531,16 @@ fn ownership_receipt_path(request: &InstallationEffectRequest) -> std::path::Pat
             Path::new(request.installation_root.as_str())
         }
         InstallerEffectPlan::StartService { .. } => Path::new(request.installation_root.as_str()),
-        InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
+        InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
+        | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { provision, .. } => {
             Path::new(provision.host_state_root.as_str())
         }
         InstallerEffectPlan::StagePackage { staging_root, .. } => Path::new(staging_root.as_str()),
         InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. } => {
             Path::new(provision.profile_roots.durable_data.as_str())
+        }
+        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { provision, .. } => {
+            provision.repository_root.as_path()
         }
     };
     let name = sha256_hex(
@@ -9631,7 +10052,9 @@ where
                     | (
                         InstallerEffectPlan::ApplyAcl { .. }
                         | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                        | InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
                         | InstallerEffectPlan::MaterializePhaseB { .. }
                         | InstallerEffectPlan::StagePackage { .. }
                         | InstallerEffectPlan::StartService { .. },
@@ -9650,7 +10073,9 @@ where
                         | InstallerEffectPlan::RegisterCurrentUserTask { .. }
                         | InstallerEffectPlan::StartService { .. }
                         | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                        | InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
                         | InstallerEffectPlan::MaterializePhaseB { .. }
                         | InstallerEffectPlan::StagePackage { .. },
                         None,
@@ -10948,9 +11373,9 @@ where
 
     /// Drives the durable prefix up to, but not through, the profile's Host
     /// bootstrap handoff. `SystemService` stops before its first ordered SCM
-    /// start. `UserMode` stops before Phase B after its current-user credentials
-    /// are applied. The caller projects the exact pending activation before
-    /// either profile can start an approved runtime.
+    /// start. A current-user profile first stops after package staging so the
+    /// caller can persist its original live root selection before any user
+    /// credential effect, then stops before Phase B for Host bootstrap.
     pub fn drive_until_host_bootstrap(
         &mut self,
         transaction_id: &PlatformHandle,
@@ -10985,14 +11410,22 @@ where
                     evidence_refs: current.observed_postconditions,
                 });
             };
-            let bootstrap_boundary = matches!(
-                current.installer_effects[index],
-                InstallerEffectPlan::StartService { .. }
-            ) || (current.profile == InstallationProfile::UserMode
+            let selection_boundary = current.profile == InstallationProfile::UserMode
+                && current.profile_selection_receipt().is_none()
                 && matches!(
                     current.installer_effects[index],
-                    InstallerEffectPlan::MaterializePhaseB { .. }
-                ));
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                );
+            let bootstrap_boundary = selection_boundary
+                || matches!(
+                    current.installer_effects[index],
+                    InstallerEffectPlan::StartService { .. }
+                )
+                || (current.profile == InstallationProfile::UserMode
+                    && matches!(
+                        current.installer_effects[index],
+                        InstallerEffectPlan::MaterializePhaseB { .. }
+                    ));
             if bootstrap_boundary {
                 return Ok(InstallationStepOutcome::Applied {
                     stage: current.stage,
@@ -11521,9 +11954,13 @@ fn effect_request(
                 .iter()
                 .zip(&transaction.effect_progress)
                 .find_map(|(effect, progress)| {
-                    matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
-                        .then(|| progress.store_credential.clone())
-                        .flatten()
+                    matches!(
+                        effect,
+                        InstallerEffectPlan::ProvisionStoreCredential { .. }
+                            | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                    )
+                    .then(|| progress.store_credential.clone())
+                    .flatten()
                 })
         })
         .flatten();
@@ -11534,12 +11971,50 @@ fn effect_request(
                 .iter()
                 .zip(&transaction.effect_progress)
                 .find_map(|(effect, progress)| {
-                    matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
-                        .then(|| progress.ownership_secret.clone())
-                        .flatten()
+                    matches!(
+                        effect,
+                        InstallerEffectPlan::ProvisionStoreCredential { .. }
+                            | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                    )
+                    .then(|| progress.ownership_secret.clone())
+                    .flatten()
                 })
         })
         .flatten();
+    let inherited_user_mode_authority_receipt =
+        matches!(&plan, InstallerEffectPlan::MaterializePhaseB { .. })
+            .then(|| {
+                transaction
+                    .installer_effects
+                    .iter()
+                    .zip(&transaction.effect_progress)
+                    .find_map(|(effect, progress)| {
+                        matches!(
+                            effect,
+                            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                        )
+                        .then(|| progress.user_mode_authority_receipt.clone())
+                        .flatten()
+                    })
+            })
+            .flatten();
+    let inherited_portable_dev_authority_receipt =
+        matches!(&plan, InstallerEffectPlan::MaterializePhaseB { .. })
+            .then(|| {
+                transaction
+                    .installer_effects
+                    .iter()
+                    .zip(&transaction.effect_progress)
+                    .find_map(|(effect, progress)| {
+                        matches!(
+                            effect,
+                            InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+                        )
+                        .then(|| progress.portable_dev_authority_receipt.clone())
+                        .flatten()
+                    })
+            })
+            .flatten();
     let is_service = matches!(
         &plan,
         InstallerEffectPlan::RegisterService { .. } | InstallerEffectPlan::StartService { .. }
@@ -11554,6 +12029,7 @@ fn effect_request(
             .runtime_state_roots
             .installation_root
             .clone(),
+        profile_selection_receipt: transaction.profile_selection_receipt().cloned(),
         effect_id,
         attempt,
         plan_digest: transaction.installer_plan_digest.clone(),
@@ -11570,7 +12046,14 @@ fn effect_request(
             .clone()
             .or(inherited_store_credential),
         staging_receipt: progress.staging_receipt.clone(),
-        user_mode_authority_receipt: progress.user_mode_authority_receipt.clone(),
+        user_mode_authority_receipt: progress
+            .user_mode_authority_receipt
+            .clone()
+            .or(inherited_user_mode_authority_receipt),
+        portable_dev_authority_receipt: progress
+            .portable_dev_authority_receipt
+            .clone()
+            .or(inherited_portable_dev_authority_receipt),
         action,
         expected_external_identity,
         service_bootstrap: is_service

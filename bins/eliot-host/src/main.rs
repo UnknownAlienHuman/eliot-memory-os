@@ -322,7 +322,12 @@ fn main() {
     if profile_supervisor_selection.is_some() {
         process_args.drain(0..2);
     }
-    let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(process_args.clone()));
+    let bootstrap = if profile_supervisor_selection.is_some() {
+        HostLaunchOptions::parse(process_args.clone()).map_err(|error| error.to_string())
+    } else {
+        parse_process_bootstrap(process_args.clone())
+    };
+    let _ = PROCESS_BOOTSTRAP.set(bootstrap);
     // HOST-0 (issue #889): best-effort diagnostics install; never gates startup.
     let _ = eliot_host::host_diagnostics::install_host_diagnostics();
     // One bounded Event Log worker owns the potentially blocking OS call.
