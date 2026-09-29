@@ -35,6 +35,10 @@ pub const COMPILER_PROFILE: &str = "compiler";
 pub const TEST_PROFILE: &str = "test";
 /// Exact revision shipped for both builtin profiles.
 pub const BUILTIN_PROFILE_REVISION: u64 = 1;
+/// Stable wire name of the package verification route.
+pub const PACKAGE_VERIFICATION_ROUTE: &str = "package-verification";
+/// Stable wire name of the bundle verification route.
+pub const BUNDLE_VERIFICATION_ROUTE: &str = "bundle-verification";
 /// Spec revision shipped for every builtin [`InstrumentSpec`].
 pub const BUILTIN_SPEC_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Target scope class recorded for builtin profiles: the exact worktree
@@ -1049,6 +1053,130 @@ pub fn test_profile() -> Result<InstrumentProfile, ProfileError> {
     )
 }
 
+/// Builds the versioned `package-verification` profile (issue #1914 W1).
+///
+/// I18.33's crate-local route is `eliot dev crate check <package>`: it resolves
+/// the one `ModuleTestCapsule` and runs the applicable contract/schema/format
+/// checks, the exact-package compilation, the selected unit/property/model/
+/// golden tests, and the separately reported format check. The stage graph
+/// declares only what the governing documents already fix — the compilation
+/// class, the test class, and the format class — over the same builtin specs
+/// `compiler`, `test`, and `dev-fast` already bind, so the route reuses admitted
+/// executable identity instead of naming a command, a path, or a package.
+///
+/// The capsule's own typed selector, services, resources, expected discovery
+/// rule, and proof ceiling bind at resolve time through the composition root
+/// ([`crate::capsule_binding`]), exactly as they do for `dev-fast`; this profile
+/// text never names a package, a test identity, or a task.
+///
+/// # Errors
+///
+/// Returns [`ProfileError`] when a builtin literal fails validation or the
+/// declared graph is not a DAG.
+pub fn package_verification_profile() -> Result<InstrumentProfile, ProfileError> {
+    let dag = StageDag::build(
+        PACKAGE_VERIFICATION_ROUTE,
+        vec![
+            StageDecl::new(
+                "package-compile".to_owned(),
+                ContractId::new(RUSTC_INSTRUMENT)?,
+                InstrumentKind::Build,
+                Vec::new(),
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "package-test".to_owned(),
+                ContractId::new(NEXTEST_INSTRUMENT)?,
+                InstrumentKind::Test,
+                vec!["package-compile".to_owned()],
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "package-format".to_owned(),
+                ContractId::new(RUSTFMT_INSTRUMENT)?,
+                InstrumentKind::Format,
+                Vec::new(),
+                true,
+                true,
+            )?,
+        ],
+    )?;
+    InstrumentProfile::new(
+        PACKAGE_VERIFICATION_ROUTE.to_owned(),
+        BUILTIN_PROFILE_REVISION,
+        BUILTIN_SPEC_VERSION,
+        vec![
+            InstrumentKind::Build,
+            InstrumentKind::Test,
+            InstrumentKind::Format,
+        ],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            ISOLATED_PROCESS_CLASS.to_owned(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
+}
+
+/// Builds the versioned `bundle-verification` profile (issue #1914 W1).
+///
+/// I18.21's parity contract makes the local and the CI result of one named
+/// profile revision comparable, so the bundle route is a versioned profile too
+/// rather than a per-run command list. Its graph is the shared compile/test
+/// spine every ELIOT verification route needs before any bundle-specific
+/// identity is admitted: a bundle that adds release-specific stages binds them
+/// as a new admitted revision of this name, never as an undeclared extra stage
+/// or a second profile type.
+///
+/// The bundle identity itself — the published artifact set, its digests, and
+/// its provenance — is not profile text. It is caller-attested and compared,
+/// and the same `require_provenance` gate that refuses a missing tool identity
+/// refuses a bundle stage whose recorded executable digest does not equal its
+/// admitted supply-chain receipt.
+///
+/// # Errors
+///
+/// Returns [`ProfileError`] when a builtin literal fails validation or the
+/// declared graph is not a DAG.
+pub fn bundle_verification_profile() -> Result<InstrumentProfile, ProfileError> {
+    let dag = StageDag::build(
+        BUNDLE_VERIFICATION_ROUTE,
+        vec![
+            StageDecl::new(
+                "bundle-compile".to_owned(),
+                ContractId::new(RUSTC_INSTRUMENT)?,
+                InstrumentKind::Build,
+                Vec::new(),
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "bundle-test".to_owned(),
+                ContractId::new(NEXTEST_INSTRUMENT)?,
+                InstrumentKind::Test,
+                vec!["bundle-compile".to_owned()],
+                true,
+                true,
+            )?,
+        ],
+    )?;
+    InstrumentProfile::new(
+        BUNDLE_VERIFICATION_ROUTE.to_owned(),
+        BUILTIN_PROFILE_REVISION,
+        BUILTIN_SPEC_VERSION,
+        vec![InstrumentKind::Build, InstrumentKind::Test],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            ISOLATED_PROCESS_CLASS.to_owned(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
+}
+
 /// Admission registry for versioned specs and profiles (I10.8.1).
 ///
 /// The registry owns instrument definitions and profiles; it never spawns a
@@ -1169,6 +1297,31 @@ impl InstrumentRegistry {
         Self::build(
             builtin_specs()?,
             vec![compiler_profile()?, test_profile()?],
+            generation,
+            Vec::new(),
+        )
+    }
+
+    /// Assembles the registry with every builtin profile, including the two
+    /// verification routes of issue #1914.
+    ///
+    /// This is the one registry a local entrypoint and CI both admit, so the
+    /// `package-verification` and `bundle-verification` routes resolve to the
+    /// same exact revision, digest, and stage DAG on either side. A route that
+    /// is missing here is missing on both sides together, never only in CI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError`] when a builtin literal fails validation.
+    pub fn with_verification_route_profiles(generation: u64) -> Result<Self, ProfileError> {
+        Self::build(
+            builtin_specs()?,
+            vec![
+                compiler_profile()?,
+                test_profile()?,
+                package_verification_profile()?,
+                bundle_verification_profile()?,
+            ],
             generation,
             Vec::new(),
         )
