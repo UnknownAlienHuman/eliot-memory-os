@@ -32,6 +32,12 @@
         </NavigationView.MenuItems>
 
         <Grid Padding="20" RowSpacing="12">
+            <!-- I11.9 keyboard operability: Escape cancels the active Governor
+                 request from anywhere in the content tree, mirroring the
+                 Cancel request button for keyboard-only operators. -->
+            <Grid.KeyboardAccelerators>
+                <KeyboardAccelerator Key="Escape" Invoked="CancelAccelerator_OnInvoked" />
+            </Grid.KeyboardAccelerators>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
@@ -96,19 +102,27 @@
                              Text="{Binding TaskId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                              AutomationProperties.Name="Canonical task ID" />
                     <TextBox Grid.Column="2" Header="Search" PlaceholderText="Title, handle, evidence or field"
-                             Text="{Binding FilterText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                    <TextBox Grid.Column="3" Header="Kind" Text="{Binding KindFilter, Mode=TwoWay}" />
-                    <TextBox Grid.Column="4" Header="Status" Text="{Binding StatusFilter, Mode=TwoWay}" />
-                    <TextBox Grid.Column="5" Header="Authority" Text="{Binding AuthorityFilter, Mode=TwoWay}" />
-                    <Button Grid.Column="6" Content="Apply" Click="ApplyFilter_OnClick" VerticalAlignment="Bottom" />
+                             Text="{Binding FilterText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="Filter Governor projection records by text" />
+                    <TextBox Grid.Column="3" Header="Kind" Text="{Binding KindFilter, Mode=TwoWay}"
+                             AutomationProperties.Name="Filter Governor projection records by kind" />
+                    <TextBox Grid.Column="4" Header="Status" Text="{Binding StatusFilter, Mode=TwoWay}"
+                             AutomationProperties.Name="Filter Governor projection records by status" />
+                    <TextBox Grid.Column="5" Header="Authority" Text="{Binding AuthorityFilter, Mode=TwoWay}"
+                             AutomationProperties.Name="Filter Governor projection records by authority" />
+                    <Button Grid.Column="6" Content="Apply" Click="ApplyFilter_OnClick" VerticalAlignment="Bottom"
+                            AutomationProperties.Name="Apply filters to current Governor projection" />
 
                     <ComboBox Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Header="Saved filters"
                               ItemsSource="{Binding SavedFilters}" SelectedItem="{Binding SelectedSavedFilter, Mode=TwoWay}"
                               DisplayMemberPath="Name" />
                     <StackPanel Grid.Row="1" Grid.Column="2" Grid.ColumnSpan="3" Orientation="Horizontal" Spacing="8" VerticalAlignment="Bottom">
-                        <Button Content="Save current" Click="SaveFilter_OnClick" />
-                        <Button Content="Apply saved" Click="ApplySavedFilter_OnClick" />
-                        <Button Content="Clear filters" Click="ClearFilter_OnClick" />
+                        <Button Content="Save current" Click="SaveFilter_OnClick"
+                                AutomationProperties.Name="Save current filter as named view" />
+                        <Button Content="Apply saved" Click="ApplySavedFilter_OnClick"
+                                AutomationProperties.Name="Apply selected saved filter view" />
+                        <Button Content="Clear filters" Click="ClearFilter_OnClick"
+                                AutomationProperties.Name="Clear all scope filters" />
                     </StackPanel>
                     <TextBlock Grid.Row="1" Grid.Column="5" Grid.ColumnSpan="2" Text="{Binding ResultSummary}"
                                TextWrapping="Wrap" VerticalAlignment="Bottom"
@@ -138,7 +152,8 @@
                               SelectedItem="{Binding ResultMode, Mode=TwoWay}"
                               AutomationProperties.Name="Query result mode" />
                     <NumberBox Grid.Column="3" Header="Graph depth" Minimum="1" Maximum="3"
-                               Value="{Binding GraphDepth, Mode=TwoWay}" SpinButtonPlacementMode="Compact" />
+                               Value="{Binding GraphDepth, Mode=TwoWay}" SpinButtonPlacementMode="Compact"
+                               AutomationProperties.Name="Causal graph expansion depth, 1 to 3" />
                     <Button Grid.Column="4" Content="Execute query" Click="ExecuteQuery_OnClick" VerticalAlignment="Bottom"
                             AutomationProperties.Name="Execute bounded typed query" />
                     <TextBox Grid.Row="1" Grid.ColumnSpan="5" Header="JSON result" Text="{Binding ResultPayloadText}"
@@ -295,7 +310,8 @@
                                       AutomationProperties.Name="Candidate disposition" />
                             <TextBox Header="Reason or exact evidence/source reference"
                                      Text="{Binding ActionInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                     TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56" />
+                                     TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56"
+                                     AutomationProperties.Name="Reason or exact evidence reference for the selected governed action" />
                             <Button Content="Submit typed action" Click="ExecuteAction_OnClick"
                                     IsEnabled="{Binding CanIssueCommands}"
                                     AutomationProperties.Name="Submit selected typed action through Governor" />
