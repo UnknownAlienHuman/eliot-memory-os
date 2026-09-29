@@ -99,7 +99,7 @@ pub struct MaintenanceTriggerClaimRequest {
 /// produce, so callers see the same bounded failure the wire family names;
 /// ledger-level refusals (unknown trigger, competing claim, revoked consumer,
 /// stale eligibility, missing mirror recovery) are distinct variants.
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[derive(Debug, Error)]
 pub enum MaintenanceTriggerDeliveryError {
     /// The presented wire value failed protocol validation.
     #[error("maintenance trigger delivery rejected: {0}")]
