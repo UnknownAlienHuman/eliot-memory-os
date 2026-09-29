@@ -1116,7 +1116,11 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
     ) -> Result<(), ProcessExecutionError> {
-        let lease_id = eliot_ors::OperationIdentity::new(operation_id.as_str())
+        // The store resolves the lease by this operation's own recorded
+        // `operation_id`, so no lease key is derived here from the operation
+        // string: naming the row is not what authorizes the replay, and a
+        // well-formed lease for some other operation cannot satisfy it.
+        let replayed_operation_id = eliot_ors::OperationIdentity::new(operation_id.as_str())
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
         let current_authority_epoch =
             eliot_contracts::AuthorityEpoch::new(owner.authority_epoch().sequence.get())
@@ -1124,7 +1128,7 @@ impl ProcessExecutionGateway {
         let decision = self
             .evidence_store
             .authorize_effect_replay_for_operation(
-                &lease_id,
+                &replayed_operation_id,
                 owner.module_id(),
                 owner.generation().get(),
                 current_authority_epoch,
