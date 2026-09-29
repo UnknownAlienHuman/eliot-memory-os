@@ -19,7 +19,7 @@
 //! - Authority and precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 
 #[cfg(windows)]
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::process_identity::FileIdentity;
@@ -149,6 +149,29 @@ impl UserOwnedRootReadLease {
         }
     }
 
+    /// Reopens the declared path without following reparse points and proves
+    /// it still names the retained root object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is substituted, its ownership proof
+    /// fails, or the operation is unsupported on the current platform.
+    pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let directory = open_user_owned_directory(&self.path, &self.sid)?;
+            let identity = crate::process_identity::file_identity_from_handle(&directory)
+                .map_err(|_| ProtectedPathError::Io)?;
+            (identity == self.identity)
+                .then_some(())
+                .ok_or(ProtectedPathError::IdentityMismatch)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
     #[cfg(windows)]
     pub(super) fn into_handle(self) -> std::fs::File {
         self.handle
@@ -255,6 +278,81 @@ impl UserOwnedRootLease {
         }
     }
 
+    /// Reopens the declared path without following reparse points and proves
+    /// it still names the retained root object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is substituted, its ownership proof
+    /// fails, or the operation is unsupported on the current platform.
+    pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let directory = open_user_owned_directory(&self.path, &self.sid)?;
+            let identity = crate::process_identity::file_identity_from_handle(&directory)
+                .map_err(|_| ProtectedPathError::Io)?;
+            (identity == self.identity)
+                .then_some(())
+                .ok_or(ProtectedPathError::IdentityMismatch)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Opens or creates one exact current-user-protected child directory.
+    ///
+    /// This is limited to one ordinary path component below the retained root.
+    /// Creation is flushed through the retained parent handle before the child
+    /// is returned; an existing child is accepted only after the normal
+    /// no-follow owner and DACL checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the child name is not one normal component, the
+    /// directory cannot be created or opened safely, or either retained path
+    /// changes identity.
+    pub(crate) fn open_or_create_child_directory(
+        &self,
+        child_name: &str,
+    ) -> Result<Self, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let child_component = Path::new(child_name);
+            let mut components = child_component.components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+                || child_name.is_empty()
+                || child_name.contains(['/', '\\'])
+            {
+                return Err(ProtectedPathError::InvalidPath);
+            }
+            self.verify_stable_identity()?;
+            self.verify_path_identity()?;
+            let path = self.path.join(child_component);
+            let created = match std::fs::create_dir(&path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(_) => return Err(ProtectedPathError::Io),
+            };
+            let child = Self::open_existing(&path)?;
+            if created {
+                crate::sync_directory_handle(&self.handle).map_err(|_| ProtectedPathError::Io)?;
+            }
+            self.verify_stable_identity()?;
+            self.verify_path_identity()?;
+            child.verify_stable_identity()?;
+            child.verify_path_identity()?;
+            Ok(child)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child_name;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
     /// Validates the parent contour of one child path below this retained
     /// root without requiring the final child to exist.
     ///
@@ -319,6 +417,59 @@ impl std::fmt::Debug for UserOwnedPathLease {
 }
 
 impl UserOwnedPathLease {
+    /// Creates one new, current-user-protected file below a retained root.
+    ///
+    /// This is create-only: an existing object is never opened or adopted.
+    /// Parent directories must already exist and are retained with no-follow
+    /// handles for the lifetime of the returned lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination already exists, a parent is
+    /// missing or substituted, the file cannot be protected, or the platform
+    /// is unsupported.
+    pub fn create_new(root: &UserOwnedRootLease, path: &Path) -> Result<Self, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            if !path.is_absolute() {
+                return Err(ProtectedPathError::InvalidPath);
+            }
+            root.verify_stable_identity()?;
+            root.verify_path_identity()?;
+            ensure_user_owned_containment(&root.path, path)?;
+            let parent = path.parent().ok_or(ProtectedPathError::InvalidPath)?;
+            let relative_parent = parent
+                .strip_prefix(&root.path)
+                .map_err(|_| ProtectedPathError::InvalidPath)?;
+            let directories =
+                open_user_owned_directory_contour(&root.path, relative_parent, &root.sid)?;
+            let file = create_user_owned_file(path, &root.sid)?;
+            let identity = crate::process_identity::file_identity_from_handle(&file)
+                .map_err(|_| ProtectedPathError::Io)?;
+            let root_handle = root
+                .handle
+                .try_clone()
+                .map_err(|_| ProtectedPathError::Io)?;
+            let lease = Self {
+                path: path.to_path_buf(),
+                identity,
+                sid: root.sid.clone(),
+                _root: root_handle,
+                _directories: directories,
+                file,
+            };
+            lease.verify_path_identity()?;
+            root.verify_stable_identity()?;
+            root.verify_path_identity()?;
+            Ok(lease)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (root, path);
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
     /// Opens one existing absolute file below the retained root.
     ///
     /// # Errors
@@ -521,6 +672,48 @@ impl UserOwnedPathLease {
         #[cfg(not(windows))]
         {
             let _ = limit;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Writes bytes only to a newly created empty file, flushes the file and
+    /// its retained parent directory, then reads the exact bytes back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file is not empty, write or durability flush
+    /// fails, readback differs, or the platform is unsupported.
+    pub fn write_new_bytes(&mut self, bytes: &[u8]) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            if self
+                .file
+                .metadata()
+                .map_err(|_| ProtectedPathError::Io)?
+                .len()
+                != 0
+            {
+                return Err(ProtectedPathError::IdentityMismatch);
+            }
+            self.file
+                .write_all(bytes)
+                .map_err(|_| ProtectedPathError::Io)?;
+            self.file.sync_all().map_err(|_| ProtectedPathError::Io)?;
+            let parent = self
+                ._directories
+                .last()
+                .ok_or(ProtectedPathError::IdentityMismatch)?;
+            crate::sync_directory_handle(parent).map_err(|_| ProtectedPathError::Io)?;
+            if self.read_bounded(bytes.len() as u64)? != bytes {
+                return Err(ProtectedPathError::IdentityMismatch);
+            }
+            self.verify_stable_identity()?;
+            self.verify_path_identity()?;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = bytes;
             Err(ProtectedPathError::UnsupportedPlatform)
         }
     }

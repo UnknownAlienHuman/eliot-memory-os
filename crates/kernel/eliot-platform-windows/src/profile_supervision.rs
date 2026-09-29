@@ -122,6 +122,10 @@ pub struct ProfileSelectionReceipt {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentUserTaskRequest {
+    /// Durable installation transaction that owns this planned registration.
+    pub transaction_id: String,
+    /// Stable effect ID from the immutable installation plan.
+    pub effect_id: String,
     /// Descriptor-bound root request validated before task mutation.
     pub roots: ProfileRootRequest,
     /// Exact approved Host image path from `RuntimeLaunchDescriptor`.
@@ -179,13 +183,6 @@ pub struct CurrentUserTaskRunReceipt {
     pub task_xml_sha256: String,
 }
 
-/// One read-only provider observation of a fixed UserMode task name.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UserModeProfileTaskInspection {
-    pub(crate) task_xml_sha256: String,
-    pub(crate) matches_request: bool,
-}
-
 /// Read-only Task Scheduler inspection after a restart. A `Matching` result
 /// proves the exact planned action and XML digest currently read back; it does
 /// not alone prove that this transaction created the task. The transaction
@@ -204,6 +201,8 @@ pub enum CurrentUserTaskObservation {
         task_xml_sha256: String,
         sid: String,
         session_id: u32,
+        /// Complete exact current readback joined to the original request.
+        receipt: CurrentUserTaskReceipt,
     },
     /// A task exists but its exact binding cannot be established.
     Mismatch {
@@ -334,11 +333,12 @@ pub fn register_current_user_task(
     }
 
     let task_name = task_name_for_selection(&selection)?;
-    let roots_digest = root_binding_digest(&selection);
     let arguments = task_arguments(&request.bootstrap_arguments)?;
     let platform_receipt = match crate::platform_security::register_user_mode_profile_task(
         &crate::platform_security::UserModeProfileTaskSpec {
             task_name: task_name.clone(),
+            transaction_id: request.transaction_id.clone(),
+            effect_id: request.effect_id.clone(),
             installation_id: selection.installation_id.clone(),
             installation_key: selection
                 .installation_key
@@ -347,7 +347,7 @@ pub fn register_current_user_task(
             component: selection.component.clone(),
             version: selection.version.clone(),
             generation: selection.generation.clone(),
-            roots_digest,
+            roots_digest: root_binding_digest(&selection),
             executable: executable.clone(),
             executable_sha256: request.executable_sha256.clone(),
             working_directory: request.working_directory.clone(),
@@ -437,7 +437,7 @@ fn cleanup_after_registration(
     }
 }
 
-    /// Starts only the exact task recorded by a live registration receipt and
+/// Starts only the exact task recorded by a live registration receipt and
 /// returns a bounded Task Scheduler engine state/PID observation. The Host
 /// executable must be admitted through its authenticated runtime/process
 /// handshake before it can be described as live.
@@ -547,10 +547,24 @@ pub fn inspect_current_user_task(
     if observed.matches_request
         && expected_receipt.is_none_or(|receipt| observed_digest == receipt.task_xml_sha256)
     {
+        let receipt = CurrentUserTaskReceipt {
+            selection: selection.clone(),
+            task_name,
+            sid: selection.owner_sid.clone(),
+            session_id: selection.session_id,
+            executable,
+            executable_sha256: request.executable_sha256.clone(),
+            working_directory: request.working_directory.clone(),
+            arguments: request.bootstrap_arguments.clone(),
+            task_xml_sha256: observed_digest.clone(),
+            request: request.clone(),
+        };
+        platform_task_receipt(&receipt, &selection)?;
         return Ok(CurrentUserTaskObservation::Matching {
             task_xml_sha256: observed_digest,
             sid: selection.owner_sid,
             session_id: selection.session_id,
+            receipt,
         });
     }
     Ok(CurrentUserTaskObservation::Mismatch {
@@ -580,6 +594,8 @@ fn platform_task_receipt(
     }
     Ok(crate::platform_security::UserModeProfileTaskReceipt {
         task_name: receipt.task_name.clone(),
+        transaction_id: receipt.request.transaction_id.clone(),
+        effect_id: receipt.request.effect_id.clone(),
         installation_id: receipt.selection.installation_id.clone(),
         installation_key: receipt
             .selection
@@ -589,7 +605,7 @@ fn platform_task_receipt(
         component: receipt.selection.component.clone(),
         version: receipt.selection.version.clone(),
         generation: receipt.selection.generation.clone(),
-        roots_digest: root_binding_digest(&receipt.selection),
+        roots_digest: root_binding_digest(current_selection),
         executable: receipt.executable.clone(),
         executable_sha256: receipt.executable_sha256.clone(),
         working_directory: receipt.working_directory.clone(),
@@ -975,6 +991,8 @@ fn platform_task_spec(
 ) -> Result<crate::platform_security::UserModeProfileTaskSpec, WindowsAdapterError> {
     Ok(crate::platform_security::UserModeProfileTaskSpec {
         task_name: task_name_for_selection(selection)?,
+        transaction_id: request.transaction_id.clone(),
+        effect_id: request.effect_id.clone(),
         installation_id: selection.installation_id.clone(),
         installation_key: selection
             .installation_key

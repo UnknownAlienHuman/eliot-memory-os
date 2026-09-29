@@ -285,9 +285,17 @@ pub use service_registration::{
     ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
 };
 pub use supervision_authority_key::{
-    SealedSupervisionAuthorityKey, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, WindowsSupervisionAuthorityKeyProvider,
-    WindowsSupervisionAuthorityKeyStore,
+    PortableDevSupervisionAuthorityKeyObservation, PortableDevSupervisionAuthorityKeyReceipt,
+    PortableDevSupervisionAuthorityKeyRequest, PortableDevSupervisionAuthorityKeyTargetObservation,
+    PortableDevSupervisionAuthorityKeyWriteOutcome, PreparedPortableDevSupervisionAuthorityKey,
+    PreparedUserModeSupervisionAuthorityCredential, SealedSupervisionAuthorityKey,
+    SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
+    UserModeSupervisionAuthorityCredentialObservation,
+    UserModeSupervisionAuthorityCredentialReceipt, UserModeSupervisionAuthorityCredentialRequest,
+    UserModeSupervisionAuthorityCredentialTargetObservation,
+    UserModeSupervisionAuthorityCredentialWriteOutcome,
+    WindowsPortableDevSupervisionAuthorityKeyProvider, WindowsSupervisionAuthorityKeyProvider,
+    WindowsSupervisionAuthorityKeyStore, WindowsUserModeSupervisionAuthorityCredentialProvider,
 };
 pub use tcp_listener_owner::{
     TcpConnectionPeerOwnerObservation, TcpListenerOwnerError, TcpListenerOwnerObservation,
