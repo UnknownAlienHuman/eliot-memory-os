@@ -443,6 +443,18 @@ try {
 }
 $denyIdentity = 'unverified-by-pinned-policy-runner'
 
+# MergeCompile collects independent failures without turning them into PASS.
+# Prerequisites are execution dependencies, not policy waivers: a failed
+# restore/metadata producer cannot leave a consumer running on stale output.
+# Quick and Review retain their existing fail-fast contract.
+$mergeCompilePrerequisites = @{
+    'cargo-fmt' = @('cargo-metadata')
+    'cargo-check-workspace' = @('cargo-metadata')
+    'cargo-denominator' = @('cargo-metadata')
+    'cargo-test-compile' = @('cargo-metadata')
+    'cargo-clippy-changed' = @('cargo-metadata', 'cargo-denominator')
+    'dotnet-build-operator' = @('dotnet-restore-operator')
+}
 $results = @()
 $harnessState = 'pass'
 $harnessError = ''
@@ -461,7 +473,22 @@ try {
         $exitCode = 0
         $gateError = ''
         try {
-            if ($null -eq $gate.Command) {
+            $unmetPrerequisites = @()
+            if ($Profile -eq 'MergeCompile' -and $mergeCompilePrerequisites.ContainsKey($gate.Name)) {
+                $unmetPrerequisites = @(
+                    foreach ($required in $mergeCompilePrerequisites[$gate.Name]) {
+                        $producer = @($results | Where-Object { $_.Name -eq $required })
+                        if ($producer.Count -ne 1 -or $producer[0].State -ne 'pass') {
+                            $required
+                        }
+                    }
+                )
+            }
+            if ($unmetPrerequisites.Count -gt 0) {
+                $state = 'not-run'
+                $exitCode = -1
+                $gateError = "prerequisite did not pass: $($unmetPrerequisites -join ', ')"
+            } elseif ($null -eq $gate.Command) {
                 $state = 'skipped-undefined'
                 $exitCode = -1
             } else {
@@ -490,7 +517,7 @@ try {
             DurationMs = $gateWatch.ElapsedMilliseconds
         }
         Write-Host "VERIFY_GATE: $($gate.Name) $state exit=$exitCode ms=$($gateWatch.ElapsedMilliseconds)"
-        if ($state -eq 'fail-exception' -or $state -eq 'cancelled') {
+        if ($state -eq 'fail-exception' -or $state -eq 'cancelled' -or $state -eq 'not-run') {
             Write-Host "VERIFY_GATE_ERROR: $($gate.Name) $gateError"
         }
         if ($gate.Name -eq 'cargo-metadata' -and $state -eq 'pass') {
@@ -501,7 +528,7 @@ try {
                 $workspaceMembers = 'unproven'
             }
         }
-        if ($state -ne 'pass') {
+        if ($state -ne 'pass' -and ($Profile -ne 'MergeCompile' -or $state -eq 'cancelled')) {
             for ($rest = $position; $rest -lt $selectedGates.Count; $rest++) {
                 $results += [pscustomobject]@{
                     Name       = $selectedGates[$rest].Name
@@ -580,7 +607,7 @@ try {
 $passedCount = @($results | Where-Object { $_.State -eq 'pass' }).Count
 $failedCount = @($results | Where-Object { $_.State -ne 'pass' -and $_.State -ne 'not-run' }).Count
 $notRunCount = @($results | Where-Object { $_.State -eq 'not-run' }).Count
-$overall = if ($failedCount -eq 0 -and $harnessState -eq 'pass') { 'PASS' } else { 'FAIL' }
+$overall = if ($passedCount -eq $selectedGates.Count -and $results.Count -eq $selectedGates.Count -and $harnessState -eq 'pass') { 'PASS' } else { 'FAIL' }
 
 if ($Profile -eq 'Quick') {
     $proofCeiling = 'QUICK_ONLY: bounded repository/document/source oracle check. Not Review, not release, not Product-Pulse proof.'
@@ -597,6 +624,7 @@ $summaryLines = @(
     "VERIFY_WORKSPACE_MEMBERS: $workspaceMembers (cargo metadata --locked --no-deps)",
     "VERIFY_TOOLCHAIN: $cargoIdentity / $pythonIdentity / deny=$denyIdentity",
     "VERIFY_POLICY_RECEIPT_CLEANUP: $receiptCleanupState",
+    "VERIFY_FAILURE_POLICY: $(if ($Profile -eq 'MergeCompile') { 'collect independent results; unmet prerequisites not-run; any nonpass fails' } else { 'fail-fast' })",
     'VERIFY_CACHE: workflow-owned only; this script implements no gate cache, so a cache hit cannot skip a gate or supply a pass receipt',
     "VERIFY_PROOF_CEILING: $proofCeiling",
     'VERIFY_DINT_CEILING: ignored/stateful/live-provider tests are outside the normal Quick/Review/MergeCompile profiles (D-INT family issues 905/907/909/911/913/915); this result covers none of them',

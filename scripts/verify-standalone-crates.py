@@ -116,7 +116,7 @@ def compile_steps(crate: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
     flag = "--locked" if (crate / "Cargo.lock").is_file() else "--offline"
     return (
         ("fmt", ("cargo", "fmt", "--manifest-path", "{manifest}", "--", "--check")),
-        ("clippy", ("cargo", "clippy", "--manifest-path", "{manifest}", "--all-targets", "--no-deps")),
+        ("clippy", ("cargo", "clippy", "--manifest-path", "{manifest}", flag, "--all-targets", "--no-deps")),
         ("test-no-run", ("cargo", "test", "--manifest-path", "{manifest}", flag, "--no-run", "--all-targets")),
     )
 
