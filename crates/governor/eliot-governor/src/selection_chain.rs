@@ -109,7 +109,9 @@ pub enum SelectionChainError {
     /// another boundary's omission record here would produce a receipt that
     /// validates but misstates which transformation did the work, so the chain
     /// is refused instead and the gap is named.
-    #[error("selection chain: stage removed member {member_ref} without its own authored disposition")]
+    #[error(
+        "selection chain: stage removed member {member_ref} without its own authored disposition"
+    )]
     UnattributedRemoval {
         /// Identity of the member that left the membership unattributed.
         member_ref: String,
