@@ -47,6 +47,11 @@ pub struct GuestRequest {
 }
 
 /// Typed guest response: exactly one of result or error is present.
+///
+/// The exclusivity is not carried by derived `Deserialize` (two independent
+/// `Option` fields accept every combination); it is enforced by
+/// `validate_response_shape` on both the byte path and the direct typed
+/// path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GuestResponse {
@@ -382,6 +387,10 @@ pub fn encode_response(response: &GuestResponse) -> Result<Vec<u8>, ConversionEr
 }
 
 /// Decodes canonical bytes into the typed response; unknown fields fail.
+///
+/// The decoded value must also pass `validate_response_shape`, so bytes
+/// carrying both a result and an error, or neither, never leave the decoder
+/// as a well-formed response.
 pub fn decode_response(bytes: &[u8]) -> Result<GuestResponse, GuestError> {
     if u64::try_from(bytes.len())
         .map_err(|_| GuestError::RejectedBytes("output bytes".to_owned()))?
@@ -389,8 +398,30 @@ pub fn decode_response(bytes: &[u8]) -> Result<GuestResponse, GuestError> {
     {
         return Err(GuestError::RejectedBytes("response shape".to_owned()));
     }
-    serde_json::from_slice(bytes)
-        .map_err(|_| GuestError::RejectedBytes("response shape".to_owned()))
+    let response: GuestResponse = serde_json::from_slice(bytes)
+        .map_err(|_| GuestError::RejectedBytes("response shape".to_owned()))?;
+    validate_response_shape(&response)?;
+    Ok(response)
+}
+
+/// Enforces the guest response's exclusive result-or-error choice.
+///
+/// Accepted: `(Some(result), None)` and `(None, Some(error))`. Rejected:
+/// `(Some(_), Some(_))` and `(None, None)`. No field is silently preferred or
+/// discarded, so a foreign result can never travel alongside an error. This
+/// is the single implementation of the rule; both the byte decoder and the
+/// host honored-output check call it, so a direct typed caller gets the same
+/// protection as a decoded one.
+pub(crate) fn validate_response_shape(response: &GuestResponse) -> Result<(), GuestError> {
+    match (&response.result, &response.error) {
+        (Some(_), None) | (None, Some(_)) => Ok(()),
+        (Some(_), Some(_)) => Err(GuestError::RejectedBytes(
+            "response carries both result and error".to_owned(),
+        )),
+        (None, None) => Err(GuestError::RejectedBytes(
+            "response carries neither result nor error".to_owned(),
+        )),
+    }
 }
 
 /// Handles one typed request, calling the native A-17a gate at most once.
