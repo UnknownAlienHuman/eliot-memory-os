@@ -38,12 +38,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ApprovedGenerationRegistry, ContractVersion, InstallationCoordinator, InstallationEffectAction,
-    InstallationEffectObservation, InstallationEffectPort, InstallationEpoch, InstallationError,
-    InstallationStage, InstallationTransaction, InstallationTransactionStore, InstallerEffectPlan,
-    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PlatformHandle, PortOutcome,
-    RedbInstallationRegistry, RedbInstallationTransactionStore, candidate_manifest_digest,
-    effect_request, handle, handles, platform_error, port_pending, sha256_handle, sha256_hex,
-    wall_clock_millis,
+    InstallationEffectObservation, InstallationEffectPort, InstallationEffectRequest,
+    InstallationEpoch, InstallationError, InstallationStage, InstallationTransaction,
+    InstallationTransactionStore, InstallerEffectPlan, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PlatformHandle, PortOutcome, RedbInstallationRegistry,
+    RedbInstallationTransactionStore, candidate_manifest_digest, effect_request, handle, handles,
+    platform_error, port_pending, sha256_handle, sha256_hex, wall_clock_millis,
 };
 
 /// Wire discriminator for the canary-removal plan, its frozen effect graph and
@@ -904,6 +904,7 @@ impl CanaryRemovalOperation {
                 // retirement could never be recorded as a durable outcome.
                 CanaryRemovalEffectState::Resolved {
                     disposition: CanaryRemovalEffectDisposition::Removed,
+                    ..
                 } => {
                     started += 1;
                 }
@@ -921,6 +922,7 @@ impl CanaryRemovalOperation {
                     disposition:
                         CanaryRemovalEffectDisposition::Absent
                         | CanaryRemovalEffectDisposition::Retained,
+                    ..
                 } => {}
                 CanaryRemovalEffectState::Unknown { .. } => {
                     open += 1;
@@ -1524,7 +1526,7 @@ fn require_quiesced_owner_effects(
         if rows.next().is_some() {
             return Err(InstallationError::Duplicate {
                 kind: "canary removal owner-derived effect".to_owned(),
-                identity: format!("{:?}", category),
+                identity: format!("{category:?}"),
             });
         }
         if row.resource_identity != identity || row.action != action {
@@ -2541,6 +2543,31 @@ fn next_revision(expected: u64) -> Result<u64, InstallationError> {
 /// mutating call, so a green stage can never come from a lost response. A
 /// readback that cannot prove absence preserves the original identity and the
 /// safe next action instead of reporting a clean removal.
+/// Builds the readback request for one already-executed plan row, or `None`
+/// when that row names no installation effect and therefore has nothing to read
+/// back from its owner.
+///
+/// The row's own `install_effect_index` selects which exact effect of the
+/// transaction is reconciled, and the row's own bound attempt and resource
+/// identity supply the preconditions, so the readback is addressed to THIS row
+/// rather than to a position in a list this loop happens to be walking.
+fn readback_request(
+    install: &InstallationTransaction,
+    row: &CanaryRemovalEffect,
+) -> Result<Option<InstallationEffectRequest>, InstallationError> {
+    let Some(index) = row.install_effect_index else {
+        return Ok(None);
+    };
+    let install_index = usize::try_from(index).map_err(|_| InstallationError::IdentityConflict)?;
+    Ok(Some(effect_request(
+        install,
+        install_index,
+        row.bound.attempt,
+        InstallationEffectAction::Rollback,
+        Some(row.resource_identity.clone()),
+    )?))
+}
+
 fn finish_with_readback<P>(
     coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
     registry: &RedbInstallationRegistry,
@@ -2554,18 +2581,9 @@ where
     let mut readback_evidence = Vec::new();
     for position in 0..registry_row {
         let row = operation.plan.effects[position].clone();
-        let Some(index) = row.install_effect_index else {
+        let Some(request) = readback_request(install, &row)? else {
             continue;
         };
-        let install_index =
-            usize::try_from(index).map_err(|_| InstallationError::IdentityConflict)?;
-        let request = effect_request(
-            install,
-            install_index,
-            row.bound.attempt,
-            InstallationEffectAction::Rollback,
-            Some(row.resource_identity.clone()),
-        )?;
         let InstallationCoordinator { port, store } = coordinator;
         match port.reconcile(&request) {
             PortOutcome::Known(InstallationEffectObservation::Absent {
