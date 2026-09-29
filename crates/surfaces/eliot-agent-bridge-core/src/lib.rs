@@ -1133,9 +1133,9 @@ pub struct RecoveryProjectionSummary {
     pub disposition: RecoveryDisposition,
 }
 
-/// A single checked record from the recovery window. Event records contain
-/// receipt metadata and digest references only; they never synthesize an
-/// `EventEnvelope` from those fields.
+/// A single checked record from the recovery window. Event records publish
+/// receipt metadata and digest references; retained source bytes stay private
+/// to the recovery adapter and are not serialized into this page.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 pub enum RecoveryProjectionRecord {
@@ -1157,8 +1157,8 @@ pub enum RecoveryProjectionObligation {
 }
 
 /// One imported event receipt and its current bridge-local obligation state.
-/// The receipt is still digest-only and is never converted into an event
-/// envelope.
+/// The public receipt is digest-only; a checked small source, when available,
+/// remains private to the recovery adapter.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryProjectionEvent {
@@ -2125,14 +2125,138 @@ pub const RECOVERY_PARTIAL_STREAM_LIST_TRUNCATED: &str = "stream-list-truncated"
 /// was refused without applying half a page.
 pub const RECOVERY_UNAVAILABLE_FOREIGN_PAGE: &str = "foreign-page-refused";
 
+/// A small source and normalization projection checked against the immutable
+/// transport hash and the owner's deterministic redaction representation.
+/// Larger content remains with its retained source owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveredSourceKind {
+    AdmittedInline,
+    Redacted,
+}
+
+/// Why the retained source cannot be carried inside a bounded recovery page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveredSourceUnavailable {
+    RequiresSourceHandle,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveredSourceProjection {
+    kind: RecoveredSourceKind,
+    source_utf8: String,
+    normalized_utf8: String,
+    transport_hash: String,
+    redaction_reason: Option<String>,
+    redacted_classes: Vec<String>,
+}
+
+impl fmt::Debug for RecoveredSourceProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveredSourceProjection")
+            .field("kind", &self.kind)
+            .field("transport_hash", &self.transport_hash)
+            .field("source_bytes", &self.source_utf8.len())
+            .field("normalized_bytes", &self.normalized_utf8.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoveredSourceProjection {
+    #[allow(clippy::result_large_err)]
+    pub fn checked(
+        kind: RecoveredSourceKind,
+        source_utf8: String,
+        normalized_utf8: String,
+        transport_hash: String,
+        redaction_reason: Option<String>,
+        redacted_classes: Vec<String>,
+    ) -> Result<Self, BridgeError> {
+        if source_utf8.is_empty()
+            || normalized_utf8.is_empty()
+            || source_utf8.len() > 4096
+            || normalized_utf8.len() > 4096
+            || transport_hash.len() != 64
+            || !transport_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_source",
+                reason: "inline source exceeds its bound or lacks a transport hash",
+            });
+        }
+        let valid = match kind {
+            RecoveredSourceKind::AdmittedInline => {
+                redaction_reason.is_none()
+                    && redacted_classes.is_empty()
+                    && normalized_utf8 == source_utf8
+                    && format!("{:x}", Sha256::digest(source_utf8.as_bytes())) == transport_hash
+            }
+            RecoveredSourceKind::Redacted => {
+                let ordered = redacted_classes.windows(2).all(|pair| pair[0] < pair[1]);
+                let classes_valid = !redacted_classes.is_empty()
+                    && redacted_classes.len() <= 16
+                    && ordered
+                    && redacted_classes.iter().all(|class| {
+                        !class.is_empty()
+                            && class.len() <= 1024
+                            && !class.chars().any(char::is_control)
+                    });
+                let reason_valid = matches!(
+                    redaction_reason.as_deref(),
+                    Some("FORBIDDEN_CONTENT_DETECTED" | "DECLARED_OUT_OF_SCOPE")
+                );
+                let classes = redacted_classes.join(",");
+                classes_valid
+                    && reason_valid
+                    && source_utf8
+                        == format!(
+                            "redacted/bridge-event-v1:hash={transport_hash}:classes={classes}"
+                        )
+                    && normalized_utf8
+                        == format!(
+                            "redacted/bridge-event-normalized-v1:hash={transport_hash}:classes={classes}:reason={}",
+                            redaction_reason.as_deref().unwrap_or_default()
+                        )
+            }
+        };
+        if !valid {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_source",
+                reason: "inline source does not match its retained owner representation",
+            });
+        }
+        Ok(Self {
+            kind,
+            source_utf8,
+            normalized_utf8,
+            transport_hash,
+            redaction_reason,
+            redacted_classes,
+        })
+    }
+
+    pub fn kind(&self) -> RecoveredSourceKind {
+        self.kind
+    }
+
+    pub fn source_utf8(&self) -> &str {
+        &self.source_utf8
+    }
+
+    pub fn normalized_utf8(&self) -> &str {
+        &self.normalized_utf8
+    }
+}
+
 /// One checked retained-event receipt fact restored from an owner page.
 ///
-/// Digest-only by construction: owner pages carry metadata, not the
-/// original event payload, so this fact never fabricates an
-/// [`EventEnvelope`]. Raw/redacted/normalized linkage is re-established
-/// only through the retained source/artifact owner; the bridge keeps the
-/// digest, producer, and phase legs separate instead of merging them into a
-/// synthetic envelope.
+/// The public projection is digest-only. An optional checked small source is
+/// retained for the recovery adapter but omitted from serialized projection
+/// pages; metadata never fabricates an [`EventEnvelope`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveredEventFact {
     stream_id: String,
@@ -2143,6 +2267,10 @@ pub struct RecoveredEventFact {
     producer_id: String,
     producer_generation: u64,
     staging_connection: String,
+    #[serde(skip_serializing)]
+    source_projection: Option<RecoveredSourceProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_unavailable: Option<RecoveredSourceUnavailable>,
 }
 
 impl RecoveredEventFact {
@@ -2195,7 +2323,91 @@ impl RecoveredEventFact {
             producer_id,
             producer_generation,
             staging_connection,
+            source_projection: None,
+            source_unavailable: None,
         })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn with_source_projection(
+        mut self,
+        projection: RecoveredSourceProjection,
+    ) -> Result<Self, BridgeError> {
+        if self.source_unavailable.is_some() {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.source_projection",
+                reason: "inline source conflicts with source unavailability",
+            });
+        }
+        if projection.transport_hash != self.envelope_digest {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.source_projection",
+                reason: "source projection hash differs from the event identity digest",
+            });
+        }
+        if projection.kind == RecoveredSourceKind::AdmittedInline {
+            let envelope: EventEnvelope =
+                serde_json::from_str(&projection.source_utf8).map_err(|_| {
+                    BridgeError::InvalidContract {
+                        field: "recovered_event.source_projection",
+                        reason: "admitted inline source is not an event envelope",
+                    }
+                })?;
+            envelope
+                .validate()
+                .map_err(|_| BridgeError::InvalidContract {
+                    field: "recovered_event.source_projection",
+                    reason: "admitted inline event envelope is invalid",
+                })?;
+            envelope
+                .require_known_payload_type()
+                .map_err(|_| BridgeError::InvalidContract {
+                    field: "recovered_event.source_projection",
+                    reason: "admitted inline event payload is unknown",
+                })?;
+            if envelope.stream_id != self.stream_id
+                || envelope.event_id != self.event_id
+                || envelope.sequence != self.sequence
+                || envelope.producer_id != self.producer_id
+                || envelope.producer_generation.value() != self.producer_generation
+                || eliot_contracts::canonical_json_bytes(&envelope).map_err(|_| {
+                    BridgeError::InvalidContract {
+                        field: "recovered_event.source_projection",
+                        reason: "admitted inline event cannot be canonically encoded",
+                    }
+                })? != projection.source_utf8.as_bytes()
+            {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_event.source_projection",
+                    reason: "admitted inline source differs from the retained event identity",
+                });
+            }
+        }
+        self.source_projection = Some(projection);
+        Ok(self)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn with_source_unavailable(
+        mut self,
+        reason: RecoveredSourceUnavailable,
+    ) -> Result<Self, BridgeError> {
+        if self.source_projection.is_some() {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.source_unavailable",
+                reason: "source unavailability conflicts with an inline source",
+            });
+        }
+        self.source_unavailable = Some(reason);
+        Ok(self)
+    }
+
+    pub fn source_projection(&self) -> Option<&RecoveredSourceProjection> {
+        self.source_projection.as_ref()
+    }
+
+    pub fn source_unavailable(&self) -> Option<RecoveredSourceUnavailable> {
+        self.source_unavailable
     }
 
     pub fn stream_id(&self) -> &str {
