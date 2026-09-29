@@ -705,18 +705,21 @@ pub fn read_current_supervision_lease_read_only(
 /// bind this revision and `A13.7` requires a restore to compare the archive
 /// against it before any effect.
 ///
-/// `Ok(None)` has two distinct meanings, and only the consumer may decide what
-/// either one means for its own policy:
-/// * the database holds tables but not `ors_meta_v1`, which is
-///   `OrsSupervisionStatusError::MigrationRequired` instead — the rule
-///   `check_schema` already applies. An ORS with no tables at all is an
-///   uninitialised store, which is an answer rather than corruption, so it is
-///   `Ok(None)`;
-/// * `ors_meta_v1` is present and `purge_ledger_revision` is absent. The
-///   owner's own reader treats an absent counter as revision zero, but this
-///   reader returns `None` so absence stays distinguishable from `Some(0)`:
-///   zero is a real revision a committed store can hold, and `I5.27` forbids
-///   silently defaulting a field that carries ordering and effect meaning.
+/// An absent counter in an initialised store is the owner's own documented
+/// answer: revision zero. `PURGE_LEDGER_REVISION_KEY` (`store.rs:427`) states
+/// that an absent counter means no purge was ever applied, "which is revision
+/// zero and not an unknown answer", and
+/// `RedbRecoveryStore::purge_ledger_revision_in` returns `Ok(0)` for exactly
+/// that case. This reader reports the owner's answer rather than
+/// second-guessing it.
+///
+/// `Ok(None)` therefore means exactly one thing: the database holds no tables
+/// at all, so no ORS was ever initialised here. Such a store has issued no
+/// counter and no rule states what its value would have been. The consumer
+/// decides what that means for its own policy; this reader does not invent a
+/// revision for it. A database that holds tables but not `ors_meta_v1` is
+/// `OrsSupervisionStatusError::MigrationRequired`, the rule `check_schema`
+/// already applies.
 ///
 /// A counter that is not a decimal `u64` is
 /// `OrsSupervisionStatusError::Corrupt`, with the record type and reason the
@@ -747,7 +750,7 @@ pub fn read_purge_ledger_revision_read_only(
             .get(PURGE_LEDGER_REVISION_KEY)
             .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
         else {
-            return Ok(None);
+            return Ok(Some(0));
         };
         let raw = value.value();
         // A decimal u64 is at most 20 characters, so that length is the whole
