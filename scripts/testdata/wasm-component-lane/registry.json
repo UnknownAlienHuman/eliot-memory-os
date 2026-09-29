@@ -1,5 +1,5 @@
 {
-  "_provenance": "TEST FIXTURE ONLY - not authority. Field provenance per entry mirrors accepted sources: manifest/module_manifest paths and Cargo package name from crates/smart/eliot-context-compiler-wasm/Cargo.toml (owner #638); world/interface/package from bins/eliot-wasm-host/wit/typed/context-admission.wit (owner #756); domain operation admit from crates/modules/eliot-wasm-runtime TypedWorld::domain_func (owner #760); toolchain channel 1.97.1 and target wasm32-wasip2 from rust-toolchain.toml (owner #870); engine wasmtime-component 47.0.4 from component_contract.rs (owner #760); stage INVOCATION from ProofStage (SCREAMING_SNAKE_CASE, owner #760); depends_on/owned_paths from module.toml (owner #638); native revision 0.1.0 from eliot-context-admission Cargo.toml. The canonical shared registry remains integrator-owned; disagreement is a ContractChallenge.",
+  "_provenance": "TEST FIXTURE ONLY - not authority. Field provenance per entry mirrors accepted sources: manifest/module_manifest paths and Cargo package name from crates/smart/eliot-context-compiler-wasm/Cargo.toml (owner #638); world/interface/package from bins/eliot-wasm-host/wit/typed/context-admission.wit (owner #756); domain operation admit from crates/modules/eliot-wasm-runtime TypedWorld::domain_func (owner #760); toolchain channel 1.97.1 and target wasm32-wasip2 from rust-toolchain.toml (owner #870); engine wasmtime-component 47.0.4 from component_contract.rs (owner #760); stage INVOCATION from ProofStage (SCREAMING_SNAKE_CASE, owner #760); depends_on/owned_paths from module.toml (owner #638); native revision 0.1.0 from eliot-context-admission Cargo.toml. native_paths is the crate directory of the entry's own native_contract dependency (crates/smart/eliot-context-admission, per that crate's Cargo.toml); shared_paths are the accepted shared WIT/Host/runtime/toolchain roots this helper already mirrors read-only (owner #756/#758/#760/#870); unrelated_paths are repository prefixes that carry no Rust, WIT, or toolchain input to any registered component, so a change under one is an explicit no-work instead of an unknown path. The canonical shared registry remains integrator-owned; disagreement is a ContractChallenge.",
   "modules": {
     "eliot-context-compiler-wasm": {
       "manifest": "crates/smart/eliot-context-compiler-wasm/Cargo.toml",
@@ -26,7 +26,20 @@
       "profile": "dev",
       "features": [],
       "depends_on": ["eliot-contracts", "eliot-evidence", "eliot-context-contracts", "eliot-context-admission"],
-      "owned_paths": ["crates/smart/eliot-context-compiler-wasm/"]
+      "owned_paths": ["crates/smart/eliot-context-compiler-wasm/"],
+      "native_paths": ["crates/smart/eliot-context-admission/"],
+      "shared_paths": [
+        "bins/eliot-wasm-host/",
+        "crates/modules/eliot-wasm-runtime/",
+        "rust-toolchain.toml"
+      ]
     }
-  }
+  },
+  "unrelated_paths": [
+    ".github/",
+    "docs/",
+    "control-20260923-impl/",
+    "scripts/testdata/",
+    "workstreams/"
+  ]
 }

@@ -192,6 +192,16 @@ wasm_registry := "scripts/testdata/wasm-component-lane/registry.json"
 wasm_base_sha := "0000000000000000000000000000000000000000"
 wasm_head_sha := "0000000000000000000000000000000000000000"
 
+# Affected-set selection over the controller-supplied changed-path list. The
+# selector, the registry-derived graph and the receipt are the helper's; this
+# recipe forwards only the evidence and runs no command itself. `just
+# wasm-select <changed-paths.json>` is the documented local half of the one
+# selector that the manual workflow also calls, so an unrelated change is an
+# explicit no-work locally and in CI alike.
+#
+wasm-select changed:
+    python scripts/wasm_component_lane.py --select --registry {{quote(wasm_registry)}} --changed {{quote(changed)}}
+
 # Exact-manifest build of one registered component under the helper's isolated
 # lane target root for #870's wasm32-wasip2 target.
 #

@@ -89,6 +89,7 @@ FROZEN_STAGES = frozenset({
 
 MAX_REGISTRY_BYTES = 65_536
 MAX_MANIFEST_BYTES = 65_536
+MAX_CHANGESET_BYTES = 65_536
 MAX_TEXT_FIELD = 512
 MAX_MODULE_NAME = 64
 MAX_TOOL_OUTPUT = 65_536
@@ -169,12 +170,37 @@ def _bounded_text(value: object, field: str) -> str:
     return value
 
 
+def _check_prefix(value: object, field: str) -> str:
+    """One bounded repository-relative prefix; no absolute, traversal, or separator."""
+    if type(value) is not str or not value or len(value) > MAX_TEXT_FIELD:
+        raise LaneError(f"INVALID_{field}")
+    if value.startswith("/") or value.startswith("\\\\") or re.match(r"^[A-Za-z]:", value):
+        raise LaneError(f"INVALID_{field}")
+    if "\\" in value or ".." in value.split("/") or value in (".", ".."):
+        raise LaneError(f"INVALID_{field}")
+    if any(char in _SHELL_CHARS for char in value):
+        raise LaneError(f"INVALID_{field}")
+    return value.rstrip("/")
+
+
+def _prefix_list(value: object, field: str) -> tuple[str, ...]:
+    if type(value) is not list or len(value) > 64:
+        raise LaneError(f"INVALID_{field}")
+    prefixes = tuple(_check_prefix(item, field) for item in value)
+    if len(set(prefixes)) != len(prefixes):
+        raise LaneError(f"INVALID_{field}")
+    return prefixes
+
+
 def load_registry(path: Path) -> dict[str, dict[str, Any]]:
     """Load a caller-supplied registry JSON file with strict shape checks.
 
     The file itself is not authority; its provenance must be an accepted
     source (see module docstring). Unknown top-level keys are rejected so
-    a second semantic registry cannot hide beside the module map.
+    a second semantic module registry cannot hide beside the module map.
+    ``unrelated_paths`` is the only permitted non-module key: it declares
+    the repository prefixes that can never affect a registered component, so
+    an unrelated change is an explicit no-work rather than an unknown path.
     """
     try:
         if path.is_symlink():
@@ -190,7 +216,7 @@ def load_registry(path: Path) -> dict[str, dict[str, Any]]:
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
         raise LaneError("MALFORMED_REGISTRY") from None
-    if type(data) is not dict or set(data) - {"_provenance", "modules"}:
+    if type(data) is not dict or set(data) - {"_provenance", "modules", "unrelated_paths"}:
         raise LaneError("MALFORMED_REGISTRY")
     modules = data.get("modules")
     if type(modules) is not dict or not modules or len(modules) > 64:
@@ -199,7 +225,72 @@ def load_registry(path: Path) -> dict[str, dict[str, Any]]:
         check_module_name(key)
         if type(entry) is not dict:
             raise LaneError("MALFORMED_REGISTRY_ENTRY")
+        _prefix_list(entry.get("owned_paths", []), "OWNED_PATHS")
+        _prefix_list(entry.get("native_paths", []), "NATIVE_PATHS")
+        _prefix_list(entry.get("shared_paths", []), "SHARED_PATHS")
+        depends_on = entry.get("depends_on", [])
+        if type(depends_on) is not list or len(depends_on) > 64:
+            raise LaneError("INVALID_DEPENDS_ON")
+        for dependency in depends_on:
+            _bounded_text(dependency, "DEPENDENCY")
+    _prefix_list(data.get("unrelated_paths", []), "UNRELATED_PATHS")
     return modules  # type: ignore[return-value]
+
+
+def load_registry_graph(path: Path) -> tuple[dict[str, dict[str, Any]], tuple[str, ...]]:
+    """The module map plus the registry-declared unrelated prefixes.
+
+    Both come from ONE caller-supplied accepted registry file, so the local
+    and workflow selector share a single graph evidence source instead of a
+    second hand-maintained path list.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raise LaneError("REGISTRY_UNAVAILABLE") from None
+    if len(raw) > MAX_REGISTRY_BYTES:
+        raise LaneError("REGISTRY_SIZE_LIMIT")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise LaneError("MALFORMED_REGISTRY") from None
+    if type(data) is not dict:
+        raise LaneError("MALFORMED_REGISTRY")
+    modules = load_registry(path)
+    return modules, _prefix_list(data.get("unrelated_paths", []), "UNRELATED_PATHS")
+
+
+def registry_graph(
+    registry: Mapping[str, Mapping[str, Any]],
+    unrelated_prefixes: Sequence[str],
+) -> tuple[Sequence[str], Mapping[str, Sequence[str]], Sequence[str], Mapping[str, Sequence[str]]]:
+    """Derive the four selector inputs from the accepted registry alone.
+
+    Shared WIT/Host/runtime prefixes, native-contract owner prefixes, and the
+    dependent fan-out are read from the per-module ``shared_paths``,
+    ``native_paths`` and ``depends_on`` evidence, so a missing declaration
+    cannot silently narrow the affected set.
+    """
+    shared: list[str] = []
+    native: dict[str, list[str]] = {}
+    dependents: dict[str, list[str]] = {}
+    for module in sorted(registry):
+        entry = registry[module]
+        for prefix in entry.get("shared_paths", []):
+            if prefix not in shared:
+                shared.append(prefix)
+        for prefix in entry.get("native_paths", []):
+            contract = str(entry.get("native_contract"))
+            native.setdefault(contract, []).append(prefix)
+        for dependency in entry.get("depends_on", []):
+            if dependency in registry:
+                dependents.setdefault(str(dependency), []).append(module)
+    return (
+        tuple(shared),
+        {contract: tuple(paths) for contract, paths in sorted(native.items())},
+        tuple(unrelated_prefixes),
+        {module: tuple(sorted(set(fan))) for module, fan in sorted(dependents.items())},
+    )
 
 
 @dataclass(frozen=True)
@@ -875,17 +966,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.registry is None:
             raise LaneError("REGISTRY_REQUIRED")
-        registry = load_registry(args.registry)
+        registry, unrelated = load_registry_graph(args.registry)
         if args.select:
             if args.changed is None:
                 raise LaneError("CHANGESET_REQUIRED")
-            changed = _load_json_capped(args.changed, MAX_REGISTRY_BYTES, "CHANGESET")
+            changed = _load_json_capped(args.changed, MAX_CHANGESET_BYTES, "CHANGESET")
+            shared, native, unrelated_paths, dependents = registry_graph(registry, unrelated)
             selection = select_affected(
-                registry, changed, shared_prefixes=(), native_contract_prefixes={},
-                unrelated_prefixes=(), dependents={},
+                registry, changed, shared_prefixes=shared,
+                native_contract_prefixes=native,
+                unrelated_prefixes=unrelated_paths,
+                dependents=dependents,
             )
-            payload.update(status="PASS", selected=list(selection.selected),
-                           disposition=selection.disposition, reason=selection.reason)
+            payload.update(
+                status="PASS",
+                selected=list(selection.selected),
+                disposition=selection.disposition,
+                reason=selection.reason,
+            )
         else:
             module = args.build or args.test
             if not module:
