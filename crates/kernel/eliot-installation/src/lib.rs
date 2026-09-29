@@ -122,6 +122,7 @@ mod credential_provision;
 mod guard_containment;
 mod installation_registry;
 mod integration_discovery;
+mod managed_change_plan;
 mod package;
 mod package_planner;
 mod plan;
@@ -170,6 +171,10 @@ use approved_generation_registry::{
 pub(crate) use integration_discovery::WindowsPathIdentity;
 pub use integration_discovery::{
     IntegrationCategory, IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry,
+};
+
+pub use managed_change_plan::{
+    ManagedEnvironmentChangePlan, compile_managed_change_plan, revalidate_managed_change_plan,
 };
 
 pub use survey::{
