@@ -752,9 +752,7 @@ impl PromotionAuthority {
     pub fn validate(&self) -> Result<(), ProblemError> {
         match self {
             Self::DeterministicPolicy { rule_id } => text(rule_id, "promotion.rule_id"),
-            Self::AuthorizedHuman { decision_ref } => {
-                text(decision_ref, "promotion.decision_ref")
-            }
+            Self::AuthorizedHuman { decision_ref } => text(decision_ref, "promotion.decision_ref"),
         }
     }
 }

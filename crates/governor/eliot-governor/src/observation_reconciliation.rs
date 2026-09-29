@@ -1779,8 +1779,11 @@ fn check_incident_review_only(
         signal_severity: signal.severity,
     };
     let mut incident = Incident {
-        incident_id: IncidentId::new(format!("watchdog-gap-incident:{batch_id}:{}", entry.sequence))
-            .map_err(|error| owner_refused(error.to_string()))?,
+        incident_id: IncidentId::new(format!(
+            "watchdog-gap-incident:{batch_id}:{}",
+            entry.sequence
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?,
         title: format!(
             "watchdog coverage gap review candidate batch {batch_id} sequence {}",
             entry.sequence
