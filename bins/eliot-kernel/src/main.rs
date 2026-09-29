@@ -204,6 +204,14 @@ async fn main() {
     let mut kernel_config =
         KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();
     #[cfg(windows)]
+    {
+        let (profile, portable_dev_repository_root) = startup_binding
+            .supervision_profile_binding(_profile_root_leases.as_ref())
+            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
+        kernel_config = kernel_config
+            .with_supervision_installation_profile(profile, portable_dev_repository_root);
+    }
+    #[cfg(windows)]
     let pipe_name = startup_binding.control_pipe.clone();
     #[cfg(not(windows))]
     let pipe_name = std::env::var("ELIOT_KERNEL_CONTROL_PIPE").unwrap_or_default();
