@@ -602,6 +602,13 @@ impl ComponentEnginePort for WasmtimeComponentEngine {
     }
 
     fn invoke(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
+        // Item-26 provider half of the source guard: this legacy provider
+        // admits only the single `eliot:wasm/guest` world with zero manifest
+        // imports and the one `run` export. A typed #756 world fails the
+        // world gate here and executes only in `typed_execution.rs`, which
+        // refuses any component import of its own; neither lane inherits
+        // ambient capabilities, and both are served by this same single
+        // Wasmtime provider engine (no second neutral-runtime engine).
         let manifest = &invocation.manifest;
         let expected_export =
             eliot_wasm_runtime::CapabilityId::new(RUN_EXPORT).map_err(|_| PortError::Denied)?;
