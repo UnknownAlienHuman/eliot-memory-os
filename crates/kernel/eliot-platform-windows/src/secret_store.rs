@@ -62,6 +62,7 @@ pub(crate) const INSTALLER_CREDENTIAL_TARGET_PREFIX: &str = "eliot/installer-roo
 pub(crate) const STORE_CREDENTIAL_TARGET_PREFIX: &str = "eliot/store/v1/";
 const USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX: &str =
     "eliot/supervision-authority/user-mode/v1/";
+const CURRENT_USER_STORE_CREDENTIAL_TARGET_PREFIX: &str = "eliot/store/v1/";
 
 /// User-scoped DPAPI ciphertext.  The bytes carry no authority and are not
 /// serializable by this crate.
@@ -111,6 +112,247 @@ impl Drop for CredentialSecret {
     fn drop(&mut self) {
         self.0.fill(0);
     }
+}
+
+/// Read-only observation of a current-user Store credential target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentUserStoreCredentialObservation {
+    /// The exact target is absent under the current-user token.
+    Absent {
+        owner_sid: PlatformHandle,
+        target: PlatformHandle,
+    },
+    /// The exact target is present under the current-user token.
+    Present {
+        owner_sid: PlatformHandle,
+        target: PlatformHandle,
+    },
+}
+
+/// Public, secret-free receipt for one current-user Store credential write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentUserStoreCredentialWriteReceipt {
+    /// Exact current-user SID observed by the provider.
+    pub owner_sid: PlatformHandle,
+    /// Exact Store credential target written and read back.
+    pub target: PlatformHandle,
+}
+
+/// Result of one current-user Store credential write attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentUserStoreCredentialProvisionOutcome {
+    /// The provider wrote and exactly read back the secret.
+    Created(CurrentUserStoreCredentialWriteReceipt),
+    /// A mutation was attempted, but its terminal result is uncertain.
+    Unknown {
+        owner_sid: PlatformHandle,
+        target: PlatformHandle,
+    },
+}
+
+/// Current-token Credential Manager provider for UserMode and PortableDev Store access.
+///
+/// The provider admits only the exact Store target namespace, re-observes the
+/// current token SID for every operation, and serializes cooperating writes
+/// with a current-user-only mutex. Credential Manager does not offer atomic
+/// create-only writes; after a mutation is attempted, an error or failed exact
+/// readback returns `Unknown` for transaction-owned reconciliation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsCurrentUserStoreCredentialProvider;
+
+impl WindowsCurrentUserStoreCredentialProvider {
+    /// Creates a provider without reading or changing Credential Manager.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Returns the exact current process-token SID.
+    ///
+    /// # Errors
+    /// Returns an error when Windows cannot observe the current token.
+    pub fn principal_sid(&self) -> Result<PlatformHandle, crate::WindowsAdapterError> {
+        current_user_store_principal_sid()
+    }
+
+    /// Generates one 256-bit Store credential without persisting it.
+    ///
+    /// # Errors
+    /// Returns an error when the Windows CSPRNG is unavailable.
+    pub fn generate_secret(&self) -> Result<CredentialSecret, crate::WindowsAdapterError> {
+        let mut secret = vec![0_u8; 32];
+        crate::fill_system_random(&mut secret)?;
+        Ok(CredentialSecret(secret))
+    }
+
+    /// Observes the exact target after validating the live user SID.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid target, SID mismatch, provider failure,
+    /// or a malformed credential value.
+    pub fn inspect(
+        &self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+    ) -> Result<CurrentUserStoreCredentialObservation, crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        match credential_read_optional(target.as_str())? {
+            Some(secret) if !secret.expose().is_empty() => {
+                Ok(CurrentUserStoreCredentialObservation::Present {
+                    owner_sid: expected_owner_sid.clone(),
+                    target: target.clone(),
+                })
+            }
+            Some(_) => Err(crate::WindowsAdapterError::IdentityMismatch),
+            None => Ok(CurrentUserStoreCredentialObservation::Absent {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            }),
+        }
+    }
+
+    /// Writes a secret once after exact-target absence, returning `Unknown`
+    /// whenever mutation may have committed without positive readback.
+    ///
+    /// # Errors
+    /// Returns an error only when validation, interlock acquisition or the
+    /// pre-write absence check fails. Post-write uncertainty is an explicit
+    /// result and must not be retried blindly.
+    pub fn write_exact_if_absent(
+        &self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+        secret: CredentialSecret,
+    ) -> Result<CurrentUserStoreCredentialProvisionOutcome, crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        if secret.expose().is_empty() || secret.expose().len() > 2560 {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        let _interlock = HostCredentialInterlock::acquire_current_user(
+            target,
+            expected_owner_sid.as_str(),
+        )?;
+        if credential_read_optional(target.as_str())?.is_some() {
+            return Err(crate::WindowsAdapterError::AlreadyExists);
+        }
+        if credential_write(target.as_str(), secret.expose()).is_err() {
+            drop(secret);
+            return Ok(CurrentUserStoreCredentialProvisionOutcome::Unknown {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            });
+        }
+        let Ok(readback) = credential_read_optional(target.as_str()) else {
+            drop(secret);
+            return Ok(CurrentUserStoreCredentialProvisionOutcome::Unknown {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            });
+        };
+        if require_exact_credential_readback(
+            secret.expose(),
+            readback.as_ref().map(CredentialSecret::expose),
+        )
+        .is_err()
+        {
+            drop(readback);
+            drop(secret);
+            return Ok(CurrentUserStoreCredentialProvisionOutcome::Unknown {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            });
+        }
+        drop(readback);
+        drop(secret);
+        Ok(CurrentUserStoreCredentialProvisionOutcome::Created(
+            CurrentUserStoreCredentialWriteReceipt {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            },
+        ))
+    }
+
+    /// Reads the exact 256-bit credential under its bound current-user token.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bindings, absence, provider failure, or
+    /// malformed credential data.
+    pub fn read(
+        &self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+    ) -> Result<CredentialSecret, crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        let secret = credential_read(target.as_str())?;
+        Ok(secret)
+    }
+
+    /// Deletes only the value whose SHA-256 matches the retained receipt, then
+    /// proves that the exact target is absent.
+    ///
+    /// # Errors
+    /// Returns an error if the current SID, target, digest, provider readback,
+    /// deletion, or absence proof does not match.
+    pub fn delete_if_digest(
+        &self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+        expected_digest: &PlatformHandle,
+    ) -> Result<(), crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        if expected_digest.as_str().len() != 64
+            || !expected_digest
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(crate::WindowsAdapterError::InvalidInput);
+        }
+        let _interlock = HostCredentialInterlock::acquire_current_user(
+            target,
+            expected_owner_sid.as_str(),
+        )?;
+        let Some(secret) = credential_read_optional(target.as_str())? else {
+            return Ok(());
+        };
+        if format!("{:x}", Sha256::digest(secret.expose())) != expected_digest.as_str() {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        credential_delete(target.as_str())?;
+        if credential_read_optional(target.as_str())?.is_some() {
+            return Err(crate::WindowsAdapterError::Unavailable);
+        }
+        Ok(())
+    }
+
+    fn validate_binding(
+        &self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+    ) -> Result<(), crate::WindowsAdapterError> {
+        if !valid_current_user_store_credential_target(target.as_str()) {
+            return Err(crate::WindowsAdapterError::InvalidInput);
+        }
+        if current_user_store_principal_sid()? != *expected_owner_sid {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn current_user_store_principal_sid() -> Result<PlatformHandle, crate::WindowsAdapterError> {
+    let sid = crate::current_process_sid().map_err(|_| crate::WindowsAdapterError::Unavailable)?;
+    PlatformHandle::new(sid).map_err(|_| crate::WindowsAdapterError::InvalidInput)
+}
+
+fn valid_current_user_store_credential_target(target: &str) -> bool {
+    let Some(suffix) = target.strip_prefix(CURRENT_USER_STORE_CREDENTIAL_TARGET_PREFIX) else {
+        return false;
+    };
+    suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Readback of one installer-owned Credential Manager target.

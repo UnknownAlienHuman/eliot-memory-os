@@ -45,7 +45,7 @@ use super::{
     same_windows_root, sha256_handle, text,
 };
 
-/// Phase-A template for one UserMode current-user Task Scheduler registration.
+/// Phase-A template for one `UserMode` current-user Task Scheduler registration.
 ///
 /// This plan binds the transaction and immutable candidate. It intentionally
 /// carries no Phase-B authority digest: the final task request can be built
@@ -115,7 +115,7 @@ impl UserModeTaskRegistrationPlan {
             profile_installation_key: launch.profile_installation_key.clone(),
             profile_roots: Box::new(launch.profile_governed_roots.clone()),
             authority_descriptor_path: launch.authority_descriptor_path.clone(),
-            authority_generation: launch.authority_generation.clone(),
+            authority_generation: launch.authority_generation,
             host_executable_path: host_executable_path.clone(),
             host_executable_sha256: host_executable_sha256.clone(),
             working_directory,
@@ -209,7 +209,7 @@ impl UserModeTaskRegistrationPlan {
     }
 }
 
-/// Binds the immutable UserMode task template to a live, Host-materialized
+/// Binds the immutable `UserMode` task template to a live, Host-materialized
 /// Phase-B root request and the already-admitted Host argv tail.
 ///
 /// The pending Phase-A marker is rejected by `sha256_handle`; the returned
@@ -232,14 +232,15 @@ pub fn complete_user_mode_task_request(
         "user_mode_task.live_authority_digest",
     )?;
     if roots.profile != PlatformProfileSelection::UserMode
-        || roots.installation_id != plan.installation_id.as_str()
-        || roots.installation_key.as_deref() != self_handle_option(&plan.profile_installation_key)
-        || roots.component != plan.profile_component.as_str()
-        || roots.version != plan.profile_version.as_str()
-        || roots.generation != plan.candidate_generation.as_str()
+        || roots.installation_id.as_str() != plan.installation_id.as_str()
+        || roots.installation_key.as_deref()
+            != self_handle_option(plan.profile_installation_key.as_ref())
+        || roots.component.as_str() != plan.profile_component.as_str()
+        || roots.version.as_str() != plan.profile_version.as_str()
+        || roots.generation.as_str() != plan.candidate_generation.as_str()
         || roots.authority_generation != plan.authority_generation.value()
-        || roots.authority_descriptor_path
-            != PathBuf::from(plan.authority_descriptor_path.as_str())
+        || roots.authority_descriptor_path.as_path()
+            != Path::new(plan.authority_descriptor_path.as_str())
         || roots.repository_root.is_some()
         || bootstrap_arguments.is_empty()
         || !same_request_roots(plan, &roots)?
@@ -257,8 +258,8 @@ pub fn complete_user_mode_task_request(
     })
 }
 
-fn self_handle_option(value: &Option<PlatformHandle>) -> Option<&str> {
-    value.as_ref().map(PlatformHandle::as_str)
+fn self_handle_option(value: Option<&PlatformHandle>) -> Option<&str> {
+    value.map(PlatformHandle::as_str)
 }
 
 fn same_request_roots(

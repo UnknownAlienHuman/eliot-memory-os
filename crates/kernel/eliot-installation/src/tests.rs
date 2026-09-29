@@ -1523,6 +1523,7 @@ fn installer_plan_parts(
             expected_host_executable: test_handle(
                 r"C:\ProgramData\Eliot\packages\canary\eliot-host.exe",
             ),
+            expected_host_executable_sha256: test_handle("d".repeat(64)),
             target: test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
             provider: StoreCredentialProvider::WindowsCredentialManager,
             scope: StoreCredentialScope::LocalService,

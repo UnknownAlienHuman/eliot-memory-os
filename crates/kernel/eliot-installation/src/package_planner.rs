@@ -4,9 +4,12 @@ use std::path::{Path, PathBuf};
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     FileIdentity, PackageManifest, PackageSourceObservation, PackageStagingError,
+    PortableDevSupervisionAuthorityKeyRequest, PortableDevSupervisionAuthorityKeyTargetObservation,
     TrustedSourceBundle, UserModeSupervisionAuthorityCredentialRequest,
     UserModeSupervisionAuthorityCredentialTargetObservation, WindowsInstallerSecretProvider,
-    WindowsUserModeSupervisionAuthorityCredentialProvider, validate_package_relative_path,
+    WindowsPortableDevSupervisionAuthorityKeyProvider,
+    WindowsUserModeSupervisionAuthorityCredentialProvider, directory_identity_for_path,
+    validate_package_relative_path,
 };
 
 use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
@@ -21,7 +24,8 @@ use crate::{
     PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange, ProfileGovernanceReport,
     ProfileRootAnchors, ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
-    SupervisionAuthorityProvisionPlan, UserModeSupervisionAuthorityProvisionPlan,
+    PhaseBSupervisionAuthorityProvisionPlan, SupervisionAuthorityProvisionPlan,
+    UserModeSupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate, prove_no_service_profile_authority_dependency,
     provider_bootstrap_credential_target_for_store_target, select_profile_roots,
@@ -108,6 +112,33 @@ fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), Installation
 
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn current_user_store_credential_plan(
+    candidate: &CandidateManifest,
+    roots: &InstallationRoots,
+    authority_generation: ResourceGeneration,
+) -> Result<StoreCredentialProvisionPlan, InstallationError> {
+    let principal_sid = WindowsInstallerSecretProvider::new()
+        .principal_sid()
+        .map_err(|error| InstallationError::InvalidField {
+            field: "generation.current_user_store_principal_sid".to_owned(),
+            reason: error.to_string(),
+        })?;
+    let plan = StoreCredentialProvisionPlan {
+        host_state_root: roots.host_state_root.clone(),
+        expected_host_executable: candidate.host_executable_path.clone(),
+        expected_host_executable_sha256: candidate.runtime_launch.host_artifact_digest.clone(),
+        target: candidate.store_credential_target.clone(),
+        provider_bootstrap_target: None,
+        provider: StoreCredentialProvider::WindowsCredentialManager,
+        scope: StoreCredentialScope::CurrentUser,
+        expected_principal_sid: principal_sid,
+        generation: authority_generation,
+        config_digest: candidate.config_digest.clone(),
+    };
+    plan.validate()?;
+    Ok(plan)
 }
 
 fn protected_snapshot_digest_from_governor_bytes(
@@ -2087,6 +2118,7 @@ impl GenerationPackagePlanner {
             candidate_manifest_digest: candidate_manifest_digest.clone(),
             package_manifest_digest,
         });
+        let mut user_mode_authority_plan = None;
         if input.profile == InstallationProfile::UserMode {
             let effect_id = PlatformHandle::new(format!(
                 "effect:user-mode-supervision-authority:{}",
@@ -2128,34 +2160,71 @@ impl GenerationPackagePlanner {
                     return Err(InstallationError::IdentityConflict);
                 }
             };
+            let provision = UserModeSupervisionAuthorityProvisionPlan {
+                transaction_id: input.transaction_id.clone(),
+                effect_id: effect_id.clone(),
+                installation_id: input.installation_epoch.installation.clone(),
+                candidate_generation: input.generation.clone(),
+                authority_generation,
+                supervision_lease_scope_id: supervision_lease_scope_id.clone(),
+                signer_id: PlatformHandle::new(request.signer_id).map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.user_mode_authority_signer_id".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                key_id: PlatformHandle::new(request.key_id).map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.user_mode_authority_key_id".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                target,
+                owner_sid,
+                profile_roots: profile_resolution.roots.clone(),
+            };
             effects.push(InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
                 effect_id: effect_id.clone(),
-                provision: Box::new(UserModeSupervisionAuthorityProvisionPlan {
-                    transaction_id: input.transaction_id.clone(),
-                    effect_id,
-                    installation_id: input.installation_epoch.installation.clone(),
-                    candidate_generation: input.generation.clone(),
-                    authority_generation,
-                    supervision_lease_scope_id: supervision_lease_scope_id.clone(),
-                    signer_id: PlatformHandle::new(request.signer_id).map_err(|error| {
-                        InstallationError::InvalidField {
-                            field: "generation.user_mode_authority_signer_id".to_owned(),
-                            reason: error.to_string(),
-                        }
-                    })?,
-                    key_id: PlatformHandle::new(request.key_id).map_err(|error| {
-                        InstallationError::InvalidField {
-                            field: "generation.user_mode_authority_key_id".to_owned(),
-                            reason: error.to_string(),
-                        }
-                    })?,
-                    target,
-                    owner_sid,
-                    profile_roots: profile_resolution.roots.clone(),
-                }),
+                provision: Box::new(provision.clone()),
             });
+            user_mode_authority_plan = Some(provision);
         }
         if input.profile == InstallationProfile::UserMode {
+            let authority = user_mode_authority_plan.clone().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "UserMode Phase-B plan requires its typed supervision authority".to_owned(),
+                )
+            })?;
+            let provision = current_user_store_credential_plan(
+                &candidate,
+                &roots,
+                authority_generation,
+            )?;
+            effects.push(InstallerEffectPlan::ProvisionCurrentUserStoreCredential {
+                effect_id: PlatformHandle::new("effect:user-mode-store-credential").map_err(
+                    |error| InstallationError::InvalidField {
+                        field: "generation.current_user_store_effect_id".to_owned(),
+                        reason: error.to_string(),
+                    },
+                )?,
+                provision: provision.clone(),
+            });
+            effects.push(InstallerEffectPlan::MaterializePhaseB {
+                effect_id: PlatformHandle::new("effect:user-mode-phase-b-materialization")
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "generation.phase_b_effect_id".to_owned(),
+                        reason: error.to_string(),
+                    })?,
+                candidate_manifest_digest: candidate_manifest_digest.clone(),
+                static_template: phase_b_static_template.clone(),
+                host_state_root_digest: crate::phase_b_host_state_root_digest(&candidate)?,
+                watchdog_selector_digest: crate::phase_b_watchdog_selector_digest(&candidate)?,
+                supervision_authority: Box::new(
+                    PhaseBSupervisionAuthorityProvisionPlan::UserMode(Box::new(authority)),
+                ),
+                provision: Box::new(provision),
+                agent_bridge_source: input.agent_bridge_source.clone(),
+            });
             let effect_id = PlatformHandle::new(format!(
                 "effect:user-mode-task:{}",
                 input.generation
@@ -2172,6 +2241,108 @@ impl GenerationPackagePlanner {
             effects.push(InstallerEffectPlan::RegisterCurrentUserTask {
                 effect_id,
                 registration: Box::new(registration),
+            });
+        }
+        if input.profile == InstallationProfile::PortableDev {
+            let authority_effect_id = PlatformHandle::new(format!(
+                "effect:portable-dev-supervision-authority:{}",
+                input.generation
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.portable_dev_authority_effect_id".to_owned(),
+                reason: error.to_string(),
+            })?;
+            let repository_root = PathBuf::from(
+                candidate
+                    .runtime_launch
+                    .profile_governed_roots
+                    .runtime_state_roots
+                    .profile_anchor_root
+                    .as_str(),
+            );
+            let repository_root_identity = directory_identity_for_path(&repository_root).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "generation.portable_dev_repository_identity".to_owned(),
+                    reason: error.to_string(),
+                },
+            )?;
+            let key_suffix = hex_digest(
+                format!(
+                    "{}\0{}\0{}",
+                    input.installation_epoch.installation,
+                    input.generation,
+                    authority_generation.value()
+                )
+                .as_bytes(),
+            );
+            let request = PortableDevSupervisionAuthorityKeyRequest {
+                transaction_id: input.transaction_id.as_str().to_owned(),
+                effect_id: authority_effect_id.as_str().to_owned(),
+                installation_id: input.installation_epoch.installation.as_str().to_owned(),
+                candidate_generation: input.generation.as_str().to_owned(),
+                authority_generation,
+                supervision_lease_scope_id: supervision_lease_scope_id.as_str().to_owned(),
+                signer_id: "eliot-kernel".to_owned(),
+                key_id: format!("eliot-supervision-key:v1:{}", input.generation),
+                repository_root,
+                repository_root_identity,
+                relative_path: format!(
+                    "{}supervision-authority-{}.sealed",
+                    eliot_runtime_contracts::PORTABLE_DEV_SUPERVISION_KEY_PREFIX,
+                    &key_suffix[..32]
+                ),
+            };
+            match WindowsPortableDevSupervisionAuthorityKeyProvider::new()
+                .inspect_target(&request)
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "generation.portable_dev_authority_target".to_owned(),
+                    reason: error.to_string(),
+                })? {
+                PortableDevSupervisionAuthorityKeyTargetObservation::Absent {
+                    repository_root_identity: observed_identity,
+                    relative_path,
+                } if observed_identity == request.repository_root_identity
+                    && relative_path == request.relative_path => {}
+                PortableDevSupervisionAuthorityKeyTargetObservation::Absent { .. }
+                | PortableDevSupervisionAuthorityKeyTargetObservation::Present { .. } => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            effects.push(InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority {
+                effect_id: authority_effect_id,
+                provision: Box::new(request.clone()),
+            });
+            let provision = current_user_store_credential_plan(
+                &candidate,
+                &roots,
+                authority_generation,
+            )?;
+            effects.push(InstallerEffectPlan::ProvisionCurrentUserStoreCredential {
+                effect_id: PlatformHandle::new("effect:portable-dev-store-credential").map_err(
+                    |error| InstallationError::InvalidField {
+                        field: "generation.current_user_store_effect_id".to_owned(),
+                        reason: error.to_string(),
+                    },
+                )?,
+                provision: provision.clone(),
+            });
+            effects.push(InstallerEffectPlan::MaterializePhaseB {
+                effect_id: PlatformHandle::new("effect:portable-dev-phase-b-materialization")
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "generation.phase_b_effect_id".to_owned(),
+                        reason: error.to_string(),
+                    })?,
+                candidate_manifest_digest: candidate_manifest_digest.clone(),
+                static_template: phase_b_static_template.clone(),
+                host_state_root_digest: crate::phase_b_host_state_root_digest(&candidate)?,
+                watchdog_selector_digest: crate::phase_b_watchdog_selector_digest(&candidate)?,
+                supervision_authority: Box::new(
+                    PhaseBSupervisionAuthorityProvisionPlan::PortableDev(Box::new(
+                        request,
+                    )),
+                ),
+                provision: Box::new(provision),
+                agent_bridge_source: input.agent_bridge_source.clone(),
             });
         }
         if input.profile == InstallationProfile::SystemService {
@@ -2252,6 +2423,8 @@ impl GenerationPackagePlanner {
                 provision: StoreCredentialProvisionPlan {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
+                    expected_host_executable_sha256:
+                        candidate.runtime_launch.host_artifact_digest.clone(),
                     target: candidate.store_credential_target.clone(),
                     // The provider child's own bootstrap/admin reference, derived
                     // by the single installation owner in its own reserved
@@ -2295,7 +2468,9 @@ impl GenerationPackagePlanner {
                 static_template: phase_b_static_template.clone(),
                 host_state_root_digest: crate::phase_b_host_state_root_digest(&candidate)?,
                 watchdog_selector_digest: crate::phase_b_watchdog_selector_digest(&candidate)?,
-                supervision_authority: Box::new(SupervisionAuthorityProvisionPlan {
+                supervision_authority: Box::new(
+                    PhaseBSupervisionAuthorityProvisionPlan::SystemService(Box::new(
+                        SupervisionAuthorityProvisionPlan {
                     installation_id: input.installation_epoch.installation.clone(),
                     candidate_generation: input.generation.clone(),
                     authority_generation,
@@ -2340,10 +2515,14 @@ impl GenerationPackagePlanner {
                     })?,
                     service_sid_type:
                         eliot_runtime_contracts::SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
-                }),
+                        },
+                    )),
+                ),
                 provision: Box::new(StoreCredentialProvisionPlan {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
+                    expected_host_executable_sha256:
+                        candidate.runtime_launch.host_artifact_digest.clone(),
                     target: candidate.store_credential_target.clone(),
                     // Same owner, same single derivation rule as the other
                     // provisioning site; a second copy of the domain string
@@ -2390,13 +2569,24 @@ impl GenerationPackagePlanner {
                     | InstallerEffectPlan::StartService { service_name, .. } => {
                         service_name.clone()
                     }
-                    InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
+                    InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
+                    | InstallerEffectPlan::ProvisionCurrentUserStoreCredential {
+                        provision, ..
+                    } => {
                         provision.target.clone()
                     }
                     InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
                         provision,
                         ..
                     } => provision.target.clone(),
+                    InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority {
+                        provision, ..
+                    } => PlatformHandle::new(provision.relative_path.clone()).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "generation.portable_dev_authority_target".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?,
                     InstallerEffectPlan::RegisterCurrentUserTask { registration, .. } => {
                         registration.effect_id.clone()
                     }
@@ -2870,6 +3060,9 @@ impl SealedPackagePlanner {
                     e,
                     InstallerEffectPlan::RegisterService { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                        | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                        | InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
                 )
             })
             .unwrap_or(installer_effects_without_package.len());

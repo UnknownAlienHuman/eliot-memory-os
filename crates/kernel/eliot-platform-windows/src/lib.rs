@@ -270,8 +270,11 @@ pub use scm_entry::{
 };
 use secret_store::valid_credential_key;
 pub use secret_store::{
-    CredentialSecret, HostCredentialMutationCapability, InstallerSecretCreateDisposition,
-    InstallerSecretObservation, ProtectedSecret, WindowsInstallerSecretProvider,
+    CredentialSecret, CurrentUserStoreCredentialObservation,
+    CurrentUserStoreCredentialProvisionOutcome, CurrentUserStoreCredentialWriteReceipt,
+    HostCredentialMutationCapability, InstallerSecretCreateDisposition,
+    InstallerSecretObservation, ProtectedSecret, WindowsCurrentUserStoreCredentialProvider,
+    WindowsInstallerSecretProvider,
 };
 pub use service_registration::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
