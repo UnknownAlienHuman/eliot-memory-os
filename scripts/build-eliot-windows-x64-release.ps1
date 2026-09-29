@@ -200,6 +200,427 @@ function Invoke-CapturedNativeProcess([string]$FilePath, [string[]]$ArgumentList
     }
 }
 
+# Issue #1923 (I18.44): every native child the release builder launches is
+# bound to a Job Object BEFORE its first instruction, so a build script,
+# proc-macro host, rustc, linker or provisioner cannot fork a descendant that
+# outlives the build. The build plane previously launched cargo directly with
+# `& $cargoInvokePath build ...`, so cancellation killed the direct child only
+# and no descendant removal was demonstrated anywhere in the release flow.
+# `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is what makes cancellation a tree
+# operation: closing the one owning handle terminates every live descendant,
+# not just the process that was asked to stop.
+#
+# The child is created SUSPENDED and assigned to the Job before ResumeThread,
+# which is the only ordering with no escape window: a child that is resumed
+# first could fork a grandchild before the assignment lands, and that
+# grandchild would never be owned by the Job. Assign-then-resume is the same
+# discipline the host runtime already uses for the trusted CLI launch
+# (scripts/invoke-eliot-windows-x64-production.ps1).
+#
+# A Job Object binds process lifetime. It does NOT sandbox the filesystem or
+# the network, and this function never claims that it does: I18.44 forbids
+# reading a Job Object check as a filesystem/network sandbox proof. That
+# boundary stays with the recorded VM/lab runner.
+function Initialize-ReleaseLaunchJobApi {
+    if ('Eliot.ReleaseLaunchJob' -as [type]) { return }
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Eliot
+{
+    public sealed class ReleaseLaunchChild
+    {
+        public IntPtr Process { get; set; }
+        public IntPtr Thread { get; set; }
+        public UInt32 ProcessId { get; set; }
+    }
+
+    public static class ReleaseLaunchJob
+    {
+        private const UInt32 CREATE_SUSPENDED = 0x00000004;
+        private const UInt32 CREATE_NO_WINDOW = 0x08000000;
+        private const UInt32 WAIT_OBJECT_0 = 0x00000000;
+        private const UInt32 WAIT_TIMEOUT = 0x00000102;
+        private const UInt32 RESUME_FAILED = 0xffffffff;
+        private const UInt32 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        private const int JobObjectExtendedLimitInformation = 9;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public UInt64 ReadOperationCount;
+            public UInt64 WriteOperationCount;
+            public UInt64 OtherOperationCount;
+            public UInt64 ReadTransferCount;
+            public UInt64 WriteTransferCount;
+            public UInt64 OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public Int64 PerProcessUserTimeLimit;
+            public Int64 PerJobUserTimeLimit;
+            public UInt32 LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public UInt32 ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public UInt32 PriorityClass;
+            public UInt32 SchedulingClass;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct STARTUPINFO
+        {
+            public UInt32 cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public UInt32 dwX;
+            public UInt32 dwY;
+            public UInt32 dwXSize;
+            public UInt32 dwYSize;
+            public UInt32 dwXCountChars;
+            public UInt32 dwYCountChars;
+            public UInt32 dwFillAttribute;
+            public UInt32 dwFlags;
+            public UInt16 wShowWindow;
+            public UInt16 cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public UInt32 dwProcessId;
+            public UInt32 dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcessW(
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            bool inheritHandles,
+            UInt32 creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref STARTUPINFO startupInfo,
+            out PROCESS_INFORMATION processInformation);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(
+            IntPtr job, int infoClass, IntPtr info, UInt32 length);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern UInt32 ResumeThread(IntPtr thread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern UInt32 WaitForSingleObject(IntPtr handle, UInt32 milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out UInt32 exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static IntPtr Create(string name)
+        {
+            IntPtr job = CreateJobObjectW(IntPtr.Zero, name);
+            if (job == IntPtr.Zero)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObjectW failed");
+            }
+            int infoSize = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            IntPtr info = Marshal.AllocHGlobal(infoSize);
+            try
+            {
+                for (int offset = 0; offset < infoSize; offset += 4)
+                {
+                    Marshal.WriteInt32(info, offset, 0);
+                }
+                Marshal.WriteInt32(info, 16, unchecked((int)JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE));
+                if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, info, (UInt32)infoSize))
+                {
+                    int code = Marshal.GetLastWin32Error();
+                    CloseHandle(job);
+                    throw new Win32Exception(code, "SetInformationJobObject(JobObjectExtendedLimitInformation) failed");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(info);
+            }
+            return job;
+        }
+
+        public static ReleaseLaunchChild LaunchSuspended(string executable, string commandLineArguments, string workingDirectory)
+        {
+            StringBuilder commandLine = new StringBuilder();
+            commandLine.Append('"').Append(executable).Append('"');
+            if (!String.IsNullOrEmpty(commandLineArguments))
+            {
+                commandLine.Append(' ').Append(commandLineArguments);
+            }
+            STARTUPINFO startupInfo = new STARTUPINFO();
+            startupInfo.cb = (UInt32)Marshal.SizeOf(typeof(STARTUPINFO));
+            PROCESS_INFORMATION processInformation;
+            if (!CreateProcessW(
+                    executable,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    false,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                    IntPtr.Zero,
+                    workingDirectory,
+                    ref startupInfo,
+                    out processInformation))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcessW failed");
+            }
+            return new ReleaseLaunchChild
+            {
+                Process = processInformation.hProcess,
+                Thread = processInformation.hThread,
+                ProcessId = processInformation.dwProcessId,
+            };
+        }
+
+        public static void Assign(IntPtr job, ReleaseLaunchChild child)
+        {
+            if (!AssignProcessToJobObject(job, child.Process))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
+            }
+        }
+
+        public static void Resume(ReleaseLaunchChild child)
+        {
+            if (ResumeThread(child.Thread) == RESUME_FAILED)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed");
+            }
+        }
+
+        public static Int32 WaitForExit(ReleaseLaunchChild child, Int32 milliseconds)
+        {
+            UInt32 wait = WaitForSingleObject(child.Process, unchecked((UInt32)milliseconds));
+            if (wait == WAIT_TIMEOUT)
+            {
+                return -1;
+            }
+            if (wait != WAIT_OBJECT_0)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject failed");
+            }
+            UInt32 exitCode;
+            if (!GetExitCodeProcess(child.Process, out exitCode))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetExitCodeProcess failed");
+            }
+            return unchecked((Int32)exitCode);
+        }
+
+        public static void CloseChild(ReleaseLaunchChild child)
+        {
+            if (child == null)
+            {
+                return;
+            }
+            if (child.Thread != IntPtr.Zero)
+            {
+                CloseHandle(child.Thread);
+                child.Thread = IntPtr.Zero;
+            }
+            if (child.Process != IntPtr.Zero)
+            {
+                CloseHandle(child.Process);
+                child.Process = IntPtr.Zero;
+            }
+        }
+
+        public static void Close(IntPtr job)
+        {
+            if (job != IntPtr.Zero)
+            {
+                CloseHandle(job);
+            }
+        }
+    }
+}
+'@
+}
+
+# Quote one argument for CreateProcessW's command line. This is the same
+# backslash/quote escaping the existing redirected runner already applies to its
+# own argv, so a Job-bound launch and a redirected launch parse identically.
+function ConvertTo-NativeArgument([string]$Value) {
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append([char]34)
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq [char]92) {
+            $backslashes++
+            continue
+        }
+        if ($character -eq [char]34) {
+            if ($backslashes -gt 0) {
+                [void]$builder.Append([char]92, (2 * $backslashes) + 1)
+            }
+            else {
+                [void]$builder.Append([char]92)
+            }
+            [void]$builder.Append([char]34)
+        }
+        else {
+            if ($backslashes -gt 0) {
+                [void]$builder.Append([char]92, $backslashes)
+            }
+            [void]$builder.Append($character)
+        }
+        $backslashes = 0
+    }
+    if ($backslashes -gt 0) {
+        [void]$builder.Append([char]92, 2 * $backslashes)
+    }
+    [void]$builder.Append([char]34)
+    $builder.ToString()
+}
+
+function New-ReleaseLaunchJob([string]$Purpose) {
+    Initialize-ReleaseLaunchJobApi
+    $safePurpose = [regex]::Replace($Purpose, '[^A-Za-z0-9._-]', '-')
+    $name = "Local\eliot-release-launch-$safePurpose-$([guid]::NewGuid().ToString('N'))"
+    return [pscustomobject]@{
+        name     = $name
+        purpose  = $safePurpose
+        handle   = [Eliot.ReleaseLaunchJob]::Create($name)
+    }
+}
+
+# Issue #1923: the Job-bound launch. The child is created suspended, bound to
+# the Job, and only then resumed, so no descendant can escape containment. The
+# caller's exit code is returned; the Job is closed on every path, and closing
+# that one owning handle is what terminates any descendant that outlived the
+# direct child.
+function Invoke-JobContainedNativeProcess([string]$FilePath, [string[]]$ArgumentList, [string]$WorkingDirectory, [string]$Purpose) {
+    Initialize-ReleaseLaunchJobApi
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        throw "job-contained launch requires an existing executable: $Purpose"
+    }
+    $job = New-ReleaseLaunchJob $Purpose
+    $child = $null
+    try {
+        $commandLine = (@($ArgumentList | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
+        $child = [Eliot.ReleaseLaunchJob]::LaunchSuspended(
+            [System.IO.Path]::GetFullPath($FilePath), $commandLine, $WorkingDirectory)
+        # Bind before resume: the only ordering with no escape window.
+        [Eliot.ReleaseLaunchJob]::Assign($job.handle, $child)
+        [Eliot.ReleaseLaunchJob]::Resume($child)
+        $exitCode = [Eliot.ReleaseLaunchJob]::WaitForExit($child, -1)
+        return [pscustomobject]@{
+            purpose    = $Purpose
+            job_name   = $job.name
+            process_id = $child.ProcessId
+            exit_code  = $exitCode
+        }
+    }
+    finally {
+        if ($null -ne $child) { [Eliot.ReleaseLaunchJob]::CloseChild($child) }
+        # Closing the owning handle is the cancellation: KILL_ON_JOB_CLOSE
+        # terminates every live descendant of the build.
+        [Eliot.ReleaseLaunchJob]::Close($job.handle)
+    }
+}
+
+# Issue #1923: descendant-TREE cancellation measurement against the same Job
+# Object owner the release build now uses. A direct-child kill cannot see a
+# grandchild, so the probe launches a child that forks a sleeping descendant and
+# then exits: the descendant is a separate process that would outlive the child
+# under any direct-child cancellation. The probe observes the descendant's PID
+# while the owning handle is still open, closes that handle, and re-checks the
+# SAME recorded PIDs. The expected set is the set of PIDs actually observed as
+# children of the one process this probe launched; it is never a second copy of
+# a caller-supplied list.
+#
+# The claim ceiling is process lifetime only. A Job Object is not a filesystem
+# or network sandbox, and this function never reports that it proved one.
+function Measure-ReleaseLaunchDescendantRemoval([string]$ShellPath, [string]$DescendantScript, [int]$ObservationSeconds) {
+    Initialize-ReleaseLaunchJobApi
+    if ([string]::IsNullOrWhiteSpace($ShellPath) -or -not (Test-Path -LiteralPath $ShellPath -PathType Leaf)) {
+        throw 'descendant-removal probe requires an existing shell executable'
+    }
+    $job = New-ReleaseLaunchJob 'descendant-removal-probe'
+    $child = $null
+    $observed = @()
+    $exitCode = 0
+    try {
+        $commandLine = (ConvertTo-NativeArgument '-NoProfile') + ' ' +
+            (ConvertTo-NativeArgument '-Command') + ' ' + (ConvertTo-NativeArgument $DescendantScript)
+        $child = [Eliot.ReleaseLaunchJob]::LaunchSuspended(
+            [System.IO.Path]::GetFullPath($ShellPath), $commandLine, $env:TEMP)
+        [Eliot.ReleaseLaunchJob]::Assign($job.handle, $child)
+        [Eliot.ReleaseLaunchJob]::Resume($child)
+        $childProcessId = [int]$child.ProcessId
+        $exitCode = [Eliot.ReleaseLaunchJob]::WaitForExit($child, 120000)
+        if ($exitCode -lt 0) { throw 'descendant-removal probe child did not exit before its deadline' }
+        $deadline = (Get-Date).AddSeconds($ObservationSeconds)
+        while ((Get-Date) -lt $deadline) {
+            $rows = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$childProcessId" -ErrorAction SilentlyContinue)
+            if ($rows.Count -ne 0) {
+                $observed = @($rows | ForEach-Object { [int]$_.ProcessId })
+                break
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($observed.Count -eq 0) {
+            throw 'descendant-removal probe forked no descendant; the measurement would prove nothing'
+        }
+    }
+    finally {
+        if ($null -ne $child) { [Eliot.ReleaseLaunchJob]::CloseChild($child) }
+        # The cancellation under measurement: closing the one owning handle is
+        # the whole-tree operation.
+        [Eliot.ReleaseLaunchJob]::Close($job.handle)
+    }
+    Start-Sleep -Milliseconds 2000
+    $surviving = @($observed | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    [pscustomobject]@{
+        owner                      = 'scripts/build-eliot-windows-x64-release.ps1 Measure-ReleaseLaunchDescendantRemoval'
+        job_name                   = $job.name
+        direct_child_exit_code     = $exitCode
+        observed_descendant_count  = @($observed).Count
+        survivors_after_cancel     = @($surviving).Count
+        claim_ceiling              = 'process lifetime only; a Job Object is not a filesystem or network sandbox'
+    }
+}
+
 function Get-RuntimeArtifactDefinitions {
     return @($runtimeArtifactDefinitions | ForEach-Object {
             [pscustomobject]@{
@@ -3935,22 +4356,41 @@ try {
             throw 'Operator publish receipt tool identity differs from the builder-invoked dotnet executable'
         }
     }
+    # Issue #1923: every release cargo build now runs as a Job-bound child
+    # (suspended -> assigned -> resumed) instead of a direct `& $cargoInvokePath`
+    # call. The argv template is unchanged, so the pins this file already proves
+    # (--frozen --locked --offline) still bind; what changes is that cancelling
+    # the build now terminates rustc, linker, build-script and proc-macro-host
+    # descendants instead of only the cargo process itself.
+    $releaseBuilds = [System.Collections.Generic.List[object]]::new()
     if ($legacyGovernorPresent) {
-        & $cargoInvokePath build --frozen --locked --offline --release -p eliot-app --bin eliot-governor
-        if ($LASTEXITCODE -ne 0) {
-            throw "cargo Governor release build failed with exit code $LASTEXITCODE"
-        }
+        $releaseBuilds.Add([ordered]@{ purpose = 'governor'; package = 'eliot-app'; binary = 'eliot-governor' }) | Out-Null
     }
     if ($frontDoorBridgePlan.provisioned) {
-        & $cargoInvokePath build --frozen --locked --offline --release -p eliot-agent-bridge --bin eliot-agent-bridge
-        if ($LASTEXITCODE -ne 0) {
-            throw "cargo Claude Code front-door release build failed with exit code $LASTEXITCODE"
-        }
+        $releaseBuilds.Add([ordered]@{ purpose = 'front-door-bridge'; package = 'eliot-agent-bridge'; binary = 'eliot-agent-bridge' }) | Out-Null
     }
     foreach ($artifact in $runtimeArtifactPlan) {
-        & $cargoInvokePath build --frozen --locked --offline --release -p $artifact.package --bin $artifact.binary
-        if ($LASTEXITCODE -ne 0) {
-            throw "cargo runtime release build failed for $($artifact.package)/$($artifact.binary) with exit code $LASTEXITCODE"
+        $releaseBuilds.Add([ordered]@{
+                purpose = "runtime-$($artifact.package)"
+                package = [string]$artifact.package
+                binary  = [string]$artifact.binary
+            }) | Out-Null
+    }
+    foreach ($releaseBuild in $releaseBuilds) {
+        $cargoBuildRun = Invoke-JobContainedNativeProcess $cargoInvokePath @(
+            'build', '--frozen', '--locked', '--offline', '--release',
+            '-p', [string]$releaseBuild.package, '--bin', [string]$releaseBuild.binary
+        ) $repo ([string]$releaseBuild.purpose)
+        $plan.launch_isolation = [ordered]@{
+            owner                  = 'scripts/build-eliot-windows-x64-release.ps1 Invoke-JobContainedNativeProcess'
+            purpose                = [string]$releaseBuild.package
+            job_name               = [string]$cargoBuildRun.job_name
+            cargo_exit_code        = [int]$cargoBuildRun.exit_code
+            descendant_containment = 'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; child created suspended, assigned to the Job, then resumed'
+            claim_ceiling          = 'process lifetime only; a Job Object is not a filesystem or network sandbox'
+        }
+        if ($cargoBuildRun.exit_code -ne 0) {
+            throw "cargo release build failed for $($releaseBuild.package)/$($releaseBuild.binary) with exit code $($cargoBuildRun.exit_code)"
         }
     }
     $postBuildIsolation = Assert-IsolatedSourceTree $repo $sourceCommit 'post-build'
