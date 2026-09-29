@@ -8308,8 +8308,8 @@ pub(crate) fn host_request_preview_response(
     envelope: &HostRequestEnvelope,
     lane: &'static str,
 ) -> Result<serde_json::Value, TransportError> {
-    let fence = serde_json::to_value(&envelope.state_fence)
-        .map_err(|_| TransportError::SessionFenced)?;
+    let fence =
+        serde_json::to_value(&envelope.state_fence).map_err(|_| TransportError::SessionFenced)?;
     Ok(serde_json::json!({
         "status": "known",
         "value": {
