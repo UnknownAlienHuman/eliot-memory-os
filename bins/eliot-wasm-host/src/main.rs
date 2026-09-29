@@ -134,13 +134,26 @@ fn main() {
     match run_ordinary_request_loop() {
         // The ordinary result publisher already emitted the versioned
         // result-event stream on stdout; this branch emits no second
-        // summary object (#2787 step 2). Reader audit (2026-09-26): no
-        // process or Kernel reader of `eliot.wasm.host-result` or
-        // `ordinary-request-complete` exists anywhere in the repository —
-        // the only references were the crate's own re-export and this
-        // removed call — so no diagnostic moved to stderr and no consumer
-        // migration was required. `emit_receipt` stays for the separate
-        // experimental describe mode only.
+        // summary object (#2787 step 2). Reader audit, re-run 2026-09-29
+        // against this tree rather than inherited: a repository-wide search
+        // for `eliot.wasm.host-result`, `WASM_HOST_RESULT_WIRE_ID` and
+        // `ordinary-request-complete` still finds no process or Kernel
+        // reader of the ordinary result stream — the only references remain
+        // this crate's own definition, its re-export, and this removed
+        // call. The Kernel demand-starts this binary
+        // (`start_wasm_host_parent`) but records the child's streams as
+        // process evidence, not as decoded result events. So no diagnostic
+        // moved to stderr and no consumer migration was required here.
+        //
+        // The consequence is recorded rather than left implicit: the
+        // consumer-side rejection rule (mixed versions, duplicate terminal
+        // events, sequence gaps, contradictory identities) is exported from
+        // the same owner as the schema, as
+        // `eliot_wasm_host::validate_result_stream`, so the first external
+        // consumer of this wire family decodes with `WasmHostResultFrame`
+        // and rejects with the producer's own validator instead of
+        // re-deriving a weaker local check. `emit_receipt` stays for the
+        // separate experimental describe mode only.
         Ok(_) => {}
         Err(error) => {
             emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());

@@ -38,7 +38,7 @@ pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{
     AckPhase, AgentHostRequestFailure, DeliveryClass, EventDisposition, EventEnvelope,
 };
-use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
+use eliot_protocol::{EventIdentityKey, ReplayLedger};
 use eliot_skill::{
     ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt,
     LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
@@ -808,6 +808,11 @@ pub trait McpForwardingPort {
         event: &HostEventEnvelope,
     ) -> Result<(), ProviderFailure>;
 
+    /// Returns the event owner's retained phase and disposition for durable
+    /// events, including exact-identity replays. A local receipt or
+    /// `RECEIVED` observation is not a substitute for this readback. Recovery
+    /// paging and its continuation remain on `reconcile_external` and
+    /// `reconcile_continue`.
     fn forward_event(
         &mut self,
         binding: &AttachBinding,
@@ -5260,19 +5265,10 @@ impl AgentBridgeCore {
             .observe(event)
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?
         {
-            EventDisposition::Duplicate => {
-                let phase = self.acknowledged_phases.get(&replay_key).copied().ok_or(
-                    BridgeError::InvalidTransition(
-                        "duplicate replay has no prior explicit acknowledgement",
-                    ),
-                )?;
-                return Ok(EventForwardStatus::Durable {
-                    phase,
-                    disposition: EventDisposition::Duplicate,
-                    cursor_advanced: false,
-                });
-            }
-            EventDisposition::Accepted => {}
+            // Exact local replays still need the owner's current retained
+            // phase/disposition. `completed_probe` only guards identity and
+            // content consistency; it cannot answer the forwarding result.
+            EventDisposition::Duplicate | EventDisposition::Accepted => {}
             other => {
                 return Err(BridgeError::InvalidEventDisposition(other));
             }
@@ -5310,9 +5306,18 @@ impl AgentBridgeCore {
         if ack.disposition == EventDisposition::Conflict {
             return Err(BridgeError::InvalidEventDisposition(ack.disposition));
         }
-        if let Some(previous) = self.pending_deliveries.get(&replay_key) {
-            EventAckReceipt::validate_advance(previous.highest_phase, ack.phase)
-                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        let previous_phase = self
+            .pending_deliveries
+            .get(&replay_key)
+            .map(|previous| previous.highest_phase)
+            .or_else(|| self.acknowledged_phases.get(&replay_key).copied());
+        if let Some(previous_phase) = previous_phase
+            && !readback_phase_reaches(previous_phase, ack.phase)
+        {
+            return Err(BridgeError::ProviderContract(format!(
+                "owner acknowledgement regressed from {previous_phase:?} to {:?}",
+                ack.phase
+            )));
         }
 
         let phase_qualified = phase_reaches(required_phase, ack.phase);
@@ -5492,6 +5497,35 @@ const fn phase_reaches(required: AckPhase, observed: AckPhase) -> bool {
         AckPhase::Applied => matches!(observed, AckPhase::Applied),
         AckPhase::Rejected => matches!(observed, AckPhase::Rejected),
         AckPhase::Received | AckPhase::Unknown => false,
+    }
+}
+
+/// Two retained owner readbacks may skip phases that completed between reads.
+/// Terminal REJECTED and UNKNOWN remain terminal for this event identity.
+fn readback_phase_reaches(previous: AckPhase, observed: AckPhase) -> bool {
+    if previous == observed {
+        return true;
+    }
+    match previous {
+        AckPhase::Received => matches!(
+            observed,
+            AckPhase::Durable
+                | AckPhase::Normalized
+                | AckPhase::Applied
+                | AckPhase::Rejected
+                | AckPhase::Unknown
+        ),
+        AckPhase::Durable => matches!(
+            observed,
+            AckPhase::Normalized | AckPhase::Applied | AckPhase::Rejected | AckPhase::Unknown
+        ),
+        AckPhase::Normalized => {
+            matches!(
+                observed,
+                AckPhase::Applied | AckPhase::Rejected | AckPhase::Unknown
+            )
+        }
+        AckPhase::Applied | AckPhase::Rejected | AckPhase::Unknown => false,
     }
 }
 

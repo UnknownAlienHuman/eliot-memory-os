@@ -179,3 +179,47 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "MERGE_COMPILE_SOURCE_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
+
+  repair-r1-compile:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run scoped R1 compile discriminator on Windows') }}
+    runs-on: windows-latest
+    timeout-minutes: 55
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 15f023ceb884ff872a64d613e70331c2c3c8aafd
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run exact source-bound compile discriminator
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git switch -C main
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'r1-target'
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          $blob = '38c1eb9243a19351846b6e4a9cc1095a8316b0f0'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $data = Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$blob" -Headers $headers
+          $bytes = [Convert]::FromBase64String($data.content)
+          $script = Join-Path $env:RUNNER_TEMP 'r1-discriminator.py'
+          [IO.File]::WriteAllBytes($script, $bytes)
+          $actual = ((git hash-object $script) | Out-String).Trim()
+          if ($actual -ne $blob) { throw 'Diagnostic script blob identity mismatch' }
+          python $script
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: r1-skill-compile-15f023ce
+          path: ${{ runner.temp }}/r1-evidence/
+          if-no-files-found: error
+          retention-days: 5

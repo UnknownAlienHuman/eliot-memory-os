@@ -129,7 +129,7 @@ public sealed record UserAutomationNormalizedOccurrence(
 /// revision. A local projection alone is never normalization evidence.
 /// </para>
 /// </remarks>
-public sealed record UserAutomationScheduleReceipt(
+public sealed record UserAutomationScheduleProjection(
     string Encoding,
     string PinnedZoneDatabaseRelease,
     string Timezone,
@@ -137,12 +137,13 @@ public sealed record UserAutomationScheduleReceipt(
     int OccurrenceCount,
     long FirstInstantSeconds,
     long LastInstantSeconds,
-    IReadOnlyList<UserAutomationNormalizedOccurrence> Occurrences)
+    IReadOnlyList<UserAutomationNormalizedOccurrence> Occurrences,
+    UserAutomationScheduleNormalizationReceipt? NormalizationReceipt = null)
 {
     /// <summary>
-    /// The exact contract identity this receipt is bound to, as one line. It
-    /// names the contract version and pinned database release carried by the
-    /// parsed revision bytes, so the UI never needs a second copy of either.
+    /// The exact contract identity observed in these parsed schedule bytes, as
+    /// one line. It names their contract version and pinned database release;
+    /// it is inspection data and is not an owner-issued receipt.
     /// </summary>
     public string ContractIdentity() => string.Create(
         CultureInfo.InvariantCulture,
@@ -579,8 +580,8 @@ public static class UserAutomationScheduleMirror
     }
 
     /// <summary>
-    /// Port of <c>normalized_occurrences</c>: the cross-member and interval rules
-    /// over the whole set.
+    /// Bounded local inspection of the cross-member and interval rules over the
+    /// supplied occurrence set. This does not issue normalization evidence.
     /// </summary>
     /// <remarks>
     /// The interval bounds are parsed as INSTANTS and every member is compared
@@ -589,7 +590,7 @@ public static class UserAutomationScheduleMirror
     /// spell their instants so that a byte comparison puts them in the opposite
     /// order, and a mixed-offset set is exactly that case.
     /// </remarks>
-    public static UserAutomationScheduleReceipt ReadOwnerSchedule(
+    public static UserAutomationScheduleProjection ReadScheduleProjection(
         string timezone,
         string dstFold,
         string dstGap,
@@ -641,7 +642,7 @@ public static class UserAutomationScheduleMirror
         }
         RequireOneSourceDigest(occurrences);
 
-        return new UserAutomationScheduleReceipt(
+        return new UserAutomationScheduleProjection(
             Encoding: OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING,
             PinnedZoneDatabaseRelease: pinnedRevision
                 ?? OperatorScheduleContract.PINNED_ZONE_DATABASE_RELEASE,
@@ -715,6 +716,34 @@ public static class UserAutomationScheduleMirror
     }
 
     /// <summary>
+    /// Refuses a fresh create/edit submission until an owner-issued normalization
+    /// result or explicit migration action is bound to the immutable revision.
+    /// </summary>
+    /// <remarks>
+    /// The accepted owner operation schema validates caller-supplied V4
+    /// occurrence records, but exposes no callable normalization result,
+    /// migration action, or bound owner identity. Equality with a previous
+    /// revision and a caller-supplied source digest prove neither owner issuance
+    /// nor freshness. This gate belongs to fresh submission, not typed request
+    /// validation: retained requests must remain decodable for exact-identity
+    /// reconciliation. Reads and inspection remain available, and no immutable
+    /// revision is rewritten.
+    /// </remarks>
+    public static void RequireOwnerIssuedNormalizationForFreshSubmission(string action)
+    {
+        if (!string.Equals(action, "create", StringComparison.Ordinal)
+            && !string.Equals(action, "edit", StringComparison.Ordinal))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(action),
+                "Only fresh create/edit schedule submissions require this owner-issued normalization gate.");
+        }
+
+        throw new InvalidOperationException(
+            $"UserAutomation {action} not sent: the current owner contract has no callable normalization result or explicit migration action bound to this immutable schedule revision. Preserve the existing revision; obtain an owner-issued result bound to a new immutable revision before submission.");
+    }
+
+    /// <summary>
     /// Checks only the locally provable relation between source fields and
     /// source digests for an edit. It cannot establish fresh owner evidence.
     /// </summary>
@@ -724,9 +753,8 @@ public static class UserAutomationScheduleMirror
     /// and rejects changing the digest when both source fields stay the same.
     /// A zone, DST policy, interval or occurrence change may validly retain the
     /// same digest; whether that effect-relevant edit has fresh normalization
-    /// evidence cannot be decided here. The Operator cannot recompute the source
-    /// hash or prove provenance, so those freshness checks remain for the owner
-    /// and Kernel until a bound owner receipt exists.
+    /// evidence cannot be decided here. Fresh submissions are guarded separately
+    /// because the Operator cannot recompute the source hash or prove provenance.
     /// </remarks>
     public static void RequireFreshOwnerEvidenceForEdit(
         UserAutomationNormalizedSchedule previous,
@@ -734,12 +762,12 @@ public static class UserAutomationScheduleMirror
     {
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(next);
-        var previousReceipt = previous.NormalizationReceipt();
-        var nextReceipt = next.NormalizationReceipt();
+        var previousProjection = previous.ReadLocalProjection();
+        var nextProjection = next.ReadLocalProjection();
         var sameSource = string.Equals(previous.Expression, next.Expression, StringComparison.Ordinal)
             && string.Equals(previous.Calendar, next.Calendar, StringComparison.Ordinal);
         var sameDigest = string.Equals(
-            previousReceipt.SourceDigest, nextReceipt.SourceDigest, StringComparison.Ordinal);
+            previousProjection.SourceDigest, nextProjection.SourceDigest, StringComparison.Ordinal);
         if (!sameSource && sameDigest)
         {
             throw new UserAutomationScheduleContractException(
@@ -788,7 +816,7 @@ public static class UserAutomationScheduleMirror
         new(
             "LegacyScheduleEncoding",
             OwnerText("LegacyScheduleEncoding", "schedule.next_occurrences"),
-            "this occurrence uses a retired encoding; run the owner re-normalization/migration action and create a NEW revision; an immutable revision is never rewritten in place");
+            "this occurrence uses a retired encoding; this Operator has no owner re-normalization or migration route, so preserve the legacy revision and obtain a current owner-normalized result before creating a NEW revision; an immutable revision is never rewritten in place");
 
     private static bool IsCanonicalCivilWallClock(string value)
     {
@@ -944,7 +972,7 @@ public sealed record UserAutomationOutcome(
     string Detail,
     string? RefusalKind,
     string? RefusalText,
-    UserAutomationScheduleReceipt? Receipt);
+    UserAutomationScheduleProjection? ScheduleProjection);
 
 /// <summary>
 /// Identity retained by the Operator for the exact request whose response is
@@ -1144,7 +1172,7 @@ public static class UserAutomationOutcomeClassifier
                 DescribeUnverifiedScheduleProjection(projection),
                 RefusalKind: null,
                 RefusalText: null,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         return new UserAutomationOutcome(
@@ -1155,7 +1183,7 @@ public static class UserAutomationOutcomeClassifier
             + "so the Operator does not report the schedule as normalized",
             RefusalKind: null,
             RefusalText: null,
-            Receipt: null);
+            ScheduleProjection: null);
     }
 
     private static UserAutomationOutcome ReadKnownEnvelope(
@@ -1186,7 +1214,7 @@ public static class UserAutomationOutcomeClassifier
                 $"The owner reports that this operation was not retained: {notRetainedReason}. The Operator has no independent submitted/current State Fence comparand for this result, so this remains an owner-reported value and does not authorize a new submission.",
                 RefusalKind: null,
                 RefusalText: null,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         if (HasExactProperties(value, "accepted", "outcome", "reason")
@@ -1206,7 +1234,7 @@ public static class UserAutomationOutcomeClassifier
                 $"The owner reports a canonical commit ({settledReason}) and a separate ledger read remains owed ({ledgerReadReason}). The Operator has no independent submitted/current State Fence comparand for this result, so keep it under the same identity and reconcile before another submission.",
                 RefusalKind: null,
                 RefusalText: null,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         // A pre-Store runtime-channel rejection uses this separate closed
@@ -1228,7 +1256,7 @@ public static class UserAutomationOutcomeClassifier
                 + "then reconcile this same operation before any new submission.",
                 "runtime_owner_rejection",
                 reason,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         if (HasExactProperties(value, "accepted", "outcome")
@@ -1246,7 +1274,7 @@ public static class UserAutomationOutcomeClassifier
                 + "then reconcile this same operation before any new submission.",
                 "identity_conflict",
                 RefusalText: null,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         // Identity first (#2972). A stale cache, a substituted fixture, a
@@ -1296,7 +1324,7 @@ public static class UserAutomationOutcomeClassifier
                 + DescribeUnverifiedScheduleProjection(projection),
                 RefusalKind: null,
                 RefusalText: null,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         return new UserAutomationOutcome(
@@ -1308,7 +1336,7 @@ public static class UserAutomationOutcomeClassifier
             + "so the Operator does not report the schedule as normalized",
             RefusalKind: null,
             RefusalText: null,
-            Receipt: null);
+            ScheduleProjection: null);
     }
 
     private static UserAutomationOutcome ReadUnknownEnvelope(
@@ -1349,7 +1377,7 @@ public static class UserAutomationOutcomeClassifier
                 + "Action: restore owner availability, then reconcile this same operation before any new submission.",
                 RefusalKind: null,
                 RefusalText: null,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         if (HasExactProperties(value, "outcome")
@@ -1367,7 +1395,7 @@ public static class UserAutomationOutcomeClassifier
                 + "The Operator does not claim commit or noncommit.",
                 RefusalKind: null,
                 RefusalText: null,
-                Receipt: null);
+                ScheduleProjection: null);
         }
 
         if (HasUserAutomationTransitionProperties(value, context, answer)
@@ -1389,7 +1417,7 @@ public static class UserAutomationOutcomeClassifier
                     + DescribeScheduleProjection(projection),
                     RefusalKind: null,
                     RefusalText: null,
-                    Receipt: null);
+                    ScheduleProjection: null);
             }
 
             return UnverifiedOwnerAnswer(
@@ -2309,7 +2337,7 @@ public static class UserAutomationOutcomeClassifier
             + $"Recovery: {recoveryReason}",
             code,
             RefusalText: null,
-            Receipt: null);
+            ScheduleProjection: null);
     }
 
     /// <summary>
@@ -2459,9 +2487,9 @@ public static class UserAutomationOutcomeClassifier
         explanation = code switch
         {
             "unsupported_contract_version" =>
-                $"Action: re-normalize under {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} and submit a new immutable revision; do not rewrite the existing revision.",
+                $"Action: obtain an owner-normalized result under {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} and submit a new immutable revision; this Operator build exposes no re-normalization route, and the existing revision must not be rewritten.",
             "legacy_encoding" =>
-                "Action: run the owner re-normalization or migration path and submit a NEW immutable revision; the Operator never rewrites a revision in place.",
+                "Action: preserve the legacy immutable revision and obtain a current owner-normalized result before submitting a NEW revision; this Operator build exposes no migration route and never rewrites a revision in place.",
             "stale_normalization_revision" =>
                 "Action: obtain a fresh owner normalization for the current effect-relevant schedule fields, then submit a new immutable revision.",
             "invalid_or_moved_receipt" =>
@@ -2480,15 +2508,15 @@ public static class UserAutomationOutcomeClassifier
             $"{reason}. The operation remains unknown and must be reconciled under its same identity; the Operator does not claim commit or noncommit.",
             RefusalKind: null,
             RefusalText: null,
-            Receipt: null);
+            ScheduleProjection: null);
 
     /// <summary>
     /// Explains why the decoded occurrence fields are inspection data rather
     /// than owner-issued normalization evidence, then shows a bounded summary.
     /// </summary>
-    private static string DescribeUnverifiedScheduleProjection(UserAutomationScheduleReceipt projection) =>
+    private static string DescribeUnverifiedScheduleProjection(UserAutomationScheduleProjection projection) =>
         $"A decodable {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection is shown for inspection, "
-        + "but this response carries no owner-issued normalization receipt or provenance. Its freshness and relationship to "
+        + "but this response does not prove the owner-issued normalization receipt or provenance. Any embedded receipt identity is unverified. Its freshness and relationship to "
         + "effect-relevant schedule fields are unverified; the Operator does not report it as normalized.\n"
         + DescribeScheduleProjection(projection);
 
@@ -2496,9 +2524,22 @@ public static class UserAutomationOutcomeClassifier
     /// Summarizes the parsed projection's contract identity and occurrence
     /// details without asserting who normalized the underlying bytes.
     /// </summary>
-    private static string DescribeScheduleProjection(UserAutomationScheduleReceipt projection)
+    private static string DescribeScheduleProjection(UserAutomationScheduleProjection projection)
     {
         var builder = new StringBuilder(projection.ContractIdentity());
+        if (projection.NormalizationReceipt is { } normalizationReceipt)
+        {
+            builder.Append("\ncaller-supplied normalization_receipt (identity and provenance unverified): ")
+                .Append("receipt_id ").Append(normalizationReceipt.ReceiptId)
+                .Append("; authority ").Append(normalizationReceipt.NormalizerAuthority)
+                .Append("; source_digest ").Append(normalizationReceipt.SourceDigest)
+                .Append("; occurrences_digest ").Append(normalizationReceipt.OccurrencesDigest)
+                .Append("; zone_database_revision ").Append(normalizationReceipt.ZoneDatabaseRevision).Append('.');
+        }
+        else
+        {
+            builder.Append("\nNo normalization_receipt is available in this projection.");
+        }
         var shown = Math.Min(MaxDescribedOccurrences, projection.Occurrences.Count);
         for (var index = 0; index < shown; index++)
         {
@@ -2523,7 +2564,7 @@ public static class UserAutomationOutcomeClassifier
             + "report this schedule as normalized.",
             RefusalKind: null,
             RefusalText: null,
-            Receipt: null);
+            ScheduleProjection: null);
 
     /// <summary>
     /// Reports a revision refused locally, before transmission. The exact owner
@@ -2537,27 +2578,14 @@ public static class UserAutomationOutcomeClassifier
             refusal.Message,
             refusal.Kind,
             refusal.OwnerText,
-            Receipt: null);
-
-    /// <summary>
-    /// Describes the exact bytes one create/edit request is bound to, so the UI
-    /// can show the contract identity and digest it is about to submit rather
-    /// than asserting normalization on the strength of a local check.
-    /// </summary>
-    public static string DescribeSubmission(
-        string action,
-        UserAutomationScheduleReceipt receipt,
-        string operationIdentity) =>
-        string.Create(
-            CultureInfo.InvariantCulture,
-            $"UserAutomation {action} is bound to {receipt.ContractIdentity()} under one retry-stable operation identity {operationIdentity}. Shape and contract version are checked locally; admission and normalization remain the owner's decision, and the owner's own source-digest value is not verified here.");
+            ScheduleProjection: null);
 
     /// <summary>
     /// Decodes a versioned occurrence projection when the answer carries one.
     /// The answer is treated as untrusted data at a bounded depth; decoding it
     /// provides inspection details, not proof of normalization provenance.
     /// </summary>
-    private static UserAutomationScheduleReceipt? FindScheduleProjection(JsonElement answer)
+    private static UserAutomationScheduleProjection? FindScheduleProjection(JsonElement answer)
     {
         if (!TryGetObject(answer, "value", out var value)
             || !value.TryGetProperty("occurrences", out var projections)
@@ -2574,7 +2602,7 @@ public static class UserAutomationOutcomeClassifier
 
     private static bool TryReadScheduleProjection(
         JsonElement element,
-        out UserAutomationScheduleReceipt receipt)
+        out UserAutomationScheduleProjection receipt)
     {
         receipt = null!;
         if (!element.TryGetProperty("timezone", out var timezone)
@@ -2600,15 +2628,42 @@ public static class UserAutomationOutcomeClassifier
             && endElement.ValueKind == JsonValueKind.String
                 ? endElement.GetString()
                 : null;
+        UserAutomationScheduleNormalizationReceipt? normalizationReceipt = null;
+        if (element.TryGetProperty("normalization_receipt", out var normalizationElement))
+        {
+            if (normalizationElement.ValueKind != JsonValueKind.Object
+                || !TryGetString(normalizationElement, "receipt_id", out var receiptId)
+                || !TryGetString(normalizationElement, "normalizer_authority", out var normalizerAuthority)
+                || !TryGetString(normalizationElement, "source_digest", out var sourceDigest)
+                || !TryGetString(normalizationElement, "zone_database_revision", out var zoneDatabaseRevision)
+                || !TryGetString(normalizationElement, "occurrences_digest", out var occurrencesDigest))
+            {
+                return false;
+            }
+            normalizationReceipt = new UserAutomationScheduleNormalizationReceipt(
+                receiptId,
+                normalizerAuthority,
+                sourceDigest,
+                zoneDatabaseRevision,
+                occurrencesDigest);
+            try
+            {
+                normalizationReceipt.Validate();
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }
         try
         {
-            receipt = UserAutomationScheduleMirror.ReadOwnerSchedule(
+            receipt = UserAutomationScheduleMirror.ReadScheduleProjection(
                 timezone.GetString()!,
                 fold.GetString()!,
                 gap.GetString()!,
                 startAt.GetString()!,
                 endAt,
-                keys);
+                keys) with { NormalizationReceipt = normalizationReceipt };
             return true;
         }
         catch (UserAutomationScheduleContractException)
@@ -2618,5 +2673,17 @@ public static class UserAutomationOutcomeClassifier
             // and it is never reported as a normalized schedule.
             return false;
         }
+    }
+
+    private static bool TryGetString(JsonElement element, string name, out string value)
+    {
+        value = string.Empty;
+        if (!element.TryGetProperty(name, out var property)
+            || property.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+        value = property.GetString()!;
+        return true;
     }
 }

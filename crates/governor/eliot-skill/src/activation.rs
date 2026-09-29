@@ -1765,9 +1765,10 @@ mod tests {
         assert!(!summary.retrieved, "never retrieved");
         assert!(!summary.delivered, "never delivered");
         assert!(!summary.activated, "never activated");
-        assert!(
-            !summary.useful,
-            "packet inclusion without activation is never useful"
+        assert_eq!(
+            summary.useful,
+            SkillUsefulness::Unknown,
+            "unobserved activation has no owner-qualified usefulness finding"
         );
         assert_eq!(
             summary.adhered,
