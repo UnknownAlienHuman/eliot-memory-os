@@ -3970,7 +3970,7 @@ impl KernelComposition {
                 Ok(Self::user_automation_horizon_publication_response(
                     "wake_horizon_published",
                     request.as_ref(),
-                    answer,
+                    &answer,
                 ))
             }
             UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
@@ -3984,7 +3984,7 @@ impl KernelComposition {
                 Ok(Self::user_automation_horizon_publication_response(
                     "wake_horizon_publication_readback",
                     request.as_ref(),
-                    answer,
+                    &answer,
                 ))
             }
         }
@@ -4006,11 +4006,16 @@ impl KernelComposition {
     /// replay handle are returned as the recovery directive, which forces
     /// `status: "unknown"`; only an answer that acknowledged the whole requested
     /// set settles the route.
+    ///
+    /// The answer is borrowed rather than taken by value: it is read twice — once
+    /// to validate it against the request and once to project it — and
+    /// `serde_json::json!` borrows every interpolated expression, so a by-value
+    /// parameter would be copied in and never consumed.
     #[cfg(windows)]
     fn user_automation_horizon_publication_response(
         outcome: &str,
         request: &UserAutomationWakeHorizonPublication,
-        answer: UserAutomationWakePublication,
+        answer: &UserAutomationWakePublication,
     ) -> serde_json::Value {
         if let Err(error) = answer.validate_for(request) {
             return Self::user_automation_runtime_error_response(
@@ -4027,10 +4032,10 @@ impl KernelComposition {
                 "reason": "the schedule owner did not acknowledge every requested occurrence, so \
                            the exact remaining set is retained and must be replayed under its \
                            handle",
-                "automation_id": answer.automation_id.clone(),
-                "automation_revision": answer.automation_revision.clone(),
-                "remaining_occurrence_ids": answer.remaining_occurrence_ids.clone(),
-                "retry_handle": answer.retry_handle.clone(),
+                "automation_id": &answer.automation_id,
+                "automation_revision": &answer.automation_revision,
+                "remaining_occurrence_ids": &answer.remaining_occurrence_ids,
+                "retry_handle": &answer.retry_handle,
             }))
         };
         serde_json::json!({
@@ -5128,14 +5133,13 @@ impl KernelComposition {
         // as this contour did, reached the Durable Job owner with no
         // `UserAutomationDurableJobMaterial` at all and so could never reach
         // `HostDurableJobOwner::dreamer_job`.
-        let runtime = UserAutomationOperatorRuntime::new(client);
-        let execution = match runtime
-            .admit_occurrence(Self::user_automation_due_wake_admission(
-                &request,
-                &resolution,
-                &readback,
-            ))
-            .await
+        let execution = match Self::user_automation_due_wake_join(
+            client,
+            &request,
+            &resolution,
+            &readback,
+        )
+        .await
         {
             Ok(execution) => execution,
             // Item 6, terminal leg. A refusal the Durable Job owner answered
@@ -5261,6 +5265,46 @@ impl KernelComposition {
             wake_intent: readback.intent.clone(),
             durable_job: request.durable_job.clone(),
         }
+    }
+
+    /// Submits one due occurrence to the runtime execution join and returns the
+    /// owner's answer (issue #2806 items 5 and 6).
+    ///
+    /// The admission is assembled and the join is awaited entirely inside this
+    /// contour, so `user_automation_due_wake_operation` never holds the join's
+    /// own state across its awaits. The join resolves the complete owner-issued
+    /// `UserAutomationDurableJobMaterial` through
+    /// `UserAutomationDurableJobMaterial::from_admitted_occurrence` whenever the
+    /// ingress carries none, and that compiler holds a whole canonical-JSON K0
+    /// `JobSubmission` and its digest inputs on the stack. Awaiting it inline
+    /// made the calling contour's future exceed the bounded size even though the
+    /// caller only ever reads the returned reference, so the join's future is
+    /// polled through one box: the transient allocation is released as soon as
+    /// the answer is back, and the caller's future stays bounded.
+    ///
+    /// The transport is already authenticated and bound to the current State
+    /// Fence by the caller, so this adds no channel, no retry and no second
+    /// admission: it is exactly the `UserAutomationOperatorRuntime` over that one
+    /// channel.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_join(
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        readback: &UserAutomationWakeReadback,
+    ) -> Result<
+        eliot_kernel_core::user_automation::AutomationExecutionReference,
+        UserAutomationRuntimeError,
+    > {
+        let runtime = UserAutomationOperatorRuntime::new(client);
+        Box::pin(runtime.admit_occurrence(Self::user_automation_due_wake_admission(
+            request,
+            resolution,
+            readback,
+        )))
+        .await
     }
 
     /// Advances the recurring horizon after an owner-acknowledged terminal
