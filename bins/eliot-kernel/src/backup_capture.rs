@@ -76,8 +76,9 @@ use eliot_store_api::WriteReceipt;
 
 use super::backup_capture_ports::{
     CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
-    PublicationPort, PublishedArchive, SnapshotRelation, owner_fence_dispositions,
-    owner_residency_key_digest, owner_suspended_recovery_refs, require_capture_admitted,
+    MEMBER_DOMAIN_PROJECTION, PublicationPort, PublishedArchive, SnapshotRelation,
+    owner_fence_dispositions, owner_residency_key_digest, owner_suspended_recovery_refs,
+    require_capture_admitted, validate_disposition_identities,
 };
 
 /// Owner order for per-owner budget accounting: canonical, blob, purge, ORS,
@@ -841,6 +842,7 @@ impl KernelBackupCapture {
             bundle.host_audit.as_ref(),
         )?;
         member_dispositions.extend(owner_declared);
+        validate_disposition_identities(&member_dispositions)?;
         let state = if class == BackupClass::FullRecovery {
             CaptureState::Complete
         } else {
@@ -1568,7 +1570,7 @@ fn member_disposition_list(
     }
     for projection in projections {
         dispositions.push((
-            format!("projection:{}", projection.record_id),
+            format!("{MEMBER_DOMAIN_PROJECTION}{}", projection.record_id),
             "captured".to_owned(),
         ));
     }
@@ -1716,16 +1718,7 @@ fn check_denominator(
             )));
         }
     }
-    let mut seen = Vec::with_capacity(dispositions.len());
-    for entry in &dispositions {
-        if seen.contains(entry) {
-            return Err(KernelCaptureError::DenominatorIncomplete(format!(
-                "member {} has a duplicate disposition",
-                entry.0
-            )));
-        }
-        seen.push(entry.clone());
-    }
+    validate_disposition_identities(&dispositions)?;
     Ok(dispositions)
 }
 
