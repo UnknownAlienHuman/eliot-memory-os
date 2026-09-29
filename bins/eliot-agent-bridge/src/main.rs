@@ -1255,10 +1255,17 @@ fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response
         _ => None,
     };
     let Some(view) = view else {
+        // I7.24 complete-evidence join: more bytes than the hot bound with no
+        // retained handle is a TRUNCATED delivery by measurement (content
+        // length observed here), so the existing typed gate refuses the frame
+        // instead of emitting unverifiable inline bytes.
+        let gate = BridgeError::IncompleteDelivery {
+            delivery: DeliveryStatus::Truncated,
+        };
         *response = Response::Error {
             code: "TOOL_RESULT_NOT_RETAINED",
             detail: format!(
-                "large candidate/projection result ({} bytes) could not be retained for explicit resource expansion",
+                "large candidate/projection result ({} bytes) could not be retained for explicit resource expansion; {gate}",
                 content.len()
             ),
         };
@@ -3560,12 +3567,18 @@ fn render_mcp_invocation(
                     content.len() > eliot_agent_bridge::MAX_PREVIEW_BYTES
                 })
             {
-                return render_error(
-                    Some(id),
-                    WIRE_INTERNAL_ERROR,
-                    "large tool result could not be retained for resource expansion",
-                    Value::Null,
+                // I7.24 complete-evidence join, mirroring the private Invoke
+                // door: bytes beyond the hot bound with no retained handle are
+                // a TRUNCATED delivery by measurement, so the existing typed
+                // gate refuses the frame instead of emitting unverifiable
+                // inline bytes.
+                let gate = BridgeError::IncompleteDelivery {
+                    delivery: DeliveryStatus::Truncated,
+                };
+                let detail = format!(
+                    "large tool result could not be retained for resource expansion; {gate}"
                 );
+                return render_error(Some(id), WIRE_INTERNAL_ERROR, &detail, Value::Null);
             }
             match render_responded_result(operation_handle, response, evidence.as_ref()) {
                 Ok(result) => render_result(id, result),
