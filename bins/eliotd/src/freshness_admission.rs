@@ -809,7 +809,7 @@ mod tests {
     fn committed_candidate() -> CommittedCandidate {
         CommittedCandidate {
             handle: "candidate-1".to_owned(),
-            durability_receipt: "receipt-commit-1".to_owned(),
+            durability_receipt: "commit-atomic-1".to_owned(),
             projection_kind: "cue-index".to_owned(),
             projection_definition_digest: DEFINITION_DIGEST.to_owned(),
             dependency_definition_digest: DEPENDENCY_DIGEST.to_owned(),
