@@ -821,6 +821,48 @@ impl SkillCatalogue {
         Ok(true)
     }
 
+    /// Marks the entry stale when the live host/profile versions moved past
+    /// the versions pinned at install (`I7.13`).
+    ///
+    /// A changed host dependency marks the Skill stale: the install pinned
+    /// `host_version`/`profile_version`, while the live host now reports
+    /// different versions. The entry keeps its pinned state and gains a
+    /// `Stale` status with a reason naming both version pairs, blocking
+    /// Material use and general delivery until revalidated (reinstall under
+    /// the new versions) or explicitly scoped/provisional. Quarantined and
+    /// already-stale entries report no change, as does agreement (no drift
+    /// to mark). Returns `true` when the entry became stale.
+    pub fn mark_host_drift_stale(
+        &mut self,
+        skill_id: &str,
+        live_host_version: &str,
+        live_profile_version: &str,
+    ) -> Result<bool, SkillError> {
+        check_text(live_host_version, "entry.host_version")?;
+        check_text(live_profile_version, "entry.profile_version")?;
+        let (admitted_host, admitted_profile) = {
+            let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
+            (entry.host_version.clone(), entry.profile_version.clone())
+        };
+        if live_host_version == admitted_host && live_profile_version == admitted_profile {
+            return Err(SkillError::InvalidField {
+                field: "entry.host_version",
+                reason: "no version drift to mark",
+            });
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!(
+            "host drift: admitted host {admitted_host}/profile {admitted_profile}, live host {live_host_version}/profile {live_profile_version}"
+        ));
+        entry.validate()?;
+        Ok(true)
+    }
+
     /// Marks the entry stale when its declared tool references no longer
     /// resolve against the tool owner's view (`I7.13`).
     ///
@@ -1002,6 +1044,34 @@ impl SkillCatalogue {
             delivery_receipt_digest: receipt.receipt_digest.clone(),
             receipt_chain_digest,
         })
+    }
+
+    /// Bridge activation entry binding validation to the live staleness gate.
+    ///
+    /// Same delivery contract as `activation_display`, with the pinned
+    /// dependency set compared against the currently registered versions
+    /// first through the activation Material-use gate: a Skill whose
+    /// declared host/tool/contract dependencies changed since install is
+    /// refused here even when the stored status still reads `Current`, so an
+    /// unvalidated or stale Skill cannot reach Material use through a
+    /// stored-status lag. A passing display keeps the full receipt chain
+    /// (validation + catalogue-staleness + delivery-ack records).
+    pub fn activation_display_against(
+        &self,
+        skill_id: &str,
+        receipt: &HotsetDeliveryReceipt,
+        ack: &HotsetDeliveryAck,
+        tools: &dyn KnownTools,
+        current_dependencies: &[DependencyVersion],
+    ) -> Result<ActivatedSkillDisplay, SkillError> {
+        let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
+        entry.validate()?;
+        super::activation::gate_material_use(
+            entry.status,
+            &entry.dependencies,
+            current_dependencies,
+        )?;
+        self.activation_display(skill_id, receipt, ack, tools)
     }
 }
 
