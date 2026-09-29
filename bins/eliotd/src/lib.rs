@@ -101,19 +101,6 @@ pub mod improvement_intake;
 /// over a real maintenance observation and commits the owner-actionable
 /// artifact durably through the Governor `RecordLearningRecord` seam.
 pub mod improvement_intake_dispatch;
-/// Issue #1867 W3: the deduplication-registry read-back. This module reads
-/// the candidate records `improvement_intake_dispatch` commits back through
-/// the existing authenticated `GetLearningRecordRange` route and rebuilds the
-/// bounded backlog from them, so the evidence-lineage merge branch is
-/// reachable across a pass boundary and across a restart instead of running
-/// against a registry that is empty at every admission.
-pub mod improvement_dedup_read;
-pub mod improvement_intake;
-/// Issue #1867 W1: the production improvement-intake dispatch. This is the
-/// live call site that reaches `eliot-improvement` from the daemon run loop
-/// over a real maintenance observation and commits the owner-actionable
-/// artifact durably through the Governor `RecordLearningRecord` seam.
-pub mod improvement_intake_dispatch;
 mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
