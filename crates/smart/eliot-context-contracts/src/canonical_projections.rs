@@ -221,10 +221,7 @@ impl CanonicalProjectionSet {
             if projection_binding != &self.binding {
                 return Err(ContextError::InvalidFence);
             }
-            if !fences_match_exact(
-                &projection_binding.state_fence,
-                &self.binding.state_fence,
-            ) {
+            if !fences_match_exact(&projection_binding.state_fence, &self.binding.state_fence) {
                 return Err(ContextError::InvalidFence);
             }
         }

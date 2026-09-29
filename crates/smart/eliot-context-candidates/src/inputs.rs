@@ -35,7 +35,9 @@ use eliot_context_contracts::{
     ContextRecipe, MeasurementRef, PrivacyClass, ProofBinding, ProviderId, ProviderRole,
     SemanticRole, SourceSnapshot,
 };
-use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId, fences_match_exact};
+use eliot_contracts::{
+    ArtifactId, ContractVersion, RequestId, StateFence, TaskId, fences_match_exact,
+};
 use eliot_cue_contracts::{ActivationResult, Completeness};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition, SourceAssurance};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope};
