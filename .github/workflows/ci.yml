@@ -168,3 +168,107 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "MERGE_COMPILE_SOURCE_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
+
+  # Temporary owner-requested diagnostic, tracked in #3004. Not an admission
+  # profile or a replacement check. Remove after collecting this exact run.
+  audit-linked-build:
+    name: One-shot unsigned core build (not admission)
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[audit-build-b292c304]') }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      AUDIT_SOURCE_SHA: b292c3041251d5ffc510743f5eb6c703945dc7aa
+      CARGO_TARGET_DIR: ${{ runner.temp }}\eliot-audit-target
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        id: audit-checkout
+        with:
+          ref: b292c3041251d5ffc510743f5eb6c703945dc7aa
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Bind diagnostic source and inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path audit-output -Force | Out-Null
+          $actual = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:AUDIT_SOURCE_SHA) { throw 'Diagnostic source mismatch' }
+          if ((git status --porcelain | Out-String).Trim()) { throw 'Checkout is not clean' }
+          @{
+            source_sha = $actual
+            workflow_sha = $env:GITHUB_SHA
+            tree = (git rev-parse 'HEAD^{tree}').Trim()
+            cargo_lock = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash
+            toolchain_file = (Get-FileHash rust-toolchain.toml -Algorithm SHA256).Hash
+            profile = 'dev with debug=0; two build jobs; no shared cache'
+            ceiling = 'UNSIGNED_BUILD_DIAGNOSTIC_ONLY; no dependency clearance or runtime acceptance'
+          } | ConvertTo-Json | Set-Content audit-output/source.json -Encoding utf8
+      - name: Install repository-pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version --verbose | Tee-Object -FilePath audit-output/rustc.txt
+          exit $LASTEXITCODE
+      - name: Link core executables without running them
+        id: audit-rust
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo build --locked --target x86_64-pc-windows-msvc --bins --keep-going -p eliot -p eliot-host -p eliot-kernel -p eliotd -p eliot-store-surreal -p eliot-watchdog -p eliot-agent-bridge -p eliot-doctor --message-format=json-render-diagnostics 1> audit-output/build.jsonl 2> audit-output/build.stderr.log
+          $buildExit = $LASTEXITCODE
+          Set-Content audit-output/rust-exit.txt $buildExit
+          Get-Content audit-output/build.stderr.log -Tail 160
+          exit $buildExit
+      - name: Compile Operator independently without running it
+        if: ${{ !cancelled() && steps.audit-checkout.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          dotnet --info > audit-output/dotnet.txt
+          dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode *> audit-output/operator-restore.log
+          $restoreExit = $LASTEXITCODE
+          Set-Content audit-output/operator-restore-exit.txt $restoreExit
+          if ($restoreExit -ne 0) { Get-Content audit-output/operator-restore.log -Tail 100; exit $restoreExit }
+          dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore *> audit-output/operator-build.log
+          $buildExit = $LASTEXITCODE
+          Set-Content audit-output/operator-build-exit.txt $buildExit
+          Get-Content audit-output/operator-build.log -Tail 100
+          exit $buildExit
+      - name: Record exact binary availability and hashes
+        if: ${{ !cancelled() && steps.audit-checkout.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path audit-output/unsigned-binaries -Force | Out-Null
+          $names = @('eliot', 'eliot-host', 'eliot-kernel', 'eliotd', 'eliot-store-surreal', 'eliot-watchdog', 'eliot-agent-bridge', 'eliot-doctor')
+          $rows = @(foreach ($name in $names) {
+            $file = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\debug\$name.exe"
+            if (Test-Path -LiteralPath $file -PathType Leaf) {
+              $item = Get-Item -LiteralPath $file
+              $digest = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+              Copy-Item -LiteralPath $file -Destination audit-output/unsigned-binaries
+              @{ name = $name; present = $true; bytes = $item.Length; sha256 = $digest }
+            } else { @{ name = $name; present = $false } }
+          })
+          $rows | ConvertTo-Json | Set-Content audit-output/binaries.json -Encoding utf8
+          git diff --exit-code -- Cargo.lock apps/Eliot.Operator/packages.lock.json
+          if ($LASTEXITCODE -ne 0) { throw 'Locked inputs changed' }
+          Add-Content $env:GITHUB_STEP_SUMMARY "## Unsigned diagnostic build; NOT an accepted product"
+          Add-Content $env:GITHUB_STEP_SUMMARY "Source=$env:AUDIT_SOURCE_SHA; workflow=$env:GITHUB_SHA. Existing MergeCompile verdict remains independent."
+          Add-Content $env:GITHUB_STEP_SUMMARY (Get-Content audit-output/binaries.json -Raw)
+      - name: Retain diagnostic logs and any linked unsigned binaries
+        if: ${{ !cancelled() && steps.audit-checkout.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-core-diagnostic-b292c304-${{ github.run_id }}-${{ github.run_attempt }}
+          path: audit-output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
