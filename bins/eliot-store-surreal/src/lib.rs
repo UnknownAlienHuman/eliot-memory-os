@@ -311,9 +311,9 @@ pub struct StoreComposition {
     runtime_state_roots: RuntimeStateRoots,
     profile_root_request: Option<ProfileRootRequest>,
     profile_selection_receipt: Option<ProfileSelectionReceipt>,
-    _profile_root_leases: Option<ProfileRootLeaseSet>,
-    _user_mode_launch_root: Option<UserOwnedRootLease>,
-    _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
+    profile_root_leases: Option<ProfileRootLeaseSet>,
+    user_mode_launch_root: Option<UserOwnedRootLease>,
+    runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
 /// Retained profile leases that keep the selected user-owned roots alive for
@@ -337,6 +337,114 @@ impl std::fmt::Debug for StoreComposition {
     }
 }
 
+type RetainedProfileRoots = (
+    Option<ProfileRootRequest>,
+    Option<ProfileRootLeaseSet>,
+    Option<ProfileSelectionReceipt>,
+);
+
+fn retain_profile_roots_for_launch(
+    config: &StoreLaunchConfig,
+    roots: &RuntimeStateRoots,
+    runtime_root_leases: &ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
+    user_mode_launch_root: Option<&UserOwnedRootLease>,
+) -> Result<RetainedProfileRoots, String> {
+    let (profile_root_request, profile_root_leases, profile_selection_receipt) = match roots.profile
+    {
+        InstallationProfile::SystemService => {
+            if user_mode_launch_root.is_some() {
+                return Err("SystemService launch cannot retain a UserMode config root".to_owned());
+            }
+            validate_runtime_leases_without_profile_receipt(roots, runtime_root_leases)?;
+            (None, None, None)
+        }
+        InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+            let host_state =
+                UserOwnedRootLease::open_existing(Path::new(roots.host_state_root.as_str()))
+                    .map_err(|error| format!("retain profile registry Host root: {error}"))?;
+            let (receipt, activation_fence) =
+                        RedbInstallationRegistry::inspect_profile_selection_and_activation_fence_user_owned_at(
+                            host_state,
+                            roots.profile,
+                            &config.runtime_launch.generation,
+                        )
+                        .map_err(|error| {
+                            format!("read persisted profile selection and activation fence: {error}")
+                        })?;
+            if activation_fence.generation != config.runtime_launch.generation {
+                return Err(
+                    "committed activation fence does not match the selected Store generation"
+                        .to_owned(),
+                );
+            }
+            let phase_b_live_binding =
+                activation_fence
+                    .phase_b_live_binding
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "committed activation fence has no Phase-B live binding".to_owned()
+                    })?;
+            let request = profile_root_request_for_live_activation(
+                &config.runtime_launch,
+                &phase_b_live_binding.authority_descriptor_digest,
+                phase_b_live_binding
+                    .provisioned_supervision_authority
+                    .authority_generation
+                    .value(),
+            )?;
+            let live_roots = open_profile_root_leases(&request)
+                .map_err(|error| format!("retain selected profile roots: {error}"))?;
+            if !profile_selection_receipts_match_retained_roots(&receipt, live_roots.selection())
+                .map_err(|error| format!("validate persisted profile root identities: {error}"))?
+            {
+                return Err(
+                    "persisted profile selection does not match live no-follow roots".to_owned(),
+                );
+            }
+            validate_runtime_leases_against_selection(
+                roots,
+                runtime_root_leases,
+                live_roots.selection(),
+            )?;
+            validate_runtime_leases_against_selection(roots, runtime_root_leases, &receipt)?;
+            match (roots.profile, user_mode_launch_root) {
+                (InstallationProfile::UserMode, Some(launch_root)) => {
+                    launch_config::validate_user_mode_launch_root_binding(launch_root, config)?;
+                    validate_user_owned_root_observation(
+                        launch_root,
+                        live_roots.selection(),
+                        "immutable_binaries",
+                    )?;
+                    validate_user_owned_root_observation(
+                        launch_root,
+                        &receipt,
+                        "immutable_binaries",
+                    )?;
+                }
+                (InstallationProfile::UserMode, None) => {
+                    return Err(
+                        "UserMode Store launch requires its explicit retained config root"
+                            .to_owned(),
+                    );
+                }
+                (InstallationProfile::PortableDev, Some(_)) => {
+                    return Err(
+                        "PortableDev launch cannot consume a UserMode config root".to_owned()
+                    );
+                }
+                (InstallationProfile::PortableDev, None) => {}
+                (InstallationProfile::SystemService, _) => unreachable!(),
+            }
+            (Some(request), Some(live_roots), Some(receipt))
+        }
+    };
+    Ok((
+        profile_root_request,
+        profile_root_leases,
+        profile_selection_receipt,
+    ))
+}
+
 impl StoreComposition {
     /// Builds the adapter from the explicit target launch configuration.
     /// Credential bytes are read only inside this process from the configured
@@ -346,7 +454,7 @@ impl StoreComposition {
         Self::new_with_user_mode_launch_root(config, None)
     }
 
-    /// Composes a selected UserMode launch while retaining the exact
+    /// Composes a selected `UserMode` launch while retaining the exact
     /// immutable-binaries root lease used to read its config. Other profiles
     /// pass no launch root and retain their existing profile-specific path
     /// contract.
@@ -362,101 +470,13 @@ impl StoreComposition {
         let runtime_root_leases = roots
             .retain_and_validate(&mut root_lease_provider)
             .map_err(|error| format!("retain canonical runtime roots: {error}"))?;
-        let (profile_root_request, profile_root_leases, profile_selection_receipt) = match roots
-            .profile
-        {
-            InstallationProfile::SystemService => {
-                if user_mode_launch_root.is_some() {
-                    return Err(
-                        "SystemService launch cannot retain a UserMode config root".to_owned()
-                    );
-                }
-                validate_runtime_leases_without_profile_receipt(roots, &runtime_root_leases)?;
-                (None, None, None)
-            }
-            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
-                let host_state =
-                    UserOwnedRootLease::open_existing(Path::new(roots.host_state_root.as_str()))
-                        .map_err(|error| format!("retain profile registry Host root: {error}"))?;
-                let (receipt, activation_fence) =
-                        RedbInstallationRegistry::inspect_profile_selection_and_activation_fence_user_owned_at(
-                            host_state,
-                            roots.profile,
-                            &config.runtime_launch.generation,
-                        )
-                        .map_err(|error| {
-                            format!("read persisted profile selection and activation fence: {error}")
-                        })?;
-                if activation_fence.generation != config.runtime_launch.generation {
-                    return Err(
-                        "committed activation fence does not match the selected Store generation"
-                            .to_owned(),
-                    );
-                }
-                let phase_b_live_binding = activation_fence
-                    .phase_b_live_binding
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "committed activation fence has no Phase-B live binding".to_owned()
-                    })?;
-                let request = profile_root_request_for_live_activation(
-                    &config.runtime_launch,
-                    &phase_b_live_binding.authority_descriptor_digest,
-                    phase_b_live_binding
-                        .provisioned_supervision_authority
-                        .authority_generation
-                        .value(),
-                )?;
-                let live_roots = open_profile_root_leases(&request)
-                    .map_err(|error| format!("retain selected profile roots: {error}"))?;
-                if !profile_selection_receipts_match_retained_roots(
-                    &receipt,
-                    live_roots.selection(),
-                )
-                .map_err(|error| format!("validate persisted profile root identities: {error}"))?
-                {
-                    return Err(
-                        "persisted profile selection does not match live no-follow roots"
-                            .to_owned(),
-                    );
-                }
-                validate_runtime_leases_against_selection(
-                    roots,
-                    &runtime_root_leases,
-                    live_roots.selection(),
-                )?;
-                validate_runtime_leases_against_selection(roots, &runtime_root_leases, &receipt)?;
-                match (roots.profile, user_mode_launch_root.as_ref()) {
-                    (InstallationProfile::UserMode, Some(launch_root)) => {
-                        launch_config::validate_user_mode_launch_root_binding(launch_root, config)?;
-                        validate_user_owned_root_observation(
-                            launch_root,
-                            live_roots.selection(),
-                            "immutable_binaries",
-                        )?;
-                        validate_user_owned_root_observation(
-                            launch_root,
-                            &receipt,
-                            "immutable_binaries",
-                        )?;
-                    }
-                    (InstallationProfile::UserMode, None) => {
-                        return Err(
-                            "UserMode Store launch requires its explicit retained config root"
-                                .to_owned(),
-                        );
-                    }
-                    (InstallationProfile::PortableDev, Some(_)) => {
-                        return Err(
-                            "PortableDev launch cannot consume a UserMode config root".to_owned()
-                        );
-                    }
-                    (InstallationProfile::PortableDev, None) => {}
-                    (InstallationProfile::SystemService, _) => unreachable!(),
-                }
-                (Some(request), Some(live_roots), Some(receipt))
-            }
-        };
+        let (profile_root_request, profile_root_leases, profile_selection_receipt) =
+            retain_profile_roots_for_launch(
+                config,
+                roots,
+                &runtime_root_leases,
+                user_mode_launch_root.as_ref(),
+            )?;
         // Root admission and persisted selection comparison happen before any
         // Store/Blob owner, credential lookup, or provider path is composed.
         let blob = BlobRootOwner::claim(
@@ -530,9 +550,9 @@ impl StoreComposition {
             runtime_state_roots: roots.clone(),
             profile_root_request,
             profile_selection_receipt,
-            _profile_root_leases: profile_root_leases,
-            _user_mode_launch_root: user_mode_launch_root,
-            _runtime_root_leases: runtime_root_leases,
+            profile_root_leases,
+            user_mode_launch_root,
+            runtime_root_leases,
         })
     }
 
@@ -544,12 +564,12 @@ impl StoreComposition {
         match (
             self.profile_root_request.as_ref(),
             self.profile_selection_receipt.as_ref(),
-            self._profile_root_leases.as_ref(),
+            self.profile_root_leases.as_ref(),
         ) {
             (None, None, None) => {
                 validate_runtime_leases_without_profile_receipt(
                     &self.runtime_state_roots,
-                    &self._runtime_root_leases,
+                    &self.runtime_root_leases,
                 )
                 .map_err(|_| StoreError::Unavailable)?;
                 Ok(StoreRootUseLease {
@@ -569,13 +589,13 @@ impl StoreComposition {
                 }
                 validate_runtime_leases_against_selection(
                     &self.runtime_state_roots,
-                    &self._runtime_root_leases,
+                    &self.runtime_root_leases,
                     current.selection(),
                 )
                 .map_err(|_| StoreError::Unavailable)?;
                 match (
                     self.runtime_state_roots.profile,
-                    self._user_mode_launch_root.as_ref(),
+                    self.user_mode_launch_root.as_ref(),
                 ) {
                     (InstallationProfile::UserMode, Some(launch_root)) => {
                         validate_user_owned_root_observation(
@@ -623,14 +643,11 @@ impl StoreComposition {
     /// runs is visible on the next observation.
     #[must_use]
     pub fn compatibility_verdict(&self) -> CompatibilityVerdict {
-        let root_use = match self.retain_roots_for_use() {
-            Ok(lease) => lease,
-            Err(_) => {
-                return CompatibilityVerdict::Maintenance {
-                    reason: "profile_root_identity_unavailable".to_owned(),
-                    report: "selected Store roots are unavailable".to_owned(),
-                };
-            }
+        let Ok(root_use) = self.retain_roots_for_use() else {
+            return CompatibilityVerdict::Maintenance {
+                reason: "profile_root_identity_unavailable".to_owned(),
+                report: "selected Store roots are unavailable".to_owned(),
+            };
         };
         let _root_use = root_use;
         let adapter = self.store.config();

@@ -227,7 +227,7 @@ fn resolve_portable_dev_config(
     Ok((root, config))
 }
 
-/// Resolves an explicit UserMode immutable-binaries root lease and loads its
+/// Resolves an explicit `UserMode` immutable-binaries root lease and loads its
 /// materialized Store config through a no-follow file lease. The loaded
 /// descriptor must bind the same root in its I3.1 profile selection.
 #[cfg(windows)]

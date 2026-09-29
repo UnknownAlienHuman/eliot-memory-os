@@ -794,6 +794,15 @@ async fn run() -> Result<(), String> {
         composed.is_ok(),
     );
     let composition = composed?;
+    run_composed(&config, &composition).await
+}
+
+#[cfg(windows)]
+#[allow(clippy::print_stderr)]
+async fn run_composed(
+    config: &eliot_store_surreal::StoreLaunchConfig,
+    composition: &StoreComposition,
+) -> Result<(), String> {
     // Issue #1836 (W1): the installation roots are known now, so the shared
     // observability runtime is installed before the provider is started or the
     // authenticated pipe is served. Hold a fresh lease set across spool/log
@@ -803,11 +812,11 @@ async fn run() -> Result<(), String> {
         let _root_use = composition.retain_roots_for_use().map_err(|error| {
             format!("revalidate Store roots before startup side effects: {error}")
         })?;
-        install_observability(&config)?;
+        install_observability(config)?;
         // I5.9 compatibility gate (issue #1932). A maintenance verdict keeps
         // the installation queryable as a non-writer; canonical mutations are
         // refused on the mutation path itself.
-        enforce_store_compatibility(&config)
+        enforce_store_compatibility(config)
     };
     let connected = composition.connect().await;
     report_stage_outcome(
@@ -832,11 +841,11 @@ async fn run() -> Result<(), String> {
         let _root_use = composition
             .retain_roots_for_use()
             .map_err(|error| format!("revalidate Store roots after provider startup: {error}"))?;
-        compatibility = compatibility.combine(enforce_store_compatibility(&config));
+        compatibility = compatibility.combine(enforce_store_compatibility(config));
         // Observed-identity binding (issue #1932, backend handoff §3): the
         // adapter proved the live version and spawn-validated digest over its
         // ownership-verified channel during connect.
-        compatibility = compatibility.combine(bind_observed_identity(&composition, &config)?);
+        compatibility = compatibility.combine(bind_observed_identity(composition, config)?);
     }
     if !compatibility.is_writer_admitted() {
         // Visible non-writer readiness: the store is up and answers
@@ -873,7 +882,7 @@ async fn run() -> Result<(), String> {
         gated.is_ok(),
     );
     gated?;
-    serve_handshake_loop(&composition, &config).await
+    serve_handshake_loop(composition, config).await
 }
 
 #[cfg(not(windows))]
