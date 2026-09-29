@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sha256_hex;
 use crate::tool_exposure::{TokenCountObservation, ToolExposureError, digest, text};
+use crate::{GrantClosureReceipt, GrantClosureState};
 
 /// Stable contract revision shared by the surface decision, budget, and
 /// dispatch binding. All three must agree on this value; a mismatch fails
@@ -546,6 +547,104 @@ fn validate_budget_input(input: &SurfaceBudgetInput) -> Result<(), ToolExposureE
     )?;
     optional_text(input.expires_at.as_deref(), "budget_input.expires_at")?;
     Ok(())
+}
+
+/// Current grant standing from the authority owner for one task/route.
+///
+/// Resolved by the admitting seam from its live grant owner — the Governor
+/// grant-closure verdict at surface advertisement, the admitted task binding
+/// at Kernel dispatch — never minted by the caller. A missing standing cannot
+/// enable Material dispatch; a revoked standing withholds it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialGrantStanding {
+    /// Grant revision the standing authorizes.
+    pub grant_revision: String,
+    /// Whether the authority owner revoked the grant.
+    pub revoked: bool,
+}
+
+impl MaterialGrantStanding {
+    /// Validates the standing shape without consulting any owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the grant revision is blank or oversized.
+    pub fn validate(&self) -> Result<(), ToolExposureError> {
+        bounded_text(&self.grant_revision, "grant.grant_revision")?;
+        Ok(())
+    }
+
+    /// Authorizes Material use under this standing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolExposureError::GrantRevoked`] when the authority owner
+    /// revoked the grant, or an error when the standing is malformed.
+    pub fn authorize_material_use(&self) -> Result<(), ToolExposureError> {
+        self.validate()?;
+        if self.revoked {
+            return Err(ToolExposureError::GrantRevoked);
+        }
+        Ok(())
+    }
+}
+
+/// Requires a live grant standing for Material dispatch.
+///
+/// A missing standing fails closed with
+/// [`ToolExposureError::GrantRequired`]; a revoked one fails with
+/// [`ToolExposureError::GrantRevoked`]. There is no silent or default grant.
+pub fn authorize_material_grant(
+    standing: Option<&MaterialGrantStanding>,
+) -> Result<(), ToolExposureError> {
+    let Some(standing) = standing else {
+        return Err(ToolExposureError::GrantRequired);
+    };
+    standing.authorize_material_use()
+}
+
+/// Resolves the Material standing for one claimed grant revision from the
+/// live grant-closure verdict.
+///
+/// The closure is the Governor's complete parent-before-child declaration
+/// consumed by the Kernel as an immutable projection: it is the single
+/// grant/revocation owner, so no second catalogue or authorization service is
+/// consulted. A missing verdict, a revoked closure, or a revision the live
+/// closure does not cover fails closed; only an `Active` closure covering
+/// the claimed revision yields a live standing.
+///
+/// # Errors
+///
+/// Returns [`ToolExposureError::GrantRequired`] when no verdict is joined or
+/// the claimed revision is not covered, [`ToolExposureError::GrantRevoked`]
+/// when the live closure revoked it, or an error for a malformed revision.
+pub fn resolve_material_grant(
+    closure: Option<&GrantClosureReceipt>,
+    grant_revision: &str,
+) -> Result<MaterialGrantStanding, ToolExposureError> {
+    bounded_text(grant_revision, "grant.grant_revision")?;
+    let Some(closure) = closure else {
+        return Err(ToolExposureError::GrantRequired);
+    };
+    if matches!(closure.state, GrantClosureState::Revoked) {
+        return Err(ToolExposureError::GrantRevoked);
+    }
+    let covered = closure.declaration.target_grant_id == grant_revision
+        || closure
+            .declaration
+            .members
+            .iter()
+            .any(|member| member.grant_id == grant_revision);
+    if !covered {
+        return Err(ToolExposureError::GrantRequired);
+    }
+    let standing = MaterialGrantStanding {
+        grant_revision: grant_revision.to_owned(),
+        revoked: false,
+    };
+    standing.validate()?;
+    Ok(standing)
 }
 
 /// Surface, method, profile, task, and grant revisions carried into call

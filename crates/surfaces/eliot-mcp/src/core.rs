@@ -6,7 +6,9 @@ use eliot_contracts::{HostCorrelationDomain, HostCorrelationProjection, HostJson
 use eliot_protocol::{
     AgentHostRequestFailure, HARD_STRUCTURED_RESPONSE_BYTES, MAX_HOST_REQUEST_TEXT_BYTES,
 };
-use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding, admit_dispatch_surface};
+use eliot_receipts::{
+    ArtifactBinding, GrantClosureReceipt, ProofCeiling, SessionBinding, admit_dispatch_surface,
+};
 use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
     canonical_digest,
@@ -2380,13 +2382,16 @@ pub fn tools_list_result_for_permitted_surface(
 /// binding shared with discovery). Hidden, forbidden, and unavailable methods
 /// stay absent from the published bytes; they are never warned about in prose.
 ///
-/// The conditions arrive from the Governor/Kernel owners: this entry validates
-/// shape only and never mints task, role, grant, or capability facts.
+/// The live grant-closure verdict arrives from the Governor/Kernel owners:
+/// a missing or revoked grant withholds every Material method from the
+/// published subset. This entry validates shape only and never mints task,
+/// role, grant, or capability facts.
 pub fn task_relative_tools_list_result(
     registry: &SemanticRegistry,
     conditions: &TaskSurfaceConditions,
+    grant_closure: Option<&GrantClosureReceipt>,
 ) -> Result<Value, WireRejection> {
-    let surface = compile_task_relative_surface(registry, conditions).map_err(|_| {
+    let surface = compile_task_relative_surface(registry, conditions, grant_closure).map_err(|_| {
         WireRejection::new(
             WIRE_INTERNAL_ERROR,
             "task-relative tool surface is unavailable",

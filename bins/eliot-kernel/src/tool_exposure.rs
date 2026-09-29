@@ -182,6 +182,50 @@ pub(crate) fn requires_intent(admission: &LocalReadAdmission) -> bool {
     call_class(admission).requires_intent()
 }
 
+/// Returns whether the accepted admission dispatches Material effects and
+/// therefore requires live Governor-issued material authority before
+/// dispatch.
+///
+/// The answer reads off the admission-derived class, so cheap exact reads
+/// stay exempt by construction while the effect-capable campaign packet —
+/// the only currently admitted Material lane — always requires it. The
+/// class derives from the accepted admission, never from the tool name, so
+/// a hidden effect-capable method invoked by name faces the identical
+/// requirement: advertisement is neither a capability grant nor a security
+/// boundary.
+pub(crate) fn requires_material_authority(admission: &LocalReadAdmission) -> bool {
+    matches!(admission, LocalReadAdmission::CampaignPacket { .. })
+}
+
+/// Re-joins the live Governor-issued material authority for one accepted
+/// effect-capable (Material) admission before it dispatches.
+///
+/// This is the tool-lane revalidation of the envelope-level material gate:
+/// it runs the single production gate behind every Material effect
+/// ([`super::KernelComposition::admit_material_authority_for_governor_issued_fence`])
+/// against the same live Governor derivation, so a missing derivation or a
+/// revocation that landed after envelope admission still fails the
+/// effect-capable lane closed. Read-only admissions are exempt by
+/// construction ([`requires_material_authority`]); no second catalogue or
+/// authorization service is consulted.
+///
+/// # Errors
+///
+/// Returns [`super::TransportError::SessionFenced`] when the admission is
+/// Material and no current Governor-derived coverage profile admits it.
+pub(crate) fn authorize_material_lane(
+    composition: &super::KernelComposition,
+    admission: &LocalReadAdmission,
+    fence: &eliot_contracts::StateFence,
+) -> Result<(), super::TransportError> {
+    if !requires_material_authority(admission) {
+        return Ok(());
+    }
+    composition
+        .admit_material_authority_for_governor_issued_fence(fence)
+        .map_err(|_| super::TransportError::SessionFenced)
+}
+
 /// Reports a staging-time loop/no-progress signal for a materially repeated call.
 ///
 /// Each retained candidate is rebuilt into a [`ToolCallRequest`] through the
