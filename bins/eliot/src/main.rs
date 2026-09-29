@@ -2756,6 +2756,7 @@ fn run_installation_materialize_source_bundle(
         },
         profile_selection: profile_selection.clone(),
         transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
+        staging_root: profile_selection.staging_root.clone(),
     };
     let receipt =
         match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {
@@ -2868,27 +2869,49 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    let runtime_health = match load_authenticated_kernel_runtime_health() {
-        Ok(runtime_health) => runtime_health,
-        Err(error) => {
-            let (code, detail) = match error {
-                AuthenticatedRuntimeHealthError::Unavailable(detail) => {
-                    ("KERNEL_RUNTIME_HEALTH_UNAVAILABLE", detail)
-                }
-                AuthenticatedRuntimeHealthError::Invalid(detail) => {
-                    ("KERNEL_RUNTIME_HEALTH_INVALID", detail)
-                }
-            };
-            write_runtime_status_error(code, &detail, false);
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    match eliot_runtime_status::collect_status_with_kernel_health(
-        host_state_root,
-        deadline,
-        &runtime_health,
-    ) {
-        Ok(report) => {
+    match eliot_runtime_status::collect_status(host_state_root, deadline) {
+        Ok(mut report) => {
+            if report
+                .active_profile_governed_roots
+                .as_ref()
+                .is_some_and(|roots| {
+                    roots.runtime_state_roots.profile == InstallationProfile::SystemService
+                })
+            {
+                let runtime_health = match load_authenticated_kernel_runtime_health() {
+                    Ok(runtime_health) => runtime_health,
+                    Err(error) => {
+                        let (code, detail) = match error {
+                            AuthenticatedRuntimeHealthError::Unavailable(detail) => {
+                                ("KERNEL_RUNTIME_HEALTH_UNAVAILABLE", detail)
+                            }
+                            AuthenticatedRuntimeHealthError::Invalid(detail) => {
+                                ("KERNEL_RUNTIME_HEALTH_INVALID", detail)
+                            }
+                        };
+                        write_runtime_status_error(code, &detail, false);
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                report.runtime_health = Some(
+                    eliot_runtime_status::project_runtime_health(&runtime_health)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                );
+            }
+            let active_profile_governance = report
+                .active_profile_governed_roots
+                .as_ref()
+                .map(|roots| {
+                    let profile = roots.runtime_state_roots.profile;
+                    eliot_installation::ProfileGovernedRoots {
+                        profile,
+                        immutable_binaries: roots.immutable_binaries.clone(),
+                        durable_data: roots.durable_data.clone(),
+                        user_config: roots.user_config.clone(),
+                        user_cache: roots.user_cache.clone(),
+                    }
+                    .governance_report()
+                });
             let status_code = if report.status == "RUNTIME_LIVE" {
                 "RUNTIME_LIVE"
             } else {
@@ -2903,6 +2926,10 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
                     "status": status_code,
                     "host_state_root": report.host_state_root,
                     "active_generation": report.active_generation,
+                    "active_profile_governed_roots": report.active_profile_governed_roots,
+                    "active_profile_governance": active_profile_governance,
+                    "active_profile_root_binding": report.active_profile_root_binding,
+                    "active_profile_supervision": report.active_profile_supervision,
                     "last_known_good_generation": report.last_known_good_generation,
                     "generations": report.generations,
                     "host_journal": {

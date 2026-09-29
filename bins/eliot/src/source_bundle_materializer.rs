@@ -570,13 +570,42 @@ fn validate_materializer_selection(
     input: &CanarySourceBundleMaterializeInput,
     selection: &ProfileSelectionResolution,
 ) -> Result<(), MaterializeError> {
+    let profile = input.profile_selection.profile;
+    selection
+        .roots
+        .validate(profile)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     selection
         .roots
         .validate_source_bundle_root(input.profile_selection.source_root.as_str())
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    if selection.governance.profile != input.profile_selection.profile
+    validate_absolute(&input.output_bundle, "output_bundle")?;
+    validate_absolute(&input.store_path, "store_path")?;
+    validate_absolute(Path::new(input.staging_root.as_str()), "staging_root")?;
+    selection
+        .roots
+        .admits_write_target(input.output_bundle.to_string_lossy().as_ref())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    selection
+        .roots
+        .admits_write_target(input.store_path.to_string_lossy().as_ref())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    selection
+        .roots
+        .admits_write_target(input.staging_root.as_str())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let governance_roots = &selection.governance.roots;
+    if selection.governance.profile != profile
+        || governance_roots.immutable_binaries != selection.roots.immutable_binaries
+        || governance_roots.durable_data != selection.roots.durable_data
+        || governance_roots.user_config != selection.roots.user_config
+        || governance_roots.user_cache != selection.roots.user_cache
         || selection.roots.runtime_state_roots.profile_anchor_root
             != input.profile_selection.profile_anchor_root
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(input.staging_root.as_str()),
+            Path::new(input.profile_selection.staging_root.as_str()),
+        )
         || (input.profile_selection.profile == InstallationProfile::PortableDev
             && input.profile_selection.generation.as_deref() != Some(input.generation.as_str()))
         || !eliot_platform_windows::windows_paths_equal(
