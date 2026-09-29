@@ -88,17 +88,25 @@ impl ExternalAttachReceiptSessionPage {
         request.validate()?;
         if self.owner_session_binding != request.owner_session_binding
             || self.records.len() > usize::from(request.limit)
-            || request.cursor.as_ref().is_some_and(|cursor| {
-                cursor.session_revision != self.session_revision
-            })
+            || request
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.session_revision != self.session_revision)
         {
             return Err(OrsError::IntegrityProblem {
                 record_type: "external_attach_receipt_session_page",
-                reason: "page binding, limit, or pinned revision differs from its request".to_owned(),
+                reason: "page binding, limit, or pinned revision differs from its request"
+                    .to_owned(),
             });
         }
-        let prior_count = request.cursor.as_ref().map_or(0, |cursor| cursor.emitted_rows);
-        let mut prior_key = request.cursor.as_ref().and_then(|cursor| cursor.after_key.as_ref());
+        let prior_count = request
+            .cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.emitted_rows);
+        let mut prior_key = request
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.after_key.as_ref());
         for record in &self.records {
             record.validate()?;
             if record.owner_session_binding != self.owner_session_binding
@@ -106,7 +114,8 @@ impl ExternalAttachReceiptSessionPage {
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "external_attach_receipt_session_page",
-                    reason: "page rows are not strictly ordered within the requested session".to_owned(),
+                    reason: "page rows are not strictly ordered within the requested session"
+                        .to_owned(),
                 });
             }
             prior_key = Some(&record.key);
@@ -129,14 +138,16 @@ impl ExternalAttachReceiptSessionPage {
             (Some(_), _) => {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "external_attach_receipt_session_page",
-                    reason: "continuation does not identify the owner-emitted page prefix".to_owned(),
+                    reason: "continuation does not identify the owner-emitted page prefix"
+                        .to_owned(),
                 });
             }
             (None, _) if emitted_after_page == self.row_count => {}
             (None, _) => {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "external_attach_receipt_session_page",
-                    reason: "terminal page does not close the pinned session denominator".to_owned(),
+                    reason: "terminal page does not close the pinned session denominator"
+                        .to_owned(),
                 });
             }
         }
@@ -177,7 +188,12 @@ impl ExternalAttachReceiptWrite {
         validate_key(&self.key)?;
         validate_session_binding(&self.owner_session_binding)?;
         self.state_fence.validate().map_err(contract)?;
-        validate_payload(&self.key, &self.owner_session_binding, &self.canonical_payload, &self.payload_sha256)
+        validate_payload(
+            &self.key,
+            &self.owner_session_binding,
+            &self.canonical_payload,
+            &self.payload_sha256,
+        )
     }
 }
 
@@ -215,7 +231,12 @@ impl ExternalAttachReceiptReadback {
         validate_key(&self.key)?;
         validate_session_binding(&self.owner_session_binding)?;
         self.state_fence.validate().map_err(contract)?;
-        validate_payload(&self.key, &self.owner_session_binding, &self.canonical_payload, &self.payload_sha256)?;
+        validate_payload(
+            &self.key,
+            &self.owner_session_binding,
+            &self.canonical_payload,
+            &self.payload_sha256,
+        )?;
         validate_store_receipt(
             &self.store_receipt,
             &self.key,
@@ -235,7 +256,8 @@ impl ExternalAttachReceiptReadback {
             if self.store_receipt.state_sha256() != sha256_hex(&bytes) {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "external_attach_receipt_v1",
-                    reason: "original store-issued receipt state hash differs from the readback".to_owned(),
+                    reason: "original store-issued receipt state hash differs from the readback"
+                        .to_owned(),
                 });
             }
             Ok(())
@@ -255,7 +277,9 @@ impl super::RedbRecoveryStore {
         let physical_key = physical_key(&request.owner_session_binding, &request.key);
         let index_key = index_key(&request.owner_session_binding);
         let write = self.database.begin_write().map_err(super::storage)?;
-        let mut rows = write.open_table(super::EXTERNAL_ATTACH_RECEIPTS).map_err(super::storage)?;
+        let mut rows = write
+            .open_table(super::EXTERNAL_ATTACH_RECEIPTS)
+            .map_err(super::storage)?;
         if let Some(value) = rows.get(physical_key.as_str()).map_err(super::storage)? {
             let existing = decode_row(value.value())?;
             validate_row(&existing, &physical_key)?;
@@ -302,12 +326,18 @@ impl super::RedbRecoveryStore {
             OperationalPhase::Active,
             state_sha256,
         )?;
-        let row = ExternalAttachReceiptRow { state, store_receipt };
+        let row = ExternalAttachReceiptRow {
+            state,
+            store_receipt,
+        };
         validate_row(&row, &physical_key)?;
         let serialized = serde_json::to_string(&row).map_err(contract)?;
         {
-            let mut rows = write.open_table(super::EXTERNAL_ATTACH_RECEIPTS).map_err(super::storage)?;
-            rows.insert(physical_key.as_str(), serialized.as_str()).map_err(super::storage)?;
+            let mut rows = write
+                .open_table(super::EXTERNAL_ATTACH_RECEIPTS)
+                .map_err(super::storage)?;
+            rows.insert(physical_key.as_str(), serialized.as_str())
+                .map_err(super::storage)?;
         }
         let index = ExternalAttachSessionIndex {
             schema_version: RECORD_SCHEMA_VERSION,
@@ -316,8 +346,11 @@ impl super::RedbRecoveryStore {
             row_count: next_count,
         };
         let index_value = serde_json::to_string(&index).map_err(contract)?;
-        write.open_table(super::META).map_err(super::storage)?
-            .insert(index_key.as_str(), index_value.as_str()).map_err(super::storage)?;
+        write
+            .open_table(super::META)
+            .map_err(super::storage)?
+            .insert(index_key.as_str(), index_value.as_str())
+            .map_err(super::storage)?;
         write.commit().map_err(super::storage)?;
         let readback = readback(&row);
         readback.validate()?;
@@ -332,7 +365,9 @@ impl super::RedbRecoveryStore {
         request.validate()?;
         let physical_key = physical_key(&request.owner_session_binding, &request.key);
         let read = self.database.begin_read().map_err(super::storage)?;
-        let rows = read.open_table(super::EXTERNAL_ATTACH_RECEIPTS).map_err(super::storage)?;
+        let rows = read
+            .open_table(super::EXTERNAL_ATTACH_RECEIPTS)
+            .map_err(super::storage)?;
         let Some(value) = rows.get(physical_key.as_str()).map_err(super::storage)? else {
             return Ok(None);
         };
@@ -360,7 +395,10 @@ impl super::RedbRecoveryStore {
         let meta = read.open_table(super::META).map_err(super::storage)?;
         let index = read_session_index(&meta, &index_key, &request.owner_session_binding)?;
         drop(meta);
-        let expected_revision = request.cursor.as_ref().map(|cursor| cursor.session_revision);
+        let expected_revision = request
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.session_revision);
         if let Some(expected_revision) = expected_revision
             && expected_revision != index.revision
         {
@@ -369,13 +407,24 @@ impl super::RedbRecoveryStore {
                 observed_revision: index.revision,
             });
         }
-        let rows = read.open_table(super::EXTERNAL_ATTACH_RECEIPTS).map_err(super::storage)?;
+        let rows = read
+            .open_table(super::EXTERNAL_ATTACH_RECEIPTS)
+            .map_err(super::storage)?;
         let mut actual_count = 0_u64;
         let mut maximum_operation_order = 0_u64;
         let mut emitted_count = 0_u64;
-        let mut cursor_seen = request.cursor.as_ref().is_none_or(|cursor| cursor.after_key.is_none());
-        let cursor_key = request.cursor.as_ref().and_then(|cursor| cursor.after_key.as_ref());
-        let expected_emitted = request.cursor.as_ref().map_or(0, |cursor| cursor.emitted_rows);
+        let mut cursor_seen = request
+            .cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.after_key.is_none());
+        let cursor_key = request
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.after_key.as_ref());
+        let expected_emitted = request
+            .cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.emitted_rows);
         let limit = usize::from(request.limit);
         let mut selected = Vec::with_capacity(limit.saturating_add(1));
         for entry in rows.range(prefix.as_str()..).map_err(super::storage)? {
@@ -383,7 +432,9 @@ impl super::RedbRecoveryStore {
             if !key.value().starts_with(prefix.as_str()) {
                 break;
             }
-            actual_count = actual_count.checked_add(1).ok_or(OrsError::ProjectionLimitExceeded)?;
+            actual_count = actual_count
+                .checked_add(1)
+                .ok_or(OrsError::ProjectionLimitExceeded)?;
             let row = decode_row(value.value())?;
             validate_row(&row, key.value())?;
             maximum_operation_order = maximum_operation_order.max(row.state.operation_order);
@@ -406,20 +457,26 @@ impl super::RedbRecoveryStore {
         if actual_count != index.row_count || maximum_operation_order != index.revision {
             return Err(OrsError::IntegrityProblem {
                 record_type: "external_attach_session_index_v1",
-                reason: "session revision or row count differs from its durable receipt set".to_owned(),
+                reason: "session revision or row count differs from its durable receipt set"
+                    .to_owned(),
             });
         }
         if !cursor_seen || (cursor_key.is_some() && emitted_count != expected_emitted) {
-            return Err(invalid_cursor("cursor does not match an owner-emitted row prefix"));
+            return Err(invalid_cursor(
+                "cursor does not match an owner-emitted row prefix",
+            ));
         }
         selected.truncate(limit);
-        let has_more = selected.len() == limit && actual_count > emitted_count + selected.len() as u64;
+        let has_more =
+            selected.len() == limit && actual_count > emitted_count + selected.len() as u64;
         let mut readbacks = Vec::with_capacity(selected.len());
         for record in selected {
-            record.validate().map_err(|error| OrsError::IntegrityProblem {
-                record_type: "external_attach_receipt_v1",
-                reason: error.to_string(),
-            })?;
+            record
+                .validate()
+                .map_err(|error| OrsError::IntegrityProblem {
+                    record_type: "external_attach_receipt_v1",
+                    reason: error.to_string(),
+                })?;
             readbacks.push(record);
         }
         let next_cursor = has_more.then(|| {
@@ -453,7 +510,8 @@ fn read_session_index(
             row_count: 0,
         });
     };
-    let index: ExternalAttachSessionIndex = serde_json::from_str(value.value()).map_err(contract)?;
+    let index: ExternalAttachSessionIndex =
+        serde_json::from_str(value.value()).map_err(contract)?;
     if index.schema_version != RECORD_SCHEMA_VERSION
         || index.owner_session_binding != binding
         || (index.row_count == 0) != (index.revision == 0)
@@ -489,7 +547,12 @@ fn validate_row(row: &ExternalAttachReceiptRow, stored_key: &str) -> Result<(), 
     validate_key(&state.key)?;
     validate_session_binding(&state.owner_session_binding)?;
     state.state_fence.validate().map_err(contract)?;
-    validate_payload(&state.key, &state.owner_session_binding, &state.canonical_payload, &state.payload_sha256)?;
+    validate_payload(
+        &state.key,
+        &state.owner_session_binding,
+        &state.canonical_payload,
+        &state.payload_sha256,
+    )?;
     if state.schema_version != RECORD_SCHEMA_VERSION
         || stored_key != physical_key(&state.owner_session_binding, &state.key)
         || state.operation_order == 0
@@ -500,15 +563,12 @@ fn validate_row(row: &ExternalAttachReceiptRow, stored_key: &str) -> Result<(), 
         });
     }
     let state_bytes = canonical_json_bytes(state).map_err(contract)?;
-    validate_store_receipt(
-        &row.store_receipt,
-        &state.key,
-        state.operation_order,
-    )?;
+    validate_store_receipt(&row.store_receipt, &state.key, state.operation_order)?;
     if row.store_receipt.state_sha256() != sha256_hex(&state_bytes) {
         return Err(OrsError::IntegrityProblem {
             record_type: "external_attach_receipt_v1",
-            reason: "original store-issued receipt state hash differs from the persisted row".to_owned(),
+            reason: "original store-issued receipt state hash differs from the persisted row"
+                .to_owned(),
         });
     }
     Ok(())
@@ -526,7 +586,8 @@ fn validate_store_receipt(
     {
         return Err(OrsError::IntegrityProblem {
             record_type: "external_attach_receipt_v1",
-            reason: "store-issued receipt identity, phase, or order differs from its row".to_owned(),
+            reason: "store-issued receipt identity, phase, or order differs from its row"
+                .to_owned(),
         });
     }
     Ok(())
@@ -538,8 +599,11 @@ fn validate_payload(
     payload: &str,
     digest: &str,
 ) -> Result<(), OrsError> {
-    if payload.is_empty() || digest.len() != MAX_DIGEST_LENGTH
-        || digest.bytes().any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    if payload.is_empty()
+        || digest.len() != MAX_DIGEST_LENGTH
+        || digest
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         || sha256_hex(payload.as_bytes()) != digest
     {
         return Err(OrsError::InvalidField {
@@ -559,7 +623,9 @@ fn validate_key(key: &OperationIdentity) -> Result<(), OrsError> {
         });
     };
     if digest.len() != MAX_DIGEST_LENGTH
-        || digest.bytes().any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        || digest
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Err(OrsError::InvalidField {
             field: "external_attach_receipt.key",

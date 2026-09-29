@@ -14,9 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
-    ExternalAttachReceiptRead, ExternalAttachReceiptReadback, ExternalAttachReceiptSessionRead,
-    ExternalAttachReceiptWrite, GovernorActivationOutcome, GovernorComposition,
+    CompositionError, CompositionReadiness, ExternalAttachReceiptRead,
+    ExternalAttachReceiptReadback, ExternalAttachReceiptSessionRead, ExternalAttachReceiptWrite,
+    FinishAttemptDraft, FinishAttemptError, GovernorActivationOutcome, GovernorComposition,
     GovernorLaunchConfig, KernelGenerationPort, KernelGenerationSnapshotProvider, KernelPortError,
     PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
 };
@@ -852,36 +852,39 @@ fn blocked_port(
 fn external_attach_kernel_error(
     error: KernelPortError,
 ) -> Box<eliot_agent_bridge_core::BridgeError> {
-    Box::new(eliot_agent_bridge_core::BridgeError::ProviderContract(format!(
-        "durable ExternalAttach Kernel owner operation failed: {error}"
-    )))
+    Box::new(eliot_agent_bridge_core::BridgeError::ProviderContract(
+        format!("durable ExternalAttach Kernel owner operation failed: {error}"),
+    ))
 }
 
 pub(crate) fn external_attach_record_from_readback(
     read_request: &ExternalAttachReceiptSessionRead,
     readback: &ExternalAttachReceiptReadback,
 ) -> Result<ExternalAttachIngressRecord, Box<eliot_agent_bridge_core::BridgeError>> {
-    readback
-        .validate()
-        .map_err(external_attach_kernel_error)?;
+    readback.validate().map_err(external_attach_kernel_error)?;
     if readback.owner_session_binding != read_request.owner_session_binding
         || readback.state_fence != read_request.expected_state_fence
     {
-        return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+        return Err(Box::new(
+            eliot_agent_bridge_core::BridgeError::StaleAuthority,
+        ));
     }
     let record = decode_external_attach_owner_payload(
         &readback.canonical_payload,
         &readback.payload_sha256,
     )?;
     let Some(claim) = record.claim.as_ref() else {
-        return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+        return Err(Box::new(
+            eliot_agent_bridge_core::BridgeError::StaleAuthority,
+        ));
     };
-    if record.owner_session_binding.as_deref()
-        != Some(read_request.owner_session_binding.as_str())
+    if record.owner_session_binding.as_deref() != Some(read_request.owner_session_binding.as_str())
         || record.admitted_fence != read_request.expected_state_fence
         || external_attach_claim_key(claim)? != readback.key.as_str()
     {
-        return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+        return Err(Box::new(
+            eliot_agent_bridge_core::BridgeError::StaleAuthority,
+        ));
     }
     Ok(record)
 }
@@ -3509,12 +3512,13 @@ impl DaemonComposition {
             Some(&session_read.owner_session_binding),
         )?;
         let owner_payload = encode_external_attach_owner_payload(&record)?;
-        let key = eliot_ors::OperationIdentity::new(owner_payload.claim_key.clone()).map_err(|_| {
-            Box::new(eliot_agent_bridge_core::BridgeError::InvalidContract {
-                field: "external_attach_record.claim_key",
-                reason: "stable owner key is invalid",
-            })
-        })?;
+        let key =
+            eliot_ors::OperationIdentity::new(owner_payload.claim_key.clone()).map_err(|_| {
+                Box::new(eliot_agent_bridge_core::BridgeError::InvalidContract {
+                    field: "external_attach_record.claim_key",
+                    reason: "stable owner key is invalid",
+                })
+            })?;
         let write = ExternalAttachReceiptWrite {
             key,
             owner_session_binding: session_read.owner_session_binding.clone(),
@@ -3536,11 +3540,15 @@ impl DaemonComposition {
             .map_err(external_attach_kernel_error)?
             .ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::NotAttached))?;
         if committed != key_read {
-            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+            return Err(Box::new(
+                eliot_agent_bridge_core::BridgeError::StaleAuthority,
+            ));
         }
         let retained = external_attach_record_from_readback(&session_read, &key_read)?;
         if retained != record {
-            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+            return Err(Box::new(
+                eliot_agent_bridge_core::BridgeError::StaleAuthority,
+            ));
         }
         binding_view(&retained)
     }
@@ -3586,7 +3594,8 @@ impl DaemonComposition {
     /// a synthesized read-only or attributed disposition.
     pub async fn external_attach_reconciliation(
         &self,
-    ) -> Result<Vec<ExternalAttachReconciliationReceipt>, Box<eliot_agent_bridge_core::BridgeError>> {
+    ) -> Result<Vec<ExternalAttachReconciliationReceipt>, Box<eliot_agent_bridge_core::BridgeError>>
+    {
         let session_read = self.external_attach_session_read_request()?;
         let mut receipts = Vec::new();
         self.governor
@@ -3677,7 +3686,9 @@ impl DaemonComposition {
             || snapshot.owner_session_binding != request.owner_session_binding
             || snapshot.expected_state_fence != request.expected_state_fence
         {
-            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+            return Err(Box::new(
+                eliot_agent_bridge_core::BridgeError::StaleAuthority,
+            ));
         }
         if snapshot.row_count == 0 || all_continuable {
             return Ok(());
@@ -3748,7 +3759,9 @@ impl DaemonComposition {
             .await
             .map_err(external_attach_kernel_error)?;
         if !exact_key_in_session {
-            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+            return Err(Box::new(
+                eliot_agent_bridge_core::BridgeError::StaleAuthority,
+            ));
         }
         self.admit_material_continuation_from_owner_snapshot(
             effect,

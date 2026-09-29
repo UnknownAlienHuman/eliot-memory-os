@@ -338,8 +338,7 @@ impl From<eliot_ors::OrsError> for KernelPortError {
 /// frame, where JSON string escaping can at most double the payload bytes.
 /// Keeping the canonical form to one quarter of the frame leaves the other
 /// half for escaping and the identity/operation envelope.
-pub const MAX_EXTERNAL_ATTACH_RECEIPT_PAYLOAD_BYTES: usize =
-    eliot_protocol::MAX_FRAME_BYTES / 4;
+pub const MAX_EXTERNAL_ATTACH_RECEIPT_PAYLOAD_BYTES: usize = eliot_protocol::MAX_FRAME_BYTES / 4;
 
 fn validate_external_attach_payload_bound(payload: &str) -> Result<(), KernelPortError> {
     if payload.is_empty() || payload.len() > MAX_EXTERNAL_ATTACH_RECEIPT_PAYLOAD_BYTES {
@@ -352,8 +351,7 @@ fn validate_external_attach_payload_bound(payload: &str) -> Result<(), KernelPor
 
 pub use eliot_ors::{
     ExternalAttachReceiptCursor, ExternalAttachReceiptRead, ExternalAttachReceiptReadback,
-    ExternalAttachReceiptSessionPage, ExternalAttachReceiptSessionRead,
-    ExternalAttachReceiptWrite,
+    ExternalAttachReceiptSessionPage, ExternalAttachReceiptSessionRead, ExternalAttachReceiptWrite,
 };
 
 /// Complete, revision-pinned owner view used for Material admission.

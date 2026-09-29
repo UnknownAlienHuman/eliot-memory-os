@@ -230,8 +230,9 @@ pub async fn serve_finish_claim(
                 kernel,
                 read_request.clone(),
                 |readback| {
-                    let record = crate::external_attach_record_from_readback(&read_request, readback)
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                    let record =
+                        crate::external_attach_record_from_readback(&read_request, readback)
+                            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
                     all_continuable &= record.receipt.admits_material_continuation();
                     Ok(())
                 },

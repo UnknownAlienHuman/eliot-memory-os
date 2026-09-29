@@ -11,8 +11,8 @@
 
 use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
 use eliot_governor::{
-    ExternalAttachReceiptRead, ExternalAttachReceiptReadback, ExternalAttachReceiptSessionRead,
-    ExternalAttachReceiptSessionPage, ExternalAttachReceiptWrite, KernelPortError,
+    ExternalAttachReceiptRead, ExternalAttachReceiptReadback, ExternalAttachReceiptSessionPage,
+    ExternalAttachReceiptSessionRead, ExternalAttachReceiptWrite, KernelPortError,
     KernelPortFuture, KernelTransitionPort, TaskControllerCampaignSourceHeads,
 };
 use eliot_learning_contracts::{
@@ -362,8 +362,7 @@ impl KernelTransitionPort for DaemonKernelClient {
                 || readback.payload_sha256 != expected.payload_sha256
             {
                 return Err(KernelPortError::Contract(
-                    "Kernel ExternalAttach commit readback differs from its exact write"
-                        .to_owned(),
+                    "Kernel ExternalAttach commit readback differs from its exact write".to_owned(),
                 ));
             }
             Ok(readback)

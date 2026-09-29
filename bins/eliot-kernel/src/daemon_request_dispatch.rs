@@ -2181,8 +2181,9 @@ impl KernelComposition {
                     let request: eliot_ors::ExternalAttachReceiptWrite =
                         serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                             .map_err(|_| TransportError::SessionFenced)?;
-                    let expected_binding = super::runtime_identity::observed_session_principal_binding()
-                        .map_err(|_| TransportError::SessionFenced)?;
+                    let expected_binding =
+                        super::runtime_identity::observed_session_principal_binding()
+                            .map_err(|_| TransportError::SessionFenced)?;
                     if request.owner_session_binding != expected_binding
                         || request.state_fence != session.module_generation.state_fence
                     {
@@ -2210,8 +2211,9 @@ impl KernelComposition {
                     let request: eliot_ors::ExternalAttachReceiptRead =
                         serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                             .map_err(|_| TransportError::SessionFenced)?;
-                    let expected_binding = super::runtime_identity::observed_session_principal_binding()
-                        .map_err(|_| TransportError::SessionFenced)?;
+                    let expected_binding =
+                        super::runtime_identity::observed_session_principal_binding()
+                            .map_err(|_| TransportError::SessionFenced)?;
                     if request.owner_session_binding != expected_binding
                         || request.state_fence != session.module_generation.state_fence
                     {
@@ -2239,8 +2241,9 @@ impl KernelComposition {
                     let request: eliot_ors::ExternalAttachReceiptSessionRead =
                         serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                             .map_err(|_| TransportError::SessionFenced)?;
-                    let expected_binding = super::runtime_identity::observed_session_principal_binding()
-                        .map_err(|_| TransportError::SessionFenced)?;
+                    let expected_binding =
+                        super::runtime_identity::observed_session_principal_binding()
+                            .map_err(|_| TransportError::SessionFenced)?;
                     if request.owner_session_binding != expected_binding
                         || request.expected_state_fence != session.module_generation.state_fence
                     {

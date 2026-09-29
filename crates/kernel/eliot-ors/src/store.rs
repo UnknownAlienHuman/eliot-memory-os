@@ -54,8 +54,7 @@ mod backup_snapshot;
 mod external_attach;
 pub use external_attach::{
     ExternalAttachReceiptCursor, ExternalAttachReceiptRead, ExternalAttachReceiptReadback,
-    ExternalAttachReceiptSessionPage, ExternalAttachReceiptSessionRead,
-    ExternalAttachReceiptWrite,
+    ExternalAttachReceiptSessionPage, ExternalAttachReceiptSessionRead, ExternalAttachReceiptWrite,
 };
 
 mod recovery_projection;
@@ -23069,7 +23068,11 @@ impl RedbRecoveryStore {
         // every other base table, so a lookup on a store that never verified an
         // archive reads authoritatively absent. No row is backfilled or inferred.
         Self::materialize_backup_verification_table(write)?;
-        drop(write.open_table(EXTERNAL_ATTACH_RECEIPTS).map_err(storage)?);
+        drop(
+            write
+                .open_table(EXTERNAL_ATTACH_RECEIPTS)
+                .map_err(storage)?,
+        );
         drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
         drop(
             write

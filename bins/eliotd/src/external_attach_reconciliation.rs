@@ -893,7 +893,10 @@ pub struct ExternalAttachBridgeClaim {
 impl ExternalAttachBridgeClaim {
     fn validate(&self) -> Result<(), Box<BridgeError>> {
         for (field, value) in [
-            ("external_attach_binding.demand_ref", self.demand_ref.as_str()),
+            (
+                "external_attach_binding.demand_ref",
+                self.demand_ref.as_str(),
+            ),
             (
                 "external_attach_binding.connection_ref",
                 self.connection_ref.as_str(),
