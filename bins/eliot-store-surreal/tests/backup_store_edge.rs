@@ -54,13 +54,14 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CAPABILITY_STORE_BACKUP, CanonicalRestoreBatch,
     CanonicalSnapshotPort, DestinationClass, EFFECTS, EffectClass, EventProjectionRelationIntents,
-    IsolatedDestination, IsolatedRestorePort, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHeadExpectation, RevisionKey, ScopeId,
-    SecurityContext, SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor,
-    SnapshotEndReceipt, SnapshotHandle, SnapshotPage, SnapshotValidationReceipt,
-    StoreBackupOperation, StoreBackupRequest, StoreBackupResponse, StoreBackupStatus,
-    StoreBackupStatusOutcome, StoreError, StoreRequest, StoreResponse, TransitionClass,
+    IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort, NamedMutationOperation,
+    NamedMutationRequest, OperationIdentity, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, RequestMeta, ReservedWriteRequest, RestoreValidationReceipt,
+    RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, SnapshotBeginRequest,
+    SnapshotCompleteness, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
+    SnapshotValidationReceipt, StoreBackupOperation, StoreBackupRequest, StoreBackupResponse,
+    StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreRequest, StoreResponse,
+    TransitionClass,
 };
 use eliot_store_surreal::{
     PROTOCOL_VERSION, SERVICE_NAME, StoreHandshakeIdentity, StoreLaunchConfig, admit_handshake,
@@ -175,11 +176,9 @@ fn envelope_identity(operation: &StoreBackupOperation) -> OperationIdentity {
                 canonical_request_hash: "c".repeat(64),
             }
         }
-        StoreBackupOperation::PrepareDestination(_) => OperationIdentity {
-            operation_id: OperationId::new("op-975-restore-1").unwrap(),
-            idempotency_key: "idem-975-restore-1".to_owned(),
-            canonical_request_hash: "c".repeat(64),
-        },
+        StoreBackupOperation::PrepareDestination(destination) => {
+            StoreBackupRequest::prepare_destination_identity(destination).unwrap()
+        }
         StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => {
             batch.operation.clone()
         }
@@ -208,9 +207,11 @@ fn backup_operation_id(operation: &StoreBackupOperation) -> Option<OperationId> 
         StoreBackupOperation::Begin(request) => Some(request.operation.operation_id.clone()),
         StoreBackupOperation::Page { handle, .. } => Some(handle.operation_id.clone()),
         StoreBackupOperation::End { handle } => Some(handle.operation_id.clone()),
-        // Preparing a destination carries no mutation identity: the
-        // destination admission digest binds the failure context instead.
-        StoreBackupOperation::PrepareDestination(_) => None,
+        StoreBackupOperation::PrepareDestination(destination) => Some(
+            StoreBackupRequest::prepare_destination_identity(destination)
+                .unwrap()
+                .operation_id,
+        ),
         StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => {
             Some(batch.operation.operation_id.clone())
         }
@@ -224,7 +225,11 @@ fn backup_idempotency_key(operation: &StoreBackupOperation) -> String {
         StoreBackupOperation::Begin(request) => request.operation.idempotency_key.clone(),
         StoreBackupOperation::Page { handle, .. } => handle.idempotency_key.clone(),
         StoreBackupOperation::End { handle } => handle.idempotency_key.clone(),
-        StoreBackupOperation::PrepareDestination(_) => "idem-975-restore-1".to_owned(),
+        StoreBackupOperation::PrepareDestination(destination) => {
+            StoreBackupRequest::prepare_destination_identity(destination)
+                .unwrap()
+                .idempotency_key
+        }
         StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => {
             batch.operation.idempotency_key.clone()
         }
@@ -308,11 +313,18 @@ fn backup_success_response(operation: &StoreBackupOperation) -> StoreResponse {
                 receipt: fixture_end_receipt(),
             },
         },
-        StoreBackupOperation::PrepareDestination(_) => StoreResponse::Backup {
-            response: StoreBackupResponse::Isolation {
-                evidence: fixture_destination().evidence,
-            },
-        },
+        StoreBackupOperation::PrepareDestination(destination) => {
+            let identity = StoreBackupRequest::prepare_destination_identity(destination).unwrap();
+            StoreResponse::Backup {
+                response: StoreBackupResponse::Isolation {
+                    receipt: IsolatedDestinationReceipt {
+                        operation: identity,
+                        destination_id: destination.destination_id.clone(),
+                        admission_digest: "a".repeat(64),
+                    },
+                },
+            }
+        }
         StoreBackupOperation::RestoreBatch(_) => StoreResponse::Backup {
             response: StoreBackupResponse::Restored {
                 receipt: fixture_restore_receipt(),
@@ -1689,7 +1701,8 @@ async fn verify_and_status_paths_cannot_restore_cut_over_or_unblock() {
         IsolatedRestorePort::prepare_isolated_destination(
             &backend,
             &backup_context("request-975-a13b"),
-            fixture_destination()
+            fixture_destination(),
+            fixture_begin().operation,
         )
         .await
         .expect_err("default prepare manufactures no evidence"),
@@ -2123,11 +2136,14 @@ fn live_windows_capture_and_isolated_restore_through_real_adapter() {
         assert!(end.is_complete());
         // Isolated restore through the real adapter, then validation and
         // reconciliation of the same operation.
-        let evidence = composition
-            .backup_prepare_destination(&context, fixture_destination())
+        let destination = fixture_destination();
+        let destination_operation =
+            StoreBackupRequest::prepare_destination_identity(&destination).unwrap();
+        let destination_receipt = composition
+            .backup_prepare_destination(&context, destination, destination_operation)
             .await
             .expect("live destination prepares");
-        assert!(!evidence.admission_handle.is_empty());
+        assert!(destination_receipt.validate().is_ok());
         let restored = composition
             .backup_restore_batch(&context, fixture_batch())
             .await

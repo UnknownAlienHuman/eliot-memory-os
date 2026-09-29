@@ -50,10 +50,10 @@ use eliot_store_api::{
     RequestMeta, RestoreConflictKind, RestoreValidationReceipt, Resubmission, RevisionHead,
     RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
     SnapshotBounds, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt,
-    SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage, SnapshotSourceIdentity,
-    SnapshotValidationReceipt, StoreError, StoreHealth, StoreMutationDisposition, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, classify_restore_conflict, is_backup_io_capability,
-    reconcile_same_operation,
+    SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage, SnapshotPageCoverage,
+    SnapshotPageState, SnapshotSourceIdentity, SnapshotValidationReceipt, StoreError, StoreHealth,
+    StoreMutationDisposition, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    classify_restore_conflict, is_backup_io_capability, reconcile_same_operation,
 };
 use serde_json::{Value, json};
 
@@ -212,10 +212,15 @@ fn page_for(begin: &SnapshotBeginRequest) -> SnapshotPage {
         cursor: SnapshotCursor {
             handle_digest: handle.snapshot_digest.clone(),
             page_index: 0,
-            cumulative_members: 2,
-            cumulative_bytes: 3072,
+            cumulative_members: 0,
+            cumulative_bytes: 0,
         },
         members: vec![record_member(), blob_member()],
+        coverage: SnapshotPageCoverage {
+            state: SnapshotPageState::InProgress,
+            cumulative_members: 2,
+            denominator_members: 3,
+        },
         cumulative_bytes: 3072,
         cumulative_work: 50,
         is_last: false,
@@ -223,8 +228,8 @@ fn page_for(begin: &SnapshotBeginRequest) -> SnapshotPage {
         next_cursor: Some(SnapshotCursor {
             handle_digest: handle.snapshot_digest.clone(),
             page_index: 1,
-            cumulative_members: 3,
-            cumulative_bytes: 3136,
+            cumulative_members: 2,
+            cumulative_bytes: 3072,
         }),
         handle,
     }
@@ -417,7 +422,7 @@ fn consume_restore_defaults(
     first: OperationIdentity,
     second: OperationIdentity,
 ) {
-    std::mem::drop(port.prepare_isolated_destination(ctx, dest));
+    std::mem::drop(port.prepare_isolated_destination(ctx, dest, begin_request().operation));
     std::mem::drop(port.restore_canonical_batch(ctx, batch.clone()));
     std::mem::drop(port.validate_restore(ctx, batch));
     std::mem::drop(port.reconcile_operation(first, second));
@@ -583,15 +588,28 @@ fn snapshot_pages_and_cursors_cannot_cross_snapshot_or_reset_bounds() {
     let mut crossed = page.clone();
     crossed.handle.snapshot_digest = hex('8');
     crossed.cursor.handle_digest = hex('8');
-    crossed.cursor.page_index = 1;
+    crossed
+        .next_cursor
+        .as_mut()
+        .expect("page has a continuation")
+        .handle_digest = hex('8');
     assert!(crossed.validate().is_ok());
     assert!(crossed.validate_continuation(&page).is_err());
     // Cumulative bytes must never reset along a continuation.
     let mut rewound_bytes = page.clone();
     rewound_bytes.members = vec![reference_member()];
+    rewound_bytes.cursor.cumulative_bytes = 36;
+    rewound_bytes.cursor.cumulative_members = 3;
     rewound_bytes.cumulative_bytes = 100;
     rewound_bytes.cursor.page_index = 1;
-    rewound_bytes.cursor.cumulative_members = 3;
+    rewound_bytes.coverage.cumulative_members = 4;
+    rewound_bytes.coverage.denominator_members = 5;
+    rewound_bytes.next_cursor = Some(SnapshotCursor {
+        handle_digest: rewound_bytes.handle.snapshot_digest.clone(),
+        page_index: 2,
+        cumulative_members: 4,
+        cumulative_bytes: 100,
+    });
     assert!(rewound_bytes.validate().is_ok());
     assert!(rewound_bytes.validate_continuation(&page).is_err());
     // Cumulative members must never reset along a continuation.
@@ -600,6 +618,14 @@ fn snapshot_pages_and_cursors_cannot_cross_snapshot_or_reset_bounds() {
     rewound_members.cumulative_bytes = 3136;
     rewound_members.cursor.page_index = 1;
     rewound_members.cursor.cumulative_members = 1;
+    rewound_members.coverage.cumulative_members = 4;
+    rewound_members.coverage.denominator_members = 5;
+    rewound_members.next_cursor = Some(SnapshotCursor {
+        handle_digest: rewound_members.handle.snapshot_digest.clone(),
+        page_index: 2,
+        cumulative_members: 4,
+        cumulative_bytes: 3136,
+    });
     assert!(rewound_members.validate().is_ok());
     assert!(rewound_members.validate_continuation(&page).is_err());
     // The page index must advance by exactly one.

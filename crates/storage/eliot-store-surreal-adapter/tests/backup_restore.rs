@@ -921,7 +921,11 @@ async fn lost_response_reconciles_exact_receipt_without_blind_retry() {
     let port = FailClosedPort;
     let context = ctx();
     let prepare = port
-        .prepare_isolated_destination(&context, valid_destination())
+        .prepare_isolated_destination(
+            &context,
+            valid_destination(),
+            valid_operation("op-952-14", &hex('c')),
+        )
         .await
         .expect_err("default prepare refuses");
     assert_eq!(prepare, StoreError::UnknownOperation);
