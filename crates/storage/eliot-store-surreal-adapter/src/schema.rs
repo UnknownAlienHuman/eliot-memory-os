@@ -641,10 +641,7 @@ pub(crate) const TX_MARK_SCHEMA_MIGRATION_INTENT: &str = "LET $schema_intent = (
 /// commit. It performs no DDL, so it neither creates nor removes a table and
 /// cannot be mistaken for a schema generation.
 pub(crate) fn migration_intent_sql() -> String {
-    format!(
-        "{} {} {} {}",
-        TX_BEGIN, TX_GUARD_FENCE, TX_MARK_SCHEMA_MIGRATION_INTENT, TX_COMMIT
-    )
+    format!("{TX_BEGIN} {TX_GUARD_FENCE} {TX_MARK_SCHEMA_MIGRATION_INTENT} {TX_COMMIT}")
 }
 
 pub(crate) fn forward_migration_sql() -> String {
