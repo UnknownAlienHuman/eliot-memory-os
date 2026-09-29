@@ -2207,61 +2207,7 @@ impl GrantGraph {
         if !self.grants.contains_key(origin) {
             return Err(AuthorityError::MissingParent(origin.clone()));
         }
-        // `BTreeMap` iteration is grant-id ordered, so edge order is
-        // deterministic across restarts and owners.
-        let mut edges = Vec::new();
-        for grant in self.grants.values() {
-            let Some(parent_id) = grant.parent_grant_id.as_ref() else {
-                // A grant with no parent grant id is a delegation root, not an
-                // edge: it has no source position to qualify, so there is no
-                // edge to declare and no disposition to record for it here.
-                continue;
-            };
-            let Some(parent) = self.grants.get(parent_id) else {
-                // Admitted maps resolve every parent; an unresolvable edge
-                // is declared cross-scope so the evaluator records a typed
-                // omission for it instead of following unknown lineage.
-                edges.push(QualifiedInfluenceEdge::cross_scope(
-                    parent_id.as_str().to_owned(),
-                    grant.grant_id.as_str().to_owned(),
-                ));
-                continue;
-            };
-            // Authorized inheritance — same-root or receipt-covered — is
-            // current by construction and propagates. Anything else is
-            // declared with the dedicated cross-scope influence relation so
-            // the evaluator records a typed `CrossScope` omission naming the
-            // exact source-bound edge position instead of an absent edge the
-            // reader cannot distinguish from an unexamined one. Revocation
-            // cannot widen scope or effect: an omitted dependent is never
-            // followed, never revoked by this traversal, and never enters
-            // the affected set.
-            if edge_is_authorized(parent, grant, &self.transitions) {
-                edges.push(QualifiedInfluenceEdge {
-                    source_ref: parent_id.as_str().to_owned(),
-                    dependent_ref: grant.grant_id.as_str().to_owned(),
-                    disposition: InfluenceEdgeDisposition::PermittedCurrent,
-                });
-            } else {
-                edges.push(QualifiedInfluenceEdge::cross_scope(
-                    parent_id.as_str().to_owned(),
-                    grant.grant_id.as_str().to_owned(),
-                ));
-            }
-        }
-        // Retained quarantined relations are influence evidence, not
-        // authority: each is declared with the dedicated cross-scope
-        // relation so the omission names the exact refused edge while the
-        // full lineage stays visible in the snapshot. Quarantine is not
-        // erasure; the verdict binds an omission only to a CURRENT
-        // verified quarantine binding and otherwise preserves the exact
-        // omission and dependent frontier.
-        for relation in self.quarantined.values() {
-            edges.push(QualifiedInfluenceEdge::cross_scope(
-                relation.parent_grant_id.as_str().to_owned(),
-                relation.child.grant_id.as_str().to_owned(),
-            ));
-        }
+        let edges = self.qualified_influence_edges();
         let request = BoundedRevocationRequest {
             request_id: format!("transitive-revocation:{}", origin.as_str()),
             root_ref: origin.as_str().to_owned(),
@@ -2339,6 +2285,67 @@ impl GrantGraph {
             }
         }
         Ok(outcome)
+    }
+
+    /// Qualifies every grant edge the graph currently knows, plus each
+    /// retained quarantined relation, as a cross-scope influence edge.
+    fn qualified_influence_edges(&self) -> Vec<QualifiedInfluenceEdge> {
+        // `BTreeMap` iteration is grant-id ordered, so edge order is
+        // deterministic across restarts and owners.
+        let mut edges = Vec::new();
+        for grant in self.grants.values() {
+            let Some(parent_id) = grant.parent_grant_id.as_ref() else {
+                // A grant with no parent grant id is a delegation root, not an
+                // edge: it has no source position to qualify, so there is no
+                // edge to declare and no disposition to record for it here.
+                continue;
+            };
+            let Some(parent) = self.grants.get(parent_id) else {
+                // Admitted maps resolve every parent; an unresolvable edge
+                // is declared cross-scope so the evaluator records a typed
+                // omission for it instead of following unknown lineage.
+                edges.push(QualifiedInfluenceEdge::cross_scope(
+                    parent_id.as_str().to_owned(),
+                    grant.grant_id.as_str().to_owned(),
+                ));
+                continue;
+            };
+            // Authorized inheritance — same-root or receipt-covered — is
+            // current by construction and propagates. Anything else is
+            // declared with the dedicated cross-scope influence relation so
+            // the evaluator records a typed `CrossScope` omission naming the
+            // exact source-bound edge position instead of an absent edge the
+            // reader cannot distinguish from an unexamined one. Revocation
+            // cannot widen scope or effect: an omitted dependent is never
+            // followed, never revoked by this traversal, and never enters
+            // the affected set.
+            if edge_is_authorized(parent, grant, &self.transitions) {
+                edges.push(QualifiedInfluenceEdge {
+                    source_ref: parent_id.as_str().to_owned(),
+                    dependent_ref: grant.grant_id.as_str().to_owned(),
+                    disposition: InfluenceEdgeDisposition::PermittedCurrent,
+                });
+            } else {
+                edges.push(QualifiedInfluenceEdge::cross_scope(
+                    parent_id.as_str().to_owned(),
+                    grant.grant_id.as_str().to_owned(),
+                ));
+            }
+        }
+        // Retained quarantined relations are influence evidence, not
+        // authority: each is declared with the dedicated cross-scope
+        // relation so the omission names the exact refused edge while the
+        // full lineage stays visible in the snapshot. Quarantine is not
+        // erasure; the verdict binds an omission only to a CURRENT
+        // verified quarantine binding and otherwise preserves the exact
+        // omission and dependent frontier.
+        for relation in self.quarantined.values() {
+            edges.push(QualifiedInfluenceEdge::cross_scope(
+                relation.parent_grant_id.as_str().to_owned(),
+                relation.child.grant_id.as_str().to_owned(),
+            ));
+        }
+        edges
     }
 
     /// Collects the quarantined dependents whose edge source the walk
