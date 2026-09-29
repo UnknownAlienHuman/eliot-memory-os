@@ -10,6 +10,7 @@ use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
 };
 
+use crate::AdmittedIsolatedDestination;
 use crate::CompositionError;
 use crate::HostObservationSource;
 use crate::HostObservationState;
@@ -1082,28 +1083,38 @@ impl WatchdogBackupPort {
         crate::watchdog_spool::backup::read_page(fence, page_index, &self.limits)
     }
 
-    /// Imports bounded restore steps and reports whether recovery is accepted.
+    /// Imports bounded restore steps INTO THE ADMITTED ISOLATED DESTINATION and
+    /// reports whether recovery is accepted.
     ///
     /// Thin delegation to `WatchdogSpool::import_backup_isolated`, with the
-    /// request's `active` installation bound against the owner-held identity
-    /// so an import can never be presented as isolated from the wrong live
-    /// installation. `dest` must differ from both `source` and that active
-    /// identity; old signed observations stay historical evidence under their
-    /// exact source identity and grant no active supervision, heartbeat,
-    /// lease, or epoch authority. A repeated byte-identical import appends
-    /// nothing; the observed disposition is then passed through
-    /// `acceptance_allowed`, so an unresolved reconciliation blocks recovery
-    /// acceptance instead of returning zero by default.
+    /// request's `active` installation bound against the owner-held identity so
+    /// an import can never be presented as isolated from the wrong live
+    /// installation. The destination is not a string: it is the externally
+    /// admitted installation binding, and the admitted destination's own
+    /// owner-issued identity is what the isolation gate compares — so the
+    /// destination must differ from both `source` and that active identity by
+    /// owner-issued fact, not by presentation. Old signed observations stay
+    /// historical evidence under their exact source identity and grant no
+    /// active supervision, heartbeat, lease, or epoch authority. A repeated
+    /// byte-identical import appends nothing to the destination; the observed
+    /// disposition is then passed through `acceptance_allowed`, so an
+    /// unresolved reconciliation blocks recovery acceptance instead of
+    /// returning zero by default.
+    ///
+    /// `destination: None` is refused by the owner with
+    /// [`SpoolError::InvalidLease`]; this port never substitutes the active
+    /// installation's own spool for a missing destination admission.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError`] when the active identity is not the owner's, the
-    /// destination is not isolated, the step chain breaks, content conflicts,
-    /// or reconciliation is unknown.
+    /// Returns [`SpoolError`] when the active identity is not the owner's, no
+    /// externally admitted destination was supplied, the destination is not
+    /// isolated, its spool cannot be opened, the step chain breaks, content
+    /// conflicts, or reconciliation is unknown.
     pub fn import_isolated(
         &self,
         source: &str,
-        dest: &str,
+        destination: Option<&AdmittedIsolatedDestination>,
         active: &str,
         steps: &[SpoolRestoreStep],
     ) -> Result<SpoolRestoreDisposition, SpoolError> {
@@ -1113,9 +1124,8 @@ impl WatchdogBackupPort {
                     .to_owned(),
             ));
         }
-        let disposition = self
-            .spool
-            .import_backup_isolated(source, dest, active, steps)?;
+        let disposition =
+            WatchdogSpool::import_backup_isolated(source, destination, active, steps)?;
         crate::watchdog_spool::backup::acceptance_allowed(disposition)?;
         Ok(disposition)
     }

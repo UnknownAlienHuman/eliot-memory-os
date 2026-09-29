@@ -6,6 +6,16 @@
 //! This module owns only the installer-bound admission read, validation, and retained no-follow
 //! runtime binding. It performs no SCM mutation, lifecycle decision, canonical/ORS/Host-journal
 //! write, authority minting, or policy operation.
+//!
+//! It owns two admissions. `FileWatchdogAdmission` admits the installation THIS
+//! PROCESS runs under, and additionally requires that the running image and the
+//! durable Phase-B supervision authority belong to it.
+//! [`admit_isolated_destination`] admits a DIFFERENT, isolated, new installation
+//! as a recovery-import destination, and requires neither — a destination is by
+//! definition not the running process and has no authority to reuse. Both go
+//! through the same registry inspection, manifest selection, service-approval,
+//! artifact-digest, and retained-root-lease owners; only those two
+//! process-coupled checks differ.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -306,6 +316,237 @@ pub(crate) fn inspect_registry_at(
     host_root: ProtectedRootLease,
 ) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
     RedbInstallationRegistry::inspect_existing_at(host_root)
+}
+
+/// One externally admitted isolated destination installation.
+///
+/// Built only by [`admit_isolated_destination`], which reads the DESTINATION
+/// installation's own installer-owned registry at the path that installation's
+/// own SCM bootstrap declares, selects the single approved generation that
+/// bootstrap names, verifies both of that generation's approved images against
+/// their approved digests, and retains no-follow leases for that generation's
+/// runtime roots. The installation identity and the Watchdog state root are
+/// therefore both read out of the destination's own approved manifest: no
+/// presented string and no presented path chooses either one.
+///
+/// This is deliberately not a [`WatchdogRuntimeBinding`] and carries none of
+/// that type's authority material. It holds no provisioned supervision
+/// authority, no supervision lease, no heartbeat readiness, no Kernel or
+/// Watchdog epoch, and makes no running-image assertion. An isolated restore
+/// destination is a NEW installation that is not the running process, so
+/// requiring this process to be its approved image — or requiring it to hold
+/// durable Phase-B supervision authority — would refuse exactly the
+/// destination an isolated restore exists to produce. Nothing here can be read
+/// as, converted into, or used to satisfy any authority check; the only thing
+/// it authorizes is "this root is an installer-approved installation, and it is
+/// not the source or the active one".
+///
+/// Isolation is not asserted here. It is proved at the point of import, by
+/// [`validate_isolated_destination`](crate::validate_isolated_destination)
+/// comparing this destination's owner-issued identity against the presented
+/// source identity and the OWNER-HELD active identity.
+pub struct AdmittedIsolatedDestination {
+    /// Installation identity the destination's own approved manifest declares.
+    destination_installation: String,
+    /// Destination's own installer-approved Watchdog state root.
+    destination_state_root: PathBuf,
+    /// Retained no-follow proof that the destination's Host-state contour
+    /// cannot be replaced underneath the registry this binding was read from.
+    _host_state_root_lease: Arc<ProtectedRootLease>,
+    /// Retained no-follow lease for the destination's approved Host image, held
+    /// for this binding's whole lifetime so the image whose digest was proved
+    /// at admission is the one still present at import.
+    _approved_host_image_lease: Arc<ProtectedPathLease>,
+    /// Retained validated no-follow leases for every destination runtime root,
+    /// including the Watchdog state root, so that root cannot be swapped between
+    /// admission and the import's own read.
+    _root_leases: Arc<ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>>,
+}
+
+impl AdmittedIsolatedDestination {
+    /// Returns the destination installation identity the destination's own
+    /// approved manifest declares.
+    ///
+    /// Owner-issued: it is read out of the destination's own registry-selected
+    /// approved generation, so it is never a value a caller chose.
+    #[must_use]
+    pub fn installation(&self) -> &str {
+        &self.destination_installation
+    }
+
+    /// Returns the destination installation's own installer-approved Watchdog
+    /// state root.
+    #[must_use]
+    pub fn watchdog_state_root(&self) -> &Path {
+        &self.destination_state_root
+    }
+}
+
+/// Admits one isolated destination installation for recovery import.
+///
+/// This is the SAME owner, registry, and validator chain the live installation
+/// is admitted through — [`inspect_registry_at`],
+/// [`select_runtime_manifest`], [`load_approved_service_registations`], the
+/// approved-artifact digest checks, and
+/// [`WindowsRuntimeRootLeaseProvider`] root retention — applied to the
+/// DESTINATION's own registry and the destination's own SCM bootstrap rather
+/// than to this process's. The presented `registry_path` and `bootstrap` are
+/// claims, never identities: the bootstrap's installation identity, generation,
+/// Host state root, and configuration descriptor must all equal the approved
+/// manifest that the destination's own registry holds, or this refuses.
+///
+/// It differs from the live-installation admission in exactly two checks, both
+/// of which would refuse a real destination:
+///
+/// - it does not require durable provisioned supervision authority, because a
+///   new isolated installation has none yet and requiring one would demand the
+///   destination already hold the authority an isolated restore exists not to
+///   reuse; and
+/// - it does not compare the running image to the destination's approved
+///   Watchdog image, because the destination is by definition not the running
+///   process.
+///
+/// It therefore proves a destination is an installer-approved installation with
+/// retained, no-follow, digest-checked roots — and nothing about authority,
+/// liveness, or the running process.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] when the destination's declared Host state root
+/// cannot be retained or does not canonicalize to itself, the registry is not
+/// that root's exact approved child or is absent, no single approved
+/// generation matches the destination bootstrap, the installer SCM approvals or
+/// the `SystemService` profile do not hold, either approved image is absent or
+/// digest-mismatched, or the destination runtime roots cannot be retained and
+/// validated.
+pub fn admit_isolated_destination(
+    registry_path: impl Into<PathBuf>,
+    bootstrap: ServiceBootstrapArguments,
+) -> Result<AdmittedIsolatedDestination, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.admit_isolated_destination").entered();
+    tracing::debug!(
+        event = "watchdog.isolated_destination_admission_attempted",
+        observation = "attempted",
+        "attempting admission of an isolated restore destination installation"
+    );
+    let registry_path = registry_path.into();
+    let declared_host_root = bootstrap.host_state_root().ok_or_else(|| {
+        SpoolError::InvalidLease(
+            "isolated restore destination admission omitted the installer-approved Host state root"
+                .to_owned(),
+        )
+    })?;
+    let host_state_root_lease =
+        ProtectedRootLease::open_existing(declared_host_root).map_err(|error| {
+            SpoolError::InvalidLease(format!(
+                "isolated restore destination Host state root open failed: {error}"
+            ))
+        })?;
+    let canonical_host_root = host_state_root_lease.canonical_path().map_err(|error| {
+        SpoolError::InvalidLease(format!(
+            "isolated restore destination Host state root resolve failed: {error}"
+        ))
+    })?;
+    if !windows_paths_equal(&canonical_host_root, declared_host_root) {
+        return Err(SpoolError::InvalidLease(
+            "isolated restore destination Host state root is not the exact retained installation root"
+                .to_owned(),
+        ));
+    }
+    let expected_registry_path = canonical_host_root.join(INSTALLATION_REGISTRY_FILE_NAME);
+    if !windows_paths_equal(&registry_path, &expected_registry_path) {
+        return Err(SpoolError::InvalidLease(
+            "isolated restore destination registry path is not the exact approved Host child"
+                .to_owned(),
+        ));
+    }
+    let registry = inspect_registry_at(
+        ProtectedRootLease::open_existing(&canonical_host_root).map_err(|error| {
+            SpoolError::InvalidLease(format!(
+                "isolated restore destination Host state root reopen failed: {error}"
+            ))
+        })?,
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+    .ok_or_else(|| {
+        SpoolError::InvalidLease(
+            "isolated restore destination installation registry is missing".to_owned(),
+        )
+    })?;
+    let selected_manifest = select_runtime_manifest(&registry, &bootstrap)?;
+    let _ = load_approved_service_registrations(&registry, &selected_manifest, &bootstrap)?;
+    let roots = selected_manifest.runtime_launch.runtime_state_roots.clone();
+    if roots.profile != InstallationProfile::SystemService {
+        return Err(SpoolError::InvalidLease(
+            "isolated restore destination has no retained file adapter for this installation profile"
+                .to_owned(),
+        ));
+    }
+    let approved_host_image_lease = verify_destination_approved_artifacts(&selected_manifest)?;
+    let mut provider = WindowsRuntimeRootLeaseProvider::for_roots(&roots)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let root_leases = roots
+        .retain_and_validate(&mut provider)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    Ok(AdmittedIsolatedDestination {
+        destination_installation: selected_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned(),
+        destination_state_root: PathBuf::from(roots.watchdog_state_root.as_str()),
+        _host_state_root_lease: Arc::new(host_state_root_lease),
+        _approved_host_image_lease: Arc::new(approved_host_image_lease),
+        _root_leases: Arc::new(root_leases),
+    })
+}
+
+/// Proves both approved images an isolated destination's approved generation
+/// declares, and returns the retained no-follow Host-image lease.
+///
+/// Both digests come from the destination's OWN registry-selected approved
+/// manifest, and both are read through the same `verify_file_digest*` owners the
+/// live-installation admission uses, so an absent, substituted, or
+/// digest-mismatched destination image is refused here rather than discovered
+/// later. The Watchdog image is verified against its approved digest only —
+/// deliberately NOT against this process's running image, because the
+/// destination is not the running process.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::InvalidLease`] when the approved Host artifact binding
+/// cannot be resolved, either approved image cannot be opened under the
+/// protected no-follow lease, or either approved digest does not match the
+/// bytes at that image.
+fn verify_destination_approved_artifacts(
+    selected_manifest: &CandidateManifest,
+) -> Result<ProtectedPathLease, SpoolError> {
+    let approved_host_image = approved_host_artifact_path(selected_manifest)?;
+    let approved_host_image_lease =
+        ProtectedPathLease::open_existing_absolute(&approved_host_image).map_err(|error| {
+            SpoolError::InvalidLease(format!(
+                "isolated restore destination approved Host image open failed: {error}"
+            ))
+        })?;
+    verify_file_digest_with_lease(
+        &approved_host_image_lease,
+        &selected_manifest.runtime_launch.host_artifact_digest,
+        "runtime_launch.host_artifact_digest",
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    verify_file_digest(
+        Path::new(
+            selected_manifest
+                .runtime_launch
+                .watchdog_executable_path
+                .as_str(),
+        ),
+        &selected_manifest.runtime_launch.watchdog_artifact_digest,
+        "runtime_launch.watchdog_artifact_digest",
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    Ok(approved_host_image_lease)
 }
 
 #[allow(
