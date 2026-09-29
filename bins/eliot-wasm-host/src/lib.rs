@@ -87,11 +87,12 @@ pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
 pub use parent_dispatch::drive_parent_dispatch;
 pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime, drive_parent_runtime};
 pub use request_loop::{
-    AdmittedBinding, DeliverySetChannel, KernelControlReader, LoopCompletion, LoopError,
-    MAX_RESULT_FRAME_BYTES, MAX_RESULT_SEQUENCE, MAX_RETAINED_RESULT_STREAM_BYTES, OP_CANCEL,
-    OP_INVOKE, OP_RECONCILE, OP_SHUTDOWN, ObservedResultRetention, OrdinaryDriveError,
-    OrdinaryOutcome, RESULT_PHASE_CONTAIN, RESULT_PHASE_DENY, RESULT_PHASE_EXECUTE,
-    RESULT_PHASE_RECONCILE, RequestLoopReport, ServedResultReadback, WASM_HOST_REQUEST_WIRE_ID,
+    ACK_PHASE_COMPLETED, ACK_PHASE_ENQUEUED, AdmittedBinding, ControlDeliveryAcknowledgement,
+    DeliverySetChannel, KernelControlReader, LoopCompletion, LoopError, MAX_RESULT_FRAME_BYTES,
+    MAX_RESULT_SEQUENCE, MAX_RETAINED_RESULT_STREAM_BYTES, OP_CANCEL, OP_INVOKE, OP_RECONCILE,
+    OP_SHUTDOWN, ObservedResultRetention, OrdinaryDriveError, OrdinaryOutcome,
+    RESULT_PHASE_CONTAIN, RESULT_PHASE_DENY, RESULT_PHASE_EXECUTE, RESULT_PHASE_RECONCILE,
+    RequestLoopReport, ServedResultReadback, WASM_HOST_REQUEST_WIRE_ID,
     WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID, WASM_HOST_RESULT_WIRE_VERSION,
     WasmHostRequest, WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame,
     run_ordinary_request_loop, run_request_loop, validate_frame, validate_result_stream,
