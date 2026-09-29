@@ -492,6 +492,8 @@ impl OriginControlPresentation {
 pub struct OriginControlGrant {
     challenge_id: String,
     operation: OriginControlOperation,
+    physical: PhysicalProcessBinding,
+    generation: Generation,
     decided_at_unix_ms: u64,
     grant_digest: String,
 }
@@ -517,9 +519,33 @@ impl OriginControlGrant {
         &self.grant_digest
     }
 
+    /// Checks that this grant names exactly the physical identity and managed
+    /// generation the caller is about to act on.
+    ///
+    /// The effect boundary calls this with the identity the authoritative
+    /// owner still holds for the same operation, so a grant minted for one
+    /// child, one image, one start time, or one generation cannot authorize a
+    /// different or substituted target. A grant is not transferable between
+    /// operations, so this never needs the operation identity to match.
+    pub fn binds_target(
+        &self,
+        physical: &PhysicalProcessBinding,
+        generation: Generation,
+    ) -> Result<(), ContractError> {
+        if self.physical != *physical {
+            return Err(ContractError::IdentityMismatch);
+        }
+        if self.generation != generation {
+            return Err(ContractError::FenceMismatch);
+        }
+        Ok(())
+    }
+
     fn mint(
         key: &KernelDispatchKey,
         challenge: &OriginChallenge,
+        physical: &PhysicalProcessBinding,
+        generation: Generation,
         now_unix_ms: u64,
     ) -> Result<Self, ContractError> {
         #[derive(Serialize)]
@@ -527,12 +553,16 @@ impl OriginControlGrant {
             domain: &'a str,
             authentication_tag: &'a str,
             operation: OriginControlOperation,
+            physical: &'a PhysicalProcessBinding,
+            generation: Generation,
             decided_at_unix_ms: u64,
         }
         let bytes = serde_json::to_vec(&GrantMaterial {
             domain: ORIGIN_CHALLENGE_DOMAIN,
             authentication_tag: &challenge.authentication_tag,
             operation: challenge.operation,
+            physical,
+            generation,
             decided_at_unix_ms: now_unix_ms,
         })
         .map_err(|error| ContractError::Serialization(error.to_string()))?;
@@ -540,6 +570,8 @@ impl OriginControlGrant {
         Ok(Self {
             challenge_id: challenge.challenge_id.clone(),
             operation: challenge.operation,
+            physical: physical.clone(),
+            generation,
             decided_at_unix_ms: now_unix_ms,
             grant_digest,
         })
@@ -940,7 +972,17 @@ impl OriginChallengeAuthority {
         {
             return Err(ContractError::DispatchPermitConsumed);
         }
-        OriginControlGrant::mint(&self.key, &presentation.challenge, now_unix_ms)
+        // `verify` above already proved the request's physical identity and
+        // generation equal the challenge's, so the grant carries those exact
+        // values: the effect boundary can then recheck the still-running
+        // target against the proof instead of trusting the caller's routing.
+        OriginControlGrant::mint(
+            &self.key,
+            &presentation.challenge,
+            &presentation.request.physical,
+            presentation.request.generation,
+            now_unix_ms,
+        )
     }
 
     /// Returns how many challenges were consumed by decisions.
