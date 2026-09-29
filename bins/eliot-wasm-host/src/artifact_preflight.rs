@@ -41,6 +41,10 @@ pub enum PreflightError {
     ReparsePoint,
     /// Path does not name a regular file.
     NotAFile,
+    /// Path is not an explicit absolute local path. The experimental lane
+    /// denies relative spellings instead of resolving them against the
+    /// process working directory.
+    NotAbsolute,
     /// File length changed after its opened-handle metadata was observed.
     LengthChanged,
     /// Bytes do not start with the WebAssembly magic.
@@ -60,6 +64,7 @@ impl fmt::Display for PreflightError {
             }
             Self::ReparsePoint => formatter.write_str("PREFLIGHT_REPARSE_POINT"),
             Self::NotAFile => formatter.write_str("PREFLIGHT_NOT_A_FILE"),
+            Self::NotAbsolute => formatter.write_str("PREFLIGHT_NOT_ABSOLUTE"),
             Self::LengthChanged => formatter.write_str("PREFLIGHT_LENGTH_CHANGED"),
             Self::MalformedPreamble => formatter.write_str("PREFLIGHT_MALFORMED_PREAMBLE"),
             Self::CoreModuleRejected => formatter.write_str("PREFLIGHT_CORE_MODULE_REJECTED"),
@@ -96,6 +101,19 @@ pub fn preflight_bytes(bytes: &[u8]) -> Result<Preflight, PreflightError> {
         digest: Sha256Digest::of_bytes(bytes),
         byte_len,
     })
+}
+
+/// Rejects a non-absolute artifact path without consulting the environment.
+/// The local-experimental lane accepts only an explicit absolute local path,
+/// so a relative spelling is denied instead of being resolved against the
+/// process working directory (no environment, registry, discovery, URL,
+/// credential, provider, or Kernel lookup on that lane).
+pub fn require_absolute_artifact_path(path: &Path) -> Result<(), PreflightError> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(PreflightError::NotAbsolute)
+    }
 }
 
 /// Reads one explicit local artifact path once into a bounded buffer.

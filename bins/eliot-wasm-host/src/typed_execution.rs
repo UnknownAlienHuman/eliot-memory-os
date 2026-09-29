@@ -568,8 +568,9 @@ fn check_ceiling(
 /// Reads nothing: the caller supplies the exact immutable buffer. The same
 /// buffer is hashed (preflight) and compiled; the path is never reread.
 /// Zero ambient imports, full resource limits, and output checks apply to
-/// descriptor/initialization execution exactly like a domain call. The
-/// admitted typed domain operation is executed by
+/// descriptor/initialization execution exactly like a domain call, including
+/// the descriptor ABI-digest check [`execute_domain_experimental`] applies.
+/// The admitted typed domain operation is executed by
 /// [`execute_domain_experimental`], which reuses this same preflight,
 /// envelope and limits.
 pub fn execute_describe_experimental(
@@ -602,6 +603,7 @@ pub fn execute_describe_experimental(
     let (output_digest, output_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
             .map_err(|error| staged(TypedStage::Output, error))?;
+    validate_descriptor_abi_digest(&descriptor).map_err(|error| staged(TypedStage::Output, error))?;
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let input_digest = Sha256Digest::of_bytes(&[]);

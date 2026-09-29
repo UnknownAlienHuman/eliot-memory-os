@@ -46,6 +46,7 @@ mod pool;
 pub use admission::{LiveAuthority, PortGrantError, ResolvedPortGrant, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
+    require_absolute_artifact_path,
 };
 pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
 pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
