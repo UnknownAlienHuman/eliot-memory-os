@@ -6,7 +6,7 @@ use eliot_contracts::{
 use eliot_learning_activation_assessment::{
     ActivationAssessmentError, AdherenceStatus, AssessmentInput, AssessmentPolicy,
     AssessmentResultOrIncomplete, MAX_INPUT_BYTES, MAX_METRICS, MAX_OUTPUT_BYTES, MAX_STAGES,
-    MissingAssessmentField,
+    MissingAssessmentField, ObservedAdherence, ObservedDelivery, ObservedRetrieval, ObservedUse,
 };
 use eliot_learning_contracts::{
     AgentAttemptId, AssessmentDimension, CampaignActiveOverlayPolicy,
