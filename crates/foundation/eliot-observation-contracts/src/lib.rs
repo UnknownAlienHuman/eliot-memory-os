@@ -746,6 +746,16 @@ pub enum MaintenanceExecutionOutcome {
     Failed,
     /// The attempt was cancelled.
     Cancelled,
+    /// The provider proved the effect did not happen, so the same identity may
+    /// retry.
+    ///
+    /// This variant exists because its absence was a live defect. A
+    /// reconciliation disposition that proves the effect never applied is not
+    /// `COMPLETED`, it did not observe a failure, and it is no longer `UNKNOWN`
+    /// either. Without it the only honest-looking encodings were a fabricated
+    /// failure or a re-asserted uncertainty the reconciliation had just
+    /// resolved.
+    ProvenNoEffect,
     /// The execution/effect outcome remains unresolved.
     Unknown,
 }

@@ -38,9 +38,10 @@ use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_governor::{CompositionError, KernelPortError, KernelTransitionPort};
 use eliot_maintenance::{
     AutomationTriggerDecision, CONTRACT_NAME, CONTRACT_VERSION, MaintenanceBrokerEvidence,
-    MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily, MaintenancePolicyEvidence,
-    MaintenanceRouteEvidence, MaintenanceSafetyEvidence, MaintenanceScheduleEvidence,
-    MaintenanceTrigger, MaintenanceTriggerInput,
+    MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily,
+    MaintenancePolicyEvidence, MaintenanceResultObligation, MaintenanceRouteEvidence,
+    MaintenanceSafetyEvidence, MaintenanceScheduleEvidence, MaintenanceTrigger,
+    MaintenanceTriggerInput, decision_result_obligation, maintenance_observation_record,
 };
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
@@ -327,6 +328,173 @@ impl DaemonComposition {
         if let Err(error) = self.evaluate_maintenance_trigger(observation) {
             let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
         }
+    }
+}
+
+/// What the publication of one maintenance source result actually did.
+///
+/// Every terminal store receipt is returned as issued. `Reconciled` is a real
+/// publication proven by the exact store receipt, and it is the same value a
+/// first attempt returns for an identical retry — the store identity, not this
+/// enum, is what distinguishes a replay from a first commit. There is no
+/// "logged" or "attempted" variant: a diagnostic line is never publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaintenanceResultPublication {
+    /// The canonical observation is admitted and the exact store receipt is in
+    /// hand, whether by the first commit or by reconciling an identical retry.
+    Reconciled {
+        /// The exact store receipt the canonical owner returned.
+        receipt: eliot_store_api::WriteReceipt,
+    },
+}
+
+/// Bounded absolute deadline applied to one maintenance result publication, in
+/// Unix milliseconds, matching the retained daemon transport's own operation
+/// bound used by the notification commit beside it.
+const MAINTENANCE_RESULT_PUBLISH_DEADLINE_MS: u64 = 30_000;
+
+/// Derives the admitted publication identity for one maintenance source result.
+///
+/// The identity is the daemon's own ingress identity at the live admitted fence,
+/// with the source result's own publication identity as the idempotency key. It
+/// is therefore a pure function of the source event: an identical retry produces
+/// byte-equal identity bytes, so the store's
+/// `(operation_id, canonical_request_hash)` identity reconciles the retry onto
+/// the first commit instead of writing a second record, and a changed result
+/// under the same identity fails closed. No clock-derived value, per-call
+/// counter, or caller-supplied source enters the key.
+///
+/// The source and product identities are bound to the daemon service name
+/// because `KernelStoreGateway::apply` fences any other caller: a substituted
+/// source would be refused rather than written.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::InvalidField`] when the publication identity is not
+/// a valid contract value or the derived request metadata does not validate.
+fn publication_identity(
+    publication_id: &str,
+    state_fence: &eliot_contracts::StateFence,
+) -> Result<eliot_protocol::RequestIdentity, ProtocolError> {
+    let now = crate::unix_ms_i64();
+    let operation_text =
+        format!("{}:maintenance-result:{publication_id}", crate::SERVICE_NAME);
+    let invalid = |field: &'static str| ProtocolError::InvalidField {
+        field,
+        reason: "maintenance result publication identity is not a valid contract value",
+    };
+    let metadata = eliot_contracts::RequestMetadata {
+        request_id: eliot_contracts::RequestId::new(operation_text.clone())
+            .map_err(|_| invalid("maintenance_result.request_id"))?,
+        session_id: None,
+        task_id: None,
+        product_id: eliot_contracts::ProductId::new(crate::SERVICE_NAME)
+            .map_err(|_| invalid("maintenance_result.product_id"))?,
+        source_id: eliot_contracts::SourceId::new(crate::SERVICE_NAME)
+            .map_err(|_| invalid("maintenance_result.source_id"))?,
+        // The live admitted fence, read from the retained Governor snapshot and
+        // never taken from the caller: a transported or cached fence must not be
+        // able to substitute for the one the result is admitted under.
+        state_fence: state_fence.clone(),
+        clock: eliot_contracts::ClockReading {
+            valid_time_ms: Some(now),
+            known_time_ms: Some(now),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    metadata
+        .validate()
+        .map_err(|_| invalid("maintenance_result.request_metadata"))?;
+    Ok(eliot_protocol::RequestIdentity {
+        request: eliot_receipts::RequestBinding {
+            metadata,
+            state_fence: state_fence.clone(),
+        },
+        idempotency_key: operation_text,
+        deadline_unix_ms: crate::unix_ms().saturating_add(MAINTENANCE_RESULT_PUBLISH_DEADLINE_MS),
+        cancellation_id: format!(
+            "{}:maintenance-result:{publication_id}:cancel",
+            crate::SERVICE_NAME
+        ),
+    })
+}
+
+/// Fail-closed refusals of the maintenance result publication path.
+///
+/// [`DaemonError`] already carries this composition's canonical-admission
+/// (`CompositionError`) and maintenance-owner (`MaintenanceError`) refusals as
+/// its own typed variants, so those are reused rather than restated here; this
+/// enum adds only the protocol-identity refusal the daemon composition does not
+/// already own. Nothing is folded into prose between layers, and no refusal is
+/// reported as a publication.
+#[derive(Debug, Error)]
+pub enum MaintenanceResultPublishError {
+    /// The publication identity or its base operation is not a valid contract
+    /// value.
+    #[error("maintenance result publication protocol: {0}")]
+    Protocol(#[from] ProtocolError),
+    /// The composition, the canonical admission, or the maintenance owner
+    /// refused the publication, each in its own typed variant.
+    #[error("maintenance result publication: {0}")]
+    Daemon(#[from] DaemonError),
+}
+
+impl DaemonComposition {
+    /// Publishes one maintenance source result into the canonical observation
+    /// path and returns the exact store receipt.
+    ///
+    /// This is the production caller of
+    /// [`admit_maintenance_result`](crate::observation_adapters::ForwardingObservationReconciliation::admit_maintenance_result).
+    /// The maintained subsystem's owner produces the obligation, the owner
+    /// validates and projects it into the observation-family record, the
+    /// Governor checks authority, fence and identity, and the Store returns its
+    /// own receipt. The publication identity comes from the source event, so an
+    /// identical retry reconciles the existing receipt instead of writing a
+    /// second record, and a lost acknowledgement is read back through the same
+    /// operation rather than committed again.
+    ///
+    /// This covers every applicable source result, not only the success branch:
+    /// a completion, a bounded partial, a failure, a cancellation, an unknown
+    /// outcome and a no-attempt non-execution decision each publish here, and a
+    /// failure or an unknown is never dropped for not being a success. A later
+    /// reconciliation appends a linked obligation rather than replacing the
+    /// earlier one, so the original uncertainty stays visible next to its
+    /// resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceResultPublishError`] when the composition is not
+    /// ready, the owner refuses the obligation or the record it projects, the
+    /// publication identity is not a contract value, or the canonical commit
+    /// cannot be completed or reconciled. Every one of those is a refusal, not a
+    /// publication, and the caller keeps the obligation durable for the retry.
+    pub async fn publish_maintenance_result(
+        &self,
+        base_operation_text: &str,
+        obligation: &MaintenanceResultObligation,
+    ) -> Result<MaintenanceResultPublication, MaintenanceResultPublishError> {
+        let observed_at_unix_ms = u64::try_from(crate::unix_ms_i64()).unwrap_or_default();
+        // The record is built and validated by the maintained subsystem's own
+        // owner before it reaches the canonical route, so a malformed obligation
+        // never becomes a store write. The owner's own refusal travels on the
+        // daemon's existing typed maintenance channel unchanged.
+        let record = maintenance_observation_record(obligation, observed_at_unix_ms)
+            .map_err(DaemonError::Maintenance)?;
+        let base_operation = OperationId::new(base_operation_text.to_owned()).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "maintenance_result.base_operation",
+                reason: "maintenance result base operation is not a valid contract value",
+            }
+        })?;
+        // The live admitted fence is read here, never taken from the caller.
+        let live_fence = self.governor.kernel_snapshot().state_fence().clone();
+        let identity = publication_identity(&obligation.publication_id, &live_fence)?;
+        let receipt = self
+            .observation_reconciliation()?
+            .admit_maintenance_result(&identity, &base_operation, &record)
+            .await?;
+        Ok(MaintenanceResultPublication::Reconciled { receipt })
     }
 }
 

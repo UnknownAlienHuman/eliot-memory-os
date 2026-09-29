@@ -2278,6 +2278,107 @@ async fn evaluate_and_emit_maintenance_notification(
     if let Some((fence, decision, evidence)) = candidate {
         note_blocked_automation_notification(kernel, fence, &decision, &evidence, failure_guard)
             .await;
+        publish_maintenance_source_results(composition, &decision, failure_guard).await;
+    }
+}
+
+/// Publishes every applicable source result of one evaluated maintenance
+/// decision into the canonical observation path.
+///
+/// This is the production binding of publication to the maintenance decision
+/// owner. It runs for **every** decision the owner produced, not only the
+/// success branch: a deferral, a block, a suggestion, an escalation and a
+/// duplicate suppression each owe a bound observation, and a decision that
+/// names an existing job also publishes that job's own retained results
+/// (completions, partials, failures, cancellations and unresolved outcomes)
+/// through the same route. A failed or unknown result is therefore never dropped
+/// for not being a success, and no result is reported through a diagnostic
+/// logger alone.
+///
+/// The exchange is awaited inside the retained maintenance flight with the
+/// composition lock released, exactly as the notification leg beside it is, so no
+/// Kernel exchange crosses the composition mutex. A refusal is an explicit typed
+/// gap through the stream's own failure guard: the obligation stays durable on
+/// its own store and is retried, so a publication outage degrades the
+/// self-observation surface without becoming a daemon-killing error and without
+/// disappearing behind exit code zero.
+async fn publish_maintenance_source_results(
+    composition: &SharedComposition,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    // The decision's own no-attempt result, plus the retained results of the job
+    // this decision names. Both come from the maintenance owner's own records:
+    // nothing here constructs an outcome class, and the job read is the existing
+    // durable-job route rather than a local map.
+    //
+    // A job the decision names is the owner of the work, so its completions,
+    // partials, failures, cancellations and unresolved outcomes publish through
+    // the same route as the decision. A suppressed duplicate therefore still
+    // makes the existing job's failures and unknown outcomes visible, rather than
+    // only the suppression itself.
+    let mut obligations = Vec::new();
+    {
+        let guard = composition.lock().await;
+        let live_fence = guard.governor_kernel_fence();
+        obligations.push(eliot_maintenance::decision_result_obligation(
+            decision, &live_fence,
+        ));
+        if let Some(job_ref) = &decision.durable_job_ref {
+            match guard.retained_maintenance_job(job_ref) {
+                Ok(Some(job)) => {
+                    obligations.extend(job.result_obligations.iter().cloned());
+                }
+                // No retained job is unavailable, not resolved: the decision's
+                // own result still publishes, and the job's results publish on
+                // the pass that observes the job.
+                Ok(None) => {}
+                Err(error) => {
+                    if failure_guard.should_emit() {
+                        let _ = eliotd::diagnostics::ErrorRecord::of(
+                            eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                            "maintenance-result-publication",
+                            &error.to_string(),
+                        )
+                        .emit();
+                    }
+                }
+            }
+        }
+    }
+    for obligation in obligations {
+        let publication = {
+            let guard = composition.lock().await;
+            guard
+                .publish_maintenance_result(&obligation.publication_id, &obligation)
+                .await
+        };
+        match publication {
+            Ok(eliotd::maintenance_trigger_evaluator::MaintenanceResultPublication::Reconciled {
+                receipt,
+            }) => {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.maintenance_result_published",
+                    publication_id = %obligation.publication_id,
+                    execution_outcome = ?obligation.execution_outcome,
+                    operation_id = %receipt.operation_id,
+                );
+            }
+            Err(error) => {
+                // The obligation is durable on the maintenance store, so a
+                // refused publication is a pending observation, not a lost
+                // result. It is reported and retried on a later pass.
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-result-publication",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+            }
+        }
     }
 }
 
@@ -2669,6 +2770,7 @@ async fn run_health_heartbeat_tick(
     if let Some((fence, decision, evidence)) = blocked_automation {
         note_blocked_automation_notification(kernel, fence, &decision, &evidence, failure_guard)
             .await;
+        publish_maintenance_source_results(composition, &decision, failure_guard).await;
     }
     // #2560: the same readiness evaluation that produced the startup record
     // reaches diagnostics here, so an operator sees exactly when a core
