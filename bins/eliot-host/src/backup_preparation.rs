@@ -35,12 +35,49 @@
 //! permission to prepare a second destination.
 //!
 //! The created directory is **not** an installation allocated through the
-//! installation authority: `ApprovedGenerationRegistry` exposes no public
-//! mutation seam (every mutator is `pub(crate)`), so the created root has no
-//! `ApprovedGeneration` row, no registry CAS and no activation fence of its
-//! own. It is a fenced empty root under a protected staging parent. Allocating
-//! a real new installation is an owner correction in
-//! `crates/kernel/eliot-installation`, outside this module.
+//! installation authority, and the gap is structural rather than a missing call
+//! from this module. Re-verified against `crates/kernel/eliot-installation` on
+//! 2026-09-29, with symbols rather than prose:
+//!
+//! * an `ApprovedGeneration` row carries a private
+//!   `InstallationActivationApproval` (`approved_generation_registry.rs:116`),
+//!   whose twelve fields are all `pub(super)` and whose only constructor is
+//!   `InstallationActivationApproval::from_verified_parts` (`activation.rs:88`)
+//!   — a `pub(crate)` seam reachable only from the signed-authority bridge;
+//! * exactly one site in the crate ever appends the row,
+//!   `generations.push` at `approved_generation_registry.rs:3151`, inside the
+//!   private `stage_pending_activation_unchecked_with_intent`;
+//! * the two families that reach it are not preparation seams.
+//!   `RedbInstallationRegistry::stage_pending_activation_from_transaction_store`
+//!   (`installation_registry.rs:505`) is `#[cfg(test)]`, and
+//!   `stage_pending_activation_signed` (`signed_activation.rs:926`) is the only
+//!   public form and is the *activation* boundary: it demands a
+//!   `SignedInstallationActivationApproval` from the independent authority, a
+//!   real `Registering` transaction in a transaction store, a live exclusive
+//!   installer `HostOwnerEpochCapability`, and
+//!   `require_stopped_scm_contour` (`signed_activation.rs:964`). Reaching for it
+//!   here would stage an activation during preparation and would require the
+//!   source's services to be stopped, which A13.7 and this issue's own "no
+//!   automatic source stop" clause forbid.
+//!
+//! `allocate_isolated_installation` has 0 occurrences in the tree, and the crate
+//! has no representation at all for "allocated but not yet approved": every row
+//! in the projection is an approved generation. Writing the missing row from
+//! this module is therefore not available without fabricating an
+//! `InstallationActivationApproval` or inventing a second installation
+//! representation, and both are forbidden. The owner correction is a new
+//! preparation-time allocation boundary in `crates/kernel/eliot-installation`
+//! together with the authority decision on what approval a
+//! prepared-but-unactivated destination holds; this module consumes that
+//! boundary when it exists and creates, in the meantime, a fenced empty root
+//! under an exact protected-root lease.
+//!
+//! A2 therefore needs **two** new public owner surfaces, not one: the allocation
+//! CAS above, and a public Host-root classification so the "preexisting foreign
+//! owner is rejected" clause can be proved at the owner. The second one is
+//! `validate_installation_host_root` (`installation_registry.rs:1343`), which is
+//! today `pub(super)`. See [`admit_staging_parent`] for why the surrounding
+//! checks cannot substitute for it.
 //!
 //! # Destination identity and epoch
 //!
@@ -745,8 +782,10 @@ pub struct RootIdentity {
 /// It is a fenced empty root under a protected staging parent, **not** an
 /// installation allocated through the installation authority: no
 /// `ApprovedGeneration` row, registry CAS or activation fence is created for
-/// it, because the registry exposes no public mutation seam. Nothing here is
-/// restored, launched, activated or retired.
+/// it. The installation owner exposes no preparation-time allocation seam at
+/// all — the module documentation names the exact owner symbols and why the
+/// existing staging families are the activation boundary rather than this one.
+/// Nothing here is restored, launched, activated or retired.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PreparedDestination {
     /// Operation identity that produced it.
@@ -1885,7 +1924,8 @@ fn validate_admission(admission: &DestinationAdmission) -> Result<(), Preparatio
 
 /// Admits a staging parent: exists, directory, reparse-free, neither the
 /// source root nor nested under it, and proved by the protected-root owner
-/// (cases 958/5-6, 958/7, 958/8).
+/// (cases 958/5-6, 958/7, 958/8). The foreign-owner half of that admission is
+/// named below and is **not** yet proved.
 ///
 /// The structural checks alone admit any existing unrelated directory, so they
 /// are not the whole admission. After they pass, the parent is proved through
@@ -1898,6 +1938,22 @@ fn validate_admission(admission: &DestinationAdmission) -> Result<(), Preparatio
 /// is one that [`reverify_recorded_destination`] can re-prove before removal, so
 /// the cleanup removal path is reachable for every root created here (case
 /// 958/15).
+///
+/// Containment is still not ownership, and the "preexisting foreign owner is
+/// rejected" clause is therefore **not** closed here. Every check above is
+/// satisfied by a *different* installation's retained Host root, so a parent that
+/// is itself a live installation is admitted. The only owner proof that would
+/// separate the two is the installation owner's own Host-root classification, and
+/// it is not public: `validate_installation_host_root`
+/// (`crates/kernel/eliot-installation/src/installation_registry.rs:1343`) is
+/// `pub(super)`. Reading the parent's registry instead does not work either,
+/// because `RedbInstallationRegistry::inspect_existing_at` resolves its path
+/// through that same private predicate and so returns
+/// `InstallationError::InvalidField` for a *vacant* parent — treating that as
+/// "not an installation" would mean matching the owner's error field string from
+/// here, and treating it as a fault would refuse every legitimate parent. See the
+/// module documentation; this is the second missing owner surface, and it is a
+/// prerequisite of the allocation seam rather than a defect in this chain.
 fn admit_staging_parent(admission: &DestinationAdmission) -> Result<PathBuf, PreparationError> {
     let parent = &admission.staging_parent;
     let metadata =
