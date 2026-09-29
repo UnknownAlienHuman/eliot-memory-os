@@ -4628,7 +4628,7 @@ impl KernelStoreGateway {
                 "automation, principal, or State Fence binding drifted".to_owned(),
             ));
         }
-        if owner.revision != *revision.as_ref() {
+        if owner.revision != *revision {
             return Err(moved(
                 "the current owner revision document is not the committed one".to_owned(),
             ));
