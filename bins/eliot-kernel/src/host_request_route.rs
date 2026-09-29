@@ -7726,10 +7726,13 @@ pub(crate) fn check_retained_source_revisions(
         return Ok(());
     };
     for recorded in revisions {
+        // A head that advanced, or a key with no observed head at all, is a
+        // changed source. `observed_heads` is the independent side, so a
+        // recorded key the Store no longer reports cannot match itself.
         let current = observed_heads
             .iter()
             .find(|head| head.key.as_str() == recorded.key.as_str());
-        if !current.is_some_and(|head| head.revision == recorded.revision) {
+        if current.is_none_or(|head| head.revision != recorded.revision) {
             return Err(TransportError::SessionFenced);
         }
     }
@@ -7753,7 +7756,9 @@ pub(crate) fn retained_source_revision_keys(
     };
     revisions
         .iter()
-        .map(|revision| RevisionKey::new(revision.key.clone()).map_err(|_| TransportError::SessionFenced))
+        .map(|revision| {
+            RevisionKey::new(revision.key.clone()).map_err(|_| TransportError::SessionFenced)
+        })
         .collect()
 }
 
