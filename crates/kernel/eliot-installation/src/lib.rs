@@ -25,7 +25,10 @@ use eliot_platform::{
 };
 pub use eliot_platform::{HostProcessNonce, PlatformHandle};
 pub use eliot_platform_windows::UserOwnedRootLease;
-use eliot_platform_windows::profile_supervision::{ProfileSelection, ProfileSelectionReceipt};
+use eliot_platform_windows::profile_supervision::{
+    CurrentUserTaskObservation, CurrentUserTaskReceipt, CurrentUserTaskRegistrationError,
+    CurrentUserTaskRequest, CurrentUserTaskRunReceipt, ProfileSelection, ProfileSelectionReceipt,
+};
 use eliot_platform_windows::{
     AgentBridgeSecurityConvergenceReceipt as PlatformAgentBridgeSecurityConvergenceReceipt,
     AgentBridgeStagePrepared as PlatformAgentBridgeStagePrepared,
@@ -45,6 +48,7 @@ use eliot_platform_windows::{
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, PortableDevSupervisionAuthorityKeyObservation,
     PortableDevSupervisionAuthorityKeyReceipt, PreparedUserModeSupervisionAuthorityCredential,
+    PreparedPortableDevSupervisionAuthorityKey,
     ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease, ServiceAbsentProof,
     ServiceAccount, ServiceBootstrapArguments, ServiceInspectionUnknownDetail,
     ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
@@ -249,8 +253,10 @@ pub use plan::{
     SupervisionAuthorityProvisionPlan, UserModeSupervisionAuthorityProvisionPlan,
 };
 use plan::{
-    validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings,
-    validate_user_mode_authority_effect_bindings,
+    validate_current_user_store_credential_effect_bindings, validate_effect_profile,
+    validate_installer_effects, validate_phase_b_effect_bindings,
+    validate_portable_dev_authority_effect_bindings,
+    validate_user_mode_authority_effect_bindings, validate_user_mode_task_effect_bindings,
 };
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
 pub use profile_roots::{
@@ -283,11 +289,14 @@ pub use setup_binding::{
 use transaction::decode_installation_transaction_json;
 use transaction::decode_installation_transaction_json_from_store;
 pub use transaction::{
-    InstallationCreateDisposition, InstallationEffectDisposition, InstallationEffectProgress,
-    InstallationEffectProgressState, InstallationOsObjectSnapshot, InstallationOwnershipSecret,
-    InstallationRootAbsentSnapshot, InstallationSecretCreationProof, InstallationSecretLifecycle,
+    CurrentUserTaskRunIntent, CurrentUserTaskUnknownKind, CurrentUserTaskUnknownProgress,
+    InstallationCreateDisposition,
+    InstallationEffectDisposition, InstallationEffectProgress, InstallationEffectProgressState,
+    InstallationOsObjectSnapshot, InstallationOwnershipSecret, InstallationRootAbsentSnapshot,
+    InstallationSecretCreationProof, InstallationSecretLifecycle,
     InstallationSecretProvisionDisposition, InstallationSecretReference, InstallationSecretScope,
-    InstallationStage, InstallationTransaction, StoreFreeSpaceObservation,
+    InstallationStage, InstallationTransaction, RetainedProfileAnchor,
+    StoreFreeSpaceObservation,
     parse_installation_transaction_id, validate_installation_transaction_json,
 };
 
@@ -365,9 +374,13 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// Version 25 requires the retained I3.1 profile-root binding on every current
 /// executable transaction and carries the corresponding launch descriptor
 /// shape. Version 26 adds the original `UserMode` authority key receipt and
-/// terminal no-effect-abort progress. Older wires require explicit migration
-/// and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(27, 0, 0);
+/// terminal no-effect-abort progress. Version 27 retains the original profile
+/// selection receipt; v28 adds exact current-user Task registration intent,
+/// receipt and unresolved progress. Version 29 adds exact Task RunEx intent
+/// and receipt plus the source-publication profile-anchor object identity.
+/// Wires before v29 require explicit migration/recovery and are never
+/// synthesized from current paths or objects.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(29, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -3188,6 +3201,14 @@ pub struct InstallationEffectRequest {
     /// Original disposable repository-key receipt persisted before its first write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portable_dev_authority_receipt: Option<PortableDevSupervisionAuthorityKeyReceipt>,
+    /// Exact live Phase-B-bound current-user task request retained before its
+    /// one permitted Task Scheduler registration attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_user_task_request: Option<CurrentUserTaskRequest>,
+    /// Exact Task Scheduler registration receipt used for readback and
+    /// transaction-owned rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_user_task_receipt: Option<CurrentUserTaskReceipt>,
     /// Apply or exact-identity rollback.
     pub action: InstallationEffectAction,
     /// Required exact identity for rollback; absent for apply.
@@ -3438,6 +3459,84 @@ impl InstallationEffectRequest {
                         reason: error.to_string(),
                     })?;
                 if receipt.request.transaction_id != self.transaction_id.as_str() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            (_, _, None, None) => {}
+            _ => return Err(InstallationError::IdentityConflict),
+        }
+        match (
+            &self.plan,
+            self.action,
+            &self.current_user_task_request,
+            &self.current_user_task_receipt,
+        ) {
+            (
+                InstallerEffectPlan::RegisterCurrentUserTask { registration, .. },
+                InstallationEffectAction::Apply,
+                Some(task_request),
+                None,
+            ) => {
+                registration.validate()?;
+                if self.profile != InstallationProfile::UserMode
+                    || task_request.transaction_id != self.transaction_id.as_str()
+                    || task_request.effect_id != registration.effect_id.as_str()
+                    || !eliot_platform_windows::windows_paths_equal(
+                        &task_request.executable,
+                        Path::new(registration.host_executable_path.as_str()),
+                    )
+                    || task_request.executable_sha256
+                        != registration.host_executable_sha256.as_str()
+                    || !eliot_platform_windows::windows_paths_equal(
+                        &task_request.working_directory,
+                        Path::new(registration.working_directory.as_str()),
+                    )
+                    || task_request.roots.installation_id
+                        != registration.installation_id.as_str()
+                    || task_request.roots.authority_generation
+                        != registration.authority_generation.value()
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let request_digest = task_request.request_digest().map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "effect.current_user_task_request".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if request_digest.len() != 64
+                    || !request_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            (
+                InstallerEffectPlan::RegisterCurrentUserTask { registration, .. },
+                InstallationEffectAction::Rollback,
+                Some(task_request),
+                Some(task_receipt),
+            ) => {
+                registration.validate()?;
+                let request_digest = task_request.request_digest().map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "effect.current_user_task_request".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if self.profile != InstallationProfile::UserMode
+                    || task_receipt.request != *task_request
+                    || task_receipt.request_digest != request_digest
+                    || task_request.transaction_id != self.transaction_id.as_str()
+                    || task_request.effect_id != registration.effect_id.as_str()
+                    || task_receipt.task_xml_sha256
+                        != self
+                            .expected_external_identity
+                            .as_ref()
+                            .map(PlatformHandle::as_str)
+                            .unwrap_or_default()
+                {
                     return Err(InstallationError::IdentityConflict);
                 }
             }
@@ -4066,6 +4165,58 @@ pub(crate) trait InstallationEffectPort: Send {
     ) {
     }
 
+    /// Generates one PortableDev key seed and returns its secret-free root
+    /// identity receipt before any file write is permitted.
+    fn prepare_portable_dev_authority(
+        &mut self,
+        _request: &InstallationEffectRequest,
+    ) -> PortOutcome<PortableDevSupervisionAuthorityKeyReceipt> {
+        PortOutcome::Unknown(UnknownReason::Unsupported)
+    }
+
+    /// Reports whether this live port still holds the prepared PortableDev
+    /// seed for the exact persisted receipt.
+    fn has_prepared_portable_dev_authority(
+        &self,
+        _receipt: &PortableDevSupervisionAuthorityKeyReceipt,
+    ) -> bool {
+        false
+    }
+
+    /// Drops an uncommitted PortableDev seed after the transaction CAS fails.
+    fn discard_prepared_portable_dev_authority(
+        &mut self,
+        _receipt: &PortableDevSupervisionAuthorityKeyReceipt,
+    ) {
+    }
+
+    /// Performs the one permitted current-user Task Scheduler registration.
+    fn register_current_user_task(
+        &mut self,
+        _request: &CurrentUserTaskRequest,
+    ) -> Result<CurrentUserTaskReceipt, CurrentUserTaskRegistrationError> {
+        Err(CurrentUserTaskRegistrationError::Rejected(
+            eliot_platform_windows::WindowsAdapterError::InvalidInput,
+        ))
+    }
+
+    /// Inspects the exact Task Scheduler identity and optional retained receipt.
+    fn inspect_current_user_task(
+        &mut self,
+        request: &CurrentUserTaskRequest,
+        expected: Option<&CurrentUserTaskReceipt>,
+    ) -> Result<CurrentUserTaskObservation, eliot_platform_windows::WindowsAdapterError> {
+        eliot_platform_windows::profile_supervision::inspect_current_user_task(request, expected)
+    }
+
+    /// Issues the one-shot Task Scheduler RunEx call for an exact registration.
+    fn run_current_user_task(
+        &mut self,
+        receipt: &CurrentUserTaskReceipt,
+    ) -> Result<CurrentUserTaskRunReceipt, eliot_platform_windows::WindowsAdapterError> {
+        eliot_platform_windows::profile_supervision::run_current_user_task(receipt)
+    }
+
     /// Creates or reopens the installer-held ownership key only after its
     /// exact reference and effect intent were durably committed.
     fn provision_ownership_secret(
@@ -4126,6 +4277,7 @@ struct WindowsInstallationEffectPort {
     supervision_keys: WindowsSupervisionAuthorityKeyStore,
     user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider,
     portable_dev_supervision_keys: WindowsPortableDevSupervisionAuthorityKeyProvider,
+    prepared_portable_dev_authority: Option<PreparedPortableDevSupervisionAuthorityKey>,
 }
 
 struct PreparedOwnershipSecret {
@@ -4146,6 +4298,7 @@ impl WindowsInstallationEffectPort {
             user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider::new(
             ),
             portable_dev_supervision_keys: WindowsPortableDevSupervisionAuthorityKeyProvider::new(),
+            prepared_portable_dev_authority: None,
         }
     }
 

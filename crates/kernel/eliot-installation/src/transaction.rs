@@ -4,12 +4,12 @@ use std::collections::BTreeSet;
 
 use eliot_platform::GuardRevertOutcome;
 use eliot_platform_windows::{
-    TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
+    FileIdentity, TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
     terminal_containment_operation_digest, validate_terminal_containment_readback_for,
 };
 use eliot_platform_windows::profile_supervision::{
     CurrentUserTaskReceipt, CurrentUserTaskRegistrationError, CurrentUserTaskRequest,
-    ProfileSelectionReceipt,
+    CurrentUserTaskRunReceipt, ProfileSelectionReceipt,
 };
 use eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt;
 use schemars::JsonSchema;
@@ -161,6 +161,36 @@ pub struct InstallationRootAbsentSnapshot {
     pub parent: InstallationOsObjectSnapshot,
     /// Explicit negative observation; never inferred from an empty identity.
     pub root_absent: bool,
+}
+
+/// Original no-follow identity of the profile anchor captured with source
+/// publication, before the installer creates or materializes descendants.
+///
+/// The path is checked against the immutable launch root, while `identity`
+/// preserves the file object selected at publication for later receipt or
+/// fresh OS-precondition comparison.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedProfileAnchor {
+    /// Exact canonical anchor path supplied by the source publication.
+    pub canonical_path: PlatformHandle,
+    /// File object identity opened without following reparse points.
+    pub identity: FileIdentity,
+}
+
+impl RetainedProfileAnchor {
+    pub(crate) fn validate(&self) -> Result<(), InstallationError> {
+        super::WindowsPathIdentity::parse_root(
+            self.canonical_path.as_str(),
+            "transaction.retained_profile_anchor.canonical_path",
+        )?;
+        if self.identity.volume_serial_number == 0 || self.identity.file_index == 0 {
+            return Err(InstallationError::IncompleteObservation(
+                "retained profile anchor has no stable file-object identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl InstallationRootAbsentSnapshot {
@@ -418,6 +448,25 @@ pub struct CurrentUserTaskUnknownProgress {
     pub cleanup_error: String,
 }
 
+/// Exact one-shot Task Scheduler RunEx intent, committed before the call.
+///
+/// A retained intent without a run receipt is unresolved after restart and
+/// never authorizes a second RunEx call.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentUserTaskRunIntent {
+    /// Canonical digest of the registration request bound to the task.
+    pub request_digest: PlatformHandle,
+    /// Exact Task Scheduler identity passed to RunEx.
+    pub task_name: String,
+    /// Current-user SID bound to the registered task.
+    pub sid: String,
+    /// Interactive session used by the one-shot run request.
+    pub session_id: u32,
+    /// Exact registered task XML digest checked before RunEx.
+    pub task_xml_sha256: PlatformHandle,
+}
+
 impl CurrentUserTaskUnknownProgress {
     /// Converts a platform result that may have committed the exact task into
     /// a serializable reconciliation carrier. Rejected/no-effect outcomes are
@@ -648,6 +697,13 @@ pub struct InstallationEffectProgress {
     /// Request and provider evidence retained when current-user task
     /// registration requires reconciliation.
     pub current_user_task_unknown: Option<CurrentUserTaskUnknownProgress>,
+    /// Exact pre-call RunEx intent. Presence forbids automatic rerun after
+    /// restart unless its matching launch receipt was already committed.
+    pub current_user_task_run_intent: Option<CurrentUserTaskRunIntent>,
+    /// Task Scheduler launch acceptance for the registered UserMode task.
+    /// This is not Host readiness; runtime readiness remains independently
+    /// observed by the Host process handshake.
+    pub current_user_task_run_receipt: Option<CurrentUserTaskRunReceipt>,
     /// Current durable effect state.
     pub state: InstallationEffectProgressState,
 }
@@ -695,6 +751,9 @@ pub struct InstallationTransaction {
     pub installation_epoch: InstallationEpoch,
     /// Selected path/supervision profile.
     pub profile: InstallationProfile,
+    /// Source-publication-time path and no-follow identity of the selected
+    /// profile anchor. This binds planning to later Apply and restart checks.
+    pub(crate) retained_profile_anchor: Option<RetainedProfileAnchor>,
     /// Versioned I3.1 four-root binding resolved for `profile`.
     ///
     /// `None` is permitted only while a fresh in-memory planner constructor is
@@ -862,6 +921,40 @@ impl InstallationTransaction {
     #[must_use]
     pub const fn profile_selection_receipt(&self) -> Option<&ProfileSelectionReceipt> {
         self.profile_selection_receipt.as_ref()
+    }
+
+    /// Returns the exact source-publication-time profile anchor pair.
+    #[must_use]
+    pub const fn retained_profile_anchor(&self) -> Option<&RetainedProfileAnchor> {
+        self.retained_profile_anchor.as_ref()
+    }
+
+    /// Binds the exact source-publication anchor pair into this plan and its
+    /// installer-plan digest. A different or inferred identity cannot replace
+    /// the first retained value.
+    pub(crate) fn bind_retained_profile_anchor(
+        &mut self,
+        anchor: RetainedProfileAnchor,
+    ) -> Result<(), InstallationError> {
+        anchor.validate()?;
+        if !super::same_windows_root(
+            anchor.canonical_path.as_str(),
+            self.candidate_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .profile_anchor_root
+                .as_str(),
+        )? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        match self.retained_profile_anchor.as_ref() {
+            Some(existing) if existing == &anchor => return Ok(()),
+            Some(_) => return Err(InstallationError::IdentityConflict),
+            None => {}
+        }
+        self.retained_profile_anchor = Some(anchor);
+        self.installer_plan_digest = self.compute_installer_plan_digest()?;
+        Ok(())
     }
 
     /// Retains the original no-follow root selection after every admitted
@@ -1172,6 +1265,7 @@ impl InstallationTransaction {
                 &candidate_manifest,
                 &staging_root,
                 &candidate_manifest.runtime_launch.runtime_state_roots,
+                None,
                 minimum_store_available_bytes,
                 &planned_changes,
                 &installer_effects,
@@ -1198,13 +1292,13 @@ impl InstallationTransaction {
                 current_user_task_request: None,
                 current_user_task_receipt: None,
                 current_user_task_unknown: None,
+                current_user_task_run_intent: None,
+                current_user_task_run_receipt: None,
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
-        // Unit tests historically use constructor-produced synthetic plans.
-        // Give those fixtures the exact root binding already present in the
-        // validated launch descriptor; production constructors leave the
-        // field unset until the published-selection planner binds it below.
+        // Unit fixtures retain their complete planned root topology; the
+        // source-time anchor identity is separately bound by the planner.
         let profile_governed_roots = if cfg!(test) {
             Some(
                 candidate_manifest
@@ -1220,6 +1314,7 @@ impl InstallationTransaction {
             transaction_id,
             installation_epoch,
             profile,
+            retained_profile_anchor: None,
             profile_governed_roots,
             profile_selection_receipt: None,
             request,
@@ -1311,6 +1406,21 @@ impl InstallationTransaction {
                 "all installer effects require authoritative applied readback before registry staging or approval projection"
                     .to_owned(),
             ));
+        }
+        if self.profile == InstallationProfile::UserMode {
+            let positions = self.user_mode_activation_effect_positions()?;
+            let progress = self
+                .effect_progress
+                .get(positions.task)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if progress.current_user_task_receipt.is_none()
+                || progress.current_user_task_run_receipt.is_none()
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "UserMode activation requires the exact Task registration and one-shot run receipts"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1815,7 +1925,9 @@ impl InstallationTransaction {
                 && (progress.phase_b_receipt.is_some()
                     || progress.staging_receipt.is_some()
                     || progress.current_user_task_receipt.is_some()
-                    || progress.current_user_task_unknown.is_some())
+                    || progress.current_user_task_unknown.is_some()
+                    || progress.current_user_task_run_intent.is_some()
+                    || progress.current_user_task_run_receipt.is_some())
             {
                 return Err(InstallationError::IncompleteObservation(
                     "pending UserMode task effect must not carry a synthetic receipt or unknown result"
@@ -1859,6 +1971,113 @@ impl InstallationTransaction {
             None => {}
         }
         progress.current_user_task_request = Some(request);
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            InstallationError::InvalidField {
+                field: "revision".to_owned(),
+                reason: "overflow".to_owned(),
+            }
+        })?;
+        self.validate()
+    }
+
+    /// Records the exact one-shot Task Scheduler RunEx intent before the call.
+    ///
+    /// A transaction which already contains this intent but no matching run
+    /// receipt must be reconciled by Host readiness and cannot issue RunEx a
+    /// second time.
+    pub(crate) fn record_current_user_task_run_intent(
+        &mut self,
+    ) -> Result<CurrentUserTaskRunIntent, InstallationError> {
+        let positions = self.user_mode_activation_effect_positions()?;
+        let progress = self
+            .effect_progress
+            .get(positions.task)
+            .ok_or(InstallationError::IdentityConflict)?;
+        if !matches!(progress.state, InstallationEffectProgressState::Applied { .. }) {
+            return Err(InstallationError::IncompleteObservation(
+                "Task Scheduler RunEx requires an Applied registration receipt".to_owned(),
+            ));
+        }
+        let request = progress
+            .current_user_task_request
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?;
+        let receipt = progress
+            .current_user_task_receipt
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?;
+        self.validate_current_user_task_receipt(request, receipt)?;
+        let intent = CurrentUserTaskRunIntent {
+            request_digest: task_digest_handle(
+                &receipt.request_digest,
+                "effect_progress.current_user_task_run_intent.request_digest",
+            )?,
+            task_name: receipt.task_name.clone(),
+            sid: receipt.sid.clone(),
+            session_id: receipt.session_id,
+            task_xml_sha256: task_digest_handle(
+                &receipt.task_xml_sha256,
+                "effect_progress.current_user_task_run_intent.task_xml_sha256",
+            )?,
+        };
+        if let Some(existing) = self.effect_progress[positions.task]
+            .current_user_task_run_intent
+            .as_ref()
+        {
+            if existing != &intent {
+                return Err(InstallationError::IdentityConflict);
+            }
+            self.validate_current_user_task_run_intent(receipt, existing)?;
+            return Ok(existing.clone());
+        }
+        if self.effect_progress[positions.task]
+            .current_user_task_run_receipt
+            .is_some()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.effect_progress[positions.task].current_user_task_run_intent = Some(intent.clone());
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            InstallationError::InvalidField {
+                field: "revision".to_owned(),
+                reason: "overflow".to_owned(),
+            }
+        })?;
+        self.validate()?;
+        Ok(intent)
+    }
+
+    /// Persists the exact Task Scheduler acceptance receipt for the retained
+    /// one-shot RunEx intent.
+    pub(crate) fn record_current_user_task_run_receipt(
+        &mut self,
+        receipt: CurrentUserTaskRunReceipt,
+    ) -> Result<(), InstallationError> {
+        let positions = self.user_mode_activation_effect_positions()?;
+        let progress = self
+            .effect_progress
+            .get(positions.task)
+            .ok_or(InstallationError::IdentityConflict)?;
+        let task_receipt = progress
+            .current_user_task_receipt
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?;
+        let intent = progress
+            .current_user_task_run_intent
+            .as_ref()
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "Task Scheduler run receipt requires its pre-call intent".to_owned(),
+            ))?;
+        self.validate_current_user_task_run_receipt(task_receipt, intent, &receipt)?;
+        match self.effect_progress[positions.task]
+            .current_user_task_run_receipt
+            .as_ref()
+        {
+            Some(existing) if existing == &receipt => return Ok(()),
+            Some(_) => return Err(InstallationError::IdentityConflict),
+            None => {}
+        }
+        self.effect_progress[positions.task].current_user_task_run_receipt = Some(receipt);
         self.revision = self.revision.checked_add(1).ok_or_else(|| {
             InstallationError::InvalidField {
                 field: "revision".to_owned(),
@@ -2031,6 +2250,76 @@ impl InstallationTransaction {
                 &request.working_directory,
             )
             || receipt.arguments != request.bootstrap_arguments
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_current_user_task_run_intent(
+        &self,
+        task_receipt: &CurrentUserTaskReceipt,
+        intent: &CurrentUserTaskRunIntent,
+    ) -> Result<(), InstallationError> {
+        handle(
+            &intent.request_digest,
+            "effect_progress.current_user_task_run_intent.request_digest",
+        )?;
+        sha256_handle(
+            &intent.request_digest,
+            "effect_progress.current_user_task_run_intent.request_digest",
+        )?;
+        text(
+            &intent.task_name,
+            "effect_progress.current_user_task_run_intent.task_name",
+        )?;
+        text(&intent.sid, "effect_progress.current_user_task_run_intent.sid")?;
+        sha256_handle(
+            &intent.task_xml_sha256,
+            "effect_progress.current_user_task_run_intent.task_xml_sha256",
+        )?;
+        if intent.request_digest.as_str() != task_receipt.request_digest
+            || intent.task_name != task_receipt.task_name
+            || intent.sid != task_receipt.sid
+            || intent.session_id == 0
+            || intent.session_id != task_receipt.session_id
+            || intent.task_xml_sha256.as_str() != task_receipt.task_xml_sha256
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_current_user_task_run_receipt(
+        &self,
+        task_receipt: &CurrentUserTaskReceipt,
+        intent: &CurrentUserTaskRunIntent,
+        receipt: &CurrentUserTaskRunReceipt,
+    ) -> Result<(), InstallationError> {
+        self.validate_current_user_task_run_intent(task_receipt, intent)?;
+        text(
+            &receipt.task_name,
+            "effect_progress.current_user_task_run_receipt.task_name",
+        )?;
+        text(
+            &receipt.sid,
+            "effect_progress.current_user_task_run_receipt.sid",
+        )?;
+        sha256_handle(
+            &PlatformHandle::new(&receipt.task_xml_sha256).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "effect_progress.current_user_task_run_receipt.task_xml_sha256"
+                        .to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            "effect_progress.current_user_task_run_receipt.task_xml_sha256",
+        )?;
+        if receipt.task_name != intent.task_name
+            || receipt.sid != intent.sid
+            || receipt.session_id != intent.session_id
+            || receipt.engine_process_id == 0
+            || receipt.task_xml_sha256 != intent.task_xml_sha256.as_str()
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -2250,7 +2539,9 @@ impl InstallationTransaction {
                 && (progress.phase_b_receipt.is_some()
                     || progress.staging_receipt.is_some()
                     || progress.current_user_task_receipt.is_some()
-                    || progress.current_user_task_unknown.is_some())
+                    || progress.current_user_task_unknown.is_some()
+                    || progress.current_user_task_run_intent.is_some()
+                    || progress.current_user_task_run_receipt.is_some())
             {
                 return Err(InstallationError::IncompleteObservation(
                     "pending PortableDev PhaseB effect must not carry synthetic task or Phase-B receipts"
@@ -2453,6 +2744,7 @@ impl InstallationTransaction {
         candidate_manifest: &CandidateManifest,
         staging_root: &PlatformHandle,
         runtime_state_roots: &RuntimeStateRoots,
+        retained_profile_anchor: Option<&RetainedProfileAnchor>,
         minimum_store_available_bytes: u64,
         planned_changes: &[PlannedChange],
         installer_effects: &[InstallerEffectPlan],
@@ -2463,6 +2755,7 @@ impl InstallationTransaction {
             candidate_manifest: &'a CandidateManifest,
             staging_root: &'a PlatformHandle,
             runtime_state_roots: &'a RuntimeStateRoots,
+            retained_profile_anchor: Option<&'a RetainedProfileAnchor>,
             minimum_store_available_bytes: u64,
             planned_changes: &'a [PlannedChange],
             installer_effects: &'a [InstallerEffectPlan],
@@ -2472,12 +2765,30 @@ impl InstallationTransaction {
             candidate_manifest,
             staging_root,
             runtime_state_roots,
+            retained_profile_anchor,
             minimum_store_available_bytes,
             planned_changes,
             installer_effects,
         })
         .map_err(|error| InstallationError::InvalidField {
             field: "installer_plan".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    fn compute_installer_plan_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        PlatformHandle::new(sha256_hex(&Self::installer_plan_unsigned_bytes(
+            &self.transaction_id,
+            &self.candidate_manifest,
+            &self.staging_root,
+            &self.candidate_manifest.runtime_launch.runtime_state_roots,
+            self.retained_profile_anchor.as_ref(),
+            self.minimum_store_available_bytes,
+            &self.planned_changes,
+            &self.installer_effects,
+        )?))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "installer_plan_digest".to_owned(),
             reason: error.to_string(),
         })
     }
@@ -2511,6 +2822,7 @@ impl InstallationTransaction {
         // current environment. `None` is never valid at this boundary; only
         // the crate-private planner constructor may hold it before binding.
         self.rehydrate_profile_binding()?;
+        self.validate_retained_profile_anchor()?;
         if let Some(receipt) = self.profile_selection_receipt.as_ref() {
             let roots = self
                 .profile_governed_roots
@@ -2591,6 +2903,7 @@ impl InstallationTransaction {
             &self.candidate_manifest,
             &self.staging_root,
             &self.candidate_manifest.runtime_launch.runtime_state_roots,
+            self.retained_profile_anchor.as_ref(),
             self.minimum_store_available_bytes,
             &self.planned_changes,
             &self.installer_effects,
@@ -2700,6 +3013,65 @@ impl InstallationTransaction {
         Ok(())
     }
 
+    fn validate_retained_profile_anchor(&self) -> Result<(), InstallationError> {
+        let retained = self.retained_profile_anchor.as_ref().ok_or_else(|| {
+            InstallationError::MigrationRequired {
+                reason: "transaction is missing its source-publication profile anchor identity; explicit migration/recovery is required"
+                    .to_owned(),
+            }
+        })?;
+        retained.validate()?;
+        let launch_anchor = &self
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .profile_anchor_root;
+        if !super::same_windows_root(retained.canonical_path.as_str(), launch_anchor.as_str())? {
+            return Err(InstallationError::IdentityConflict);
+        }
+
+        if matches!(self.profile, InstallationProfile::UserMode | InstallationProfile::PortableDev)
+            && let Some(receipt) = self.profile_selection_receipt.as_ref()
+        {
+            let anchor = receipt
+                .roots
+                .iter()
+                .find(|root| root.role == "runtime_state_roots.profile_anchor_root")
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "profile selection omitted the retained anchor role".to_owned(),
+                    )
+                })?;
+            if anchor.identity != retained.identity
+                || !eliot_platform_windows::windows_paths_equal(
+                    &anchor.canonical_path,
+                    std::path::Path::new(retained.canonical_path.as_str()),
+                )
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+
+        if self.profile == InstallationProfile::SystemService {
+            for progress in &self.effect_progress {
+                let Some(snapshot) = progress
+                    .admitted_precondition
+                    .as_ref()
+                    .and_then(|precondition| precondition.os_snapshot.as_ref())
+                else {
+                    continue;
+                };
+                if snapshot.profile_anchor.volume_serial_number
+                    != retained.identity.volume_serial_number
+                    || snapshot.profile_anchor.file_index != retained.identity.file_index
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         clippy::match_same_arms,
@@ -2795,7 +3167,9 @@ impl InstallationTransaction {
             if !task_effect
                 && (progress.current_user_task_request.is_some()
                     || progress.current_user_task_receipt.is_some()
-                    || progress.current_user_task_unknown.is_some())
+                    || progress.current_user_task_unknown.is_some()
+                    || progress.current_user_task_run_intent.is_some()
+                    || progress.current_user_task_run_receipt.is_some())
             {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -2805,14 +3179,32 @@ impl InstallationTransaction {
                     progress.current_user_task_request.as_ref(),
                     progress.current_user_task_receipt.as_ref(),
                     progress.current_user_task_unknown.as_ref(),
+                    progress.current_user_task_run_intent.as_ref(),
+                    progress.current_user_task_run_receipt.as_ref(),
                 ) {
-                    (InstallationEffectProgressState::Pending, None, None, None) => {}
-                    (InstallationEffectProgressState::Pending, Some(request), None, None) => {
+                    (
+                        InstallationEffectProgressState::Pending,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ) => {}
+                    (
+                        InstallationEffectProgressState::Pending,
+                        Some(request),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ) => {
                         self.validate_current_user_task_request(request)?;
                     }
                     (
                         InstallationEffectProgressState::IntentCommitted { .. },
                         Some(request),
+                        None,
+                        None,
                         None,
                         None,
                     ) => self.validate_current_user_task_request(request)?,
@@ -2821,6 +3213,8 @@ impl InstallationTransaction {
                         Some(request),
                         receipt,
                         Some(unknown),
+                        None,
+                        None,
                     ) => {
                         if let Some(receipt) = receipt {
                             self.validate_current_user_task_receipt(request, receipt)?;
@@ -2832,10 +3226,28 @@ impl InstallationTransaction {
                         Some(request),
                         Some(receipt),
                         None,
-                    ) => self.validate_current_user_task_receipt(request, receipt)?,
+                        run_intent,
+                        run_receipt,
+                    ) => {
+                        self.validate_current_user_task_receipt(request, receipt)?;
+                        match (run_intent, run_receipt) {
+                            (None, None) => {}
+                            (Some(intent), None) => {
+                                self.validate_current_user_task_run_intent(receipt, intent)?;
+                            }
+                            (Some(intent), Some(run_receipt)) => {
+                                self.validate_current_user_task_run_receipt(
+                                    receipt,
+                                    intent,
+                                    run_receipt,
+                                )?;
+                            }
+                            (None, Some(_)) => return Err(InstallationError::IdentityConflict),
+                        }
+                    }
                     _ => {
                         return Err(InstallationError::IncompleteObservation(
-                            "current-user task progress must retain its exact pre-write request and matching Applied or reconciliation receipt"
+                            "current-user task progress must retain its exact request, registration receipt, and optional one-shot run receipt"
                                 .to_owned(),
                         ));
                     }
@@ -4138,6 +4550,9 @@ struct InstallationTransactionWire {
     transaction_id: PlatformHandle,
     installation_epoch: InstallationEpoch,
     profile: InstallationProfile,
+    /// Explicit null before planner source publication only; current wire
+    /// validation rejects a missing identity after construction.
+    retained_profile_anchor: Option<RetainedProfileAnchor>,
     // Current durable wire records are never in the constructor-only
     // unbound state. A non-optional wire field rejects both an omitted member
     // and an explicit JSON null before the in-memory transaction is rebuilt.
@@ -4176,6 +4591,7 @@ impl InstallationTransactionWire {
             transaction_id: self.transaction_id,
             installation_epoch: self.installation_epoch,
             profile: self.profile,
+            retained_profile_anchor: self.retained_profile_anchor,
             profile_governed_roots: Some(self.profile_governed_roots),
             profile_selection_receipt: self.profile_selection_receipt,
             request: self.request,
@@ -4206,7 +4622,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v28 records are
+/// transaction authority object to another crate. Pre-v29 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -4263,11 +4679,13 @@ fn validate_current_transaction_progress(
             "current_user_task_request",
             "current_user_task_receipt",
             "current_user_task_unknown",
+            "current_user_task_run_intent",
+            "current_user_task_run_receipt",
         ] {
             if !progress.contains_key(field) {
                 return Err(InstallationError::MigrationRequired {
                     reason: format!(
-                        "installation transaction effect progress entry {index} is missing the v28 {field} member"
+                        "installation transaction effect progress entry {index} is missing the v29 {field} member"
                     ),
                 });
             }
@@ -4355,7 +4773,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v28 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v29 is required"
                         ),
                     });
                 }
@@ -4394,7 +4812,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v28 discriminator".to_owned(),
+            reason: "installation transaction predates the required v29 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -4423,7 +4841,16 @@ fn decode_installation_transaction_json_with_policy(
         .is_some_and(|object| object.contains_key("profile_selection_receipt"))
     {
         return Err(InstallationError::MigrationRequired {
-            reason: "installation transaction wire is missing mandatory original profile selection receipt member; explicit migration to v28 is required"
+            reason: "installation transaction wire is missing mandatory original profile selection receipt member; explicit migration to v29 is required"
+                .to_owned(),
+        });
+    }
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("retained_profile_anchor"))
+    {
+        return Err(InstallationError::MigrationRequired {
+            reason: "installation transaction wire is missing the source-publication profile anchor identity; explicit migration to v29 is required"
                 .to_owned(),
         });
     }

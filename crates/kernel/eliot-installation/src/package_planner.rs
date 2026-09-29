@@ -24,6 +24,7 @@ use crate::{
     PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange, ProfileGovernanceReport,
     ProfileRootAnchors, ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
+    RetainedProfileAnchor,
     PhaseBSupervisionAuthorityProvisionPlan, SupervisionAuthorityProvisionPlan,
     UserModeSupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
@@ -1052,13 +1053,13 @@ fn enumerate_source_tree(
     Ok(set)
 }
 
-/// In-memory proof that a published source bundle is the exact bundle that
-/// the planner is about to observe.  This is deliberately not part of the
-/// transaction wire: the resulting candidate signature/effect digests are the
-/// durable authority, while this proof closes the materializer-to-planner
-/// handoff window.
+/// In-memory proof that a published source bundle and profile anchor are the
+/// exact objects the planner is about to observe. The source artifact facts
+/// close the materializer-to-planner handoff; the profile anchor pair is also
+/// retained on the durable transaction for later root-selection comparison.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceBundlePublicationBinding {
+    retained_profile_anchor: RetainedProfileAnchor,
     source_identity: FileIdentity,
     files: Vec<PackageArtifactDigest>,
     evidence_digest: PlatformHandle,
@@ -1222,6 +1223,7 @@ impl GenerationPackagePlanner {
         evidence_digest: PlatformHandle,
     ) -> Result<InstallationTransaction, InstallationError> {
         let publication_binding = SourceBundlePublicationBinding {
+            retained_profile_anchor: test_retained_profile_anchor(&input),
             source_identity,
             files,
             evidence_digest,
@@ -1330,6 +1332,7 @@ impl GenerationPackagePlanner {
         };
         let resolution = Self::resolve_profile_selection(&profile_selection)?;
         let publication_binding = SourceBundlePublicationBinding {
+            retained_profile_anchor: test_retained_profile_anchor(&input),
             source_identity,
             files,
             evidence_digest,
@@ -1355,6 +1358,7 @@ impl GenerationPackagePlanner {
         input: GenerationPackagePlanInput,
         selection: &ProfileSelectionInput,
         published_roots: &InstallationRoots,
+        retained_profile_anchor: RetainedProfileAnchor,
         source_identity: FileIdentity,
         files: Vec<PackageArtifactDigest>,
         evidence_digest: PlatformHandle,
@@ -1378,7 +1382,24 @@ impl GenerationPackagePlanner {
                     .to_owned(),
             ));
         }
+        retained_profile_anchor.validate()?;
+        if !crate::same_windows_root(
+            retained_profile_anchor.canonical_path.as_str(),
+            selection.profile_anchor_root.as_str(),
+        )? || !crate::same_windows_root(
+            retained_profile_anchor.canonical_path.as_str(),
+            published_roots
+                .runtime_state_roots
+                .profile_anchor_root
+                .as_str(),
+        )? {
+            return Err(InstallationError::ProfileViolation(
+                "source publication anchor path differs from the retained I3.1 selection"
+                    .to_owned(),
+            ));
+        }
         let publication_binding = SourceBundlePublicationBinding {
+            retained_profile_anchor,
             source_identity,
             files,
             evidence_digest,
@@ -1526,6 +1547,18 @@ impl GenerationPackagePlanner {
         {
             return Err(InstallationError::ProfileViolation(
                 "package plan inputs differ from the resolved I3.1 profile selection".to_owned(),
+            ));
+        }
+        publication_binding.retained_profile_anchor.validate()?;
+        if !crate::same_windows_root(
+            publication_binding
+                .retained_profile_anchor
+                .canonical_path
+                .as_str(),
+            profile_selection.profile_anchor_root.as_str(),
+        )? {
+            return Err(InstallationError::ProfileViolation(
+                "source publication anchor differs from the selected profile anchor".to_owned(),
             ));
         }
         profile_resolution.roots.validate(input.profile)?;
@@ -2650,6 +2683,9 @@ impl GenerationPackagePlanner {
             input.recovery_command,
         )?;
         transaction.profile_governed_roots = Some(profile_resolution.roots.clone());
+        transaction.bind_retained_profile_anchor(
+            publication_binding.retained_profile_anchor.clone(),
+        )?;
         transaction.validate()?;
         if let Some((lease, config)) = source_store_config.as_ref() {
             if config.runtime_launch != transaction.candidate_manifest.runtime_launch {
@@ -2763,10 +2799,25 @@ fn test_source_publication_binding(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SourceBundlePublicationBinding {
+        retained_profile_anchor: test_retained_profile_anchor(input),
         source_identity,
         files: ordered_files,
         evidence_digest,
     })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_retained_profile_anchor(input: &GenerationPackagePlanInput) -> RetainedProfileAnchor {
+    // This identity exists only inside the explicit planner test-support
+    // surface. Production planning requires the no-follow pair delivered by
+    // source publication through `plan_with_published_profile_binding`.
+    RetainedProfileAnchor {
+        canonical_path: input.profile_anchor_root.clone(),
+        identity: FileIdentity {
+            volume_serial_number: 1,
+            file_index: 1,
+        },
+    }
 }
 
 fn validate_source_bundle_publication_binding(
