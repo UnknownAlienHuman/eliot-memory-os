@@ -1384,6 +1384,13 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::HostRequestLegacyCorrelationUnresolved => BackupError::UnsupportedFormat(
             "restore journal host-request legacy correlation is unresolved".to_owned(),
         ),
+        OrsError::HostRequestAttemptLimitExceeded => BackupError::InvalidField {
+            field: "restore.journal_host_request_attempt_limit",
+            reason: "host-request attempt journal capacity exceeded",
+        },
+        OrsError::HostRequestAttemptExpired => BackupError::FenceMismatch {
+            subject: "restore journal host-request attempt expired".to_owned(),
+        },
         OrsError::Encoding(detail) => BackupError::Serialization(detail),
         OrsError::Storage(_) => {
             BackupError::Target("restore journal owner storage failure".to_owned())

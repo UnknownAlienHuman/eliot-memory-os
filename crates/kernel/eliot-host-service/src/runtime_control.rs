@@ -881,8 +881,9 @@ fn validate_user_automation_response(
             Ok(())
         }
         UserAutomationHostExecutionResponse::WakeRead { .. }
-        | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => Err(
-            "user automation readback and batch enumeration travel over the authenticated execution transport, never runtime-control"
+        | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
+        | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => Err(
+            "user automation wake readback, cancellation-batch readback, and batch enumeration travel over the authenticated execution transport, never runtime-control"
                 .to_owned(),
         ),
     }

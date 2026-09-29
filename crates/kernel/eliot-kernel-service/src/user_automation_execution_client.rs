@@ -22,11 +22,47 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    UserAutomationDurableJobPort, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
+    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobPort,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationReadback, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakeEnumerationRequest, UserAutomationWakePort, UserAutomationWakeReadRequest,
     UserAutomationWakeReadback,
 };
+
+/// Persisted observer for the authenticated cancellation transport boundary.
+///
+/// The concrete transport calls these methods only with the exact carrier it
+/// is about to send or the response it has already validated. Implementations
+/// must durably bind each observation to the existing send claim; an observer
+/// error stops the exchange or leaves it reconciling.
+pub trait UserAutomationHostExecutionObserver: Send + Sync {
+    /// Retains the pre-send fence before the named-pipe write is attempted.
+    fn dispatch_started(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+    ) -> Result<(), UserAutomationRuntimeError>;
+
+    /// Retains a typed proof that the carrier was rejected before any write.
+    fn definitely_not_sent(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+        proof: eliot_ors::HostRequestNoSendProof,
+    ) -> Result<(), UserAutomationRuntimeError>;
+
+    /// Retains the actual named-pipe delivery result.
+    fn delivery_outcome(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+        receipt: eliot_ors::HostRequestDeliveryReceipt,
+    ) -> Result<(), UserAutomationRuntimeError>;
+
+    /// Retains the exact typed response body after request/response validation.
+    fn response_received(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+        response: &UserAutomationHostExecutionResponse,
+    ) -> Result<(), UserAutomationRuntimeError>;
+}
 
 /// Stable wire identity for the typed UserAutomation Host execution carrier.
 pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_ID: &str = "eliot.user_automation.host_execution";
@@ -499,6 +535,11 @@ pub enum UserAutomationHostExecutionOperation {
         /// Immutable revision, full occurrence denominator, and digest.
         request: Box<UserAutomationWakeEnumerationRequest>,
     },
+    /// Read the exact durable cancellation batch by its original typed request.
+    ReadCancellationBatch {
+        /// Original same-fence cancellation request and complete target set.
+        request: Box<UserAutomationWakeCancellation>,
+    },
 }
 
 /// Typed Kernel-to-Host request carrier for one UserAutomation execution
@@ -566,6 +607,19 @@ impl UserAutomationHostExecutionRequest {
         Self::new(
             channel,
             UserAutomationHostExecutionOperation::EnumeratePendingWakes {
+                request: request.into(),
+            },
+        )
+    }
+
+    /// Builds and hashes one authenticated exact cancellation-batch readback.
+    pub fn read_cancellation_batch(
+        channel: UserAutomationHostChannelBinding,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        Self::new(
+            channel,
+            UserAutomationHostExecutionOperation::ReadCancellationBatch {
                 request: request.into(),
             },
         )
@@ -676,6 +730,16 @@ impl UserAutomationHostExecutionRequest {
                     return Err(rejected("wake enumeration channel fence mismatch"));
                 }
             }
+            UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+                request
+                    .validate()
+                    .map_err(|error| rejected(format!("wake cancellation readback: {error}")))?;
+                if request.state_fence != self.channel.state_fence {
+                    return Err(rejected(
+                        "wake cancellation readback channel fence mismatch",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -720,6 +784,17 @@ pub enum UserAutomationHostExecutionResponse {
         state_fence: StateFence,
         /// Versioned receipt covering every committed occurrence.
         receipt: Box<UserAutomationWakeEnumerationReceipt>,
+    },
+    /// Exact durable cancellation batch returned by the Host journal owner.
+    WakeCancellationBatchReadback {
+        /// Digest of the exact request carrier answered.
+        request_sha256: String,
+        /// Fence observed by the Host owner.
+        state_fence: StateFence,
+        /// New server-authenticated channel used for this readback.
+        authenticated_channel_binding_sha256: String,
+        /// The exact retained Host batch record and append receipt projection.
+        readback: Box<UserAutomationWakeCancellationReadback>,
     },
     /// Closed Host-owner failure projection.
     Failed {
@@ -772,6 +847,11 @@ impl UserAutomationHostExecutionResponse {
                 request_sha256,
                 state_fence,
                 ..
+            }
+            | Self::WakeCancellationBatchReadback {
+                request_sha256,
+                state_fence,
+                ..
             } => (request_sha256, state_fence),
             Self::Failed {
                 request_sha256,
@@ -788,6 +868,10 @@ impl UserAutomationHostExecutionResponse {
         self.validate_operation_response(request)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each typed request and response variant is checked in one exhaustive boundary"
+    )]
     fn validate_operation_response(
         &self,
         request: &UserAutomationHostExecutionRequest,
@@ -841,6 +925,30 @@ impl UserAutomationHostExecutionResponse {
                     .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
                 Ok(())
             }
+            (
+                UserAutomationHostExecutionOperation::ReadCancellationBatch { request: query },
+                Self::WakeCancellationBatchReadback {
+                    authenticated_channel_binding_sha256,
+                    readback,
+                    ..
+                },
+            ) => {
+                query
+                    .validate()
+                    .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                readback
+                    .validate_for(query)
+                    .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                validate_sha256(
+                    authenticated_channel_binding_sha256,
+                    "cancellation_readback.authenticated_channel_binding_sha256",
+                )?;
+                let expected_channel = request.channel.authenticated_evidence_digest()?;
+                if authenticated_channel_binding_sha256 != &expected_channel {
+                    return Err(UserAutomationRuntimeError::IdentityConflict);
+                }
+                Ok(())
+            }
             (_, Self::Failed { .. }) => Ok(()),
             (
                 UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
@@ -879,6 +987,38 @@ impl UserAutomationHostExecutionResponse {
                 Self::WakeEnumeration { .. },
             )
             | (
+                UserAutomationHostExecutionOperation::ReadCancellationBatch { .. },
+                Self::Admitted { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::ReadCancellationBatch { .. },
+                Self::Cancelled { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::ReadCancellationBatch { .. },
+                Self::WakeRead { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::ReadCancellationBatch { .. },
+                Self::WakeEnumeration { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
+                Self::WakeCancellationBatchReadback { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
+                Self::WakeCancellationBatchReadback { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::ReadPendingWake { .. },
+                Self::WakeCancellationBatchReadback { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. },
+                Self::WakeCancellationBatchReadback { .. },
+            )
+            | (
                 UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. },
                 Self::Admitted { .. },
             )
@@ -898,7 +1038,10 @@ impl UserAutomationHostExecutionResponse {
 fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMetadata {
     match &request.operation {
         UserAutomationHostExecutionOperation::AdmitOccurrence { request } => &request.context,
-        UserAutomationHostExecutionOperation::CancelPendingWakes { request } => &request.context,
+        UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+        | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+            &request.context
+        }
         UserAutomationHostExecutionOperation::ReadPendingWake { request } => &request.context,
         UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => &request.context,
     }
@@ -1258,6 +1401,19 @@ pub trait UserAutomationHostExecutionTransport: Send + Sync {
         &self,
         request: UserAutomationHostExecutionRequest,
     ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError>;
+
+    /// Sends a cancellation only after durably recording each custody boundary.
+    /// Transports without this observer path fail closed and never fall back to
+    /// the unobserved `execute` method.
+    async fn execute_observed(
+        &self,
+        _request: UserAutomationHostExecutionRequest,
+        _observer: &dyn UserAutomationHostExecutionObserver,
+    ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "authenticated transport has no durable cancellation custody observer".to_owned(),
+        ))
+    }
 }
 
 /// Concrete Windows transport for the authenticated Kernel-to-Host execution
@@ -1356,6 +1512,14 @@ impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExe
         &self,
         request: UserAutomationHostExecutionRequest,
     ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError> {
+        if matches!(
+            &request.operation,
+            UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
+        ) {
+            return Err(UserAutomationRuntimeError::Unavailable(
+                "wake cancellation requires the durable transport-custody observer".to_owned(),
+            ));
+        }
         if request.channel != self.channel {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
@@ -1375,6 +1539,81 @@ impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExe
             .await
             .map_err(|error| UserAutomationRuntimeError::UnknownOutcome(error.to_string()))?;
         decode_user_automation_host_execution_response_frame(&response_frame, &request)
+    }
+
+    async fn execute_observed(
+        &self,
+        request: UserAutomationHostExecutionRequest,
+        observer: &dyn UserAutomationHostExecutionObserver,
+    ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError> {
+        if request.channel != self.channel {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        if !matches!(
+            &request.operation,
+            UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
+        ) {
+            return Err(rejected(
+                "transport custody observation is restricted to wake cancellation",
+            ));
+        }
+        let frame = match user_automation_host_execution_request_frame(&request) {
+            Ok(frame) => frame,
+            Err(error) => {
+                observer
+                    .definitely_not_sent(
+                        &request,
+                        eliot_ors::HostRequestNoSendProof::RequestRejectedBeforeWrite,
+                    )
+                    .map_err(|_| {
+                        UserAutomationRuntimeError::UnknownOutcome(
+                            "the pre-write rejection could not be durably observed".to_owned(),
+                        )
+                    })?;
+                return Err(error);
+            }
+        };
+        let mut transport = self.transport.lock().await;
+        // The claim expiry is checked by the durable observer after waiting
+        // for this transport, immediately before the first possible write.
+        observer.dispatch_started(&request)?;
+        let Ok(outcome) = transport.send_frame(&frame, self.limits).await else {
+            observer
+                .delivery_outcome(
+                    &request,
+                    eliot_ors::HostRequestDeliveryReceipt::UnknownOutcome,
+                )
+                .map_err(|_| {
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "the uncertain send outcome could not be durably observed".to_owned(),
+                    )
+                })?;
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "UserAutomation cancellation send crossed an unclassified transport error"
+                    .to_owned(),
+            ));
+        };
+        let delivery_receipt = match outcome {
+            DeliveryOutcome::Delivered => eliot_ors::HostRequestDeliveryReceipt::Delivered,
+            DeliveryOutcome::UnknownOutcome => {
+                eliot_ors::HostRequestDeliveryReceipt::UnknownOutcome
+            }
+        };
+        observer.delivery_outcome(&request, delivery_receipt)?;
+        if delivery_receipt == eliot_ors::HostRequestDeliveryReceipt::UnknownOutcome {
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "UserAutomation cancellation delivery crossed an unknown boundary".to_owned(),
+            ));
+        }
+        let response_frame = transport.receive_frame(self.limits).await.map_err(|_| {
+            UserAutomationRuntimeError::UnknownOutcome(
+                "UserAutomation cancellation response was not received".to_owned(),
+            )
+        })?;
+        let response =
+            decode_user_automation_host_execution_response_frame(&response_frame, &request)?;
+        observer.response_received(&request, &response)?;
+        Ok(response)
     }
 }
 
@@ -1431,7 +1670,8 @@ where
             UserAutomationHostExecutionResponse::WakeRead { readback, .. } => Ok(readback),
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::Cancelled { .. }
-            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1454,7 +1694,41 @@ where
             UserAutomationHostExecutionResponse::WakeEnumeration { receipt, .. } => Ok(*receipt),
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::Cancelled { .. }
-            | UserAutomationHostExecutionResponse::WakeRead { .. } => {
+            | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
+            }
+        }
+    }
+
+    /// Reads the exact retained cancellation batch on a new authenticated
+    /// channel. A missing or conflicting record is returned as reconciliation
+    /// failure; this path never resends cancellation.
+    pub async fn read_cancellation_batch(
+        &self,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
+        let carrier = UserAutomationHostExecutionRequest::read_cancellation_batch(
+            self.transport.channel_binding().clone(),
+            request,
+        )?;
+        match self.execute(carrier).await? {
+            UserAutomationHostExecutionResponse::WakeCancellationBatchReadback {
+                authenticated_channel_binding_sha256,
+                readback,
+                ..
+            } => Ok(UserAutomationAuthenticatedWakeCancellationReadback {
+                authenticated_channel_binding_sha256,
+                readback,
+            }),
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::Cancelled { .. }
+            | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1480,7 +1754,8 @@ where
             UserAutomationHostExecutionResponse::Admitted { execution, .. } => Ok(execution),
             UserAutomationHostExecutionResponse::Cancelled { .. }
             | UserAutomationHostExecutionResponse::WakeRead { .. }
-            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1496,21 +1771,37 @@ where
 {
     async fn cancel_pending_wakes(
         &self,
+        _request: impl Into<Box<UserAutomationWakeCancellation>>,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "wake cancellation requires the durable transport-custody observer".to_owned(),
+        ))
+    }
+
+    async fn cancel_pending_wakes_observed(
+        &self,
         request: impl Into<Box<UserAutomationWakeCancellation>>,
+        observer: &dyn UserAutomationHostExecutionObserver,
     ) -> Result<Vec<String>, UserAutomationRuntimeError> {
         let carrier = UserAutomationHostExecutionRequest::cancel_pending_wakes(
             self.transport.channel_binding().clone(),
             request,
         )?;
-        match self.execute(carrier).await? {
+        let response = self
+            .transport
+            .execute_observed(carrier.clone(), observer)
+            .await?;
+        response.validate_for(&carrier)?;
+        match response {
             UserAutomationHostExecutionResponse::Cancelled { wake_ids, .. } => Ok(wake_ids),
-            UserAutomationHostExecutionResponse::Admitted { .. }
-            | UserAutomationHostExecutionResponse::WakeRead { .. }
-            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
-                Err(UserAutomationRuntimeError::IdentityConflict)
-            }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
                 Err(failure.into_runtime_error())
+            }
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
+            | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
             }
         }
     }
@@ -1520,6 +1811,14 @@ where
         request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
     ) -> Result<UserAutomationWakeEnumerationReceipt, UserAutomationRuntimeError> {
         UserAutomationHostExecutionClient::enumerate_pending_wakes(self, request).await
+    }
+
+    async fn read_cancellation_batch(
+        &self,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
+        UserAutomationHostExecutionClient::read_cancellation_batch(self, request).await
     }
 }
 

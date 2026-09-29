@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use eliot_contracts::{EpochContractError, EpochId as EpochIdentity, EpochTransition, StateFence};
 use eliot_observation_contracts::ObservationRecordEnvelope;
@@ -1515,6 +1517,11 @@ impl WakeCancellationBatchEntry {
 pub struct WakeCancellationBatchRecord {
     pub fence: RecordFence,
     pub operation: IdempotencyIdentity,
+    /// Canonical commitment of the exact typed `UserAutomation` cancellation
+    /// request received by the Host. Legacy batches omit it and cannot satisfy
+    /// exact cancellation readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_commitment_sha256: Option<String>,
     pub entries: Vec<WakeCancellationBatchEntry>,
 }
 
@@ -1522,6 +1529,9 @@ impl WakeCancellationBatchRecord {
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
+        if let Some(commitment) = &self.request_commitment_sha256 {
+            record_checksum_digest(commitment, "wake_cancellation.request_commitment_sha256")?;
+        }
         if self.entries.is_empty() {
             return Err(JournalError::Invalid(
                 "wake cancellation batch must not be empty".into(),
@@ -1538,6 +1548,19 @@ impl WakeCancellationBatchRecord {
         }
         Ok(())
     }
+}
+
+/// Rebuildable exact lookup entry produced by the journal reducer. It is
+/// populated only from a validated original frame and its sequence/checksum;
+/// the journal validates the corresponding durable commit receipt at open.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WakeCancellationBatchProjection {
+    pub(crate) record: WakeCancellationBatchRecord,
+    pub(crate) sequence: u64,
+    pub(crate) record_checksum: String,
+    /// Set only after the original durable commit receipt is checked at open
+    /// or the live append has committed successfully.
+    pub(crate) receipt_valid: bool,
 }
 
 /// Observation records cannot bypass the Host and activation fence.
@@ -2761,6 +2784,12 @@ pub struct HostState {
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
     pub applied_operations: Vec<AppliedOperation>,
+    /// In-memory index of committed cancellation batches, rebuilt from the
+    /// journal on open. It is omitted from serialized read models and grants
+    /// no independent authority; queries need not scan the journal history.
+    #[serde(skip)]
+    pub(crate) wake_cancellation_batches:
+        Arc<BTreeMap<(String, String), WakeCancellationBatchProjection>>,
     /// Retirement records this Host log durably applied, retained so a reader
     /// can resolve one retirement by its exact operation identity.
     ///
@@ -2806,6 +2835,7 @@ impl HostState {
             retained_epochs,
             retired_epochs: Vec::new(),
             applied_operations: Vec::new(),
+            wake_cancellation_batches: Arc::default(),
             epoch_retirements: Vec::new(),
         }
     }

@@ -16,7 +16,7 @@
 //! [`UserAutomationRuntimePort`](super::UserAutomationRuntimePort) over the
 //! already-authenticated `USER_AUTOMATION_RUNTIME_OPERATION` Host channel. It
 //! adds no transport, no route, no authority and no second job lifecycle: it
-//! only forwards the three port calls to the existing
+//! only forwards the owner port calls to the existing
 //! [`UserAutomationHostExecutionClient`] and fails closed where this contour
 //! has no owner to reach.
 
@@ -36,14 +36,16 @@ use super::user_automation::{
     UserAutomationStoreOutcome,
 };
 use super::user_automation_execution::{
-    UserAutomationDurableJobPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
-    UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationWakeCancellation,
-    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobPort,
+    UserAutomationFailurePublication, UserAutomationFailureRecord, UserAutomationHorizonTrigger,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationRuntimePort,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback,
 };
 use super::user_automation_execution_client::{
-    UserAutomationHostExecutionClient, UserAutomationHostExecutionTransport,
+    UserAutomationHostExecutionClient, UserAutomationHostExecutionObserver,
+    UserAutomationHostExecutionTransport,
 };
 use super::user_automation_orchestration::{
     UserAutomationOrchestrationRecord, UserAutomationRuntimeObligation,
@@ -1609,7 +1611,7 @@ fn validate_horizon_phase(horizon: &UserAutomationHorizonPhase) -> Result<(), St
 /// execution channel.
 ///
 /// The adapter owns no mutable state and creates no transport: it forwards the
-/// three port calls to the existing [`UserAutomationHostExecutionClient`] bound
+/// owner port calls to the existing [`UserAutomationHostExecutionClient`] bound
 /// to the server-authored channel, and it fails closed with a named reason
 /// wherever this contour has no owner to reach. It is composed by the
 /// authenticated `eliot_user_automation` operator route, so the operator commit
@@ -1644,6 +1646,22 @@ where
         request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Vec<String>, UserAutomationRuntimeError> {
         UserAutomationWakePort::cancel_pending_wakes(self.client, request).await
+    }
+
+    async fn cancel_pending_wakes_observed(
+        &self,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
+        observer: &dyn UserAutomationHostExecutionObserver,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        UserAutomationWakePort::cancel_pending_wakes_observed(self.client, request, observer).await
+    }
+
+    async fn read_cancellation_batch(
+        &self,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
+        UserAutomationWakePort::read_cancellation_batch(self.client, request).await
     }
 
     async fn enumerate_pending_wakes(
@@ -1697,6 +1715,17 @@ where
             .validate()
             .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
         UserAutomationWakePort::cancel_pending_wakes(self.client, request).await
+    }
+
+    async fn cancel_pending_wakes_observed(
+        &self,
+        request: UserAutomationWakeCancellation,
+        observer: &dyn UserAutomationHostExecutionObserver,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        UserAutomationWakePort::cancel_pending_wakes_observed(self.client, request, observer).await
     }
 
     async fn deliver_user_automation_failure(
