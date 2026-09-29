@@ -24,10 +24,6 @@ pub use action_envelope::{
     ActionEnvelopeCarrier, ActionEnvelopeCarrierError, MAX_ACTION_ENVELOPE_BYTES,
     MAX_ACTION_ENVELOPE_OP_LEN,
 };
-pub use generated::{
-    NativeWorkerExecuteEbpCallV1, NativeWorkerFacetStubError,
-    compile_native_worker_execute_call_v1,
-};
 pub use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind,
 };
@@ -39,6 +35,9 @@ use eliot_process::{
     ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
 use eliot_receipts::{ProofCeiling, ReceiptDisposition};
+pub use generated::{
+    NativeWorkerExecuteEbpCallV1, NativeWorkerFacetStubError, compile_native_worker_execute_call_v1,
+};
 use thiserror::Error;
 
 pub use eliot_protocol::AckPhase;

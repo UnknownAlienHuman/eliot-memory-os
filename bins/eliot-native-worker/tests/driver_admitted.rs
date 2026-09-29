@@ -1372,10 +1372,7 @@ fn stdio_execute_frame() -> WorkerFrame {
     let call = load(compile_native_worker_execute_call_v1(
         &facet_ref, &cell, &request,
     ));
-    stdio_frame(
-        "stdio-exec-1",
-        WorkerFrameBody::Execute(call),
-    )
+    stdio_frame("stdio-exec-1", WorkerFrameBody::Execute(call))
 }
 
 fn stdio_cancel_frame() -> WorkerFrame {
