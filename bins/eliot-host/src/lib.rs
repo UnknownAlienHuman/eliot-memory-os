@@ -1744,7 +1744,7 @@ pub enum HostError {
             |rendered| rendered.reason
         )
     )]
-    OriginCollisionUnproven(#[from] eliot_host_service::OriginCollisionDirective),
+    OriginCollisionUnproven(eliot_host_service::OriginCollisionDirective),
     /// The planned Store endpoint's owner could not be read.
     ///
     /// Issue #1775. A read that failed is not a read that succeeded with an

@@ -1074,6 +1074,13 @@ fn lease_census_reason(error: &HostError) -> &'static str {
         HostError::WatchdogCoverageUnavailable(_) => "supervision-spool-unreadable",
         #[cfg(windows)]
         HostError::StoreRecoveryRequired(_) => "durable-state-unreadable",
+        // Ownership of the planned Store endpoint is unproven, so the durable
+        // supervision state behind it could not be established either; the
+        // census must not report `Idle` on an unverified endpoint.
+        #[cfg(windows)]
+        HostError::OriginCollisionUnproven(_) => "durable-state-unreadable",
+        #[cfg(windows)]
+        HostError::StoreEndpointOwnerUnreadable(_) => "durable-state-unreadable",
     }
 }
 
