@@ -98,10 +98,12 @@
 //!   provenance or task-selection standing, and no owner maps a transition
 //!   effect ceiling onto [`RequestedEffect`]; evaluation there would be
 //!   `INCOMPLETE` for every real request. For `fetch_committed_candidate` the
-//!   closed `eliot_store_api::NamedReadOperation` catalogue exposes no
-//!   projection-publication read and no candidate-by-handle read, and the one
-//!   production `eliot_store_api::CanonicalReadClient` in `eliotd`
-//!   (`KernelContextReadClient`) activates only `GetRevisionHeads`, so no
+//!   closed `eliot_store_api::NamedReadOperation` catalogue (23 rows, verified
+//!   at `main@941bc3fc`) exposes no projection-publication read and no
+//!   candidate-by-handle read, and the one production
+//!   `eliot_store_api::CanonicalReadClient` in `eliotd`
+//!   (`KernelContextReadClient`) reaches the store only through
+//!   `execute_named`, whose closed allowlist admits neither, so no
 //!   observed publication can reach this cell at runtime. Until those
 //!   producers exist, this cell proves the gate logic only and claims no
 //!   runtime admission, persistence, or publication behavior.
