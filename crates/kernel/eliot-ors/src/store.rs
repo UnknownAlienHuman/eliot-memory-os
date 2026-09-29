@@ -7033,10 +7033,14 @@ pub trait OperationalRecoveryStore: Send + Sync {
         after_identity: Option<&str>,
         limit: u16,
     ) -> Result<Vec<MaintenanceTriggerGapStorageRecord>, OrsError>;
-    /// Rejects downstream retention proof admission until ORS can verify its
-    /// owner binding. The opaque proof shape and deadline alone cannot
-    /// authorize payload compaction; acknowledgement and terminalization
-    /// remain available.
+    /// Retains one validated downstream retention proof and finite horizon on
+    /// a trigger that already reached acknowledgement or terminal
+    /// disposition. The proof is bound to the exact CAS'd lifecycle row: the
+    /// row must already retain the downstream intent the proof covers, an
+    /// exact proof replay is idempotent, and a changed proof conflicts.
+    /// Downstream-owner authentication belongs to the invoking Kernel owner;
+    /// this owner binds the admitted bytes without interpreting them, and
+    /// acknowledgement and terminalization remain available independently.
     fn record_maintenance_trigger_retention(
         &self,
         trigger_id: &str,
@@ -36038,11 +36042,37 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     ) -> Result<MaintenanceTriggerLifecycleRecord, OrsError> {
         validate_text(trigger_id, "maintenance_trigger_id")?;
         proof.validate()?;
-        let _ = (expected_state_revision, now_ms);
-        // No downstream-owner verifier is available at this boundary. Refuse
-        // before opening a write transaction so a direct OrsCoordinator call
-        // cannot make opaque proof bytes authorize payload compaction.
-        Err(OrsError::InvalidTransition)
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut lifecycle = load_maintenance_trigger_lifecycle_for_update(&write, trigger_id)?;
+        // Exact replay returns the retained row without advancing the
+        // revision; a changed proof under the same trigger conflicts instead
+        // of overwriting retained downstream evidence.
+        if let Some(retained) = lifecycle.downstream_retention.as_ref() {
+            if retained == &proof {
+                return commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        // Retention evidence is admissible only after the trigger reached a
+        // disposition that ends delivery: exact acknowledgement or an explicit
+        // terminal expiry/supersession. The row validation additionally
+        // requires a retained downstream intent beside the proof, so a bare
+        // acknowledgement without recorded effects cannot authorize pruning.
+        if expected_state_revision != lifecycle.state_revision
+            || !matches!(
+                lifecycle.phase,
+                MaintenanceTriggerLifecyclePhase::Acknowledged
+                    | MaintenanceTriggerLifecyclePhase::Expired
+                    | MaintenanceTriggerLifecyclePhase::Superseded
+            )
+            || lifecycle.downstream_intent_record.is_none()
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        lifecycle.downstream_retention = Some(proof);
+        advance_maintenance_trigger_lifecycle(&mut lifecycle, now_ms)?;
+        persist_maintenance_trigger_lifecycle(&write, &lifecycle)?;
+        commit_maintenance_trigger_lifecycle_transition(self, write, &lifecycle)
     }
 
     fn compact_maintenance_trigger_payload(
