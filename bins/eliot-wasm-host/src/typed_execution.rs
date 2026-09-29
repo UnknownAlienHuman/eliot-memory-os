@@ -330,11 +330,7 @@ impl fmt::Display for TypedExecutionError {
                 write!(formatter, "WORLD_SELECTION:{}", truncate_detail(reason))
             }
             Self::ExportTypeMismatch(name) => {
-                write!(
-                    formatter,
-                    "EXPORT_TYPE_MISMATCH:{}",
-                    truncate_detail(name)
-                )
+                write!(formatter, "EXPORT_TYPE_MISMATCH:{}", truncate_detail(name))
             }
             Self::MissingExport(name) | Self::ForbiddenImport(name) => {
                 write!(
