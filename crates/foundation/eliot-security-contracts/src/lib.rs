@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod revocation_digest;
+mod source_use;
 mod surface_types;
 mod validation;
 
@@ -16,6 +17,7 @@ pub use revocation_digest::{
     RevocationClosureDigestBounds, RevocationClosureDigestInput, revocation_affected_members,
     revocation_affected_members_digest, revocation_closure_canonical_digest,
 };
+pub use source_use::*;
 pub use surface_types::*;
 pub use validation::{
     SecurityContractError, import_legacy_selection_receipt_v1, selection_chain_head_digest,
