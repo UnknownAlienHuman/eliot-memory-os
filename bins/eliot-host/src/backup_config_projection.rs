@@ -1434,9 +1434,7 @@ pub fn project_backup_config_owner_bound(
         if presented != owner_audit {
             return Err(note_config_error(
                 "project_owner_bound",
-                ProjectionError::StaleEvidence {
-                    field: "audit",
-                },
+                ProjectionError::StaleEvidence { field: "audit" },
             ));
         }
     }
