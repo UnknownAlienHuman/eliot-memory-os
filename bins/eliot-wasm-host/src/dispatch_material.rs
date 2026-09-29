@@ -1659,7 +1659,7 @@ fn reclaim_claimed_delivery_unlocked(
     let (owner_identity, join, disposition) =
         match read_claimed_reclamation_owner_state_unlocked(claim, install_dir) {
             Ok(state) => state,
-            Err(outcome) => return outcome,
+            Err(outcome) => return *outcome,
         };
     let effective_claim = match bind_claim_for_reclamation_unlocked(
         claim,
@@ -1669,7 +1669,7 @@ fn reclaim_claimed_delivery_unlocked(
         install_dir,
     ) {
         Ok(bound) => bound,
-        Err(outcome) => return outcome,
+        Err(outcome) => return *outcome,
     };
 
     if let Some(outcome) =
@@ -1678,13 +1678,10 @@ fn reclaim_claimed_delivery_unlocked(
         return outcome;
     }
 
-    let staged = match read_claimed_dispatch_material_unlocked(install_dir) {
-        Ok(staged) => staged,
-        Err(_) => {
-            return ClaimedReclamation::RetainedForRecovery {
-                claimed: claim.identity().clone(),
-            };
-        }
+    let Ok(staged) = read_claimed_dispatch_material_unlocked(install_dir) else {
+        return ClaimedReclamation::RetainedForRecovery {
+            claimed: claim.identity().clone(),
+        };
     };
     let Some((staged_claim, _material)) = staged else {
         return ClaimedReclamation::AlreadyGone {
@@ -1708,30 +1705,27 @@ fn read_claimed_reclamation_owner_state_unlocked(
         OwnerJoinBinding,
         OwnerDeliveryDisposition,
     ),
-    ClaimedReclamation,
+    Box<ClaimedReclamation>,
 > {
     let identity = claim.identity();
-    let disposition_record = match read_owner_disposition_unlocked(install_dir, identity) {
-        Ok(record) => record,
-        Err(_) => {
-            return Err(ClaimedReclamation::RetainedForRecovery {
-                claimed: identity.clone(),
-            });
-        }
+    let Ok(disposition_record) = read_owner_disposition_unlocked(install_dir, identity) else {
+        return Err(Box::new(ClaimedReclamation::RetainedForRecovery {
+            claimed: identity.clone(),
+        }));
     };
     let owner_identity = disposition_record.disposition.identity().clone();
     if !owner_identity.names(identity) {
-        return Err(ClaimedReclamation::ReplacementPreserved {
+        return Err(Box::new(ClaimedReclamation::ReplacementPreserved {
             claimed: identity.clone(),
-        });
+        }));
     }
     match read_delivery_publication_unlocked(install_dir, identity) {
         Ok(Some(publication))
             if publication.is_ready() && publication.identity() == &owner_identity => {}
         _ => {
-            return Err(ClaimedReclamation::RetainedForRecovery {
+            return Err(Box::new(ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
-            });
+            }));
         }
     }
     let join = disposition_record.disposition.join().clone();
@@ -1740,9 +1734,9 @@ fn read_claimed_reclamation_owner_state_unlocked(
         .as_ref()
         .is_some_and(|expected| expected != &join)
     {
-        return Err(ClaimedReclamation::RetainedForRecovery {
+        return Err(Box::new(ClaimedReclamation::RetainedForRecovery {
             claimed: identity.clone(),
-        });
+        }));
     }
     Ok((owner_identity, join, disposition_record.disposition))
 }
@@ -1776,30 +1770,22 @@ fn reconcile_claimed_asides_after_successor_unlocked(
     match read_claimed_dispatch_material_unlocked(install_dir) {
         Ok(Some((current, _))) if claim_is_same_owner_delivery(claim, &current) => return None,
         Ok(Some(_)) => {}
-        // Without a complete current envelope, payload names may be partial
-        // publication state. Keep the aside until discovery can establish the
-        // successor set instead of treating an empty read as absence proof.
-        Ok(None) => {
-            return Some(ClaimedReclamation::RetainedForRecovery {
-                claimed: identity.clone(),
-            });
-        }
-        Err(_) => {
+        // An absent, incomplete, or unreadable current envelope cannot prove a
+        // successor set, so preserve the aside rather than treating it as gone.
+        Ok(None) | Err(_) => {
             return Some(ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
             });
         }
     }
 
-    let aside_bytes =
-        match read_verified_claimed_asides_unlocked(install_dir, identity, &paths, &present) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Some(ClaimedReclamation::RetainedForRecovery {
-                    claimed: identity.clone(),
-                });
-            }
-        };
+    let Ok(aside_bytes) =
+        read_verified_claimed_asides_unlocked(install_dir, identity, &paths, present)
+    else {
+        return Some(ClaimedReclamation::RetainedForRecovery {
+            claimed: identity.clone(),
+        });
+    };
     Some(delete_claimed_asides_unlocked(
         identity,
         &paths,
@@ -1823,9 +1809,8 @@ fn claimed_reclaim_aside_presence_unlocked(paths: &[std::path::PathBuf; 3]) -> O
     for (slot, aside) in present.iter_mut().zip(paths) {
         match std::fs::symlink_metadata(aside) {
             Ok(metadata) if metadata.file_type().is_file() => *slot = true,
-            Ok(_) => return None,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
+            _ => return None,
         }
     }
     Some(present)
@@ -1835,14 +1820,18 @@ fn read_verified_claimed_asides_unlocked(
     install_dir: &std::path::Path,
     claim: &StagedDeliveryIdentity,
     paths: &[std::path::PathBuf; 3],
-    present: &[bool; 3],
+    present: [bool; 3],
 ) -> Result<[Option<Vec<u8>>; 3], MaterialError> {
     let owner_copy = read_retained_owner_material_unlocked(install_dir, claim)?;
     let mut aside_bytes: [Option<Vec<u8>>; 3] = std::array::from_fn(|_| None);
     for (index, ((aside, is_present), retained)) in
-        paths.iter().zip(present).zip(owner_copy.iter()).enumerate()
+        paths
+            .iter()
+            .zip(present)
+            .zip(owner_copy.iter())
+            .enumerate()
     {
-        if !*is_present {
+        if !is_present {
             continue;
         }
         let bytes = read_bounded_regular_file(
@@ -1893,7 +1882,7 @@ fn bind_claim_for_reclamation_unlocked(
     join: &OwnerJoinBinding,
     disposition: &OwnerDeliveryDisposition,
     install_dir: &std::path::Path,
-) -> Result<DeliveryClaim, ClaimedReclamation> {
+) -> Result<DeliveryClaim, Box<ClaimedReclamation>> {
     let identity = claim.identity();
     let mut effective_identity = identity.clone();
     effective_identity.publication_incarnation = Some(owner_identity.publication_incarnation);
@@ -1922,9 +1911,9 @@ fn bind_claim_for_reclamation_unlocked(
                     .as_ref()
                     .is_some_and(|current| current != claimant_incarnation)
             {
-                return Err(ClaimedReclamation::RetainedForRecovery {
+                return Err(Box::new(ClaimedReclamation::RetainedForRecovery {
                     claimed: identity.clone(),
-                });
+                }));
             }
             effective_claim = match bind_claim_to_owner(
                 &effective_claim,
@@ -1936,25 +1925,25 @@ fn bind_claim_for_reclamation_unlocked(
             ) {
                 Ok(bound) => bound,
                 Err(_) => {
-                    return Err(ClaimedReclamation::RetainedForRecovery {
+                    return Err(Box::new(ClaimedReclamation::RetainedForRecovery {
                         claimed: identity.clone(),
-                    });
+                    }));
                 }
             };
             if !disposition.is_claimed_by(&effective_claim)
                 || !read_served_result_unlocked(install_dir, &effective_claim)
                     .is_ok_and(|result| result.is_some_and(|record| record.names(&effective_claim)))
             {
-                return Err(ClaimedReclamation::RetainedForRecovery {
+                return Err(Box::new(ClaimedReclamation::RetainedForRecovery {
                     claimed: identity.clone(),
-                });
+                }));
             }
         }
         OwnerDeliveryDisposition::RetiredNoEffect { .. } => {}
         _ => {
-            return Err(ClaimedReclamation::RetainedForRecovery {
+            return Err(Box::new(ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
-            });
+            }));
         }
     }
     Ok(effective_claim)
@@ -2827,7 +2816,7 @@ fn resolve_delivery_claim_unlocked(
                 {
                     Ok(DeliveryClaimOutcome::RetainedResult(claim))
                 }
-                Ok(None) | Ok(Some(_)) => Ok(DeliveryClaimOutcome::ExistingInFlight(claim)),
+                Ok(None | Some(_)) => Ok(DeliveryClaimOutcome::ExistingInFlight(claim)),
                 Err(_) => Ok(DeliveryClaimOutcome::Unavailable),
             }
         }
@@ -3424,7 +3413,36 @@ fn read_served_result_unlocked(
         &record.runtime_request_digest,
         "served-result-runtime-digest",
     )?;
-    if record.retained_at_unix_ms == 0 || !record.names(claim) || &record.identity != owner_identity
+    validate_served_result_readback(
+        &record,
+        claim,
+        owner_identity,
+        expected_digest.as_deref(),
+        expected_sequence,
+    )?;
+    if let Some(next_disposition) = terminal_disposition_from_served_result(
+        &disposition.disposition,
+        &record,
+        &bytes,
+        expected_digest.as_deref(),
+    )? {
+        disposition.disposition = next_disposition;
+        write_owner_disposition_unlocked(install_dir, &claim.identity, &disposition)
+            .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    }
+    Ok(Some(record))
+}
+
+fn validate_served_result_readback(
+    record: &ServedResultRecord,
+    claim: &DeliveryClaim,
+    owner_identity: &OwnerDeliveryIdentity,
+    expected_digest: Option<&str>,
+    expected_sequence: Option<u64>,
+) -> Result<(), MaterialError> {
+    if record.retained_at_unix_ms == 0
+        || !record.names(claim)
+        || &record.identity != owner_identity
     {
         return Err(MaterialError::Malformed);
     }
@@ -3473,63 +3491,67 @@ fn read_served_result_unlocked(
     {
         return Err(MaterialError::DigestMismatch);
     }
+    Ok(())
+}
 
-    if expected_digest.is_none() {
-        if let Some(stream) = record.stream.as_ref()
-            && let Some(result_sequence) = stream.terminal_sequence
+fn terminal_disposition_from_served_result(
+    current: &OwnerDeliveryDisposition,
+    record: &ServedResultRecord,
+    bytes: &[u8],
+    expected_digest: Option<&str>,
+) -> Result<Option<OwnerDeliveryDisposition>, MaterialError> {
+    if expected_digest.is_none()
+        && let Some(stream) = record.stream.as_ref()
+        && let Some(result_sequence) = stream.terminal_sequence
+    {
+        let (
+            owner_identity,
+            owner_join,
+            request_commitment,
+            launch_incarnation,
+            claimant_incarnation,
+            runtime_request_digest,
+        ) = match current {
+            OwnerDeliveryDisposition::InFlight {
+                identity,
+                join,
+                request_commitment,
+                launch_incarnation,
+                claimant_incarnation,
+                runtime_request_digest,
+            } => (
+                identity.clone(),
+                join.clone(),
+                request_commitment.clone(),
+                launch_incarnation.clone(),
+                claimant_incarnation.clone(),
+                runtime_request_digest.clone(),
+            ),
+            _ => return Err(MaterialError::DigestMismatch),
+        };
+        // The result's owner, request, launch, and claimant commitments must
+        // match the exact InFlight record before it becomes durable owner state.
+        if record.identity != owner_identity
+            || record.join != owner_join
+            || record.request_commitment.as_str() != request_commitment.as_str()
+            || record.launch_incarnation.as_str() != launch_incarnation.as_str()
+            || record.claimant_incarnation.as_str() != claimant_incarnation.as_str()
+            || record.runtime_request_digest.as_str() != runtime_request_digest.as_str()
         {
-            let (
-                owner_identity,
-                owner_join,
-                request_commitment,
-                launch_incarnation,
-                claimant_incarnation,
-                runtime_request_digest,
-            ) = match &disposition.disposition {
-                OwnerDeliveryDisposition::InFlight {
-                    identity,
-                    join,
-                    request_commitment,
-                    launch_incarnation,
-                    claimant_incarnation,
-                    runtime_request_digest,
-                } => (
-                    identity.clone(),
-                    join.clone(),
-                    request_commitment.clone(),
-                    launch_incarnation.clone(),
-                    claimant_incarnation.clone(),
-                    runtime_request_digest.clone(),
-                ),
-                _ => return Err(MaterialError::DigestMismatch),
-            };
-            // The result's owner, request, launch, and claimant commitments
-            // must all match the exact InFlight record before its digest and
-            // terminal sequence can become durable owner state.
-            if &record.identity != &owner_identity
-                || &record.join != &owner_join
-                || record.request_commitment.as_str() != request_commitment.as_str()
-                || record.launch_incarnation.as_str() != launch_incarnation.as_str()
-                || record.claimant_incarnation.as_str() != claimant_incarnation.as_str()
-                || record.runtime_request_digest.as_str() != runtime_request_digest.as_str()
-            {
-                return Err(MaterialError::DigestMismatch);
-            }
-            disposition.disposition = OwnerDeliveryDisposition::TerminalUnacknowledged {
-                identity: owner_identity,
-                join: owner_join,
-                request_commitment,
-                launch_incarnation,
-                claimant_incarnation,
-                runtime_request_digest,
-                result_digest: Sha256Digest::of_bytes(&bytes).as_str().to_owned(),
-                result_sequence,
-            };
-            write_owner_disposition_unlocked(install_dir, &claim.identity, &disposition)
-                .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+            return Err(MaterialError::DigestMismatch);
         }
+        return Ok(Some(OwnerDeliveryDisposition::TerminalUnacknowledged {
+            identity: owner_identity,
+            join: owner_join,
+            request_commitment,
+            launch_incarnation,
+            claimant_incarnation,
+            runtime_request_digest,
+            result_digest: Sha256Digest::of_bytes(bytes).as_str().to_owned(),
+            result_sequence,
+        }));
     }
-    Ok(Some(record))
+    Ok(None)
 }
 
 /// Writes the served-result record atomically (process-scoped partial,
