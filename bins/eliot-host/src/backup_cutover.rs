@@ -2632,9 +2632,19 @@ fn commit_with_durable_intent(
 /// this cutover names — the same derivation the staged pending-activation
 /// contour uses — and the candidate is the one the owner's own
 /// `bind_approved_target` join proved approved against this attempt's own
-/// registry projection, so no path and no generation is presented text. The
-/// contour reads its prior generation from the Host's approved-generation
-/// registry, the same owner the installer cutover always read it from.
+/// registry projection, so no path and no generation is presented text.
+///
+/// The PRIOR generation is resolved from that same checked owner projection and
+/// must be the admitted `expected_predecessor`, and this composition's cached
+/// `host.registry` must still agree with the fresh readback on the active
+/// generation. Both are required before the contour runs, because the contour
+/// re-reads that cache for its own rollback decisions: resolving the candidate
+/// from a fresh projection while resolving the prior from the cache let the
+/// process effect run against a generation the trailing registry CAS had not
+/// accepted, and that CAS cannot undo a stopped process. A disagreement refuses
+/// with [`CutoverError::ExpectedPredecessorConflict`] and is provably a
+/// no-effect refusal, so the durable intent stays `Pending` and re-plans under
+/// the same identity once the projections agree again.
 ///
 /// The failure evidence is this module's own durable record: the `Pending`
 /// intent appended immediately before this call, re-read from the journal owner
@@ -2649,12 +2659,45 @@ fn activate_cutover_contour(
     validated: &ValidatedCutover,
 ) -> Result<Option<CutoverOutcome>, CutoverError> {
     let candidate = bind_approved_target(validated.request(), registry)?;
-    let prior = host.registry.active().ok_or_else(|| {
-        note_cutover_error(
+    // ONE checked projection must name BOTH ends of this transition, and the
+    // retained process owner must be the exact predecessor this admitted body
+    // names - both proved BEFORE the contour runs.
+    //
+    // The candidate is resolved from the owner readback this attempt was fenced
+    // on, but the prior generation was read from this composition's CACHED
+    // `host.registry`, and `cutover_generation_contour` re-reads that same cache
+    // for its own rollback decisions. The trailing registry CAS can reject stale
+    // state; it cannot undo a prior process that is already stopped, so the
+    // process effect must not be chosen from a projection the CAS has not
+    // accepted. A cache that has moved on is refused rather than followed, and a
+    // prior that is not the admitted `expected_predecessor` is refused even when
+    // the cache and the fresh readback agree: the effect is then not the
+    // transition this operation was admitted for (A13.7 keeps the old
+    // installation until the exact new one is accepted; I5.27: a committed
+    // canonical intent never proves the effect occurred).
+    //
+    // The refusal is typed and pre-effect, so it is provably a no-effect
+    // refusal. The durable intent appended immediately above stays `Pending`
+    // rather than recording a terminal `Failed` for an effect that never ran, and
+    // the same operation re-plans and re-reads the owners when the projections
+    // agree again.
+    if host.registry.active_generation() != registry.active_generation() {
+        return Err(note_cutover_error(
             "activate_contour",
-            CutoverError::Registry("cutover has no active prior generation".to_owned()),
-        )
-    })?;
+            CutoverError::ExpectedPredecessorConflict,
+        ));
+    }
+    let prior = registry
+        .active()
+        .filter(|generation| {
+            generation.manifest.generation == validated.request().expected_predecessor
+        })
+        .ok_or_else(|| {
+            note_cutover_error(
+                "activate_contour",
+                CutoverError::ExpectedPredecessorConflict,
+            )
+        })?;
     let (prior_kernel, prior_store, _) = prior.manifest.host_child_paths();
     let prior_kernel = prior_kernel.clone();
     let prior_store = prior_store.clone();
