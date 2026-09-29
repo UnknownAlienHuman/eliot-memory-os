@@ -518,6 +518,40 @@ fn require_stopped_scm_contour(
     ))
 }
 
+/// Refuses a new canary admission for a generation already under governed
+/// canary removal.
+///
+/// This is the admission fence read from the owner side, not from the removal
+/// side. The governed removal operation is a durable record keyed by the exact
+/// installed transaction and the target generation, so the activation owner
+/// resolves it with one point load instead of a store scan. A removal that has
+/// not reached `COMPLETED` is still retiring that generation: staging a new
+/// pending activation for it would admit a canary the installation owner is
+/// concurrently deleting, so the admission is refused here before any registry
+/// CAS is attempted. The comparison is against that record's own stage, not a
+/// flag, a timestamp or a caller-supplied value, and the loaded record is
+/// validated through its own validator before its stage is trusted.
+fn refuse_fenced_canary_admission(
+    transaction_store: &RedbInstallationTransactionStore,
+    transaction: &InstallationTransaction,
+) -> Result<(), InstallationError> {
+    let Some(removal) = transaction_store.load_canary_removal_for_generation(
+        &transaction.transaction_id,
+        &transaction.candidate_manifest.generation,
+    )? else {
+        return Ok(());
+    };
+    removal.validate()?;
+    if removal.stage != super::CanaryRemovalStage::Completed {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "generation {} is under governed canary removal {}; a new activation is refused for a fenced canary",
+            transaction.candidate_manifest.generation.as_str(),
+            removal.removal_transaction_id.as_str()
+        )));
+    }
+    Ok(())
+}
+
 impl RedbInstallationRegistry {
     fn pending_projection_matches(
         &self,
@@ -585,6 +619,7 @@ impl RedbInstallationRegistry {
             .activation_projection_intent()
             .ok_or(InstallationError::IdentityConflict)?;
         intent.validate_against_transaction(transaction)?;
+        refuse_fenced_canary_admission(transaction_store, transaction)?;
         if self.pending_projection_matches(transaction, approval)? {
             return Ok(());
         }
