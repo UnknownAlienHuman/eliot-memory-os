@@ -1427,7 +1427,9 @@ const RECLAIM_ASIDE_SUFFIX: &str = ".reclaiming";
 /// Aside path for one fixed staging name under the claimed identity: the
 /// fixed name is only a locator, and this claimed-identity name is the
 /// only path ever deleted. The claim fragment is filename-sanitized and
-/// truncated; the process id scopes forensics, never authority.
+/// truncated; the full envelope digest and owner publication revision keep
+/// different delivery identities from aliasing through that readable label.
+/// The readable fragment is for forensics, never authority.
 fn reclaim_aside_path(
     install_dir: &std::path::Path,
     file_name: &str,
@@ -1450,20 +1452,15 @@ fn reclaim_aside_path(
         claim.generation,
         claim.publication_incarnation.unwrap_or_default(),
         claim.publication_revision.unwrap_or_default(),
-        claim.envelope_digest.as_str().get(..16).unwrap_or_default(),
+        claim.envelope_digest.as_str(),
     ))
 }
 
 /// Restores aside bytes to their fixed name only when no successor owns
-/// it. The hard-link attempt is the atomic restore-if-absent path: it
-/// fails when the publisher already staged a successor, so a replacement
-/// is never clobbered. When the fixed name holds a successor, the aside
-/// bytes remain as recovery evidence and are never discarded. When the
-/// fixed name is absent and the filesystem lacks hard links, a plain
-/// rename restores: safe on Windows (rename fails over an existing
-/// destination), with a narrow clobber window against a concurrent
-/// publisher on Unix. That window is the honest residual of filesystems
-/// without atomic restore-if-absent.
+/// it. The hard-link attempt is the atomic restore-if-absent path; when the
+/// fixed name already exists, aside bytes remain as recovery evidence. If
+/// hard links are unavailable, rename is used only while the shared
+/// installation-root lock excludes the cooperating publisher.
 fn restore_aside_if_absent(aside: &std::path::Path, fixed: &std::path::Path) {
     if std::fs::hard_link(aside, fixed).is_ok() {
         let _ = std::fs::remove_file(aside);
@@ -1487,14 +1484,13 @@ fn consume_staged_unlocked(path: &std::path::Path) -> ReclaimOutcome {
     }
 }
 
-/// Reclaims one fixed staging name by claim: renames the fixed name aside
-/// under the claimed-identity name, re-verifies the aside bytes against
-/// the claim, and deletes only the verified aside. A fixed name that went
-/// missing answers `NotFound`; aside bytes that fail verification are
-/// restored when no successor owns the name and answer `Preserved` — a
-/// replacement landing between the set pre-check and this removal is
-/// never deleted. Deletion targets the claimed aside path only, never a
-/// generic current pathname.
+/// Reclaims one fixed staging name by claim while the shared installation-
+/// root lock is held: renames the fixed name aside under the claimed-
+/// identity name, re-verifies the aside bytes against the claim, and deletes
+/// only the verified aside. A fixed name that went missing answers
+/// `NotFound`; aside bytes that fail verification are restored when no
+/// successor owns the name and answer `Preserved`. Deletion targets the
+/// claimed aside path only, never a generic current pathname.
 #[must_use]
 fn reclaim_claimed_file_unlocked(
     install_dir: &std::path::Path,
@@ -1568,24 +1564,16 @@ fn reclaim_claimed_file_unlocked(
 /// loader and compares the full identity (claim, operation, generation,
 /// nonce, grant/fence, digests, window, epoch, material-set digest,
 /// installation binding); anything else is a replacement left untouched.
-/// Each removal then re-verifies on its own: the fixed name is renamed
-/// aside under the claimed-identity name and only aside bytes that still
-/// verify against the claim are deleted, so a replacement B landing after
-/// the pre-check is restored, never deleted. The envelope check re-hashes
-/// the claimed aside bytes against the material-set digest recorded when
-/// this claim was taken, so a replacement envelope that merely carries the
-/// same typed field values is never deleted either. A matching readable
-/// served marker is required before reclaim: absent or uncertain served
-/// state leaves the claimed bytes for recovery. No single-owner condition
-/// is asserted — the owner publisher stages replacements and retires
-/// expired sets concurrently by design — which is exactly why every
-/// deletion re-verifies after the move. Residual windows: the Unix restore
-/// path without hard-link support (see `restore_aside_if_absent`), and a
-/// crash between rename-aside and restore/delete orphaning one aside
-/// (removed on the next reclaim; the fixed set heals on the owner's next
-/// publication). The sibling kernel half fixes the analogous
-/// publisher-side race; coordination is by protocol (aside names never
-/// collide with publisher partials).
+/// The shared installation-root lock remains held through every marker read,
+/// aside move and deletion, so the Kernel publisher cannot replace a fixed
+/// name between the pre-check and cleanup. Each removal still re-verifies
+/// aside bytes against the exact claim before deleting; the envelope check
+/// compares the full material-set digest, so typed-field equality is never
+/// treated as delivery identity. A matching owner disposition and retained
+/// result (or explicit no-effect retirement) are required before reclaim;
+/// absent or uncertain state leaves the claimed bytes for recovery. A crash
+/// between rename-aside and deletion can leave that exact aside for a later
+/// guarded recovery attempt; no age or count heuristic retires it.
 #[must_use]
 pub fn reclaim_claimed_delivery(
     claim: &DeliveryClaim,
