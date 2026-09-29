@@ -2307,15 +2307,19 @@ pub enum StoreRecoveryRequired {
     LateDead,
 }
 
+// The cutover launch discriminator and its generation selector are read by
+// `HostComposition::cutover_generation_contour`, which the admitted #961 port
+// dispatches through `crate::backup_cutover::execute_cutover` ->
+// `activate_cutover_contour`. They carried a `dead_code` allowance only while
+// that chain had no production caller; the caller exists, so the allowance is
+// gone rather than restated.
 #[cfg(windows)]
-#[allow(dead_code)]
 enum CutoverLaunchOutcome {
     Candidate,
     Rollback { candidate_error: String },
 }
 
 #[cfg(windows)]
-#[allow(dead_code)]
 impl CutoverLaunchOutcome {
     fn activation_generation<'a>(
         &self,
@@ -6043,9 +6047,25 @@ impl HostComposition {
     /// [`crate::backup_cutover::reconcile_cutover_outcome`] under the same
     /// operation identity, so a lost response or a crash between the
     /// registry and the journal returns the exact `Unknown` disposition
-    /// instead of a local assumption. No algorithm is reimplemented here and
-    /// no cutover is executed at Host startup: this method runs only when an
-    /// admitted cutover operation is dispatched.
+    /// instead of a local assumption, and a proven commit returns the exact
+    /// `RetirementPending` disposition instead of a bare `Committed`. No
+    /// algorithm is reimplemented here and no cutover is executed at Host
+    /// startup: this method runs only when an admitted cutover operation is
+    /// dispatched.
+    ///
+    /// # Returned disposition
+    ///
+    /// The value that reaches the command surface is this owner's own two-owner
+    /// projection, never a local assumption: the exact typed
+    /// [`crate::backup_cutover::CutoverDisposition`] with its causal
+    /// [`crate::backup_cutover::CutoverResidual`], the ORIGINAL operation
+    /// identity, and a bounded redacted evidence set. `Committed`,
+    /// `RetirementPending`, `Prepared`, `Reconciled`, `Failed`, `Unknown` and
+    /// `Requested` are all reachable here, and none of them is a Product or
+    /// Finish claim. Prior-generation retirement stays a separate explicitly
+    /// authorized step holding the returned barrier; a `RetirementPending`
+    /// result is the honest statement that the activation committed under this
+    /// operation and that retirement has not happened yet.
     ///
     /// Prior-generation process/SCM retirement remains a separate explicitly
     /// authorized
@@ -6233,17 +6253,37 @@ impl HostComposition {
             &retirement,
             coherence,
         );
-        if reconciled.disposition != CutoverDisposition::RetirementPending {
-            host_terminal.disarm();
-            return Ok((reconciled, barrier));
-        }
-        // Reached only when the projection above DID return `RetirementPending`,
-        // which requires both a coherent pair and the registry's own
-        // operation-bound receipt. A torn pair returned `Unknown` +
-        // `ConcurrentOwnerMovement` at the branch above, so the proven
-        // `Committed` never reaches here unreported.
+        // #961 AUD5/B5: the value that leaves the admitted port is THIS
+        // PROJECTION, never the pre-projection `committed` the registry CAS
+        // produced. Every disposition the command surface can observe for a
+        // proven commit is decided here: `RetirementPending` when the
+        // coherence-bracketed pair plus the registry's own operation-bound
+        // receipt establish that this operation's activation committed and no
+        // retirement has happened yet, and `Unknown` + its causal residual
+        // (including `ConcurrentOwnerMovement` for a torn pair) whenever they
+        // do not. Handing back the local `Committed` in the first case
+        // discarded the one disposition word the command surface most needs,
+        // contradicted this method's own stated observation, and made
+        // `RetirementPending` unreachable from the only port that can produce
+        // it.
+        //
+        // This is not a weaker or a louder claim. The identity is the same
+        // one: `CutoverReadback::from_request` carries the admitted body's own
+        // operation identity, and `bind_admitted_cutover_body` has already
+        // proved the presented `request.operation` EQUALS
+        // `ValidatedCutover::sealed_operation` on all three fields, so the
+        // original operation identity survives the round trip unchanged. The
+        // disposition is more specific, the residual is causal rather than a
+        // bare `None`, and the bounded evidence is the durable intent's own
+        // handles - no path list, no archive digest, no error text. Nothing
+        // here infers a Product or Finish claim from an installation status
+        // (I0.13: no audit package or status elevates it without Product
+        // Proof); the returned word is the owner-observation pair and nothing
+        // more, and the barrier still has to be presented to the separately
+        // authorized `backup_dispatch_cutover_retire` step before any prior
+        // generation is retired.
         host_terminal.disarm();
-        Ok((committed, barrier))
+        Ok((reconciled, barrier))
     }
 
     /// Exact admitted cutover disposition for one operation, read from the
@@ -8602,8 +8642,13 @@ impl HostComposition {
         Ok((prior_disposition, generation, authority))
     }
 
+    // Both of the next two are called by `HostComposition::cutover_generation_contour`
+    // on the live admitted #961 chain (`backup_dispatch_cutover` ->
+    // `crate::backup_cutover::execute_cutover` -> `activate_cutover_contour`):
+    // the prior-Kernel failure transition and the launched-Kernel activation,
+    // including the rollback reactivation arm. Their `dead_code` allowances
+    // existed only while that chain had no production caller.
     #[cfg(windows)]
-    #[allow(dead_code)]
     fn fail_current_kernel_record(&self, evidence: &str) -> Result<(), HostError> {
         let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
             HostError::OwnerLeaseRecovery(
@@ -8614,7 +8659,6 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    #[allow(dead_code)]
     fn activate_launched_kernel(
         &mut self,
         generation: &PlatformHandle,
@@ -8983,6 +9027,22 @@ impl HostComposition {
     /// Activates one approved generation only after a bounded process cutover;
     /// a rejected candidate restores the registry's previous LKG projection.
     ///
+    /// This is the INSTALLER entry, not the #961 cutover entry. Its ordered
+    /// process work lives in [`Self::cutover_generation_contour`], which the
+    /// admitted #961 port now dispatches for real through
+    /// [`Self::backup_dispatch_cutover`] ->
+    /// [`crate::backup_cutover::execute_cutover`] ->
+    /// [`crate::backup_cutover`]'s `activate_cutover_contour`; the two owner
+    /// decisions this wrapper keeps are the staged-pending-activation
+    /// precondition and the trailing [`Self::commit_pending_durable`], and BOTH
+    /// belong to the installer. An installation cutover stages no installer
+    /// pending activation - it authorizes itself with its own durable cutover
+    /// intent and commits through the registry's operation-bound cutover CAS -
+    /// so giving this entry a #961 caller would require synthesizing a second
+    /// recovery owner, which A12.3 and A13.6 forbid. The allowance below
+    /// therefore covers this entry's own installer precondition, not the cutover
+    /// chain: the chain itself is live and carries no allowance.
+    ///
     /// # Errors
     ///
     /// Returns an error if admission is fenced, either generation is invalid,
@@ -8990,7 +9050,7 @@ impl HostComposition {
     #[cfg(windows)]
     #[allow(
         dead_code,
-        reason = "the staged pending activation and its durable commit are owned by this installer cutover; the #961 installation cutover dispatches the contour without one"
+        reason = "the staged pending activation and its durable commit are owned by this installer cutover; the #961 installation cutover dispatches `cutover_generation_contour` directly, under its own durable cutover intent, and stages no installer pending activation"
     )]
     fn cutover_generation(
         &mut self,
