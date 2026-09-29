@@ -73,9 +73,13 @@
 //!
 //! - `bins/eliotd/src/lib.rs`, after the `store_failure_projection` line:
 //!   `pub mod swarm_composition;`
-//! - Binary wiring (daemon owns exactly one composition over its one
-//!   Governor attachment composition, one ledger owner, one runner owner):
-//!   `let swarm = eliotd::swarm_composition::SwarmComposition::new(&attachment, &ledger, &runner);`
+//! - Production wiring (issue #1126 slice A): the daemon owns exactly one
+//!   Governor attachment composition
+//!   (`DaemonComposition::swarm_attachment_composition`, constructed once in
+//!   `DaemonComposition::start`), and binds this composition over it with
+//!   `DaemonComposition::swarm_composition(&ledger, &runner)`. The ledger and
+//!   runner stay explicit caller ports until their production owners land
+//!   (#1699 ledger/store, #2866 items 2-4 registry, #22 permit runner).
 //!
 //! # No-lost-child accounting over the durable ledger
 //!
