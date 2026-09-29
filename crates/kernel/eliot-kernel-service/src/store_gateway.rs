@@ -3093,6 +3093,50 @@ impl KernelStoreGateway {
         Ok(())
     }
 
+    /// Reads the schedule normalization receipt envelopes this fence retains in
+    /// the canonical Store receipt history.
+    ///
+    /// The normalization receipt is owner evidence over the compiled occurrence
+    /// set, so it is read from the owner that retained it and is never assembled,
+    /// derived or defaulted here. Selection is by the envelope's own
+    /// content-derived identity — exactly the id the immutable revision names —
+    /// and the binding is then closed by
+    /// [`UserAutomationPreflightProjection::assemble`], which validates the
+    /// envelope through its own `validate()` and requires its canonical bytes to
+    /// carry the revision's compiled-occurrence digest. An owner that retained no
+    /// such envelope simply yields none, and the caller reports the missing
+    /// owner instead of substituting a receipt.
+    async fn read_run_now_normalization_receipts(
+        &self,
+        state_fence: &StateFence,
+        declared: &eliot_kernel_core::user_automation::ScheduleNormalizationReceipt,
+    ) -> Result<Vec<eliot_receipts::ReceiptEnvelope>, RunNowPreflightAssembly> {
+        let recovery = self
+            .recovery(StoreRecoveryRequest {
+                contract_version: eliot_store_api::CONTRACT_VERSION,
+                state_fence: state_fence.clone(),
+                records: Vec::new(),
+                include_receipts: true,
+                include_jobs: false,
+            })
+            .await
+            .map_err(RunNowPreflightAssembly::Unavailable)?;
+        if recovery.state_fence != *state_fence {
+            return Err(RunNowPreflightAssembly::Unknown(
+                "retained UserAutomation receipt history does not bind to the request fence"
+                    .to_owned(),
+            ));
+        }
+        Ok(recovery
+            .receipts
+            .into_iter()
+            .filter_map(|receipt| receipt.envelope)
+            .filter(|envelope| {
+                envelope.identity.receipt_id.as_str() == declared.receipt_id.as_str()
+            })
+            .collect())
+    }
+
     /// Assembles the complete preflight projection for one committed `RunNow`
     /// occurrence from its owner members.
     ///
@@ -3170,17 +3214,27 @@ impl KernelStoreGateway {
             Self::require_run_now_active_evidence(owner, &execution, &evidence)?;
         }
         // The schedule normalization envelope the revision names is owner
-        // evidence over the compiled occurrence set. This boundary reads the
-        // committed occurrence through the Store write receipt above, which
-        // carries no calendar normalization envelope, and nothing in the
-        // repository publishes or retains one yet: the owner that compiles an
-        // expression has no accepted write path yet (#2806). The run-now route
-        // therefore supplies none, and the preflight binding refuses the
-        // revision with `ReceiptBinding` rather than admitting a schedule whose
-        // occurrence set is only self-asserted. That is the fail-closed
-        // behaviour the versioned contract requires; it is not a fallback and
-        // the route recovers the moment the owner envelope is readable here.
-        let normalization_receipts: Vec<eliot_receipts::ReceiptEnvelope> = Vec::new();
+        // evidence over the compiled occurrence set, so it is read from the
+        // canonical Store receipt history rather than assembled here. The read
+        // selects the envelope by its own content-derived identity; assembly then
+        // re-checks that envelope's canonical bytes name the compiled occurrence
+        // digest, so a self-asserted digest cannot satisfy the binding. An owner
+        // that has retained no such envelope leaves the occurrence unadmitted by
+        // name instead of substituting a receipt.
+        let normalization_receipts = Box::pin(self.read_run_now_normalization_receipts(
+            state_fence,
+            &owner.revision.schedule.normalization_receipt,
+        ))
+        .await?;
+        if normalization_receipts.is_empty() {
+            return Err(RunNowPreflightAssembly::Unavailable(
+                "no owner-issued schedule normalization receipt envelope is retained under this \
+                 State Fence for the receipt identity the immutable revision names, so the \
+                 compiled occurrence set stays self-asserted and the committed occurrence is not \
+                 admitted"
+                    .to_owned(),
+            ));
+        }
         UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
             revision: &owner.revision,
             configuration_state: owner.current_configuration_state,
