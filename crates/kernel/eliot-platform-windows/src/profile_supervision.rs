@@ -202,7 +202,10 @@ pub enum CurrentUserTaskObservation {
         sid: String,
         session_id: u32,
         /// Complete exact current readback joined to the original request.
-        receipt: CurrentUserTaskReceipt,
+        ///
+        /// Boxed for storage only: the readback carries the entire retained
+        /// original request, and every field remains present and unaltered.
+        receipt: Box<CurrentUserTaskReceipt>,
     },
     /// A task exists but its exact binding cannot be established.
     Mismatch {
@@ -226,7 +229,8 @@ pub enum CurrentUserTaskRegistrationError {
     /// Task creation committed but post-registration validation failed and
     /// exact deletion could not be confirmed.
     CleanupRequired {
-        receipt: CurrentUserTaskReceipt,
+        /// Boxed for storage only; the full committed receipt is retained.
+        receipt: Box<CurrentUserTaskReceipt>,
         cause: WindowsAdapterError,
         cleanup_error: WindowsAdapterError,
     },
@@ -234,7 +238,8 @@ pub enum CurrentUserTaskRegistrationError {
     /// read back. The original request, intended XML digest and any observed
     /// XML digest are retained as an explicit reconciliation obligation.
     CommittedUnknown {
-        request: CurrentUserTaskRequest,
+        /// Boxed for storage only; the exact original request is retained.
+        request: Box<CurrentUserTaskRequest>,
         task_name: String,
         requested_xml_sha256: String,
         observed_xml_sha256: Option<String>,
@@ -332,7 +337,7 @@ pub fn register_current_user_task(
             unknown,
         )) => {
             return Err(CurrentUserTaskRegistrationError::CommittedUnknown {
-                request: request.clone(),
+                request: Box::new(request.clone()),
                 task_name: unknown.task_name,
                 requested_xml_sha256: unknown.requested_xml_sha256,
                 observed_xml_sha256: unknown.observed_xml_sha256,
@@ -439,7 +444,7 @@ fn cleanup_after_registration(
     match remove_current_user_task(&receipt) {
         Ok(()) => CurrentUserTaskRegistrationError::Rejected(cause),
         Err(cleanup_error) => CurrentUserTaskRegistrationError::CleanupRequired {
-            receipt,
+            receipt: Box::new(receipt),
             cause,
             cleanup_error,
         },
@@ -572,7 +577,7 @@ pub fn inspect_current_user_task(
             task_xml_sha256: observed_digest,
             sid: selection.owner_sid,
             session_id: selection.session_id,
-            receipt,
+            receipt: Box::new(receipt),
         });
     }
     Ok(CurrentUserTaskObservation::Mismatch {
