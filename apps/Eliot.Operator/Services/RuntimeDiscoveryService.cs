@@ -113,9 +113,9 @@ public sealed class RuntimeDiscoveryService
             || endpoint.BrokerEpoch == 0
             || string.IsNullOrWhiteSpace(endpoint.InteractiveSessionId)
             || string.IsNullOrWhiteSpace(endpoint.HandoffNonce)
-            || endpoint.Role != "human_operator"
+            || !string.Equals(endpoint.Role, OperatorCapabilityNames.HumanOperatorRole, StringComparison.Ordinal)
             || !endpoint.Capabilities.SequenceEqual(
-                ["controlboard.read", "operator.command"],
+                [OperatorCapabilityNames.ControlboardRead, OperatorCapabilityNames.OperatorCommand],
                 StringComparer.Ordinal))
         {
             throw new RuntimeDiscoveryException("endpoint_invalid", OperatorFaultReason.EndpointInvalid);
