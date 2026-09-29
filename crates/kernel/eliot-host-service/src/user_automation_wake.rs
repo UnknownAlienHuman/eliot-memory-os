@@ -546,10 +546,7 @@ fn horizon_wake_record(
             format!("ua-wake-deadline:{}", entry.occurrence_key),
             "deadline",
         )?,
-        expiry: wake_handle(
-            format!("ua-wake-expiry:{}", entry.occurrence_key),
-            "expiry",
-        )?,
+        expiry: wake_handle(format!("ua-wake-expiry:{}", entry.occurrence_key), "expiry")?,
         required_capabilities: vec![wake_handle(
             USER_AUTOMATION_KERNEL_CAPABILITY.to_owned(),
             "required_capability",
