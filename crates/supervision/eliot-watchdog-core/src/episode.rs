@@ -334,9 +334,11 @@ pub fn classify_source_event(
 #[must_use]
 pub fn reopen_permitted(condition: &ReopenCondition, admission: &SourceEventAdmission) -> bool {
     match condition {
-        ReopenCondition::RecurrenceWithNewSourceEvent => admission.is_new_evidence(),
-        ReopenCondition::NewEvidence => admission.is_new_evidence(),
-        ReopenCondition::ExpectedContextChanged => false,
-        ReopenCondition::Explicit { .. } | ReopenCondition::Unknown { .. } => false,
+        ReopenCondition::RecurrenceWithNewSourceEvent | ReopenCondition::NewEvidence => {
+            admission.is_new_evidence()
+        }
+        ReopenCondition::ExpectedContextChanged
+        | ReopenCondition::Explicit { .. }
+        | ReopenCondition::Unknown { .. } => false,
     }
 }
