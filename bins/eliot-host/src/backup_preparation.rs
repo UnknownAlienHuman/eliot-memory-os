@@ -1004,19 +1004,17 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
         operation_id: &str,
         intent: &serde_json::Value,
     ) -> Result<(), PreparationError> {
-        let admission: DestinationAdmission = serde_json::from_value(
-            intent
-                .get("admission")
-                .cloned()
-                .ok_or(PreparationError::InvalidRequest {
+        let admission: DestinationAdmission =
+            serde_json::from_value(intent.get("admission").cloned().ok_or(
+                PreparationError::InvalidRequest {
                     field: "admission",
                     reason: "intent frame carries no admission".to_owned(),
-                })?,
-        )
-        .map_err(|_| PreparationError::InvalidRequest {
-            field: "admission",
-            reason: "intent admission is not a decodable admission".to_owned(),
-        })?;
+                },
+            )?)
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "admission",
+                reason: "intent admission is not a decodable admission".to_owned(),
+            })?;
         let root = intent
             .get("root")
             .and_then(serde_json::Value::as_str)
@@ -1061,10 +1059,7 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
             // See `PREPARATION_NO_SOURCE_ARCHIVE`: preparation binds no archive,
             // and the absence is recorded explicitly rather than filled with an
             // invented identity.
-            source_archive: preparation_handle(
-                PREPARATION_NO_SOURCE_ARCHIVE,
-                "source_archive",
-            )?,
+            source_archive: preparation_handle(PREPARATION_NO_SOURCE_ARCHIVE, "source_archive")?,
             admission_digest: preparation_handle(admission_digest, "admission_digest")?,
             // The proposed destination, recorded before any effect. It is a
             // name, not ownership: only a `Prepared` frame's pinned identity
