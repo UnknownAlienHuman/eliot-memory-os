@@ -3676,7 +3676,7 @@ impl KernelStoreGateway {
         else {
             return Err("superseding edit did not return a canonical revision".to_owned());
         };
-        if committed != revision {
+        if committed != revision.as_ref() {
             return Err(
                 "committed UserAutomation revision does not match the superseding edit request"
                     .to_owned(),
@@ -3698,7 +3698,7 @@ impl KernelStoreGateway {
                 state_fence: sealed.context.state_fence.clone(),
             })
             .await?;
-        if owner.revision != *revision {
+        if owner.revision != *revision.as_ref() {
             return Err(
                 "committed UserAutomation revision does not match the current owner revision"
                     .to_owned(),
@@ -4628,7 +4628,7 @@ impl KernelStoreGateway {
                 "automation, principal, or State Fence binding drifted".to_owned(),
             ));
         }
-        if owner.revision != *revision {
+        if owner.revision != *revision.as_ref() {
             return Err(moved(
                 "the current owner revision document is not the committed one".to_owned(),
             ));
