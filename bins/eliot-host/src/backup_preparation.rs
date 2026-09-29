@@ -3021,7 +3021,10 @@ impl OwnerEvidence {
     /// already holds it (`HostComposition::prepare_backup_destination` passes it
     /// to `authenticate_for_owner`) — which is a change outside this file.
     pub fn owner_lease_ref(&self) -> String {
-        format!("protected-root-lease:{}", file_identity_text(self.root_identity))
+        format!(
+            "protected-root-lease:{}",
+            file_identity_text(self.root_identity)
+        )
     }
 
     /// Projects the bounded owner-issued configuration evidence for one
