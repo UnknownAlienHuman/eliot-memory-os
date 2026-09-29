@@ -1918,7 +1918,6 @@ fn collect_user_owned_profile_status_at_root(
     Ok(Some(user_owned_profile_status_report(
         canonical_path,
         registry.as_ref(),
-        registry_state,
         active_manifest,
         active_profile_root_binding,
         active_profile_supervision,
@@ -1944,7 +1943,7 @@ fn inspect_user_owned_registry(
                     .validate()
                     .map_err(|error| StatusError::Invalid(format!("registry validate: {error}")))?;
                 match registry_profile(&candidate) {
-                    Some(recorded_profile) if recorded_profile != profile => continue,
+                    Some(recorded_profile) if recorded_profile != profile => {}
                     Some(recorded_profile) => {
                         if !registry_has_one_profile(&candidate, recorded_profile) {
                             return Err(StatusError::Invalid(
@@ -2058,7 +2057,6 @@ fn user_owned_profile_gaps(
 fn user_owned_profile_status_report(
     canonical_path: &Path,
     registry: Option<&eliot_installation::ApprovedGenerationRegistry>,
-    registry_state: ComponentState,
     active_manifest: Option<&CandidateManifest>,
     active_profile_root_binding: Option<ProfileRootBindingContour>,
     active_profile_supervision: Option<ProfileSupervisionContour>,
@@ -2081,7 +2079,7 @@ fn user_owned_profile_status_report(
             .collect()
     });
     let (host_journal, ors, transaction_stage, services, readiness, components) =
-        user_owned_unobserved_contours(registry_state.clone());
+        user_owned_unobserved_contours(registry.is_some());
     RuntimeStatusReport {
         contract: "eliot.runtime.live".to_owned(),
         contract_version: "1.3.0".to_owned(),
@@ -2106,7 +2104,7 @@ fn user_owned_profile_status_report(
     }
 }
 
-fn user_owned_unobserved_contours(registry_state: ComponentState) -> (
+fn user_owned_unobserved_contours(registry_exists: bool) -> (
     HostJournalContour,
     OrsContour,
     TransactionStageContour,
@@ -2169,7 +2167,7 @@ fn user_owned_unobserved_contours(registry_state: ComponentState) -> (
         age_gap: "profile-specific authenticated readiness observer required".to_owned(),
     };
     let components = ComponentStatuses {
-        installation_registry: registry_state,
+        installation_registry: registry_component_state(registry_exists),
         host_journal: unknown(
             "current-user Host journal was not inspected",
             "read-only user-owned journal adapter required",
