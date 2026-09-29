@@ -14,7 +14,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
-use eliot_receipts::surface::{MaterialGrantStanding, resolve_material_grant};
+use eliot_receipts::surface::{
+    MaterialGrantStanding, authorize_material_grant, resolve_material_grant,
+};
 use eliot_receipts::{
     BudgetCoverage, BudgetOverflow, GrantClosureReceipt, OverflowDisposition, RenderedToolCost,
     SurfaceBudgetInput, TOOL_SURFACE_CONTRACT_VERSION, TokenCountObservation,
@@ -676,8 +678,12 @@ fn decide_disposition(
     // A2: a missing or revoked grant cannot enable Material dispatch. Only
     // read-only methods keep the narrowest observable capability without a
     // live standing; every Material method is withheld from advertisement
-    // with its reason recorded, never merely discouraged in prose.
-    if effect_rank(profile.effect_class) > effect_rank(EffectClass::ReadOnly) && grant.is_none() {
+    // with its reason recorded, never merely discouraged in prose. The typed
+    // grant gate fails closed on both missing (GrantRequired) and revoked
+    // (GrantRevoked) standings.
+    if effect_rank(profile.effect_class) > effect_rank(EffectClass::ReadOnly)
+        && authorize_material_grant(grant).is_err()
+    {
         return (
             SurfaceDisposition::Hidden,
             "no live grant standing; Material use withheld from advertisement",
