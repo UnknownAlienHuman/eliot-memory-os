@@ -389,8 +389,15 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                     }
                     .into());
                 }
-                Self::check_backup_end(&begin.operation, &admitted_handle, &response)
-                    .map_err(Into::into)
+                Self::check_backup_end(
+                    &begin.operation,
+                    &admitted_handle,
+                    begin.denominator.is_complete,
+                    begin.denominator.member_count(),
+                    begin.denominator.total_bytes(),
+                    &response,
+                )
+                .map_err(Into::into)
             }
             Ok(_) => Err(StoreError::InvalidReceipt.into()),
             Err(RequestFailure::Unknown { .. }) => Err(StoreError::UnknownOutcome {
@@ -404,6 +411,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     fn check_backup_end(
         admitted_operation: &OperationIdentity,
         admitted_handle: &SnapshotHandle,
+        admitted_denominator_complete: bool,
+        admitted_member_count: u64,
+        admitted_byte_count: u64,
         response: &StoreBackupResponse,
     ) -> Result<SnapshotEndReceipt, StoreError> {
         let StoreBackupResponse::EndReceipt { receipt } = response else {
@@ -411,6 +421,13 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         };
         receipt.validate()?;
         if &receipt.handle != admitted_handle || &receipt.operation != admitted_operation {
+            return Err(StoreError::IdentityConflict);
+        }
+        if receipt.is_complete()
+            && (!admitted_denominator_complete
+                || receipt.member_count != admitted_member_count
+                || receipt.byte_count != admitted_byte_count)
+        {
             return Err(StoreError::IdentityConflict);
         }
         Ok(receipt.clone())
