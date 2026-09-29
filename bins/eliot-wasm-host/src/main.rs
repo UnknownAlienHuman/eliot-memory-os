@@ -128,10 +128,9 @@ fn main() {
     // artifact acquisition, compilation, or instantiation. This lane never
     // falls back to the experimental path. Borrows only: the experimental
     // branch below moves its own selection.
-    if let (Some(component_path), Some(world_name)) = (
-        &config.governed_typed_component,
-        &config.experimental_world,
-    ) {
+    if let (Some(component_path), Some(world_name)) =
+        (&config.governed_typed_component, &config.experimental_world)
+    {
         run_governed_typed_denial(component_path.as_path(), world_name.as_str());
     }
 
@@ -200,7 +199,10 @@ fn run_governed_typed_denial(component_path: &Path, world_name: &str) -> ! {
         // The gate owns no live admission channel, so even a future
         // non-denial here must not execute: fail closed on the same code.
         Ok(()) => {
-            emit_error("KERNEL_ADMISSION_REQUIRED", "governed admission is required");
+            emit_error(
+                "KERNEL_ADMISSION_REQUIRED",
+                "governed admission is required",
+            );
             std::process::exit(ADMISSION_REQUIRED_EXIT);
         }
         Err(error) => {
