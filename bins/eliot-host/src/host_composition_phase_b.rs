@@ -271,7 +271,7 @@ impl HostComposition {
                             != launch
                                 .profile_installation_key
                                 .as_ref()
-                                .map(|key| key.as_str())
+                                .map(eliot_platform::PlatformHandle::as_str)
                         || selection.component != launch.profile_component.as_str()
                         || selection.version != launch.profile_version.as_str()
                         || selection.generation != launch.generation.as_str()
