@@ -15,6 +15,17 @@ proof_entrypoint = "cargo test -p eliot-maintenance"
 
 [dependencies]
 eliot-contracts.workspace = true
+# Issue #1695 W3: the maintenance owner records, with every source transition,
+# the result-to-observation obligation its durable job revision owes. The
+# execution-outcome and delivery-state vocabularies already exist in this
+# foundation contract crate, so the owner states its obligation in the shared
+# vocabulary instead of minting a second one beside it.
+eliot-observation-contracts.workspace = true
+# The observation-family record the producer emits carries a `WorkScopeId` from
+# the shared receipt contract. This is the same C0 dependency `eliot-governor`
+# and `eliot-problem` already take to use that observation surface, not a new
+# edge into a higher layer.
+eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true
