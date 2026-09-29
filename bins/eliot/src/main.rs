@@ -3364,11 +3364,24 @@ fn run_installation_effect(
     ) {
         write_installation_error(
             "INSTALLATION_STATE_INVALID",
-            "SystemService Activating transaction is missing its durable activation projection intent",
+            "profile activation transaction is missing its durable activation projection intent",
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    let preflight_status = installation_preflight_status(preflight_transaction.stage(), recover);
+    let preflight_effects_applied = preflight_transaction.effect_progress().iter().all(|progress| {
+        matches!(
+            progress.state,
+            eliot_installation::InstallationEffectProgressState::Applied { .. }
+        )
+    });
+    let preflight_status = if preflight_transaction.profile == InstallationProfile::UserMode
+        && preflight_transaction.stage() == InstallationStage::ActiveVerified
+        && !preflight_effects_applied
+    {
+        recover.then_some("PENDING_RUNTIME")
+    } else {
+        installation_preflight_status(preflight_transaction.stage(), recover)
+    };
     let should_query_host_terminal_now = should_query_host_terminal(
         preflight_transaction.profile,
         preflight_transaction.stage(),
@@ -3451,11 +3464,35 @@ fn run_installation_effect(
                     return Ok(INVALID_REQUEST_EXIT);
                 }
             };
-            let staging = InstallationStagingDisposition::not_attempted(if recover {
-                "recovery reconciled the exact Host terminal; no rollback effect was attempted"
-            } else {
-                "apply observed the exact Host terminal before projection; no effect was attempted"
+            let all_effects_applied = transaction.effect_progress().iter().all(|progress| {
+                matches!(
+                    progress.state,
+                    eliot_installation::InstallationEffectProgressState::Applied { .. }
+                )
             });
+            let user_mode_supervision_pending = transaction.profile == InstallationProfile::UserMode
+                && !all_effects_applied;
+            let terminal_status = if user_mode_supervision_pending {
+                "PENDING_RUNTIME"
+            } else {
+                "ACTIVE_VERIFIED"
+            };
+            let staging = if user_mode_supervision_pending {
+                InstallationStagingDisposition {
+                    disposition: "PENDING_RUNTIME",
+                    reason: Some(
+                        "Host committed the generation, but current-user task registration and run evidence remain pending"
+                            .to_owned(),
+                    ),
+                    registry: None,
+                }
+            } else {
+                InstallationStagingDisposition::not_attempted(if recover {
+                    "recovery reconciled the exact Host terminal; no rollback effect was attempted"
+                } else {
+                    "apply observed the exact Host terminal before projection; no effect was attempted"
+                })
+            };
             print_transaction_projection(
                 if recover {
                     "RECOVERY_RESULT"
@@ -3466,9 +3503,9 @@ fn run_installation_effect(
                 &transaction,
                 Some(&outcome),
                 Some(&staging),
-                Some("ACTIVE_VERIFIED"),
+                Some(terminal_status),
             )?;
-            return Ok(installation_command_exit_code("ACTIVE_VERIFIED"));
+            return Ok(installation_command_exit_code(terminal_status));
         }
     }
 
@@ -3668,6 +3705,13 @@ fn run_installation_effect(
             outcome => outcome,
         }
     } else if preflight_transaction.profile == InstallationProfile::UserMode {
+        if preflight_transaction.stage() == InstallationStage::ActiveVerified {
+            user_mode_pending = true;
+            Ok(InstallationStepOutcome::Applied {
+                stage: InstallationStage::ActiveVerified,
+                evidence_refs: preflight_transaction.observed_postconditions.clone(),
+            })
+        } else {
         match coordinator.drive_until_host_bootstrap(&transaction_id) {
             Ok(InstallationStepOutcome::Applied {
                 evidence_refs: bootstrap_evidence,
@@ -3792,6 +3836,7 @@ fn run_installation_effect(
             }
             outcome => outcome,
         }
+        }
     } else {
         coordinator.drive_all_effects_until_blocked(&transaction_id)
     };
@@ -3859,7 +3904,7 @@ fn run_installation_effect(
     ) {
         write_installation_error(
             "INSTALLATION_STATE_INVALID",
-            "SystemService Activating transaction is missing its durable activation projection intent",
+            "profile activation transaction is missing its durable activation projection intent",
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
@@ -3913,15 +3958,25 @@ fn run_installation_effect(
     // activation is pending and the next invocation will query-reconcile the
     // Host receipt rather than retrying materialization.
     let phase_b_pending = !recover
-        && transaction.stage() == InstallationStage::Activating
-        && ((transaction.profile == InstallationProfile::SystemService
+        && ((transaction.stage() == InstallationStage::Activating
+            && transaction.profile == InstallationProfile::SystemService
             && matches!(effective_outcome, InstallationStepOutcome::Rejected))
-            || (transaction.profile == InstallationProfile::UserMode && user_mode_pending));
+            || (transaction.profile == InstallationProfile::UserMode
+                && user_mode_pending
+                && matches!(
+                    transaction.stage(),
+                    InstallationStage::Activating | InstallationStage::ActiveVerified
+                )));
     let staging = if phase_b_pending {
         InstallationStagingDisposition {
             disposition: "PENDING_RUNTIME",
             reason: Some(
-                if transaction.profile == InstallationProfile::UserMode {
+                if transaction.profile == InstallationProfile::UserMode
+                    && transaction.stage() == InstallationStage::ActiveVerified
+                {
+                    "Host committed the generation, but current-user task registration and run evidence remain pending"
+                        .to_owned()
+                } else if transaction.profile == InstallationProfile::UserMode {
                     "UserMode pending registry projection is staged; Host Phase-B bootstrap and current-user task activation remain pending"
                         .to_owned()
                 } else {
@@ -4012,10 +4067,35 @@ fn reconcile_host_activation_terminal(
             .host_state_root
             .as_str(),
     );
-    let host_root = ProtectedRootLease::open_existing(host_state_root)
-        .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
-        return Ok(None);
+    let registry = match transaction.profile {
+        InstallationProfile::SystemService => {
+            let host_root = ProtectedRootLease::open_existing(host_state_root)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
+                return Ok(None);
+            };
+            registry.load()?
+        }
+        InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+            let host_root = UserOwnedRootLease::open_existing(host_state_root)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let canonical_root = host_root
+                .canonical_path()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            if !eliot_platform_windows::windows_paths_equal(&canonical_root, host_state_root) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            host_root
+                .verify_stable_identity()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let Some(registry) = RedbInstallationRegistry::inspect_existing_user_owned_at(
+                host_root,
+                transaction.profile,
+            )? else {
+                return Ok(None);
+            };
+            registry
+        }
     };
     let receipt = match registry.read_committed_activation_receipt(
         &transaction.transaction_id,
@@ -4151,7 +4231,10 @@ fn installation_command_status(
         }
         | InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
         InstallationStepOutcome::Applied { .. } if recover => "ERROR",
-        InstallationStepOutcome::Applied { .. } if !all_effects_applied => "ERROR",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Activating,
+            ..
+        } if !recover && profile == InstallationProfile::UserMode => "PENDING_RUNTIME",
         InstallationStepOutcome::Applied {
             stage: InstallationStage::Activating,
             ..
@@ -4159,7 +4242,18 @@ fn installation_command_status(
         InstallationStepOutcome::Applied {
             stage: InstallationStage::ActiveVerified,
             ..
+        } if !recover && profile == InstallationProfile::UserMode && all_effects_applied => {
+            "ACTIVE_VERIFIED"
+        }
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::ActiveVerified,
+            ..
+        } if !recover && profile == InstallationProfile::UserMode => "PENDING_RUNTIME",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::ActiveVerified,
+            ..
         } if !recover && profile == InstallationProfile::SystemService => "ACTIVE_VERIFIED",
+        InstallationStepOutcome::Applied { .. } if !all_effects_applied => "ERROR",
         InstallationStepOutcome::Applied { .. }
             if !recover && profile == InstallationProfile::SystemService =>
         {
@@ -4196,7 +4290,7 @@ fn should_query_host_terminal(
     stage: InstallationStage,
     has_activation_projection_intent: bool,
 ) -> bool {
-    profile == InstallationProfile::SystemService
+    matches!(profile, InstallationProfile::SystemService | InstallationProfile::UserMode)
         && has_activation_projection_intent
         && matches!(
             stage,
@@ -4209,7 +4303,7 @@ fn activation_projection_state_is_invalid(
     stage: InstallationStage,
     has_activation_projection_intent: bool,
 ) -> bool {
-    profile == InstallationProfile::SystemService
+    matches!(profile, InstallationProfile::SystemService | InstallationProfile::UserMode)
         && stage == InstallationStage::Activating
         && !has_activation_projection_intent
 }
