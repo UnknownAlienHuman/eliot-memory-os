@@ -5134,6 +5134,7 @@ impl BridgeRunner {
     /// against the retained registry BEFORE the core attaches, so a refused
     /// route never launches. The persisted fingerprint is retained for
     /// [`BridgeRunner::reconnect`].
+    #[allow(clippy::result_large_err)]
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
         let fingerprint = admit_bridge_route_launch(
             &mut self.route_registry,
@@ -5155,6 +5156,7 @@ impl BridgeRunner {
     /// native resume; any divergence refuses with an explicit
     /// rehydrated/new-attempt state instead of silently continuing under the
     /// previous session identity.
+    #[allow(clippy::result_large_err)]
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
         let route_moved = match &self.active_route_fingerprint {
             Some(prior) => {
