@@ -3667,7 +3667,10 @@ impl MaintenanceTriggerDecisionCommit {
             trigger_id: decision.trigger_id.clone(),
             operation_hash: sha256_hex(&decision_bytes),
             trigger_revision,
-            evaluation_revision: format!("{}.{}.{}", contract.0, contract.1, contract.2),
+            evaluation_revision: format!(
+                "{}.{}.{}",
+                contract.major, contract.minor, contract.patch
+            ),
             policy_revision: policy.revision.map_or_else(
                 || UNPUBLISHED_POLICY_REVISION.to_owned(),
                 |revision| revision.to_string(),
