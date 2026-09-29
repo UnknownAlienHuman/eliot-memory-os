@@ -7109,6 +7109,7 @@ fn ownership_receipt_path(request: &InstallationEffectRequest) -> std::path::Pat
         InstallerEffectPlan::CreateRoot { root, .. }
         | InstallerEffectPlan::ApplyAcl { root, .. } => Path::new(root.as_str()),
         InstallerEffectPlan::RegisterService { .. }
+        | InstallerEffectPlan::RegisterCurrentUserTask { .. }
         | InstallerEffectPlan::MaterializePhaseB { .. } => {
             Path::new(request.installation_root.as_str())
         }
@@ -9646,6 +9647,7 @@ where
                     (
                         InstallerEffectPlan::ApplyAcl { .. }
                         | InstallerEffectPlan::RegisterService { .. }
+                        | InstallerEffectPlan::RegisterCurrentUserTask { .. }
                         | InstallerEffectPlan::StartService { .. }
                         | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
@@ -9653,7 +9655,8 @@ where
                         | InstallerEffectPlan::StagePackage { .. },
                         None,
                     )
-                    | (InstallerEffectPlan::RegisterService { .. }, Some(_)) => {}
+                    | (InstallerEffectPlan::RegisterService { .. }, Some(_))
+                    | (InstallerEffectPlan::RegisterCurrentUserTask { .. }, Some(_)) => {}
                 }
                 if matches!(
                     transaction.installer_effects[index],

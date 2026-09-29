@@ -107,6 +107,8 @@ pub enum CanaryRemovalResource {
     ServiceRegistration,
     /// One canonical SCM service start admitted for this generation.
     ServiceStart,
+    /// The current-user Task Scheduler registration owned by this generation.
+    CurrentUserTaskRegistration,
     /// One installer-owned root created below the installation root.
     InstallationRoot,
     /// One protected ACL applied by the original transaction.
@@ -1758,6 +1760,12 @@ fn freeze_effect_graph(
             ),
             InstallerEffectPlan::StartService { .. } => (
                 CanaryRemovalResource::ServiceStart,
+                applied_identity(progress)?,
+                true,
+                false,
+            ),
+            InstallerEffectPlan::RegisterCurrentUserTask { .. } => (
+                CanaryRemovalResource::CurrentUserTaskRegistration,
                 applied_identity(progress)?,
                 true,
                 false,
