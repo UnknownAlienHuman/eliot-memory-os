@@ -133,6 +133,8 @@ pub enum SecurityContractError {
     SelectionSealFinalMembership,
     #[error("selection seal does not bind the exact delivered packet or export bytes")]
     SelectionSealPacketBytes,
+    #[error("selection seal does not bind the exact delivered expansion handles")]
+    SelectionSealExpansionHandles,
     #[error("selection seal declares a membership page without a complete closure reference")]
     SelectionSealPageClosureMissing,
     #[error("canonical security contract serialization failed: {0}")]
@@ -1281,8 +1283,12 @@ impl SelectionChainSeal {
         if self.packet_bytes_digest != sha256_hex(delivered_packet_bytes) {
             return Err(SecurityContractError::SelectionSealPacketBytes);
         }
+        // The expansion handles are their own binding, not another name for the
+        // packet bytes: a seal that proves which members were delivered says
+        // nothing about which retrievable expansions travelled with them, and a
+        // swapped handle set must be reported as the handle failure it is.
         if self.expansion_handle_ids != delivered_expansion_handle_ids {
-            return Err(SecurityContractError::SelectionSealPacketBytes);
+            return Err(SecurityContractError::SelectionSealExpansionHandles);
         }
         Ok(())
     }
