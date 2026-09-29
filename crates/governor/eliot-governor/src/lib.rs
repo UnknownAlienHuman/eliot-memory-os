@@ -94,6 +94,7 @@ mod negative_memory_gate;
 mod observation_reconciliation;
 pub mod opencode_action_gate;
 mod operator_intent;
+mod operator_intent_execution;
 mod operator_reconciliation;
 mod owner_closure_feed;
 mod owner_closure_provider;
@@ -208,6 +209,10 @@ pub use operator_intent::{
     OperatorIntentEffect, OperatorIntentIdentity, OperatorIntentPlan, OperatorIntentPlanRevision,
     OperatorIntentPlanRevisionRef, OperatorIntentRisk, OperatorIntentRoute, OperatorIntentScope,
     OperatorIntentValidationError,
+};
+pub use operator_intent_execution::{
+    OperatorIntentEffectDisposition, OperatorIntentEpistemic, OperatorIntentExecutionError,
+    OperatorIntentExecutionLink,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use owner_closure_feed::{
