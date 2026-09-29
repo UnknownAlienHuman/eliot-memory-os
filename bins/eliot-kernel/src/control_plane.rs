@@ -647,9 +647,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         }
         #[cfg(windows)]
-        if is_probe
-            && let Some((renewed_head, live_receipt)) = supervision_publication.as_ref()
-        {
+        if is_probe && let Some((renewed_head, live_receipt)) = supervision_publication.as_ref() {
             // I1.5 W4 (#1751): the probe that just renewed supervision is
             // fresh observable evidence for the runtime-lease tick beside
             // the issuance site below. Past-due rows for this fence reach
@@ -768,10 +766,7 @@ impl KernelComposition {
         if let (KernelControlCommand::Activate(_), Some(receipt)) =
             (&request.command, &activation_receipt)
         {
-            let fence = StateFence::new(
-                request.candidate.kernel_epoch.clone(),
-                request.generation,
-            );
+            let fence = StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
             let expires_at_ms = crate::unix_ms()
                 .checked_add(RUNTIME_LEASE_VALIDITY_MS)
                 .ok_or(TransportError::SessionFenced)?;
@@ -1617,12 +1612,8 @@ impl KernelComposition {
         live_receipt: &EliotdLiveReceipt,
         now_ms: u64,
     ) -> Result<RuntimeLeaseTickOutcome, TransportError> {
-        let fence = StateFence::new(
-            request.candidate.kernel_epoch.clone(),
-            request.generation,
-        );
-        if renewed.record.state != LeaseState::Active
-            || renewed.record.binding.state_fence != fence
+        let fence = StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+        if renewed.record.state != LeaseState::Active || renewed.record.binding.state_fence != fence
         {
             return Err(TransportError::SessionFenced);
         }
