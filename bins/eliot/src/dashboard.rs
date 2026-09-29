@@ -134,11 +134,11 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         name: "Review",
-        limitation: "eliot-controlboard ControlBoardView.reviews exists, but the controlboard.status consumer merges items and reviews into one un-sectioned row set, so review items are not separable here; the section projection is residual work of #1213",
+        limitation: "eliot-runtime-status ControlBoardEntryKind does separate Item from Review on the contour, but RenderedControlBoardRow carries no entry-class field, so the served rows cannot separate review items here; adding that field belongs to the eliot-runtime-status owner, and the served board itself stays inadmissible until the Kernel admits controlboard.read and a producer presents it",
     },
     Section {
         name: "Change lineage",
-        limitation: "eliot-controlboard ControlBoardView.provenance exists, but the controlboard.status transport carries no provenance section; the section projection is residual work of #1213",
+        limitation: "the eliot-runtime-status ControlBoardContour carries provenance_edge_count only, by its own bounded decision that edge bodies are out of scope, and RenderedControlBoard carries no provenance field at all; the section projection therefore belongs to the eliot-runtime-status and provenance owners, not to this surface",
     },
     Section {
         name: "Attention",
