@@ -780,6 +780,16 @@ fn request(effect: Option<ProposedEffect>) -> WorkerRequest {
     }
 }
 
+fn execute_call(effect: Option<ProposedEffect>) -> NativeWorkerExecuteEbpCallV1 {
+    let cell = eliot_contracts::CapabilityCellId::new("cell-test-1").expect("cell");
+    crate::generated::compile_native_worker_execute_call_v1(
+        crate::generated::NATIVE_WORKER_RESOURCE_FACET_REF,
+        &cell,
+        &request(effect),
+    )
+    .expect("generated execute call")
+}
+
 fn proposed_effect() -> ProposedEffect {
     ProposedEffect {
         effect_id: "effect-1".to_owned(),
@@ -841,9 +851,11 @@ fn v1_string_authority_wire_is_rejected_before_admission() {
     value["state_fence"] = serde_json::json!("legacy-fence");
     assert!(serde_json::from_value::<WorkerHello>(value).is_err());
 
-    let mut value =
-        serde_json::to_value(frame("request-1", WorkerFrameBody::Execute(request(None))))
-            .expect("fixture");
+    let mut value = serde_json::to_value(frame(
+        "request-1",
+        WorkerFrameBody::Execute(execute_call(None)),
+    ))
+    .expect("fixture");
     value["protocol_version"] = serde_json::json!("eliot-native-worker/v1");
     value["authority_epoch"] = serde_json::json!("1");
     value["state_fence"] = serde_json::json!("legacy-fence");
@@ -949,14 +961,20 @@ fn stale_epoch_and_fence_are_rejected_before_live_provider_use() {
         .lock()
         .expect("admission lock")
         .revalidations;
-    let mut stale_epoch = frame("execute-epoch", WorkerFrameBody::Execute(request(None)));
+    let mut stale_epoch = frame(
+        "execute-epoch",
+        WorkerFrameBody::Execute(execute_call(None)),
+    );
     stale_epoch.authority_epoch = test_epoch(2);
     stale_epoch.state_fence.authority_epoch = test_epoch(2);
     assert_eq!(
         block_on(core.handle(stale_epoch)),
         Err(WorkerError::StaleEpoch)
     );
-    let mut stale_fence = frame("execute-fence", WorkerFrameBody::Execute(request(None)));
+    let mut stale_fence = frame(
+        "execute-fence",
+        WorkerFrameBody::Execute(execute_call(None)),
+    );
     stale_fence.state_fence = StateFence::new(
         test_epoch(1),
         ResourceGeneration::new(2).expect("generation"),
@@ -992,7 +1010,7 @@ fn live_lease_revision_expiry_and_revocation_fail_closed() {
         }
         let result = block_on(core.handle(frame(
             &format!("execute-{expected}"),
-            WorkerFrameBody::Execute(request(None)),
+            WorkerFrameBody::Execute(execute_call(None)),
         )));
         match expected {
             "lease" | "expired" => assert_eq!(result, Err(WorkerError::StaleLease)),
@@ -1009,7 +1027,7 @@ fn effect_is_only_candidate_after_exact_live_provider_admission() {
     start(&mut core);
     let events = block_on(core.handle(frame(
         "effect-1",
-        WorkerFrameBody::Execute(request(Some(proposed_effect()))),
+        WorkerFrameBody::Execute(execute_call(Some(proposed_effect()))),
     )))
     .expect("authorized candidate");
     assert_eq!(events.len(), 2);
@@ -1045,7 +1063,7 @@ fn rejected_revoked_and_expired_effects_emit_no_candidate_event() {
         }
         let result = block_on(core.handle(frame(
             &format!("effect-{mode}"),
-            WorkerFrameBody::Execute(request(Some(proposed_effect()))),
+            WorkerFrameBody::Execute(execute_call(Some(proposed_effect()))),
         )));
         match mode {
             "rejected" => assert!(matches!(result, Err(WorkerError::EffectRejected(_)))),
@@ -1096,7 +1114,7 @@ fn unknown_cancel_blocks_work_until_exact_p03_reconciliation() {
     assert_eq!(
         block_on(core.handle(frame(
             "execute-blocked",
-            WorkerFrameBody::Execute(request(None))
+            WorkerFrameBody::Execute(execute_call(None))
         ))),
         Err(WorkerError::InvalidLifecycle)
     );
@@ -1454,7 +1472,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
         original_hello
     );
 
-    let original_frame = frame("request-17", WorkerFrameBody::Execute(request(None)));
+    let original_frame = frame("request-17", WorkerFrameBody::Execute(execute_call(None)));
     let frame_wire = serde_json::to_value(&original_frame).expect("frame wire");
     assert_eq!(frame_wire["authority_epoch"], epoch_wire());
     assert!(frame_wire["state_fence"].is_object());
@@ -1551,9 +1569,11 @@ fn native_case_19_protocol_label_and_field_shape_must_match_v2() {
         serde_json::to_value(hello("connection-19", "request-19")).expect("hello wire");
     hello_wire["authority_epoch"] = serde_json::json!("1");
     assert!(serde_json::from_value::<WorkerHello>(hello_wire).is_err());
-    let mut frame_wire =
-        serde_json::to_value(frame("request-19", WorkerFrameBody::Execute(request(None))))
-            .expect("frame wire");
+    let mut frame_wire = serde_json::to_value(frame(
+        "request-19",
+        WorkerFrameBody::Execute(execute_call(None)),
+    ))
+    .expect("frame wire");
     frame_wire["state_fence"] = serde_json::json!("legacy-fence");
     assert!(serde_json::from_value::<WorkerFrame>(frame_wire).is_err());
 
@@ -1589,7 +1609,7 @@ fn native_case_20_zero_counters_and_epoch_fence_mismatch_reject() {
         mismatched.validate(),
         Err(WorkerError::InvalidHandshake("epoch_fence"))
     );
-    let mut mismatched_frame = frame("request-20d", WorkerFrameBody::Execute(request(None)));
+    let mut mismatched_frame = frame("request-20d", WorkerFrameBody::Execute(execute_call(None)));
     mismatched_frame.authority_epoch = test_epoch(2);
     assert_eq!(
         mismatched_frame.validate_shape(),
@@ -1683,7 +1703,7 @@ fn native_case_21_stale_resource_task_policy_integration_fences_preserve_provide
     ] {
         let mut stale = frame(
             &format!("case-21-{name}"),
-            WorkerFrameBody::Execute(request(None)),
+            WorkerFrameBody::Execute(execute_call(None)),
         );
         stale.state_fence = fence;
         assert_eq!(block_on(core.handle(stale)), Err(WorkerError::StaleFence));
@@ -1729,7 +1749,7 @@ fn native_case_21_stale_resource_task_policy_integration_fences_preserve_provide
 
         let result = block_on(core.handle(frame(
             &format!("case-21-live-{expected}"),
-            WorkerFrameBody::Execute(request(None)),
+            WorkerFrameBody::Execute(execute_call(None)),
         )));
         match expected {
             "lease" | "expired" => assert_eq!(result, Err(WorkerError::StaleLease)),

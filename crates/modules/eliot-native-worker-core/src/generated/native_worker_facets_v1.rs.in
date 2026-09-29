@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use eliot_agent_api::{AttemptId, ProposedEffect};
-use eliot_contracts::{ContractIdentity, ContractVersion, native_worker_resource_facet_v1};
+use eliot_contracts::{
+    CapabilityCellId, ContractIdentity, ContractVersion, native_worker_resource_facet_v1,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -31,23 +33,27 @@ impl WorkerRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NativeWorkerExecuteEbpCallV1 {
+pub struct NativeWorkerExecuteEbpCallV1 {
     pub wire_version: u16,
     pub facet_manifest_ref: String,
     pub facet_contract_identity: ContractIdentity,
     pub method_id: String,
     pub method_schema_identity: ContractIdentity,
-    /// EBP Execute payload projection; transport identity stays with the received `WorkerFrame`.
-    pub payload: serde_json::Value,
+    /// Exact capability cell admitted for this worker generation.
+    pub capability_cell: CapabilityCellId,
+    /// Typed method input derived from the ELIOT-owned facet contract.
+    /// `attempt_id` is bound to the admitted claim; the exact State Fence
+    /// remains in the enclosing EBP `WorkerFrame`.
+    pub input: WorkerRequest,
 }
 
 impl NativeWorkerExecuteEbpCallV1 {
     pub(crate) fn validate_for_dispatch(
         &self,
         admitted_facet_ref: &str,
-        request: &WorkerRequest,
+        admitted_cell: &CapabilityCellId,
     ) -> Result<(), NativeWorkerFacetStubError> {
         let source = native_worker_resource_facet_v1()
             .map_err(|_| NativeWorkerFacetStubError::InvalidSource)?;
@@ -70,28 +76,31 @@ impl NativeWorkerExecuteEbpCallV1 {
         {
             return Err(NativeWorkerFacetStubError::InvalidSource);
         }
-        let expected_payload = serde_json::json!({
-            "facet_manifest_ref": admitted_facet_ref,
-            "facet_contract_identity": source.identity,
-            "method_id": method.method_id,
-            "method_schema_identity": expected_method_identity,
-            "input": request,
-        });
-        (self.payload == expected_payload)
-            .then_some(())
-            .ok_or(NativeWorkerFacetStubError::InvalidField("execute_payload"))
+        if &self.capability_cell != admitted_cell {
+            return Err(NativeWorkerFacetStubError::InvalidField("capability_cell"));
+        }
+        self.input
+            .validate_shape()
+            .map_err(NativeWorkerFacetStubError::InvalidField)?;
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| NativeWorkerFacetStubError::Serialization)?;
+        if encoded.len() > NATIVE_WORKER_EXECUTE_MAX_REQUEST_BYTES {
+            return Err(NativeWorkerFacetStubError::InvalidField("request_bytes"));
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum NativeWorkerFacetStubError {
+pub enum NativeWorkerFacetStubError {
     InvalidField(&'static str),
     InvalidSource,
     Serialization,
 }
 
-pub(crate) fn compile_native_worker_execute_call_v1(
+pub fn compile_native_worker_execute_call_v1(
     facet_manifest_ref: &str,
+    capability_cell: &CapabilityCellId,
     request: &WorkerRequest,
 ) -> Result<NativeWorkerExecuteEbpCallV1, NativeWorkerFacetStubError> {
     if facet_manifest_ref != NATIVE_WORKER_RESOURCE_FACET_REF {
@@ -120,26 +129,15 @@ pub(crate) fn compile_native_worker_execute_call_v1(
     if method_schema_identity.name.as_str() != NATIVE_WORKER_EXECUTE_METHOD_SCHEMA_NAME {
         return Err(NativeWorkerFacetStubError::InvalidSource);
     }
-    let payload_value = serde_json::json!({
-        "facet_manifest_ref": facet_manifest_ref,
-        "facet_contract_identity": source.identity.clone(),
-        "method_id": method.method_id.clone(),
-        "method_schema_identity": method_schema_identity.clone(),
-        "input": request,
-    });
-    let encoded = serde_json::to_vec(&payload_value)
-        .map_err(|_| NativeWorkerFacetStubError::Serialization)?;
-    if encoded.len() > NATIVE_WORKER_EXECUTE_MAX_REQUEST_BYTES {
-        return Err(NativeWorkerFacetStubError::InvalidField("request_bytes"));
-    }
     let call = NativeWorkerExecuteEbpCallV1 {
         wire_version: NATIVE_WORKER_EXECUTE_STUB_WIRE_VERSION,
         facet_manifest_ref: facet_manifest_ref.to_owned(),
         facet_contract_identity: source.identity.clone(),
         method_id: method.method_id.clone(),
         method_schema_identity,
-        payload: payload_value,
+        capability_cell: capability_cell.clone(),
+        input: request.clone(),
     };
-    call.validate_for_dispatch(facet_manifest_ref, request)?;
+    call.validate_for_dispatch(facet_manifest_ref, capability_cell)?;
     Ok(call)
 }
