@@ -79,6 +79,22 @@ impl PurgeLedgerRecord {
                 reason: "an applied purge always consumes a non-zero ledger revision",
             });
         }
+        self.validate_entry()
+    }
+
+    /// Validates the carried ledger entry and the row's own contract version,
+    /// without requiring an allocated revision yet.
+    ///
+    /// Split from [`Self::validate`] so the applying transaction can prove the
+    /// entry against the ledger contract BEFORE the owner has allocated the
+    /// revision this purge will consume, rather than constructing a placeholder
+    /// revision to make a whole-row validation pass. No durable row can still
+    /// carry revision zero, because the whole-row check is what every read and
+    /// every commit runs.
+    pub fn validate_entry(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
         self.entry
             .validate()
             .map_err(|error| OrsError::Contract(error.to_string()))

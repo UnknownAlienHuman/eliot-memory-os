@@ -5444,12 +5444,17 @@ impl RedbRecoveryStore {
         entry: &eliot_security_contracts::PurgeLedgerEntry,
     ) -> Result<u64, OrsError> {
         crate::model::validate_text(&entry.purge_id, "purge_ledger_purge_id")?;
-        let candidate = crate::PurgeLedgerRecord {
+        // The ENTRY is what the ledger contract validates, and it is validated
+        // before anything becomes durable. The revision is deliberately not
+        // part of that call: it is owner-allocated below, and the candidate
+        // cannot carry the allocated value before the transaction has read the
+        // counter.
+        let mut applied = crate::PurgeLedgerRecord {
             contract_version: crate::CONTRACT_VERSION,
             applied_revision: 0,
             entry: entry.clone(),
         };
-        candidate.validate()?;
+        applied.validate_entry()?;
         let write = self.database.begin_write().map_err(storage)?;
         let existing = {
             let table = write.open_table(PURGE_LEDGER).map_err(storage)?;
@@ -5461,7 +5466,7 @@ impl RedbRecoveryStore {
         if let Some(bytes) = existing {
             let stored: crate::PurgeLedgerRecord = decode(&bytes)?;
             stored.validate()?;
-            if !stored.same_applied_purge(&candidate) {
+            if !stored.same_applied_purge(&applied) {
                 return Err(OrsError::IntegrityProblem {
                     record_type: crate::PURGE_LEDGER_RECORD_TYPE,
                     reason: "purge_id is already applied with a different ledger entry".to_owned(),
@@ -5470,13 +5475,11 @@ impl RedbRecoveryStore {
             write.commit().map_err(storage)?;
             return Ok(stored.applied_revision);
         }
-        let next = Self::purge_ledger_revision_in(&write.open_table(META).map_err(storage)?)?
-            .checked_add(1)
-            .ok_or(OrsError::ProjectionLimitExceeded)?;
-        let applied = crate::PurgeLedgerRecord {
-            applied_revision: next,
-            ..candidate
-        };
+        applied.applied_revision = Self::purge_ledger_revision_in(
+            &write.open_table(META).map_err(storage)?,
+        )?
+        .checked_add(1)
+        .ok_or(OrsError::ProjectionLimitExceeded)?;
         applied.validate()?;
         {
             let mut table = write.open_table(PURGE_LEDGER).map_err(storage)?;
@@ -5485,13 +5488,14 @@ impl RedbRecoveryStore {
                 .insert(entry.purge_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        let revision = applied.applied_revision;
         {
             let mut meta = write.open_table(META).map_err(storage)?;
-            meta.insert(PURGE_LEDGER_REVISION_KEY, next.to_string().as_str())
+            meta.insert(PURGE_LEDGER_REVISION_KEY, revision.to_string().as_str())
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
-        Ok(next)
+        Ok(revision)
     }
 
     /// Returns the authoritative purge-ledger revision this owner has applied
@@ -6011,13 +6015,17 @@ impl RedbRecoveryStore {
         record_key: &str,
     ) -> Result<(), OrsError> {
         let observed = Self::purge_ledger_revision_in(&write.open_table(META).map_err(storage)?)?;
-        if let Some(existing) = write
-            .open_table(PURGE_LEDGER_REVISION_BINDINGS)
-            .map_err(storage)?
-            .get(record_key)
-            .map_err(storage)?
-        {
-            let stored: crate::PurgeLedgerRevisionBinding = decode(existing.value())?;
+        let existing = {
+            let table = write
+                .open_table(PURGE_LEDGER_REVISION_BINDINGS)
+                .map_err(storage)?;
+            table
+                .get(record_key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(bytes) = existing {
+            let stored: crate::PurgeLedgerRevisionBinding = decode(&bytes)?;
             stored.validate()?;
             if stored.record_key != record_key {
                 return Err(OrsError::IntegrityProblem {
@@ -6041,9 +6049,10 @@ impl RedbRecoveryStore {
         };
         binding.validate()?;
         let payload = encode(&binding)?;
-        write
+        let mut table = write
             .open_table(PURGE_LEDGER_REVISION_BINDINGS)
-            .map_err(storage)?
+            .map_err(storage)?;
+        table
             .insert(record_key, payload.as_str())
             .map_err(storage)?;
         Ok(())
@@ -6064,9 +6073,10 @@ impl RedbRecoveryStore {
         record_key: &str,
     ) -> Result<Option<u64>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
-        let Some(bytes) = read
+        let table = read
             .open_table(PURGE_LEDGER_REVISION_BINDINGS)
-            .map_err(storage)?
+            .map_err(storage)?;
+        let Some(bytes) = table
             .get(record_key)
             .map_err(storage)?
             .map(|value| value.value().to_owned())

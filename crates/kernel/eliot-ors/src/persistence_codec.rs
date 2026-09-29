@@ -404,11 +404,11 @@ pub(super) fn is_current_grant_closure_shape(value: &str) -> bool {
     .any(|field| commit.contains_key(*field))
 }
 
-pub(super) fn encode<T: Serialize>(value: &T) -> Result<String, OrsError> {
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<String, OrsError> {
     serde_json::to_string(value).map_err(|error| OrsError::Encoding(error.to_string()))
 }
 
-pub(super) trait PersistedValue: DeserializeOwned {
+pub(crate) trait PersistedValue: DeserializeOwned {
     const RECORD_TYPE: &'static str;
 
     fn validate_persisted(&self) -> Result<(), OrsError>;
@@ -899,7 +899,7 @@ impl PersistedValue for KernelReconciliationItem {
     }
 }
 
-pub(super) fn decode<T: PersistedValue>(value: &str) -> Result<T, OrsError> {
+pub(crate) fn decode<T: PersistedValue>(value: &str) -> Result<T, OrsError> {
     decode_named(value, T::RECORD_TYPE)
 }
 
