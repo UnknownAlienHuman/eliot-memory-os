@@ -5,7 +5,7 @@ use eliot_context_contracts::{
     QualityOperation, QualityScorecard, SerializedContextMeasurement,
 };
 
-use crate::{AssemblyError, bounds, boundary, measurement, render};
+use crate::{AssemblyError, boundary, bounds, measurement, render};
 
 /// Stable local ordering revision for the A-15 canonical rendered payload.
 pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
