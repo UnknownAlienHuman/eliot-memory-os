@@ -421,7 +421,7 @@ impl AdmittedIsolatedDestination {
 /// validated.
 pub fn admit_isolated_destination(
     registry_path: impl Into<PathBuf>,
-    bootstrap: ServiceBootstrapArguments,
+    bootstrap: &ServiceBootstrapArguments,
 ) -> Result<AdmittedIsolatedDestination, SpoolError> {
     let _span = tracing::debug_span!("watchdog.admit_isolated_destination").entered();
     tracing::debug!(
@@ -473,8 +473,8 @@ pub fn admit_isolated_destination(
             "isolated restore destination installation registry is missing".to_owned(),
         )
     })?;
-    let selected_manifest = select_runtime_manifest(&registry, &bootstrap)?;
-    let _ = load_approved_service_registrations(&registry, &selected_manifest, &bootstrap)?;
+    let selected_manifest = select_runtime_manifest(&registry, bootstrap)?;
+    let _ = load_approved_service_registrations(&registry, &selected_manifest, bootstrap)?;
     let roots = selected_manifest.runtime_launch.runtime_state_roots.clone();
     if roots.profile != InstallationProfile::SystemService {
         return Err(SpoolError::InvalidLease(
