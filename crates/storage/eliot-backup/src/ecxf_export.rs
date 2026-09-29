@@ -25,17 +25,58 @@
 //!   reaches the archive builder, so no manifest is ever written with an
 //!   unproved boundary;
 //! * the declared event interval must describe exactly the exported events;
-//! * every store write receipt must validate and be compatible with the same
-//!   state fence;
+//! * the observed revision and ordering heads are re-checked through the store
+//!   port's own [`ScopeRevisionView::validate`], so a view assembled from two
+//!   moments, or carrying a duplicate head key, is refused (issue #1141, A3
+//!   mixed-revision);
+//! * every store write receipt must validate, be compatible with the same
+//!   state fence, and sit at or below the ordering and revision heads the owner
+//!   declared for this view — a receipt past a declared head is a stale or mixed
+//!   capture (issue #1141, A3 stale);
+//! * every emitted event identity a receipt claims must be present in the
+//!   exported event stream, so a view whose receipt/event chain cannot be
+//!   closed is refused before it becomes a section record (issue #1141, A3
+//!   unverifiable);
 //! * every source event and projection record validates its own recorded
 //!   checksum against its payload before it is destructured, so a source whose
 //!   retained checksum does not describe its payload is refused instead of
 //!   being re-digested into an internally consistent package that no longer
 //!   preserves the source's integrity claim;
 //! * `eliot-ecxf` then re-proves that every revision and ordering head carries
-//!   that same `state_fence`, that every purge-ledger entry does too, and that
-//!   the fence reachability set equals the residency keys of the exported
-//!   blobs.
+//!   that same `state_fence`, that every purge-ledger entry does too, that the
+//!   fence reachability set equals the residency keys of the exported blobs,
+//!   that the fence's declared event interval equals the delivered event count,
+//!   and that the manifest's declared purge state equals the ledger the package
+//!   actually carries.
+//!
+//! # There is no live-DB-file backup path (issue #1141, W4)
+//!
+//! I05-10 states the export "is independent of `SurrealQL`" and I05-13 states the
+//! ORS fence "is a logical Kernel export, not a copy of a live redb file".
+//! `crates/storage/AGENTS.md` carries the same rule: "Live DB file copying is
+//! not a supported backup contract."
+//!
+//! That is not only a claim about this function; it is measurable in the crate,
+//! and the measurement is recorded here so a later reader can repeat it:
+//!
+//! * a sweep of `crates/storage/eliot-backup/src` and
+//!   `crates/storage/eliot-ecxf/src` for `fs::copy`, `hard_link`, `copy_dir`,
+//!   `copy(`, `fs_extra` and `walkdir` returns no match: no byte of any
+//!   pre-existing file is ever duplicated into a package;
+//! * a case-insensitive sweep of the same two directories for `surrealdb`,
+//!   `surrealkv`, `surreal::`, `Db::`, `rocksdb` and `*.db` returns no match:
+//!   the crate holds no vendor type, no database handle and no data-file path;
+//! * the crate's every `std::fs` call site is accounted for above and below —
+//!   `ecxf_export.rs` writes only package members it rendered itself, into a
+//!   staging tree it claimed exclusively, and reads back only those same
+//!   members;
+//!   `isolated_restore.rs` creates and removes only its own temp-dir root;
+//!   `product_run.rs` and `restore_runner.rs` write and read only bundle and
+//!   journal bytes they serialized themselves.
+//!
+//! The consequence is that a backup artifact can only exist if a source owner
+//! produced a coherent view through [`EcxfSourceStore`]. There is no code path
+//! that produces a package from files found on disk.
 //!
 //! `layout` materialises the whole package in memory and re-validates the
 //! archive before returning, so every one of those refusals happens before any
@@ -55,16 +96,19 @@
 //! identity and the published package path, never as proof that nothing was
 //! published.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use eliot_blob_api::BlobReadyReceipt;
 use eliot_security_contracts::PurgeLedgerEntry;
 pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
-use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, SnapshotCompleteness, WriteReceipt};
+use eliot_store_api::{
+    OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId, ScopeRevisionView,
+    SnapshotCompleteness, WriteReceipt,
+};
 use serde::{Deserialize, Serialize};
 
-use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256};
+use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256, digest, text};
 
 /// Record-type label of one canonical store write receipt inside the `ECXF/1`
 /// receipt stream.
@@ -326,6 +370,55 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
 /// fence and the source owner reports that as
 /// [`SnapshotCompleteness::Complete`]. Anything else refuses here, before the
 /// archive is assembled.
+///
+/// The four named refusals of issue #1141 item A3 map onto checks that read
+/// two *independently recorded* positions rather than re-deriving one from the
+/// other:
+///
+/// * **partial** — the owner's own completeness discriminator, and the declared
+///   event interval against the events actually delivered;
+/// * **stale** — the observed fence against the authenticated request's fence,
+///   and every receipt's own ordering/revision positions against the heads the
+///   owner declared for this view;
+/// * **mixed-revision** — [`ScopeRevisionView::validate`], the store port's own
+///   coherence contract, run over the observed heads so a view assembled from
+///   two different moments (or with a duplicate head key) never reaches the
+///   archive builder;
+/// * **unverifiable** — every receipt's emitted-event identities against the
+///   exported event stream, and every source adapter / generation identity
+///   against its own shape, so a view that cannot be re-checked by the
+///   `eliot-ecxf` manifest validator is refused here first.
+///
+/// The heads are looked up in maps built once, so the membership test is
+/// "does the owner declare this position" and not a search of a caller-chosen
+/// list.
+/// The owner-declared identities that travel into `manifest.json`, checked for
+/// shape at the export boundary rather than by the interchange crate's own
+/// `text`/`digest` helpers further down.
+///
+/// This is a shape requirement, not an authenticity proof: the authenticity
+/// obligation is the importer's, which checks the recorded values against what
+/// it holds.
+fn require_exported_identity_shape(snapshot: &CoherentSourceExport) -> Result<(), BackupError> {
+    text(&snapshot.source_adapter, "ecxf.source_adapter")?;
+    text(
+        &snapshot.source_adapter_version,
+        "ecxf.source_adapter_version",
+    )?;
+    text(&snapshot.schema_generation, "ecxf.schema_generation")?;
+    text(&snapshot.store_generation, "ecxf.store_generation")?;
+    text(&snapshot.export_receipt, "ecxf.export_receipt")?;
+    digest(
+        &snapshot.architecture_source_digest,
+        "ecxf.architecture_source_digest",
+    )?;
+    digest(
+        &snapshot.normative_pair_identity_receipt_digest,
+        "ecxf.normative_pair_identity_receipt_digest",
+    )?;
+    Ok(())
+}
+
 fn prove_coherent_boundary(
     snapshot: &CoherentSourceExport,
     request: &EcxfExportRequest,
@@ -333,6 +426,7 @@ fn prove_coherent_boundary(
     if !snapshot.completeness.is_complete() {
         return Err(BackupError::InconsistentBoundary);
     }
+    require_exported_identity_shape(snapshot)?;
     if snapshot.scope_id.as_ref() != Some(&request.scope_id) {
         return Err(BackupError::FenceMismatch {
             subject: "export scope".to_owned(),
@@ -348,6 +442,36 @@ fn prove_coherent_boundary(
             subject: "export event range count".to_owned(),
         });
     }
+    // Issue #1141, A3 (mixed-revision): the store port already owns the
+    // coherent-view contract, so the observed heads are re-checked through
+    // `ScopeRevisionView::validate` instead of a second head-checking loop
+    // here. It refuses a duplicate revision key, a duplicate ordering scope and
+    // any head whose fence differs from the view fence — the three ways a view
+    // can describe more than one moment. `eliot-ecxf` checks the same
+    // relationship again on the fence it emits; that is a coherence check
+    // between two recorded positions, this one is the port contract.
+    let scope_view = ScopeRevisionView {
+        scope_id: request.scope_id.clone(),
+        revision_heads: snapshot.revision_heads.clone(),
+        ordering_heads: snapshot.ordering_heads.clone(),
+        state_fence: snapshot.state_fence.clone(),
+    };
+    scope_view.validate().map_err(BackupError::Store)?;
+    let revisions: BTreeMap<&RevisionKey, u64> = snapshot
+        .revision_heads
+        .iter()
+        .map(|head| (&head.key, head.revision))
+        .collect();
+    let orderings: BTreeMap<&OrderingScopeId, u64> = snapshot
+        .ordering_heads
+        .iter()
+        .map(|head| (&head.scope, head.sequence))
+        .collect();
+    let events: BTreeSet<&str> = snapshot
+        .events
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect();
     for receipt in &snapshot.receipts {
         receipt.validate().map_err(BackupError::Store)?;
         if !receipt
@@ -357,6 +481,62 @@ fn prove_coherent_boundary(
             return Err(BackupError::FenceMismatch {
                 subject: format!("receipt {}", receipt.operation_id),
             });
+        }
+        // Issue #1141, A3 (stale): a receipt records the ordering position and
+        // the revision advance its transition consumed. If either is past the
+        // head the owner declared for this view, the view spans a moment later
+        // than its own fence — a mixed or stale capture, refused here rather
+        // than emitted as a coherent export.
+        for head in &receipt.ordering_sequences {
+            let Some(observed) = orderings.get(&head.scope) else {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!(
+                        "receipt {} ordering scope {} absent from the declared ordering heads",
+                        receipt.operation_id, head.scope
+                    ),
+                });
+            };
+            if head.sequence > *observed {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!(
+                        "receipt {} ordering head {}",
+                        receipt.operation_id, head.scope
+                    ),
+                });
+            }
+        }
+        for delta in &receipt.revision_before_after {
+            let Some(observed) = revisions.get(&delta.key) else {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!(
+                        "receipt {} revision key {} absent from the declared revision heads",
+                        receipt.operation_id, delta.key
+                    ),
+                });
+            };
+            if delta.after > *observed {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!(
+                        "receipt {} revision head {}",
+                        receipt.operation_id, delta.key
+                    ),
+                });
+            }
+        }
+        // Issue #1141, A3 (unverifiable): the receipt/event chain is closed
+        // against the exported stream, so a receipt citing an event this view
+        // does not deliver is refused before it becomes a section record. The
+        // expected set is the delivered event identities, which this crate
+        // never chooses.
+        for event_id in &receipt.emitted_event_ids {
+            if !events.contains(event_id.as_str()) {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!(
+                        "receipt {} emitted event {} absent from the exported event stream",
+                        receipt.operation_id, event_id
+                    ),
+                });
+            }
         }
     }
     Ok(())
