@@ -837,7 +837,10 @@ impl CanaryRemovalOperation {
     /// Derives the only stage the durable per-row evidence admits.
     ///
     /// The stage is never authored independently: a green stage over an
-    /// unresolved effect is refused here and can never be persisted.
+    /// unresolved effect is refused here and can never be persisted. `Completed`
+    /// is admitted only when no `REMOVE` row is still open, which is the
+    /// terminal registry record's own resolved state together with the
+    /// authoritative readback of every row before it.
     fn expected_stage(&self) -> Result<(), InstallationError> {
         let mut open = 0_usize;
         let mut unknown = 0_usize;
@@ -852,13 +855,19 @@ impl CanaryRemovalOperation {
                     open += 1;
                     started += 1;
                 }
-                // An authoritatively resolved row is neither open nor merely
-                // started: its exact postcondition was already read back from
-                // the resource's own owner. Counting it as open would keep
-                // `open` above zero for every plan that removes anything, so
-                // `Completed` would be unreachable and the terminal registry
+                // A resolved row is no longer open: its exact postcondition was
+                // already read back from the resource's own owner. It still
+                // proves that this operation executed, so a `REMOVED` row keeps
+                // the stage at `EXECUTING` while the terminal registry row is
+                // still pending. Counting a resolved row as open instead would
+                // keep `open` above zero for every plan that removes anything,
+                // so `Completed` would be unreachable and the terminal registry
                 // retirement could never be recorded as a durable outcome.
-                CanaryRemovalEffectState::Resolved { .. } => {}
+                CanaryRemovalEffectState::Resolved { disposition } => {
+                    if *disposition == CanaryRemovalEffectDisposition::Removed {
+                        started += 1;
+                    }
+                }
                 CanaryRemovalEffectState::Unknown { .. } => {
                     open += 1;
                     unknown += 1;
