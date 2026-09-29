@@ -597,6 +597,27 @@ pub struct SourceRecord {
     /// Exact common lineage root; `None` preserves unknown independence and
     /// is never treated as a unique root.
     pub lineage_root: Option<String>,
+    /// Provider/generator family that produced this record; `None` means the
+    /// producing family is not established, never that it is its own family.
+    ///
+    /// I21.6 names provider family beside source family as a *separate*
+    /// dependence input: two records from different works produced by the same
+    /// generator are not independent corroboration, and a record whose provider
+    /// is unknown cannot be placed on that axis at all.
+    pub provider_family: Option<String>,
+    /// Evaluator family that judged this record; `None` means no evaluator is
+    /// established, never that it is its own evaluator.
+    ///
+    /// This is the axis a single shared evaluator collapses: one evaluator over
+    /// many pages yields one group no matter how many pages it saw.
+    pub evaluator_family: Option<String>,
+    /// Assumptions this material is known to inherit, sorted and deduplicated
+    /// by the constructor.
+    ///
+    /// Shared-assumption dependence is a property of the whole assumption set,
+    /// not of any one assumption: two records that share no assumption are
+    /// independent on this axis even if each carries several.
+    pub assumptions: BTreeSet<String>,
     /// Privacy class carried end to end.
     pub disclosure: DisclosureClass,
     /// Free-text source content stays inert data; flags record that
@@ -662,6 +683,12 @@ pub struct SourceRecordParams {
     pub authority_domains: BTreeSet<String>,
     /// Lineage root.
     pub lineage_root: Option<String>,
+    /// Provider/generator family.
+    pub provider_family: Option<String>,
+    /// Evaluator family.
+    pub evaluator_family: Option<String>,
+    /// Inherited assumptions.
+    pub assumptions: BTreeSet<String>,
     /// Disclosure class.
     pub disclosure: DisclosureClass,
     /// Content flags.
@@ -737,6 +764,15 @@ impl SourceRecord {
         }
         if let Some(root) = &params.lineage_root {
             text(root, "source.lineage_root")?;
+        }
+        if let Some(provider) = &params.provider_family {
+            text(provider, "source.provider_family")?;
+        }
+        if let Some(evaluator) = &params.evaluator_family {
+            text(evaluator, "source.evaluator_family")?;
+        }
+        for assumption in &params.assumptions {
+            text(assumption, "source.assumptions")?;
         }
         for flag in &params.content_flags {
             text(flag, "source.content_flags")?;
@@ -818,6 +854,9 @@ impl SourceRecord {
             grade: params.grade,
             authority_domains: params.authority_domains,
             lineage_root: params.lineage_root,
+            provider_family: params.provider_family,
+            evaluator_family: params.evaluator_family,
+            assumptions: params.assumptions,
             disclosure: params.disclosure,
             content_flags: params.content_flags,
             incentives_note: params.incentives_note,
@@ -918,7 +957,16 @@ impl SourceRecord {
 /// role hashed identically to its predecessor. The bytes and the field set both
 /// changed, so the domain says so instead of letting one name cover two
 /// incompatible field sets.
-pub const SOURCE_RECORD_DIGEST_DOMAIN: &str = "source-record/v2";
+///
+/// Bumped `v2` -> `v3` by #1767 with three independence fields — provider
+/// family, evaluator family and the inherited assumption set. The record is
+/// serialized whole, so adding them puts them in the preimage by construction
+/// rather than by another hand-written list, and without the bump the same
+/// domain would cover two different field sets: the same reasoning `v1` -> `v2`
+/// records, applied once more. Every record frozen under `v2` now carries a
+/// different identity for the same content, which is the correct outcome and
+/// not a grandfathered admission.
+pub const SOURCE_RECORD_DIGEST_DOMAIN: &str = "source-record/v3";
 
 /// The single canonical encoder input for [`SourceRecord`].
 ///
@@ -1568,6 +1616,73 @@ impl ObservedOutsideScope {
     pub const REASON: &'static str = "observed_outside_frozen_scope";
 }
 
+/// One recorded acquisition attempt against one declared member.
+///
+/// The disposition and the exact bytes behind it are kept together, because
+/// "this member was attempted" and "this member was acquired, and these are the
+/// bytes" are different facts and replay has to tell them apart: a repeated
+/// delivery of the *same* attempt is idempotent, a different attempt against a
+/// member that already closed is a changed binding, and a different attempt
+/// against a member that did *not* close is a later acquisition linked to the
+/// earlier failure rather than an overwrite of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemberAttempt {
+    /// What this attempt observed.
+    disposition: SourceDisposition,
+    /// Digest of the acquired content bytes, when the attempt acquired any.
+    content_digest: Option<String>,
+    /// Admitted operation identity that produced this attempt, when there was
+    /// one.
+    operation_id: Option<String>,
+    /// Whether this attempt was recorded *after* an earlier attempt on the same
+    /// member, which it therefore links to instead of replacing.
+    links_earlier_attempt: bool,
+}
+
+/// Every attempt recorded against one declared member, in arrival order.
+///
+/// The vector is never truncated: the first attempt is the one a later
+/// successful acquisition answers, and a reader that only sees the final
+/// disposition would learn nothing about the failure it recovered from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemberAccounting {
+    /// The acquiring source handle, when any attempt recorded one.
+    handle: Option<String>,
+    /// Recorded attempts in arrival order; never empty for an accounted member.
+    attempts: Vec<MemberAttempt>,
+}
+
+impl MemberAccounting {
+    /// The disposition of the latest recorded attempt.
+    fn disposition(&self) -> SourceDisposition {
+        self.attempts
+            .last()
+            .map_or(SourceDisposition::Unknown, |attempt| attempt.disposition)
+    }
+
+    /// Whether the latest recorded attempt closed the member intact.
+    fn closes(&self) -> bool {
+        self.attempts
+            .last()
+            .is_some_and(|attempt| attempt.disposition.closes_member())
+    }
+
+    /// Whether `attempt` repeats the *latest* recorded attempt exactly.
+    ///
+    /// The comparison is by content, not by label: disposition, acquiring
+    /// handle, the digest of the exact bytes and the admitted operation that
+    /// produced them. The `links_earlier_attempt` marker is deliberately not
+    /// compared — it is this function's own output, not a caller-supplied fact.
+    fn same_binding(&self, attempt: &MemberAttempt, handle: Option<&String>) -> bool {
+        self.handle.as_ref() == handle
+            && self.attempts.last().is_some_and(|current| {
+                current.disposition == attempt.disposition
+                    && current.content_digest == attempt.content_digest
+                    && current.operation_id == attempt.operation_id
+            })
+    }
+}
+
 /// Exact coverage accounting over the frozen denominator: every expected
 /// member carries exactly one visible disposition, an explicit exclusion, or
 /// a budget-frontier note, and every candidate the run actually observed is
@@ -1578,7 +1693,7 @@ impl ObservedOutsideScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverageAccount {
     expected: BTreeSet<String>,
-    outcomes: BTreeMap<String, (SourceDisposition, Option<String>)>,
+    outcomes: BTreeMap<String, MemberAccounting>,
     exclusions: BTreeMap<String, String>,
     frontier: Option<String>,
     observed: BTreeMap<String, ObservedOutsideScope>,
@@ -1611,6 +1726,44 @@ impl CoverageAccount {
         disposition: SourceDisposition,
         handle: Option<String>,
     ) -> Result<(), PortfolioError> {
+        self.record_attempt(
+            member,
+            MemberAttempt {
+                disposition,
+                content_digest: None,
+                operation_id: None,
+                links_earlier_attempt: false,
+            },
+            handle,
+        )
+    }
+
+    /// Records one identified acquisition attempt against one expected member.
+    ///
+    /// This is [`Self::record`] with the evidence identity the attempt carried:
+    /// the digest of the exact bytes it acquired and the admitted operation
+    /// that produced them. Both are part of the replay binding, so a repeated
+    /// delivery of the same attempt is still idempotent, a *different* attempt
+    /// against a member that already closed is a changed binding and conflicts,
+    /// and a different attempt against a member that did **not** close is the
+    /// later acquisition I21.6 asks to be linked to the earlier failure rather
+    /// than written over it — it is appended, marked as a recovery, and leaves
+    /// the earlier attempt readable behind it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::UnknownHandle`] for a member the frozen
+    /// denominator never declared, a field error for a blank handle or a
+    /// malformed content digest or operation identity, and
+    /// [`PortfolioError::Conflict`] for a member carrying an explicit exclusion,
+    /// for a changed handle under an unchanged disposition, or for a later
+    /// attempt against a member that already closed.
+    fn record_attempt(
+        &mut self,
+        member: &str,
+        attempt: MemberAttempt,
+        handle: Option<String>,
+    ) -> Result<(), PortfolioError> {
         if !self.expected.contains(member) {
             return Err(PortfolioError::UnknownHandle {
                 field: "coverage.member",
@@ -1619,23 +1772,40 @@ impl CoverageAccount {
         if let Some(handle) = &handle {
             text(handle, "coverage.handle")?;
         }
+        if let Some(content_digest) = &attempt.content_digest {
+            digest(content_digest, "coverage.content_digest")?;
+        }
+        if let Some(operation_id) = &attempt.operation_id {
+            text(operation_id, "coverage.operation_id")?;
+        }
         if self.exclusions.contains_key(member) {
             return Err(PortfolioError::Conflict {
                 field: "coverage.member",
             });
         }
-        match self.outcomes.get(member) {
-            Some((current, current_handle))
-                if *current == disposition && *current_handle == handle =>
-            {
-                Ok(())
-            }
-            Some(_) => Err(PortfolioError::Conflict {
+        match self.outcomes.get_mut(member) {
+            // The identical binding repeating is a repeated receipt delivery:
+            // idempotent, and it must not append a phantom attempt.
+            Some(current) if current.same_binding(&attempt, handle.as_ref()) => Ok(()),
+            Some(current) if current.closes() => Err(PortfolioError::Conflict {
                 field: "coverage.member",
             }),
+            Some(current) => {
+                let recovery = MemberAttempt {
+                    links_earlier_attempt: true,
+                    ..attempt
+                };
+                current.handle = handle;
+                current.attempts.push(recovery);
+                Ok(())
+            }
             None => {
-                self.outcomes
-                    .insert(member.to_owned(), (disposition, handle));
+                let mut accounting = MemberAccounting {
+                    handle,
+                    attempts: Vec::new(),
+                };
+                accounting.attempts.push(attempt);
+                self.outcomes.insert(member.to_owned(), accounting);
                 Ok(())
             }
         }
@@ -1667,7 +1837,19 @@ impl CoverageAccount {
             "coverage.admitted_manifest_digest",
         )?;
         if self.expected.contains(handle) {
-            return self.record(handle, disposition, Some(handle.to_owned()));
+            // The attempt keeps the evidence identity the acquisition actually
+            // carried, so replay over a declared member is bound by content and
+            // not by the disposition label alone.
+            return self.record_attempt(
+                handle,
+                MemberAttempt {
+                    disposition,
+                    content_digest: Some(content_digest.to_owned()),
+                    operation_id: Some(operation_id.to_owned()),
+                    links_earlier_attempt: false,
+                },
+                Some(handle.to_owned()),
+            );
         }
         let observation = ObservedOutsideScope {
             handle: handle.to_owned(),
@@ -1735,10 +1917,10 @@ impl CoverageAccount {
     /// Returns `(independent_roots, unknown_independence_handles)`.
     pub fn independent_coverage(&self, lineage: &LineageTable) -> (usize, usize) {
         let mut handles = Vec::new();
-        for (member, (disposition, handle)) in &self.outcomes {
-            if *disposition == SourceDisposition::Observed
-                && !self.exclusions.contains_key(member)
-                && let Some(handle) = handle
+        for (member, accounting) in &self.outcomes {
+            if !self.exclusions.contains_key(member)
+                && let Some(handle) = &accounting.handle
+                && accounting.closes()
             {
                 handles.push(handle.clone());
             }
@@ -1784,14 +1966,45 @@ impl CoverageAccount {
     /// Whether every accounted member closed intact. Complete accounting with
     /// failures still reports `false` here: accounting completeness and
     /// evidence success stay distinct.
+    ///
+    /// "Closed" reads the *latest* recorded attempt, so a member whose first
+    /// attempt failed and whose later attempt closed intact is closed — and the
+    /// earlier failure is still readable through [`Self::recovered_members`],
+    /// which is what keeps a recovery from erasing the failure it answered.
     pub fn all_closed(&self) -> bool {
         self.is_accounted()
-            && self.expected.iter().all(|m| {
-                matches!(
-                    self.outcomes.get(m),
-                    Some((disposition, _)) if disposition.closes_member()
+            && self
+                .expected
+                .iter()
+                .all(|m| self.outcomes.get(m).is_some_and(MemberAccounting::closes))
+    }
+
+    /// Declared members whose first recorded attempt did not close and whose
+    /// latest recorded attempt did, in canonical member order.
+    ///
+    /// Each entry is `(member, first_attempt_disposition, recovery_disposition)`,
+    /// so a later successful acquisition is reported as *linked to* the earlier
+    /// failure rather than standing alone as if nothing had gone wrong.
+    #[must_use]
+    pub fn recovered_members(&self) -> Vec<(String, &'static str, &'static str)> {
+        self.outcomes
+            .iter()
+            .filter(|(_, accounting)| {
+                accounting.attempts.len() > 1 && accounting.closes()
+            })
+            .map(|(member, accounting)| {
+                let first = accounting
+                    .attempts
+                    .first()
+                    .map_or(SourceDisposition::Unknown, |attempt| attempt.disposition);
+                let latest = accounting.disposition();
+                (
+                    member.clone(),
+                    first.wire_name(),
+                    latest.wire_name(),
                 )
             })
+            .collect()
     }
 
     fn canonical_into(&self, preimage: &mut String) {
@@ -1800,11 +2013,31 @@ impl CoverageAccount {
             push_field(preimage, "expected", member);
         }
         push_count(preimage, "outcomes", self.outcomes.len());
-        for (member, (disposition, handle)) in &self.outcomes {
+        for (member, accounting) in &self.outcomes {
             push_field(preimage, "member", member);
-            push_field(preimage, "disposition", disposition.wire_name());
-            if let Some(handle) = handle {
+            if let Some(handle) = &accounting.handle {
                 push_field(preimage, "handle", handle);
+            }
+            // Every attempt is pushed, not only the latest one: a member whose
+            // first attempt failed and whose second closed intact hashes
+            // differently from a member that only ever closed, which is what
+            // stops a recovery from presenting itself as an unbroken success.
+            push_count(preimage, "attempts", accounting.attempts.len());
+            for attempt in &accounting.attempts {
+                push_field(preimage, "attempt_disposition", attempt.disposition.wire_name());
+                push_field(
+                    preimage,
+                    "attempt_links_earlier",
+                    bool_text(attempt.links_earlier_attempt),
+                );
+                match &attempt.content_digest {
+                    Some(content) => push_field(preimage, "attempt_content_digest", content),
+                    None => push_field(preimage, "attempt_content_digest", "absent"),
+                }
+                match &attempt.operation_id {
+                    Some(operation) => push_field(preimage, "attempt_operation_id", operation),
+                    None => push_field(preimage, "attempt_operation_id", "absent"),
+                }
             }
         }
         push_count(preimage, "observed", self.observed.len());
@@ -1838,8 +2071,24 @@ impl CoverageAccount {
     }
 
     /// Canonical digest of the frozen accounting shape.
+    ///
+    /// The declared identity domain is `coverage/v2`. Bumped from `v1` by
+    /// #1767 because the preimage's *field set* changed: a member's accounting
+    /// is now the full ordered attempt chain with the evidence identity of each
+    /// attempt, where `v1` pushed one disposition and one handle. The same name
+    /// covering two different field sets is exactly the defect the bumps on
+    /// `source-record`, `frozen-inquiry` and `absence-preconditions` exist to
+    /// prevent.
+    ///
+    /// Transitively `absence-preconditions/v2` binds this digest through
+    /// `account_digest` and `coverage-receipt/v2` through `account_digest` and
+    /// `AbsencePreconditions`'s own set, so all three change value for the same
+    /// run. Their own field sets and domains are unchanged, and the value
+    /// changing in a field a digest already declared is the dependency behaving
+    /// as declared rather than a new shape — the same reasoning
+    /// `coverage-receipt/v1` -> `v2` records, and it applies here unchanged.
     pub fn digest(&self) -> String {
-        let mut preimage = String::from("coverage/v1;");
+        let mut preimage = String::from("coverage/v2;");
         self.canonical_into(&mut preimage);
         freeze(&preimage)
     }
@@ -2887,18 +3136,18 @@ impl NoMatchEvaluationIssuer {
         );
         let mut results = Vec::with_capacity(account.outcomes.len());
         let mut grades = Vec::with_capacity(account.outcomes.len());
-        for (member, (disposition, handle)) in &account.outcomes {
+        for (member, accounting) in &account.outcomes {
+            let disposition = accounting.disposition();
+            let handle = accounting.handle.as_ref();
             if !disposition.closes_member() {
                 return Err(PortfolioError::IncompleteDenominator {
                     field: "no_match_issuer.disposition",
                 });
             }
-            let record = handle
-                .as_ref()
-                .and_then(|handle| records.get(handle.as_str()));
+            let record = handle.and_then(|handle| records.get(handle.as_str()));
             let (result, grade) = self.result_for(
                 member,
-                handle.as_ref(),
+                handle,
                 record,
                 manifest,
                 &predicate_digest,
@@ -3315,7 +3564,7 @@ impl AbsencePreconditions {
                 let closed_by_account = account
                     .outcomes
                     .get(&result.member)
-                    .is_some_and(|(disposition, _)| disposition.closes_member());
+                    .is_some_and(MemberAccounting::closes);
                 if !closed_by_account {
                     return Err(PortfolioError::Conflict {
                         field: "no_match_result.member",
@@ -3342,17 +3591,17 @@ impl AbsencePreconditions {
         // and is strictly smaller, so the disposition-only count has to be taken
         // here or not at all.
         let mut closed_by_account = 0usize;
-        for (member, (disposition, handle)) in &account.outcomes {
+        for (member, accounting) in &account.outcomes {
+            let disposition = accounting.disposition();
+            let handle = accounting.handle.as_ref();
             if !disposition.closes_member() {
                 unclosed.push((member.clone(), disposition.wire_name()));
                 continue;
             }
             closed_by_account += 1;
-            let record = handle
-                .as_ref()
-                .and_then(|handle| records.get(handle.as_str()));
+            let record = handle.and_then(|handle| records.get(handle.as_str()));
             let reason = member_join_reason(
-                handle.as_ref(),
+                handle,
                 record,
                 results.get(member.as_str()).copied(),
                 &binding,
