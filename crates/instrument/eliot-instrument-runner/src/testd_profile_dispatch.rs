@@ -34,9 +34,7 @@
 //! and evaluation still belongs to `eliot-verifier`.
 
 use eliot_instrument_nextest::NEXTEST_INSTRUMENT;
-use eliot_testd_core::{
-    TESTD_LIST_PROFILE, TESTD_PRODUCTIVE_PROFILE, TESTD_SCOPED_PROFILE,
-};
+use eliot_testd_core::{TESTD_LIST_PROFILE, TESTD_PRODUCTIVE_PROFILE, TESTD_SCOPED_PROFILE};
 use thiserror::Error;
 
 use crate::registry::ProviderRegistry;
@@ -107,10 +105,14 @@ pub fn instrument_contract_for_testd_profile(
 /// does dispatch — fails closed instead of being silently accepted.
 #[must_use]
 pub fn dispatched_testd_profiles() -> Vec<&'static str> {
-    [TESTD_PRODUCTIVE_PROFILE, TESTD_LIST_PROFILE, TESTD_SCOPED_PROFILE]
-        .into_iter()
-        .filter(|profile| eliot_testd_core::is_productive_testd_profile(profile))
-        .collect()
+    [
+        TESTD_PRODUCTIVE_PROFILE,
+        TESTD_LIST_PROFILE,
+        TESTD_SCOPED_PROFILE,
+    ]
+    .into_iter()
+    .filter(|profile| eliot_testd_core::is_productive_testd_profile(profile))
+    .collect()
 }
 
 /// Why a Testd dispatch name could not be resolved to an instrument contract.
