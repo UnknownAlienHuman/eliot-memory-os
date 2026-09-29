@@ -50,8 +50,8 @@ use eliot_contracts::{
     RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_governor::{
-    CapabilityRouteRegistry, ExecutionIdentity, RouteBehaviorFingerprint,
-    RouteInstallationIdentity, RuntimeRoute,
+    ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute,
+    RouteBehaviorFingerprint, RouteInstallationIdentity, RuntimeRoute,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -76,6 +76,7 @@ pub mod opencode_host_events;
 pub mod reactive_injection_receipts;
 pub mod reactive_runtime_composition;
 pub mod route_identity_gate;
+mod route_registry;
 pub mod settled_plan_transport;
 mod transport_profile;
 mod understanding_bootstrap;
@@ -98,6 +99,7 @@ pub use reactive_injection_receipts::{
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
 use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_reconnect};
+use route_registry::RetainedRouteLaunch;
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
@@ -4745,12 +4747,23 @@ pub struct BridgeRunner {
     /// Fingerprint persisted for the last admitted launch (issue #1816, W3).
     ///
     /// The complete W3 material returned by [`admit_bridge_route_launch`].
-    /// [`BridgeRunner::reconnect`] fingerprints the Governor-retained route
-    /// definition and classifies it against this launch value through
+    /// [`BridgeRunner::reconnect`] cross-checks this launch value against the
+    /// sealed launch and the live presentation through
     /// [`classify_bridge_route_reconnect`], so a fingerprint move can never
     /// silently continue. Process memory only, like the rest of the attach
     /// state: a new process admits a new launch.
     active_route_fingerprint: Option<RouteBehaviorFingerprint>,
+    /// Sealed route launch retained for resume classification (issue #1816, W4).
+    ///
+    /// Sealed by [`BridgeRunner::attach`] from the genuine post-attach facts
+    /// — the admitted route and installation plus the owner-issued attach
+    /// binding — and read by [`BridgeRunner::reconnect`] through
+    /// [`classify_bridge_route_reconnect`]. This is the independent retained
+    /// side of the resume comparison: a different production step seals it
+    /// than the one that presents the live declaration and binding, so the
+    /// guard never compares a fingerprint with itself. Process memory only,
+    /// like the rest of the attach state: a new process admits a new launch.
+    retained_route_launch: Option<RetainedRouteLaunch>,
 }
 
 /// Owner-supplied bootstrap inputs sealed to the live attach binding.
@@ -5131,6 +5144,7 @@ impl BridgeRunner {
             route_installation,
             delegated_user_broker_class,
             active_route_fingerprint: None,
+            retained_route_launch: None,
         })
     }
     #[must_use]
@@ -5157,8 +5171,10 @@ impl BridgeRunner {
     ///
     /// The contour route is admitted through [`admit_bridge_route_launch`]
     /// against the retained registry BEFORE the core attaches, so a refused
-    /// route never launches. The persisted fingerprint is retained for
-    /// [`BridgeRunner::reconnect`].
+    /// route never launches. The launch observation is then recorded as a
+    /// Governor receipt from the genuine attach evidence, and the launch is
+    /// sealed for [`BridgeRunner::reconnect`]: a launch that cannot be
+    /// receipted never becomes a continuity bound.
     #[allow(clippy::result_large_err)]
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
         let fingerprint = admit_bridge_route_launch(
@@ -5169,6 +5185,47 @@ impl BridgeRunner {
         )
         .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         let view = self.core.attach(request)?;
+        // The launch receipt is recorded before the launch is sealed. The
+        // receipt carries the genuine attach observation: the owner-issued
+        // binding as transport-metadata evidence, and no observed route
+        // facts, because the activation handshake exposes none and I3.4
+        // forbids reconstructing them from the request. Every component is
+        // validated identity text (admitted route/installation plus the
+        // owner's validated binding identities), so the owner's whole-receipt
+        // validation holds on this path and its typed refusal propagates.
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .map_err(|_| {
+                BridgeError::ProviderContract(
+                    "bridge route launch receipt clock precedes the Unix epoch".to_owned(),
+                )
+            })?;
+        let binding = view.binding();
+        let launch_receipt = ActualRouteReceipt::new(
+            self.bridge_route.clone(),
+            self.route_installation.clone(),
+            ObservedRoute {
+                provider_and_model: None,
+                auth_profile_class: None,
+                billing_mode: None,
+                serializer_fingerprint: None,
+            },
+            observed_at,
+            vec![
+                format!("bridge-contour-attach:{}", self.bridge_route.route_id),
+                format!("kernel-activation-session:{}", binding.session_id().as_str()),
+                format!("kernel-activation-connection:{}", binding.connection_id().as_str()),
+            ],
+        );
+        self.route_registry
+            .record_receipt(launch_receipt)
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.retained_route_launch = Some(RetainedRouteLaunch::seal(
+            &self.bridge_route,
+            &self.route_installation,
+            &view,
+        ));
         self.active_route_fingerprint = Some(fingerprint);
         self.reset_bootstrap_gate_on_session_change();
         Ok(view)
@@ -5176,28 +5233,46 @@ impl BridgeRunner {
     /// Reconnects under a replacement connection: the real bridge resume path
     /// (issue #1816, W4).
     ///
-    /// The Governor-retained route definition is fingerprinted and classified
-    /// against the launch fingerprint through
-    /// [`classify_bridge_route_reconnect`]. An unchanged retained definition
-    /// keeps native resume; any divergence refuses with an explicit
+    /// The live contour declaration is re-derived from the live profile and
+    /// fingerprinted, and the live attach binding is read fresh; both are
+    /// classified against the sealed launch and the Governor-retained receipt
+    /// through [`classify_bridge_route_reconnect`]. An unchanged launch keeps
+    /// native resume; any route-material, launch-authority, bound-integrity,
+    /// or retained-receipt divergence refuses with an explicit
     /// rehydrated/new-attempt state instead of silently continuing under the
-    /// previous session identity.
+    /// previous launch. A resume with no sealed launch while the core holds a
+    /// live attach is refused for the same reason: that is continuity without
+    /// admission.
     #[allow(clippy::result_large_err)]
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
-        let route_moved = match &self.active_route_fingerprint {
-            Some(prior) => {
-                classify_bridge_route_reconnect(
-                    &self.route_registry,
-                    prior,
-                    &self.bridge_route,
-                    &self.route_installation,
-                ) == ContinuityKind::Rehydrated
+        let route_moved = match (&self.retained_route_launch, &self.active_route_fingerprint) {
+            (Some(sealed), Some(prior)) => {
+                let profile = self.profile;
+                let (live_route, live_installation, _) = bridge_contour_declaration(profile);
+                match self.attach_view() {
+                    Some(live) => {
+                        classify_bridge_route_reconnect(
+                            sealed,
+                            prior,
+                            &self.route_registry,
+                            &live_route,
+                            &live_installation,
+                            &live,
+                        ) == ContinuityKind::Rehydrated
+                    }
+                    // The core holds no live attach: it reports the
+                    // attachment state itself; the route gate invents nothing.
+                    None => false,
+                }
             }
-            None => false,
+            // Sealed without a bound, or a live attach with no sealed launch:
+            // continuity without admission never continues silently.
+            (Some(_), None) => true,
+            (None, _) => self.attach_view().is_some(),
         };
         if route_moved {
             return Err(BridgeError::ProviderContract(
-                "bridge route fingerprint moved since launch: resume refuses silent \
+                "bridge route launch admission does not cover this resume: refusing silent \
                  continuity; re-attach for an explicit rehydrated new attempt"
                     .to_owned(),
             ));
