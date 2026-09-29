@@ -46,7 +46,7 @@ use eliot_runtime_contracts::{
     I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, WakeIntent,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
@@ -75,11 +75,12 @@ use crate::store_write_reservation::{
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
-    UserAutomationRemovalResult, UserAutomationWakeCancellation,
-    UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
-    UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
-    read_retirement_wake_targets, retirement_wake_enumeration_request,
+    UserAutomationDueWakeResolution, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationExecutionRequest, UserAutomationRemovalResult, UserAutomationRuntimeAdmission,
+    UserAutomationWakeCancellation, UserAutomationWakeCancellationTarget,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakePublication,
+    UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
+    retirement_wake_enumeration_request,
 };
 use crate::user_automation_execution_client::{
     UserAutomationHostExecutionObserver, UserAutomationHostExecutionOperation,
@@ -3264,6 +3265,189 @@ impl KernelStoreGateway {
             evidence: &evidence,
         })
         .map_err(|error| RunNowPreflightAssembly::Unknown(error.to_string()))
+    }
+
+    /// Assembles the complete owner-issued preflight projection for one due
+    /// scheduled wake from the same live owners `RunNow` reads, and runs it
+    /// through the same execution join.
+    ///
+    /// A scheduled occurrence has no committed Store operation of its own — it
+    /// is not a `RunNow` — so the run-now assembler cannot serve it: its
+    /// `source_receipt` is the committed manual-nonce receipt. This assembler
+    /// therefore takes the owner-issued `source_receipt` the authenticated
+    /// ingress already carries on its preflight receipt and re-proves it here,
+    /// rather than inventing one. Every other member is read from the owner
+    /// that attests it: the current immutable revision and its live
+    /// configuration state, the B-owned policy snapshot, the complete
+    /// Durable Job/history projection over the whole denominator, and the
+    /// schedule normalization receipt envelopes the revision names. Nothing is
+    /// defaulted and nothing is re-derived by spelling.
+    ///
+    /// It then calls [`UserAutomationService::execute_occurrence`], which is
+    /// the execution join `run_now_handoff` composes: the same complete-denominator
+    /// refusal, the same deterministic [`UserAutomationPreflightProjection::preflight`]
+    /// decision, and the same `admit_occurrence` hand-off that resolves the
+    /// complete Durable Job material. Reaching the Durable Job owner without
+    /// that decision would admit an occurrence whose unresolved prior effects,
+    /// overlap policy, declared closure, or provider policy were never checked,
+    /// which is exactly the blind rerun I11.12:59 and I14.21 forbid.
+    ///
+    /// The wake intent is the schedule owner's own journal record, passed in by
+    /// the caller that read it back. It is inert evidence of a published wake
+    /// and grants no execution authority by itself; the preflight below is what
+    /// admits this occurrence.
+    pub async fn due_wake_execution_join<R>(
+        &self,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        wake_intent: WakeIntent,
+        runtime: &R,
+    ) -> Result<UserAutomationExecutionOutcome, UserAutomationRuntimeError>
+    where
+        R: UserAutomationRuntimePort + ?Sized,
+    {
+        let runtime_error = |error: UserAutomationExecutionError| match error {
+            UserAutomationExecutionError::Runtime(runtime) => runtime,
+            // The declared occurrence denominator is unproven, so the answer is
+            // unknown and the durable query handle inside the obligation stays
+            // the caller's route to finish enumerating it. Reporting it as a
+            // refusal would claim the owner decided something it did not.
+            UserAutomationExecutionError::OccurrenceDenominatorIncomplete(obligation) => {
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "occurrence {} has no owner-proven complete occurrence denominator: \
+                     operation_ref={} cause={:?} read_revision={} \
+                     denominator_query_ref={}",
+                    obligation.occurrence_id,
+                    obligation.operation_ref,
+                    obligation.cause,
+                    obligation.read_revision,
+                    obligation
+                        .denominator_query_ref
+                        .as_deref()
+                        .unwrap_or("<none>"),
+                ))
+            }
+            decided => UserAutomationRuntimeError::Rejected(decided.to_string()),
+        };
+        let state_fence = &request.context.state_fence;
+        let owner = self
+            .read_user_automation_owner(&UserAutomationOwnerLookup {
+                automation_id: resolution.revision.automation_id.clone(),
+                requested_revision: resolution.revision.revision.clone(),
+                authenticated_principal: request.authenticated_principal.clone(),
+                state_fence: state_fence.clone(),
+            })
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        // The resolution was made against an earlier read of the same owner, and
+        // the preflight below is assembled from this one. Comparing the two
+        // immutable revisions by content is what proves they are the same
+        // document rather than two reads that happened to agree on a selector.
+        if owner.automation_id != resolution.revision.automation_id
+            || owner.revision != resolution.revision
+            || owner.revision.owner_principal != request.authenticated_principal
+            || owner.state_fence != *state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        // `resolve_due_wake` refused every state that admits no occurrence, so
+        // this read only has to prove it still reads the same admitted state.
+        // Anything else is a refusal re-derived by the preflight below, not
+        // asserted here.
+        let config_snapshot = self.read_user_automation_policy_snapshot(state_fence).await?;
+        let service_request = UserAutomationServiceRequest {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            intent: UserAutomationOperatorIntent {
+                intent_id: format!(
+                    "{}:due-wake-preflight",
+                    request.identity.operation_id.as_str()
+                ),
+                principal_ref: request.authenticated_principal.clone(),
+                state_fence: state_fence.clone(),
+                operation: UserAutomationOperation::Status {
+                    automation_id: owner.automation_id.clone(),
+                },
+            },
+        };
+        // This read refuses rather than answering "no admitted job" when the
+        // owner cannot prove the occurrence denominator complete, and that
+        // refusal carries the durable query handle the caller needs to finish
+        // enumerating it. Reporting it as an unreachable owner would answer the
+        // same question the run-now leg answers as `unknown`.
+        let execution = self
+            .read_user_automation_owner_execution_view(&service_request, &owner.automation_id)
+            .await
+            .map_err(UserAutomationRuntimeError::UnknownOutcome)?;
+        if execution.history_query_ref != owner.revision.execution_history_query_ref {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let normalization_receipts = self
+            .read_run_now_normalization_receipts(
+                state_fence,
+                &owner.revision.schedule.normalization_receipt,
+            )
+            .await
+            .map_err(|assembly| match assembly {
+                RunNowPreflightAssembly::Unknown(reason) => {
+                    UserAutomationRuntimeError::UnknownOutcome(reason)
+                }
+                RunNowPreflightAssembly::Unavailable(reason) => {
+                    UserAutomationRuntimeError::Unavailable(reason)
+                }
+            })?;
+        if normalization_receipts.is_empty() {
+            return Err(UserAutomationRuntimeError::Unavailable(
+                "no owner-issued schedule normalization receipt envelope is retained under this \
+                 State Fence for the receipt identity the immutable revision names, so the \
+                 compiled occurrence set stays self-asserted and the due occurrence is not \
+                 admitted"
+                    .to_owned(),
+            ));
+        }
+        // The same live evidence the run-now assembly reads. A due wake issues
+        // no provider call before preflight either, so the only honest provider
+        // observation here is none — which deterministic mode requires
+        // (I11.12:49) and an agent revision still cannot obtain at this
+        // boundary. `UserAutomationPreflightProjection::assemble` refuses the
+        // active revision whose declared closure, delivery capability, or
+        // provider policy these members do not satisfy, so no caller-side
+        // re-derivation of that decision is added here.
+        let evidence = UserAutomationPreflightEvidence {
+            observed_provider_fingerprint: None,
+            trusted_tool_definition_refs: owner.revision.trusted_tool_definition_refs.clone(),
+            delivery_available: Self::read_run_now_delivery_capability(&owner.revision),
+            failure: None,
+        };
+        let source_receipt = &request.preflight.source_receipt;
+        let projection = UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
+            revision: &owner.revision,
+            configuration_state: owner.current_configuration_state,
+            config_snapshot: &config_snapshot,
+            source_receipt,
+            normalization_receipts: &normalization_receipts,
+            execution: &execution,
+            invocation: &resolution.invocation,
+            request_metadata: &request.context,
+            evidence: &evidence,
+        })
+        .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
+        UserAutomationService::new(&store)
+            .execute_occurrence(
+                UserAutomationExecutionRequest {
+                    context: request.context.clone(),
+                    authenticated_principal: request.authenticated_principal.clone(),
+                    identity: request.identity.clone(),
+                    invocation: resolution.invocation.clone(),
+                    projection,
+                    wake_intent,
+                },
+                runtime,
+            )
+            .await
+            .map_err(runtime_error)
     }
 
     /// Requires the live evidence an active **agent** revision still lacks.
