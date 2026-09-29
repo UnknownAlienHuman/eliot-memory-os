@@ -20,9 +20,10 @@
 //! scheduler handle is taken, external effects are dropped before they can
 //! be emitted) and the comparator outcome persists observed legs with
 //! explicit unknown where nothing was observed. Rollback proposes a newer
-//! routing cutover — never a committed one: the new authority epoch must
-//! strictly rise, an old epoch is never reactivated, and only the
-//! Kernel-owned cutover receipt commits the route.
+//! routing cutover — never a committed one: the new authority epoch is the
+//! exact one-step direct child inside one epoch lineage, as admitted by the
+//! carried cutover record's own validation, so an old epoch is never
+//! reactivated, and only the Kernel-owned cutover receipt commits the route.
 //!
 //! State migration performs no transform of its own: the component-owned
 //! migration handler exports/imports state, and [`migrate_state`] verifies
