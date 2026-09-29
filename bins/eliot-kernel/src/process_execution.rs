@@ -1940,9 +1940,14 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         match started {
             Ok(receipt) => Ok(receipt),
             Err(error) => {
-                // The child never started: drop its registration so a failed
-                // launch leaves no orphan entry behind.
-                if let Ok(mut registry) = self.descendants.lock() {
+                // A typed UnknownOutcome means the platform could not observe
+                // that its still-suspended child was terminated. Keep this
+                // operation's owner/epoch/generation registration available
+                // for reconciliation; only a proved pre-effect refusal may
+                // release the attempt registration here.
+                if !matches!(&error, ProcessExecutionError::UnknownOutcome)
+                    && let Ok(mut registry) = self.descendants.lock()
+                {
                     registry.remove(&operation_id);
                 }
                 Err(error)
