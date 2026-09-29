@@ -66,7 +66,7 @@ impl KernelOperatorBindings {
         let expires_at = observed_at_ms
             .checked_add(OPERATOR_BINDING_TTL_MS)
             .ok_or(TransportError::SessionFenced)?
-            .min(request.context.endpoint_expires_at)
+            .min(request.context.endpoint_expires_at);
             .min(current.expires_at);
         if expires_at <= observed_at_ms {
             return Err(TransportError::SessionFenced);
@@ -120,7 +120,8 @@ impl KernelOperatorBindings {
         let expires_at = observed_at_ms
             .checked_add(OPERATOR_BINDING_TTL_MS)
             .ok_or(TransportError::SessionFenced)?
-            .min(current.expires_at);
+            .min(current.expires_at)
+            .min(request.context.endpoint_expires_at)
         if expires_at <= observed_at_ms {
             return Err(TransportError::SessionFenced);
         }
@@ -163,6 +164,7 @@ impl KernelOperatorBindings {
             || active.request.context.registration != *current
             || current.status != RegistrationStatus::Active
             || current.expires_at <= observed_at_ms
+            || active.request.context.endpoint_expires_at <= observed_at_ms
             || active.grant.expires_at <= observed_at_ms
         {
             return Err(TransportError::SessionFenced);
