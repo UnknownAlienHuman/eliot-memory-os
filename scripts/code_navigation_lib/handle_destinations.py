@@ -75,6 +75,7 @@ class DestinationResolver:
                 f"canonical handle index has no handle entries: {handle_index_relative}"
             )
         self._handles: dict[str, dict[str, Any]] = {}
+        self._owners: dict[str, str] = {}
         self._load_and_validate(raw_handles)
 
     def _load_and_validate(self, raw_handles: dict[str, Any]) -> None:
@@ -82,6 +83,10 @@ class DestinationResolver:
             handle = str(raw_handle).strip()
             if not handle:
                 raise NavigationError("handle index contains an empty handle")
+            if handle in self._handles:
+                raise NavigationError(
+                    f"handle index declares a duplicate handle identity: {handle}"
+                )
             if not isinstance(record, dict):
                 raise NavigationError(f"handle {handle} is not a valid record")
             required = ("source", "title", "path", "anchor")
@@ -100,13 +105,21 @@ class DestinationResolver:
             anchor = str(record["anchor"]).strip()
             if not anchor:
                 raise NavigationError(f"handle {handle} has an empty anchor")
+            destination = f"{normalized_path}#{anchor}"
+            owner = self._owners.get(destination)
+            if owner is not None:
+                raise NavigationError(
+                    f"handle index declares an ambiguous destination claimed by both "
+                    f"{owner} and {handle}: {destination}"
+                )
+            self._owners[destination] = handle
             self._handles[handle] = {
                 "handle": handle,
                 "title": str(record["title"]).strip(),
                 "path": normalized_path,
                 "anchor": anchor,
                 "source": str(record["source"]).strip(),
-                "direct_destination": f"{normalized_path}#{anchor}",
+                "direct_destination": destination,
             }
 
     def resolve(self, handle: str) -> dict[str, Any]:

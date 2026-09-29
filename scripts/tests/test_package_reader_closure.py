@@ -6,9 +6,9 @@ Each test case method has # WORK_UNIT_CASE: 690/<case> immediately above it.
 
 from __future__ import annotations
 
+import copy
 import json
-import os
-import shutil
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,8 +51,6 @@ from scripts.code_navigation_lib.prototype_docs import (
 )
 from scripts.docs_shards_core import (
     DocsError,
-    choose_cuts,
-    parse_headings,
     self_test as docs_shards_self_test,
     sha256_text,
     verify_manifest,
@@ -63,6 +61,58 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+REVERSE_HEADING = "## Reverse documentation"
+HANDLE_CELL_RE = re.compile(r"^\[`(?P<handle>[^`]+)`\]\(")
+LINK_LABEL_RE = re.compile(r"\[`(?P<label>[^`]+)`\]\(")
+REVERSE_TARGET_RE = re.compile(r"^`(?P<cell>[^`]+:[^`]+)`")
+
+
+def _table_section(rendered: str, heading: str) -> str:
+    """Return the lines of one rendered Markdown table, heading excluded."""
+    lines = rendered.splitlines()
+    start = next(index for index, line in enumerate(lines) if line == heading)
+    section: list[str] = []
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        section.append(line)
+    return "\n".join(section)
+
+
+def _reverse_section(rendered: str) -> dict[str, dict[str, set[str]]]:
+    """Parse the rendered reverse table into handle -> {packages, targets}."""
+    lines = rendered.splitlines()
+    start = next(
+        index for index, line in enumerate(lines) if line.startswith(REVERSE_HEADING)
+    )
+    rows: dict[str, dict[str, set[str]]] = {}
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if not line.startswith("| ") or line.startswith("|---"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 4 or cells[0] == "Handle":
+            continue
+        handle_match = HANDLE_CELL_RE.match(cells[0])
+        if handle_match is None:
+            continue
+        handle = handle_match.group("handle")
+        if handle in rows:
+            raise AssertionError(f"duplicate reverse row for handle {handle}")
+        # Each <br>-separated chunk is "`root:path`" optionally followed by a
+        # `[requires: ...]` gate; only the leading root:path is the identity.
+        targets = set()
+        for chunk in cells[3].split("<br>"):
+            match = REVERSE_TARGET_RE.match(chunk.strip())
+            if match is not None:
+                targets.add(match.group("cell"))
+        rows[handle] = {
+            "packages": {match.group("label") for match in LINK_LABEL_RE.finditer(cells[2])},
+            "targets": targets,
+        }
+    return rows
 
 
 class TestPackageReaderClosure(unittest.TestCase):
@@ -237,23 +287,171 @@ class TestPackageReaderClosure(unittest.TestCase):
 
     # WORK_UNIT_CASE: 690/10
     def test_10_one_disposition_per_manifest(self) -> None:
-        for p in self.registry["packages"]:
-            dispositions = []
-            if p.get("default_member"):
-                dispositions.append("default")
-            elif p.get("workspace_member"):
-                dispositions.append("workspace")
-            else:
-                dispositions.append("nonmember prototype")
-            self.assertEqual(len(dispositions), 1)
+        # Adversarial: a manifest that carries two dispositions at once must be
+        # rejected by the production validator, not relabelled by the test.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "crates/p/src").mkdir(parents=True)
+            (root / "docs/architecture").mkdir(parents=True)
+            (root / "docs/code-navigation").mkdir(parents=True)
+            (root / PROTOCOL_PATH).write_text("# protocol\n", encoding="utf-8")
+            contract = (
+                f"{ROUTING_START}\npython scripts/docs_read.py read\n"
+                f"[protocol](../{PROTOCOL_PATH})\n{ROUTING_END}\n"
+                f"[workspace](../{PACKAGE_INDEX_PATH})\n"
+                f"[prototype](../{PROTOTYPE_INDEX_PATH})\n"
+            )
+            (root / "crates/AGENTS.md").write_text(contract, encoding="utf-8")
+            (root / "crates/p/Cargo.toml").write_text(
+                "[package]\nname='p'\n[package.metadata.eliot]\nprototype=true\n"
+                "workspace_admission='pending proof'\n",
+                encoding="utf-8",
+            )
+            (root / "crates/p/src/lib.rs").write_text("pub fn p() {}\n", encoding="utf-8")
+            (root / "docs/architecture/handle-index.json").write_text(
+                json.dumps({
+                    "schema_version": "eliot-handle-index-v1",
+                    "handles": {
+                        "I2.8": {
+                            "source": "implementation",
+                            "title": "I2.8. Package metadata",
+                            "path": "docs/" + "architecture/I02-08.md",
+                            "anchor": "i28-package-metadata",
+                        }
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (root / ("docs/" + "architecture/I02-08.md")).write_text(
+                "## I2.8. Package metadata\n", encoding="utf-8"
+            )
+            doubly_admitted = {
+                "packages": [{
+                    "root_path": "crates/p",
+                    "manifest_path": "crates/p/Cargo.toml",
+                    "workspace_member": False,
+                    "default_member": True,
+                    "targets": [{"kind": "lib", "path": "src/lib.rs"}],
+                    "logical_blocks": ["test"],
+                }],
+                "logical_blocks": [{
+                    "id": "test",
+                    "documentation_handles": ["I2.8"],
+                    "documentation_route_ids": ["test-route"],
+                }],
+            }
+            with self.assertRaises(NavigationError) as cm:
+                validate_prototype_docs(root, doubly_admitted)
+            self.assertIn("marked as a default member", str(cm.exception))
+            self.assertIn("crates/p", str(cm.exception))
+
+        # Second disposition on a real workspace manifest: the registry flag must
+        # not contradict the authoritative Cargo.toml default-member denominator.
+        registry = copy.deepcopy(self.registry)
+        liar = next(
+            package for package in registry["packages"]
+            if package["workspace_member"] and not package["default_member"]
+        )
+        liar["default_member"] = True
+        with self.assertRaises(NavigationError) as cm:
+            validate_package_docs(REPO_ROOT, registry)
+        self.assertIn("default-member state disagrees", str(cm.exception))
+        self.assertIn(liar["root_path"], str(cm.exception))
+
+        # Positive control on real metadata: the two production denominators
+        # partition every real manifest exactly once, and the rendered indexes
+        # place each manifest in exactly one of them.
+        workspace_roots = {p["root_path"] for p in _packages(self.registry)}
+        prototype_roots = {p["root_path"] for p in _prototype_packages(self.registry)}
+        all_roots = {p["root_path"] for p in self.registry["packages"]}
+        self.assertEqual(workspace_roots & prototype_roots, set())
+        self.assertEqual(workspace_roots | prototype_roots, all_roots)
+        workspace_section = _table_section(
+            render_package_docs(self.registry, REPO_ROOT), "## Workspace packages"
+        )
+        prototype_section = _table_section(
+            render_prototype_docs(REPO_ROOT, self.registry),
+            "## Nonmember prototype packages",
+        )
+        for package in self.registry["packages"]:
+            manifest_link = f"](../../{package['manifest_path']})"
+            in_workspace = workspace_section.count(manifest_link)
+            in_prototype = prototype_section.count(manifest_link)
+            self.assertEqual(
+                in_workspace + in_prototype,
+                1,
+                f"{package['root_path']} is not admitted exactly once: "
+                f"workspace={in_workspace} prototype={in_prototype}",
+            )
 
     # WORK_UNIT_CASE: 690/11
     def test_11_one_disposition_per_target(self) -> None:
-        for p in self.registry["packages"]:
-            pkg_disp = "default" if p.get("default_member") else ("workspace" if p.get("workspace_member") else "prototype")
-            for t in p.get("targets", []):
-                self.assertIsNotNone(t.get("path"))
-                self.assertIn(pkg_disp, ("default", "workspace", "prototype"))
+        # Adversarial: one target identity declared with two different
+        # required-features gates must be rejected by cargo.inferred_targets.
+        with tempfile.TemporaryDirectory() as td:
+            package_root = Path(td)
+            (package_root / "src/bin").mkdir(parents=True)
+            (package_root / "src/main.rs").write_text("fn main() {}\n", encoding="utf-8")
+            (package_root / "src/bin/twin.rs").write_text("fn main() {}\n", encoding="utf-8")
+            conflicting = {
+                "package": {"name": "twin"},
+                "bin": [
+                    {"name": "twin", "path": "src/bin/twin.rs", "required-features": ["fast"]},
+                    {"name": "twin", "path": "src/bin/twin.rs", "required-features": ["slow"]},
+                ],
+            }
+            with self.assertRaises(NavigationError) as cm:
+                inferred_targets(package_root, conflicting, strict=True)
+            self.assertIn("more than once", str(cm.exception))
+            self.assertIn("required-features", str(cm.exception))
+
+            # The same identity declared twice with one identical gate collapses
+            # to exactly one disposition, not two.
+            agreed = copy.deepcopy(conflicting)
+            agreed["bin"][1]["required-features"] = ["fast"]
+            targets = inferred_targets(package_root, agreed, strict=True)
+            twins = [t for t in targets if t["path"] == "src/bin/twin.rs"]
+            self.assertEqual(len(twins), 1)
+            self.assertEqual(twins[0]["required_features"], "fast")
+
+        # Real registry: no target carries two dispositions. A target path is
+        # package-relative, so the identity is (root, kind, path) and the
+        # rendered reverse cell is (root:path) - both must be unique and must
+        # resolve to one real file inside its own package root.
+        # Each target must appear exactly once per reverse row, and every target
+        # of a governing package must appear in that row - never dropped, never
+        # duplicated within the row.
+        blocks = _blocks(self.registry)
+        reverse = _reverse_section(render_package_docs(self.registry, REPO_ROOT))
+        for handle, row in reverse.items():
+            self.assertEqual(
+                len(row["targets"]),
+                len({cell for cell in row["targets"]}),
+                f"reverse row for {handle} repeats a target",
+            )
+            expected = {
+                f"{package['root_path']}:{target['path']}"
+                for package in _packages(self.registry)
+                if handle in _handles(package, blocks)
+                for target in package.get("targets", [])
+            }
+            self.assertEqual(row["targets"], expected, f"target set differs for {handle}")
+        for package in self.registry["packages"]:
+            root_path = package["root_path"]
+            identities = [
+                (target["kind"], target["path"]) for target in package.get("targets", [])
+            ]
+            self.assertEqual(
+                len(identities), len(set(identities)),
+                f"{root_path} lists a target identity twice",
+            )
+            for target in package.get("targets", []):
+                absolute = (REPO_ROOT / root_path / target["path"]).resolve()
+                self.assertTrue(absolute.is_file(), f"{root_path}:{target['path']} does not exist")
+                self.assertTrue(
+                    absolute.is_relative_to((REPO_ROOT / root_path).resolve()),
+                    f"{root_path}:{target['path']} escapes its package root",
+                )
 
     # WORK_UNIT_CASE: 690/12
     def test_12_inherited_family_evidence_supports_but_cannot_replace_closure(self) -> None:
@@ -442,21 +640,53 @@ class TestPackageReaderClosure(unittest.TestCase):
 
     # WORK_UNIT_CASE: 690/22
     def test_22_duplicate_ambiguous_handle(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            t = Path(td)
-            (t / "docs/architecture").mkdir(parents=True)
-            (t / "docs/architecture/handle-index.json").write_text(
-                json.dumps({
-                    "schema_version": "eliot-handle-index-v1",
-                    "handles": {
-                        "A0": {"source": "a", "title": "A0", "path": "docs/" + "architecture/A.md", "anchor": "a"},
-                    },
-                }),
+        def write_index(root: Path, handles: dict) -> None:
+            (root / "docs/architecture").mkdir(parents=True, exist_ok=True)
+            (root / "docs/architecture/handle-index.json").write_text(
+                json.dumps({"schema_version": "eliot-handle-index-v1", "handles": handles}),
                 encoding="utf-8",
             )
-            (t / ("docs/" + "architecture/A.md")).write_text("## A\n", encoding="utf-8")
-            res = DestinationResolver(t)
-            self.assertIsNotNone(res.resolve("A0"))
+            (root / ("docs/" + "architecture/A.md")).write_text(
+                "## A\n## B\n", encoding="utf-8"
+            )
+
+        def record(title: str, anchor: str) -> dict:
+            return {
+                "source": "a",
+                "title": title,
+                "path": "docs/" + "architecture/A.md",
+                "anchor": anchor,
+            }
+
+        # Two distinct keys that collapse to one stripped identity must not
+        # silently overwrite: the later one won in the unfixed resolver.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write_index(root, {"A0": record("FIRST-WINS", "a"), "A0 ": record("SECOND-WINS", "a")})
+            with self.assertRaises(NavigationError) as cm:
+                DestinationResolver(root)
+            message = str(cm.exception)
+            self.assertIn("duplicate handle identity", message)
+            self.assertIn("A0", message)
+
+        # Two distinct handles claiming the same fragment#anchor are ambiguous.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write_index(root, {"A0": record("A0", "a"), "A1": record("A1", "a")})
+            with self.assertRaises(NavigationError) as cm:
+                DestinationResolver(root)
+            message = str(cm.exception)
+            self.assertIn("ambiguous destination", message)
+            self.assertIn("A0", message)
+            self.assertIn("A1", message)
+
+        # Two distinct handles on distinct anchors are not ambiguous and resolve.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write_index(root, {"A0": record("A0", "a"), "A1": record("A1", "b")})
+            resolver = DestinationResolver(root)
+            self.assertEqual(resolver.resolve("A0")["direct_destination"], "docs/architecture/A.md#a")
+            self.assertEqual(resolver.resolve("A1")["direct_destination"], "docs/architecture/A.md#b")
 
     # WORK_UNIT_CASE: 690/23
     def test_23_malformed_empty_handle(self) -> None:
@@ -521,9 +751,58 @@ class TestPackageReaderClosure(unittest.TestCase):
 
     # WORK_UNIT_CASE: 690/27
     def test_27_percent_separator_case_alias_cannot_produce_duplicate_identity(self) -> None:
-        h1 = self.resolver.resolve("I2.8")
-        h2 = self.resolver.resolve("i2.8" if "i2.8" in self.resolver.all_handles() else "I2.8")
-        self.assertEqual(h1["direct_destination"], h2["direct_destination"])
+        canonical = "I2.8"
+        real = self.resolver.resolve(canonical)
+        all_handles = self.resolver.all_handles()
+        self.assertIn(canonical, all_handles)
+        aliases = ("i2.8", "I2%2E8", "I2.8%20", "I2-8", "I2.8.", "I2_8", "I2 8")
+        # An alias must never resolve, and must never appear as a second stored
+        # identity beside the canonical handle.
+        for alias in aliases:
+            self.assertNotIn(alias, all_handles, f"alias {alias!r} is stored as its own handle")
+            with self.assertRaises(NavigationError, msg=f"alias {alias!r} resolved"):
+                self.resolver.resolve(alias)
+        self.assertEqual(
+            self.resolver.resolve(canonical)["direct_destination"],
+            real["direct_destination"],
+        )
+        self.assertEqual(
+            len([h for h in all_handles if h.strip() == canonical]),
+            1,
+            "the canonical handle has more than one stored identity",
+        )
+
+        # An index that ships a percent/case/separator alias of a live handle is
+        # rejected at load, so a reader cannot navigate to two identities.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "docs/architecture").mkdir(parents=True)
+            (root / "docs/architecture/handle-index.json").write_text(
+                json.dumps({
+                    "schema_version": "eliot-handle-index-v1",
+                    "handles": {
+                        "I2.8": {
+                            "source": "implementation",
+                            "title": "I2.8. Package metadata",
+                            "path": "docs/" + "architecture/I02-08.md",
+                            "anchor": "i28-package-metadata",
+                        },
+                        "i2.8": {
+                            "source": "implementation",
+                            "title": "I2.8. Package metadata (case alias)",
+                            "path": "docs/" + "architecture/I02-08.md",
+                            "anchor": "i28-package-metadata",
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (root / ("docs/" + "architecture/I02-08.md")).write_text(
+                "## I2.8. Package metadata\n", encoding="utf-8"
+            )
+            with self.assertRaises(NavigationError) as cm:
+                DestinationResolver(root)
+            self.assertIn("ambiguous destination", str(cm.exception))
 
     # WORK_UNIT_CASE: 690/28
     def test_28_generic_unanchored_handle_index_rejected(self) -> None:
@@ -559,11 +838,41 @@ class TestPackageReaderClosure(unittest.TestCase):
 
     # WORK_UNIT_CASE: 690/32
     def test_32_no_extra_reverse_member(self) -> None:
+        rendered = render_package_docs(self.registry, REPO_ROOT)
+        reverse = _reverse_section(rendered)
+        reverse_handles = set(reverse)
         blocks = _blocks(self.registry)
-        all_pkg_handles: set[str] = set()
-        for p in _packages(self.registry):
-            all_pkg_handles.update(_handles(p, blocks))
-        self.assertGreater(len(all_pkg_handles), 0)
+        packages = _packages(self.registry)
+        forward: dict[str, set[str]] = {}
+        for package in packages:
+            for handle in _handles(package, blocks):
+                forward.setdefault(handle, set()).add(str(package["root_path"]))
+        self.assertEqual(reverse_handles, set(forward))
+        for handle, expected_packages in forward.items():
+            self.assertEqual(
+                reverse[handle]["packages"],
+                expected_packages,
+                f"reverse row for {handle} does not match the forward relation",
+            )
+            self.assertTrue(expected_packages, f"forward relation for {handle} is empty")
+        # No row may admit a package that the forward relation never names.
+        for handle, row in reverse.items():
+            self.assertIn(handle, forward, f"extra reverse handle {handle}")
+            for admitted in row["packages"]:
+                self.assertIn(admitted, forward[handle])
+
+        # The same check on the prototype index, against the prototype denominator.
+        prototype_render = render_prototype_docs(REPO_ROOT, self.registry)
+        prototype_reverse = _reverse_section(prototype_render)
+        prototype_forward: dict[str, set[str]] = {}
+        for package in _prototype_packages(self.registry):
+            for handle in _handles(package, blocks):
+                prototype_forward.setdefault(handle, set()).add(str(package["root_path"]))
+        self.assertEqual(set(prototype_reverse), set(prototype_forward))
+        for handle, expected_packages in prototype_forward.items():
+            self.assertEqual(prototype_reverse[handle]["packages"], expected_packages)
+        for handle in prototype_reverse:
+            self.assertIn(handle, prototype_forward)
 
     # WORK_UNIT_CASE: 690/33
     def test_33_multiple_blocks_handles_without_loss_duplicate_package(self) -> None:
@@ -609,9 +918,41 @@ class TestPackageReaderClosure(unittest.TestCase):
 
     # WORK_UNIT_CASE: 690/37
     def test_37_irrelevant_input_permutation_gives_identical_bytes(self) -> None:
-        r1 = render_package_docs(self.registry, REPO_ROOT)
-        r2 = render_package_docs(self.registry, REPO_ROOT)
-        self.assertEqual(r1.encode("utf-8"), r2.encode("utf-8"))
+        baseline = render_package_docs(self.registry, REPO_ROOT).encode("utf-8")
+        baseline_prototype = render_prototype_docs(REPO_ROOT, self.registry).encode("utf-8")
+
+        # A permuted-but-equivalent registry. Only genuinely order-irrelevant
+        # inputs are permuted: the packages list (the renderer sorts it), each
+        # package's targets and rust_files (sorted by a typed key), and each
+        # block's handle/route/matched-file lists (sorted by natural_handle_key
+        # or unused). The logical-blocks declaration order and each package's
+        # own logical_blocks order are meaningful declared order and are kept.
+        permuted = copy.deepcopy(self.registry)
+        permuted["packages"] = list(reversed(permuted["packages"]))
+        for package in permuted["packages"]:
+            package["targets"] = list(reversed(package.get("targets", [])))
+            package["rust_files"] = list(reversed(package.get("rust_files", [])))
+        for block in permuted["logical_blocks"]:
+            block["documentation_handles"] = list(reversed(block["documentation_handles"]))
+            block["documentation_route_ids"] = list(reversed(block["documentation_route_ids"]))
+            block["matched_files"] = list(reversed(block.get("matched_files", [])))
+        self.assertNotEqual(
+            [p["root_path"] for p in permuted["packages"]],
+            [p["root_path"] for p in self.registry["packages"]],
+            "the permutation did not reorder anything",
+        )
+        self.assertEqual(
+            render_package_docs(permuted, REPO_ROOT).encode("utf-8"),
+            baseline,
+        )
+        self.assertEqual(
+            render_prototype_docs(REPO_ROOT, permuted).encode("utf-8"),
+            baseline_prototype,
+        )
+
+        # And the generated index files on disk are exactly those bytes.
+        self.assertEqual((REPO_ROOT / PACKAGE_INDEX_PATH).read_bytes(), baseline)
+        self.assertEqual((REPO_ROOT / PROTOTYPE_INDEX_PATH).read_bytes(), baseline_prototype)
 
     # WORK_UNIT_CASE: 690/38
     def test_38_repeated_generation_byte_identical(self) -> None:
@@ -858,8 +1199,73 @@ class TestPackageReaderClosure(unittest.TestCase):
 
     # WORK_UNIT_CASE: 690/50
     def test_50_largest_shard_diagnostic_cannot_override_failure(self) -> None:
-        cuts = choose_cuts("# H1\nText\n", parse_headings("# H1\nText\n"))
-        self.assertGreater(len(cuts), 0)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            big = "b" * 48000
+            over = "o" * 48001
+            bad = "z" * 32
+            (root / "big.md").write_text(big, encoding="utf-8")
+            (root / "over.md").write_text(over, encoding="utf-8")
+            (root / "bad.md").write_text(bad, encoding="utf-8")
+
+            def manifest(entries: list[tuple[str, str, str]]) -> dict:
+                """Build a manifest whose source is the concatenation of its shards."""
+                fragments = []
+                reconstructed = ""
+                for order, (path, text, rendered_sha) in enumerate(entries):
+                    digest = sha256_text(text)
+                    fragments.append({
+                        "order": order,
+                        "path": path,
+                        "source_start_char": len(reconstructed),
+                        "source_end_char": len(reconstructed) + len(text),
+                        "source_sha256": digest,
+                        "rendered_sha256": rendered_sha,
+                        "source_bytes": len(text.encode("utf-8")),
+                        "rendered_bytes": len(text.encode("utf-8")),
+                        "navigation_rewrites": [],
+                        "headings": [],
+                    })
+                    reconstructed += text
+                return {
+                    "source_key": "architecture",
+                    "source_sha256": sha256_text(reconstructed),
+                    "source_bytes": len(reconstructed.encode("utf-8")),
+                    "source_characters": len(reconstructed),
+                    "fragments": fragments,
+                }
+
+            # The exactly-48,000 shard is the largest, and it is followed by a
+            # violating shard: the ceiling failure must still be raised.
+            with self.assertRaises(DocsError) as cm:
+                verify_manifest(root, manifest([
+                    ("big.md", big, sha256_text(big)),
+                    ("over.md", over, sha256_text(over)),
+                ]))
+            message = str(cm.exception)
+            self.assertIn("exceeds 48000 byte limit", message)
+            self.assertIn("path=over.md", message)
+            self.assertIn("bytes=48001", message)
+            self.assertIn("manifest=architecture", message)
+
+            # A largest-shard report must not mask a different violation in a
+            # later shard: the hash mismatch is raised, not the largest report.
+            with self.assertRaises(DocsError) as cm:
+                verify_manifest(root, manifest([
+                    ("big.md", big, sha256_text(big)),
+                    ("bad.md", bad, sha256_text("tampered")),
+                ]))
+            message = str(cm.exception)
+            self.assertIn("rendered fragment hash mismatch: bad.md", message)
+            self.assertNotIn("largest", message.lower())
+
+            # Control: the same two legal shards verify and report the largest.
+            result = verify_manifest(root, manifest([
+                ("big.md", big, sha256_text(big)),
+                ("bad.md", bad, sha256_text(bad)),
+            ]))
+            self.assertEqual(result["largest_fragment"], 48000)
+            self.assertEqual(result["fragments"], 2)
 
     # WORK_UNIT_CASE: 690/51
     def test_51_readme_exact_supported_commands_proof_boundary(self) -> None:
@@ -900,7 +1306,106 @@ class TestPackageReaderClosure(unittest.TestCase):
 
     # WORK_UNIT_CASE: 690/55
     def test_55_unexecuted_full_checkout_actions_evidence_stays_unexecuted(self) -> None:
-        self.assertTrue(os.environ.get("CI") is None or os.environ.get("CI") == "false" or True)
+        # Clause 1: the generated indexes may not record an Actions or
+        # full-checkout execution this unit never observed. A missing token
+        # proves the claim is absent from the artifact; it does NOT prove that
+        # no such run happened elsewhere.
+        for relative in (PACKAGE_INDEX_PATH, PROTOTYPE_INDEX_PATH):
+            text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+            boundary = text[text.index("## Proof boundary"):]
+            self.assertIn("It does not prove", boundary)
+            self.assertIn("Product", boundary)
+            for claim in ("Actions", "workflow run", "full checkout", "CI passed", "green build"):
+                self.assertNotIn(claim, text, f"{relative} records an unobserved {claim!r} claim")
+            self.assertIn(
+                "python scripts/code_navigation.py check --root .",
+                text,
+                f"{relative} does not name the reproduction command",
+            )
+
+        # Clause 2: the generated output is not an input to its own freshness
+        # check. Rendering is identical whether the index file is absent,
+        # current, or tampered, so an output-only commit cannot self-invalidate
+        # the input binding.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "docs/architecture").mkdir(parents=True)
+            (root / "docs/code-navigation").mkdir(parents=True)
+            (root / ("docs/" + "architecture/I02-08.md")).write_text(
+                "## I2.8. Package metadata\n", encoding="utf-8"
+            )
+            (root / "docs/architecture/handle-index.json").write_text(
+                json.dumps({
+                    "schema_version": "eliot-handle-index-v1",
+                    "handles": {
+                        "I2.8": {
+                            "source": "implementation",
+                            "title": "I2.8. Package metadata",
+                            "path": "docs/" + "architecture/I02-08.md",
+                            "anchor": "i28-package-metadata",
+                        }
+                    },
+                }),
+                encoding="utf-8",
+            )
+            registry = {
+                "workspace_manifest": {"members": ["crates/a"], "default_members": ["crates/a"]},
+                "packages": [{
+                    "root_path": "crates/a",
+                    "manifest_path": "crates/a/Cargo.toml",
+                    "workspace_member": True,
+                    "default_member": True,
+                    "targets": [{"kind": "lib", "path": "src/lib.rs"}],
+                    "logical_blocks": ["test"],
+                }],
+                "logical_blocks": [{
+                    "id": "test",
+                    "documentation_handles": ["I2.8"],
+                    "documentation_route_ids": ["test-route"],
+                }],
+            }
+            index = root / PACKAGE_INDEX_PATH
+            without_index = render_package_docs(registry, root)
+            index.write_text(without_index, encoding="utf-8", newline="")
+            self.assertEqual(render_package_docs(registry, root), without_index)
+            _check_package_index(root, registry)
+            index.write_text("output-only edit\n", encoding="utf-8", newline="")
+            self.assertEqual(
+                render_package_docs(registry, root),
+                without_index,
+                "the generated index influenced its own render",
+            )
+            with self.assertRaises(NavigationError) as cm:
+                _check_package_index(root, registry)
+            self.assertIn("hand-edited", str(cm.exception))
+            # The input binding is live, not vacuous: in a second checkout whose
+            # source input differs, the expected bytes differ too. A separate
+            # directory is used because DestinationResolver is cached per root.
+            with tempfile.TemporaryDirectory() as other:
+                moved = Path(other)
+                (moved / "docs/architecture").mkdir(parents=True)
+                (moved / ("docs/" + "architecture/I02-08.md")).write_text(
+                    "## I2.8. Package metadata\n", encoding="utf-8"
+                )
+                (moved / "docs/architecture/handle-index.json").write_text(
+                    json.dumps({
+                        "schema_version": "eliot-handle-index-v1",
+                        "handles": {
+                            "I2.8": {
+                                "source": "implementation",
+                                "title": "I2.8. Package metadata",
+                                "path": "docs/" + "architecture/I02-08.md",
+                                "anchor": "i28-package-metadata-renamed",
+                            }
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+                self.assertNotEqual(
+                    render_package_docs(registry, moved),
+                    without_index,
+                    "a source-input change did not change the expected bytes",
+                )
 
 
 if __name__ == "__main__":
