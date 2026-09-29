@@ -429,6 +429,30 @@ fn consumed_payload_digest(payload: &[serde_json::Value]) -> Result<String, Prov
     Ok(sha256_hex(&bytes))
 }
 
+fn acknowledgement_receipts_share_request(
+    previous: &serde_json::Value,
+    current: &serde_json::Value,
+) -> bool {
+    matches!(
+        (
+            previous
+                .get("operation_id")
+                .and_then(serde_json::Value::as_str),
+            current
+                .get("operation_id")
+                .and_then(serde_json::Value::as_str),
+            previous
+                .get("request_sha256")
+                .and_then(serde_json::Value::as_str),
+            current
+                .get("request_sha256")
+                .and_then(serde_json::Value::as_str),
+        ),
+        (Some(previous_operation), Some(current_operation), Some(previous_request), Some(current_request))
+            if previous_operation == current_operation && previous_request == current_request
+    )
+}
+
 /// Validates a Kernel acknowledgement receipt against the exact frontier and
 /// owner tuple held by the unresolved offer. The receipt proves ack progress
 /// only; its independent read has not completed.
@@ -681,6 +705,13 @@ struct BridgeEventTransportFacts {
     connection_id: String,
     state_fence: StateFence,
     session: Option<String>,
+}
+
+struct ReconciliationAttempt {
+    value: serde_json::Value,
+    outcome: ReconciliationPortOutcome,
+    window_status: RecoveryWindowStatus,
+    continuation_pending: bool,
 }
 
 fn event_transport_failure() -> ProviderFailure {
@@ -1252,6 +1283,37 @@ fn has_unresolved_handoff_mutation(value: &serde_json::Value) -> Result<bool, Pr
         ));
     }
     Ok(handoff_status == "unknown" || maintenance_status == "unknown")
+}
+
+fn validate_acknowledgement_read_unknown(value: &serde_json::Value) -> Result<(), ProviderFailure> {
+    if value
+        .get("reconciliation_status")
+        .and_then(serde_json::Value::as_str)
+        != Some("unknown")
+        || value
+            .get("handoff_reconciliation_status")
+            .and_then(serde_json::Value::as_str)
+            != Some("not_run")
+        || value
+            .get("handoff_maintenance_status")
+            .and_then(serde_json::Value::as_str)
+            != Some("not_run")
+        || !value
+            .get("reconciliation")
+            .is_some_and(serde_json::Value::is_null)
+        || !value
+            .get("handoff_receipts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        || value
+            .get("acknowledgement")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: unknown owner read carried read or handoff facts",
+        ));
+    }
+    Ok(())
 }
 
 /// Decodes one owner gap fact: scoped under its stream, or unscoped at top
@@ -2295,6 +2357,413 @@ fn decode_handoff_maintenance_pressure(
     Ok(())
 }
 
+fn checked_json_digest(value: &serde_json::Value) -> Result<String, ProviderFailure> {
+    let bytes = canonical_json_bytes(value).map_err(|_| event_transport_failure())?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn validate_handoff_mutation_receipt(
+    receipt: &serde_json::Value,
+) -> Result<(&serde_json::Value, &serde_json::Value), ProviderFailure> {
+    const KIND: &str = "bridge-event-handoff";
+    if receipt.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || receipt.get("kind").and_then(serde_json::Value::as_str) != Some(KIND)
+        || receipt.get("status").and_then(serde_json::Value::as_str) != Some("committed")
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: malformed handoff mutation receipt identity",
+        ));
+    }
+    let request = receipt.get("request").ok_or_else(|| {
+        event_shape_failure("reconciliation refused: handoff receipt omitted its request")
+    })?;
+    let outcome = receipt.get("outcome").ok_or_else(|| {
+        event_shape_failure("reconciliation refused: handoff receipt omitted its outcome")
+    })?;
+    let request_sha = checked_json_digest(request)?;
+    if receipt
+        .get("request_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(request_sha.as_str())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff receipt request digest mismatch",
+        ));
+    }
+    let operation_material = serde_json::json!({
+        "kind": KIND,
+        "request_sha256": request_sha,
+    });
+    let operation_sha = checked_json_digest(&operation_material)?;
+    let operation_id = format!("{KIND}:operation:{operation_sha}");
+    if receipt
+        .get("operation_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(operation_sha.as_str())
+        || receipt
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id.as_str())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff receipt operation digest mismatch",
+        ));
+    }
+    let outcome_sha = checked_json_digest(outcome)?;
+    if receipt
+        .get("outcome_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(outcome_sha.as_str())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff receipt outcome digest mismatch",
+        ));
+    }
+    let receipt_material = serde_json::json!({
+        "operation_id": operation_id,
+        "outcome": outcome,
+    });
+    let receipt_sha = checked_json_digest(&receipt_material)?;
+    if receipt
+        .get("receipt_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(receipt_sha.as_str())
+        || receipt
+            .get("receipt_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(format!("{KIND}:receipt:{receipt_sha}").as_str())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff receipt commitment mismatch",
+        ));
+    }
+    Ok((request, outcome))
+}
+
+fn decode_handoff_maintenance_continuations(
+    value: &serde_json::Value,
+    reconciliation: &serde_json::Value,
+    stream_namespaces: &BTreeMap<String, String>,
+) -> Result<bool, ProviderFailure> {
+    let status = value
+        .get("handoff_maintenance_status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(event_transport_failure)?;
+    let maintenance = reconciliation
+        .get("handoff_maintenance")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(event_transport_failure)?;
+    if status == "not_run" {
+        if maintenance.is_empty() {
+            return Ok(false);
+        }
+        return Err(event_shape_failure(
+            "reconciliation refused: skipped owner maintenance carried results",
+        ));
+    }
+    if status != "known" {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner maintenance status is not final",
+        ));
+    }
+    let mut summary = None;
+    let mut inventory_namespaces = BTreeSet::new();
+    let mut stream_continuation = false;
+    for (index, item) in maintenance.iter().enumerate() {
+        let has_continuation = item.get("owner_maintenance_continuation").is_some();
+        let has_cursor_bytes = item.get("owner_maintenance_cursor_bytes").is_some();
+        if has_continuation || has_cursor_bytes {
+            if summary.is_some() || index + 1 != maintenance.len() {
+                return Err(event_shape_failure(
+                    "reconciliation refused: owner maintenance summary is duplicated or misplaced",
+                ));
+            }
+            summary = Some(item);
+            continue;
+        }
+        stream_continuation |= decode_handoff_stream_maintenance_continuation(
+            item,
+            stream_namespaces,
+            &mut inventory_namespaces,
+        )?;
+    }
+    let summary = summary.ok_or_else(|| {
+        event_shape_failure("reconciliation refused: owner maintenance summary is absent")
+    })?;
+    let owner_continuation = decode_owner_maintenance_continuation(summary)?;
+    Ok(stream_continuation || owner_continuation)
+}
+
+fn decode_handoff_stream_maintenance_continuation(
+    item: &serde_json::Value,
+    stream_namespaces: &BTreeMap<String, String>,
+    inventory_namespaces: &mut BTreeSet<String>,
+) -> Result<bool, ProviderFailure> {
+    let namespace = recovery_digest(item, "namespace")?;
+    if item.get("stream_id").is_some() {
+        let stream_id = recovery_identity(item, "stream_id")?;
+        if stream_namespaces.get(&stream_id) != Some(&namespace) {
+            return Err(event_shape_failure(
+                "reconciliation refused: maintenance namespace/stream is outside the offered or recovered owner context",
+            ));
+        }
+    } else if !inventory_namespaces.insert(namespace) {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner inventory maintenance repeated a namespace",
+        ));
+    }
+    if item
+        .get("retired")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+        || item
+            .get("terminalized")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        || item
+            .get("repaired")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        || item
+            .get("handoff_scan_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: per-stream maintenance result is incomplete",
+        ));
+    }
+    let retirement_continuation = item
+        .get("retirement_continuation")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(event_transport_failure)?;
+    let repair_continuation = item
+        .get("repair_continuation")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(event_transport_failure)?;
+    if (retirement_continuation || repair_continuation)
+        && item
+            .get("handoff_scan_bytes")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream continuation has no persisted scan cursor",
+        ));
+    }
+    Ok(retirement_continuation || repair_continuation)
+}
+
+fn decode_owner_maintenance_continuation(
+    summary: &serde_json::Value,
+) -> Result<bool, ProviderFailure> {
+    if summary.as_object().is_none_or(|object| {
+        object.len() != 2
+            || !object.contains_key("owner_maintenance_continuation")
+            || !object.contains_key("owner_maintenance_cursor_bytes")
+    }) {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner maintenance summary has an unsupported shape",
+        ));
+    }
+    let owner_continuation = summary
+        .get("owner_maintenance_continuation")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(event_transport_failure)?;
+    let cursor_bytes = summary
+        .get("owner_maintenance_cursor_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(event_transport_failure)?;
+    if owner_continuation && cursor_bytes == 0 {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner continuation has no persisted cursor",
+        ));
+    }
+    Ok(owner_continuation)
+}
+
+fn decode_handoff_reconcile_continuation(
+    value: &serde_json::Value,
+    frontiers: &[ReconciliationConsumedFrontier],
+    reconcile_key: &str,
+) -> Result<(bool, BTreeMap<String, String>), ProviderFailure> {
+    let status = value
+        .get("handoff_reconciliation_status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(event_transport_failure)?;
+    let receipts = value
+        .get("handoff_receipts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(event_transport_failure)?;
+    let mut expected = BTreeMap::new();
+    for frontier in frontiers {
+        if expected
+            .insert(frontier.stream_id().to_owned(), frontier.sequence())
+            .is_some()
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: duplicate locally offered handoff frontier",
+            ));
+        }
+    }
+    if status == "not_run" {
+        if receipts.is_empty() && expected.is_empty() {
+            return Ok((false, BTreeMap::new()));
+        }
+        return Err(event_shape_failure(
+            "reconciliation refused: skipped handoff reconcile carried receipts",
+        ));
+    }
+    if status != "known" || receipts.len() != expected.len() {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff receipt set does not match the offered frontiers",
+        ));
+    }
+    let mut continuation = false;
+    let mut namespaces = BTreeMap::new();
+    for receipt in receipts {
+        let (stream_id, namespace, has_more) =
+            decode_handoff_mutation_continuation(receipt, &mut expected, reconcile_key)?;
+        if namespaces.insert(stream_id, namespace).is_some() {
+            return Err(event_shape_failure(
+                "reconciliation refused: duplicate stream in handoff receipts",
+            ));
+        }
+        continuation |= has_more;
+    }
+    if !expected.is_empty() {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff continuation omitted an offered frontier",
+        ));
+    }
+    Ok((continuation, namespaces))
+}
+
+fn decode_handoff_mutation_continuation(
+    receipt: &serde_json::Value,
+    expected: &mut BTreeMap<String, u64>,
+    reconcile_key: &str,
+) -> Result<(String, String, bool), ProviderFailure> {
+    let (request, outcome) = validate_handoff_mutation_receipt(receipt)?;
+    let stream_id = request
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(event_transport_failure)?;
+    let sequence = request
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(event_transport_failure)?;
+    if expected.remove(stream_id) != Some(sequence)
+        || request
+            .get("reconcile_key")
+            .and_then(serde_json::Value::as_str)
+            != Some(reconcile_key)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff receipt is not bound to the exact offered frontier",
+        ));
+    }
+    let namespace = request
+        .get("namespace")
+        .and_then(serde_json::Value::as_str)
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or_else(event_transport_failure)?;
+    if outcome.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace)
+        || outcome
+            .get("acked_sequence")
+            .and_then(serde_json::Value::as_u64)
+            != Some(sequence)
+        || outcome
+            .get("reconciled")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: handoff outcome is not bound to its committed request",
+        ));
+    }
+    let scan_bytes = outcome
+        .get("handoff_scan_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(event_transport_failure)?;
+    let has_more = outcome
+        .get("reconcile_continuation")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(event_transport_failure)?;
+    let after = outcome
+        .get("reconcile_after_sequence")
+        .ok_or_else(event_transport_failure)?;
+    if has_more {
+        if after
+            .as_u64()
+            .is_none_or(|after| after == 0 || after > sequence)
+            || scan_bytes == 0
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: handoff continuation cursor is outside its exact frontier",
+            ));
+        }
+    } else if !after.is_null() {
+        return Err(event_shape_failure(
+            "reconciliation refused: completed handoff scan retained a cursor",
+        ));
+    }
+    Ok((stream_id.to_owned(), namespace.to_owned(), has_more))
+}
+
+fn decode_reconciliation_stream_namespaces(
+    reconciliation: &serde_json::Value,
+) -> Result<BTreeMap<String, String>, ProviderFailure> {
+    let streams = reconciliation
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(event_transport_failure)?;
+    let mut namespaces = BTreeMap::new();
+    for stream in streams {
+        let stream_id = recovery_identity(stream, "stream_id")?;
+        let namespace = recovery_digest(stream, "owner_namespace")?;
+        if namespaces.insert(stream_id, namespace).is_some() {
+            return Err(event_shape_failure(
+                "reconciliation refused: duplicate stream in maintenance owner context",
+            ));
+        }
+    }
+    Ok(namespaces)
+}
+
+fn decode_reconcile_maintenance_continuation(
+    value: &serde_json::Value,
+    frontiers: &[ReconciliationConsumedFrontier],
+    window_status: RecoveryWindowStatus,
+) -> Result<bool, ProviderFailure> {
+    let reconciliation = value
+        .get("reconciliation")
+        .ok_or_else(event_transport_failure)?;
+    let reconcile_key = verify_reconcile_key(reconciliation)?;
+    let (handoff, receipt_namespaces) =
+        decode_handoff_reconcile_continuation(value, frontiers, &reconcile_key)?;
+    let mut stream_namespaces = decode_reconciliation_stream_namespaces(reconciliation)?;
+    for (stream_id, namespace) in receipt_namespaces {
+        if stream_namespaces
+            .insert(stream_id, namespace.clone())
+            .is_some_and(|recovered| recovered != namespace)
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: offered receipt and recovered stream name different owners",
+            ));
+        }
+    }
+    let owner =
+        decode_handoff_maintenance_continuations(value, reconciliation, &stream_namespaces)?;
+    let pending = handoff || owner;
+    if pending && window_status != RecoveryWindowStatus::Active {
+        return Err(event_shape_failure(
+            "reconciliation refused: non-active window carried live maintenance continuation",
+        ));
+    }
+    Ok(pending)
+}
+
 /// Decodes the stream enumeration of one owner answer within the
 /// negotiated stream budget. It remains pure with respect to the bridge
 /// forwarding cache: owner ack bases are committed only after the core has
@@ -3191,44 +3660,21 @@ impl KernelMcpForwardingPort {
         offer.disposition = disposition;
     }
 
-    /// Retains the exact Kernel mutation receipt when its acknowledgement
-    /// committed. The receipt may resolve the offered ack frontier, but it
-    /// never supplies read facts, cursor proofs, or a read commitment.
+    /// Retains the exact Kernel mutation receipt as evidence while the
+    /// separate read or bounded handoff work remains unresolved. It never
+    /// supplies read facts, cursor proofs, or a read commitment.
     fn retain_acknowledgement_read_unknown(
         &mut self,
         value: &serde_json::Value,
     ) -> Result<(), ProviderFailure> {
-        if value
-            .get("reconciliation_status")
-            .and_then(serde_json::Value::as_str)
-            != Some("unknown")
-            || value
-                .get("handoff_reconciliation_status")
-                .and_then(serde_json::Value::as_str)
-                != Some("not_run")
-            || value
-                .get("handoff_maintenance_status")
-                .and_then(serde_json::Value::as_str)
-                != Some("not_run")
-            || !value
-                .get("reconciliation")
-                .is_some_and(serde_json::Value::is_null)
-            || !value
-                .get("handoff_receipts")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(Vec::is_empty)
-        {
-            return Err(event_shape_failure(
-                "reconciliation refused: unknown owner read carried read or handoff facts",
-            ));
-        }
-        self.retain_acknowledgement_receipt(value, true)
+        validate_acknowledgement_read_unknown(value)?;
+        self.retain_acknowledgement_receipt_evidence(value, true)
     }
 
-    /// Preserves a committed acknowledgement receipt independently from the
-    /// owner read and handoff mutation outcomes. `required` is true only for
-    /// the Kernel's ack-committed/read-unknown envelope.
-    fn retain_acknowledgement_receipt(
+    /// Retains a committed acknowledgement receipt as evidence while the
+    /// separate read or bounded handoff work remains unresolved. This does
+    /// not advance local acknowledgement bases or resolve the offer.
+    fn retain_acknowledgement_receipt_evidence(
         &mut self,
         value: &serde_json::Value,
         required: bool,
@@ -3262,7 +3708,91 @@ impl KernelMcpForwardingPort {
                 "reconciliation refused: acknowledgement receipt does not match transport custody",
             ));
         }
-        let acknowledged = validate_acknowledgement_receipt(receipt, offer)?;
+        validate_acknowledgement_receipt(receipt, offer)?;
+        if offer
+            .stream_identities
+            .iter()
+            .any(|(stream_id, identity)| owner.owner_identity.get(stream_id) != Some(identity))
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: acknowledgement receipt is exact for a predecessor owner identity that is no longer adopted",
+            ));
+        }
+        if let Some(previous) = &offer.acknowledgement_receipt {
+            validate_acknowledgement_receipt(previous, offer)?;
+            if !acknowledgement_receipts_share_request(previous, receipt) {
+                return Err(event_shape_failure(
+                    "reconciliation refused: committed acknowledgement request changed while its consumed offer remains unresolved",
+                ));
+            }
+        }
+        let retained_offer = owner.consumed_offer.as_mut().ok_or_else(|| {
+                event_shape_failure(
+                    "reconciliation refused: retained consumed offer disappeared during receipt validation",
+                )
+            })?;
+        if retained_offer.acknowledgement_receipt.is_none() {
+            retained_offer.acknowledgement_receipt = Some(receipt.clone());
+        }
+        Ok(())
+    }
+
+    /// Promotes a previously validated acknowledgement receipt into local
+    /// acknowledgement bases after the complete response has been validated.
+    /// A saved receipt is usable when the final retry omits it.
+    fn retain_acknowledgement_receipt(
+        &mut self,
+        value: &serde_json::Value,
+        required: bool,
+    ) -> Result<(), ProviderFailure> {
+        let mut receipt = value
+            .get("acknowledgement")
+            .filter(|receipt| !receipt.is_null())
+            .cloned();
+        if receipt.is_none() {
+            receipt = self
+                .shared
+                .try_borrow()
+                .map_err(|_| local_state_failure())?
+                .consumed_offer
+                .as_ref()
+                .and_then(|offer| offer.acknowledgement_receipt.clone());
+        }
+        let Some(receipt) = receipt else {
+            if required {
+                return Err(event_shape_failure(
+                    "reconciliation refused: unknown owner read omitted its committed acknowledgement receipt",
+                ));
+            }
+            return Ok(());
+        };
+        let mut owner = self
+            .shared
+            .try_borrow_mut()
+            .map_err(|_| local_state_failure())?;
+        let owner = &mut *owner;
+        let offer = owner.consumed_offer.as_ref().ok_or_else(|| {
+            event_shape_failure(
+                "reconciliation refused: acknowledgement receipt has no retained consumed offer",
+            )
+        })?;
+        if !matches!(
+            offer.disposition,
+            ConsumedOfferDisposition::HandedToTransport
+        ) {
+            return Err(event_shape_failure(
+                "reconciliation refused: acknowledgement receipt does not match transport custody",
+            ));
+        }
+        let acknowledged = validate_acknowledgement_receipt(&receipt, offer)?;
+        if let Some(previous) = &offer.acknowledgement_receipt {
+            validate_acknowledgement_receipt(previous, offer)?;
+            if !acknowledgement_receipts_share_request(previous, &receipt) {
+                return Err(event_shape_failure(
+                    "reconciliation refused: committed acknowledgement request changed while its consumed offer remains unresolved",
+                ));
+            }
+        }
         if offer
             .stream_identities
             .iter()
@@ -3277,7 +3807,7 @@ impl KernelMcpForwardingPort {
         let stream_identities = offer.stream_identities.clone();
         let mut owner_acked = owner.owner_acked.clone();
         let mut delivered_sequences = owner.delivered_sequences.clone();
-        let acknowledgement_receipt = receipt.clone();
+        let acknowledgement_receipt = receipt;
         for (stream_id, acked_cursor) in acknowledged {
             let confirmed_cursor = owner_acked
                 .get(&stream_id)
@@ -3394,10 +3924,17 @@ impl KernelMcpForwardingPort {
             }) {
             Ok(status) => status,
             Err(error) => {
+                let receipt_check = self.retain_acknowledgement_receipt_evidence(value, false);
                 self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                receipt_check?;
                 return Err(error);
             }
         };
+        let receipt_check = self.retain_acknowledgement_receipt_evidence(value, false);
+        if let Err(error) = receipt_check {
+            self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+            return Err(error);
+        }
         if window_status != RecoveryWindowStatus::Active
             && value
                 .get("acknowledgement")
@@ -3409,6 +3946,141 @@ impl KernelMcpForwardingPort {
             ));
         }
         Ok(window_status)
+    }
+
+    fn reject_unknown_reconciliation_outcome(
+        &mut self,
+        value: &serde_json::Value,
+        preserve_offer: bool,
+    ) -> Result<(), ProviderFailure> {
+        if value
+            .get("reconciliation_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown")
+        {
+            if preserve_offer {
+                if let Err(error) = validate_acknowledgement_read_unknown(value) {
+                    self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                    return Err(error);
+                }
+                if let Err(error) = self.retain_acknowledgement_receipt_evidence(value, true) {
+                    self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                    return Err(error);
+                }
+                return Err(ProviderFailure::new(
+                    "eliot-kernel-front-door",
+                    "bounded follow-up owner read is unknown; no page was imported and the exact consumed frontier remains retained for reconciliation",
+                ));
+            }
+            return match self.retain_acknowledgement_read_unknown(value) {
+                Ok(()) => Err(ProviderFailure::new(
+                    "eliot-kernel-front-door",
+                    "owner acknowledgement committed with an exact receipt, but the follow-up read is unknown; no read facts or page commitment were returned, and the same offer remains retained for reconciliation",
+                )),
+                Err(error) => {
+                    self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                    Err(error)
+                }
+            };
+        }
+        match has_unresolved_handoff_mutation(value) {
+            Ok(true) => match self.retain_acknowledgement_receipt_evidence(value, false) {
+                Ok(()) if preserve_offer => Err(ProviderFailure::new(
+                    "eliot-kernel-front-door",
+                    "bounded follow-up has unresolved handoff mutation status; no page was imported and the exact consumed frontier remains retained for reconciliation",
+                )),
+                Ok(()) => Err(ProviderFailure::new(
+                    "eliot-kernel-front-door",
+                    "owner read facts may be valid, but a handoff mutation outcome is unknown; its read page was not imported, no handoff completion was reported, and the next reconcile must recover the unresolved mutation",
+                )),
+                Err(error) => {
+                    self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                    Err(error)
+                }
+            },
+            Ok(false) => Ok(()),
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                Err(error)
+            }
+        }
+    }
+
+    fn reconcile_external_attempt(
+        &mut self,
+        binding: &AttachBinding,
+        facts: &BridgeEventTransportFacts,
+        consumed: &[serde_json::Value],
+        consumed_frontiers: &[ReconciliationConsumedFrontier],
+        correlation: &str,
+        preserve_offer_on_unknown: bool,
+    ) -> Result<ReconciliationAttempt, ProviderFailure> {
+        let now_ms = bridge_event_unix_ms()?;
+        let frame = bridge_event_frame_for_operation(
+            correlation,
+            facts,
+            serde_json::json!({
+                "operation": BridgeEventMethod::Reconcile.kernel_operation(),
+                "consumed": consumed,
+            }),
+            now_ms,
+        )?;
+        let reply = match self.exchange(&frame) {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        self.mark_consumed_offer_disposition(ConsumedOfferDisposition::HandedToTransport);
+        let value = match decode_bridge_event_reply(&reply, &frame) {
+            Ok(value) => value,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        self.reject_unknown_reconciliation_outcome(&value, preserve_offer_on_unknown)?;
+        let window_status = self.validate_reconciliation_window_response(&value)?;
+        let outcome = match decode_reconciliation_outcome(
+            binding,
+            facts,
+            &value,
+            consumed_frontiers.to_vec(),
+            None,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        let continuation_pending = match decode_reconcile_maintenance_continuation(
+            &value,
+            consumed_frontiers,
+            window_status,
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        if continuation_pending
+            && (window_status != RecoveryWindowStatus::Active
+                || !matches!(&outcome, ReconciliationPortOutcome::Reconciled(_)))
+        {
+            self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+            return Err(event_shape_failure(
+                "reconciliation refused: unresolved maintenance has no active reconciled page",
+            ));
+        }
+        Ok(ReconciliationAttempt {
+            value,
+            outcome,
+            window_status,
+            continuation_pending,
+        })
     }
 }
 
@@ -3568,87 +4240,52 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                  activate before event delivery",
             ));
         }
-        let now_ms = bridge_event_unix_ms()?;
         let (consumed, consumed_frontiers) = self.prepare_consumed_offer(
             facts.connection_id.as_str(),
             binding.activation_generation().get(),
         )?;
         let correlation = format!("bridge-reconcile:{}", facts.connection_id);
-        let frame = bridge_event_frame_for_operation(
-            &correlation,
+        let first = self.reconcile_external_attempt(
+            binding,
             &facts,
-            serde_json::json!({
-                "operation": BridgeEventMethod::Reconcile.kernel_operation(),
-                "consumed": consumed,
-            }),
-            now_ms,
+            &consumed,
+            &consumed_frontiers,
+            &correlation,
+            false,
         )?;
-        let reply = match self.exchange(&frame) {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
-                return Err(error);
-            }
-        };
-        self.mark_consumed_offer_disposition(ConsumedOfferDisposition::HandedToTransport);
-        let value = match decode_bridge_event_reply(&reply, &frame) {
-            Ok(value) => value,
-            Err(error) => {
-                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
-                return Err(error);
-            }
-        };
-        if value
-            .get("reconciliation_status")
-            .and_then(serde_json::Value::as_str)
-            == Some("unknown")
-        {
-            return match self.retain_acknowledgement_read_unknown(&value) {
-                Ok(()) => Err(ProviderFailure::new(
+        let final_attempt = if first.continuation_pending {
+            let followup_correlation = format!("{correlation}:maintenance:1");
+            let followup = self.reconcile_external_attempt(
+                binding,
+                &facts,
+                &consumed,
+                &consumed_frontiers,
+                &followup_correlation,
+                true,
+            )?;
+            if followup.window_status != RecoveryWindowStatus::Active {
+                return Err(ProviderFailure::new(
                     "eliot-kernel-front-door",
-                    "owner acknowledgement committed with an exact receipt, but the follow-up read is unknown; no read facts or page commitment were returned, and the same offer remains retained for reconciliation",
-                )),
-                Err(error) => {
-                    self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
-                    Err(error)
-                }
-            };
-        }
-        let window_status = self.validate_reconciliation_window_response(&value)?;
-        match has_unresolved_handoff_mutation(&value) {
-            Ok(true) => {
-                return match self.retain_acknowledgement_receipt(&value, false) {
-                    Ok(()) => Err(ProviderFailure::new(
-                        "eliot-kernel-front-door",
-                        "owner read facts may be valid, but a handoff mutation outcome is unknown; its read page was not imported, no handoff completion was reported, and the next reconcile must recover the unresolved mutation",
-                    )),
-                    Err(error) => {
-                        self.mark_consumed_offer_disposition(
-                            ConsumedOfferDisposition::OutcomeUnknown,
-                        );
-                        Err(error)
-                    }
-                };
+                    "bounded maintenance follow-up returned a moved or expired window; no page was imported and the exact consumed frontier remains retained for reconciliation",
+                ));
             }
-            Ok(false) => {}
-            Err(error) => {
-                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
-                return Err(error);
+            if followup.continuation_pending {
+                return Err(ProviderFailure::new(
+                    "eliot-kernel-front-door",
+                    "bounded owner maintenance remains partial after one follow-up; no page was imported and the exact consumed frontier remains retained for the next reconciliation",
+                ));
             }
-        }
-        if window_status == RecoveryWindowStatus::Active
-            && let Err(error) = self.retain_acknowledgement_receipt(&value, false)
+            followup
+        } else {
+            first
+        };
+        if final_attempt.window_status == RecoveryWindowStatus::Active
+            && let Err(error) = self.retain_acknowledgement_receipt(&final_attempt.value, false)
         {
             self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
             return Err(error);
         }
-        match decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, None) {
-            Ok(outcome) => Ok(outcome),
-            Err(error) => {
-                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
-                Err(error)
-            }
-        }
+        Ok(final_attempt.outcome)
     }
     /// Reads one bounded recovery page inside the declared window through
     /// the real reconcile route (issue #2732).
