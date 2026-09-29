@@ -3,6 +3,11 @@
 //! This module accepts owner-projected observations and policy bounds. It does
 //! not read stores, infer intent, accumulate durable state, or authorize an
 //! effect. Missing source projections remain explicit `NoSignal` outcomes.
+//!
+//! Prose bar: no output of this module - signal, Diagnostic Brief, or analysis
+//! request - may delete memory, alter a policy, or terminate work. An attempt to
+//! derive such an effect is refused by [`ProhibitedEffectAttempt::deny`], which
+//! is the only exit from an effect attempt and admits no class.
 
 use crate::signals::{
     AcknowledgementFact, CoverageRef, EvidenceRef, ExpectedRevision, ObservedTime, ProfileRevision,
@@ -80,6 +85,103 @@ pub enum HealthDetection<T> {
     Detected(T),
     /// Available evidence does not prove an applicable delta.
     NoSignal(HealthNoSignalReason),
+}
+
+/// Output families a caller may try to derive from a health evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthOutputFamily {
+    /// The evidence-only `Signal` emitted by one detector rule.
+    Signal,
+    /// A Diagnostic Brief compiled from persistent or cross-cutting drift.
+    DiagnosticBrief,
+    /// A bounded Dreamer/Watchdog-Agent analysis request.
+    AnalysisRequest,
+}
+
+/// Effect classes the I08-18 prose bar forbids on every health output.
+///
+/// A health output is an observed delta. It carries no authority to delete
+/// memory, alter a policy, or terminate work, so no effect of these classes can
+/// be derived from one - see [`ProhibitedEffectAttempt::deny`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProhibitedEffectClass {
+    /// Deleting or purging a memory record.
+    MemoryDelete,
+    /// Altering an active policy, bound, or authority revision.
+    PolicyAlter,
+    /// Terminating work the health output does not own.
+    WorkTerminate,
+}
+
+/// An attempt to execute one forbidden effect on the authority of a health output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProhibitedEffectAttempt {
+    /// Output family the caller cites as justification.
+    pub output: HealthOutputFamily,
+    /// Effect class the caller asks to execute.
+    pub class: ProhibitedEffectClass,
+    /// Signal identity the caller cites.
+    pub signal_id: SignalId,
+    /// Exact subject the caller wants the effect applied to.
+    pub subject: String,
+}
+
+/// Fail-closed outcome: the attempt is refused and nothing is executed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProhibitedEffectDenial {
+    /// Output family that was cited.
+    pub output: HealthOutputFamily,
+    /// Effect class that was refused.
+    pub class: ProhibitedEffectClass,
+    /// Signal identity that was cited.
+    pub signal_id: SignalId,
+    /// Subject that remains untouched.
+    pub subject: String,
+    /// Why the cited output carries no authority for this class.
+    pub reason: &'static str,
+}
+
+impl ProhibitedEffectAttempt {
+    /// Builds the attempt from the signal the caller actually holds.
+    ///
+    /// The signal identity is read from the immutable revision, so the attempt
+    /// is anchored to the output it cites rather than to a restated name.
+    #[must_use]
+    pub fn for_signal(
+        output: HealthOutputFamily,
+        class: ProhibitedEffectClass,
+        signal: &Signal,
+        subject: String,
+    ) -> Self {
+        Self {
+            output,
+            class,
+            signal_id: signal.revision().signal_id.clone(),
+            subject,
+        }
+    }
+
+    /// Refuses the attempt.
+    ///
+    /// This is the only exit from an effect attempt against a health output:
+    /// there is no branch that admits a memory delete, a policy change, or a
+    /// work termination, and the denial names the subject that stayed
+    /// untouched. Each forbidden class states its own reason, so admitting a
+    /// new class later would require a new arm here.
+    #[must_use]
+    pub fn deny(&self) -> ProhibitedEffectDenial {
+        ProhibitedEffectDenial {
+            output: self.output,
+            class: self.class,
+            signal_id: self.signal_id.clone(),
+            subject: self.subject.clone(),
+            reason: match self.class {
+                ProhibitedEffectClass::MemoryDelete => "health_output_cannot_delete_memory",
+                ProhibitedEffectClass::PolicyAlter => "health_output_cannot_alter_policy",
+                ProhibitedEffectClass::WorkTerminate => "health_output_cannot_terminate_work",
+            },
+        }
+    }
 }
 
 /// Before and after values copied from one owner projection.
