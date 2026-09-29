@@ -73,6 +73,8 @@ pub enum CliError {
     MissingExperimentalComponent,
     /// An experimental component was supplied without its world selection.
     MissingExperimentalWorld,
+    /// A governed component was supplied without its world selection.
+    MissingGovernedWorld,
     /// The experimental world spelling is not a frozen typed world.
     UnknownWorld(String),
 }
@@ -88,6 +90,7 @@ impl fmt::Display for CliError {
                 formatter.write_str("MISSING_EXPERIMENTAL_COMPONENT")
             }
             Self::MissingExperimentalWorld => formatter.write_str("MISSING_EXPERIMENTAL_WORLD"),
+            Self::MissingGovernedWorld => formatter.write_str("MISSING_GOVERNED_WORLD"),
             Self::UnknownWorld(_) => formatter.write_str("UNKNOWN_WORLD"),
         }
     }
@@ -116,7 +119,13 @@ pub struct CliConfig {
     pub transport: Transport,
     /// Explicit bounded local artifact for the non-governed experimental path.
     pub experimental_typed_component: Option<std::path::PathBuf>,
-    /// Explicit frozen world selection for the experimental path.
+    /// Explicit bounded local artifact for a governed typed attempt. The
+    /// governed lane binds no Kernel admission channel, so this selection is
+    /// denied with the typed admission denial before compilation or
+    /// instantiation and never falls back to the experimental path.
+    pub governed_typed_component: Option<std::path::PathBuf>,
+    /// Explicit frozen world selection for an explicit typed lane (the
+    /// experimental path or a governed attempt).
     pub experimental_world: Option<String>,
     /// One-shot P03-admitted guest execution: run the artifact's `run`
     /// export over the input bytes inside this process and emit raw output
@@ -160,6 +169,7 @@ where
     let mut profile = None;
     let mut transport = Transport::Stdio;
     let mut experimental_typed_component: Option<std::path::PathBuf> = None;
+    let mut governed_typed_component: Option<std::path::PathBuf> = None;
     let mut experimental_world: Option<String> = None;
     let mut guest_exec = false;
     let mut guest_artifact: Option<std::path::PathBuf> = None;
@@ -229,6 +239,30 @@ where
                     ));
                 }
                 experimental_typed_component = Some(std::path::PathBuf::from(value));
+                index += 1;
+            }
+            "--governed-typed-component" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument(
+                        "--governed-typed-component requires a value".to_owned(),
+                    )
+                })?;
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--governed-typed-component requires a value".to_owned(),
+                    ));
+                }
+                governed_typed_component = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            value if value.starts_with("--governed-typed-component=") => {
+                let value = value.trim_start_matches("--governed-typed-component=");
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--governed-typed-component= requires a value".to_owned(),
+                    ));
+                }
+                governed_typed_component = Some(std::path::PathBuf::from(value));
                 index += 1;
             }
             "--world" => {
@@ -343,6 +377,16 @@ where
         }
         (None, None) => {}
     }
+    if governed_typed_component.is_some() {
+        match &experimental_world {
+            None => return Err(CliError::MissingGovernedWorld),
+            Some(world) => {
+                if crate::typed_bindings::TypedWorld::parse(world).is_none() {
+                    return Err(CliError::UnknownWorld(world.clone()));
+                }
+            }
+        }
+    }
     let guest_exec = if guest_exec {
         Some(GuestExecArgs {
             artifact: guest_artifact.ok_or_else(|| {
@@ -402,10 +446,21 @@ where
             "guest execution and typed experimental selection are mutually exclusive".to_owned(),
         ));
     }
+    if governed_typed_component.is_some() && experimental_typed_component.is_some() {
+        return Err(CliError::MalformedArgument(
+            "governed and experimental typed selections are mutually exclusive".to_owned(),
+        ));
+    }
+    if guest_exec.is_some() && governed_typed_component.is_some() {
+        return Err(CliError::MalformedArgument(
+            "guest execution and governed typed selection are mutually exclusive".to_owned(),
+        ));
+    }
     Ok(CliConfig {
         profile: profile.ok_or(CliError::MissingProfile)?,
         transport,
         experimental_typed_component,
+        governed_typed_component,
         experimental_world,
         guest_exec,
     })

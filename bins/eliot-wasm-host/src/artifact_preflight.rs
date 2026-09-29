@@ -49,6 +49,10 @@ pub enum PreflightError {
     CoreModuleRejected,
     /// Local file could not be read (kind string only, no path/secret).
     Unreadable(String),
+    /// Caller-supplied source names a remote, registry, or discovery
+    /// location (`://` authority marker), never an explicit bounded local
+    /// artifact or fixture.
+    ArbitraryPathDenied,
 }
 
 impl fmt::Display for PreflightError {
@@ -63,6 +67,7 @@ impl fmt::Display for PreflightError {
             Self::LengthChanged => formatter.write_str("PREFLIGHT_LENGTH_CHANGED"),
             Self::MalformedPreamble => formatter.write_str("PREFLIGHT_MALFORMED_PREAMBLE"),
             Self::CoreModuleRejected => formatter.write_str("PREFLIGHT_CORE_MODULE_REJECTED"),
+            Self::ArbitraryPathDenied => formatter.write_str("PREFLIGHT_ARBITRARY_PATH_DENIED"),
             Self::Unreadable(kind) => write!(formatter, "PREFLIGHT_UNREADABLE:{kind}"),
         }
     }
@@ -101,7 +106,9 @@ pub fn preflight_bytes(bytes: &[u8]) -> Result<Preflight, PreflightError> {
 /// Reads one explicit local artifact path once into a bounded buffer.
 /// No environment, registry, discovery, URL, or credential lookup.
 /// The returned bytes and [`Preflight`] digest describe the same buffer.
+/// URL/authority-shaped sources are denied before any filesystem access.
 pub fn read_bounded_artifact(path: &Path) -> Result<(Vec<u8>, Preflight), PreflightError> {
+    reject_remote_artifact_source(path)?;
     let path = absolute_artifact_path(path)?;
     reject_reparse_components(&path)?;
     let file = open_artifact_file(&path)
@@ -149,6 +156,18 @@ pub fn read_bounded_artifact(path: &Path) -> Result<(Vec<u8>, Preflight), Prefli
     }
     let preflight = preflight_bytes(&bytes)?;
     Ok((bytes, preflight))
+}
+
+/// Rejects URL/authority-shaped sources before any filesystem access. Only
+/// an explicit bounded local artifact is admitted on either mode; a remote,
+/// registry, or discovery locator is never a local file. Single-colon
+/// Windows drive and UNC spellings carry no `://` authority marker and are
+/// unaffected.
+fn reject_remote_artifact_source(path: &Path) -> Result<(), PreflightError> {
+    if path.as_os_str().to_string_lossy().contains("://") {
+        return Err(PreflightError::ArbitraryPathDenied);
+    }
+    Ok(())
 }
 
 fn absolute_artifact_path(path: &Path) -> Result<PathBuf, PreflightError> {
