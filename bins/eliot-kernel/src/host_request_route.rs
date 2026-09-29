@@ -233,15 +233,6 @@ const BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED: &str = "rejected";
 /// against the constant this module really enforces rather than a second copy.
 pub(super) const MAX_QUEUED_LOCAL_READS: usize = 64;
 
-/// The retained queued local-read bound, as the hot spine's registration sees
-/// it.
-///
-/// I12.14 binds the checked-in declaration against the bound this route
-/// actually enforces, so the running-build side reads it from here rather than
-/// from the declaration. A declaration that names a different item bound fails
-/// the bind instead of being enforced as written.
-pub(crate) const KERNEL_HOT_PATH_MAX_QUEUED_LOCAL_READS: u64 = MAX_QUEUED_LOCAL_READS as u64;
-
 /// Returns whether the operation string selects the P-04 host-request route.
 ///
 /// The closed agent-bridge event-delivery entries ride this same predicate:

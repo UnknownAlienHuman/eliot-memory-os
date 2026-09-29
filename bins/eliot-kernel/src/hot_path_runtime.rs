@@ -37,6 +37,7 @@ use eliot_runtime_contracts::{
     hot_path_bound_status,
 };
 
+use super::{IpcImplementation, host_request_route::MAX_QUEUED_LOCAL_READS};
 use crate::KernelComposition;
 
 /// The service identity this composition registers its own hot operations
@@ -423,15 +424,17 @@ impl KernelHotSpine {
 /// operations, from the settings the real owners enforce.
 ///
 /// The values are the owners', not the declaration's: the frame and queue byte
-/// limits come from the front door's own transport limits, and the retained
-/// queued local-read count comes from the host-request route's own bound. The
+/// limits come from the front door's own transport registered accessors, and
+/// the retained queued local-read count comes from the host-request route's own
+/// bound. Both are read through the owners themselves rather than through a
+/// second copy of the number, so the running build is the authoritative side of
+/// the comparison and cannot drift from what the process really enforces. The
 /// declaration is compared against these, so a declaration that drifts from the
 /// running build is refused rather than silently enforced.
-pub(crate) fn kernel_running_build_registration(
-    max_frame_bytes: u64,
-    queue_bytes: u64,
-    max_queued_local_reads: u64,
-) -> RunningBuildRegistration {
+pub(crate) fn kernel_running_build_registration() -> RunningBuildRegistration {
+    let queued_items = MAX_QUEUED_LOCAL_READS as u64;
+    let frame_bytes = IpcImplementation::registered_frame_bytes() as u64;
+    let queue_bytes = IpcImplementation::registered_queue_bytes() as u64;
     RunningBuildRegistration {
         service: KERNEL_HOT_PATH_SERVICE.to_owned(),
         operations: vec![
@@ -439,7 +442,7 @@ pub(crate) fn kernel_running_build_registration(
                 operation: LOCAL_READ_CLAIM_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
                     queue_id: HotPathQueueId::Claim.as_str().to_owned(),
-                    max_items: max_queued_local_reads,
+                    max_items: queued_items,
                     max_bytes: queue_bytes,
                 },
             },
@@ -447,16 +450,16 @@ pub(crate) fn kernel_running_build_registration(
                 operation: LOCAL_READ_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
                     queue_id: HotPathQueueId::Read.as_str().to_owned(),
-                    max_items: max_queued_local_reads,
-                    max_bytes: max_frame_bytes,
+                    max_items: queued_items,
+                    max_bytes: frame_bytes,
                 },
             },
             RegisteredOperation {
                 operation: LOCAL_READ_RESULT_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
                     queue_id: HotPathQueueId::Result.as_str().to_owned(),
-                    max_items: max_queued_local_reads,
-                    max_bytes: max_frame_bytes,
+                    max_items: queued_items,
+                    max_bytes: frame_bytes,
                 },
             },
         ],
@@ -472,15 +475,7 @@ pub(crate) fn kernel_running_build_registration(
 /// that cannot bind its declaration advertises no validated hot path.
 #[cfg(windows)]
 pub(crate) fn bind_kernel_hot_spine() -> Option<KernelHotSpine> {
-    KernelHotSpine::bind(
-        DECLARED_MANIFEST_BYTES,
-        kernel_running_build_registration(
-            crate::front_door_session::KERNEL_HOT_PATH_MAX_FRAME_BYTES,
-            crate::front_door_session::KERNEL_HOT_PATH_QUEUE_BYTES,
-            crate::host_request_route::KERNEL_HOT_PATH_MAX_QUEUED_LOCAL_READS,
-        ),
-    )
-    .ok()
+    KernelHotSpine::bind(DECLARED_MANIFEST_BYTES, kernel_running_build_registration()).ok()
 }
 
 /// The service name the Kernel hot spine binds under, for diagnostics.

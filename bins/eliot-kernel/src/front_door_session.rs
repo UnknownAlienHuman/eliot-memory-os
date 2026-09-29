@@ -234,23 +234,6 @@ impl IpcImplementation {
     }
 }
 
-/// The transport limits this Kernel's front door actually enforces.
-///
-/// I12.14 binds the checked-in hot-path declaration against the settings the
-/// running process serves, so this exposes the front door's own limits as
-/// crate-visible constants. Both are read through the transport's own
-/// registered accessors, so the bind compares the declaration against the
-/// running build's real limits and these constants cannot drift away from
-/// them. The declaration is compared against these values, which is what makes
-/// a declaration that names a different frame or queue byte bound fail the
-/// bind rather than be silently accepted.
-pub(crate) const KERNEL_HOT_PATH_MAX_FRAME_BYTES: u64 =
-    IpcImplementation::registered_frame_bytes() as u64;
-
-/// The queued-byte budget this Kernel's front door actually enforces.
-pub(crate) const KERNEL_HOT_PATH_QUEUE_BYTES: u64 =
-    IpcImplementation::registered_queue_bytes() as u64;
-
 impl KernelComposition {
     /// Returns the selected local IPC name for diagnostics and ready output.
     ///
