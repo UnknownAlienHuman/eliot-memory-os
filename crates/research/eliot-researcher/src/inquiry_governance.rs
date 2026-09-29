@@ -4768,6 +4768,23 @@ pub struct InquiryGovernance {
     pub lane_discipline: LaneDisciplineOutcome,
     /// Terminal typed inquiry disposition.
     pub terminal: InquiryTerminalRecord,
+    /// The run-bound reference allowlist, re-proved and carried whole.
+    ///
+    /// Carried as the manifest itself, not only as the digest
+    /// `profile.reference_manifest_digest` publishes, because the published
+    /// digest is a claim while the manifest is the thing a reader needs in order
+    /// to **check** that claim. With only the digest on the record, the
+    /// `certified=` figure has nothing to re-derive the presented certificate
+    /// from and can only report the recorded status; with the manifest carried,
+    /// the same figure is re-derived from the run's own admission predicate and
+    /// an independent set of admitted records.
+    ///
+    /// I21.7: this is the allowlist, so a reference outside it is unsupported
+    /// text and can never become a citable source. It is re-proved here against
+    /// its own content through [`AllowedReferenceManifest::validate`] and bound
+    /// to the profile that published its digest, so a widened manifest cannot sit
+    /// beside a profile resolved under the narrower one.
+    pub run_reference_manifest: AllowedReferenceManifest,
     /// Governor-facing profile admission request.
     pub profile_admission_request: GovernorInquiryAdmissionRequest,
     /// Governor-facing source transition requests.
@@ -4885,6 +4902,7 @@ impl InquiryGovernance {
         let record = Self {
             inquiry_id: observation.inquiry_id,
             evidence_set_id: observation.evidence_set_id,
+            run_reference_manifest: observation.reference_manifest.clone(),
             profile_admission_request: profile.admission_request(),
             source_admission_requests: admissibility
                 .iter()
@@ -4946,6 +4964,7 @@ impl InquiryGovernance {
                 field: "inquiry.compilation_inputs",
             });
         }
+        self.validate_run_reference_manifest()?;
         if !self
             .profile
             .binds(&self.inquiry_id, &self.freeze.state_fence)
@@ -4988,16 +5007,80 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
-        // The Researcher half of the two-record pair a positive admitted source
-        // has to show is re-proved here rather than trusted: each
-        // Governor-facing request is an artefact that leaves this domain, and a
-        // request whose inquiry, evidence set, profile revision, source handle,
-        // source-record digest, eligibility, scope or fence was rewritten after
-        // it was built would otherwise be published beside a decision it no
-        // longer describes. The other half of the pair — the actual
-        // Governor/Kernel/Store commit receipt — is deliberately absent and this
-        // domain does not synthesize one; I21.1 puts the transition through the
-        // sole canonical writer.
+        self.validate_source_admission_requests()?;
+        for diagnostic in &self.unadmitted_references {
+            diagnostic.validate_integrity()?;
+            if diagnostic.inquiry_id != self.inquiry_id
+                || diagnostic.evidence_set_id != self.evidence_set_id
+                || diagnostic.state_fence != self.terminal.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.unadmitted_reference_binding",
+                });
+            }
+        }
+        for obligation in &self.obligations {
+            obligation.validate_integrity()?;
+        }
+        // I21.5: a recorded `VERIFIED` status is this domain's own verdict, and a
+        // verdict is only publishable if the certificate it names still re-derives
+        // from the run's own material. Two rosters are built and compared:
+        //
+        // - `recorded` is every obligation whose status this record claims is
+        //   `VERIFIED`;
+        // - `derived` is every obligation whose acceptance certificate, re-derived
+        //   from the carried manifest and the admitted source records for its own
+        //   `coverage_member`, is of the kind that obligation declares.
+        //
+        // They are built from different inputs on purpose: `recorded` reads the
+        // status field, `derived` never reads it. A writer that flipped a status
+        // to `VERIFIED` without holding a matching certificate makes `recorded`
+        // larger than `derived`; a writer that satisfied an obligation and then
+        // restated the status makes `derived` larger than `recorded`. Both are
+        // refused. Comparing one list against a restated copy of itself would
+        // prove nothing, which is why the two are produced separately.
+        let mut recorded: Vec<&str> = self
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.status == InquiryObligationStatus::Verified)
+            .map(|obligation| obligation.obligation_id.as_str())
+            .collect();
+        recorded.sort_unstable();
+        let mut derived = certified_obligations(
+            &self.run_reference_manifest,
+            &self.obligations,
+            &self.admissibility,
+        )?;
+        derived.sort_unstable();
+        if recorded != derived {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.certified_obligations",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves the Governor-facing source-admission requests this record
+    /// carries against the admissibility records it publishes beside them.
+    ///
+    /// The Researcher half of the two-record pair a positive admitted source
+    /// has to show is re-proved here rather than trusted: each
+    /// Governor-facing request is an artefact that leaves this domain, and a
+    /// request whose inquiry, evidence set, profile revision, source handle,
+    /// source-record digest, eligibility, scope or fence was rewritten after
+    /// it was built would otherwise be published beside a decision it no
+    /// longer describes. The other half of the pair - the actual
+    /// Governor/Kernel/Store commit receipt - is deliberately absent and this
+    /// domain does not synthesize one; I21.1 puts the transition through the
+    /// sole canonical writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity mismatch when the request count does not match the
+    /// admissibility record count, when a request no longer re-derives its own
+    /// digest, or when a request has been swapped for a well-formed request
+    /// about a different source, decision, evidence set or fence.
+    fn validate_source_admission_requests(&self) -> Result<(), InquiryError> {
         if self.source_admission_requests.len() != self.admissibility.len() {
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.source_admission_requests",
@@ -5026,19 +5109,43 @@ impl InquiryGovernance {
                 });
             }
         }
-        for diagnostic in &self.unadmitted_references {
-            diagnostic.validate_integrity()?;
-            if diagnostic.inquiry_id != self.inquiry_id
-                || diagnostic.evidence_set_id != self.evidence_set_id
-                || diagnostic.state_fence != self.terminal.state_fence
-            {
-                return Err(InquiryError::IntegrityMismatch {
-                    field: "inquiry.unadmitted_reference_binding",
-                });
-            }
-        }
-        for obligation in &self.obligations {
-            obligation.validate_integrity()?;
+        Ok(())
+    }
+
+    /// Re-proves the run-bound reference allowlist this record carries.
+    ///
+    /// I21.7: the allowlist is re-proved on the RECORD, not only on the
+    /// observation `record` was handed. `AllowedReferenceManifest::validate`
+    /// recomputes the canonical digest over the manifest's own content and
+    /// refuses a mismatch, so the manifest carried beside the published
+    /// `manifest=` digest is the one that digest was computed from. The three
+    /// bindings below then make the same manifest the one the profile, the
+    /// freeze and the terminal disposition were all bound to: comparing the
+    /// carried `digest` field against each of those is a real comparison
+    /// between two independently produced values, whereas before the manifest
+    /// was carried at all the record held only its digest and had nothing to
+    /// re-derive an admission or a certificate from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity mismatch when the carried manifest does not
+    /// re-derive its own published digest, or when the profile, the freeze and
+    /// the terminal disposition are not all bound to that same manifest and
+    /// fence.
+    fn validate_run_reference_manifest(&self) -> Result<(), InquiryError> {
+        self.run_reference_manifest
+            .validate()
+            .map_err(|_| InquiryError::IntegrityMismatch {
+                field: "inquiry.run_reference_manifest",
+            })?;
+        if self.run_reference_manifest.digest != self.profile.reference_manifest_digest
+            || self.run_reference_manifest.digest != self.freeze.manifest_digest
+            || self.run_reference_manifest.digest != self.terminal.manifest_digest
+            || self.run_reference_manifest.state_fence != self.terminal.state_fence
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.run_reference_manifest_binding",
+            });
         }
         Ok(())
     }
@@ -5206,15 +5313,29 @@ impl std::fmt::Display for InquiryGovernance {
     /// Governor/Kernel/Store commit receipt is the owner's, and a line that
     /// implied one would be a false proof claim under A0.3.
     ///
-    /// `certified` is the number of obligations this run recorded as satisfied by
-    /// their declared acceptance certificate, re-proved here through
-    /// [`InquiryObligation::is_verified_by_certificate`] against the kind each
-    /// obligation declares rather than read off a status alone.
+    /// `certified` is the number of obligations this run both recorded as
+    /// satisfied AND whose acceptance certificate re-derives, from the run-bound
+    /// manifest and the admitted source records, as a kind that obligation
+    /// declares. It is not a status read: see [`certified_obligations`].
     /// `certified=0` is the honest spelling of the live state whenever the run
     /// holds no admitted certificate of a declared kind for any member, and the
     /// line says that instead of omitting the figure.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let terminal = &self.terminal;
+        // `certified` is re-derived, and a re-derivation that cannot be completed
+        // has no honest numeric spelling, so it renders as `unproved` rather than
+        // as a count the run did not establish. `record` runs
+        // `validate_integrity`, which performs the same derivation and refuses the
+        // record on failure, so this arm is reachable only on a record assembled
+        // outside that path.
+        let certified = match certified_obligations(
+            &self.run_reference_manifest,
+            &self.obligations,
+            &self.admissibility,
+        ) {
+            Ok(certified) => certified.len().to_string(),
+            Err(_) => "unproved".to_owned(),
+        };
         write!(
             formatter,
             "contract={INQUIRY_GOVERNANCE_CONTRACT} version={INQUIRY_GOVERNANCE_VERSION} \
@@ -5271,7 +5392,7 @@ impl std::fmt::Display for InquiryGovernance {
             self.obligations.len(),
             self.compilation_inputs.materialisable().len(),
             self.compilation_inputs.deferred().len(),
-            certified_obligations(&self.obligations),
+            certified,
             self.compilation_inputs.digest,
             self.freeze.digest,
             self.lane_discipline.evidence_class.wire_name(),
@@ -6874,6 +6995,12 @@ fn open_obligations(
     for member in members {
         let mut obligation = InquiryObligation::new(InquiryObligationParams {
             obligation_id: format!("obl-{member}"),
+            // The member is carried on the record, not only inside the identity
+            // and the goal prose, so a reader holding the run's manifest and
+            // admitted records can re-derive which certificate this obligation
+            // was actually about and ask `is_verified_by_certificate` a real
+            // question instead of reading the recorded status back.
+            coverage_member: member.clone(),
             parent_question: observation.question.clone(),
             goal: format!("resolve admitted reference {member} inside the frozen scope"),
             protocol_ref: profile.profile_id_and_revision(),
@@ -7414,26 +7541,63 @@ fn refused_dispositions_for(kind: ResearchDebtKind) -> Vec<&'static str> {
     .collect()
 }
 
-/// Number of obligations this run recorded as satisfied by their declared
-/// acceptance certificate.
+/// Obligation identities this run actually satisfied by an acceptance
+/// certificate it holds.
 ///
-/// Both halves are required, and neither alone is the answer: the recorded
-/// `VERIFIED` status is this domain's own verdict, and
-/// [`InquiryObligation::is_verified_by_certificate`] re-proves it against the
-/// certificate kind the obligation declares, so an obligation that was recorded
-/// verified under a kind it does not declare, or whose recorded state the
-/// certificate predicate refuses, is not published as certified. It is the
-/// read-side counterpart of the transition [`open_obligations`] performs on the
-/// build side, and it is on the live route: `eliot-mod-research` renders this
-/// line on every run.
-fn certified_obligations(obligations: &[InquiryObligation]) -> usize {
-    obligations
-        .iter()
-        .filter(|obligation| {
-            obligation.status == InquiryObligationStatus::Verified
-                && obligation.is_verified_by_certificate(obligation.acceptance_certificate_kind)
-        })
-        .count()
+/// Three things must all hold, and the first two together are the property the
+/// previous form of this function did not have:
+///
+/// 1. the obligation was **recorded** `VERIFIED` — this domain's own verdict;
+/// 2. the certificate kind **re-derived from the run's own material** for that
+///    obligation's `coverage_member` — the run-bound manifest read through
+///    [`AllowedReferenceManifest::allows`], and an admitted, integrity-re-proved,
+///    `ELIGIBLE` [`SourceAdmissibilityRecord`] carrying exact evidence spans —
+///    is of the kind the obligation **declares**; and
+/// 3. the recorded state is not one the certificate predicate refuses, so no
+///    presented kind verifies a rejected, cancelled or invalidated obligation.
+///
+/// The re-derivation is what makes this a verification rather than an echo. The
+/// previous body asked
+/// `is_verified_by_certificate(obligation.acceptance_certificate_kind)`, which
+/// hands the predicate the obligation's **own declared** kind; the kind
+/// comparison in [`InquiryObligation::is_verified_by_certificate`] then
+/// compared a value with itself and was `true` by construction, leaving the
+/// recorded status as the only thing actually being read. That is the same
+/// status-echo defect the predicate itself was corrected for, one layer up: a
+/// `VERIFIED` status asserted by a writer that never held a matching
+/// certificate published `certified=1`.
+///
+/// Here the presented kind comes from `manifest` and `admissibility`, the same
+/// two inputs [`open_obligations`] decides the build side from, so the read side
+/// and the build side answer the same question from the same admitted material
+/// and can be compared by a reader who holds neither the code nor the writer's
+/// intent. It is on the live route: `eliot-mod-research` renders this line on
+/// every run.
+///
+/// # Errors
+///
+/// Returns the first integrity failure of an admitted record whose handle is
+/// read while re-deriving a presented kind, rather than counting a certificate
+/// from a record that no longer re-proves its own digest.
+fn certified_obligations<'a>(
+    manifest: &AllowedReferenceManifest,
+    obligations: &'a [InquiryObligation],
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<Vec<&'a str>, InquiryError> {
+    let mut certified = Vec::new();
+    for obligation in obligations {
+        if obligation.status != InquiryObligationStatus::Verified {
+            continue;
+        }
+        // The member comes off the record, and the presented kind off the run's
+        // own admitted material — never off the obligation's declared kind.
+        let presented =
+            presented_acceptance_certificate(manifest, &obligation.coverage_member, admissibility)?;
+        if obligation.is_verified_by_certificate(presented) {
+            certified.push(obligation.obligation_id.as_str());
+        }
+    }
+    Ok(certified)
 }
 
 /// Stable wire spelling of the debt kinds a run registered, deduplicated and

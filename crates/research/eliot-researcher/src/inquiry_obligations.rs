@@ -115,6 +115,15 @@ impl InquiryObligationStatus {
 pub struct InquiryObligationParams<'a> {
     /// Stable obligation identity.
     pub obligation_id: String,
+    /// The frozen coverage-denominator member this obligation resolves.
+    ///
+    /// Carried as its own field rather than left implicit in the identity or
+    /// the goal prose, because the obligation's acceptance certificate is a
+    /// claim about *this* member: an exact source identity plus the exact
+    /// passage for it. Without the handle on the record, a reader that re-derives
+    /// which certificate the run actually holds has nothing to derive it for and
+    /// can only read the recorded status back, which proves nothing.
+    pub coverage_member: String,
     /// Parent question this obligation answers.
     pub parent_question: String,
     /// What must become true.
@@ -151,6 +160,14 @@ pub struct InquiryObligationParams<'a> {
 pub struct InquiryObligation {
     /// Stable obligation identity.
     pub obligation_id: String,
+    /// The frozen coverage-denominator member this obligation resolves.
+    ///
+    /// This is the handle the acceptance certificate is a claim *about*, and it
+    /// is inside the digest preimage, so an obligation cannot be re-pointed at a
+    /// different member after the certificate was decided. It is what lets
+    /// [`is_verified_by_certificate`](Self::is_verified_by_certificate) be asked
+    /// a real question by a reader holding the run's own material.
+    pub coverage_member: String,
     /// Parent question this obligation answers.
     pub parent_question: String,
     /// What must become true.
@@ -198,13 +215,14 @@ impl InquiryObligation {
     ///
     /// # Errors
     ///
-    /// Returns a field error for a blank identity, goal, boundary, role,
-    /// verifier or stop condition, a zero budget, an empty dependency or
-    /// assumption entry, and [`InquiryError::UnknownHandle`] when a dependency
-    /// names the obligation itself.
+    /// Returns a field error for a blank identity, coverage member, goal,
+    /// boundary, role, verifier or stop condition, a zero budget, an empty
+    /// dependency or assumption entry, and [`InquiryError::UnknownHandle`] when
+    /// a dependency names the obligation itself.
     #[allow(clippy::too_many_arguments)]
     pub fn new(params: InquiryObligationParams<'_>) -> Result<Self, InquiryError> {
         text(&params.obligation_id, "obligation.obligation_id").map_err(InquiryError::from)?;
+        text(&params.coverage_member, "obligation.coverage_member").map_err(InquiryError::from)?;
         text(&params.parent_question, "obligation.parent_question").map_err(InquiryError::from)?;
         text(&params.goal, "obligation.goal").map_err(InquiryError::from)?;
         text(
@@ -233,6 +251,7 @@ impl InquiryObligation {
         }
         let mut obligation = Self {
             obligation_id: params.obligation_id,
+            coverage_member: params.coverage_member,
             parent_question: params.parent_question,
             goal: params.goal,
             profile_id: params.profile.profile_id.clone(),
@@ -278,9 +297,14 @@ impl InquiryObligation {
     /// refuse a late certificate: an obligation that was rejected, cancelled or
     /// invalidated is no longer satisfiable, so no presented kind verifies it.
     ///
-    /// `presented` is the kind of certificate the caller actually admitted.
-    /// Only the certificate kind the obligation declared can verify it, so a
-    /// certificate of any other kind leaves the obligation unsatisfied.
+    /// `presented` is the kind of certificate the caller actually admitted, read
+    /// from the run's own material and not from this obligation. Only the
+    /// certificate kind the obligation declared can verify it, so a certificate of
+    /// any other kind leaves the obligation unsatisfied. This is what makes the
+    /// comparison a real one: a caller that passes
+    /// `self.acceptance_certificate_kind` back in gets a tautological `true` that
+    /// proves nothing, and the only callers that matter are the ones that derive
+    /// `presented` from the run-bound manifest and the admitted source records.
     /// [`Self::admit_acceptance_certificate`] is the only path that acts on that
     /// answer, which is what keeps a `Verified` status from ever being reached
     /// without a certificate.
@@ -351,8 +375,12 @@ impl InquiryObligation {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("inquiry-obligation/v1;");
+        // v2: `coverage_member` joined the hashed shape, so an obligation sealed
+        // under v1 cannot re-verify and an obligation cannot be re-pointed at a
+        // different denominator member without changing its identity.
+        let mut preimage = String::from("inquiry-obligation/v2;");
         push_field(&mut preimage, "obligation_id", &self.obligation_id);
+        push_field(&mut preimage, "coverage_member", &self.coverage_member);
         push_field(&mut preimage, "parent_question", &self.parent_question);
         push_field(&mut preimage, "goal", &self.goal);
         push_field(&mut preimage, "profile_id", &self.profile_id);
