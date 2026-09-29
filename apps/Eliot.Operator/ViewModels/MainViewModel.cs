@@ -15,6 +15,28 @@ public enum OperatorBannerSeverity
     Error
 }
 
+/// The observed state of the User Broker session binding this UI runs under.
+///
+/// These are the three states the lifecycle can actually be observed in, and
+/// nothing is inferred between them. A binding that was never attempted is not
+/// the same as one that was refused: the first still lets the transport perform
+/// the admission on the next request, while the second is terminal for this
+/// process because continuity is the owner's to reissue (I11.1 "Visual polish
+/// cannot hide degraded capability behind a green state", I11.8).
+public enum OperatorSessionBindingState
+{
+    /// No broker-issued handoff has been redeemed yet. This is the startup
+    /// state, and the transport authenticates the first request.
+    NotAttempted = 0,
+    /// A broker-issued handoff was redeemed and the broker echoed the exact
+    /// role and capability set this UI is bound to.
+    Established,
+    /// The broker-issued handoff was absent, consumed, expired, refused or
+    /// invalidated. No in-process continuity exists, and a replacement is the
+    /// owner's to issue — never this process to reconstruct.
+    Refused
+}
+
 public sealed record OperatorPageDefinition(string Tag, string Title, string Description, bool RequiresTask);
 public sealed record SavedFilterViewModel(string Name, string PageTag, string Search, string? Kind, string? Status, string? Authority);
 public sealed record OperatorTaskContext(string ProjectId, string TaskId, ulong Revision);
@@ -92,6 +114,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private OperatorBannerSeverity _statusSeverity = OperatorBannerSeverity.Informational;
     private bool _pendingJournalUnavailable;
     private OperatorRoleBinding? _roleBinding;
+    private OperatorSessionBindingState _sessionBindingState = OperatorSessionBindingState.NotAttempted;
     private string _bindingSummary = "Session binding not yet established.";
 
     public MainViewModel(
@@ -213,6 +236,32 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// A withheld command capability is stated here, so a disabled action is
     /// never unexplained.
     public string BindingSummary { get => _bindingSummary; private set => Set(ref _bindingSummary, value); }
+    /// The observed User Broker session-binding state this UI is in. A
+    /// refused binding is shown as refused, never as a pending admission: a
+    /// lifecycle that cannot continue must not read as one that has not begun.
+    public OperatorSessionBindingState SessionBindingState
+    {
+        get => _sessionBindingState;
+        private set
+        {
+            if (!Set(ref _sessionBindingState, value)) return;
+            // The label is derived from the state, so the state change must
+            // raise it too; a bound TextBlock would otherwise keep showing the
+            // previous lifecycle name.
+            OnPropertyChanged(nameof(SessionBindingLabel));
+            UpdateBindingSummary(null);
+        }
+    }
+    /// Plain-language name of the binding lifecycle, so the state is stated
+    /// rather than left to the wording of `BindingSummary` (I11.9: "what
+    /// happened / why it matters / what to do").
+    public string SessionBindingLabel => _sessionBindingState switch
+    {
+        OperatorSessionBindingState.Established => "Session binding established with the User Broker.",
+        OperatorSessionBindingState.Refused =>
+            "Session binding refused. This window cannot continue; restart it through the broker-issued handoff.",
+        _ => "Session binding not yet established. The next request is authenticated by the User Broker."
+    };
     /// A null (never-established) binding is unknown, not denied: the
     /// transport authenticates every request, so reads proceed until the
     /// broker proves otherwise. A KNOWN binding that withholds the read
@@ -620,6 +669,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
                     _requestCancellation?.Token ?? CancellationToken.None);
                 ShowUserAutomationResult(action, read, readRequest);
             }
+            catch (OperatorRestartRequiredException restart)
+            {
+                // A refusal on this read is the same terminal lifecycle as one
+                // on the projection route: the broker session binding is gone
+                // for this process, so the UI says so instead of only naming a
+                // failed read.
+                SessionBindingState = OperatorSessionBindingState.Refused;
+                SetBanner("Restart required", restart.Message, OperatorBannerSeverity.Error);
+            }
             catch (Exception error)
             {
                 SetBanner("UserAutomation read failed", error.Message, OperatorBannerSeverity.Error);
@@ -735,6 +793,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (OperatorRestartRequiredException restart)
         {
+            // A mutation path refusal is the same terminal lifecycle as a read
+            // one: the broker session binding is gone, so the UI stops reading
+            // as though an admission were still pending.
+            SessionBindingState = OperatorSessionBindingState.Refused;
             ReplacePending(pending.OperationId, OperatorOperationPhase.PossiblyExecuted);
             RefreshPendingState();
             SetBanner(
@@ -1017,6 +1079,20 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 SetBanner("Request cancelled", "The nonblocking Governor request was cancelled.", OperatorBannerSeverity.Informational);
             }
         }
+        catch (OperatorRestartRequiredException restart)
+        {
+            // The broker session binding is gone for this process: the UI moves
+            // to the terminal Refused lifecycle and says so, instead of leaving
+            // a summary that reads as a still-pending admission.
+            SessionBindingState = OperatorSessionBindingState.Refused;
+            if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
+            {
+                SetBanner(
+                    "Restart required",
+                    restart.Message,
+                    OperatorBannerSeverity.Error);
+            }
+        }
         catch (Exception error)
         {
             if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
@@ -1219,6 +1295,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (OperatorRestartRequiredException restart)
         {
+            SessionBindingState = OperatorSessionBindingState.Refused;
             ReplacePending(pending.OperationId, OperatorOperationPhase.PossiblyExecuted);
             RefreshPendingState();
             SetBanner(
@@ -1546,6 +1623,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         var binding = _client.GrantedBinding;
         if (RoleBindingEquals(_roleBinding, binding)) return;
         _roleBinding = binding;
+        // A live grant is the only positive evidence that the broker admitted
+        // this binding. Its absence is not treated as a refusal here: a
+        // transport that dropped, or that has not been established yet, reports
+        // null, and only a typed restart-required disposition from the client
+        // moves the lifecycle to Refused. A Refused lifecycle is never walked
+        // back to Established by a later read of the same transport: continuity
+        // after a refusal is the owner's to reissue, not this process to infer.
+        if (binding is not null
+            && _sessionBindingState == OperatorSessionBindingState.NotAttempted)
+        {
+            SessionBindingState = OperatorSessionBindingState.Established;
+        }
         OnPropertyChanged(nameof(GrantedRole));
         OnPropertyChanged(nameof(CanReadProjection));
         OnPropertyChanged(nameof(CanIssueCommands));
@@ -1561,6 +1650,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void UpdateBindingSummary(OperatorProjectionPage? page)
     {
+        if (_sessionBindingState == OperatorSessionBindingState.Refused)
+        {
+            // A refused binding is terminal for this process. It is stated
+            // here, not as a pending admission, so the summary can never read
+            // as though a fresh handoff were still on its way.
+            BindingSummary =
+                "User Broker session binding refused: no in-process continuity exists. " +
+                OperatorHandoff.ReacquisitionRequirement;
+            return;
+        }
         if (_roleBinding is null)
         {
             BindingSummary = "Session binding not yet established; the transport authenticates every request.";

@@ -163,3 +163,34 @@ because plain `dotnet publish` otherwise produced an executable that failed
 during XAML activation. Current UI debt is presentation-only: several
 projections are raw JSON-first, and contour reassignment/approvals/incidents
 were not exercised in the bounded L8 run.
+
+## Session-binding lifecycle
+
+The UI tracks one observed lifecycle for the User Broker session binding it
+runs under, as `MainViewModel.SessionBindingState`:
+
+- `NotAttempted` — no handoff has been redeemed yet. The transport authenticates
+  the next request, and the transport is the only thing that can move this
+  forward.
+- `Established` — a live transport reported the broker-echoed role and exact
+  capability set, and views and effects gate on that grant.
+- `Refused` — a typed `OperatorRestartRequiredException` (including its
+  `OperatorHandoffRefusedException` subclass) came back from any read or effect
+  route. This is terminal for the process: the owner-issued handoff was absent,
+  consumed, expired or refused, and continuity is the owner's to reissue. The
+  binding summary then names that refusal and the owner obligation instead of
+  reading as a still-pending admission, and no later read of the same transport
+  walks the lifecycle back to `Established`.
+
+Only the typed refusal moves the lifecycle. A transport that reports no grant
+because it dropped, or because it was never established, is not a refusal, and
+the UI does not invent one from a null grant.
+
+`MainWindow.xaml` states the state in a labelled `InfoBar` and
+`MainWindow.xaml.cs::SyncSessionBindingBar` gives it the severity it has. An
+established binding raises no green bar at all — the ordinary good state is
+carried by the binding summary line — because a green status bar for the normal
+case is exactly what I11.9 forbids. A merely unestablished binding is the normal
+startup state and is informational; only a refusal escalates to an open error
+bar.
+

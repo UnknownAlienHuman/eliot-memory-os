@@ -204,6 +204,17 @@
                         <TextBlock Text="{Binding SectionDescription}" TextWrapping="Wrap" Opacity="0.8" />
                         <TextBlock Text="{Binding BindingSummary}" TextWrapping="Wrap" Opacity="0.7" FontSize="12"
                                    AutomationProperties.Name="Authenticated User Broker session binding" />
+                        <!--
+                            I11.9: a degraded or refused capability must never read as a
+                            pending one. The summary text above already states a refusal
+                            verbatim; this badge names the lifecycle state for a screen
+                            reader so the state is not carried by wording alone.
+                        -->
+                        <InfoBar x:Name="SessionBindingBar" Margin="0,6,0,0"
+                                 IsClosable="False"
+                                 Title="{Binding SessionBindingLabel}"
+                                 AutomationProperties.LiveSetting="Polite"
+                                 AutomationProperties.Name="User Broker session binding state" />
                     </StackPanel>
 
                     <Canvas x:Name="GraphCanvas" Grid.Row="1" Height="230" Visibility="Collapsed"

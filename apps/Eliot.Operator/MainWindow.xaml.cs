@@ -27,9 +27,11 @@ public sealed partial class MainWindow : Window
         {
             if (args.PropertyName == nameof(MainViewModel.StatusSeverity)) SyncBannerSeverity();
             if (args.PropertyName == nameof(MainViewModel.HasUnknownOperations)) SyncReconcileVisibility();
+            if (args.PropertyName == nameof(MainViewModel.SessionBindingState)) SyncSessionBindingBar();
         };
         SyncBannerSeverity();
         SyncReconcileVisibility();
+        SyncSessionBindingBar();
         Navigation.SelectedItem = Navigation.MenuItems[0];
         Closed += MainWindow_OnClosed;
         _ = RefreshProjectionAsync();
@@ -258,6 +260,35 @@ public sealed partial class MainWindow : Window
             OperatorBannerSeverity.Error => InfoBarSeverity.Error,
             _ => InfoBarSeverity.Informational
         };
+    }
+
+    /// <summary>
+    /// States the session-binding lifecycle at the severity it actually has.
+    /// </summary>
+    /// <remarks>
+    /// I11.9 forbids hiding a degraded capability behind a green status, so an
+    /// established binding is NOT shown as a green bar: the ordinary good state
+    /// is stated by the binding summary line and raises no bar of its own. A
+    /// merely unestablished binding is a normal startup state and is stated
+    /// informationally. Only a refusal is escalated, to an open error bar,
+    /// because that lifecycle cannot continue.
+    /// </remarks>
+    private void SyncSessionBindingBar()
+    {
+        switch (ViewModel.SessionBindingState)
+        {
+            case OperatorSessionBindingState.Established:
+                SessionBindingBar.IsOpen = false;
+                break;
+            case OperatorSessionBindingState.Refused:
+                SessionBindingBar.Severity = InfoBarSeverity.Error;
+                SessionBindingBar.IsOpen = true;
+                break;
+            default:
+                SessionBindingBar.Severity = InfoBarSeverity.Informational;
+                SessionBindingBar.IsOpen = true;
+                break;
+        }
     }
 
     private void SyncReconcileVisibility()
