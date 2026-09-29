@@ -1395,7 +1395,7 @@ fn reactive_ledger_mutation_frame(
         request_identity: Some(identity),
         payload: ProtocolPayload::Json(serde_json::json!({
             "operation": REACTIVE_LEDGER_MUTATION_OPERATION,
-            "candidate": payload,
+            "request": payload,
         })),
         trace_context: BTreeMap::new(),
     };

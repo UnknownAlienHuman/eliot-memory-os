@@ -32,7 +32,7 @@ use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_mcp::{KernelHostRequestPort, PortFailure};
 use eliot_protocol::{MAX_RESTORE_URIS, ReactiveLedgerMutationRequest, ReactiveRestoreQuery};
 
-use super::BridgeRunner;
+use super::{BridgeRunner, ReactiveInjectionLedger};
 
 /// Outcome of the ledger leg of one restore.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,6 +284,23 @@ pub fn commit_reactive_ledger_candidate(
         reply.ledger_revision,
     )?;
     Ok(reply.ledger_revision)
+}
+
+/// Runs one reactive ledger operation on a clone and commits that candidate
+/// before returning its result to the stdio response path.
+pub fn mutate_reactive_ledger<T>(
+    runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
+    mutate: impl FnOnce(&mut ReactiveInjectionLedger, &str) -> Result<T, BridgeError>,
+) -> Result<T, BridgeError> {
+    let session_id = runner
+        .attach_view()
+        .map(|view| view.binding().session_id().as_str().to_owned())
+        .ok_or(BridgeError::NotAttached)?;
+    let mut candidate = runner.reactive_ledger_candidate();
+    let result = mutate(&mut candidate, &session_id)?;
+    commit_reactive_ledger_candidate(runner, port, candidate)?;
+    Ok(result)
 }
 
 fn map_reactive_mutation_failure(error: PortFailure) -> BridgeError {
