@@ -19,14 +19,14 @@ use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, CanonicalObligation, DeliveryConfidence,
     DeliveryObservation, DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort,
     G08NotificationPort, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
-    LedgerReserveOutcome, NotificationSeverity, NotificationStateMutation,
-    NotificationStatePort, NotificationStateReadRequest, NotificationStateReadResponse,
-    NotificationStateRequest, NotificationStateResponse, NotifyCore, OneShotLedgerPort,
-    ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
-    UserAutomationInvocation, UserAutomationPreflightProjection, VerificationPorts,
-    WATCHDOG_PRODUCT_ID, WATCHDOG_SOURCE_ID, WatchdogSignaturePort,
-    validate_fallback_envelope_size, validate_fallback_freshness, watchdog_notification_id,
-    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
+    LedgerReserveOutcome, NotificationSeverity, NotificationStateMutation, NotificationStatePort,
+    NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
+    NotificationStateResponse, NotifyCore, OneShotLedgerPort, ResolutionAuthorization,
+    SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest, UserAutomationInvocation,
+    UserAutomationPreflightProjection, VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SOURCE_ID,
+    WatchdogSignaturePort, validate_fallback_envelope_size, validate_fallback_freshness,
+    watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
+    watchdog_signature_payload,
 };
 #[cfg(test)]
 use eliot_notify_core::{WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN};
@@ -1780,13 +1780,13 @@ pub mod notify_declaration;
 pub mod notify_launch;
 pub mod operation_identity;
 pub mod quiet_hours;
+pub use eliot_notify_core::NotificationEnvelope;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{
     FallbackMaterial, FallbackVerificationDeclaration, decode_hex, fallback_provider_error,
     load_fallback_material,
 };
-pub use eliot_notify_core::NotificationEnvelope;
 pub use installed_binary::{
     InstalledNotifyBinary, NOTIFY_IMAGE_FILE_NAME, NotifyBinaryBinding, NotifyBinaryError,
     NotifyDigest, notify_binding_from_declaration, resolve_notify_binary,

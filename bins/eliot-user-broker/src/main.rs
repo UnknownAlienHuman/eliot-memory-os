@@ -456,20 +456,43 @@ fn parse_root() -> Result<PathBuf, String> {
     }
 }
 
+/// Dispatches one broker-admitted notify delivery.
+///
+/// The arm body lives here rather than inline so `dispatch` keeps its line
+/// budget: admit the Human state change, then launch the broker-composed
+/// delivery line through `launch_notify_deliver`.
+fn dispatch_notify_deliver(
+    composition: &mut BrokerComposition,
+    request: LaunchRequest,
+    delivery: &NotifyDeliver,
+    authority: Option<&HumanStateAuthority>,
+) -> Message {
+    let operation_key = request.approved.idempotency_key.clone();
+    match composition.admit_human_state_change(authority, &operation_key) {
+        Err(error) => composition_rejection(&error),
+        Ok(()) => dispatch_launch(composition.launch_notify_deliver(request, delivery)),
+    }
+}
+
+/// Parses one inbound broker request line.
+///
+/// A malformed line is a stable `REQUEST_INVALID` error, never a dispatch.
+fn parse_request(line: &str) -> Result<Request, Message> {
+    serde_json::from_str::<Request>(line).map_err(|error| Message::Error {
+        code: "REQUEST_INVALID",
+        detail: error.to_string(),
+    })
+}
+
 fn dispatch(
     composition: &mut BrokerComposition,
     line: &str,
     fallback_status: &Value,
     notify_launch_status: &Value,
 ) -> Message {
-    let request = match serde_json::from_str::<Request>(line) {
+    let request = match parse_request(line) {
         Ok(request) => request,
-        Err(error) => {
-            return Message::Error {
-                code: "REQUEST_INVALID",
-                detail: error.to_string(),
-            };
-        }
+        Err(message) => return message,
     };
     match request {
         Request::Launch { request, authority } => {
@@ -501,13 +524,7 @@ fn dispatch(
             request,
             delivery,
             authority,
-        } => {
-            let operation_key = request.approved.idempotency_key.clone();
-            match composition.admit_human_state_change(authority.as_ref(), &operation_key) {
-                Err(error) => composition_rejection(&error),
-                Ok(()) => dispatch_launch(composition.launch_notify_deliver(request, &delivery)),
-            }
-        }
+        } => dispatch_notify_deliver(composition, request, &delivery, authority.as_ref()),
         Request::NotifyAcknowledge {
             request,
             acknowledgement,
