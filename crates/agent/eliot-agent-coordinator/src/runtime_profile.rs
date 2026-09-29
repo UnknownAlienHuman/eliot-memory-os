@@ -95,12 +95,17 @@
 //! # Caller
 //!
 //! `caller: STITCH`. Nothing in the tree calls this loader yet, and this module
-//! does not invent a caller. The upstream reason is recorded in `core.rs`: the
-//! profile-bound entry point `AgentCoordinator::pull_next` "has no in-tree
-//! caller yet: the composition root that would compile and supply a
-//! `SchedulingProfile` is outside this crate", and the profile-free
-//! `AgentCoordinator::next_ready` is exercised only from in-crate tests. The
-//! composition root that compiles this document is a separate owner.
+//! does not invent a caller. The upstream reason is recorded on
+//! `AgentCoordinator::pull_next` in `core.rs` and is narrower than "no profile
+//! was supplied": in production this coordinator's `attempts` map is empty,
+//! because `AgentFabric` never calls `AgentCoordinator::admit` and no
+//! production issuer of the provider-verified `ProviderAdmissionReceipt` that
+//! `admit` requires exists in this tree. Wiring this loader alone would
+//! therefore compile a profile for a projection that is permanently empty; the
+//! blocking join is the #1678 admission saga's owner-issued receipt. The
+//! profile-free `AgentCoordinator::next_ready` is likewise exercised only from
+//! in-crate tests. The composition root that compiles this document is a
+//! separate owner.
 
 use std::io::Read;
 use std::path::Path;

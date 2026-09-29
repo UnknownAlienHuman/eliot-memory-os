@@ -1371,13 +1371,16 @@ impl AgentCoordinator {
     ///
     /// Known limitation, stated here so a reader of the code does not need the
     /// delivery report: the per-class partition is reachable only through the
-    /// profile-bound path [`Self::pull_next`], and `pull_next` has **no in-tree
-    /// caller** — the composition root that could supply a `SchedulingProfile` is
-    /// out of this crate's grant. So on every path that runs today, selection
-    /// applies the age order and the class-rank order but no per-class limit, and
-    /// `profile_revision` in the published outcome is `None`. A reader must not
-    /// conclude from this method that saturated low-priority work is prevented
-    /// from consuming another class's partition: nothing on this path does that.
+    /// profile-bound path [`Self::pull_next`], and in production this
+    /// coordinator's `attempts` map is **empty** — `AgentFabric` never calls
+    /// [`Self::admit`], because no production issuer of the provider-verified
+    /// [`ProviderAdmissionReceipt`] that `admit` requires exists in this tree.
+    /// So this method returns `None` on every production path today, no caller
+    /// invokes it, and `profile_revision` in any published outcome would be
+    /// `None`. A reader must not conclude from this method that saturated
+    /// low-priority work is prevented from consuming another class's
+    /// partition: nothing on this path does that. The full measurement is on
+    /// [`Self::pull_next`].
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
         self.attempts.get(&selected).cloned()
@@ -1444,10 +1447,28 @@ impl AgentCoordinator {
     /// `selected_attempt_id` starts that attempt through the existing
     /// [`Self::start_attempt`], which remains the only state transition.
     ///
-    /// This entry point has no in-tree caller yet: the composition root that
-    /// would compile and supply a `SchedulingProfile` is outside this crate, so
-    /// the per-class partition it enforces is currently unexercised in
-    /// production. See the limitation note on [`Self::next_ready`].
+    /// Unreachable in production, and the reason is upstream of the profile.
+    /// Measured on `origin/main` @ `5d691922c`, the whole production gap is:
+    ///
+    /// - No caller outside this crate constructs a [`ProviderAdmissionReceipt`].
+    ///   Its `expires_at_unix_ms` doc records that "No production issuer exists
+    ///   in this tree yet, so every construction site is a test fixture", and
+    ///   `git grep` finds no `bins/` construction site. The receipt is
+    ///   provider-verified on intake, so a pull cannot be fed a synthesized
+    ///   one without forging provider evidence.
+    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly three
+    ///   coordinator methods — `plan` (twice), `snapshot`, and a lease
+    ///   `authorizes` on an unrelated `SwarmCoordinatorLease`. It never calls
+    ///   [`Self::admit`], so this coordinator's `attempts` map is empty in
+    ///   production and every pull over it would select nothing even if a
+    ///   profile were supplied.
+    ///
+    /// So the per-class partition is unexercised in production, and the
+    /// blocking join is `AgentFabric` -> [`Self::admit`], not a missing profile.
+    /// Building that join needs the #1678 admission saga's owner-issued
+    /// receipt; supplying only a `SchedulingProfile` would produce a selector
+    /// that is correct and permanently empty. See also the note on
+    /// [`Self::next_ready`].
     ///
     /// # Errors
     ///
