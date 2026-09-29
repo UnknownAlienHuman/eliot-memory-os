@@ -128,15 +128,16 @@ fn observe_frame(event: &'static str, outcome: &'static str) {
 }
 
 impl KernelComposition {
-    /// Observes one failed frame input without payload at the owned dispatch
-    /// boundary.
+    /// Observes one failed frame input without payload.
     ///
     /// F-LOG-KERNEL-1 (#897 T10/T26): shared classifier for failed frame
-    /// input, called by `dispatch_frame` on its decode-reject path so the
-    /// observation lives in the owned module. Only static event/outcome
-    /// literals are emitted: byte counts classify the outcome and never
-    /// reach the record, and the `Io` message is never logged (W6, I15.4).
-    fn observe_frame_read_input(error: &TransportError) {
+    /// input. The front-door driver calls this on transport read errors
+    /// before fencing, and `dispatch_frame` calls it on its decode-reject
+    /// path, so both seams share one outcome taxonomy in the owned module.
+    /// Only static event/outcome literals are emitted: byte counts classify
+    /// the outcome and never reach the record, and the `Io` message is never
+    /// logged (W6, I15.4).
+    pub(crate) fn observe_frame_read_input(error: &TransportError) {
         let outcome: &'static str = match error {
             TransportError::Protocol(eliot_protocol::ProtocolError::PartialFrame {
                 actual: 0,
@@ -151,6 +152,21 @@ impl KernelComposition {
             _ => "failed",
         };
         observe_frame("kernel.frame_read", outcome);
+    }
+
+    /// Observes one transport frame write outcome without payload.
+    ///
+    /// F-LOG-KERNEL-1 (#897 T15/T26): the front-door driver owns every
+    /// `send_frame` write, so dispatch-side preparation is never delivery.
+    /// The driver calls this from `send_checked`: `Delivered` stays a
+    /// transport acknowledgement (never semantic completion, T16) and
+    /// `UnknownOutcome` remains `unknown` rather than collapsing into
+    /// success or failure.
+    pub(crate) fn observe_frame_write_outcome(delivered: bool) {
+        observe_frame(
+            "kernel.frame_write",
+            if delivered { "success" } else { "unknown" },
+        );
     }
 }
 

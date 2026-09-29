@@ -1902,12 +1902,14 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         observe_daemon_request("kernel.daemon_request_received", "attempt");
         observe_daemon_operation(trusted_daemon_operation(operation), "received");
+        let mut subordinate_terminal_emitted = false;
         let result = Box::pin(self.execute_daemon_request_inner(
             session,
             request_id,
             operation,
             &payload,
             request_identity.as_ref(),
+            &mut subordinate_terminal_emitted,
         ))
         .await;
         match &result {
@@ -1938,13 +1940,14 @@ impl KernelComposition {
                     // the terminal below stays the single designated terminal.
                     observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
                 }
-                // F-LOG-KERNEL-1 (#897 T20): `receipt` failures already carry
-                // their single designated terminal from
-                // `store_receipt_dispatch::dispatch` (outside #897 scope), so
-                // a second terminal here would inflate one failed operation
-                // into two records. The fenced observations above stay the
-                // correlated subordinate phases.
-                if trusted_daemon_operation(operation) != "receipt" {
+                // F-LOG-KERNEL-1 (#897 T20): a failed receipt sub-dispatch
+                // already owns that operation's single designated terminal,
+                // so a second terminal here would inflate one failure into
+                // two records. Pre-match gates and the post-match frame
+                // build emit no subordinate terminal, so they still
+                // terminalise here: exactly one terminal either way. The
+                // fenced observations above stay unconditional.
+                if !subordinate_terminal_emitted {
                     super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
                 }
                 observe_daemon_request("kernel.daemon_request_cleanup", "fenced");
@@ -1994,6 +1997,7 @@ impl KernelComposition {
         operation: &str,
         payload: &serde_json::Value,
         request_identity: Option<&RequestIdentity>,
+        subordinate_terminal_emitted: &mut bool,
     ) -> Result<Frame, TransportError> {
         #[cfg(windows)]
         if operation == USER_AUTOMATION_OPERATOR_OPERATION {
@@ -2177,7 +2181,17 @@ impl KernelComposition {
             NOTIFICATION_STATE_READ_OPERATION => {
                 Box::pin(self.notification_state_read_operation(session, payload.clone())).await
             }
-            "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
+            "receipt" => {
+                // F-LOG-KERNEL-1 (#897 T20): only a dispatch failure carries
+                // the subordinate designated terminal, so only that leg
+                // transfers terminal ownership to the sub-dispatch.
+                let outcome =
+                    store_receipt_dispatch::dispatch(self, session, payload.clone()).await;
+                if outcome.is_err() {
+                    *subordinate_terminal_emitted = true;
+                }
+                outcome
+            }
             "store_named" => self.store_named_operation(session, payload.clone()).await,
             "local_read" => self.local_read_operation(session, payload.clone()).await,
             "daemon_degraded" => {

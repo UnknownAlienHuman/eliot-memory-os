@@ -1011,22 +1011,40 @@ fn source_api_diff_and_family_partition_guard() {
         );
         assert!(!src.contains("dedup"), "no global dedup");
     }
-    // F-LOG-KERNEL-1 (#897 T26): the guard above only reads the six owned
-    // files, so it cannot see an edit to an unowned file. The transport-act
-    // observations live in the owned modules; the unowned front-door driver
-    // must carry no #897 observe callsite.
+    // F-LOG-KERNEL-1 (#897 T26): the owned-file loop above cannot see an edit
+    // to an unowned file, so the driver carries an explicit allowlist: the
+    // four #897 transport-act callsites must be present, and no other
+    // observe_ symbol may appear on any driver line.
     let driver_src =
         std::fs::read_to_string(manifest_dir.join("src/front_door_driver.rs")).expect("driver");
-    for retired in [
-        "observe_front_door_accepted",
-        "observe_front_door_accept_fenced",
-        "observe_frame_read_input",
-        "observe_frame_write_outcome",
+    for required in [
+        "KernelComposition::observe_front_door_accepted()",
+        "KernelComposition::observe_front_door_accept_fenced()",
+        "KernelComposition::observe_frame_read_input(",
+        "KernelComposition::observe_frame_write_outcome(",
     ] {
         assert!(
-            !driver_src.contains(retired),
-            "no #897 observe callsite in unowned driver: {retired}"
+            driver_src.contains(required),
+            "required #897 callsite missing in driver: {required}"
         );
+    }
+    for (index, line) in driver_src.lines().enumerate() {
+        if line.contains("observe_") {
+            assert!(
+                [
+                    "observe_entrypoint_with_detail",
+                    "observe_host",
+                    "observe_front_door_accepted",
+                    "observe_front_door_accept_fenced",
+                    "observe_frame_read_input",
+                    "observe_frame_write_outcome",
+                ]
+                .iter()
+                .any(|allowed| line.contains(allowed)),
+                "unexpected observe callsite at driver line {}: {line}",
+                index + 1
+            );
+        }
     }
     let (kernel, _guard) = test_kernel();
     let (logs, result) = capture_with(|| {
