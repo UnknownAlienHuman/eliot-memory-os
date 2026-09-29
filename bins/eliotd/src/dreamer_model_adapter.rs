@@ -1792,6 +1792,10 @@ mod tests {
             task_revision: "task-rev-1".to_owned(),
             plan_revision: rev("plan-rev-t12-07")?,
             state_fence: fence.clone(),
+            human_staffing_intent: eliot_agent_coordinator::HumanStaffingIntent {
+                preset: eliot_agent_coordinator::StaffingPreset::Balanced,
+                per_job_budget: test_budget(),
+            },
             privacy_class: PrivacyClass::Private,
             work_class: "model_jobs".parse()?,
             lanes: vec![StaffingLaneRequest {
@@ -1810,6 +1814,10 @@ mod tests {
                         wall_time_ms: 100,
                         ..BudgetEvidence::default()
                     },
+                    route_classes: vec!["provider-model-a".to_owned()],
+                    route_class_evidence_refs: vec!["route-class-evidence-0".to_owned()],
+                    privacy_classes: vec![PrivacyClass::Private],
+                    privacy_evidence_refs: vec!["privacy-evidence-0".to_owned()],
                     evidence_refs: vec!["route-evidence-0".to_owned()],
                 }],
                 budget: test_budget(),

@@ -13,6 +13,7 @@ use eliot_agent_api::{RouteFingerprint, StateFence};
 use eliot_agent_contracts::RevisionId;
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_receipts::ProofCeiling;
+use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -22,6 +23,7 @@ use crate::model_control::{
     ModelCatalogueSnapshot, ModelControlError, ModelQuery, ModelQueryHit, ModelQueryReceipt,
     ModelRole, ModelSelectionReceipt, ModelSelector, QuotaDisposition, RoleModelPreference,
     RouteAdmissionStatus, RouteHealthStatus, SelectionRejection, ZeroModelExecutionCounters,
+    validate_unique_texts,
 };
 use crate::provider_account_catalogue::{
     AuthDisposition, ConcurrencyDisposition, IncidentDisposition, ProviderAccountCatalogueSnapshot,
@@ -31,7 +33,7 @@ use crate::provider_account_catalogue::{
 pub const MODEL_REGISTRY_SCHEMA_VERSION: &str = "eliot.agent-model-registry/v1";
 pub const MODEL_SEARCH_SCHEMA_VERSION: &str = "eliot.agent-model-search/v1";
 /// Schema identity for [`CompiledRouteCandidates`].
-pub const COMPILED_ROUTE_CANDIDATES_VERSION: &str = "eliot.agent-route-candidates/v1";
+pub const COMPILED_ROUTE_CANDIDATES_VERSION: &str = "eliot.agent-route-candidates/v2";
 const MAX_EXPECTED_ROUTES: usize = 4096;
 const MAX_REQUIREMENTS: usize = 256;
 /// Maximum route-resolution inputs accepted by [`compile_route_candidates`].
@@ -1653,6 +1655,13 @@ pub struct RouteResolutionInput {
     pub capacity_revision: RevisionId,
     pub capacity_limit: usize,
     pub budget_evidence: BudgetEvidence,
+    /// Route-owner capability classes; declarations on the task, role, or
+    /// launch cannot make a route capable of a class by themselves.
+    pub route_classes: Vec<String>,
+    pub route_class_evidence_refs: Vec<String>,
+    /// Route-owner privacy classes for this exact route.
+    pub privacy_classes: Vec<PrivacyClass>,
+    pub privacy_evidence_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
 }
 
@@ -1729,6 +1738,37 @@ fn validate_resolution_input(input: &RouteResolutionInput) -> Result<(), ModelCo
         .budget_evidence
         .validate()
         .map_err(|_| ModelControlError::InvalidField("route_candidates.budget_evidence"))?;
+    if input.route_classes.is_empty() {
+        return Err(ModelControlError::InvalidField(
+            "route_candidates.route_classes",
+        ));
+    }
+    validate_unique_texts(
+        &input.route_classes,
+        "route_candidates.route_classes",
+        false,
+    )?;
+    validate_unique_texts(
+        &input.route_class_evidence_refs,
+        "route_candidates.route_class_evidence_refs",
+        false,
+    )?;
+    if input.privacy_classes.is_empty()
+        || input
+            .privacy_classes
+            .iter()
+            .enumerate()
+            .any(|(index, class)| input.privacy_classes[index + 1..].contains(class))
+    {
+        return Err(ModelControlError::InvalidField(
+            "route_candidates.privacy_classes",
+        ));
+    }
+    validate_unique_texts(
+        &input.privacy_evidence_refs,
+        "route_candidates.privacy_evidence_refs",
+        false,
+    )?;
     if input.evidence_refs.is_empty() {
         return Err(ModelControlError::InvalidField(
             "route_candidates.evidence_refs",
@@ -1876,11 +1916,29 @@ pub fn compile_route_candidates(
         let preference_rank = u16::try_from(index)
             .map_err(|_| ModelControlError::InvalidField("route_candidates.rank"))?;
         let mut evidence_refs = input.evidence_refs.clone();
+        evidence_refs.extend(input.route_class_evidence_refs.iter().cloned());
+        evidence_refs.extend(input.privacy_evidence_refs.iter().cloned());
+        evidence_refs.sort();
+        evidence_refs.dedup();
         for pin in [&catalogue_digest, &preference_policy_digest] {
             if !evidence_refs.iter().any(|existing| existing == pin) {
                 evidence_refs.push(pin.clone());
             }
         }
+        let mut route_classes = input.route_classes.clone();
+        route_classes.sort();
+        let mut route_class_evidence_refs = input.route_class_evidence_refs.clone();
+        route_class_evidence_refs.sort();
+        let mut privacy_evidence_refs = input.privacy_evidence_refs.clone();
+        privacy_evidence_refs.sort();
+        let mut privacy_classes = input.privacy_classes.clone();
+        privacy_classes.sort_by_key(|class| match class {
+            PrivacyClass::Public => 0,
+            PrivacyClass::Internal => 1,
+            PrivacyClass::Private => 2,
+            PrivacyClass::Secret => 3,
+            PrivacyClass::Licensed => 4,
+        });
         candidates.push(RouteCandidateEvidence {
             route: input.route.clone(),
             preference_rank,
@@ -1888,6 +1946,10 @@ pub fn compile_route_candidates(
             capacity_revision: input.capacity_revision.clone(),
             capacity_limit: input.capacity_limit,
             budget_evidence: input.budget_evidence.clone(),
+            route_classes,
+            route_class_evidence_refs,
+            privacy_classes,
+            privacy_evidence_refs,
             evidence_refs,
         });
     }

@@ -47,10 +47,9 @@
 //! recorded first. Route-class eligibility is bound to the request's own
 //! declared route classes, so a class the request never bound a route to is
 //! unstaffed and carries an explicit disposition rather than a candidate
-//! borrowed from a neighbouring class. The bridge's remaining two inputs — the
-//! shape-derived preset and the assumed route-local privacy dimension — are
-//! known defects of this path, each recorded with its out-of-scope enabler in
-//! [`crate::staffing_policy`].
+//! borrowed from a neighbouring class. The selected Human preset, its cost
+//! ceiling, and route-owner class/privacy evidence are bound into the canonical
+//! receipt persisted with the definition.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -748,11 +747,10 @@ pub(crate) fn build_admitted_provider_capability(
 /// unavailable independent audit included — is refused here, before any
 /// reservation, admission, activation or dispatch can observe it.
 ///
-/// Route-class eligibility is bound to the request's own declared route
-/// classes, so a class with no owner-proven binding is unstaffed and dispositioned
-/// rather than filled from the whole candidate pool. The shape-derived preset
-/// and the assumed route-local privacy dimension are known defects of this path
-/// and are documented, with their enablers, in [`crate::staffing_policy`].
+/// Route-class eligibility is bound to the route owner's classes intersected
+/// with recipe, role, and launch declarations. The selected Human intent and
+/// route-local privacy evidence are also bound into the canonical staffing
+/// receipt enforced against the compiled candidate.
 ///
 /// # Errors
 ///
