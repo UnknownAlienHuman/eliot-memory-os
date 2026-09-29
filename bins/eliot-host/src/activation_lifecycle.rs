@@ -1172,6 +1172,13 @@ pub(super) fn prove_terminal_runtime_release(
 /// STITCH, out of contour (other lane): the durable row commit and the Kernel
 /// renewal/expiry tick. Named adopters are the `ors_runtime_lease_current_v1`
 /// commit path beside
+/// Validity window in milliseconds for a Host-projected runtime lease
+/// (issue #1751 W4; I1.5). Mirrors the Kernel
+/// `RUNTIME_LEASE_VALIDITY_MS` and the supervision renewal policy's
+/// 60-second validity: one window for both halves of the lease census, so
+/// the projected expiry can never outlive the owner's proof.
+const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
+
 /// `RedbRecoveryStore::{load_runtime_leases_by_state_fence,
 /// load_runtime_lease_census_by_state_fence}`, consumed by the Kernel
 /// `idle_lease_census` runtime leg over the authenticated
@@ -1202,6 +1209,9 @@ pub fn project_runtime_lease(
         authority_epoch: activation.lineage.kernel_epoch.clone(),
         state_fence: contour_fence.clone(),
         state,
+        expires_at_ms: unix_millis()?
+            .checked_add(RUNTIME_LEASE_VALIDITY_MS)
+            .ok_or_else(|| HostError::Platform("runtime lease expiry overflowed".to_owned()))?,
     };
     lease
         .validate()
