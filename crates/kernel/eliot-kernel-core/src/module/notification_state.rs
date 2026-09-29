@@ -131,6 +131,19 @@ pub struct Acknowledgement {
     pub sequence: u64,
 }
 
+impl Acknowledgement {
+    /// Validates a recorded acknowledgement on its own terms.
+    ///
+    /// The `acknowledge` leg admits only a non-blank principal, so a record
+    /// that decodes with an empty one was not produced by this model. I11.7
+    /// keeps acknowledgement a toast-suppression observation only, so this
+    /// check deliberately reads no delivery or resolution field: a
+    /// suppression marker never decides whether a record is closed.
+    fn validate(&self) -> Result<(), NotificationError> {
+        text(&self.principal, "acknowledgement.principal")
+    }
+}
+
 /// Evidence-backed terminal disposition stored on the canonical record.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +158,43 @@ pub struct ResolutionRef {
     pub evidence_handles: Vec<String>,
     /// Human disposition recorded by the owner.
     pub disposition: String,
+}
+
+impl ResolutionRef {
+    /// Validates a recorded disposition against the record that carries it.
+    ///
+    /// These are the two rules the `resolve` leg already applies to its
+    /// [`ResolutionAuthorization`] — evidence is present, and every handle is
+    /// drawn from the record's own evidence — restated on the stored record so
+    /// the read gate accepts exactly the dispositions the write gate can
+    /// produce. Without it a decoded record carrying a disposition that names
+    /// no evidence, or evidence the record never carried, would pass
+    /// [`Notification::validate`], be counted as resolved by the canonical
+    /// inbox metrics, and drop out of the unresolved critical obligations: a
+    /// critical item would leave the board with no evidence behind it, which
+    /// is the closure I11.7:9 forbids.
+    ///
+    /// `record_evidence` is the record's own `evidence_handles`, passed in
+    /// rather than re-read so this stays a pure function of its arguments.
+    fn validate(&self, record_evidence: &[String]) -> Result<(), NotificationError> {
+        text(&self.receipt_id, "resolution.receipt_id")?;
+        text(&self.authority_id, "resolution.authority_id")?;
+        text(&self.authority_owner, "resolution.authority_owner")?;
+        text(&self.disposition, "resolution.disposition")?;
+        if self.evidence_handles.is_empty() {
+            return Err(NotificationError::ResolutionRequiresEvidence);
+        }
+        validate_text_list(&self.evidence_handles, "resolution.evidence_handle")
+            .map_err(|_| NotificationError::ResolutionEvidenceUnbound)?;
+        if self
+            .evidence_handles
+            .iter()
+            .any(|handle| !record_evidence.contains(handle))
+        {
+            return Err(NotificationError::ResolutionEvidenceUnbound);
+        }
+        Ok(())
+    }
 }
 
 /// Compatibility name for consumers that used the pre-I11.5 resolution type.
@@ -267,6 +317,15 @@ pub struct Notification {
 
 impl Notification {
     /// Validates the complete canonical record shape.
+    ///
+    /// Every I11.5 field the record carries is checked here, including the
+    /// two lifecycle observations: an acknowledgement must name a principal,
+    /// and a disposition must name the evidence it closes on. The two
+    /// lifecycle fields are validated, not ignored, because this is the one
+    /// gate every consumer of a decoded canonical record passes through
+    /// before treating it as an inbox row, and a record that reached the
+    /// store by any route other than these transitions must be refused here
+    /// rather than projected as a closed item.
     pub fn validate(&self) -> Result<(), NotificationError> {
         NotificationDraft {
             notification_id: self.notification_id.clone(),
@@ -286,7 +345,14 @@ impl Notification {
         if self.occurrences == 0 || self.revision == 0 {
             return Err(NotificationError::InvalidField("record_revision"));
         }
-        self.delivery.validate()
+        self.delivery.validate()?;
+        if let Some(acknowledgement) = &self.acknowledgement {
+            acknowledgement.validate()?;
+        }
+        if let Some(resolution) = &self.resolution_ref {
+            resolution.validate(&self.evidence_handles)?;
+        }
+        Ok(())
     }
 
     /// Returns true while the record still needs operator attention.
