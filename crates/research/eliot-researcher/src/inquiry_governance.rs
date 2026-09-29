@@ -6536,9 +6536,10 @@ fn assess_sources(
 ///
 /// A source identity is a reference I21.7 names, and so is everything a record
 /// built from it carries: its locator, its retained raw-evidence artifact
-/// handle, each of its citation edges and each of its span anchors. Before this
-/// revision this function looked at `candidate.handle` and nothing else, so a
-/// record whose *handle* was admitted and whose *locator* was
+/// handle, each of its citation edges, the raw source identity it was derived
+/// from and each of its span anchors. Before this revision this function looked
+/// at `candidate.handle` and nothing else, so a record whose *handle* was
+/// admitted and whose *locator* was
 /// `https://attacker.example/paper` produced no diagnostic at all — the URL was
 /// neither refused nor retained, and the eligibility decision in
 /// [`crate::source_admissibility::decide`] did not look at it either, so it rode
@@ -6724,10 +6725,10 @@ fn reference_firewall(
 /// here is exactly the set the eligibility decision refused. A reason here names
 /// the lever that can change the verdict and, unlike the candidate-handle arm,
 /// names the *surface* it was found on: a URL on a locator is admitted by
-/// `url_handles`, a citation edge and a receipt handle are admitted by the
-/// handle lists, and those are different lists for different surfaces, so a
-/// reason that named one where the other applies would send a reader to a list
-/// that cannot change the verdict.
+/// `url_handles`, while a citation edge, a raw-source derivation and a receipt
+/// handle are admitted by the handle lists, and those are different lists for
+/// different surfaces, so a reason that named one where the other applies would
+/// send a reader to a list that cannot change the verdict.
 ///
 /// This runs for every candidate rather than only for one whose own handle was
 /// unadmitted. A record whose source identity the manifest declares but whose

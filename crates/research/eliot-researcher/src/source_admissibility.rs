@@ -764,8 +764,8 @@ impl std::fmt::Display for GovernorSourceTransitionRequest {
 /// second, unadmitted reference on, and each is a reference in its own right:
 /// I21.7 names "a valid citation, URL, source ID, line range, artifact handle or
 /// support relation" as things a model cannot mint through prose, and a locator,
-/// a receipt handle, a citation edge and a span anchor are those things on a
-/// record that already passed the handle check.
+/// a receipt handle, a citation edge, a raw-source derivation and a span anchor
+/// are those things on a record that already passed the handle check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RecordReferenceSurface {
     /// `InquiryObservation::candidates[].handle` — the reference identity the
@@ -785,6 +785,27 @@ pub enum RecordReferenceSurface {
     ReceiptHandle,
     /// `SourceRecord::cites` — a citation edge to another source identity.
     CitationEdge,
+    /// `SourceRecord::transformed_from` — the raw source identity this record
+    /// was derived from.
+    ///
+    /// A source identity exactly like a citation edge, and missing before this
+    /// member existed. `SourceRecord::new` reads it only as text, and the
+    /// constructor's one rule on it is that it may not name the record's own
+    /// handle; nothing ever asked the manifest whether the manifest admits the
+    /// source identity it points at. So a record could name a raw source the
+    /// run-bound manifest does not list, and the derivation that record claims —
+    /// and the two independence axes
+    /// [`SourceIndependence::derived_from`] and
+    /// [`SourceIndependence::shared_context_ancestor`] read, and
+    /// `SourceTaint::DerivedFromParentSummary` refuses use on — would rest on a
+    /// reference identity this run never admitted. That is the same failure
+    /// `receipt_handle` had, one field over, and it is the sentence I21.7
+    /// forbids: a support relation minted through prose.
+    ///
+    /// Identity surface, not coordinate: like a citation edge it names *another
+    /// source identity*, not a position inside this one, so it is admitted by
+    /// the handle lists and never by `url_handles`.
+    RawSourceDerivation,
     /// `SourceRecord::evidence_spans[].anchor` — a coordinate inside the source.
     SpanAnchor,
 }
@@ -798,6 +819,7 @@ impl RecordReferenceSurface {
             Self::Locator => "locator",
             Self::ReceiptHandle => "receipt_handle",
             Self::CitationEdge => "citation_edge",
+            Self::RawSourceDerivation => "raw_source_derivation",
             Self::SpanAnchor => "span_anchor",
         }
     }
@@ -829,6 +851,36 @@ pub struct PresentedReference {
 /// able to act on separately. Order is the record's own field order and the
 /// record's own element order, so the same record always presents the same
 /// references in the same sequence.
+///
+/// The raw-source derivation sits between the citation edges and the span
+/// anchors for the same reason it is emitted there: it is a field order fact
+/// here and a kind fact in [`RecordReferenceSurface`].
+///
+/// # Why the derivation is enumerated at all
+///
+/// Every other field on this record that names *another source identity* is
+/// enumerated, and this one was not, which made it the single ungated reference
+/// a vetted record could carry. `SourceRecord::new` checks that a derivation does
+/// not name the record's own handle and that it is non-blank text, but neither
+/// the eligibility decision in [`decide`] nor the retained diagnostic in
+/// `crate::inquiry_governance::reference_firewall` ever asked the manifest
+/// whether it admits the identity named here. Measured on `origin/main` before
+/// this change, `transformed_from` had nine occurrences across
+/// `eliot-researcher/src` and not one of them was a manifest admission: three in
+/// `inquiry_governance.rs` (two independence-axis projections and one `None` at
+/// the composition root) and six in `evidence_portfolio.rs` and this file (the
+/// field, the constructor's self-reference rule, the `AuthorizedManifest` mirror,
+/// a lineage-index build, a grade cap, and the taint test this file reads it for).
+/// A record could therefore claim it was derived from a source this run never
+/// admitted, and the claim is load-bearing: it is what
+/// `SourceIndependence::derived_from` and
+/// `SourceIndependence::shared_context_ancestor` read to place the record on two
+/// independence axes, and what `SourceTaint::DerivedFromParentSummary` keys on
+/// to refuse evidentiary use of an unverified reduction. An independence claim
+/// resting on an unadmitted source is not independence this run established.
+///
+/// It is emitted only when present, so a record with no raw lineage presents no
+/// derivation rather than presenting an empty one.
 #[must_use]
 pub fn record_references(record: &SourceRecord) -> Vec<PresentedReference> {
     let mut presented = vec![
@@ -845,6 +897,17 @@ pub fn record_references(record: &SourceRecord) -> Vec<PresentedReference> {
         presented.push(PresentedReference {
             surface: RecordReferenceSurface::CitationEdge,
             reference: edge.clone(),
+        });
+    }
+    // The raw source this record was derived from is a source identity, and the
+    // one this reader did not enumerate. It is emitted only when the record
+    // carries one, because an absent derivation is not a reference any manifest
+    // can admit and emitting the empty string would make a record with no raw
+    // lineage look like one pointing at an identity named "".
+    if let Some(raw) = &record.transformed_from {
+        presented.push(PresentedReference {
+            surface: RecordReferenceSurface::RawSourceDerivation,
+            reference: raw.clone(),
         });
     }
     for span in &record.evidence_spans {
@@ -889,10 +952,16 @@ pub fn record_references(record: &SourceRecord) -> Vec<PresentedReference> {
 ///   artifact handle at all still produced citable records. The exemption above
 ///   rests on the reference naming a position *inside the admitted source*, and
 ///   a receipt handle does not, so it does not apply here.
-/// - a **citation edge**
-///   ([`RecordReferenceSurface::CitationEdge`]) is a source identity, not a
-///   pointer, so it is admitted only by the source, evidence and artifact handle
-///   lists and never by `url_handles`.
+/// - a **citation edge** ([`RecordReferenceSurface::CitationEdge`]) is a source
+///   identity, not a pointer, so it is admitted only by the source, evidence and
+///   artifact handle lists and never by `url_handles`.
+/// - a **raw-source derivation** ([`RecordReferenceSurface::RawSourceDerivation`])
+///   is the same kind of fact by the same reading: it names the other source
+///   identity this record was reduced from, so it is admitted by the handle
+///   lists and never by `url_handles`. A record whose derivation points at an
+///   identity this manifest does not list is a record whose claimed support
+///   relation rests on a source this run never admitted, and it is refused here
+///   for exactly the reason its citation edges are.
 /// - a **candidate handle** ([`RecordReferenceSurface::CandidateHandle`]) is an
 ///   identity with no admitted source behind it at all, so it is admitted by the
 ///   same handle lists and by nothing else.
@@ -931,6 +1000,7 @@ pub fn admits_record_reference(
     match presented.surface {
         RecordReferenceSurface::CandidateHandle
         | RecordReferenceSurface::CitationEdge
+        | RecordReferenceSurface::RawSourceDerivation
         | RecordReferenceSurface::ReceiptHandle => manifest.allows(&presented.reference),
         RecordReferenceSurface::Locator | RecordReferenceSurface::SpanAnchor => {
             match classify_locator(&presented.reference) {
