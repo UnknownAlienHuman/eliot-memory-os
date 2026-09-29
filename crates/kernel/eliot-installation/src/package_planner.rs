@@ -20,7 +20,8 @@ use crate::{
     RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
     StoreCredentialProvisionPlan, StoreCredentialScope, SupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
-    phase_b_static_template_for_candidate, select_profile_roots, supervision_key_slot_for_scope_id,
+    phase_b_static_template_for_candidate, provider_bootstrap_credential_target_for_store_target,
+    select_profile_roots, supervision_key_slot_for_scope_id,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 
@@ -1869,6 +1870,25 @@ impl GenerationPackagePlanner {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
                     target: candidate.store_credential_target.clone(),
+                    // The provider child's own bootstrap/admin reference, derived
+                    // by the single installation owner in its own reserved
+                    // namespace. Provisioning it here is what makes the pair
+                    // INDEPENDENTLY rotatable (#1810 step 3): before this, the
+                    // Store bridge required a second reference that nothing in
+                    // installation ever provisioned, so it could not be rotated,
+                    // revoked, or proved absent. This calls the owner's single
+                    // derivation rule rather than repeating it.
+                    provider_bootstrap_target: Some(
+                        provider_bootstrap_credential_target_for_store_target(
+                            &candidate.store_credential_target,
+                        )
+                        .map_err(|error| {
+                            InstallationError::InvalidField {
+                                field: "generation.provider_bootstrap_target".to_owned(),
+                                reason: error.to_string(),
+                            }
+                        })?,
+                    ),
                     provider: StoreCredentialProvider::WindowsCredentialManager,
                     scope: StoreCredentialScope::LocalService,
                     expected_principal_sid: PlatformHandle::new(LOCAL_SERVICE_SID).map_err(
@@ -1942,6 +1962,20 @@ impl GenerationPackagePlanner {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
                     target: candidate.store_credential_target.clone(),
+                    // Same owner, same single derivation rule as the other
+                    // provisioning site; a second copy of the domain string
+                    // would let the two contours drift apart.
+                    provider_bootstrap_target: Some(
+                        provider_bootstrap_credential_target_for_store_target(
+                            &candidate.store_credential_target,
+                        )
+                        .map_err(|error| {
+                            InstallationError::InvalidField {
+                                field: "generation.provider_bootstrap_target".to_owned(),
+                                reason: error.to_string(),
+                            }
+                        })?,
+                    ),
                     provider: StoreCredentialProvider::WindowsCredentialManager,
                     scope: StoreCredentialScope::LocalService,
                     expected_principal_sid: PlatformHandle::new(LOCAL_SERVICE_SID).map_err(

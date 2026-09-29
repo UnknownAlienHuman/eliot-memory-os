@@ -719,6 +719,19 @@ pub struct StoreCredentialProvisionPlan {
     /// this non-public target plus the create-new marker is the final race
     /// trust boundary; any observed target is rejected and never overwritten.
     pub target: PlatformHandle,
+    /// The provider child's own bootstrap/admin reference, provisioned by this
+    /// same owner in its own reserved namespace.
+    ///
+    /// #1810 step 3 requires the bootstrap/admin reference and the ordinary
+    /// client reference to be INDEPENDENTLY rotatable, and I15.4 requires that
+    /// they are distinct references a sibling process inherits neither of. A
+    /// single `target` cannot express that: rotating it would rewrite the
+    /// ordinary client credential too, and one absent value would silently
+    /// leave the provider child unauthenticated. It is `Option` only because a
+    /// pre-existing single-reference installation is still parseable; when it
+    /// is `None` no bootstrap credential is provisioned at all, which the Store
+    /// bridge then fails closed on rather than substituting a default.
+    pub provider_bootstrap_target: Option<PlatformHandle>,
     /// Exact provider implementation.
     pub provider: StoreCredentialProvider,
     /// Exact token scope.
@@ -750,6 +763,37 @@ impl StoreCredentialProvisionPlan {
                 field: "credential.target".to_owned(),
                 reason,
             });
+        }
+        if let Some(provider_bootstrap_target) = &self.provider_bootstrap_target {
+            handle(
+                provider_bootstrap_target,
+                "credential.provider_bootstrap_target",
+            )?;
+            if let Err(reason) =
+                validate_provider_bootstrap_credential_target(provider_bootstrap_target.as_str())
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "credential.provider_bootstrap_target".to_owned(),
+                    reason,
+                });
+            }
+            // Sibling noninheritance, proved on the pair rather than asserted
+            // in prose: the two references must land in DIFFERENT reserved
+            // namespaces, so no single rotation rewrites both and neither
+            // contour's read can resolve the other's value.
+            //
+            // The two namespaces are the owner-admitted constants, not a
+            // caller-supplied list, so a missing member cannot make this pass
+            // by agreeing with itself: a caller that sets
+            // `provider_bootstrap_target` to the client reference itself is
+            // refused here, because `eliot/store/v1/` is not a provider target.
+            if provider_bootstrap_target.as_str() == self.target.as_str() {
+                return Err(InstallationError::ProfileViolation(
+                    "provider bootstrap credential must not alias the ordinary client \
+                     credential reference; a sibling inheriting one inherits both"
+                        .to_owned(),
+                ));
+            }
         }
         handle(
             &self.expected_principal_sid,
