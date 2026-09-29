@@ -863,7 +863,9 @@ pub enum RouteRegistryError {
     /// I10.3 admits `interactive_user` launches only through the authorized
     /// User Broker: direct daemon or Kernel launching under a user-desktop
     /// identity is rejected instead of being treated as equivalent.
-    #[error("an interactive_user route may launch only through its declared User Broker class; direct daemon or kernel launching under a user-desktop identity is rejected")]
+    #[error(
+        "an interactive_user route may launch only through its declared User Broker class; direct daemon or kernel launching under a user-desktop identity is rejected"
+    )]
     InteractiveUserRequiresUserBroker,
 }
 
