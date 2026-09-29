@@ -525,7 +525,11 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
 /// standing entry is marked stale before insert, so the drift is recorded
 /// even when the insert below refuses (unknown tools) — a refused reinstall
 /// must not leave the old pins looking current against the new declaration.
-/// Quarantined standing entries are left untouched (governed state).
+/// The same pre-insert marking covers the other two dependency legs: a new
+/// admitted Tool Definition version marks definition drift stale (contract
+/// leg), and standing tool references the owner's view no longer knows mark
+/// the tool basis stale (tool leg). Quarantined standing entries are left
+/// untouched (governed state).
 ///
 /// Re-installing a revised package replaces the entry wholesale
 /// (immutable-body revision): the catalogue digest changes, so Hotset receipts
@@ -559,6 +563,35 @@ pub fn install_package(
             &context.host_version,
             &context.profile_version,
         )?;
+    }
+    let definition_drifted = catalogue.get(&skill_id).is_some_and(|standing| {
+        standing.admitted_definition_version != context.admitted_definition_version
+    });
+    if definition_drifted {
+        let admitted = catalogue
+            .get(&skill_id)
+            .map(|standing| standing.admitted_definition_version.clone())
+            .ok_or(SkillError::NotFound)?;
+        catalogue.mark_definition_drift_stale(
+            &skill_id,
+            &context.admitted_definition_version,
+            &admitted,
+        )?;
+    }
+    let missing_tools: Vec<String> = catalogue
+        .get(&skill_id)
+        .map(|standing| {
+            standing
+                .body
+                .tool_refs
+                .iter()
+                .filter(|tool| !tools.knows_tool(tool))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if !missing_tools.is_empty() {
+        catalogue.mark_tool_basis_stale(&skill_id, &missing_tools)?;
     }
     catalogue.insert(entry, tools)?;
     Ok(skill_id)
