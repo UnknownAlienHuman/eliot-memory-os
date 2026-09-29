@@ -40,11 +40,10 @@ use eliot_platform_windows::{
     WindowsPlatform,
 };
 use eliot_process::{
-    DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
-    KernelDispatchKey, OperationId, OriginChallenge, OriginChallengeRequest,
-    OriginControlGrant, OriginControlOperation, OriginControlPresentation, PermitIssuance,
-    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
-    ProcessExecutionError, ProcessExecutor,
+    DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation, KernelDispatchKey,
+    OperationId, OriginChallenge, OriginChallengeRequest, OriginControlGrant,
+    OriginControlOperation, OriginControlPresentation, PermitIssuance, ProcessEvidence,
+    ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
     ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
     ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SessionId,
     SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
@@ -143,11 +142,7 @@ impl GovernedProcessEffectBinding {
         &self.operation_id
     }
 
-    fn matches_request(
-        &self,
-        owner: &ProcessOwnerBinding,
-        request: &ProcessRequest,
-    ) -> bool {
+    fn matches_request(&self, owner: &ProcessOwnerBinding, request: &ProcessRequest) -> bool {
         self.owner == *owner
             && self.operation_id == *request.operation_id()
             && self.session_id == *request.session_id()
