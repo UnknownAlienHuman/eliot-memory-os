@@ -954,6 +954,9 @@ public sealed record UserAutomationOutcome(
 /// </summary>
 public sealed record UserAutomationResultValidationContext
 {
+    // A reviewed decoder change must explicitly acknowledge the Rust result schema.
+    private const string SupportedUserAutomationResultSchemaSha256 = "97e2c5cdde5475940818fd97844dd08a293777941f0e2f9769936c370cb5b9c9";
+
     private UserAutomationResultValidationContext(
         string expectedOperationId,
         string expectedIdempotencyKey,
@@ -1050,10 +1053,6 @@ public sealed record UserAutomationResultValidationContext
 /// </remarks>
 public static class UserAutomationOutcomeClassifier
 {
-    // Regeneration is refused unless this decoder explicitly acknowledges the
-    // Rust result/transition schema digest. Update only with a reviewed decoder
-    // change; the generated mirror alone must not widen the accepted wire.
-    private const string SupportedUserAutomationResultSchemaSha256 = "30ebaa34afb15650f576a87522ac2f47f4e367256b31f1ffb8e06d6eb44328e8";
     private const int MaxTypedEnvelopeChars = OperatorProtocol.MaxLineChars;
     private const int MaxIdentityChars = 256;
     // The Kernel's bounded idempotency key is prefixed in operation_id.
@@ -1880,7 +1879,7 @@ public static class UserAutomationOutcomeClassifier
         if (!HasAllowedAndRequiredProperties(
                 phase,
                 OperatorScheduleContract.USER_AUTOMATION_HORIZON_PHASE_MEMBERS,
-                OperatorScheduleContract.USER_AUTOMATION_HORIZON_PHASE_REQUIRED_MEMBERS)
+                OperatorScheduleContract.USER_AUTOMATION_HORIZON_PHASE_MEMBERS)
             || !TryReadClosedValue(phase, "trigger", OperatorScheduleContract.USER_AUTOMATION_HORIZON_TRIGGER_VALUES, out _)
             || !TryReadBoundedText(phase, "automation_id", MaxIdentityChars, out _)
             || !TryReadBoundedText(phase, "automation_revision", MaxIdentityChars, out _)
@@ -1913,7 +1912,7 @@ public static class UserAutomationOutcomeClassifier
         if (!HasAllowedAndRequiredProperties(
                 record,
                 OperatorScheduleContract.USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS,
-                OperatorScheduleContract.USER_AUTOMATION_ORCHESTRATION_RECORD_REQUIRED_MEMBERS)
+                OperatorScheduleContract.USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS)
             || !TryGetObject(record, "parent", out var parent)
             || !HasExactProperties(parent, "operation_id", "canonical_request_hash", "idempotency_key")
             || !TryReadBoundedText(parent, "operation_id", MaxOperationIdChars, out _)
@@ -1938,7 +1937,7 @@ public static class UserAutomationOutcomeClassifier
             if (!HasAllowedAndRequiredProperties(
                     obligation,
                     OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS,
-                    OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_REQUIRED_MEMBERS)
+                    OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS)
                 || !TryReadClosedValue(obligation, "kind", OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_KINDS, out _)
                 || !TryReadBoundedText(obligation, "owner_operation_id", MaxOperationIdChars, out _)
                 || !TryReadBoundedText(obligation, "request_digest", 64, out var requestDigest)

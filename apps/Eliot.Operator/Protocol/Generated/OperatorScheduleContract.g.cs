@@ -26,12 +26,12 @@
 //   crates/kernel/eliot-kernel-core/src/module/notification_state.rs
 //   crates/foundation/eliot-receipts/src/lib.rs
 //   crates/kernel/eliot-platform/src/handle_nonce.rs
-// contract_source_sha256: f43d4604a9ecdabf3878e8abc427dbf947c70fd172e46408fb1aaec12c90a546
+// contract_source_sha256: b995a43a341c733450bf1d55af522e5341ff65ca4948798137ffbdbfeb0afd35
 // constants_source_sha256: ea50e5435dd673fd0db560e3dbee5830f8b8382bde9ba9f41061ff5c1666a511
 // dispositions_source_sha256: c4e647fdf7f44d2ad6a194259323bf75c220b4b2bf4f00f40ffbb258cf0c2817
 // refusals_source_sha256: 2f2fd3ce7bbf507d067887e936c06089a7b21fb2576271524c55374010a2ade6
 // grammar_source_sha256: 0283a4fe812976c36ae4e22821c8b445c3b9881b516600b6727820381cb8c5a6
-// user_automation_result_schema_sha256: 30ebaa34afb15650f576a87522ac2f47f4e367256b31f1ffb8e06d6eb44328e8
+// user_automation_result_schema_sha256: 97e2c5cdde5475940818fd97844dd08a293777941f0e2f9769936c370cb5b9c9
 //
 // Stated boundary of this mirror. The Operator validates the bounded wire
 // shape, the exact supported contract version and the self-consistency of the
@@ -203,7 +203,7 @@ public static class OperatorScheduleContract
     /// The C# decoder source pins this value separately; changing only the
     /// generated artefact cannot widen the decoder.
     /// </summary>
-    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "30ebaa34afb15650f576a87522ac2f47f4e367256b31f1ffb8e06d6eb44328e8";
+    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "97e2c5cdde5475940818fd97844dd08a293777941f0e2f9769936c370cb5b9c9";
 
     /// <summary>Generated public members of `UserAutomationOperatorResultEnvelope`.</summary>
     public static readonly string[] USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS =

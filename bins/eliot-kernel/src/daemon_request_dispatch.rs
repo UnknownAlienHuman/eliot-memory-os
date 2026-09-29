@@ -3922,20 +3922,20 @@ impl KernelComposition {
         match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
             Ok(()) => {}
             Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
-                return Ok(Self::bind_user_automation_operator_response(
+                return Self::bind_user_automation_operator_response(
                     &request,
-                    Self::user_automation_precommit_refusal_response(&request, &error),
-                )?);
+                    &Self::user_automation_precommit_refusal_response(&request, &error),
+                );
             }
             Err(_) => {
-                return Ok(Self::bind_user_automation_operator_response(
+                return Self::bind_user_automation_operator_response(
                     &request,
-                    Self::user_automation_runtime_error_response(
+                    &Self::user_automation_runtime_error_response(
                         UserAutomationRuntimeError::UnknownOutcome(
                             "user_automation_request_validation_outcome_unavailable".to_owned(),
                         ),
                     ),
-                )?);
+                );
             }
         }
         let transition = match self
@@ -3944,7 +3944,7 @@ impl KernelComposition {
         {
             Ok(transition) => transition,
             Err(response) => {
-                return Ok(Self::bind_user_automation_operator_response(&request, response)?);
+                return Self::bind_user_automation_operator_response(&request, &response);
             }
         };
         if !transition.is_known() {
@@ -3955,28 +3955,26 @@ impl KernelComposition {
             // only; the response value is unchanged.
             observe_daemon_request("kernel.daemon_response_unknown", "unknown");
         }
-        let envelope = match eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_transition(
-            &request,
-            transition,
-        ) {
-            Ok(envelope) => envelope,
-            Err(_) => {
-                // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
-                // observation only; `execute_daemon_request_observed` owns
-                // the single designated terminal for this failed operation.
-                observe_daemon_request(
-                    "kernel.daemon_user_automation_occurrence_projection",
-                    "unknown",
-                );
-                return Ok(Self::bind_user_automation_operator_response(
-                    &request,
-                    Self::user_automation_runtime_error_response(
-                        UserAutomationRuntimeError::UnknownOutcome(
-                            "user_automation_occurrence_projection_requires_reconciliation".to_owned(),
-                        ),
+        let Ok(envelope) =
+            eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_transition(
+                &request, transition,
+            )
+        else {
+            // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+            // observation only; `execute_daemon_request_observed` owns
+            // the single designated terminal for this failed operation.
+            observe_daemon_request(
+                "kernel.daemon_user_automation_occurrence_projection",
+                "unknown",
+            );
+            return Self::bind_user_automation_operator_response(
+                &request,
+                &Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "user_automation_occurrence_projection_requires_reconciliation".to_owned(),
                     ),
-                )?);
-            }
+                ),
+            );
         };
         serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
     }
@@ -3984,7 +3982,7 @@ impl KernelComposition {
     #[cfg(windows)]
     fn bind_user_automation_operator_response(
         request: &eliot_kernel_service::UserAutomationServiceRequest,
-        response: serde_json::Value,
+        response: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let envelope =
             eliot_kernel_service::UserAutomationOperatorResultEnvelope::bind_internal_response(

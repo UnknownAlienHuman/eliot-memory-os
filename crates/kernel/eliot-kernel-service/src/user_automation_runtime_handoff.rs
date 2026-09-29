@@ -60,7 +60,7 @@ pub const USER_AUTOMATION_RESULT_WIRE_ID: &str = "eliot.kernel.user-automation.o
 /// Current version of the result envelope and its closed payload union.
 pub const USER_AUTOMATION_RESULT_WIRE_VERSION: u16 = 1;
 
-/// The submitted operation correlation echoed beside every UserAutomation
+/// The submitted operation correlation echoed beside every `UserAutomation`
 /// result. This is distinct from the JSON-RPC transport identifier, which the
 /// current Operator client does not expose.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -72,7 +72,7 @@ pub struct UserAutomationResultCorrelation {
     pub idempotency_key: String,
 }
 
-/// Disposition of a versioned UserAutomation Operator result.
+/// Disposition of a versioned `UserAutomation` Operator result.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UserAutomationOperatorResultStatus {
@@ -99,9 +99,9 @@ pub enum UserAutomationOperatorResultRecovery {
 #[serde(untagged)]
 pub enum UserAutomationOperatorResultValue {
     /// Full canonical transition plus its deterministic inspection projection.
-    Transition(UserAutomationOperatorTransitionValue),
+    Transition(Box<UserAutomationOperatorTransitionValue>),
     /// Typed refusal before the canonical Store was called.
-    AttemptRefusal(UserAutomationAttemptRefusalValue),
+    AttemptRefusal(Box<UserAutomationAttemptRefusalValue>),
     /// Proven absence in an owner readback.
     NotRetained(UserAutomationNotRetainedValue),
     /// The owner could not be reached.
@@ -127,10 +127,7 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
         let object = value
             .as_object()
             .ok_or_else(|| D::Error::custom("UserAutomation result value is not an object"))?;
-        if object
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("user_automation_refusal")
+        if object.get("kind").and_then(serde_json::Value::as_str) == Some("user_automation_refusal")
         {
             return serde_json::from_value(value)
                 .map(Self::AttemptRefusal)
@@ -154,6 +151,7 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
 
         match variant {
             "transition" => serde_json::from_value(value)
+                .map(Box::new)
                 .map(Self::Transition)
                 .map_err(D::Error::custom),
             "not_retained" => serde_json::from_value(value)
@@ -174,7 +172,9 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
             "identity_conflict" => serde_json::from_value(value)
                 .map(Self::IdentityConflict)
                 .map_err(D::Error::custom),
-            _ => Err(D::Error::custom("UserAutomation result value is unsupported")),
+            _ => Err(D::Error::custom(
+                "UserAutomation result value is unsupported",
+            )),
         }
     }
 }
@@ -312,12 +312,19 @@ pub struct UserAutomationIdentityConflictValue {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserAutomationOperatorResultEnvelope {
+    /// Closed public result wire identity.
     pub wire_id: String,
+    /// Version of the closed public result contract.
     pub wire_version: u16,
+    /// Known or unresolved disposition of the whole result.
     pub status: UserAutomationOperatorResultStatus,
+    /// Exact semantic identity of the submitted Operator request.
     pub correlation: UserAutomationResultCorrelation,
+    /// Authenticated State Fence observed by the Kernel owner.
     pub state_fence: StateFence,
+    /// Closed result payload bound to this correlation and fence.
     pub value: UserAutomationOperatorResultValue,
+    /// Required owner reconciliation, or absence once settled.
     pub recovery: Option<UserAutomationOperatorResultRecovery>,
 }
 
@@ -343,12 +350,12 @@ impl UserAutomationOperatorResultEnvelope {
             status,
             correlation: result_correlation(request),
             state_fence: request.context.state_fence.clone(),
-            value: UserAutomationOperatorResultValue::Transition(
+            value: UserAutomationOperatorResultValue::Transition(Box::new(
                 UserAutomationOperatorTransitionValue {
                     transition,
                     occurrences,
                 },
-            ),
+            )),
             recovery,
         };
         envelope.validate_for_request(request)?;
@@ -359,7 +366,7 @@ impl UserAutomationOperatorResultEnvelope {
     /// versioned public envelope. Legacy JSON never crosses this boundary.
     pub fn bind_internal_response(
         request: &UserAutomationServiceRequest,
-        response: serde_json::Value,
+        response: &serde_json::Value,
     ) -> Result<Self, String> {
         let object = response
             .as_object()
@@ -382,17 +389,19 @@ impl UserAutomationOperatorResultEnvelope {
                 .cloned()
                 .ok_or_else(|| "internal UserAutomation response has no value".to_owned())?,
         )?;
-        let recovery = if object.get("recovery").is_some_and(serde_json::Value::is_null) {
+        let recovery = if object
+            .get("recovery")
+            .is_some_and(serde_json::Value::is_null)
+        {
             None
         } else {
             Some(
-                serde_json::from_value(
-                    object
-                        .get("recovery")
-                        .cloned()
-                        .ok_or_else(|| "internal UserAutomation response has no recovery".to_owned())?,
-                )
-                .map_err(|_| "internal UserAutomation recovery is not a closed variant".to_owned())?,
+                serde_json::from_value(object.get("recovery").cloned().ok_or_else(|| {
+                    "internal UserAutomation response has no recovery".to_owned()
+                })?)
+                .map_err(|_| {
+                    "internal UserAutomation recovery is not a closed variant".to_owned()
+                })?,
             )
         };
         let envelope = Self {
@@ -410,13 +419,23 @@ impl UserAutomationOperatorResultEnvelope {
 
     /// Validates the complete envelope against the request the authenticated
     /// route actually admitted. This is the only constructor-independent gate.
-    pub fn validate_for_request(&self, request: &UserAutomationServiceRequest) -> Result<(), String> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "closed result variants each require an exact disposition check"
+    )]
+    pub fn validate_for_request(
+        &self,
+        request: &UserAutomationServiceRequest,
+    ) -> Result<(), String> {
         if self.wire_id != USER_AUTOMATION_RESULT_WIRE_ID
             || self.wire_version != USER_AUTOMATION_RESULT_WIRE_VERSION
             || self.correlation != result_correlation(request)
             || self.state_fence != request.context.state_fence
         {
-            return Err("UserAutomation result envelope is not bound to the submitted operation and fence".to_owned());
+            return Err(
+                "UserAutomation result envelope is not bound to the submitted operation and fence"
+                    .to_owned(),
+            );
         }
         self.state_fence
             .validate()
@@ -426,7 +445,10 @@ impl UserAutomationOperatorResultEnvelope {
                 value.transition.validate_for_request(request)?;
                 validate_schedule_inspection_projections(&value.transition, &value.occurrences)?;
                 if self.recovery.as_ref().is_some_and(|recovery| {
-                    matches!(recovery, UserAutomationOperatorResultRecovery::LedgerReadOwed { .. })
+                    matches!(
+                        recovery,
+                        UserAutomationOperatorResultRecovery::LedgerReadOwed { .. }
+                    )
                 }) {
                     return Err("transition cannot carry a non-transition recovery kind".to_owned());
                 }
@@ -440,15 +462,20 @@ impl UserAutomationOperatorResultEnvelope {
                             UserAutomationOperatorResultStatus::Unknown
                         }
                 {
-                    return Err("UserAutomation transition status/recovery does not join its phases".to_owned());
+                    return Err(
+                        "UserAutomation transition status/recovery does not join its phases"
+                            .to_owned(),
+                    );
                 }
             }
             UserAutomationOperatorResultValue::AttemptRefusal(value) => {
                 if self.status != UserAutomationOperatorResultStatus::Unknown
-                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
-                        recovery,
-                        UserAutomationOperatorResultRecovery::UnknownOutcome { .. }
-                    ))
+                    || !self.recovery.as_ref().is_some_and(|recovery| {
+                        matches!(
+                            recovery,
+                            UserAutomationOperatorResultRecovery::UnknownOutcome { .. }
+                        )
+                    })
                     || value.kind != "user_automation_refusal"
                     || value.schema_version != 1
                     || value.operation.operation_id != self.correlation.operation_id
@@ -458,7 +485,9 @@ impl UserAutomationOperatorResultEnvelope {
                     || value.attempt_state != "store_not_called"
                     || value.refusal.code.trim().is_empty()
                 {
-                    return Err("UserAutomation refusal is not bound to the current attempt".to_owned());
+                    return Err(
+                        "UserAutomation refusal is not bound to the current attempt".to_owned()
+                    );
                 }
             }
             UserAutomationOperatorResultValue::NotRetained(value) => {
@@ -468,42 +497,56 @@ impl UserAutomationOperatorResultEnvelope {
                     || value.outcome != "not_retained"
                     || value.reason.trim().is_empty()
                 {
-                    return Err("UserAutomation not-retained result has an invalid disposition".to_owned());
+                    return Err(
+                        "UserAutomation not-retained result has an invalid disposition".to_owned(),
+                    );
                 }
             }
             UserAutomationOperatorResultValue::Unavailable(value) => {
                 if self.status != UserAutomationOperatorResultStatus::Unknown
-                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
-                        recovery,
-                        UserAutomationOperatorResultRecovery::Unavailable { .. }
-                    ))
+                    || !self.recovery.as_ref().is_some_and(|recovery| {
+                        matches!(
+                            recovery,
+                            UserAutomationOperatorResultRecovery::Unavailable { .. }
+                        )
+                    })
                     || value.outcome != "unavailable"
                 {
-                    return Err("UserAutomation unavailable result has an invalid disposition".to_owned());
+                    return Err(
+                        "UserAutomation unavailable result has an invalid disposition".to_owned(),
+                    );
                 }
             }
             UserAutomationOperatorResultValue::UnknownOutcome(value) => {
                 if self.status != UserAutomationOperatorResultStatus::Unknown
-                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
-                        recovery,
-                        UserAutomationOperatorResultRecovery::UnknownOutcome { .. }
-                    ))
+                    || !self.recovery.as_ref().is_some_and(|recovery| {
+                        matches!(
+                            recovery,
+                            UserAutomationOperatorResultRecovery::UnknownOutcome { .. }
+                        )
+                    })
                     || value.outcome != "unknown_outcome"
                 {
-                    return Err("UserAutomation unknown result has an invalid disposition".to_owned());
+                    return Err(
+                        "UserAutomation unknown result has an invalid disposition".to_owned()
+                    );
                 }
             }
             UserAutomationOperatorResultValue::OutcomeSettled(value) => {
                 if self.status != UserAutomationOperatorResultStatus::Known
-                    || !self.recovery.as_ref().is_some_and(|recovery| matches!(
-                        recovery,
-                        UserAutomationOperatorResultRecovery::LedgerReadOwed { .. }
-                    ))
+                    || !self.recovery.as_ref().is_some_and(|recovery| {
+                        matches!(
+                            recovery,
+                            UserAutomationOperatorResultRecovery::LedgerReadOwed { .. }
+                        )
+                    })
                     || !value.accepted
                     || value.outcome != "outcome_settled"
                     || value.reason.trim().is_empty()
                 {
-                    return Err("UserAutomation settled result has an invalid disposition".to_owned());
+                    return Err(
+                        "UserAutomation settled result has an invalid disposition".to_owned()
+                    );
                 }
             }
             UserAutomationOperatorResultValue::Rejected(value) => {
@@ -513,7 +556,9 @@ impl UserAutomationOperatorResultEnvelope {
                     || value.outcome != "rejected"
                     || value.reason.trim().is_empty()
                 {
-                    return Err("UserAutomation rejection result has an invalid disposition".to_owned());
+                    return Err(
+                        "UserAutomation rejection result has an invalid disposition".to_owned()
+                    );
                 }
             }
             UserAutomationOperatorResultValue::IdentityConflict(value) => {
@@ -522,7 +567,9 @@ impl UserAutomationOperatorResultEnvelope {
                     || value.accepted
                     || value.outcome != "identity_conflict"
                 {
-                    return Err("UserAutomation identity conflict has an invalid disposition".to_owned());
+                    return Err(
+                        "UserAutomation identity conflict has an invalid disposition".to_owned(),
+                    );
                 }
             }
         }
@@ -554,7 +601,8 @@ fn user_automation_inspection_occurrences(
                 UserAutomationTrigger::Scheduled { occurrence_key } => occurrence_key.as_str(),
                 UserAutomationTrigger::Manual { .. } => {
                     return Err(
-                        "compiled UserAutomation schedule identity is unexpectedly manual".to_owned(),
+                        "compiled UserAutomation schedule identity is unexpectedly manual"
+                            .to_owned(),
                     );
                 }
             };
@@ -592,7 +640,8 @@ fn validate_schedule_inspection_projections(
     let expected = user_automation_inspection_occurrences(transition)?;
     if projections != expected {
         return Err(
-            "UserAutomation schedule projection does not exactly match its owner transition".to_owned(),
+            "UserAutomation schedule projection does not exactly match its owner transition"
+                .to_owned(),
         );
     }
     Ok(())
@@ -616,11 +665,9 @@ fn parse_result_value(
             .map(UserAutomationOperatorResultValue::Transition)
             .map_err(|_| "UserAutomation transition result is not closed".to_owned());
     }
-    if object.get("kind").and_then(serde_json::Value::as_str)
-        == Some("user_automation_refusal")
-    {
+    if object.get("kind").and_then(serde_json::Value::as_str) == Some("user_automation_refusal") {
         return serde_json::from_value(value)
-            .map(UserAutomationOperatorResultValue::AttemptRefusal)
+            .map(|value| UserAutomationOperatorResultValue::AttemptRefusal(Box::new(value)))
             .map_err(|_| "UserAutomation attempt refusal is not closed".to_owned());
     }
     let outcome = object
@@ -668,10 +715,14 @@ fn recovery_to_phase(
 ) -> Option<UserAutomationRecoveryPhase> {
     match recovery {
         UserAutomationOperatorResultRecovery::Unavailable { reason } => {
-            Some(UserAutomationRecoveryPhase::Unavailable { reason: reason.clone() })
+            Some(UserAutomationRecoveryPhase::Unavailable {
+                reason: reason.clone(),
+            })
         }
         UserAutomationOperatorResultRecovery::UnknownOutcome { reason } => {
-            Some(UserAutomationRecoveryPhase::UnknownOutcome { reason: reason.clone() })
+            Some(UserAutomationRecoveryPhase::UnknownOutcome {
+                reason: reason.clone(),
+            })
         }
         UserAutomationOperatorResultRecovery::LedgerReadOwed { .. } => None,
     }
@@ -1233,7 +1284,9 @@ impl UserAutomationOperatorTransition {
             || self.identity.idempotency_key != request.identity.idempotency_key
             || self.state_fence != request.context.state_fence
         {
-            return Err("UserAutomation transition belongs to another request or State Fence".to_owned());
+            return Err(
+                "UserAutomation transition belongs to another request or State Fence".to_owned(),
+            );
         }
         self.validate_run_now_wake_readback(request)?;
         self.validate()
@@ -1261,7 +1314,7 @@ impl UserAutomationOperatorTransition {
         readback
             .validate_for(&wake_request)
             .map_err(|error| error.to_string())?;
-        if readback.operation_id != self.identity.operation_id
+        if readback.operation_id != self.identity.operation_id.as_str()
             || readback.idempotency_key != self.identity.idempotency_key
         {
             return Err(
@@ -1272,15 +1325,24 @@ impl UserAutomationOperatorTransition {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "closed mutation phases and owner joins must be checked together"
+    )]
     fn validate_phase_joins(&self) -> Result<(), String> {
         match &self.configuration {
             UserAutomationConfigurationPhase::Read { .. } => {
                 if self.horizon.is_some()
                     || self.orchestration.is_some()
                     || !matches!(&self.wake, UserAutomationWakePhase::NotApplicable { .. })
-                    || !matches!(&self.execution, UserAutomationExecutionPhase::NotApplicable { .. })
+                    || !matches!(
+                        &self.execution,
+                        UserAutomationExecutionPhase::NotApplicable { .. }
+                    )
                 {
-                    return Err("a read-only UserAutomation result carries mutation phases".to_owned());
+                    return Err(
+                        "a read-only UserAutomation result carries mutation phases".to_owned()
+                    );
                 }
             }
             UserAutomationConfigurationPhase::Committed { receipt, result }
@@ -1292,7 +1354,10 @@ impl UserAutomationOperatorTransition {
                     || receipt.state_fence != self.state_fence
                     || receipt.status != WriteReceiptStatus::Committed
                 {
-                    return Err("UserAutomation configuration receipt is not bound to its parent".to_owned());
+                    return Err(
+                        "UserAutomation configuration receipt is not bound to its parent"
+                            .to_owned(),
+                    );
                 }
                 receipt
                     .require_reconciliation_envelope()
@@ -1303,28 +1368,37 @@ impl UserAutomationOperatorTransition {
                         cancelled_wake_ids,
                     } => {
                         revision.validate().map_err(|error| error.to_string())?;
-                        if !matches!(&self.execution, UserAutomationExecutionPhase::NotApplicable { .. }) {
-                            return Err("a revision mutation carries a foreign execution phase".to_owned());
+                        if !matches!(
+                            &self.execution,
+                            UserAutomationExecutionPhase::NotApplicable { .. }
+                        ) {
+                            return Err(
+                                "a revision mutation carries a foreign execution phase".to_owned()
+                            );
                         }
                         match &self.wake {
-                            UserAutomationWakePhase::Cancelled { cancelled_wake_ids: observed }
-                                if observed == cancelled_wake_ids => {}
+                            UserAutomationWakePhase::Cancelled {
+                                cancelled_wake_ids: observed,
+                            } if observed == cancelled_wake_ids => {}
                             UserAutomationWakePhase::NotApplicable { .. }
                                 if cancelled_wake_ids.is_empty() => {}
                             UserAutomationWakePhase::UnknownOutcome { .. }
                             | UserAutomationWakePhase::Unavailable { .. } => {}
                             _ => {
-                                return Err("UserAutomation wake phase does not join its mutation".to_owned());
+                                return Err("UserAutomation wake phase does not join its mutation"
+                                    .to_owned());
                             }
                         }
-                        if let Some(horizon) = &self.horizon {
-                            if horizon.automation_id != revision.automation_id
+                        if let Some(horizon) = &self.horizon
+                            && (horizon.automation_id != revision.automation_id
                                 || horizon.automation_revision != revision.revision
                                 || horizon.revision_digest
-                                    != revision.digest().map_err(|error| error.to_string())?
-                            {
-                                return Err("UserAutomation horizon belongs to another committed revision".to_owned());
-                            }
+                                    != revision.digest().map_err(|error| error.to_string())?)
+                        {
+                            return Err(
+                                "UserAutomation horizon belongs to another committed revision"
+                                    .to_owned(),
+                            );
                         }
                         if let Some(orchestration) = &self.orchestration {
                             let expected_receipt_digest =
@@ -1339,14 +1413,18 @@ impl UserAutomationOperatorTransition {
                             }
                         }
                     }
-                    UserAutomationMutationResult::RunNow { invocation, wake_intent } => {
+                    UserAutomationMutationResult::RunNow {
+                        invocation,
+                        wake_intent,
+                    } => {
                         invocation.validate().map_err(|error| error.to_string())?;
                         wake_intent.validate().map_err(|error| error.to_string())?;
                         if wake_intent.state_fence != self.state_fence
                             || self.horizon.is_some()
                             || self.orchestration.is_some()
                         {
-                            return Err("RunNow phases are not bound to the committed occurrence".to_owned());
+                            return Err("RunNow phases are not bound to the committed occurrence"
+                                .to_owned());
                         }
                         match &self.wake {
                             UserAutomationWakePhase::Published { readback }
@@ -1356,7 +1434,12 @@ impl UserAutomationOperatorTransition {
                                     && !readback.record_checksum.trim().is_empty() => {}
                             UserAutomationWakePhase::UnknownOutcome { .. }
                             | UserAutomationWakePhase::Unavailable { .. } => {}
-                            _ => return Err("RunNow wake phase does not join the committed wake intent".to_owned()),
+                            _ => {
+                                return Err(
+                                    "RunNow wake phase does not join the committed wake intent"
+                                        .to_owned(),
+                                );
+                            }
                         }
                         let occurrence_id = invocation
                             .occurrence_identity()
@@ -1364,24 +1447,36 @@ impl UserAutomationOperatorTransition {
                         match &self.execution {
                             UserAutomationExecutionPhase::Admitted { execution }
                                 if execution.occurrence_id == occurrence_id
-                                    && matches!(&self.wake, UserAutomationWakePhase::Published { .. }) => {}
-                            UserAutomationExecutionPhase::Deferred { reason }
-                                if matches!(&self.wake, UserAutomationWakePhase::Published { .. })
-                                    || (matches!(
+                                    && matches!(
                                         &self.wake,
-                                        UserAutomationWakePhase::UnknownOutcome { .. }
-                                            | UserAutomationWakePhase::Unavailable { .. }
-                                    ) && matches!(
-                                        reason,
-                                        UserAutomationDeferReason::Paused
-                                            | UserAutomationDeferReason::Retired
-                                    )) => {}
+                                        UserAutomationWakePhase::Published { .. }
+                                    ) => {}
+                            UserAutomationExecutionPhase::Deferred { reason }
+                                if matches!(
+                                    &self.wake,
+                                    UserAutomationWakePhase::Published { .. }
+                                ) || (matches!(
+                                    &self.wake,
+                                    UserAutomationWakePhase::UnknownOutcome { .. }
+                                        | UserAutomationWakePhase::Unavailable { .. }
+                                ) && matches!(
+                                    reason,
+                                    UserAutomationDeferReason::Paused
+                                        | UserAutomationDeferReason::Retired
+                                )) => {}
                             UserAutomationExecutionPhase::BlockedConfig { .. }
-                                if matches!(&self.wake, UserAutomationWakePhase::Published { .. }) => {}
-                            UserAutomationExecutionPhase::UnknownOutcome { .. }
-                                if matches!(&self.wake, UserAutomationWakePhase::Published { .. }) => {}
+                            | UserAutomationExecutionPhase::UnknownOutcome { .. }
+                                if matches!(
+                                    &self.wake,
+                                    UserAutomationWakePhase::Published { .. }
+                                ) => {}
                             UserAutomationExecutionPhase::Unavailable { .. } => {}
-                            _ => return Err("RunNow execution phase does not join its committed occurrence".to_owned()),
+                            _ => {
+                                return Err(
+                                    "RunNow execution phase does not join its committed occurrence"
+                                        .to_owned(),
+                                );
+                            }
                         }
                     }
                 }
