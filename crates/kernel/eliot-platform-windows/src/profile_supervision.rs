@@ -805,7 +805,7 @@ fn retain_profile_roots(
         owner_sid = Some(sid.to_owned());
         session_id = Some(anchor.session_id());
     }
-    let (mut role_observations, mut role_leases, owner_sid) = retain_role_roots(
+    let role_roots = retain_role_roots(
         request.profile,
         root_requests,
         local_app_data.as_deref(),
@@ -814,14 +814,14 @@ fn retain_profile_roots(
         repository_identity,
         owner_sid,
     )?;
-    observations.append(&mut role_observations);
-    leases.append(&mut role_leases);
+    observations.append(&mut role_roots.observations);
+    leases.append(&mut role_roots.leases);
     finish_profile_selection(
         request,
         observations,
         leases,
         local_app_data_lease,
-        owner_sid,
+        role_roots.owner_sid,
         session_id,
     )
 }
@@ -845,6 +845,14 @@ fn profile_role_requests(request: &ProfileRootRequest) -> Vec<(String, PathBuf)>
     root_requests
 }
 
+/// The observations, retained leases, and single observed owner SID produced by
+/// one pass over the profile's non-anchor role roots.
+struct RetainedRoleRoots {
+    observations: Vec<ProfileRootObservation>,
+    leases: Vec<UserOwnedRootLease>,
+    owner_sid: Option<String>,
+}
+
 /// Opens and retains every non-anchor profile role root, observing the exact
 /// current-user owner SID that binds them all together.
 fn retain_role_roots(
@@ -855,14 +863,7 @@ fn retain_role_roots(
     repository_path: Option<&Path>,
     repository_identity: Option<FileIdentity>,
     mut owner_sid: Option<String>,
-) -> Result<
-    (
-        Vec<ProfileRootObservation>,
-        Vec<UserOwnedRootLease>,
-        Option<String>,
-    ),
-    WindowsAdapterError,
-> {
+) -> Result<RetainedRoleRoots, WindowsAdapterError> {
     let mut observations = Vec::with_capacity(root_requests.len());
     let mut leases = Vec::new();
     for (role, path) in root_requests {
@@ -913,7 +914,11 @@ fn retain_role_roots(
         });
         leases.push(lease);
     }
-    Ok((observations, leases, owner_sid))
+    Ok(RetainedRoleRoots {
+        observations,
+        leases,
+        owner_sid,
+    })
 }
 
 /// Proves the complete postcondition of a retained profile root set and builds
