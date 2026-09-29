@@ -314,6 +314,10 @@ pub enum ContractError {
     /// A state fence has no identity-bearing dependency.
     #[error("state fence must contain at least one dependency")]
     EmptyFence,
+    /// An I4.5 state fence key is neither carried by the fence nor covered by
+    /// exactly one named owner receipt.
+    #[error("state fence key {key} has no single named owner receipt")]
+    IncompleteFenceKeyReceipt { key: &'static str },
     /// A request has no request identity.
     #[error("request metadata must contain a request id")]
     MissingRequestId,
@@ -745,6 +749,121 @@ impl ClockReading {
     }
 }
 
+/// One closed I4.5 `StateFence` key
+/// (`I04-05-generation-vector-and-state-fence.md:6-15`).
+///
+/// The set is closed on purpose: I4.5 prohibits a single global generation, and
+/// a key may only leave this enumeration by becoming a real [`StateFence`]
+/// field. Widening the shard therefore breaks
+/// `validate_i45_key_receipts` until the new key is either carried or
+/// receipted, which is what stops an omission from being silent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FenceKey {
+    /// I4.5 `scope_id`.
+    ScopeId,
+    /// I4.5 `resource_generations`.
+    ResourceGenerations,
+    /// I4.5 `revision_heads`.
+    RevisionHeads,
+    /// I4.5 `authority_epoch`.
+    AuthorityEpoch,
+    /// I4.5 `integration_revision`.
+    IntegrationRevision,
+    /// I4.5 `module_generations`.
+    ModuleGenerations,
+    /// I4.5 `verifier_generations`.
+    VerifierGenerations,
+    /// I4.5 `created_at`.
+    CreatedAt,
+}
+
+impl FenceKey {
+    /// Every I4.5 key, in the order the shard lists them.
+    pub const ALL: [Self; 8] = [
+        Self::ScopeId,
+        Self::ResourceGenerations,
+        Self::RevisionHeads,
+        Self::AuthorityEpoch,
+        Self::IntegrationRevision,
+        Self::ModuleGenerations,
+        Self::VerifierGenerations,
+        Self::CreatedAt,
+    ];
+
+    /// The I4.5 shard spelling of this key.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScopeId => "scope_id",
+            Self::ResourceGenerations => "resource_generations",
+            Self::RevisionHeads => "revision_heads",
+            Self::AuthorityEpoch => "authority_epoch",
+            Self::IntegrationRevision => "integration_revision",
+            Self::ModuleGenerations => "module_generations",
+            Self::VerifierGenerations => "verifier_generations",
+            Self::CreatedAt => "created_at",
+        }
+    }
+
+    /// Returns whether [`StateFence`] physically carries this key's value.
+    ///
+    /// Only [`FenceKey::AuthorityEpoch`] and [`FenceKey::IntegrationRevision`]
+    /// are carried. The narrower single-valued `resource_generation`,
+    /// `task_revision` and `policy_revision` fields are deliberately not counted
+    /// here: I4.5 asks for a per-resource generation vector
+    /// ([`FenceKey::ResourceGenerations`]) and for open dependency-key/revision
+    /// pairs ([`FenceKey::RevisionHeads`]), and one fixed slot is neither. Those
+    /// two keys are receipted by name rather than passed off as coverage.
+    pub const fn carried_by_state_fence(self) -> bool {
+        matches!(self, Self::AuthorityEpoch | Self::IntegrationRevision)
+    }
+}
+
+/// Owner receipt for one I4.5 key that [`StateFence`] does not carry.
+///
+/// This is the typed owner receipt required by #1027 A4: `owner` names the
+/// subsystem that holds the key's canonical value and `reason` states why that
+/// value cannot live in the fence. A blanket "some keys live elsewhere" is not
+/// admissible; every omitted key needs its own row in
+/// [`StateFence::I45_KEY_OMISSIONS`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FenceKeyOmission {
+    /// The I4.5 key this fence does not carry.
+    pub key: FenceKey,
+    /// The subsystem that owns the key's canonical value.
+    pub owner: &'static str,
+    /// Why the owned value cannot be a `StateFence` field.
+    pub reason: &'static str,
+}
+
+/// Fail-closed check that every I4.5 key is either carried by [`StateFence`] or
+/// covered by exactly one named owner receipt, and that no receipt names an
+/// empty owner or reason.
+fn validate_i45_key_receipts() -> Result<(), ContractError> {
+    for key in FenceKey::ALL {
+        let receipts = StateFence::I45_KEY_OMISSIONS
+            .iter()
+            .filter(|omission| omission.key == key)
+            .count();
+        let expected = usize::from(!key.carried_by_state_fence());
+        if receipts != expected {
+            return Err(ContractError::IncompleteFenceKeyReceipt { key: key.as_str() });
+        }
+    }
+    for omission in &StateFence::I45_KEY_OMISSIONS {
+        if omission.owner.trim().is_empty() {
+            return Err(ContractError::Blank {
+                field: "state_fence.i45_key_omission.owner",
+            });
+        }
+        if omission.reason.trim().is_empty() {
+            return Err(ContractError::Blank {
+                field: "state_fence.i45_key_omission.reason",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A compact, dependency-only state fence.
 ///
 /// The authority epoch is the lineage-aware [`EpochId`] exact tuple
@@ -753,6 +872,13 @@ impl ClockReading {
 /// and never authorize; a numerically larger sequence from another lineage is
 /// never newer. No scalar-to-canonical coercion exists and no legacy numeric
 /// import exists; only the structured `(lineage_id, sequence)` tuple binds authority.
+///
+/// This type carries two of the eight I4.5 keys. The remaining six are declared
+/// in [`StateFence::I45_KEY_OMISSIONS`], which names the owning subsystem and
+/// the reason each one cannot be a fence field, and is checked by
+/// [`StateFence::validate`]. The receipt is a property of the type, not a
+/// caller assertion, so it is identical for every fence and never takes part in
+/// [`fences_match_exact`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StateFence {
@@ -769,6 +895,65 @@ pub struct StateFence {
 }
 
 impl StateFence {
+    /// Owner receipt for each I4.5 key this fence does not carry (#1027 A4).
+    ///
+    /// Each row names the owning subsystem and why the owned value cannot be a
+    /// `StateFence` field. [`StateFence::validate`] fails closed when a key
+    /// that is not carried has no row, has two rows, or names an empty owner or
+    /// reason, so an I4.5 key can never be dropped without a receipt appearing
+    /// for it.
+    pub const I45_KEY_OMISSIONS: [FenceKeyOmission; 6] = [
+        FenceKeyOmission {
+            key: FenceKey::ScopeId,
+            owner: "eliot-workscope ScopeIdentity / eliot-context-contracts ContextBinding",
+            reason: "WorkScope mints and revisions the scope identity, and each Context \
+Compiler operation carries it on its own ContextBinding, which is compared by full binding \
+equality at the point of use. I4.5 forbids one global scope counter, so a single fence-wide \
+scope value would be exactly the prohibited counter.",
+        },
+        FenceKeyOmission {
+            key: FenceKey::ResourceGenerations,
+            owner: "eliot-store-api RevisionHead within ScopeRevisionView",
+            reason: "This fence carries the one load-bearing resource_generation. The per-resource \
+generation vector is the store's own aggregate, held as RevisionHead records that each carry \
+their own state_fence and are compared head by head with the store's same-fence check. A vector \
+here would duplicate the store's generation authority and force unrelated operations to carry \
+generations they never read.",
+        },
+        FenceKeyOmission {
+            key: FenceKey::RevisionHeads,
+            owner: "eliot-store-api RevisionHeadExpectation via eliot-canonical CanonicalWriteEnvelope",
+            reason: "Exact dependency-key/revision pairs are the canonical store's compare-and-swap \
+input and are resolved at the write envelope, which compares them against the observed heads. The \
+fence's task_revision and policy_revision slots are a fixed, narrower set, not the open pair map \
+I4.5 requires, so they are compared exactly by fences_match_exact instead of being reported as \
+revision-head coverage.",
+        },
+        FenceKeyOmission {
+            key: FenceKey::ModuleGenerations,
+            owner: "eliot-runtime-contracts ModuleGeneration within KernelAuthoritySnapshot",
+            reason: "There is one registered module generation per module and the aggregate is the \
+Kernel authority projection, not one value. Each ModuleGeneration carries its own state_fence, so \
+the module dependency is already fenced at its own owner instead of being flattened here.",
+        },
+        FenceKeyOmission {
+            key: FenceKey::VerifierGenerations,
+            owner: "eliot-receipts VerifierBinding",
+            reason: "Verification scope is recorded per verifier as verifier_id with verifier_revision \
+and its own state_fence, and it is rehydrated as executed verifier runs at the point of use. No \
+single verifier generation is load-bearing for an operation that runs no verifier, so making the \
+field mandatory would be exactly the I4.5 prohibition on one global generation.",
+        },
+        FenceKeyOmission {
+            key: FenceKey::CreatedAt,
+            owner: "eliot_contracts ClockReading",
+            reason: "This crate keeps point-in-time values separate so an external timestamp cannot \
+become causal order. A created_at inside the fence would put a host wall-clock reading into the \
+canonical bytes that canonical_fence_digest hashes and fences_match_exact compares, letting a \
+clock skew decide authority.",
+        },
+    ];
+
     /// Constructs a fence with the minimum authority and resource dependencies.
     ///
     /// Takes the lineage-aware [`EpochId`] directly; no scalar-to-canonical
@@ -802,11 +987,14 @@ impl StateFence {
     ///
     /// [`EpochId`] is always a validated non-zero `(lineage_id, sequence)`
     /// tuple by construction, so only the resource generation is checked here.
+    /// The I4.5 key-omission owner receipt is checked on the same path, so a
+    /// fence cannot be admitted anywhere while an I4.5 key is neither carried
+    /// nor explained by a named owner.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.resource_generation.value() == 0 {
             return Err(ContractError::EmptyFence);
         }
-        Ok(())
+        validate_i45_key_receipts()
     }
 }
 
