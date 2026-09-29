@@ -4780,7 +4780,8 @@ pub struct BridgeRunner {
 ///
 /// The snapshot freezes every carried identity class at note time (issue #8
 /// W1): principal and Session through the seal itself, `WorkScope` through
-/// the seal plus the note-time content check, the task set through
+/// the seal plus the note-time content check, the task set through the
+/// note-time selection-vs-seal binding plus
 /// [`BootstrapSnapshot::delivery_tasks_match`], and source, route,
 /// workspace-instance, projection-source/generation, and receipt references
 /// by retaining the exact noted context — sealed delivery composes only
@@ -5797,8 +5798,14 @@ impl BridgeRunner {
     /// Shared retention core behind the host-snapshot and compiled-surface
     /// intakes: fail-closed composition validation first (nothing invalid is
     /// ever stored), then the principal/`WorkScope` content check against the
-    /// live seal, then retention of the exact noted context, task set, seal,
-    /// and intake provenance. `owner_compiled` is true only for snapshots
+    /// live seal, then the composed task-selection check against the sealed
+    /// activation task (issue #8 W1/P1: a `Bound`/`Unique` selection must name
+    /// the sealed task and revision before retention, so later
+    /// `delivery_tasks_match` equality preserves a seal-checked set instead
+    /// of two unbound host values; `Ambiguous`/`None` claims no task and
+    /// needs no agreement, exactly as at delivery), then retention of the
+    /// exact noted context, task set, seal, and intake provenance.
+    /// `owner_compiled` is true only for snapshots
     /// whose context arrived through [`BootstrapContext::from_compiled_surface`]
     /// with its owner-frozen rendering identities already validated there.
     fn retain_sealed_snapshot(
@@ -5807,10 +5814,12 @@ impl BridgeRunner {
         tasks: BootstrapTaskInputs,
         owner_compiled: bool,
     ) -> Result<(), BootstrapError> {
-        get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
+        let composed =
+            get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
             BootstrapSnapshot::content_matches_binding(&context, seal)?;
+            BootstrapSnapshot::selection_matches_sealed_task(&composed, seal)?;
         }
         self.bootstrap_snapshot = Some(BootstrapSnapshot {
             context,
