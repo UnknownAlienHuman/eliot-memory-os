@@ -2187,9 +2187,10 @@ impl KernelComposition {
     /// principal owning the operation, which the namespace key cannot otherwise
     /// separate from it. Such a reconciliation answers from the NAMED predecessor's
     /// own row, not from a recompute of the presented bytes, so the presented bundle
-    /// must be that predecessor's archive: the freshly decoded
-    /// `report.archive_sha256` is compared against the stored
-    /// `identity.archive_sha256` before anything is projected. The bundle is still
+    /// must be that predecessor's archive: the owner re-decides the decoded bytes
+    /// and the whole of that decision is compared against the stored row by
+    /// [`owner_reproves_predecessor_operation`] before anything is projected. The
+    /// bundle is still
     /// decoded and validated first either way, so a reconciliation never skips the
     /// capture owner's admission gate.
     ///
