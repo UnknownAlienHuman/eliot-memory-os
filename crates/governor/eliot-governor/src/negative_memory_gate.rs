@@ -1,4 +1,4 @@
-//! Governor-owned negative-memory gate on the real effect path (issue #1731
+//! Governor-owned negative-memory gate contract (issue #1731
 //! W4, I12.19, I1.8, I12.16).
 //!
 //! # Where this gate sits and why
@@ -24,15 +24,14 @@
 //! layer that is allowed to interpret policy — never inside Kernel and never
 //! inside the store bridge.
 //!
-//! [`evaluate_negative_memory_gate`] is invoked from
-//! [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical),
-//! the single governed write funnel every canonical commit in this process
-//! traverses ([`commit_canonical_with_readiness`](crate::composition::GovernorComposition::commit_canonical_with_readiness),
-//! [`commit_capability_evidence_record`](crate::capability_evidence_commit::commit_capability_evidence_record)
-//! and [`commit_experience_bank`](crate::experience_commit::commit_experience_bank) all route
-//! through it). Placing the gate there is what makes it impossible for a
-//! direct action invocation to bypass the check because no Context packet was
-//! requested: there is no second canonical write route to bypass.
+//! [`evaluate_negative_memory_gate`] is invoked by the explicit
+//! [`GovernorComposition::commit_canonical_gated_by_negative_memory`](crate::composition::GovernorComposition::commit_canonical_gated_by_negative_memory)
+//! wrapper. The ordinary [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical)
+//! method remains ungated, and source tracing found no production caller of
+//! the gated wrapper. This owner-side contract therefore does not claim that a
+//! current external effect contour is wired to it. The WASM request loop
+//! (#2568), native worker (#1911), and Doctor repair execution have separate
+//! dispatch owners and require their own explicit integration.
 //!
 //! # What the gate does, in order
 //!
@@ -54,36 +53,33 @@
 //!    nothing: a match becomes a block only when an owner-admitted
 //!    [`NegativeMemoryActionPolicy`] agrees.
 //!
-//! The rule snapshot itself is resolved by the caller through the existing
-//! closed named read; [`NegativeMemoryGateInput::read`] is that
-//! [`NegativeMemoryCandidateRead`], produced by
-//! [`NegativeMemoryGateInput::resolve`] through
-//! [`eliot_store_api::learning_record_read_request`] on
-//! [`NamedReadOperation::GetLearningRecordRange`] filtered to
-//! [`LearningRecordKind::ActivationReceipt`] at the request's exact fence. No
-//! new database, no new named operation and no catalogue change are involved.
+//! [`NegativeMemoryGateInput::read`] carries the expected closed named-read
+//! snapshot (`GetLearningRecordRange` filtered to activation receipts), with
+//! its exact `StateFence`. The current source has no production resolver for
+//! this input: the effect owner must provide the real named-read result and
+//! bind it to the same canonical request before invoking the gated wrapper.
 //!
 //! # The four dispositions (I12.19: exact blocks, similarity only warns)
 //!
-//! * [`NegativeMemoryGateDecision::Block`] — an exact admitted match whose
+//! * [`NegativeMemoryGateDisposition::Block`] — an exact admitted match whose
 //!   admitted disposition is `Block`. The action is refused.
-//! * [`NegativeMemoryGateDecision::RequireCheck`] — an exact admitted match
+//! * [`NegativeMemoryGateDisposition::RequireCheck`] — an exact admitted match
 //!   whose admitted disposition is `RequireCheck`. The action is refused and
 //!   the decision names the **safe discriminating check** recorded on the
 //!   matched rule.
-//! * [`NegativeMemoryGateDecision::Proceed`] with a
+//! * [`NegativeMemoryGateDisposition::Proceed`] with a
 //!   [`NegativeMemoryProceedWarning`] — a **near** match, or an advisory
 //!   disposition. The action proceeds to ordinary authorization. It is a
 //!   warning, not permission: the caller's own authorization is unchanged and
 //!   nothing here widens it.
-//! * [`NegativeMemoryGateDecision::Unavailable`] — the lookup was incomplete, a
+//! * [`NegativeMemoryGateDisposition::Unavailable`] — the lookup was incomplete, a
 //!   rule was unvalidatable, a required policy was absent, or the revision
 //!   moved. This follows the explicit unavailable/incomplete rule: it is
 //!   **neither** a fabricated exact match **nor** a fabricated no-match, and it
 //!   refuses the effect until the snapshot is resolvable.
 //!
 //! A complete enumeration with no applicable rule is
-//! [`NegativeMemoryGateDecision::Proceed`] with no warning, and that is the only
+//! [`NegativeMemoryGateDisposition::Proceed`] with no warning, and that is the only
 //! way absence is certified — the matcher's
 //!   [`NegativeMemoryMatchKind::certifies_rule_absence`] is the sole source of
 //!   that fact and the gate re-uses it rather than re-deriving "no rule".
@@ -94,7 +90,7 @@
 //! caller captured before comparing. The gate requires the caller's dispatch
 //! revalidation [`NegativeMemoryGateInput::revalidated_rule_set_revision`] to
 //! equal it. If they differ, the rule set churned between lookup and dispatch
-//! and the gate returns [`NegativeMemoryGateDecision::Unavailable`] with
+//! and the gate returns [`NegativeMemoryGateDisposition::Unavailable`] with
 //! [`NegativeMemoryGateRefusal::RuleSetRevisionMoved`]: it does not dispatch on
 //! the stale snapshot (which would leave a stale block in force) and it does not
 //! dispatch on the fresh one without re-comparing (which would be a bypass).
@@ -102,20 +98,21 @@
 //! [`NegativeMemoryGateRefusal::RuleSetRevisionAbsent`], so "I did not look
 //! again" can never be read as "nothing changed".
 //!
-//! The `StateFence` is bound by the read itself: the named read is issued
-//! `ExactFence` at the request's own fence, so a previous generation's snapshot
-//! is never served as current.
+//! The gate requires exact equality among the candidate read's `StateFence`,
+//! the gate input fence and the canonical envelope's request fence. A previous
+//! generation's snapshot therefore cannot be reused as current.
 //!
 //! # Absence of a policy is not permission and not a block
 //!
 //! An exact match with **no** owner-admitted action policy bound to that exact
 //! record revision and digest yields
-//! [`NegativeMemoryGateDecision::Unavailable`] with
+//! [`NegativeMemoryGateDisposition::Unavailable`] with
 //! [`NegativeMemoryGateRefusal::AdmittedPolicyAbsent`]. A record's existence,
 //! and a record's digest matching, grant nothing — that is the explicit boundary
 //! in `NegativeMemoryActionPolicy`'s own documentation, and this gate is where it
 //! is enforced.
 
+use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_dreamer_failure::{
     NegativeMemoryActionPolicy, NegativeMemoryCandidateRead, NegativeMemoryDisposition,
     NegativeMemoryFingerprint, NegativeMemoryHorizonDomain, NegativeMemoryMatchBound,
@@ -125,6 +122,9 @@ use eliot_dreamer_failure::{
 use eliot_store_api::StateFence;
 
 use crate::composition::CompositionError;
+use crate::negative_memory_probe::{
+    NegativeMemoryProbeProposal, admit_negative_memory_probe,
+};
 
 /// A near-match or advisory warning that accompanies a proceed.
 ///
@@ -197,11 +197,17 @@ pub enum NegativeMemoryGateRefusal {
         /// Exact detail.
         detail: String,
     },
+    /// The supplied subject, candidate snapshot or dispatch request is not
+    /// bound to the exact canonical request that would be committed.
+    RequestBindingMismatch {
+        /// Exact failed binding field or calculation.
+        detail: String,
+    },
 }
 
-/// The typed disposition the gate returns to the admission path.
+/// The typed disposition produced by matching and policy admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NegativeMemoryGateDecision {
+pub enum NegativeMemoryGateDisposition {
     /// The exact matched action is blocked. The effect must not proceed.
     Block {
         /// Immutable record identity of the blocking rule.
@@ -228,6 +234,10 @@ pub enum NegativeMemoryGateDecision {
         required_verifier: String,
         /// The recorded trigger dimensions this check discriminates.
         discriminates_dimension_names: Vec<String>,
+        /// Governor-admitted, typed read-only proposal for the exact named
+        /// check. It preserves the protected action identities and carries
+        /// its own effect ceiling, budget and verifier binding.
+        probe: NegativeMemoryProbeProposal,
         /// The rule-set revision that was revalidated at dispatch.
         rule_set_revision: u64,
     },
@@ -245,7 +255,174 @@ pub enum NegativeMemoryGateDecision {
     },
 }
 
+/// Exact request/action/snapshot identity carried with every gate outcome.
+///
+/// Fields are private so callers cannot manufacture a transferable `Proceed`.
+/// The Governor creates this binding from the same subject, named read and
+/// canonical envelope that it evaluates, then compares it again immediately
+/// before dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NegativeMemoryGateBinding {
+    operation_id: String,
+    canonical_request_digest: String,
+    action_id: String,
+    action_operation_id: String,
+    action_effect_id: String,
+    action_input_digest: String,
+    subject_digest: String,
+    scope_id: String,
+    task_id: String,
+    read_handle: String,
+    read_rule_set_revision: String,
+    read_rule_set_digest: String,
+    state_fence: StateFence,
+}
+
+impl NegativeMemoryGateBinding {
+    fn capture(input: &NegativeMemoryGateInput<'_>, envelope: &CanonicalWriteEnvelope) -> Self {
+        Self {
+            operation_id: envelope.operation_id.as_str().to_owned(),
+            canonical_request_digest: envelope.canonical_request_hash().unwrap_or_default(),
+            action_id: input.subject.action.action_id.clone(),
+            action_operation_id: input.subject.action.operation_id.clone(),
+            action_effect_id: input.subject.action.effect_id.clone(),
+            action_input_digest: input.subject.action.input_digest.clone(),
+            subject_digest: input.subject.computed_digest().unwrap_or_default(),
+            scope_id: envelope.scope_id.as_str().to_owned(),
+            task_id: input.subject.applicability.task_id.clone(),
+            read_handle: input.read.read_handle.clone(),
+            read_rule_set_revision: input.read.rule_set_revision.clone(),
+            read_rule_set_digest: input.read.rule_set_digest.clone(),
+            state_fence: envelope.request.state_fence.clone(),
+        }
+    }
+
+    /// Canonical operation identity this decision protects.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Digest of the exact canonical request envelope this decision protects.
+    #[must_use]
+    pub fn canonical_request_digest(&self) -> &str {
+        &self.canonical_request_digest
+    }
+
+    /// Stable action identity bound by the compared subject.
+    #[must_use]
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+
+    /// Operation identity declared by the compared action subject.
+    #[must_use]
+    pub fn action_operation_id(&self) -> &str {
+        &self.action_operation_id
+    }
+
+    /// Effect identity bound by the compared subject.
+    #[must_use]
+    pub fn action_effect_id(&self) -> &str {
+        &self.action_effect_id
+    }
+
+    /// Input digest bound by the compared action.
+    #[must_use]
+    pub fn action_input_digest(&self) -> &str {
+        &self.action_input_digest
+    }
+
+    /// Digest of the exact typed action subject that was compared.
+    #[must_use]
+    pub fn subject_digest(&self) -> &str {
+        &self.subject_digest
+    }
+
+    /// Scope identity that was both compared and dispatched.
+    #[must_use]
+    pub fn scope_id(&self) -> &str {
+        &self.scope_id
+    }
+
+    /// Task identity that was both compared and dispatched.
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    /// Named read handle and rule snapshot revision used by the comparison.
+    #[must_use]
+    pub fn read_handle(&self) -> &str {
+        &self.read_handle
+    }
+
+    /// Revision head observed by the bounded candidate read.
+    #[must_use]
+    pub fn read_rule_set_revision(&self) -> &str {
+        &self.read_rule_set_revision
+    }
+
+    /// Digest over the exact pages delivered by the bounded candidate read.
+    #[must_use]
+    pub fn read_rule_set_digest(&self) -> &str {
+        &self.read_rule_set_digest
+    }
+
+    /// Exact StateFence bound to the read and canonical request.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    fn validate_for_dispatch(
+        &self,
+        input: &NegativeMemoryGateInput<'_>,
+        envelope: &CanonicalWriteEnvelope,
+    ) -> Result<(), NegativeMemoryGateRefusal> {
+        validate_request_binding(input, envelope)?;
+        if self != &Self::capture(input, envelope) {
+            return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+                detail: "gate decision binding changed after comparison".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+}
+
+/// A gate result bound to the exact request, action, scope, read and fence.
+///
+/// The disposition is private and cannot be separated from its binding. Every
+/// successful result, including an unadorned no-match `Proceed`, carries the
+/// same non-transferable evidence through the canonical write call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NegativeMemoryGateDecision {
+    disposition: NegativeMemoryGateDisposition,
+    binding: NegativeMemoryGateBinding,
+}
+
 impl NegativeMemoryGateDecision {
+    /// The typed outcome of the bounded matcher and policy admission.
+    #[must_use]
+    pub const fn disposition(&self) -> &NegativeMemoryGateDisposition {
+        &self.disposition
+    }
+
+    /// Exact request, action, snapshot and fence binding for this outcome.
+    #[must_use]
+    pub const fn binding(&self) -> &NegativeMemoryGateBinding {
+        &self.binding
+    }
+
+    pub(crate) fn validate_for_dispatch(
+        &self,
+        input: &NegativeMemoryGateInput<'_>,
+        envelope: &CanonicalWriteEnvelope,
+    ) -> Result<(), NegativeMemoryGateRefusal> {
+        self.binding.validate_for_dispatch(input, envelope)
+    }
+
     /// Whether this decision refuses the effect before it reaches the store.
     ///
     /// A near-match warning does **not** refuse: it proceeds to ordinary
@@ -253,8 +430,10 @@ impl NegativeMemoryGateDecision {
     #[must_use]
     pub const fn refuses_effect(&self) -> bool {
         matches!(
-            self,
-            Self::Block { .. } | Self::RequireCheck { .. } | Self::Unavailable { .. }
+            &self.disposition,
+            NegativeMemoryGateDisposition::Block { .. }
+                | NegativeMemoryGateDisposition::RequireCheck { .. }
+                | NegativeMemoryGateDisposition::Unavailable { .. }
         )
     }
 }
@@ -291,8 +470,8 @@ pub struct NegativeMemoryGateInput<'a> {
     pub state_fence: &'a StateFence,
 }
 
-fn refused(refusal: NegativeMemoryGateRefusal) -> NegativeMemoryGateDecision {
-    NegativeMemoryGateDecision::Unavailable { refusal }
+fn refused(refusal: NegativeMemoryGateRefusal) -> NegativeMemoryGateDisposition {
+    NegativeMemoryGateDisposition::Unavailable { refusal }
 }
 
 /// Evaluates the negative-memory gate for one pending action and returns the
@@ -317,7 +496,22 @@ fn refused(refusal: NegativeMemoryGateRefusal) -> NegativeMemoryGateDecision {
 ///    validated against the matched record before it is trusted.
 pub fn evaluate_negative_memory_gate(
     input: &NegativeMemoryGateInput<'_>,
+    envelope: &CanonicalWriteEnvelope,
 ) -> NegativeMemoryGateDecision {
+    let binding = NegativeMemoryGateBinding::capture(input, envelope);
+    let disposition = match validate_request_binding(input, envelope) {
+        Ok(()) => evaluate_negative_memory_disposition(input),
+        Err(refusal) => refused(refusal),
+    };
+    NegativeMemoryGateDecision {
+        disposition,
+        binding,
+    }
+}
+
+fn evaluate_negative_memory_disposition(
+    input: &NegativeMemoryGateInput<'_>,
+) -> NegativeMemoryGateDisposition {
     if let Some(decision) = revalidate_rule_set_revision(input) {
         return decision;
     }
@@ -341,6 +535,63 @@ pub fn evaluate_negative_memory_gate(
     decide(input, &result)
 }
 
+fn validate_request_binding(
+    input: &NegativeMemoryGateInput<'_>,
+    envelope: &CanonicalWriteEnvelope,
+) -> Result<(), NegativeMemoryGateRefusal> {
+    let canonical_request_digest = envelope
+        .canonical_request_hash()
+        .map_err(|error| NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: format!("canonical request digest could not be computed: {error}"),
+        })?;
+    if input.subject.action.operation_id != envelope.operation_id.as_str() {
+        return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: "pending action operation_id differs from the canonical envelope".to_owned(),
+        });
+    }
+    if input.subject.canonical_request_digest != canonical_request_digest {
+        return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: "pending action subject is not bound to the canonical request digest".to_owned(),
+        });
+    }
+    if input.subject.applicability.scope_id != envelope.scope_id.as_str() {
+        return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: "pending action scope differs from the canonical envelope scope".to_owned(),
+        });
+    }
+    let request_task = envelope
+        .task_id
+        .as_deref()
+        .or_else(|| envelope.request.task_id.as_ref().map(|task| task.as_str()));
+    if request_task != Some(input.subject.applicability.task_id.as_str()) {
+        return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: "pending action task differs from or is absent in the canonical request".to_owned(),
+        });
+    }
+    if input.subject.action.target_id != input.subject.applicability.target_id {
+        return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: "pending action and applicability target identities differ".to_owned(),
+        });
+    }
+    if input.subject.action.effect_class != envelope.requested_effect_ceiling
+        || input.subject.applicability.effect_class != envelope.requested_effect_ceiling
+    {
+        return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: "pending action effect class differs from the canonical request effect ceiling"
+                .to_owned(),
+        });
+    }
+    if input.state_fence != &envelope.request.state_fence
+        || input.read.state_fence != envelope.request.state_fence
+    {
+        return Err(NegativeMemoryGateRefusal::RequestBindingMismatch {
+            detail: "candidate snapshot, gate request, and canonical envelope do not share the exact StateFence"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Returns a refusal when the dispatch-time revalidation does not equal the
 /// snapshot's own Fence A revision, and `None` when it does.
 ///
@@ -349,7 +600,7 @@ pub fn evaluate_negative_memory_gate(
 /// as a caller that observed no change.
 fn revalidate_rule_set_revision(
     input: &NegativeMemoryGateInput<'_>,
-) -> Option<NegativeMemoryGateDecision> {
+) -> Option<NegativeMemoryGateDisposition> {
     let Some(revalidated) = input.revalidated_rule_set_revision else {
         return Some(refused(NegativeMemoryGateRefusal::RuleSetRevisionAbsent));
     };
@@ -381,7 +632,7 @@ fn revalidate_rule_set_revision(
 /// `record_digest` from the recorded fields and verifies the causal ceiling and
 /// evidence coverage. One unvalidatable record makes the whole enumeration
 /// undecidable, so the lookup can never certify absence.
-fn validate_every_rule(read: &NegativeMemoryCandidateRead) -> Option<NegativeMemoryGateDecision> {
+fn validate_every_rule(read: &NegativeMemoryCandidateRead) -> Option<NegativeMemoryGateDisposition> {
     for page in &read.delivered_pages {
         for rule in &page.rules {
             if let Err(violation) = rule.validate() {
@@ -402,7 +653,7 @@ fn validate_every_rule(read: &NegativeMemoryCandidateRead) -> Option<NegativeMem
 fn decide(
     input: &NegativeMemoryGateInput<'_>,
     result: &NegativeMemoryMatchResult,
-) -> NegativeMemoryGateDecision {
+) -> NegativeMemoryGateDisposition {
     let rule_set_revision = input.revalidated_rule_set_revision.unwrap_or_default();
     let kind = result.outcome.kind();
     if !kind.certifies_rule_absence()
@@ -426,9 +677,9 @@ fn decide(
             })
         }
         NegativeMemoryOutcome::NoMatch { .. } => {
-            NegativeMemoryGateDecision::Proceed { warning: None }
+            NegativeMemoryGateDisposition::Proceed { warning: None }
         }
-        NegativeMemoryOutcome::Near { matched } => NegativeMemoryGateDecision::Proceed {
+        NegativeMemoryOutcome::Near { matched } => NegativeMemoryGateDisposition::Proceed {
             warning: Some(NegativeMemoryProceedWarning {
                 record_id: matched.record_id.clone(),
                 rule_revision: matched.rule_revision,
@@ -452,7 +703,7 @@ fn decide_exact(
     input: &NegativeMemoryGateInput<'_>,
     matched: &eliot_dreamer_failure::ExactMatch,
     rule_set_revision: u64,
-) -> NegativeMemoryGateDecision {
+) -> NegativeMemoryGateDisposition {
     let Some(record) = find_matched_record(input, matched) else {
         return refused(NegativeMemoryGateRefusal::MatchNotDecidable {
             detail: format!(
@@ -484,13 +735,13 @@ fn decide_exact(
         });
     }
     match policy.disposition {
-        NegativeMemoryDisposition::Block => NegativeMemoryGateDecision::Block {
+        NegativeMemoryDisposition::Block => NegativeMemoryGateDisposition::Block {
             record_id: record.record_id.clone(),
             rule_revision: record.rule_revision,
             policy_id: policy.policy_id.clone(),
             rule_set_revision,
         },
-        NegativeMemoryDisposition::RequireCheck => NegativeMemoryGateDecision::RequireCheck {
+        NegativeMemoryDisposition::RequireCheck => NegativeMemoryGateDisposition::RequireCheck {
             record_id: record.record_id.clone(),
             rule_revision: record.rule_revision,
             policy_id: policy.policy_id.clone(),
@@ -500,11 +751,25 @@ fn decide_exact(
                 .discriminating_check
                 .discriminates_dimension_names
                 .clone(),
+            probe: match admit_negative_memory_probe(
+                record,
+                policy,
+                input.subject,
+                input.read,
+                input.state_fence,
+            ) {
+                Ok(probe) => probe,
+                Err(refusal) => {
+                    return refused(NegativeMemoryGateRefusal::MatchNotDecidable {
+                        detail: format!("safe check proposal admission failed: {refusal:?}"),
+                    });
+                }
+            },
             rule_set_revision,
         },
         // An advisory policy on an exact match is a warning, never a block: the
         // policy owner explicitly declined blocking power.
-        NegativeMemoryDisposition::Advisory => NegativeMemoryGateDecision::Proceed {
+        NegativeMemoryDisposition::Advisory => NegativeMemoryGateDisposition::Proceed {
             warning: Some(NegativeMemoryProceedWarning {
                 record_id: record.record_id.clone(),
                 rule_revision: record.rule_revision,
@@ -548,11 +813,11 @@ fn find_matched_record<'r>(
 pub(crate) fn refusal_as_composition_error(
     decision: &NegativeMemoryGateDecision,
 ) -> Option<CompositionError> {
-    match decision {
-        NegativeMemoryGateDecision::Unavailable { refusal } => Some(CompositionError::Recovery(
+    match decision.disposition() {
+        NegativeMemoryGateDisposition::Unavailable { refusal } => Some(CompositionError::Recovery(
             format!("negative-memory gate refused the effect: {refusal:?}"),
         )),
-        NegativeMemoryGateDecision::Block {
+        NegativeMemoryGateDisposition::Block {
             record_id,
             rule_revision,
             policy_id,
@@ -560,7 +825,7 @@ pub(crate) fn refusal_as_composition_error(
         } => Some(CompositionError::Recovery(format!(
             "negative-memory gate blocked the effect: rule {record_id} revision {rule_revision} under admitted policy {policy_id}"
         ))),
-        NegativeMemoryGateDecision::RequireCheck {
+        NegativeMemoryGateDisposition::RequireCheck {
             record_id,
             rule_revision,
             check_id,
@@ -568,6 +833,6 @@ pub(crate) fn refusal_as_composition_error(
         } => Some(CompositionError::Recovery(format!(
             "negative-memory gate requires the admitted discriminating check {check_id} for rule {record_id} revision {rule_revision}"
         ))),
-        NegativeMemoryGateDecision::Proceed { .. } => None,
+        NegativeMemoryGateDisposition::Proceed { .. } => None,
     }
 }

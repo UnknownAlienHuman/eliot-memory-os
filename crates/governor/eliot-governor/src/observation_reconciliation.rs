@@ -115,6 +115,14 @@ use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
     KernelTransitionPort,
 };
+use crate::negative_memory_gate::{
+    NegativeMemoryGateDecision, NegativeMemoryGateDisposition,
+};
+use crate::negative_memory_probe::NegativeMemoryProbeRefusal;
+use crate::negative_memory_extinction::{
+    NegativeMemoryExtinctionDocument, NegativeMemoryExtinctionRequest,
+    negative_memory_extinction_event_id, validate_negative_memory_extinction,
+};
 
 /// Production adapter manifest name from the Surreal adapter.
 const PRODUCTION_MANIFEST_NAME: &str = "eliot.storage.store-surreal-adapter";
@@ -132,6 +140,56 @@ pub struct GovernorObservationReconciliation<'a, P: ?Sized> {
     canonical: &'a CanonicalAdmissionOwner,
     kernel: &'a P,
     readiness: CompositionReadiness,
+}
+
+/// Outcome recorded for one matched negative-memory gate decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NegativeMemoryGateObservationOutcome {
+    /// An exact admitted rule blocked the pending action before dispatch.
+    ExactBlock,
+    /// An exact admitted rule required its typed read-only probe.
+    ProbeRequired,
+    /// An exact advisory rule allowed ordinary authorization to continue.
+    ExactAdvisoryProceeded,
+    /// A near match produced a warning and the canonical write committed.
+    NearMatchProceeded,
+}
+
+/// Canonical receipt of one negative-memory gate observation.
+#[derive(Clone, Debug)]
+pub struct NegativeMemoryGateObservationReceipt {
+    /// Stable observation event identity used for replay deduplication.
+    pub event_id: String,
+    /// Stable operation identity used at the canonical writer.
+    pub operation_id: OperationId,
+    /// Rule identity and revision observed by the gate.
+    pub record_id: String,
+    /// Exact rule revision observed by the gate.
+    pub rule_revision: u64,
+    /// Typed gate outcome recorded in the observation.
+    pub outcome: NegativeMemoryGateObservationOutcome,
+    /// Canonical immutable receipt for the observation append.
+    pub store_write_receipt: WriteReceipt,
+}
+
+/// Canonical receipt of one confirmed negative-memory false-activation
+/// observation appended after the immutable successor policy revision.
+#[derive(Clone, Debug)]
+pub struct NegativeMemoryExtinctionObservationReceipt {
+    /// Stable observation identity derived from the original extinction
+    /// operation and verifier receipt.
+    pub event_id: String,
+    /// Stable canonical operation identity for the observation append.
+    pub operation_id: OperationId,
+    /// Original negative-memory record whose activation was narrowed.
+    pub record_id: String,
+    /// Original negative-memory revision retained as history.
+    pub rule_revision: u64,
+    /// Exact immutable successor policy revision committed with the evidence.
+    pub successor_policy_revision: u64,
+    /// Canonical immutable observation receipt.
+    pub store_write_receipt: WriteReceipt,
 }
 
 impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
@@ -162,7 +220,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
 /// The digest is the lowercase hex SHA-256 over the canonical JSON bytes of
 /// the exact admitted fence, so an external verifier holding the same fence
 /// computes the identical echo without trusting caller-supplied text.
-fn doctor_fence_echo(
+pub(crate) fn doctor_fence_echo(
     fence: &StateFence,
 ) -> Result<eliot_doctor_core::StateFence, CompositionError> {
     let bytes = canonical_json_bytes(fence).map_err(|error| {
@@ -184,6 +242,242 @@ fn canonical_digest(value: &impl serde::Serialize) -> Result<String, Composition
         CompositionError::Owner(format!("cannot canonicalize admission bytes: {error}"))
     })?;
     Ok(sha256_hex(&bytes))
+}
+
+#[derive(serde::Serialize)]
+struct NegativeMemoryObservationPreimage<'a> {
+    domain: &'static str,
+    source_idempotency_key: &'a str,
+    request_operation_id: &'a str,
+    action_id: &'a str,
+    action_operation_id: &'a str,
+    action_effect_id: &'a str,
+    action_input_digest: &'a str,
+    record_id: &'a str,
+    rule_revision: u64,
+    policy_id: Option<&'a str>,
+    check_id: Option<&'a str>,
+    dimensions: &'a [String],
+    warning_fields: &'a [String],
+    read_handle: &'a str,
+    read_rule_set_revision: &'a str,
+    read_rule_set_digest: &'a str,
+    request_digest: &'a str,
+    outcome: NegativeMemoryGateObservationOutcome,
+    state_fence: &'a StateFence,
+}
+
+#[derive(serde::Serialize)]
+struct NegativeMemoryExtinctionObservationPreimage<'a> {
+    domain: &'static str,
+    source_operation_id: &'a str,
+    source_request_hash: &'a str,
+    source_idempotency_key: &'a str,
+    source_commit_id: &'a str,
+    scope_id: &'a str,
+    event_id: &'a str,
+    record_id: &'a str,
+    rule_revision: u64,
+    record_digest: &'a str,
+    successor_policy_id: &'a str,
+    successor_policy_revision: u64,
+    successor_policy_digest: &'a str,
+    verification_ref: &'a str,
+    condition_digest: &'a str,
+    evidence_refs: &'a [String],
+    state_fence: &'a StateFence,
+}
+
+fn check_negative_memory_action_receipt(
+    receipt: &WriteReceipt,
+    identity: &eliot_protocol::RequestIdentity,
+    binding: &crate::negative_memory_gate::NegativeMemoryGateBinding,
+) -> Result<(), CompositionError> {
+    receipt
+        .validate()
+        .map_err(|error| owner_refused(format!("negative-memory action receipt is malformed: {error}")))?;
+    if receipt.status != WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != binding.operation_id()
+        || receipt.idempotency_key != identity.idempotency_key
+        || receipt.canonical_request_hash != binding.canonical_request_digest()
+        || receipt.state_fence != *binding.state_fence()
+    {
+        return Err(identity_refused(
+            "negative-memory action receipt does not bind the matched operation, request and fence"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn negative_memory_gate_observation_record(
+    event_id: &str,
+    fence: &StateFence,
+    binding: &crate::negative_memory_gate::NegativeMemoryGateBinding,
+    record_id: &str,
+    rule_revision: u64,
+    policy_id: Option<&str>,
+    check_id: Option<&str>,
+    dimensions: &[String],
+    warning_fields: &[String],
+    outcome: NegativeMemoryGateObservationOutcome,
+) -> Result<ObservationRecordEnvelope, CompositionError> {
+    let mut evidence = BTreeSet::new();
+    for reference in [
+        binding.action_id(),
+        binding.action_operation_id(),
+        binding.action_effect_id(),
+        binding.action_input_digest(),
+        binding.canonical_request_digest(),
+        binding.read_handle(),
+        binding.read_rule_set_digest(),
+        record_id,
+    ] {
+        evidence.insert(reference.to_owned());
+    }
+    if let Some(policy_id) = policy_id {
+        evidence.insert(policy_id.to_owned());
+    }
+    if let Some(check_id) = check_id {
+        evidence.insert(check_id.to_owned());
+    }
+    Ok(ObservationRecordEnvelope {
+        record_id: event_id.to_owned(),
+        kind: ObservationRecordKind::Telemetry,
+        event: Some(ObservationEventCore {
+            event_id_and_time: ObservationEventIdentity {
+                event_id: event_id.to_owned(),
+                clock: ClockReading::default(),
+            },
+            producer_generation_and_trace: ProducerTrace {
+                producer: "governor-negative-memory-gate".to_owned(),
+                generation: fence.resource_generation.value().to_string(),
+                trace_ref: Some(binding.action_operation_id().to_owned()),
+            },
+            kind: ObservationKind::FailureOrRepair,
+            affected_scope: ObservationScope {
+                work_scope: WorkScopeId::new(binding.scope_id())
+                    .map_err(|error| owner_refused(error.to_string()))?,
+                task_ref: Some(binding.task_id().to_owned()),
+                attempt_ref: Some(binding.action_id().to_owned()),
+                module_or_route_ref: Some("negative-memory-gate".to_owned()),
+            },
+            observed_delta: format!(
+                "negative-memory rule {record_id} revision {rule_revision} produced {outcome:?} for action {} operation {} effect {} under request {} read {} revision {} policy {:?} check {:?} dimensions {:?} warning-fields {:?}",
+                binding.action_id(),
+                binding.action_operation_id(),
+                binding.action_effect_id(),
+                binding.operation_id(),
+                binding.read_handle(),
+                binding.read_rule_set_revision(),
+                policy_id,
+                check_id,
+                dimensions,
+                warning_fields,
+            ),
+            expected_baseline: None,
+            evidence_and_raw_handles: evidence.into_iter().collect(),
+            coverage_and_blind_intervals: CoverageEvidence {
+                disposition: CoverageDisposition::Complete,
+                denominator_source_ref: binding.read_handle().to_owned(),
+                interval: None,
+                blind_intervals: Vec::new(),
+                observed_count: 1,
+            },
+            privacy_retention_and_disclosure: PrivacyRetentionDisclosure {
+                privacy_domain_ref: "governor-negative-memory".to_owned(),
+                retention_policy_ref: "governor-retention".to_owned(),
+                disclosure_class: "internal".to_owned(),
+            },
+            candidate_importance: 1,
+            dedup_key: event_id.to_owned(),
+        }),
+        coverage_gap: None,
+        journal_control_event: false,
+        parent_record_id: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn negative_memory_gate_observation_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    operation_id: &OperationId,
+    submission: &ObservationSubmission,
+    binding: &crate::negative_memory_gate::NegativeMemoryGateBinding,
+    record_id: &str,
+    rule_revision: u64,
+    event_id: &str,
+    manifest_digest: &OperationManifestDigest,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let request_digest = submission
+        .request_digest()
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("record_id", submission.record.record_id.clone()),
+        ("request_digest", request_digest),
+        ("operation_id", submission.operation_id.clone()),
+        ("idempotency_key", submission.idempotency_key.clone()),
+        ("source_operation_id", binding.action_operation_id().to_owned()),
+        ("source_action_id", binding.action_id().to_owned()),
+        ("source_effect_id", binding.action_effect_id().to_owned()),
+        ("source_input_digest", binding.action_input_digest().to_owned()),
+        ("negative_memory_record_id", record_id.to_owned()),
+        ("rule_revision", rule_revision.to_string()),
+        ("event_id", event_id.to_owned()),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    let mut proof_refs = BTreeSet::new();
+    for reference in [
+        binding.action_id(),
+        binding.action_operation_id(),
+        binding.action_effect_id(),
+        binding.action_input_digest(),
+        binding.canonical_request_digest(),
+        binding.read_handle(),
+        binding.read_rule_set_digest(),
+        record_id,
+    ] {
+        proof_refs.insert(reference.to_owned());
+    }
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: operation_id.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: submission.idempotency_key.clone(),
+        scope_id: ScopeId::new(binding.scope_id())
+            .map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: canonical_digest(submission)?,
+        operation_manifest_digest: manifest_digest.clone(),
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: proof_refs.into_iter().collect(),
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
+                .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: identity.request.metadata.state_fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
 }
 
 /// Reconstructs the production adapter manifest digest.
@@ -1291,6 +1585,582 @@ fn watchdog_observation_envelope(
 }
 
 impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> {
+    /// Appends a matched negative-memory gate decision through the current
+    /// ObservationJournal and canonical receipt owner.
+    ///
+    /// Block/probe-required decisions carry no action receipt because the
+    /// gated wrapper has not dispatched the action. Proceed warnings require
+    /// the exact committed receipt for the action they describe. Replays use
+    /// a stable source/action/rule/outcome identity, reconcile the original
+    /// operation receipt first, and never submit a second observation write.
+    pub async fn admit_negative_memory_gate_observation(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        decision: &NegativeMemoryGateDecision,
+        action_receipt: Option<&WriteReceipt>,
+    ) -> Result<Option<NegativeMemoryGateObservationReceipt>, CompositionError> {
+        self.validate_watchdog_identity_fence(identity)?;
+        let binding = decision.binding();
+        if binding.state_fence() != &identity.request.metadata.state_fence
+            || binding.action_operation_id() != binding.operation_id()
+            || binding.scope_id().trim().is_empty()
+            || binding.task_id().trim().is_empty()
+        {
+            return Err(identity_refused(
+                "negative-memory observation is not bound to the exact admitted action/fence"
+                    .to_owned(),
+            ));
+        }
+
+        let (record_id, rule_revision, outcome, policy_id, check_id, dimensions, warning_fields) =
+            match decision.disposition() {
+                NegativeMemoryGateDisposition::Block {
+                    record_id,
+                    rule_revision,
+                    policy_id,
+                    ..
+                } => {
+                    if action_receipt.is_some() {
+                        return Err(owner_refused(
+                            "blocked negative-memory action unexpectedly has a write receipt"
+                                .to_owned(),
+                        ));
+                    }
+                    (
+                        record_id.clone(),
+                        *rule_revision,
+                        NegativeMemoryGateObservationOutcome::ExactBlock,
+                        Some(policy_id.clone()),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                }
+                NegativeMemoryGateDisposition::RequireCheck {
+                    record_id,
+                    rule_revision,
+                    policy_id,
+                    check_id,
+                    required_verifier,
+                    discriminates_dimension_names,
+                    probe,
+                    ..
+                } => {
+                    probe.validate().map_err(|refusal: NegativeMemoryProbeRefusal| {
+                        owner_refused(format!(
+                            "negative-memory probe proposal is invalid at observation: {refusal:?}"
+                        ))
+                    })?;
+                    if probe.check_id() != check_id
+                        || probe.required_verifier() != required_verifier
+                        || probe.discriminates_dimension_names() != discriminates_dimension_names
+                        || probe.source_operation_id() != binding.action_operation_id()
+                        || probe.source_effect_id() != binding.action_effect_id()
+                        || probe.admission().state_fence() != binding.state_fence()
+                    {
+                        return Err(identity_refused(
+                            "negative-memory probe observation changed the admitted proposal binding"
+                                .to_owned(),
+                        ));
+                    }
+                    if action_receipt.is_some() {
+                        return Err(owner_refused(
+                            "probe-required action unexpectedly has a write receipt".to_owned(),
+                        ));
+                    }
+                    (
+                        record_id.clone(),
+                        *rule_revision,
+                        NegativeMemoryGateObservationOutcome::ProbeRequired,
+                        Some(policy_id.clone()),
+                        Some(check_id.clone()),
+                        discriminates_dimension_names.clone(),
+                        Vec::new(),
+                    )
+                }
+                NegativeMemoryGateDisposition::Proceed {
+                    warning: Some(warning),
+                } => {
+                    let receipt = action_receipt.ok_or_else(|| {
+                        owner_refused(
+                            "negative-memory proceed warning lacks the exact committed action receipt"
+                                .to_owned(),
+                        )
+                    })?;
+                    check_negative_memory_action_receipt(receipt, identity, binding)?;
+                    let exact_advisory = warning.differing_field_names.is_empty();
+                    (
+                        warning.record_id.clone(),
+                        warning.rule_revision,
+                        if exact_advisory {
+                            NegativeMemoryGateObservationOutcome::ExactAdvisoryProceeded
+                        } else {
+                            NegativeMemoryGateObservationOutcome::NearMatchProceeded
+                        },
+                        None,
+                        None,
+                        Vec::new(),
+                        warning.differing_field_names.clone(),
+                    )
+                }
+                NegativeMemoryGateDisposition::Proceed { warning: None }
+                | NegativeMemoryGateDisposition::Unavailable { .. } => return Ok(None),
+            };
+
+        let state_fence = binding.state_fence().clone();
+        if self.canonical.state_fence() != &state_fence {
+            return Err(identity_refused(
+                "negative-memory observation fence no longer matches the canonical owner"
+                    .to_owned(),
+            ));
+        }
+        let preimage = NegativeMemoryObservationPreimage {
+            domain: "eliot-negative-memory-observation-v1",
+            source_idempotency_key: &identity.idempotency_key,
+            request_operation_id: binding.operation_id(),
+            action_id: binding.action_id(),
+            action_operation_id: binding.action_operation_id(),
+            action_effect_id: binding.action_effect_id(),
+            action_input_digest: binding.action_input_digest(),
+            record_id: &record_id,
+            rule_revision,
+            policy_id: policy_id.as_deref(),
+            check_id: check_id.as_deref(),
+            dimensions: &dimensions,
+            warning_fields: &warning_fields,
+            read_handle: binding.read_handle(),
+            read_rule_set_revision: binding.read_rule_set_revision(),
+            read_rule_set_digest: binding.read_rule_set_digest(),
+            request_digest: binding.canonical_request_digest(),
+            outcome,
+            state_fence: &state_fence,
+        };
+        let event_id = canonical_digest(&preimage)?;
+        let event_id = format!("negative-memory-event:{event_id}");
+        let operation_id = OperationId::new(format!("negative-memory-observation:{}", &event_id[22..]))
+            .map_err(|error| owner_refused(error.to_string()))?;
+        let idempotency_key = format!("negative-memory-observation:{}", &event_id[22..]);
+        let observation_identity = eliot_protocol::RequestIdentity {
+            request: identity.request.clone(),
+            idempotency_key: idempotency_key.clone(),
+            deadline_unix_ms: identity.deadline_unix_ms,
+            cancellation_id: identity.cancellation_id.clone(),
+        };
+        let record = negative_memory_gate_observation_record(
+            &event_id,
+            &state_fence,
+            binding,
+            &record_id,
+            rule_revision,
+            policy_id.as_deref(),
+            check_id.as_deref(),
+            &dimensions,
+            &warning_fields,
+            outcome,
+        )?;
+        let submission = ObservationSubmission {
+            operation_id: operation_id.as_str().to_owned(),
+            idempotency_key: idempotency_key.clone(),
+            state_fence: state_fence.clone(),
+            record,
+            record_v2: None,
+            capture_route: CaptureRoute::CanonicalJournal,
+            durability: Durability::Durable,
+            plan: None,
+            task_selection: None,
+            evidence: None,
+        };
+        let mut scratch = self.observation.clone();
+        match scratch
+            .admit(submission.clone())
+            .map_err(|error| owner_refused(error.to_string()))?
+        {
+            ObservationAdmissionResult::Accepted { .. }
+            | ObservationAdmissionResult::Replayed { .. } => {}
+            ObservationAdmissionResult::Rejected { rejection } => {
+                return Err(owner_refused(format!(
+                    "negative-memory observation admission refused: {}",
+                    rejection.all_contract_errors.join("; ")
+                )));
+            }
+        }
+
+        let manifest_digest = production_manifest_digest()?;
+        let envelope = negative_memory_gate_observation_envelope(
+            &observation_identity,
+            &operation_id,
+            &submission,
+            binding,
+            &record_id,
+            rule_revision,
+            &event_id,
+            &manifest_digest,
+        )?;
+        let expected_hash = envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        let receipt = self
+            .commit_negative_memory_receipt(
+                &observation_identity,
+                &operation_id,
+                envelope,
+                &expected_hash,
+                &manifest_digest,
+            )
+            .await?;
+        if receipt.status != WriteReceiptStatus::Committed {
+            return Err(owner_refused(
+                "negative-memory observation did not receive a committed canonical receipt"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(NegativeMemoryGateObservationReceipt {
+            event_id,
+            operation_id,
+            record_id,
+            rule_revision,
+            outcome,
+            store_write_receipt: receipt,
+        }))
+    }
+
+    /// Appends the verified false-activation outcome after its immutable
+    /// successor policy write. This is crate-private so it can only be reached
+    /// through `commit_negative_memory_extinction`, which has already checked
+    /// the endorsed owner report, exact reopen evidence, predecessor revision
+    /// and canonical policy receipt.
+    pub(crate) async fn admit_negative_memory_false_activation(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        source_operation_id: &OperationId,
+        scope_id: &ScopeId,
+        request: &NegativeMemoryExtinctionRequest,
+        document: &NegativeMemoryExtinctionDocument,
+        policy_receipt: &WriteReceipt,
+    ) -> Result<NegativeMemoryExtinctionObservationReceipt, CompositionError> {
+        validate_negative_memory_extinction(request).map_err(|error| {
+            owner_refused(format!("false-activation evidence is invalid: {error:?}"))
+        })?;
+        self.validate_watchdog_identity_fence(identity)?;
+        let fence = &identity.request.metadata.state_fence;
+        let expected_event_id = negative_memory_extinction_event_id(request).map_err(|error| {
+            owner_refused(format!("false-activation event binding is invalid: {error:?}"))
+        })?;
+        if request.state_fence != *fence
+            || document.state_fence != *fence
+            || self.canonical.state_fence() != fence
+            || expected_event_id != document.event_id
+            || request.record.record_id != document.record_id
+            || request.record.rule_revision != document.rule_revision
+            || request.record.record_digest != document.record_digest
+            || request.prior_policy.policy_id != document.prior_policy.policy_id
+            || request.prior_policy.policy_revision != document.prior_policy.policy_revision
+            || request.prior_policy.policy_digest != document.prior_policy.policy_digest
+            || request.successor_policy.policy_id != document.successor_policy.policy_id
+            || request.successor_policy.policy_revision != document.successor_policy.policy_revision
+            || request.successor_policy.policy_digest != document.successor_policy.policy_digest
+            || request.evidence.verification_ref != document.verification_ref
+            || request.evidence.condition_digest != document.condition_digest
+            || request.evidence.evidence_refs != document.evidence_refs
+            || request.evidence.verifier != document.verifier
+            || request.evidence.outcome != document.outcome
+            || request.evidence.admission_ref != document.admission_ref
+        {
+            return Err(identity_refused(
+                "false-activation observation is not bound to the validated extinction evidence, successor, scope fence and canonical owner"
+                    .to_owned(),
+            ));
+        }
+        if document.outcome
+            != crate::negative_memory_extinction::NegativeMemoryExtinctionOutcome::SafeToNarrow
+            || source_operation_id.as_str()
+                != format!("negative-memory-extinction:{}", document.event_id)
+        {
+            return Err(owner_refused(
+                "false-activation observation does not bind a confirmed successor revision"
+                    .to_owned(),
+            ));
+        }
+        policy_receipt
+            .validate()
+            .map_err(|error| owner_refused(format!("extinction receipt is malformed: {error}")))?;
+        if policy_receipt.status != WriteReceiptStatus::Committed
+            || policy_receipt.operation_id != *source_operation_id
+            || policy_receipt.idempotency_key != identity.idempotency_key
+            || policy_receipt.state_fence != *fence
+        {
+            return Err(identity_refused(
+                "false-activation observation lacks the exact committed policy receipt"
+                    .to_owned(),
+            ));
+        }
+
+        let preimage = NegativeMemoryExtinctionObservationPreimage {
+            domain: "eliot-negative-memory-false-activation-v1",
+            source_operation_id: source_operation_id.as_str(),
+            source_request_hash: &policy_receipt.canonical_request_hash,
+            source_idempotency_key: &policy_receipt.idempotency_key,
+            source_commit_id: policy_receipt.commit_id.as_str(),
+            scope_id: scope_id.as_str(),
+            event_id: &document.event_id,
+            record_id: &document.record_id,
+            rule_revision: document.rule_revision,
+            record_digest: &document.record_digest,
+            successor_policy_id: &document.successor_policy.policy_id,
+            successor_policy_revision: document.successor_policy.policy_revision,
+            successor_policy_digest: &document.successor_policy.policy_digest,
+            verification_ref: &document.verification_ref,
+            condition_digest: &document.condition_digest,
+            evidence_refs: &document.evidence_refs,
+            state_fence: fence,
+        };
+        let event_id = format!("negative-memory-false-activation:{}", canonical_digest(&preimage)?);
+        let suffix = event_id
+            .strip_prefix("negative-memory-false-activation:")
+            .ok_or_else(|| owner_refused("false-activation event identity malformed".to_owned()))?;
+        let operation_id = OperationId::new(format!("negative-memory-observation:{suffix}"))
+            .map_err(|error| owner_refused(error.to_string()))?;
+        let idempotency_key = format!("negative-memory-observation:{suffix}");
+        let observation_identity = eliot_protocol::RequestIdentity {
+            request: identity.request.clone(),
+            idempotency_key: idempotency_key.clone(),
+            deadline_unix_ms: identity.deadline_unix_ms,
+            cancellation_id: identity.cancellation_id.clone(),
+        };
+        let mut evidence = BTreeSet::new();
+        for reference in [
+            document.record_id.as_str(),
+            document.record_digest.as_str(),
+            document.prior_policy.policy_digest.as_str(),
+            document.successor_policy.policy_digest.as_str(),
+            document.verification_ref.as_str(),
+            document.condition_digest.as_str(),
+            source_operation_id.as_str(),
+            policy_receipt.canonical_request_hash.as_str(),
+        ] {
+            evidence.insert(reference.to_owned());
+        }
+        evidence.extend(document.evidence_refs.iter().cloned());
+        let record = ObservationRecordEnvelope {
+            record_id: event_id.clone(),
+            kind: ObservationRecordKind::Telemetry,
+            event: Some(ObservationEventCore {
+                event_id_and_time: ObservationEventIdentity {
+                    event_id: event_id.clone(),
+                    clock: ClockReading::default(),
+                },
+                producer_generation_and_trace: ProducerTrace {
+                    producer: "governor-negative-memory-extinction".to_owned(),
+                    generation: fence.resource_generation.value().to_string(),
+                    trace_ref: Some(source_operation_id.as_str().to_owned()),
+                },
+                kind: ObservationKind::FailureOrRepair,
+                affected_scope: ObservationScope {
+                    work_scope: WorkScopeId::new(scope_id.as_str())
+                        .map_err(|error| owner_refused(error.to_string()))?,
+                    task_ref: identity
+                        .request
+                        .metadata
+                        .task_id
+                        .as_ref()
+                        .map(|task| task.as_str().to_owned()),
+                    attempt_ref: Some(document.verification_ref.clone()),
+                    module_or_route_ref: Some("negative-memory-extinction".to_owned()),
+                },
+                observed_delta: format!(
+                    "false activation confirmed for negative-memory record {} revision {}; policy {} advanced from {} to {} under verifier receipt {}",
+                    document.record_id,
+                    document.rule_revision,
+                    document.successor_policy.policy_id,
+                    document.prior_policy.policy_revision,
+                    document.successor_policy.policy_revision,
+                    document.verification_ref,
+                ),
+                expected_baseline: None,
+                evidence_and_raw_handles: evidence.into_iter().collect(),
+                coverage_and_blind_intervals: CoverageEvidence {
+                    disposition: CoverageDisposition::Complete,
+                    denominator_source_ref: document.verification_ref.clone(),
+                    interval: None,
+                    blind_intervals: Vec::new(),
+                    observed_count: u64::try_from(document.evidence_refs.len()).unwrap_or(u64::MAX),
+                },
+                privacy_retention_and_disclosure: PrivacyRetentionDisclosure {
+                    privacy_domain_ref: "governor-negative-memory".to_owned(),
+                    retention_policy_ref: "governor-retention".to_owned(),
+                    disclosure_class: "internal".to_owned(),
+                },
+                candidate_importance: 1,
+                dedup_key: event_id.clone(),
+            }),
+            coverage_gap: None,
+            journal_control_event: false,
+            parent_record_id: Some(document.record_id.clone()),
+        };
+        let submission = ObservationSubmission {
+            operation_id: operation_id.as_str().to_owned(),
+            idempotency_key: idempotency_key.clone(),
+            state_fence: fence.clone(),
+            record,
+            record_v2: None,
+            capture_route: CaptureRoute::CanonicalJournal,
+            durability: Durability::Durable,
+            plan: None,
+            task_selection: None,
+            evidence: None,
+        };
+        let mut scratch = self.observation.clone();
+        match scratch
+            .admit(submission.clone())
+            .map_err(|error| owner_refused(error.to_string()))?
+        {
+            ObservationAdmissionResult::Accepted { .. }
+            | ObservationAdmissionResult::Replayed { .. } => {}
+            ObservationAdmissionResult::Rejected { rejection } => {
+                return Err(owner_refused(format!(
+                    "false-activation observation admission refused: {}",
+                    rejection.all_contract_errors.join("; ")
+                )));
+            }
+        }
+        let manifest_digest = production_manifest_digest()?;
+        let request_digest = submission
+            .request_digest()
+            .map_err(|error| owner_refused(error.to_string()))?;
+        let mut parameters = BTreeMap::new();
+        for (name, value) in [
+            ("record_id", submission.record.record_id.clone()),
+            ("request_digest", request_digest),
+            ("operation_id", submission.operation_id.clone()),
+            ("idempotency_key", submission.idempotency_key.clone()),
+            ("source_operation_id", source_operation_id.as_str().to_owned()),
+            ("source_request_hash", policy_receipt.canonical_request_hash.clone()),
+            ("event_id", event_id.clone()),
+            ("negative_memory_record_id", document.record_id.clone()),
+            ("rule_revision", document.rule_revision.to_string()),
+            ("policy_revision", document.successor_policy.policy_revision.to_string()),
+            ("verification_ref", document.verification_ref.clone()),
+        ] {
+            parameters.insert(name.to_owned(), serde_json::Value::String(value));
+        }
+        let envelope = CanonicalWriteEnvelope {
+            operation_id: operation_id.clone(),
+            request: observation_identity.request.metadata.clone(),
+            idempotency_key: idempotency_key.clone(),
+            scope_id: scope_id.clone(),
+            task_id: identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(|task| task.as_str().to_owned()),
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: canonical_digest(&submission)?,
+            operation_manifest_digest: manifest_digest.clone(),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: evidence.into_iter().collect(),
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
+                    .map_err(|error| owner_refused(error.to_string()))?,
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        };
+        envelope.validate()?;
+        let expected_hash = envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        let observation_receipt = self
+            .commit_negative_memory_receipt(
+                &observation_identity,
+                &operation_id,
+                envelope,
+                &expected_hash,
+                &manifest_digest,
+            )
+            .await?;
+        if observation_receipt.status != WriteReceiptStatus::Committed {
+            return Err(owner_refused(
+                "false-activation observation lacks a committed canonical receipt".to_owned(),
+            ));
+        }
+        Ok(NegativeMemoryExtinctionObservationReceipt {
+            event_id,
+            operation_id,
+            record_id: document.record_id.clone(),
+            rule_revision: document.rule_revision,
+            successor_policy_revision: document.successor_policy.policy_revision,
+            store_write_receipt: observation_receipt,
+        })
+    }
+
+    /// Commits one #1731-owned write through the existing observation owner,
+    /// reconciling the original operation before retry and after an unknown
+    /// acknowledgement. No alternate receipt store or second write identity
+    /// is created.
+    pub(crate) async fn commit_negative_memory_receipt(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: &OperationId,
+        envelope: CanonicalWriteEnvelope,
+        expected_hash: &str,
+        manifest_digest: &OperationManifestDigest,
+    ) -> Result<WriteReceipt, CompositionError> {
+        if let Some(receipt) = self
+            .reconcile_negative_memory_receipt(identity, operation_id, expected_hash, manifest_digest)
+            .await?
+        {
+            return Ok(receipt);
+        }
+        self.commit_observation_leg(
+            identity,
+            operation_id,
+            envelope,
+            expected_hash,
+            manifest_digest,
+        )
+        .await
+    }
+
+    async fn reconcile_negative_memory_receipt(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: &OperationId,
+        expected_hash: &str,
+        manifest_digest: &OperationManifestDigest,
+    ) -> Result<Option<WriteReceipt>, CompositionError> {
+        let Some(receipt) = self.kernel.receipt(operation_id.clone()).await? else {
+            return Ok(None);
+        };
+        if receipt.idempotency_key != identity.idempotency_key
+            || receipt.canonical_request_hash != expected_hash
+        {
+            return Err(identity_refused(format!(
+                "negative-memory operation {operation_id} already has a receipt for different bytes"
+            )));
+        }
+        check_receipt(
+            &receipt,
+            operation_id,
+            identity,
+            expected_hash,
+            TransitionClass::CaptureCandidate,
+            manifest_digest,
+        )?;
+        Ok(Some(receipt))
+    }
+
     /// Validates readiness plus exact fence agreement for Watchdog admission.
     ///
     /// Mirrors [`Self::validate_identity_fence`] without the doctor echo: the

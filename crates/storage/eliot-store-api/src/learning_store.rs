@@ -94,8 +94,9 @@ pub const MAX_LEARNING_PAGE_RECORDS: u16 = 64;
 /// Closed learning-record kind discriminator (issue #1868).
 ///
 /// One closed set covers every durable learning record named in Work
-/// (view refs, activation receipts, deltas, overlays, closures,
-/// candidates) without a per-kind table/authority split.
+/// (view refs, activation receipts, negative-memory extinction receipts,
+/// deltas, overlays, closures, candidates) without a per-kind
+/// table/authority split.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LearningRecordKind {
     /// A proposed behavioral delta record.
@@ -106,6 +107,8 @@ pub enum LearningRecordKind {
     Closure,
     /// An activation receipt record.
     ActivationReceipt,
+    /// An owner-verified negative-memory extinction receipt.
+    NegativeMemoryExtinctionReceipt,
     /// A candidate record (recording never performs promotion).
     Candidate,
     /// A reference to a rebuilt view revision (views never accept writes).
@@ -121,6 +124,7 @@ impl LearningRecordKind {
             Self::Overlay => "overlay",
             Self::Closure => "closure",
             Self::ActivationReceipt => "activation_receipt",
+            Self::NegativeMemoryExtinctionReceipt => "negative_memory_extinction_receipt",
             Self::Candidate => "candidate",
             Self::ViewRef => "view_ref",
         }
@@ -134,6 +138,7 @@ impl LearningRecordKind {
             b"overlay" => Some(Self::Overlay),
             b"closure" => Some(Self::Closure),
             b"activation_receipt" => Some(Self::ActivationReceipt),
+            b"negative_memory_extinction_receipt" => Some(Self::NegativeMemoryExtinctionReceipt),
             b"candidate" => Some(Self::Candidate),
             b"view_ref" => Some(Self::ViewRef),
             _ => None,

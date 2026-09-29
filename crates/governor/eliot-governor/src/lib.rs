@@ -65,6 +65,14 @@ pub use negative_memory_activation::{
     NegativeMemoryActivationRequest, commit_negative_memory_activation,
     negative_memory_activation_mutation_request, validate_negative_memory_activation,
 };
+pub use negative_memory_extinction::{
+    NegativeMemoryExtinctionDocument, NegativeMemoryExtinctionEvidence,
+    NegativeMemoryExtinctionOutcome, NegativeMemoryExtinctionReceipt,
+    NegativeMemoryExtinctionRefusal, NegativeMemoryExtinctionRequest,
+    commit_negative_memory_extinction, negative_memory_extinction_event_id,
+    negative_memory_extinction_mutation_request, negative_memory_policy_admission_ref,
+    validate_negative_memory_extinction,
+};
 pub use negative_memory_context::{
     AdmittedNegativeMemoryRule, MAX_ADMITTED_NEGATIVE_MEMORY_RULES, MAX_NEGATIVE_MEMORY_DIMENSIONS,
     MAX_NEGATIVE_MEMORY_EXPOSURE_TEXT, MAX_NEGATIVE_MEMORY_LOSSES,
@@ -76,8 +84,14 @@ pub use negative_memory_context::{
     project_negative_memory_rules,
 };
 pub use negative_memory_gate::{
-    NegativeMemoryGateDecision, NegativeMemoryGateInput, NegativeMemoryGateRefusal,
-    NegativeMemoryProceedWarning, evaluate_negative_memory_gate,
+    NegativeMemoryGateBinding, NegativeMemoryGateDecision, NegativeMemoryGateDisposition,
+    NegativeMemoryGateInput, NegativeMemoryGateRefusal, NegativeMemoryProceedWarning,
+    evaluate_negative_memory_gate,
+};
+pub use negative_memory_probe::{
+    NegativeMemoryProbeAdmission, NegativeMemoryProbeBudget,
+    NegativeMemoryProbeEffectCeiling, NegativeMemoryProbeForbiddenEffectGuard,
+    NegativeMemoryProbeProposal, NegativeMemoryProbeRefusal,
 };
 mod controlboard_projection;
 mod learning_admission;
@@ -88,7 +102,9 @@ mod learning_record_commit;
 mod migration_inventory;
 mod negative_memory_activation;
 mod negative_memory_context;
+mod negative_memory_extinction;
 mod negative_memory_gate;
+mod negative_memory_probe;
 mod observation_reconciliation;
 mod operator_intent;
 mod operator_reconciliation;
@@ -189,8 +205,9 @@ pub use migration_inventory::{
     impact_entry_node, impact_node, lookup_by_package, migration_inventory_guard, resolve,
 };
 pub use observation_reconciliation::{
-    GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
-    WatchdogEntryKind,
+    GovernorObservationReconciliation, NegativeMemoryExtinctionObservationReceipt,
+    NegativeMemoryGateObservationOutcome, NegativeMemoryGateObservationReceipt,
+    WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
 };
 pub use operator_intent::{
     OPERATOR_INTENT_CONTRACT_NAME, OPERATOR_INTENT_CONTRACT_VERSION, OperatorIntentApprovals,

@@ -31,10 +31,11 @@
 //! constructible outside this module, so a bounded enumeration with a missing
 //! page can never certify the absence of an applicable rule.
 
+use eliot_contracts::StateFence;
 use eliot_dreamer_contracts::{
     ContractViolation, FailureAction, FailureApplicability, FailureCoverage, FailureDimension,
     FailureDimensionSource, FailureDimensionValue, FailureEnvironment, canonical_bytes, digest_hex,
-    error::check_text, is_hex64_lower,
+    error::{check_fence, check_text}, is_hex64_lower,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -47,13 +48,13 @@ use crate::negative_memory::{
 };
 
 /// Wire revision of a matcher result.
-pub const NEGATIVE_MEMORY_MATCH_SCHEMA_VERSION: u32 = 1;
+pub const NEGATIVE_MEMORY_MATCH_SCHEMA_VERSION: u32 = 2;
 
 /// Domain label mixed into the matcher result content digest.
-const MATCH_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-match/v1";
+const MATCH_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-match/v2";
 
 /// Domain label mixed into the subject content digest.
-const SUBJECT_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-subject/v1";
+const SUBJECT_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-subject/v2";
 
 /// The closed set of relations a compared identity can satisfy.
 ///
@@ -144,6 +145,10 @@ pub struct ScopeComparison {
 pub struct NegativeMemorySubject {
     /// The exact pending action.
     pub action: FailureAction,
+    /// Canonical request digest for the exact canonical envelope this subject
+    /// describes. The Governor compares it with the envelope before the gate
+    /// decision may reach canonical dispatch.
+    pub canonical_request_digest: String,
     /// The owner-issued task, scope and target identities of the pending action.
     pub applicability: FailureApplicability,
     /// The owner-issued environment identity of the pending action.
@@ -161,6 +166,7 @@ pub struct NegativeMemorySubject {
 struct SubjectPreimage<'a> {
     domain: &'static str,
     action: &'a FailureAction,
+    canonical_request_digest: &'a str,
     applicability: &'a FailureApplicability,
     environment: &'a FailureEnvironment,
     resources: &'a [NegativeMemoryResource],
@@ -183,6 +189,7 @@ impl NegativeMemorySubject {
         let preimage = SubjectPreimage {
             domain: SUBJECT_DIGEST_DOMAIN,
             action: &self.action,
+            canonical_request_digest: &self.canonical_request_digest,
             applicability: &self.applicability,
             environment: &self.environment,
             resources: &resources,
@@ -211,6 +218,11 @@ impl NegativeMemorySubject {
             .map_err(|_| NegativeMemoryViolation::MissingRequiredField {
                 field: "matcher.subject.action",
             })?;
+        if !is_hex64_lower(&self.canonical_request_digest) {
+            return Err(NegativeMemoryViolation::NotADigest {
+                field: "matcher.subject.canonical_request_digest",
+            });
+        }
         self.applicability.validate().map_err(|_| {
             NegativeMemoryViolation::MissingRequiredField {
                 field: "matcher.subject.applicability",
@@ -307,6 +319,10 @@ pub struct NegativeMemoryCandidateRead {
     /// The rule-set revision head the read observed before reading (I12.16
     /// Fence A). The matcher records it; it does not revalidate it.
     pub rule_set_revision: String,
+    /// Exact StateFence at which the named read observed this rule set.
+    /// Governor rechecks exact equality with both the gate request and the
+    /// canonical effect envelope before dispatch.
+    pub state_fence: StateFence,
     /// Digest over the delivered pages.
     pub rule_set_digest: String,
     /// The page total, when the read established it.
@@ -331,6 +347,11 @@ impl NegativeMemoryCandidateRead {
     pub fn validate(&self) -> Result<(), NegativeMemoryViolation> {
         read_text("matcher.read.read_handle", &self.read_handle)?;
         read_text("matcher.read.rule_set_revision", &self.rule_set_revision)?;
+        check_fence(&self.state_fence).map_err(|_| {
+            NegativeMemoryViolation::BindingInconsistent {
+                field: "matcher.read.state_fence",
+            }
+        })?;
         if !is_hex64_lower(&self.rule_set_digest) {
             return Err(NegativeMemoryViolation::NotADigest {
                 field: "matcher.read.rule_set_digest",
