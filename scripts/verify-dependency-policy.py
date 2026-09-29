@@ -3766,6 +3766,19 @@ def _validate_candidate_release_advisories(
     }
 
 
+def classify_evidence_scope(record: str) -> str:
+    """Source-vs-installed evidence classification (audit 5886153415).
+
+    TEST-PHASE entrypoint (W8/A4): the installed workstation observation is
+    installed scope and gates installed/runtime/release acceptance only;
+    every other external-executable record is source scope. These labels are
+    additive evidence data; they suppress no finding and change no status.
+    """
+    if record in ("observed_installed", "installed_advisory_disposition"):
+        return "installed"
+    return "source"
+
+
 def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     evidence: dict = {}
@@ -4042,6 +4055,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         "status": "findings" if findings else "observed",
         "configured": surreal,
         "pinned_artifact": {
+            "evidence_scope": classify_evidence_scope("pinned_artifact"),
             "version": surreal.get("version"),
             "sha256": configured_sha,
             "catalog": catalog_evidence,
@@ -4049,12 +4063,14 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         },
         "provisioning_receipt": provisioning_receipt,
         "observed_installed": {
+            "evidence_scope": classify_evidence_scope("observed_installed"),
             "path": str(observed_path.resolve()) if observed_path else None,
             "version": observed_version,
             "sha256": observed_sha,
             "version_probe": version_probe,
         },
         "advisory_snapshot": {
+            "evidence_scope": classify_evidence_scope("advisory_snapshot"),
             "source": advisory_source,
             "query": surreal.get("advisory_query"),
             "package": advisory_package,
