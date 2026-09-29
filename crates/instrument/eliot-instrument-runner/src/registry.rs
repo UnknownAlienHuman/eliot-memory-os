@@ -632,8 +632,7 @@ pub const REQUIRED_IDENTITY_SLOTS: [IdentitySlot; 10] = [
 /// empty value is the honest "nothing attested" state the governed build lane
 /// already uses, so emptiness is reported as an unattested slot rather than a
 /// blank identity that could be mistaken for a bound one.
-pub const ATTESTED_IDENTITY_SLOTS: [IdentitySlot; 2] =
-    [IdentitySlot::Source, IdentitySlot::Lock];
+pub const ATTESTED_IDENTITY_SLOTS: [IdentitySlot; 2] = [IdentitySlot::Source, IdentitySlot::Lock];
 
 /// The declared identity values one entry binds.
 ///
