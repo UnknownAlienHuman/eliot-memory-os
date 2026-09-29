@@ -101,6 +101,7 @@ mod kernel_transition_client;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
+mod maintenance_trigger_recovery;
 mod negative_memory_action_gate;
 pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;
