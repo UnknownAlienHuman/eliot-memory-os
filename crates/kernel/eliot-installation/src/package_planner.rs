@@ -1849,7 +1849,13 @@ impl GenerationPackagePlanner {
                 "--config".to_owned(),
                 config_path.as_str().to_owned(),
             ],
-            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+            InstallationProfile::UserMode => vec![
+                "--user-mode-root".to_owned(),
+                profile_resolution.roots.immutable_binaries.clone(),
+                "--config".to_owned(),
+                config_path.as_str().to_owned(),
+            ],
+            InstallationProfile::SystemService => {
                 vec!["--config".to_owned(), config_path.as_str().to_owned()]
             }
         })?;
