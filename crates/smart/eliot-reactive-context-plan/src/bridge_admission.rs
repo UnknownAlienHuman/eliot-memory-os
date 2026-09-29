@@ -35,14 +35,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DeliveryDisposition, PendingContextInjectionPlan, PlannedAttentionBinding, PlannedContextItem,
-    PlannedItemKind,
+    BridgeAdmissionInvalidation, DeliveryDisposition, PendingContextInjectionPlan,
+    PlannedAttentionBinding, PlannedContextItem, PlannedItemKind,
 };
 
 /// Maximum relation handles carried on one instruction. Mirrors the bridge
 /// ledger bound (`MAX_RELATION_ACTIVATIONS`); the producer enforces it at the
 /// source so an over-bound plan fails here, never as a transport rejection.
 pub const MAX_BRIDGE_RELATIONS: usize = 8;
+const MAX_BRIDGE_TEXT_BYTES: usize = 8 * 1024;
 
 /// Bridge admission severity derived from owner-set attention stickiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -116,9 +117,8 @@ pub struct BridgeAdmissionBatch {
     pub session_id: SessionId,
     /// Owner scope for the whole batch.
     pub scope_id: WorkScopeId,
-    /// Source-invalidation signals passed through for the bridge
-    /// invalidation-aware dedup (`plan.invalidation` verbatim).
-    pub invalidations: Vec<String>,
+    /// Exact historical item identities to reopen in bridge session dedup.
+    pub invalidations: Vec<BridgeAdmissionInvalidation>,
     /// First-delivery instructions, in plan order.
     pub items: Vec<BridgeAdmissionInstruction>,
     /// Already-delivered sticky items correctly not re-emitted.
@@ -196,6 +196,22 @@ pub fn plan_bridge_admissions(
     non_blank(&plan.result_digest, "plan.result_digest")?;
     non_blank(&plan.activation_digest, "plan.activation_digest")?;
     non_blank(&plan.policy_digest, "plan.policy_digest")?;
+    for invalidation in &plan.invalidation {
+        for (value, field) in [
+            (invalidation.cue_source.as_str(), "invalidation.cue_source"),
+            (invalidation.cue_id.as_str(), "invalidation.cue_id"),
+        ] {
+            non_blank(value, field)?;
+            if value.len() > MAX_BRIDGE_TEXT_BYTES {
+                return Err(BridgeAdmissionError::InvalidField { field });
+            }
+        }
+        if invalidation.session_id != plan.request.session_id {
+            return Err(BridgeAdmissionError::InvalidField {
+                field: "invalidation.session_id",
+            });
+        }
+    }
     let mut batch = BridgeAdmissionBatch {
         session_id: plan.request.session_id.clone(),
         scope_id: plan.request.scope_id.clone(),
