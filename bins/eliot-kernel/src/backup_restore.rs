@@ -59,9 +59,17 @@
 //! The durable journal is injected as `J: RestoreJournalPort` with
 //! owner-issued [`RestoreJournalAdmission`](eliot_backup::RestoreJournalAdmission):
 //! production refuses fixture-flagged or unadmitted journals, and this file
-//! contains no in-memory or no-op journal type by construction. Cutover is
-//! validated-only ([`KernelBackupRestore::qualify_cutover`]): no receipt is
-//! minted here — authorization and execution belong to #961.
+//! contains no in-memory or no-op journal type by construction. The admission
+//! is additionally bound to the journal that actually runs: the production
+//! entry [`KernelBackupRestore::restore_with_ors_journal`] compares the
+//! admission's `journal_identity_ref` with the durable ORS restore-journal
+//! namespace, and compares the ORS binding with the archive, target, and the
+//! admitted owner, so a production restore cannot file its durable rows under
+//! an admission describing some other store. Cutover is validated-only
+//! ([`KernelBackupRestore::qualify_cutover`]): no receipt is minted here —
+//! authorization and execution belong to #961 — and qualification requires
+//! owner-issued new-epoch and operational-readiness evidence, refusing a
+//! rehearsal outright from the posture its own destination pinned.
 //!
 //! Capability cell: Kernel restore ownership (isolated import execution).
 //! Forbidden authority: no ORS row reinterpretation, no epoch minting, no
@@ -92,8 +100,9 @@ use serde::Serialize;
 use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, PinnedDestinationAdmission,
-    RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts,
-    StagedCleanupRefusal, check_kernel_effect_fence, require_production_admitted,
+    RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY,
+    RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal, check_kernel_effect_fence,
+    require_production_admitted,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -643,8 +652,16 @@ pub struct CutoverQualification {
     pub destination_root: PathBuf,
     /// Owner obligations checked (always the full 13-slot denominator).
     pub obligations_checked: u32,
-    /// Whether owner-issued new-epoch evidence was present and validated.
-    pub owner_epoch_present: bool,
+    /// Lineage id of the owner-issued new Authority Epoch that authorized this
+    /// qualification.
+    ///
+    /// This value is reported only after the accepted
+    /// [`RestoreOwnerEpoch`](eliot_backup::RestoreOwnerEpoch) was present and
+    /// validated against the exact authority the restore actually ran under,
+    /// and after its superseding set accounted for every observed lineage
+    /// limit. An absent owner epoch refuses rather than qualifying, so this
+    /// field can never report a caller-proposed epoch as owner authority.
+    pub owner_epoch_lineage: String,
 }
 
 /// Kernel-owned production restore adapter.
@@ -829,6 +846,7 @@ impl KernelBackupRestore {
             &destination,
             &transaction.transaction_id,
             &plan.target.target_id,
+            ports.rehearsal,
             ports.manifest_evidence.as_ref(),
         )?;
         let receipts = match ports.keys {
@@ -883,18 +901,24 @@ impl KernelBackupRestore {
         })
     }
 
-    /// Refuses a destination pinned to a different transaction, target, or
-    /// manifest evidence, and corrupt pinned admissions.
+    /// Refuses a destination pinned to a different transaction, target,
+    /// rehearsal posture, or manifest evidence, and corrupt pinned
+    /// admissions.
     ///
-    /// A pinned admission for the exact current transaction, target, and
-    /// evidence resumes; anything else pinned refuses as foreign or drifted
-    /// instead of continuing the old transaction under new authority. An
+    /// A pinned admission for the exact current transaction, target, posture
+    /// and evidence resumes; anything else pinned refuses as foreign or
+    /// drifted instead of continuing the old transaction under new authority.
+    /// The rehearsal posture is part of that identity because it is what
+    /// decides whether the destination may ever be qualified for cutover: a
+    /// rehearsal-prepared root is never continued by a production run, and a
+    /// production-prepared root is never downgraded to a rehearsal. An
     /// unpinned destination proceeds: it is either fresh or a pre-prepare
     /// crash whose byte staging the engine re-applies idempotently.
     fn refuse_foreign_destination(
         destination: &KernelIsolatedDestination,
         transaction_id: &str,
         target_id: &str,
+        rehearsal: bool,
         expected: Option<&DestinationManifestEvidence>,
     ) -> Result<(), KernelRestoreError> {
         let path = destination.root().join(DESTINATION_ADMISSION_FILE);
@@ -909,6 +933,11 @@ impl KernelBackupRestore {
             serde_json::from_slice(&bytes).map_err(|_| KernelRestoreError::JournalCorrupt)?;
         if pinned.transaction_id != transaction_id || pinned.target_id != target_id {
             return Err(KernelRestoreError::JournalBindingConflict);
+        }
+        if pinned.rehearsal != rehearsal {
+            return Err(KernelRestoreError::FenceMismatch(
+                "destination rehearsal posture".to_owned(),
+            ));
         }
         match (expected, Some(&pinned.evidence)) {
             (Some(want), Some(have)) if want != have => Err(KernelRestoreError::FenceMismatch(
@@ -937,14 +966,29 @@ impl KernelBackupRestore {
     /// at prepare — absent without Host admission, and qualification refuses
     /// without it), and the freshly re-validated restored fence (lineage
     /// advance re-proven here with no caller arithmetic on epochs).
-    /// Owner-issued new-epoch evidence, when present, is consumed through
-    /// its owner validation — never minted.
+    ///
+    /// Two further requirements are hard refusals, not warnings. The
+    /// owner-issued new Authority Epoch is REQUIRED (see
+    /// [`require_qualified_owner_epoch`]) and must be the authority this
+    /// restore ran under, with a superseding set that accounts for every
+    /// lineage limit the restore observed; and the owner-issued operational
+    /// validation for the exact isolated root is REQUIRED (see
+    /// [`require_operational_validation`]). Absent either, a safe partial
+    /// isolated import stays explicitly partial and never reads as operationally
+    /// ready. The owner-issued values are consumed through their accepted
+    /// owner validation — never minted, never recomputed here.
+    ///
+    /// A rehearsal is refused outright, read from the durable rehearsal
+    /// posture its own destination pinned at prepare. That is why a rehearsal
+    /// cannot qualify even with a full Host admission, an owner-issued epoch,
+    /// and a separate Human/System Owner authorization: it activates nothing,
+    /// cuts over nothing, and retires nothing, and this method says so instead
+    /// of relying on a caller to remember.
     ///
     /// Returns a qualification report only; no receipt is minted here.
     /// Minting through the accepted `authorize_cutover` belongs to #961.
     /// This path performs NO activation, retirement, route/process mutation,
-    /// or live-authority invalidation. Rehearsal is safe by construction —
-    /// there is simply no effect to rehearse beyond validation.
+    /// or live-authority invalidation.
     pub fn qualify_cutover(
         &self,
         plan: &RestorePlan,
@@ -986,12 +1030,8 @@ impl KernelBackupRestore {
             .map_err(KernelRestoreError::TargetFailed)?;
         require_cutover_obligations(&evidence.obligations, bundle)
             .map_err(KernelRestoreError::TargetFailed)?;
-        let owner_epoch_present = evidence.owner_epoch.is_some();
-        if let Some(owner_epoch) = evidence.owner_epoch.as_ref() {
-            owner_epoch
-                .validate()
-                .map_err(KernelRestoreError::TargetFailed)?;
-        }
+        let owner_epoch = require_qualified_owner_epoch(evidence)?;
+        require_operational_validation(evidence)?;
         if destination.label() != plan.target.target_id
             || !destination.root().starts_with(&self.work_root)
         {
@@ -1015,6 +1055,16 @@ impl KernelBackupRestore {
         {
             return Err(KernelRestoreError::JournalBindingConflict);
         }
+        // A rehearsal is an isolated-import proof only. The destination it
+        // prepared carries that posture in durable owner state, so the
+        // rehearsal path can never reach this qualification even when it ran
+        // under a full Host admission, an owner-issued new epoch, and a
+        // separate Human/System Owner authorization. A rehearsal never
+        // activates, cuts over, or retires a source installation; it is
+        // refused here, and the refusal is stated rather than inferred.
+        if pinned.rehearsal {
+            return Err(KernelRestoreError::CutoverNotAuthorized);
+        }
         plan.restored_fence
             .validate()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
@@ -1023,9 +1073,98 @@ impl KernelBackupRestore {
             target_id: plan.target.target_id.clone(),
             destination_root: destination.root().to_path_buf(),
             obligations_checked: 13,
-            owner_epoch_present,
+            owner_epoch_lineage: owner_epoch.new_epoch.lineage_id.as_str().to_owned(),
         })
     }
+}
+
+/// Requires the owner-issued new Authority Epoch that authorizes cutover, and
+/// binds it to the exact authority this restore actually ran under (issue #960,
+/// W10/A16).
+///
+/// Three independent refusals, each a presented-vs-owner comparison:
+///
+/// 1. **Presence.** The accepted contract holds that "a caller-proposed target
+///    epoch is planning input, not accepted authority; only this owner-issued
+///    value may support cutover". An evidence without an
+///    [`RestoreOwnerEpoch`](eliot_backup::RestoreOwnerEpoch) therefore carries
+///    only a proposal, and an absent owner epoch refuses. A rehearsal never
+///    has one, so this is also the refusal that keeps a rehearsal from
+///    qualifying on any other admission.
+/// 2. **Binding.** The owner-issued new epoch/generation must be the authority
+///    the restore ran under. `validate_against_plan` already bound
+///    `evidence.authority_epoch` / `evidence.resource_generation` to the
+///    plan's restored fence, so comparing the owner-issued value against them
+///    refuses an owner epoch issued for a different authority than the one
+///    this restore actually obtained — a stale-authority restore presenting a
+///    current-looking owner receipt.
+/// 3. **Closure.** The owner-issued superseding set is compared against the
+///    lineage limits this restore INDEPENDENTLY observed in the archive
+///    (`evidence.observed_lineage_limits`), not against a copy of the owner's
+///    own list. A limit the restore observed and the owner did not supersede
+///    is an open lineage, so it refuses. The comparison is by owner identity
+///    because that is what makes one limit account for another; the values
+///    themselves are validated by the accepted `RestoreOwnerEpoch::validate`
+///    against the recorded lineage, never recomputed here.
+fn require_qualified_owner_epoch(
+    evidence: &RestoreEvidence,
+) -> Result<&eliot_backup::RestoreOwnerEpoch, KernelRestoreError> {
+    let Some(owner_epoch) = evidence.owner_epoch.as_ref() else {
+        return Err(KernelRestoreError::TargetFailed(
+            BackupError::RestoreEvidenceIncomplete,
+        ));
+    };
+    owner_epoch
+        .validate()
+        .map_err(KernelRestoreError::TargetFailed)?;
+    if owner_epoch.new_epoch != evidence.authority_epoch
+        || owner_epoch.new_generation != evidence.resource_generation
+    {
+        return Err(KernelRestoreError::TargetFailed(
+            BackupError::StaleRestoreLineage,
+        ));
+    }
+    for limit in &evidence.observed_lineage_limits {
+        if !owner_epoch
+            .supersedes
+            .iter()
+            .any(|superseded| superseded.owner_id == limit.owner_id)
+        {
+            return Err(KernelRestoreError::TargetFailed(
+                BackupError::RestoreEvidenceIncomplete,
+            ));
+        }
+    }
+    Ok(owner_epoch)
+}
+
+/// Requires the owner-issued operational validation that authorizes
+/// operational readiness for the exact isolated root (issue #960, W10).
+///
+/// The accepted contract holds that "transport acknowledgement, content
+/// equality, checksum validity, a phase count, or a self-asserted
+/// `active_authority_restored = false` is insufficient operational proof. Only
+/// the exact owner named in `owner` may issue this evidence, and only for the
+/// exact isolated destination named in `target_ref`." Without that value the
+/// isolated import is at best safe and partial, so operational-readiness and
+/// cutover qualification refuse. Nothing here re-derives, recomputes or
+/// manufactures the evidence: presence plus the accepted
+/// [`OperationalValidationEvidence`](eliot_backup::OperationalValidationEvidence)
+/// `validate` (already run inside [`RestoreEvidence::validate`], which also
+/// binds `target_ref` to the evidence target) is the whole check, and the
+/// obligation denominator above has already refused every applicable
+/// unresolved effect, absent owner channel and incomplete closure that would
+/// otherwise let a partial import read as ready.
+fn require_operational_validation(evidence: &RestoreEvidence) -> Result<(), KernelRestoreError> {
+    let Some(operational) = evidence.operational_validation.as_ref() else {
+        return Err(KernelRestoreError::TargetFailed(
+            BackupError::RestoreEvidenceIncomplete,
+        ));
+    };
+    operational
+        .validate()
+        .map_err(KernelRestoreError::TargetFailed)?;
+    Ok(())
 }
 
 fn suspended_entries(
@@ -1043,6 +1182,14 @@ fn suspended_entries(
 /// blob/ORS suspension excused exactly when the archive carries no blobs
 /// or ORS snapshot to suspend.
 ///
+/// Each slot is checked twice, because state alone is not attribution: the
+/// obligation must name the exact responsible owner, and it must be
+/// `Satisfied` by that owner. A `Satisfied` obligation attributed to some
+/// other owner is not that owner's evidence — existence and shape prove
+/// nothing — so the owner identity is compared before the state, presented
+/// against the owner vocabulary [`phase_owner`] and the finalize evidence
+/// were built from.
+///
 /// A `MissingCapability` or `Unknown` anywhere — unresolved effects, stale
 /// authority, unverifiable keys, incomplete closure, absent denominator —
 /// refuses with the exact obligation slot: suspension is not resolution
@@ -1057,15 +1204,18 @@ fn require_cutover_obligations(
     bundle: &BackupBundle,
 ) -> Result<(), BackupError> {
     fn require(
-        capability: &'static str,
+        owner: &'static str,
         obligation: &RestoreOwnerObligation,
         applicable: bool,
     ) -> Result<(), BackupError> {
+        if obligation.owner_id != owner {
+            return Err(BackupError::FinalizeEvidenceMismatch);
+        }
         match obligation.state {
             RestoreObligationState::Satisfied => Ok(()),
             RestoreObligationState::NotAttempted if !applicable => Ok(()),
             RestoreObligationState::NotAttempted => Err(BackupError::RestoreJournalCorrupt),
-            _ => Err(BackupError::RestoreCapabilityUnsupported { capability }),
+            _ => Err(BackupError::RestoreCapabilityUnsupported { capability: owner }),
         }
     }
     let list: [(&RestoreOwnerObligation, &'static str, bool); 13] = [
@@ -1103,8 +1253,8 @@ fn require_cutover_obligations(
             true,
         ),
     ];
-    for (obligation, capability, applicable) in list {
-        require(capability, obligation, applicable)?;
+    for (obligation, owner, applicable) in list {
+        require(owner, obligation, applicable)?;
     }
     Ok(())
 }
@@ -1189,6 +1339,11 @@ struct KernelRestoreTarget<'a> {
     blob_scope: Option<&'a DestinationScope>,
     receipts: Vec<BlobRestorationReceipt>,
     manifest_evidence: Option<DestinationManifestEvidence>,
+    /// Whether this execution runs as rehearsal. Pinned into the destination
+    /// admission at prepare and re-checked before every later effect, so a
+    /// rehearsal-prepared root is never continued by a production run and can
+    /// never reach cutover qualification.
+    rehearsal: bool,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
     /// Bounded output budget derived from the archive before any write.
@@ -1219,6 +1374,7 @@ impl<'a> KernelRestoreTarget<'a> {
             blob_scope: ports.blob_scope,
             receipts,
             manifest_evidence: ports.manifest_evidence.clone(),
+            rehearsal: ports.rehearsal,
             calls: Vec::new(),
             final_evidence: None,
             budget: StagedOutputBudget::derive(bundle)?,
@@ -1448,6 +1604,7 @@ impl<'a> KernelRestoreTarget<'a> {
             destination,
             transaction_id,
             target_id,
+            self.rehearsal,
             self.manifest_evidence.as_ref(),
         )
         .is_err()
@@ -1593,8 +1750,9 @@ impl<'a> KernelRestoreTarget<'a> {
 
     /// Re-verifies the pinned destination admission before a post-prepare
     /// effect. Unadmitted restores skip; admitted ones require the exact
-    /// pinned transaction, target, and manifest evidence — any drift
-    /// refuses the effect instead of continuing under changed authority.
+    /// pinned transaction, target, rehearsal posture, and manifest evidence —
+    /// any drift refuses the effect instead of continuing under changed
+    /// authority.
     fn check_destination_admission(
         &self,
         intent: &RestoreIntent,
@@ -1609,6 +1767,7 @@ impl<'a> KernelRestoreTarget<'a> {
             serde_json::from_slice(&bytes).map_err(|_| BackupError::RestoreJournalCorrupt)?;
         if pinned.transaction_id != intent.transaction_id
             || pinned.target_id != plan_target_id
+            || pinned.rehearsal != self.rehearsal
             || pinned.evidence != *expected
         {
             return Err(BackupError::FenceMismatch {
@@ -1675,6 +1834,7 @@ impl<'a> KernelRestoreTarget<'a> {
                 transaction_id: intent.transaction_id.clone(),
                 target_id: plan.target.target_id.clone(),
                 evidence,
+                rehearsal: self.rehearsal,
             };
             let bytes = canonical_json_bytes(&pinned)
                 .map_err(|error| BackupError::Serialization(error.to_string()))?;
@@ -2281,12 +2441,30 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
 /// effects land in this target. The comparison is exact equality against the
 /// archive's own declared identity, never a normalisation that could make two
 /// different values compare equal.
+///
+/// The owner-issued admission is compared here too, and this is the check that
+/// carries W1's "production cannot substitute an in-memory or no-op port".
+/// [`require_production_admitted`](super::backup_restore_ports::require_production_admitted)
+/// alone only proves an admission VALUE is well-formed and not fixture-flagged;
+/// it says nothing about which journal the execution then ran on, because
+/// `restore` takes its `J` as a parameter. Binding the admission's
+/// `journal_identity_ref` to [`RESTORE_JOURNAL_IDENTITY`] — the exact
+/// namespace this adapter's ORS rows are filed under, and the identity
+/// composition is required to place in the admission it issues — is what
+/// makes the presented admission and the journal actually executing the same
+/// owner channel. An admission for any other journal identity, including one
+/// describing an in-process store, refuses before a single effect runs.
 fn check_ors_journal_binding(
     bundle: &BackupBundle,
     target: &RestoreContext,
     ports: &RestorePorts<'_>,
     identity: &OrsRestoreBinding,
 ) -> Result<(), KernelRestoreError> {
+    if ports.journal_admission.journal_identity_ref != RESTORE_JOURNAL_IDENTITY {
+        return Err(KernelRestoreError::OwnerEvidenceInvalid(
+            "restore journal admission does not name the durable ORS restore journal".to_owned(),
+        ));
+    }
     if identity.source_archive_id != bundle.manifest.backup_id {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal source archive does not name this archive".to_owned(),
