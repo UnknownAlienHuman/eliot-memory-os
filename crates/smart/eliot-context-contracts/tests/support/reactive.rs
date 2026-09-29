@@ -394,7 +394,8 @@ pub fn context_view() -> (
     let admitted = admitted();
     let binding = admitted.binding.clone();
     let recipe_digest = digest();
-    let fence_digest = "b".repeat(64);
+    let fence_digest = eliot_context_contracts::canonical_fence_digest(&binding.state_fence)
+        .expect("canonical fence digest");
     let rendered: Vec<_> = admitted
         .records
         .iter()

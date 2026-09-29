@@ -238,6 +238,13 @@ impl ActiveUnderstandingView {
         if self.binding != admitted.binding {
             return Err(ContextError::InvalidFence);
         }
+        // The admitted economy receipt carries the recipe commitment produced by
+        // admission.  A view built from a different recipe must not validate
+        // against this admitted set, so the two digests are compared here rather
+        // than only hashed into the view's own payload.
+        if self.recipe_digest != admitted.economy.recipe_digest {
+            return Err(ContextError::IdentityConflict);
+        }
         let expected_omissions: BTreeSet<_> = admitted.economy.displaced.iter().cloned().collect();
         let actual_omissions: BTreeSet<_> =
             self.selection.omission_evidence.iter().cloned().collect();
@@ -293,6 +300,14 @@ impl ActiveUnderstandingView {
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
         self.selection.validate()?;
+        // The view carries its own `fence_digest`, so re-hashing that string
+        // only proves internal consistency.  Recompute it from the State Fence
+        // the view claims to have been compiled against, so a well-shaped but
+        // unrelated digest cannot be re-sealed into a valid view.
+        let expected_fence_digest = crate::canonical_fence_digest(&self.binding.state_fence)?;
+        if self.fence_digest != expected_fence_digest {
+            return Err(ContextError::InvalidFence);
+        }
         let derived_output_digest = Self::canonical_output_digest(
             &self.binding,
             &self.recipe_digest,
