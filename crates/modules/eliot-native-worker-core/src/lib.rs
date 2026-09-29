@@ -835,6 +835,14 @@ where
                         "capability was not admitted".to_owned(),
                     ));
                 }
+                // Facet-identity gate (Implements #22 W2): a claimed dispatch
+                // executes only under the owner-admitted facet identity
+                // carried by the v2 executable expectation. A legacy start
+                // without a claim echo dispatches unchanged.
+                let _admitted_facet = crate::protocol::admitted_facet_ref_for_dispatch(
+                    grant.claim_binding_digest(),
+                    grant.executable_expectation(),
+                )?;
                 request
                     .proposed_effect
                     .as_ref()
@@ -1254,32 +1262,43 @@ where
         let live = match outcome {
             AdmissionLivenessOutcome::Live(facts) => AdmissionLiveness::seal(facts),
             AdmissionLivenessOutcome::Rejected { reason } => {
+                // Terminal for this grant: the owner refused liveness, so the
+                // admitted authority (including any credential-bearing
+                // introduction) is dropped and no further frame dispatches
+                // under it. A new admission must seal a new grant.
+                self.grant = None;
                 return Err(WorkerError::AdmissionRejected(reason));
             }
             AdmissionLivenessOutcome::Revoked { revision } => {
+                self.grant = None;
                 return Err(WorkerError::Revoked(revision));
             }
         };
         if live.revoked() {
+            self.grant = None;
             return Err(WorkerError::Revoked(live.admission_revision().to_owned()));
         }
         if live.admission_id() != grant.admission_id()
             || live.lease() != &grant.authority().lease
             || live.authority_epoch() != &grant.authority().epoch
         {
+            self.grant = None;
             return Err(WorkerError::StaleLease);
         }
         if live.state_fence() != &grant.authority().state_fence {
+            self.grant = None;
             return Err(WorkerError::StaleFence);
         }
         if live.admission_revision() != grant.admission_revision()
             || live.revocation_revision() != grant.revocation_revision()
         {
+            self.grant = None;
             return Err(WorkerError::StaleRevision);
         }
         if live.expires_at_unix_ms() != grant.expires_at_unix_ms()
             || live.observed_at_unix_ms() >= live.expires_at_unix_ms()
         {
+            self.grant = None;
             return Err(WorkerError::StaleLease);
         }
         if live.observed_at_unix_ms() > deadline_unix_ms {

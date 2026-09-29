@@ -6244,6 +6244,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
     /// The admitted capability cell and Module Catalog revision are required
     /// caller-supplied owner inputs; this method does not infer either value.
+    /// The supplied revision must equal the live `module_registry` revision at
+    /// publish: a binding is compiled against the current catalog, never a
+    /// stale one (Implements #22 W1). A catalog change makes the binding
+    /// stale; it needs a new admission, never a local repair.
     /// All parameters are required; blank or malformed input fails closed.
     #[allow(
         clippy::too_many_arguments,
@@ -6326,6 +6330,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             route_ref,
             work_scope_id,
         )?;
+        // Catalog-revision pin (Implements #22 W1): the binding is compiled
+        // against the admitted Module Catalog revision, so the supplied
+        // revision must equal the live `module_registry` revision at publish.
+        // A stale revision fails closed as `Recovery`; the owner advances the
+        // revision through a new admission, never a local repair here.
+        if module_catalog_revision != self.owners.module_registry.revision() {
+            return Err(CompositionError::Recovery(
+                "native binding catalog revision is not the live Module Catalog revision"
+                    .to_owned(),
+            ));
+        }
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
             registration_id: registration_id.to_owned(),
@@ -10672,7 +10687,7 @@ mod tests {
                 vec!["intro-1".to_owned()],
                 vec!["grant-1".to_owned()],
                 1,
-                7,
+                1,
                 eliot_store_api::EffectClass::ReversibleMutation,
                 vec!["cred-1".to_owned()],
                 vec!["res-1".to_owned()],
