@@ -5,7 +5,7 @@ use std::path::Path;
 
 use eliot_wasm_host::{
     CliError, ContourGateError, PrototypeContourDecision, TypedWorld, admit_generation,
-    admit_prototype, default_experimental_limits, execute_describe_experimental,
+    admit_prototype, default_experimental_limits, execute_domain_experimental,
     experimental_manifest, parse_args, read_bounded_artifact, run_guest_exec,
     run_ordinary_request_loop, typed_wit_digest,
 };
@@ -149,11 +149,12 @@ fn main() {
     }
 }
 
-/// Runs the experimental typed describe mode: preflight, prototype contour
-/// admission, describe, then the full two-phase contour admission over the
-/// actually observed imports. A manifest using an undeclared import is
-/// rejected before any success receipt is emitted. This mode is separate
-/// from the governed lane and never stands in for it.
+/// Runs the experimental typed mode: preflight, prototype contour
+/// admission, the descriptor identity gate, then the single typed domain
+/// invocation for the selected world, then the full two-phase contour
+/// admission over the actually observed imports. A manifest using an
+/// undeclared import is rejected before any success receipt is emitted.
+/// This mode is separate from the governed lane and never stands in for it.
 fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
     let Some(world) = TypedWorld::parse(world_name) else {
         emit_error("UNKNOWN_WORLD", "world is unknown");
@@ -181,8 +182,8 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
         emit_error("ADMISSION_DENIED", contour_gate_code(&error));
         std::process::exit(ADMISSION_REQUIRED_EXIT);
     }
-    match execute_describe_experimental(world, &artifact, &limits) {
-        Ok((receipt, descriptor)) => {
+    match execute_domain_experimental(world, &artifact, &limits) {
+        Ok((receipt, descriptor, terminal)) => {
             // Contour admission, phase two (pre-receipt): the full admission
             // sequence runs over the actually observed imports before any
             // success receipt is emitted.
@@ -196,6 +197,7 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
             let artifact_bytes = receipt.artifact_bytes.to_string();
             let abi_revision = descriptor.abi_revision.to_string();
             let elapsed_ms = receipt.elapsed_ms.to_string();
+            let domain_output_bytes = receipt.domain_output_bytes.to_string();
             emit_receipt(&[
                 ("proof", &receipt.proof),
                 ("world", &receipt.world),
@@ -203,12 +205,22 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
                 ("artifact_digest", receipt.artifact_digest.as_str()),
                 ("artifact_bytes", &artifact_bytes),
                 ("engine", &receipt.engine_version),
+                ("engine_config", receipt.engine_config_digest.as_str()),
                 ("wit_digest", receipt.wit_digest.as_str()),
                 ("descriptor_world", &descriptor.world_name),
                 ("descriptor_package", &descriptor.package_id),
                 ("abi_revision", &abi_revision),
                 ("output_digest", receipt.output_digest.as_str()),
                 ("output_bytes", &output_bytes),
+                ("domain_operation", &terminal.operation),
+                ("domain_disposition", &terminal.disposition),
+                ("domain_input_digest", receipt.domain_input_digest.as_str()),
+                (
+                    "domain_output_digest",
+                    receipt.domain_output_digest.as_str(),
+                ),
+                ("domain_output_bytes", &domain_output_bytes),
+                ("domain_ceiling", &terminal.proof_ceiling),
                 ("terminal", &receipt.terminal),
                 ("semantic_digest", receipt.semantic_digest.as_str()),
                 ("elapsed_ms", &elapsed_ms),
