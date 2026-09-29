@@ -1364,6 +1364,18 @@ pub struct AgentBridgeHandshake {
 pub enum KernelFrameAction {
     /// Return a bounded liveness or status reply.
     Reply(Frame),
+    /// Apply one authenticated Agent Bridge reactive-ledger mutation through
+    /// the retained Kernel Store gateway. The typed request is decoded at
+    /// frame admission; current application identity is revalidated by the
+    /// serving owner immediately before the Store operation.
+    ReactiveLedgerMutation {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Exact authenticated request identity admitted on the same frame.
+        identity: RequestIdentity,
+        /// Closed reactive-ledger mutation request from the protocol owner.
+        request: eliot_protocol::ReactiveLedgerMutationRequest,
+    },
     /// Execute one authenticated, provider-neutral process operation.
     Process {
         /// Correlation identity to echo in the response.

@@ -5424,7 +5424,7 @@ impl KernelComposition {
                     self.with_live_bridge_application_binding(
                         session,
                         &identity.request.state_fence,
-                        || {
+                        |_| {
                             self.admit_bridge_event_envelope(
                                 session,
                                 &event,
@@ -5448,7 +5448,7 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    || self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
+                    |_| self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
                 )?
             }
             AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
@@ -5456,7 +5456,7 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    || {
+                    |_| {
                         self.answer_bridge_event_reconcile_under_transition(
                             session,
                             &scope,
@@ -5494,7 +5494,7 @@ impl KernelComposition {
         &self,
         session: &Session,
         frame_fence: &eliot_contracts::StateFence,
-        operation: impl FnOnce() -> Result<T, TransportError>,
+        operation: impl FnOnce(&super::ActivatedApplicationBinding) -> Result<T, TransportError>,
     ) -> Result<T, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         let (retained, _pending) =
@@ -5544,7 +5544,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
-        operation()
+        operation(&retained)
     }
 
     /// Reads the exact accepted activation and proves its fence is still
@@ -6829,6 +6829,196 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         state.session.clone().ok_or(TransportError::SessionFenced)
+    }
+
+    /// Commits one typed Agent Bridge ledger snapshot through the retained
+    /// Store gateway. The presenting Session and request identity are already
+    /// admitted by `dispatch_frame`; this entry rechecks the current
+    /// activation/application binding, derives the principal from that
+    /// retained binding, then uses the service-owned canonical seal and CAS.
+    #[cfg(windows)]
+    pub(crate) async fn execute_reactive_ledger_mutation(
+        &self,
+        session: &Session,
+        request_id: eliot_contracts::RequestId,
+        identity: &RequestIdentity,
+        wire_request: eliot_protocol::ReactiveLedgerMutationRequest,
+    ) -> Result<Frame, TransportError> {
+        if session.module_generation.module_id.as_str() != eliot_protocol::AGENT_BRIDGE_MODULE_ID
+            || session.connection_id.trim().is_empty()
+            || !session.accepts(&session.authority_epoch, session.session_epoch)
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        wire_request
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if wire_request.state_fence != identity.request.state_fence
+            || identity
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(|session_id| session_id.as_str())
+                != Some(wire_request.session_id.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let canonical_wire_request = eliot_contracts::canonical_json_bytes(&wire_request)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_key = format!(
+            "reactive-ledger-{}",
+            eliot_contracts::sha256_hex(&canonical_wire_request)
+        );
+        if identity.idempotency_key != operation_key
+            || identity.request.metadata.request_id.as_str() != operation_key
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        // This guarded read supplies the sole application principal/session
+        // authority. Neither value is accepted from the Bridge mutation body.
+        let binding = self.with_live_bridge_application_binding(
+            session,
+            &identity.request.state_fence,
+            |retained| Ok(retained.clone()),
+        )?;
+        if wire_request.session_id != binding.session_id
+            || !wire_request
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&binding.authority_epoch)
+            || wire_request.state_fence.resource_generation != binding.activation_generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        // `KernelService` is behind a synchronous composition lock. Derive
+        // the service-owned live context while holding that lock, then drop it
+        // before the asynchronous Store operation.
+        let service_context = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let reactive_session = eliot_kernel_service::AuthenticatedReactiveSession::bind(
+                &service,
+                &binding.principal_id,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+            reactive_session
+                .service_context(&service)
+                .map_err(|_| TransportError::SessionFenced)?
+        };
+
+        let request_metadata = identity.request.metadata.clone();
+        if request_metadata.session_id.as_ref().map(|value| value.as_str())
+            != Some(binding.session_id.as_str())
+            || request_metadata.state_fence != wire_request.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation_id = eliot_contracts::OperationId::new(format!(
+            "reactive-ledger:{}",
+            operation_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let request = eliot_kernel_service::seal_reactive_ledger_request(
+            eliot_kernel_service::ReactiveLedgerRequest {
+                operation: eliot_store_api::OperationIdentity {
+                    operation_id,
+                    idempotency_key: identity.idempotency_key.clone(),
+                    canonical_request_hash: "0".repeat(64),
+                },
+                context: request_metadata,
+                state_fence: wire_request.state_fence.clone(),
+                session_id: binding.session_id.clone(),
+                expected_revision: wire_request.expected_revision,
+                ledger_json: wire_request.ledger_json.clone(),
+            },
+        )
+        .map_err(reactive_ledger_mutation_error)?;
+        let expected_ledger_revision = wire_request
+            .expected_revision
+            .checked_add(1)
+            .ok_or(TransportError::IdentityConflict)?;
+
+        // Close the gap between dispatch and the Store effect: activation,
+        // application Session, transport binding, and leases are checked
+        // again immediately before the retained gateway is called.
+        let gateway = self.retained_store_gateway()?;
+        self.with_live_bridge_application_binding(
+            session,
+            &identity.request.state_fence,
+            |current| {
+                if current != &binding {
+                    return Err(TransportError::SessionFenced);
+                }
+                Ok(())
+            },
+        )?;
+        let outcome = eliot_kernel_service::handle_reactive_ledger_request_in_context(
+            gateway.as_ref(),
+            service_context,
+            &request,
+        )
+        .await
+        .map_err(reactive_ledger_mutation_error)?;
+        let receipt_operation = &outcome.receipt.core.operation;
+        if outcome.ledger_json != wire_request.ledger_json
+            || outcome.ledger_revision != expected_ledger_revision
+            || receipt_operation.operation_id != request.operation.operation_id
+            || receipt_operation.idempotency_key != identity.idempotency_key
+            || receipt_operation.request_id != request.context.request_id
+            || receipt_operation.state_fence != wire_request.state_fence
+            || outcome.receipt.core.request.metadata != request.context
+        {
+            return Err(TransportError::UnknownOutcome);
+        }
+        let reply = eliot_protocol::ReactiveLedgerMutationReply {
+            session_id: binding.session_id,
+            state_fence: wire_request.state_fence,
+            ledger_revision: outcome.ledger_revision,
+            ledger_json: outcome.ledger_json,
+            receipt: outcome.receipt,
+            replayed: outcome.replayed,
+        };
+        reply
+            .validate()
+            .map_err(|_| TransportError::UnknownOutcome)?;
+        let value = serde_json::to_value(reply).map_err(|_| TransportError::UnknownOutcome)?;
+        let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        frame.request_id = Some(request_id);
+        frame.validate()?;
+        Ok(frame)
+    }
+}
+
+#[cfg(windows)]
+fn reactive_ledger_mutation_error(
+    error: eliot_kernel_service::ReactiveServiceError,
+) -> TransportError {
+    use eliot_kernel_service::ReactiveServiceError;
+    use eliot_store_api::StoreError;
+
+    match error {
+        ReactiveServiceError::IdentityConflict
+        | ReactiveServiceError::Store(
+            StoreError::IdentityConflict
+            | StoreError::RevisionConflict
+            | StoreError::OrderingConflict,
+        ) => TransportError::IdentityConflict,
+        ReactiveServiceError::NotCommitted
+        | ReactiveServiceError::MissingReceiptEnvelope
+        | ReactiveServiceError::Store(
+            StoreError::UnknownOutcome { .. } | StoreError::MissingReceiptEnvelope,
+        ) => TransportError::UnknownOutcome,
+        _ => TransportError::SessionFenced,
     }
 }
 

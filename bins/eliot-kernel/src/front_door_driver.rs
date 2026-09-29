@@ -333,6 +333,12 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::ReactiveLedgerMutation { .. } => {
+                // This typed mutation is exclusive to the admitted
+                // server-first Agent Bridge loop below.
+                session.fence();
+                return Err(TransportError::SessionFenced);
+            }
             KernelFrameAction::Process {
                 request_id,
                 request,
@@ -694,6 +700,26 @@ async fn serve_admitted_bridge_host_requests(
         };
         match action {
             KernelFrameAction::Reply(reply) => {
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    kernel.revoke_agent_bridge(&connection_id);
+                    return Err(error);
+                }
+            }
+            KernelFrameAction::ReactiveLedgerMutation {
+                request_id,
+                identity,
+                request,
+            } => {
+                let reply = match kernel
+                    .execute_reactive_ledger_mutation(&session, request_id, &identity, request)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        kernel.revoke_agent_bridge(&connection_id);
+                        return Err(error);
+                    }
+                };
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     kernel.revoke_agent_bridge(&connection_id);
                     return Err(error);
