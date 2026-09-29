@@ -7,9 +7,22 @@
 #![forbid(unsafe_code)]
 
 mod revocation_digest;
+mod native_resource_lease;
+mod native_resource_selection;
 mod surface_types;
 mod validation;
 
+pub use native_resource_selection::{
+    NATIVE_RESOURCE_SELECTION_CANDIDATE_VERSION, NATIVE_RESOURCE_SELECTION_VERSION,
+    NativeResourceDevicePolicy, NativeResourceKind, NativeResourceNetworkPolicy,
+    NativeResourceReparsePolicy, NativeResourceSelection, NativeResourceSelectionCandidate,
+    NativeResourceSelectionError,
+};
+pub use native_resource_lease::{
+    NATIVE_RESOURCE_LEASE_VERSION, NativeResourceLease, NativeResourceLeaseBindingField,
+    NativeResourceLeaseConsumptionReceipt, NativeResourceLeaseError, NativeResourceLeaseField,
+    NativeResourceMeasurement, NativeResourceLeaseBinding,
+};
 pub use revocation_digest::{
     REVOCATION_DISPOSITION_COMPLETE, REVOCATION_DISPOSITION_PARTIAL,
     REVOCATION_DISPOSITION_UNKNOWN, REVOCATION_HISTORY_EVIDENCE_VERSION,
