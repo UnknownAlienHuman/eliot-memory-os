@@ -138,6 +138,15 @@ impl ProfileResolutionRequest {
     /// to the resolver is the exact admitted class plus the three admitted
     /// roots, so the environment digest changes whenever the layout does.
     ///
+    /// This helper stays at its truthful ceiling: the binding is structural
+    /// and local. The genesis-epoch fence is not proof that the Kernel
+    /// admitted the current operation, and the environment digest attests the
+    /// admitted roots rather than an observed toolchain or host. It carries
+    /// no candidate or source commitment. The production adapter
+    /// [`ProfileResolutionBindings::admitted`] must consume owner-issued
+    /// bindings and recheck them at dispatch; this helper must never be
+    /// presented as that proof.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineError`] when the admitted lineage cannot form an
@@ -226,6 +235,75 @@ impl ProfileResolutionBindings {
             scope,
             environment,
         }
+    }
+
+    /// Consumes owner-issued admission for one production resolution (issue
+    /// #1813 CHECK 5882318903).
+    ///
+    /// Unlike [`ProfileResolutionRequest::bindings`], which starts a
+    /// structural local lineage at the contract genesis epoch, the admitting
+    /// composition root supplies the actual admitted [`TargetLayout`],
+    /// [`WorkScope`] with its owner-issued
+    /// [`StateFence`](eliot_contracts::StateFence), and [`StageEnvironment`]
+    /// with owner-observed environment evidence here, and this adapter
+    /// rechecks them at dispatch: the layout roots rebuild, the scope fence
+    /// still validates, and the environment digest keeps its attested shape.
+    /// A changed or malformed binding refuses instead of rebinding silently.
+    /// Candidate and source commitment travel on the stage plan through
+    /// [`StagePlan::bind_candidate_identity`], not in this binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when a supplied binding no longer validates.
+    pub fn admitted(
+        layout: TargetLayout,
+        scope: WorkScope,
+        environment: StageEnvironment,
+    ) -> Result<Self, EngineError> {
+        let rebuilt_layout = TargetLayout::new(
+            layout.source_root.clone(),
+            layout.target_root.clone(),
+            layout.cache_root.clone(),
+        )
+        .map_err(|error| {
+            rejected(
+                "governed-profile",
+                &format!("owner-issued target layout is refused at dispatch: {error}"),
+            )
+        })?;
+        if rebuilt_layout.digest() != layout.digest() {
+            return Err(rejected(
+                "governed-profile",
+                "owner-issued target layout digest changed at dispatch",
+            ));
+        }
+        let rebuilt_scope = WorkScope::new(scope.declared_scope.clone(), scope.fence.clone())
+            .map_err(|error| {
+                rejected(
+                    "governed-profile",
+                    &format!("owner-issued workscope is refused at dispatch: {error}"),
+                )
+            })?;
+        if rebuilt_scope.digest() != scope.digest() {
+            return Err(rejected(
+                "governed-profile",
+                "owner-issued workscope digest changed at dispatch",
+            ));
+        }
+        if environment.class.trim().is_empty()
+            || environment.class.chars().any(char::is_control)
+            || environment.digest.len() != 64
+            || environment
+                .digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(rejected(
+                "governed-profile",
+                "owner-issued environment evidence is malformed at dispatch",
+            ));
+        }
+        Ok(Self::new(layout, scope, environment))
     }
 }
 
@@ -399,7 +477,15 @@ impl GovernedProfileService {
     /// evidence handles become producible instead of structurally absent.
     /// Runs are matched to declared stages by the full durable stage
     /// identity; foreign runs never satisfy the plan, and declared stages
-    /// without a run stay explicit missing proofs.
+    /// without a run stay explicit missing proofs. Planning and execution
+    /// stay separate entry paths: planning calls
+    /// [`GovernedProfileService::describe_execution`], while the executable
+    /// path obtains admitted stage operations from the existing
+    /// TestExecutionPlane and feeds their observed runs here. The profile
+    /// revision resolves once per call and its registry, profile, DAG, and
+    /// resolution digests bind every per-stage record, pending handle,
+    /// result, and the aggregate, so a registry update cannot silently change
+    /// later stages of the same run.
     ///
     /// # Errors
     ///
@@ -413,6 +499,11 @@ impl GovernedProfileService {
         runs: Vec<InstrumentRun>,
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
+        let bindings = ProfileResolutionBindings::admitted(
+            bindings.layout.clone(),
+            bindings.scope.clone(),
+            bindings.environment.clone(),
+        )?;
         let registry = governed_registry_for(name, BUILTIN_REGISTRY_GENERATION)?;
         let resolved = ProfileCompiler::new(&registry)
             .resolve_admitted(
