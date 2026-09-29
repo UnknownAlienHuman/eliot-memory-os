@@ -1755,7 +1755,7 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
-        self.execute_doctor_request_with_control(session, request_id, operation, payload, false)
+        self.execute_doctor_request_with_control(session, request_id, operation, payload, false, false)
             .await
     }
 
@@ -1770,6 +1770,7 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
         control: bool,
+        emit_terminal: bool,
     ) -> Result<Frame, TransportError> {
         observe_frame("kernel.frame_doctor_execute", "attempt");
         let result = self
@@ -1784,12 +1785,15 @@ impl KernelComposition {
                     // owner (`admit_doctor_repair_cancellation`), so the
                     // requested cancellation is observed as effected here.
                     // Production-reachable via the driver control arm. Info
-                    // only; `dispatch_frame` owns the single designated terminal.
+                    // only; terminal owner is per-path: `dispatch_frame` on the dispatch path, this wrapper on the driver path.
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 observe_frame("kernel.frame_doctor_execute", "fenced");
+                if emit_terminal {
+                    super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+                }
             }
         }
         result
@@ -2063,7 +2067,7 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
-        self.execute_testd_request_with_control(session, request_id, operation, payload, false)
+        self.execute_testd_request_with_control(session, request_id, operation, payload, false, false)
             .await
     }
 
@@ -2078,6 +2082,7 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
         control: bool,
+        emit_terminal: bool,
     ) -> Result<Frame, TransportError> {
         observe_frame("kernel.frame_testd_execute", "attempt");
         let result = self
@@ -2092,12 +2097,15 @@ impl KernelComposition {
                     // owner (`admit_testd_cancellation`), so the requested
                     // cancellation is observed as effected here.
                     // Production-reachable via the driver control arm. Info
-                    // only; `dispatch_frame` owns the single designated terminal.
+                    // only; terminal owner is per-path: `dispatch_frame` on the dispatch path, this wrapper on the driver path.
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 observe_frame("kernel.frame_testd_execute", "fenced");
+                if emit_terminal {
+                    super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+                }
             }
         }
         result

@@ -398,7 +398,7 @@ async fn serve_connection(
                 // instead of silently dropping the submit.
                 let reply = kernel
                     .execute_doctor_request_with_control(
-                        &session, request_id, &operation, payload, control,
+                        &session, request_id, &operation, payload, control, true,
                     )
                     .await?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
@@ -436,7 +436,7 @@ async fn serve_connection(
                 } else {
                     kernel
                         .execute_testd_request_with_control(
-                            &session, request_id, &operation, payload, control,
+                            &session, request_id, &operation, payload, control, true,
                         )
                         .await?
                 };
