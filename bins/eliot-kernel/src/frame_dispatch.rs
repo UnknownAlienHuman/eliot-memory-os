@@ -1442,6 +1442,22 @@ fn is_daemon_operation(operation: &str) -> bool {
             // `ProcessExecutionRequest` decode, and fenced the session
             // before the arm was ever entered.
             | super::daemon_request_dispatch::QUERY_GRANT_CLOSURE_LINKS_OPERATION
+            // Issue #686: the two canonical second-phase legs the projection
+            // read above cannot perform itself. The markers are the one strings
+            // the admitted dispatch arms already serve
+            // (`GRANT_CLOSURE_RECEIPT_OPERATION`,
+            // `LINK_GRANT_CLOSURE_RECEIPT_OPERATION`); without these entries
+            // the frame would fall through every predicate, fail the
+            // `ProcessExecutionRequest` decode, and fence the session before
+            // either arm was ever entered — which is exactly how a first-phase
+            // receipt read and a pending second-phase link stayed unreachable
+            // from the daemon. The entries only let the frame reach the arms:
+            // each arm still proves the module binding, the peer principal, and
+            // the exact session State Fence, and the closure still comes from
+            // the retained P-07 owner and the retained ORS rather than from the
+            // payload.
+            | super::daemon_request_dispatch::GRANT_CLOSURE_RECEIPT_OPERATION
+            | super::daemon_request_dispatch::LINK_GRANT_CLOSURE_RECEIPT_OPERATION
             | "store_recovery"
             | "store_initialize_genesis"
             | "apply_prepared"

@@ -158,6 +158,39 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+
+/// Authenticated P-07 read route answering the committed first-phase closure
+/// receipt of one exact target grant (issue #686).
+///
+/// The projection above answers whether a second phase already COMPLETED; this
+/// route answers whether a first phase committed at all for the grant the
+/// daemon is revoking, and it answers from the same bound P-07 owner that
+/// committed it. Without it the revocation ingress on the far side of the
+/// transport can never learn the committed closure and must stay unestablished.
+/// The route is read-only and serves the owner's committed bytes verbatim: it
+/// never links, never fences, and never derives a closure.
+pub(crate) const GRANT_CLOSURE_RECEIPT_OPERATION: &str = "grant_closure_receipt";
+/// Authenticated P-07 write route recording the canonical second-phase
+/// receipt link against one committed closure first phase (issue #686).
+///
+/// The sibling read above can observe a completed second phase but cannot
+/// create one, so a pending canonical reconciliation has no route to complete
+/// itself. This route records the link against the same durable ORS row the
+/// read projects and proves the read-back before it answers. It grants no
+/// authority: it only makes an already fenced closure's canonical
+/// reconciliation durable, and it is idempotent for one identical link.
+pub(crate) const LINK_GRANT_CLOSURE_RECEIPT_OPERATION: &str =
+    "link_grant_closure_canonical_receipt";
+/// Typed receipt kind answered by the closure-receipt read arm.
+const GRANT_CLOSURE_RECEIPT_KIND: &str = "grant_closure_receipt";
+/// Typed refusal kind answered by the same arm. A refusal is never an absent
+/// closure read as "this grant was never revoked".
+const GRANT_CLOSURE_RECEIPT_REFUSAL_KIND: &str = "grant_closure_receipt_refused";
+/// Typed receipt kind answered by the canonical second-phase link arm.
+const GRANT_CLOSURE_LINK_KIND: &str = "grant_closure_canonical_receipt_link";
+/// Typed refusal kind answered by the same arm. A refusal is never an empty
+/// link read as "canonical reconciliation completed".
+const GRANT_CLOSURE_LINK_REFUSAL_KIND: &str = "grant_closure_canonical_receipt_link_refused";
 /// Typed refusal kind answered by the P-07 authority arms (`#1110`).
 /// Refusals are completed application answers, never missing frames or receipts.
 const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
@@ -522,6 +555,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "revoke_introduction" => "revoke_introduction",
         ACTIVATE_ROOT_TRANSITION_OPERATION => ACTIVATE_ROOT_TRANSITION_OPERATION,
         QUERY_GRANT_CLOSURE_LINKS_OPERATION => QUERY_GRANT_CLOSURE_LINKS_OPERATION,
+        GRANT_CLOSURE_RECEIPT_OPERATION => GRANT_CLOSURE_RECEIPT_OPERATION,
+        LINK_GRANT_CLOSURE_RECEIPT_OPERATION => LINK_GRANT_CLOSURE_RECEIPT_OPERATION,
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
@@ -3031,6 +3066,70 @@ impl KernelComposition {
                     // completed here".
                     Err(error) => Ok(serde_json::json!({
                         "kind": GRANT_CLOSURE_LINKS_REFUSAL_KIND,
+                        "value": { "reason": error.to_string() },
+                    })),
+                }
+            }
+            GRANT_CLOSURE_RECEIPT_OPERATION => {
+                let query: eliot_kernel_service::GrantClosureReceiptQuery =
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                // Same-fence admission, exactly as the sibling read does it:
+                // the query is refused before the retained owner is even
+                // locked.
+                if query.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                // The owner that committed the first phase is the only accepted
+                // source; an unbound composition withholds the read rather than
+                // routing to a no-authority port.
+                let owner = self.retained_p07_owner()?;
+                let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+                match eliot_kernel_service::serve_grant_closure_receipt(
+                    bound.port(),
+                    &query,
+                    &session.module_generation.state_fence,
+                ) {
+                    // The owner's committed bytes, verbatim.
+                    Ok(receipt) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_RECEIPT_KIND,
+                        "value": receipt,
+                    })),
+                    // A refusal keeps its durable reason and stays a refusal:
+                    // the daemon must never read "no committed closure" as
+                    // "this grant needs no closure".
+                    Err(error) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_RECEIPT_REFUSAL_KIND,
+                        "value": { "reason": error.to_string() },
+                    })),
+                }
+            }
+            LINK_GRANT_CLOSURE_RECEIPT_OPERATION => {
+                let request: eliot_kernel_service::GrantClosureCanonicalLinkRequest =
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if request.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                // The Kernel owns ORS in its own process, so the link is
+                // recorded against the one durable store that holds the
+                // immutable first-phase row this operation names.
+                match eliot_kernel_service::commit_grant_closure_canonical_link(
+                    self.p07_ors.as_ref(),
+                    &request,
+                    &session.module_generation.state_fence,
+                ) {
+                    // The proved read-back of the durable link, so the caller
+                    // never has to take the store's word for it.
+                    Ok(projection) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_LINK_KIND,
+                        "value": projection,
+                    })),
+                    // An uncommitted first phase, an immutable conflict, or a
+                    // transient failure all refuse with their durable reason;
+                    // none of them is a completed link.
+                    Err(error) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_LINK_REFUSAL_KIND,
                         "value": { "reason": error.to_string() },
                     })),
                 }
