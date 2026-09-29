@@ -6831,11 +6831,42 @@ impl WindowsInstallationEffectPort {
                 })
             }
             HostCredentialControlResponse::Matching { receipt } => {
-                if !receipt.matches_intent(&host_request.intent) {
+                receipt
+                    .validate()
+                    .map_err(|_| PortError::IdentityConflict)?;
+                if !receipt.matches_intent(&host_request.intent)
+                    || receipt.request_digest != host_request.intent.request_digest
+                {
                     return Err(PortError::IdentityConflict);
                 }
-                let bytes =
-                    serde_json::to_vec(&receipt).map_err(|_| PortError::InvalidRequestMetadata)?;
+                let retained_receipt = if operation == HostCredentialControlOperation::Reconcile
+                    && request.action == InstallationEffectAction::Rollback
+                    && matches!(
+                        &request.plan,
+                        InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                    )
+                {
+                    // Reconcile returns a fresh operation/process-bound receipt;
+                    // preserve Applied identity only after its stable object
+                    // binding matches the retained receipt exactly.
+                    let Some(retained) = host_request.expected_receipt.as_ref() else {
+                        return Err(PortError::IdentityConflict);
+                    };
+                    retained
+                        .validate()
+                        .map_err(|_| PortError::IdentityConflict)?;
+                    if !retained.matches_intent(&host_request.intent)
+                        || !credential_receipts_bind_same_store_object(retained, &receipt)
+                    {
+                        return Err(PortError::IdentityConflict);
+                    }
+                    Some(retained.clone())
+                } else {
+                    None
+                };
+                let identity_receipt = retained_receipt.as_ref().unwrap_or(&receipt);
+                let bytes = serde_json::to_vec(identity_receipt)
+                    .map_err(|_| PortError::InvalidRequestMetadata)?;
                 let digest = PlatformHandle::new(sha256_hex(&bytes))
                     .map_err(|_| PortError::InvalidRequestMetadata)?;
                 let external_identity =
@@ -6847,7 +6878,7 @@ impl WindowsInstallationEffectPort {
                     evidence: vec![receipt.response_digest.clone()],
                     postcondition_digest: digest,
                     service_control_grant: None,
-                    credential_receipt: Some(receipt),
+                    credential_receipt: Some(identity_receipt.clone()),
                     staging_receipt: None,
                     phase_b_receipt: None,
                     service_runtime_lineage: None,
@@ -9038,6 +9069,25 @@ fn is_request_correlated_credential_unknown(
             .strip_prefix(CREDENTIAL_UNKNOWN_REFERENCE_PREFIX)
             .and_then(|rest| rest.split(':').next())
             == Some(intent_digest.as_str())
+}
+
+fn credential_receipts_bind_same_store_object(
+    retained: &CredentialAccessReceipt,
+    observed: &CredentialAccessReceipt,
+) -> bool {
+    // Process identity and request/response digests describe this observation,
+    // not the credential object whose Applied identity the transaction keeps.
+    retained.transaction_id == observed.transaction_id
+        && retained.effect_id == observed.effect_id
+        && retained.generation == observed.generation
+        && retained.config_digest == observed.config_digest
+        && retained.target == observed.target
+        && retained.provider == observed.provider
+        && retained.scope == observed.scope
+        && retained.principal_sid == observed.principal_sid
+        && retained.host_owner_epoch == observed.host_owner_epoch
+        && retained.marker == observed.marker
+        && retained.credential_envelope_digest == observed.credential_envelope_digest
 }
 
 /// Projects one Host-minted credential unknown into the request-correlated
