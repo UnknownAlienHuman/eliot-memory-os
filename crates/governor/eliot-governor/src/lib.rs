@@ -141,6 +141,7 @@ pub use capability_evidence_commit::{
 pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
+    ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
 };
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a

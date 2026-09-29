@@ -20,20 +20,31 @@
 //! owner that cannot be read fails the assembly instead of producing a
 //! placeholder.
 //!
-//! The snapshot carries no board items, reviews, or provenance edges. Owner
-//! records (tasks, coordination events, journal entries) carry no `ControlBoard`
+//! The snapshot carries no board items or provenance edges. Owner records
+//! (tasks, coordination events, journal entries) carry no `ControlBoard`
 //! visibility, privacy, or epistemic facts, and inventing them would be a
 //! privacy expansion. An empty-items view over real bindings is the honest
 //! projection; it is distinct from a missing provider, which stays a typed
 //! `PLAN_GAP` at the surface. Command families that need item projections
 //! remain deferred until their owners expose the required contract.
+//!
+//! Anchored-review obligations are the one exception, and only in owner-issued
+//! form: [`ControlBoardReviewBatch`] reproduces the coordination owner's own
+//! retained records verbatim and adds no visibility, privacy, or role fact, so
+//! no `ControlBoard` DTO can be filled from it yet. Those records are
+//! nevertheless load-bearing here — the G-11 review-projection binding digest
+//! covers them — so a review that moves, is answered, or is disposed changes
+//! the served binding instead of being reported as an unchanged board. The
+//! batch denominator is the coordination owner's separately recorded
+//! expectation, so an unrecorded expectation reads as unknown rather than as
+//! a complete review section.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_coordination::CoordinationOwner;
+use eliot_coordination::{AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding};
 use eliot_observation::ObservationJournal;
 use eliot_store_api::ScopeRevisionView;
 use eliot_task::TaskLifecycleOwner;
@@ -73,6 +84,65 @@ pub struct ControlBoardOwnerBinding {
     pub receipt_ref: String,
 }
 
+/// One artifact's anchored-review obligations, reproduced from the
+/// coordination owner.
+///
+/// This is the owner-issued detail record the G-11 review projection serves,
+/// not a board row: it carries no `Visibility`, no privacy class, and no
+/// capability decision, so no role filter can be evaluated from it and none is
+/// claimed. Every obligation keeps its own historical anchor, reviewed
+/// revision and digest, and its own outcome, so one answered review never
+/// presents a multi-item batch as complete. `outstanding` is derived from the
+/// coordination owner's separately recorded expectation, never from the
+/// obligations this struct also carries; when no expectation was recorded the
+/// denominator is `None` and no completeness may be inferred.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardReviewBatch {
+    /// Artifact identity this batch is anchored to.
+    pub artifact_id: String,
+    /// Currently admitted artifact head revision, absent when none was
+    /// admitted. This is the current target and is deliberately separate from
+    /// each obligation's own `artifact_revision`, so a review of an older
+    /// revision cannot be read as approving the head.
+    pub current_artifact_revision: Option<u64>,
+    /// Owner-recorded expected-review count, absent when unrecorded.
+    pub expected: Option<u64>,
+    /// Retained obligation count.
+    pub submitted: u64,
+    /// Retained obligations that reached a recorded disposition.
+    pub disposed: u64,
+    /// Expected reviews still lacking a recorded disposition, absent when the
+    /// owner recorded no expectation.
+    pub outstanding: Option<u64>,
+    /// Every retained obligation for this artifact, in `review_id` order.
+    pub obligations: Vec<PeerReviewBatchObligation>,
+}
+
+/// One retained anchored-review obligation as the owner holds it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardReviewBatchObligation {
+    /// Stable review identity.
+    pub review_id: String,
+    /// Exact reviewed artifact revision; never rewritten by a later head.
+    pub artifact_revision: u64,
+    /// Exact reviewed artifact digest at that revision.
+    pub artifact_digest: String,
+    /// Author of this obligation.
+    pub reviewer_session_id: String,
+    /// Historical anchor selector exactly as submitted.
+    pub anchor_field: String,
+    /// Anchor resolution claimed at submit.
+    pub anchor_resolution: AnchorResolution,
+    /// This obligation's own lifecycle.
+    pub lifecycle: PeerReviewLifecycle,
+    /// This obligation's own standing.
+    pub standing: PeerReviewStanding,
+    /// Reason retained when this obligation was rejected.
+    pub rejection_reason: Option<String>,
+    /// Evidence references the obligation itself carries.
+    pub evidence_refs: Vec<String>,
+}
+
 /// Refresh-consistent `ControlBoard` snapshot assembled over Governor owners.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ControlBoardGovernorSnapshot {
@@ -86,6 +156,11 @@ pub struct ControlBoardGovernorSnapshot {
     pub g11_coordination: ControlBoardOwnerBinding,
     /// I-12 report-projection binding served by the observation journal.
     pub i12_report: ControlBoardOwnerBinding,
+    /// Anchored-review obligations the coordination owner retains, in artifact
+    /// identity order. Empty only when the owner itself retains no review
+    /// expectation, obligation, or artifact head; a missing owner would fail
+    /// the assembly rather than reach this field.
+    pub review_batches: Vec<ControlBoardReviewBatch>,
 }
 
 /// Borrowed assembly inputs. The caller retains every owner; this struct only
@@ -160,6 +235,9 @@ pub fn compile_controlboard_snapshot(
         .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
     let scope_bytes = serde_json::to_vec(&parts.read_scope)
         .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
+    let review_batches = project_review_batches(parts.coordination);
+    let review_bytes = serde_json::to_vec(&review_batches)
+        .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
     let owner_digests = (
         sha256_hex(&coordination_bytes),
         sha256_hex(&task_bytes),
@@ -167,22 +245,78 @@ pub fn compile_controlboard_snapshot(
         sha256_hex(&problem_bytes),
         sha256_hex(&scope_bytes),
     );
-    let bind = |binding_id: &str, receipt_ref: &str| {
-        canonical_json_bytes(&(binding_id, parts.fence, parts.read_revision, &owner_digests))
-            .map(|bytes| ControlBoardOwnerBinding {
-                binding_id: binding_id.to_owned(),
-                binding_digest: sha256_hex(&bytes),
-                receipt_ref: receipt_ref.to_owned(),
-            })
-            .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))
+    // The G-11 binding is the review projection, so it also covers the
+    // coordination owner's retained review obligations. The I-12 binding is
+    // the observation report projection and deliberately does not: a moved or
+    // disposed review must change the review binding, not the report binding.
+    let bind = |binding_id: &str, receipt_ref: &str, review_digest: Option<&str>| {
+        canonical_json_bytes(&(
+            binding_id,
+            parts.fence,
+            parts.read_revision,
+            &owner_digests,
+            review_digest,
+        ))
+        .map(|bytes| ControlBoardOwnerBinding {
+            binding_id: binding_id.to_owned(),
+            binding_digest: sha256_hex(&bytes),
+            receipt_ref: receipt_ref.to_owned(),
+        })
+        .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))
     };
+    let review_digest = sha256_hex(&review_bytes);
     Ok(ControlBoardGovernorSnapshot {
         fence: parts.fence.clone(),
         read_revision: parts.read_revision,
         coordination_sequence: parts.coordination.current_sequence(),
-        g11_coordination: bind(G11_OWNER_BINDING_ID, parts.coordination_receipt_digest)?,
-        i12_report: bind(I12_OWNER_BINDING_ID, parts.observation_receipt_digest)?,
+        g11_coordination: bind(
+            G11_OWNER_BINDING_ID,
+            parts.coordination_receipt_digest,
+            Some(&review_digest),
+        )?,
+        i12_report: bind(I12_OWNER_BINDING_ID, parts.observation_receipt_digest, None)?,
+        review_batches,
     })
+}
+
+/// Reproduces the coordination owner's retained review obligations verbatim.
+///
+/// This performs no completeness arithmetic of its own: every count and the
+/// outstanding denominator come from
+/// [`CoordinationOwner::peer_review_batches`], which reads the owner's
+/// separately recorded expectation, so a batch can never be closed by this
+/// projection's own list. The only thing decided here is the shape: the
+/// surface-visible record repeats the owner's fields and invents no
+/// visibility, privacy, or role fact.
+fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardReviewBatch> {
+    coordination
+        .peer_review_batches()
+        .into_iter()
+        .map(|batch| ControlBoardReviewBatch {
+            artifact_id: batch.artifact_id,
+            current_artifact_revision: batch.current_artifact_revision,
+            expected: batch.expected,
+            submitted: batch.submitted,
+            disposed: batch.disposed,
+            outstanding: batch.outstanding,
+            obligations: batch
+                .obligations
+                .into_iter()
+                .map(|obligation| ControlBoardReviewBatchObligation {
+                    review_id: obligation.review_id,
+                    artifact_revision: obligation.artifact_revision,
+                    artifact_digest: obligation.artifact_digest,
+                    reviewer_session_id: obligation.reviewer_session_id,
+                    anchor_field: obligation.anchor_field,
+                    anchor_resolution: obligation.anchor_resolution,
+                    lifecycle: obligation.lifecycle,
+                    standing: obligation.standing,
+                    rejection_reason: obligation.rejection_reason,
+                    evidence_refs: obligation.evidence_refs,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -3880,6 +3880,110 @@ pub struct PeerReviewDenominator {
     pub open_conflicts: u64,
 }
 
+/// One anchored-review obligation as the coordination owner retains it.
+///
+/// This is a read projection over [`AnchoredReview`]: it adds no persisted
+/// record, no lifecycle, and no authority. Every field is copied from the one
+/// retained record, so an obligation always reports its own outcome and can
+/// never be summarised by another item's answer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeerReviewObligation {
+    pub review_id: String,
+    pub request_id: String,
+    /// Reviewed artifact identity the obligation is anchored to.
+    pub artifact_id: String,
+    /// Reviewed artifact revision observed at submit; a later head never
+    /// rewrites it.
+    pub artifact_revision: u64,
+    /// Reviewed artifact digest bound at that revision.
+    pub artifact_digest: String,
+    pub reviewer_session_id: String,
+    pub target_kind: ReviewTargetKind,
+    pub kind: ReviewKind,
+    /// Historical anchor selector exactly as submitted.
+    pub anchor_field: String,
+    /// Anchor resolution claimed at submit; the owner records the claim and
+    /// never recomputes it from a moved target.
+    pub anchor_resolution: AnchorResolution,
+    pub lifecycle: PeerReviewLifecycle,
+    pub standing: PeerReviewStanding,
+    pub recommendation: ReviewRecommendation,
+    pub rejection_reason: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub proof_refs: Vec<String>,
+    pub created_at: u64,
+    /// Record fence the retained obligation was admitted under.
+    pub state_fence: StateFence,
+}
+
+impl PeerReviewObligation {
+    /// Whether this obligation reached a recorded disposition.
+    ///
+    /// Delivery, acknowledgement, and answering are not dispositions: only an
+    /// explicit resolution or a rejection carrying its reason closes the
+    /// obligation, so one answered review never discharges a batch.
+    #[must_use]
+    pub const fn is_disposed(&self) -> bool {
+        matches!(
+            self.lifecycle,
+            PeerReviewLifecycle::Resolved | PeerReviewLifecycle::RejectedWithReason
+        )
+    }
+}
+
+impl From<&AnchoredReview> for PeerReviewObligation {
+    fn from(review: &AnchoredReview) -> Self {
+        Self {
+            review_id: review.review_id.clone(),
+            request_id: review.request_id.clone(),
+            artifact_id: review.artifact_id.clone(),
+            artifact_revision: review.artifact_revision,
+            artifact_digest: review.artifact_digest.clone(),
+            reviewer_session_id: review.reviewer_session_id.clone(),
+            target_kind: review.target_kind,
+            kind: review.kind,
+            anchor_field: review.anchor_field.clone(),
+            anchor_resolution: review.anchor_resolution,
+            lifecycle: review.lifecycle,
+            standing: review.standing,
+            recommendation: review.recommendation,
+            rejection_reason: review.rejection_reason.clone(),
+            evidence_refs: review.evidence_refs.clone(),
+            proof_refs: review.proof_refs.clone(),
+            created_at: review.created_at,
+            state_fence: review.state_fence.clone(),
+        }
+    }
+}
+
+/// One artifact's anchored-review obligations with their batch accounting.
+///
+/// The batch is keyed by artifact identity. `expected` is the owner's own
+/// recorded expectation and is deliberately `None` when none was recorded: an
+/// unrecorded expectation is an unknown denominator, never a complete batch,
+/// and is never reported as zero.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeerReviewBatch {
+    pub artifact_id: String,
+    /// Currently admitted artifact head revision, or `None` when no revision
+    /// has been admitted. This is the current target, not the reviewed one.
+    pub current_artifact_revision: Option<u64>,
+    /// Owner-recorded expected-review count, or `None` when unrecorded.
+    pub expected: Option<u64>,
+    /// Number of retained obligations for this artifact.
+    pub submitted: u64,
+    /// Number of retained obligations that reached a recorded disposition.
+    pub disposed: u64,
+    /// Expected reviews still lacking a recorded disposition, derived against
+    /// the owner-recorded expectation. `None` when that expectation is
+    /// unrecorded, so an unknown denominator is never shown as complete.
+    pub outstanding: Option<u64>,
+    /// Every retained obligation, in `review_id` order.
+    pub obligations: Vec<PeerReviewObligation>,
+}
+
 fn recommendations_conflict(left: ReviewRecommendation, right: ReviewRecommendation) -> bool {
     let approves = |recommendation: ReviewRecommendation| {
         matches!(
@@ -4352,6 +4456,54 @@ impl CoordinationOwner {
             }
         }
         denominator
+    }
+
+    /// Reads every anchored-review batch this owner retains.
+    ///
+    /// The batch set is derived from the owner's own retained records, never
+    /// from a caller-supplied list: an artifact appears because the owner
+    /// holds an expectation, a retained obligation, or an admitted head for
+    /// it, so a batch cannot be dropped by omitting it from a request.
+    /// `expected` is read from the separately recorded expectation and is
+    /// `None` when the owner never recorded one, which keeps an unrecorded
+    /// denominator distinct from a complete batch. Ordering is by artifact
+    /// identity, and obligations are in `review_id` order, so two reads of the
+    /// same owner state return identical bytes.
+    #[must_use]
+    pub fn peer_review_batches(&self) -> Vec<PeerReviewBatch> {
+        let mut artifacts: BTreeSet<&str> = BTreeSet::new();
+        artifacts.extend(self.peer_review_expectations.keys().map(String::as_str));
+        artifacts.extend(self.peer_reviews.values().map(|review| review.artifact_id.as_str()));
+        artifacts.extend(self.peer_artifact_heads.keys().map(String::as_str));
+        artifacts
+            .into_iter()
+            .map(|artifact_id| {
+                let obligations: Vec<PeerReviewObligation> = self
+                    .peer_reviews
+                    .values()
+                    .filter(|review| review.artifact_id == artifact_id)
+                    .map(PeerReviewObligation::from)
+                    .collect();
+                let submitted = obligations.len() as u64;
+                let disposed = obligations
+                    .iter()
+                    .filter(|obligation| obligation.is_disposed())
+                    .count() as u64;
+                let expected = self.peer_review_expectations.get(artifact_id).copied();
+                PeerReviewBatch {
+                    artifact_id: artifact_id.to_owned(),
+                    current_artifact_revision: self
+                        .peer_artifact_heads
+                        .get(artifact_id)
+                        .map(|head| head.revision),
+                    expected,
+                    submitted,
+                    disposed,
+                    outstanding: expected.map(|expected| expected.saturating_sub(disposed)),
+                    obligations,
+                }
+            })
+            .collect()
     }
 
     /// Reads one anchored review as an owned clone.
