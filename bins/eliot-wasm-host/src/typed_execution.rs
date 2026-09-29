@@ -1502,6 +1502,7 @@ impl Drop for EpochDriver {
         }
     }
 }
+}
 
 /// Runs one descriptor closure with fuel, memory/table/instance limits,
 /// and epoch interruption driven by both a tick pump and the wall
