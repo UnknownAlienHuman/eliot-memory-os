@@ -71,8 +71,7 @@ pub use dispatch_material::{
     WASM_DISPATCH_MATERIAL_WIRE_ID, WASM_DISPATCH_MATERIAL_WIRE_VERSION,
     WASM_HOST_CONTROL_FILE_NAME, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
     WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path,
-    bind_dispatch_material, consume_staged, read_dispatch_material, read_dispatch_material_from,
-    read_staged_bytes,
+    bind_dispatch_material, read_dispatch_material, read_dispatch_material_from, read_staged_bytes,
 };
 pub use governed_admission::{HostAdmitError, admit_governed_host, check_governed_host_output};
 pub use guest_exec::{
