@@ -39,7 +39,8 @@ use eliot_agent_opencode::{
     ActionGate, ActionGateDecision, ActionGateError, ActionGateRequest, CredentialResolver,
     EffectDecisionRecord, HOST_EVENTS_PAYLOAD_TYPE, HostEventAdmission, HostEventAdmissionError,
     HostEventAdmissionFailure, HostEventAdmissionReceipt, HostEventDelivery, HostEventGap,
-    HostEventKind, HostEventPorts, HostEventSubmission, IntroductionStore,
+    HostEventKind, HostEventPorts, HostEventSubmission, HostEventsListener, HostEventsShutdown,
+    IntroductionStore,
 };
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorActionGateRefusal, GovernorActionGateRequest, decide_pre_effect};
@@ -624,6 +625,104 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
             .map_err(|error| HostEventAdmissionError::of(bridge_failure(&error)))?;
         Ok(())
     }
+}
+
+/// Startup failure of the `/v1/host-events` service.
+///
+/// Fail-closed: the route is never started unless the owner can bind the
+/// endpoint the introduction pins, so a foreign or squatting listener can
+/// never inherit it. Carries no secret material.
+#[derive(Debug, Error)]
+pub enum HostEventsServiceError {
+    /// The single-threaded runtime the non-`Send` admission port requires
+    /// could not be built.
+    #[error("host-events service runtime refused: {0}")]
+    Runtime(#[from] std::io::Error),
+}
+
+/// How the `/v1/host-events` service is started by the bridge composition.
+#[derive(Clone, Debug, Default)]
+pub enum HostEventsStartup {
+    /// No current introduction exists: the route is never opened, so nothing
+    /// can reach an unintroduced endpoint.
+    #[default]
+    Unintroduced,
+    /// The owner installed a current introduction for `generation`, and the
+    /// listener is bound to the exact endpoint it pins.
+    ///
+    /// The store is boxed so the uninhabited case does not pay for it: the
+    /// route is unintroduced for the whole process unless a broker-owned
+    /// introduction is installed first.
+    Introduced {
+        /// Current owner-held introductions for this process.
+        introductions: Box<BridgeIntroductionStore>,
+        /// Bridge generation this listener was bound under. Rotation away
+        /// from it ends the route before another request is admitted.
+        generation: u64,
+    },
+}
+
+/// Serves `POST /v1/host-events` on the bridge thread (issue #2898, steps 1
+/// and 5).
+///
+/// This is the production composition seam that makes the route reachable.
+/// [`assemble_ports`] supplies the durable Agent Bridge → Kernel admission
+/// route, the real Governor/authority `ActionGate`, the owner-held
+/// introductions and the owner-resolved credential; this function owns only
+/// the transport lifecycle — the single-threaded runtime the non-`Send`
+/// admission port requires and the typed shutdown that ends the route when
+/// the active bridge generation moves.
+///
+/// Ownership rules this function must not weaken:
+///
+/// * The listener is supplied already bound by this process, so the endpoint
+///   the introduction pins is the endpoint this listener owns. A bind
+///   conflict refuses the route at
+///   [`HostEventsListener::bind_loopback`]/`from_pre_bound` instead of letting
+///   a squatter serve it, and every request is re-checked against the serving
+///   port in `join_introduction`.
+/// * An unintroduced composition never opens the port at all
+///   ([`HostEventsStartup::Unintroduced`]), so an endpoint with no current
+///   broker-minted introduction has no listener to reach.
+/// * The service is supervised, not decorative: it returns only on the stop
+///   signal or on bridge-generation rotation, and every request is admitted
+///   through the same durable route and gate the ports carry.
+pub fn serve_host_events<F>(
+    runner: &mut BridgeRunner,
+    listener: &HostEventsListener,
+    startup: HostEventsStartup,
+    current_profile: Option<GovernanceProfile>,
+    resolve_credential: F,
+) -> Result<HostEventsShutdown, HostEventsServiceError>
+where
+    F: Fn(&SecretRef) -> Option<SecretString> + Send,
+{
+    let (introductions, bound_generation) = match startup {
+        HostEventsStartup::Introduced {
+            introductions,
+            generation,
+        } => (*introductions, generation),
+        HostEventsStartup::Unintroduced => return Ok(HostEventsShutdown::Stopped),
+    };
+    // Both watch channels are owned here for the whole service: dropping a
+    // sender would close its channel, which the listener reads as a stop or a
+    // rotation. The process is the only supervisor, so the route lives exactly
+    // as long as the bridge process and ends with it.
+    let (_stop_owner, stop_signal) = tokio::sync::watch::channel(false);
+    let (_generation_owner, generation_signal) = tokio::sync::watch::channel(bound_generation);
+    // The admission port borrows the runner on this thread, so the runtime is
+    // current-thread and lives exactly as long as the service.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut ports = assemble_ports(runner, introductions, current_profile, resolve_credential);
+    let shutdown = runtime.block_on(listener.serve_until(
+        &mut ports,
+        bound_generation,
+        stop_signal,
+        generation_signal,
+    ));
+    Ok(shutdown)
 }
 
 /// Assembles the ingress ports over the live bridge composition.

@@ -16,10 +16,10 @@ const USEFUL_EVENTS = new Set([
 ])
 const TRANSIENT_HTTP_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
 const ALLOWED_HTTP_HOSTS = new Set(["127.0.0.1", "::1", "[::1]"])
-// Bare decision strings are legacy/unverified: they describe the observation
-// ceiling only and can no longer authorize a mutating tool. The verified gate
-// path requires the versioned owner-proved response (see verifyGatePermit).
-const ALLOWED_GATE_DECISIONS = new Set(["recorded", "allow", "allowed", "pass"])
+// There is deliberately no bare decision-string set here. The legacy
+// "recorded|allow|allowed|pass" object can no longer authorize a mutating
+// tool: the verified gate path requires the versioned owner-proved response
+// (see verifyGatePermit), and anything else throws before the tool runs.
 
 const BRIDGE_ENV_KEYS = [
   "APPDATA",
