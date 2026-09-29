@@ -6648,7 +6648,7 @@ impl HostComposition {
                         "current-user Host root is not the exact retained profile root".to_owned(),
                     ));
                 }
-                ApprovedGenerationRegistry::inspect_existing_user_owned_at(
+                RedbInstallationRegistry::inspect_existing_user_owned_at(
                     root_lease,
                     selected_profile,
                 )?

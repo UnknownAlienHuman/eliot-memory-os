@@ -399,7 +399,9 @@ impl ProfileSupervisorJob {
     pub fn profile_selection(&self) -> Result<&ProfileSelectionReceipt, HostError> {
         self.profile_roots
             .verify_stable_identity()
-            .and_then(|()| self.user_owned_root.verify_stable_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.user_owned_root
+            .verify_stable_identity()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         Ok(self.profile_roots.selection())
     }
@@ -411,7 +413,9 @@ impl ProfileSupervisorJob {
     pub fn observe(&self) -> Result<RunningJobObservation, HostError> {
         self.profile_roots
             .verify_stable_identity()
-            .and_then(|()| self.user_owned_root.verify_stable_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.user_owned_root
+            .verify_stable_identity()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         self.executable_lease
             .verify()
@@ -437,7 +441,9 @@ impl ProfileSupervisorJob {
     pub fn stop(mut self) -> Result<TerminatedJobChild, HostError> {
         self.profile_roots
             .verify_stable_identity()
-            .and_then(|()| self.user_owned_root.verify_stable_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.user_owned_root
+            .verify_stable_identity()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         self.executable_lease
             .verify()
