@@ -112,6 +112,7 @@ pub use restore_journal::{
 pub use snapshot_model::{OrsSnapshotReceipt, OrsSnapshotRequest};
 pub use status::{
     observe_supervision_status, open_existing_read_only, read_current_supervision_lease_read_only,
+    read_purge_ledger_revision_read_only,
 };
 pub use status_projection::{
     OrsSupervisionStatusError, ProcessStreamRecoveryStatusProjection, SupervisionStatusProjection,

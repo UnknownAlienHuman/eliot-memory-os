@@ -21,6 +21,15 @@ const SUPERVISION_LEASE_HISTORY: TableDefinition<&str, &str> =
 const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
 
+// The two literals below are owned by `store.rs`: `META` at `store.rs:128` and
+// `PURGE_LEDGER_REVISION_KEY` at `store.rs:427`. A change to either there must
+// be mirrored here, or this read-only reader would answer about a table and key
+// the owner no longer writes. The duplication is the same one the
+// `SUPERVISION_LEASE_*` names above already make, and the alternative — making
+// a second reader of a private store table — is worse.
+const PURGE_LEDGER_META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
+const PURGE_LEDGER_REVISION_KEY: &str = "purge_ledger_revision";
+
 const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HISTORY: u16 = 8;
 
@@ -672,6 +681,90 @@ pub fn read_current_supervision_lease_read_only(
             validate_replay_authority(&read, current, &mut used)?;
         }
         Ok(current)
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(error) => Err(map_panic(error)),
+    }
+}
+
+/// Read-only answering read of the owner-issued purge-ledger revision
+/// (issue #958; `I05.13:44`, `A13.7`).
+///
+/// This is a read-only inspection seam, not a store: it opens the ORS with
+/// `redb::ReadOnlyDatabase`, never creates or initialises a database, never
+/// begins a write transaction and never constructs `RedbRecoveryStore`, so no
+/// caller of this crate becomes a second mutable root owner — the stop
+/// condition in `crates/storage/AGENTS.md`.
+///
+/// The returned value is the durable counter the owner committed in the same
+/// transaction as each purge-ledger row, i.e. exactly the fact
+/// `RedbRecoveryStore::purge_ledger_revision` issues to the owner. It is never
+/// recomputed here, never derived from an archive under check and never
+/// assembled from caller input: `I05.13` requires a `full_recovery` receipt to
+/// bind this revision and `A13.7` requires a restore to compare the archive
+/// against it before any effect.
+///
+/// `Ok(None)` has two distinct meanings, and only the consumer may decide what
+/// either one means for its own policy:
+/// * the database holds tables but not `ors_meta_v1`, which is
+///   `OrsSupervisionStatusError::MigrationRequired` instead — the rule
+///   `check_schema` already applies. An ORS with no tables at all is an
+///   uninitialised store, which is an answer rather than corruption, so it is
+///   `Ok(None)`;
+/// * `ors_meta_v1` is present and `purge_ledger_revision` is absent. The
+///   owner's own reader treats an absent counter as revision zero, but this
+///   reader returns `None` so absence stays distinguishable from `Some(0)`:
+///   zero is a real revision a committed store can hold, and `I5.27` forbids
+///   silently defaulting a field that carries ordering and effect meaning.
+///
+/// A counter that is not a decimal `u64` is
+/// `OrsSupervisionStatusError::Corrupt`, with the record type and reason the
+/// owner's own reader reports. It is never guessed, clamped or rounded.
+pub fn read_purge_ledger_revision_read_only(
+    path: impl AsRef<Path>,
+) -> Result<Option<u64>, OrsSupervisionStatusError> {
+    let path = path.as_ref();
+    validate_path(path)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let db = ReadOnlyDatabase::open(path).map_err(map_db_error)?;
+        let read = db.begin_read().map_err(map_tx_error)?;
+        if !has_table(&read, PURGE_LEDGER_META)? {
+            let any_table = read
+                .list_tables()
+                .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
+                .next()
+                .is_some();
+            if any_table {
+                return Err(OrsSupervisionStatusError::MigrationRequired(
+                    "missing purge-ledger metadata table: ors_meta_v1".to_owned(),
+                ));
+            }
+            return Ok(None);
+        }
+        let meta = read.open_table(PURGE_LEDGER_META).map_err(map_table_error)?;
+        let Some(value) = meta
+            .get(PURGE_LEDGER_REVISION_KEY)
+            .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let raw = value.value();
+        // A decimal u64 is at most 20 characters, so that length is the whole
+        // bound: an over-long value cannot be a revision, and checking it
+        // before parsing keeps the read bounded without a second ceiling.
+        let revision = if raw.len() > 20 {
+            None
+        } else {
+            raw.parse::<u64>().ok()
+        };
+        match revision {
+            Some(revision) => Ok(Some(revision)),
+            None => Err(OrsSupervisionStatusError::Corrupt(format!(
+                "{}: purge-ledger revision is not an unsigned integer",
+                crate::PURGE_LEDGER_RECORD_TYPE
+            ))),
+        }
     }));
     match outcome {
         Ok(result) => result,
