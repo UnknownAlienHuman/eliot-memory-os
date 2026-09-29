@@ -12,9 +12,9 @@
 //! one exact [`ResearchQueryRequest`] to one admitted operation before any
 //! executor contact. Because the exchange request carries no artifact/config/
 //! protocol digest, no Module Registry reference, no process generation, no
-//! Authority Epoch and no operation identity of its own, the record also
-//! re-proves those eight facts by value against the Kernel's own dispatch
-//! presentation and its sealed receipt
+//! Authority Epoch and no operation or cancellation identity of its own, the
+//! record also re-proves those nine facts by value against the Kernel's own
+//! dispatch presentation and its sealed receipt
 //! ([`ProviderAdmission::bind_admitted_dispatch`]); carrying them is not the
 //! same as being bound to this operation.
 
@@ -72,6 +72,12 @@ impl AdmissionRefusal {
 /// - `operation_id` is the stable identity for cancel/reconcile and the only
 ///   identity the exchange ever keys on; the provider-local job reference
 ///   stays outcome evidence, never canonical identity.
+/// - `cancellation_id` is the cancellation identity for this operation's
+///   lifecycle (I7.4: every request carries idempotency identity, deadline and
+///   cancellation semantics). It is carried here rather than re-read from the
+///   presentation at each use, so a terminal receipt or a control request
+///   cannot report or act on a cancellation identity that was never compared
+///   against the sealed admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderAdmission {
     bridge: BridgeIdentity,
@@ -89,6 +95,7 @@ pub struct ProviderAdmission {
     required_schema: String,
     bridge_generation: String,
     operation_id: OperationId,
+    cancellation_id: String,
     inquiry_digest: String,
     denominator_digest: String,
     coverage_goal: String,
@@ -115,6 +122,7 @@ impl ProviderAdmission {
         required_schema: impl Into<String>,
         bridge_generation: impl Into<String>,
         operation_id: OperationId,
+        cancellation_id: impl Into<String>,
         inquiry_digest: impl Into<String>,
         denominator_digest: impl Into<String>,
         coverage_goal: impl Into<String>,
@@ -134,12 +142,14 @@ impl ProviderAdmission {
         let module_generation_id = module_generation_id.into();
         let required_schema = required_schema.into();
         let bridge_generation = bridge_generation.into();
+        let cancellation_id = cancellation_id.into();
         let coverage_goal = coverage_goal.into();
         for value in [
             &module_id,
             &module_generation_id,
             &required_schema,
             &bridge_generation,
+            &cancellation_id,
             &coverage_goal,
         ] {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -168,6 +178,7 @@ impl ProviderAdmission {
             required_schema,
             bridge_generation,
             operation_id,
+            cancellation_id,
             inquiry_digest,
             denominator_digest,
             coverage_goal,
@@ -264,6 +275,13 @@ impl ProviderAdmission {
         &self.operation_id
     }
 
+    /// Returns the admitted cancellation identity for this operation's
+    /// lifecycle.
+    #[must_use]
+    pub fn cancellation_id(&self) -> &str {
+        &self.cancellation_id
+    }
+
     /// Returns the digest of the frozen Researcher inquiry this acquisition
     /// answers.
     #[must_use]
@@ -318,7 +336,8 @@ impl ProviderAdmission {
     /// [`ProviderAdmission::validate_request`] binds an *exchange request* to
     /// this record, and the request carries no artifact/config/protocol digest,
     /// no Module Registry reference, no process generation, no Authority Epoch
-    /// and no operation identity of its own — those eight facts live only here.
+    /// and no operation or cancellation identity of its own — those nine facts
+    /// live only here.
     /// A record that merely carries them proves nothing about which operation
     /// was admitted, so this method compares each one **by value** against the
     /// two records that do carry it: the presented
@@ -339,8 +358,9 @@ impl ProviderAdmission {
     ///
     /// What follows the owner proof is the field-wise comparison, so the record
     /// is self-verifying rather than dependent on a caller's diligence: the
-    /// admission's epoch, State Fence, process generation and operation identity
-    /// are compared against the owner's own echoes, and its artifact,
+    /// admission's epoch, State Fence, process generation, operation identity and
+    /// cancellation identity are compared against the owner's own echoes, and
+    /// its artifact,
     /// config/protocol digests, Module Registry references, privacy/data class,
     /// budget/deadline and route terms are compared against the admitted
     /// presentation byte for byte. `coverage_goal` is deliberately absent: it is
@@ -352,7 +372,7 @@ impl ProviderAdmission {
     ///
     /// Returns [`AdmissionRefusal::RequestMismatch`] when the receipt does not
     /// echo this dispatch exactly, is not an admitted disposition, or when any
-    /// of the eight identity facts above disagrees by value. There is no
+    /// of the nine identity facts above disagrees by value. There is no
     /// fallback value, no partial acceptance, and no second reason code: this
     /// record is either the record of the admitted operation or it is not.
     pub fn bind_admitted_dispatch(
@@ -379,6 +399,8 @@ impl ProviderAdmission {
             || self.fence != receipt.admitted_fence
             || self.operation_id.as_str() != dispatch.operation_id.as_str()
             || self.operation_id.as_str() != receipt.operation_id.as_str()
+            || self.cancellation_id != dispatch.cancellation_id
+            || self.cancellation_id != receipt.cancellation_id
             || admitted_disclosure_wire(self.disclosure) != dispatch.disclosure.as_str()
             || self.budget_units != dispatch.budget_units
             || self.deadline_ms != dispatch.deadline_ms
@@ -463,6 +485,7 @@ mod tests {
                         "research-evidence-bundle/v1",
                         "gen-24-slice-a",
                         crate::support::test_operation_id(),
+                        "cancel-24-slice-a",
                         DIGEST_A,
                         DIGEST_B,
                         crate::support::COVERAGE_GOAL,
@@ -495,6 +518,7 @@ mod tests {
                         "research-evidence-bundle/v1",
                         "gen-24-slice-a",
                         crate::support::test_operation_id(),
+                        "cancel-24-slice-a",
                         DIGEST_A,
                         DIGEST_B,
                         crate::support::COVERAGE_GOAL,
@@ -535,6 +559,7 @@ mod tests {
                     "research-evidence-bundle/v1",
                     "gen-24-slice-a",
                     crate::support::test_operation_id(),
+                    "cancel-24-slice-a",
                     DIGEST_A,
                     DIGEST_B,
                     crate::support::COVERAGE_GOAL,
@@ -566,6 +591,7 @@ mod tests {
                         "research-evidence-bundle/v1",
                         "gen-24-slice-a",
                         crate::support::test_operation_id(),
+                        "cancel-24-slice-a",
                         DIGEST_A,
                         DIGEST_B,
                         crate::support::COVERAGE_GOAL,

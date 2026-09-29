@@ -378,6 +378,7 @@ fn admit(
         dispatch.bridge_generation.clone(),
         OperationId::new(dispatch.operation_id.clone())
             .map_err(|error| Failure::NoAdmission(format!("operation identity: {error}")))?,
+        dispatch.cancellation_id.clone(),
         dispatch.inquiry_digest.clone(),
         dispatch.denominator_digest.clone(),
         admitted.request.coverage_goal.clone(),
@@ -389,11 +390,11 @@ fn admit(
     // record carries that the exchange request does not (artifact, config and
     // protocol digests, Module/Capability Registry references, process
     // generation, Authority Epoch, State Fence, privacy/data class, budget and
-    // deadline, and the cancellation identity) is compared by value against the
-    // Kernel's own attested content through the wire owner's `verify_echo` and
-    // the field-wise comparison beside it. A record built from one dispatch and
-    // a receipt for another is refused here, before any port, authority, or
-    // executor is constructed.
+    // deadline, the operation identity and the cancellation identity) is
+    // compared by value against the Kernel's own attested content through the
+    // wire owner's `verify_echo` and the field-wise comparison beside it. A
+    // record built from one dispatch and a receipt for another is refused here,
+    // before any port, authority, or executor is constructed.
     admission
         .bind_admitted_dispatch(dispatch, client_receipt)
         .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
@@ -527,7 +528,7 @@ fn terminal_receipt(
     let dispatch = &admitted.dispatch;
     ProviderExecutionReceipt {
         operation_id: dispatch.operation_id.clone(),
-        cancellation_id: dispatch.cancellation_id.clone(),
+        cancellation_id: admission.cancellation_id().to_owned(),
         exchange_id: dispatch.exchange_id.clone(),
         idempotency_key: dispatch.idempotency_key.clone(),
         dispatch_sha256: dispatch.canonical_sha256().unwrap_or_default(),
