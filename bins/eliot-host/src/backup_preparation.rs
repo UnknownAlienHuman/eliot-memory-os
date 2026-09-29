@@ -84,14 +84,19 @@
 //! [`PreparationError::InvalidRequest`] with the `owner_lease_ref` field when it
 //! differs, so a stale or foreign lease cannot reach a receipt.
 //!
-//! The projection still **refuses** a presented purge-ledger revision, and that
-//! refusal is backed by a proved **producer** absence rather than by a value
-//! this module declined to read: the purge revision belongs to the ORS owner
-//! (`RedbRecoveryStore::purge_ledger_revision`). This module holds no ORS
-//! handle, and it must not open one: `crates/storage/AGENTS.md` forbids a
-//! second *mutable* root owner, so the composition reads the installation
-//! registry and nothing else. The unblocking seam is named in
-//! [`crate::backup_config_projection::project_backup_config_owner_bound`].
+//! The purge-ledger revision is **owner-issued** too, and now read rather than
+//! refused: [`OwnerEvidence::owner_purge_ledger_revision`] opens the
+//! approved-manifest-selected ORS child through
+//! [`ProtectedRuntimePathLease`], re-proves the retained identity and path
+//! identity on both sides of the read, and hands the value to
+//! [`crate::backup_config_projection::project_backup_config_owner_bound`],
+//! where a presented revision is a *claim* checked against that owner value.
+//! That read does NOT make this composition root a second *mutable* root owner
+//! (`crates/storage/AGENTS.md`): it is a `ReadOnlyDatabase` read with no write
+//! transaction, no retained store handle and no ORS lease held past the call,
+//! so the module still holds no registry writer, no store handle and no ORS
+//! lease of its own. The producer stays
+//! `RedbRecoveryStore::purge_ledger_revision`; this module observes it.
 //!
 //! The forensic audit note is no longer refused, because it no longer has to be:
 //! [`OwnerEvidence::owner_audit_note`] derives it from the validated
@@ -203,7 +208,8 @@ use eliot_installation::{
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease, windows_paths_equal,
+    FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease, ProtectedRuntimePathLease,
+    windows_paths_equal,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -269,8 +275,8 @@ pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
 /// filled with an explicit, static, truthful **absence** marker rather than an
 /// invented archive identity, which would let a reader believe a specific
 /// archive had been proved. This is the same "record the absence" treatment the
-/// owner-issued configuration projection still applies to the purge-ledger
-/// revision and the forensic audit note, and the marker is part of the
+/// owner-issued configuration projection still applies to the forensic audit
+/// note, and the marker is part of the
 /// record's exact-binding transition, so it cannot vary between one
 /// preparation's admission and its result.
 pub const PREPARATION_NO_SOURCE_ARCHIVE: &str = "eliot.backup.preparation.no-source-archive.v1";
@@ -447,6 +453,21 @@ const OP_STAGING_LEASE: &str = "staging_lease";
 const OP_CALLER_AUTH: &str = "caller_auth";
 /// The durable Host-state journal sink this module writes intent/result through.
 const OP_JOURNAL_SINK: &str = "journal_sink";
+
+/// The ORS file name the kernel operational-record state root's own child
+/// carries.
+///
+/// The owner of this name is
+/// `bins/eliot-host/src/watchdog_publication.rs:58`
+/// (`read_manifest_current_supervision_lease` reads the same file through the
+/// same retained runtime-path lease), and the two declarations MUST agree: the
+/// watchdog module is declared `mod watchdog_publication;` (private) in
+/// `bins/eliot-host/src/lib.rs`, so its constant is not reachable from here and
+/// this one is declared beside its use rather than by refactoring the crate root
+/// to share it. If the ORS file name ever changes, both sites change together —
+/// a copy that drifts would make this module read a different file than the
+/// owner it claims to observe.
+const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 
 /// Notes the facade's actual Event Log seam status (typed-unavailable).
 fn backup_prepare_note_event_log_unavailable() {
@@ -2817,6 +2838,14 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
 /// `canonical_host_root`; that is the property a backup manifest needs from a
 /// lease reference, and it is a decision the code makes rather than a claim
 /// about a lease it no longer holds.
+///
+/// It is also the source of the owner-issued **purge-ledger revision** the
+/// configuration projection binds
+/// ([`OwnerEvidence::owner_purge_ledger_revision`]). That one value is *not*
+/// retained in the bundle: the counter belongs to the ORS owner and is read from
+/// it, read-only and through a short-lived retained lease, at the moment the
+/// projection consumes it — the same "take it at use" discipline the lease
+/// reference follows, for the same reason.
 pub struct OwnerEvidence {
     registry: ApprovedGenerationRegistry,
     approved: ApprovedGeneration,
@@ -3305,11 +3334,154 @@ impl OwnerEvidence {
         Ok(note)
     }
 
+    /// Returns the **owner-issued** durable purge-ledger revision (issue #958
+    /// A1; I5.13:44, A13.7).
+    ///
+    /// The value is the ORS owner's own durable counter, read READ-ONLY through
+    /// a retained [`ProtectedRuntimePathLease`] and handed to
+    /// [`crate::backup_config_projection::project_backup_config_owner_bound`],
+    /// where a presented revision is a *claim* checked against this one exactly
+    /// as the owner lease reference and the audit note already are. It is never
+    /// recomputed here, never taken from
+    /// [`PresentedPreparationRequest::purge_ledger_revision`], and never derived
+    /// from a caller-supplied path: `RedbRecoveryStore::purge_ledger_revision`
+    /// is the producer, and this function only observes what that owner
+    /// durably wrote.
+    ///
+    /// The location is OWNER-ISSUED. `kernel_ors_root` is read from the approved
+    /// manifest this bundle already validated during [`OwnerEvidence::inspect`]
+    /// — an active approved generation, a validated manifest and topology-
+    /// validated manifest-bound runtime roots — and only the file name beside it
+    /// is contributed here. No caller value reaches this path.
+    ///
+    /// The read discipline is the `read_manifest_current_supervision_lease`
+    /// precedent in `bins/eliot-host/src/watchdog_publication.rs`: the ORS child
+    /// is opened through the installer-provisioned runtime contour (which proves
+    /// the immutable `BA+LS+SY` file DACL and never asks the caller for
+    /// `WRITE_DAC`), the retained handle's current final path is compared with
+    /// the approved manifest's selection, and the retained identity plus the path
+    /// identity are re-proved BOTH BEFORE the read and AGAIN AFTER it, so the
+    /// value provably comes from the exact file that was proved. A path that
+    /// moved across the read refuses instead of returning a value read from
+    /// somewhere else.
+    ///
+    /// **This does not make this composition root a store owner.** The read is a
+    /// `ReadOnlyDatabase` transaction: no write transaction, no store handle
+    /// retained, no table written, and the lease is dropped on return.
+    /// `crates/storage/AGENTS.md` stops at "a request needs … a second mutable
+    /// root owner"; a read-only observation of a counter the ORS owner already
+    /// maintains is not that, and the module continues to hold no registry
+    /// writer, no store handle and no ORS lease of its own.
+    ///
+    /// The `Ok(None)` answer is refused, not turned into a zero. The owner's own
+    /// rule — `RedbRecoveryStore::purge_ledger_revision_in`, "An absent counter
+    /// is revision zero" — governs a counter key inside an initialised store, and
+    /// a reader faithful to that rule answers `Some(0)` there; so a `None` from
+    /// the owner means no counter was established for this ORS at all, and
+    /// substituting `0` would state the owner's answer on its behalf. This
+    /// module's standing rule applies: absence of proof is never treated as
+    /// proof of absence. A store that has never purged says so with a real zero.
+    ///
+    /// What is NOT proved: the revision is a point-in-time observation of a
+    /// counter, not a fence, so the owner can advance it the instant after this
+    /// returns and nothing downstream may treat the bound value as "the revision
+    /// during restore"; and the retained handle proves the file's identity, not
+    /// its CONTENTS — the revision is trusted because the ORS owner produced it
+    /// from a schema-checked read of that exact file, not because this module
+    /// inspected any record inside it.
+    ///
+    /// I5.13 forbids replaying a raw credential reference in a backup manifest.
+    /// `credential_receipt_digest` and `host_process_nonce_digest` are visible
+    /// on the committed fence this bundle holds ([`OwnerEvidence::inspect`]
+    /// proves and stores it) — they sit on the Host Phase-B prepared
+    /// materialization its `phase_b_live_binding` carries — and are deliberately
+    /// NOT extracted here, exactly as they are not extracted for the audit note:
+    /// a digest of a credential receipt is not a credential reference, and
+    /// nothing in this value path reads credential material or a secret-typed
+    /// field.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with a static [`PreparationError`] at every step: the ORS
+    /// open is mapped through the existing [`protected_path_to_preparation`]
+    /// helper, a selection or identity disagreement is
+    /// [`PreparationError::UnknownState`], an owner read that produced no
+    /// revision and an owner read that produced no counter are both
+    /// [`PreparationError::UnknownState`] with distinct static reasons, and the
+    /// owner's own error text is never echoed.
+    pub fn owner_purge_ledger_revision(&self) -> Result<u64, PreparationError> {
+        // The approved manifest's own ORS root, never a request field. Built
+        // before the observation so the refusal below names the same path the
+        // read would have used.
+        let ors_path = PathBuf::from(
+            self.approved
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .kernel_ors_root
+                .as_str(),
+        )
+        .join(KERNEL_ORS_FILE_NAME);
+        let read = (|| -> Result<u64, PreparationError> {
+            let retained =
+                ProtectedRuntimePathLease::open_existing_absolute(&ors_path).map_err(|error| {
+                    protected_path_to_preparation(OP_OWNER_EVIDENCE, &ors_path, error)
+                })?;
+            if !windows_paths_equal(retained.path(), &ors_path) {
+                return Err(PreparationError::UnknownState {
+                    operation: OP_OWNER_EVIDENCE.to_owned(),
+                    reason: "retained ORS lease is not the approved manifest's ORS child".to_owned(),
+                });
+            }
+            retained
+                .verify_stable_identity()
+                .and_then(|()| retained.verify_path_identity())
+                .map_err(|error| {
+                    protected_path_to_preparation(OP_OWNER_EVIDENCE, &ors_path, error)
+                })?;
+            let revision = eliot_ors::read_purge_ledger_revision_read_only(retained.path())
+                // The owner's error internals are never echoed; the static
+                // reason names the refused property only.
+                .map_err(|_| PreparationError::UnknownState {
+                    operation: OP_OWNER_EVIDENCE.to_owned(),
+                    reason: "owner purge-ledger read did not produce a revision".to_owned(),
+                })?
+                .ok_or_else(|| PreparationError::UnknownState {
+                    operation: OP_OWNER_EVIDENCE.to_owned(),
+                    reason: "owner established no purge-ledger counter for this ORS".to_owned(),
+                })?;
+            // The value is only trusted if it came from the file that was
+            // proved: the same identity pair is re-proved across the read, and a
+            // handle that no longer resolves to the approved selection refuses
+            // rather than returning a revision read from somewhere else.
+            retained
+                .verify_stable_identity()
+                .and_then(|()| retained.verify_path_identity())
+                .map_err(|error| {
+                    protected_path_to_preparation(OP_OWNER_EVIDENCE, &ors_path, error)
+                })?;
+            if !windows_paths_equal(retained.path(), &ors_path) {
+                return Err(PreparationError::UnknownState {
+                    operation: OP_OWNER_EVIDENCE.to_owned(),
+                    reason: "retained ORS lease moved off the approved manifest's ORS child"
+                        .to_owned(),
+                });
+            }
+            Ok(revision)
+        })();
+        match read {
+            Ok(revision) => Ok(revision),
+            Err(error) => {
+                Err(note_prepare_error(OP_OWNER_EVIDENCE, "purge_revision", error, 0))
+            }
+        }
+    }
+
     /// Projects the bounded owner-issued configuration evidence for one
     /// presented preparation request (issue #958, cases 958/1-4, 958/16).
     ///
     /// This is the production construction of the owner-bound projection. The
-    /// owner supplies four of its inputs and the request supplies only
+    /// owner supplies five of its inputs and the request supplies only
     /// presented evidence:
     ///
     /// - the manifest digest is the owner-issued configuration digest from
@@ -3321,6 +3493,11 @@ impl OwnerEvidence {
     ///   re-proves the retained protected-root lease immediately before this
     ///   method uses it, so the record names the lease this owner still holds
     ///   over the source rather than anything the requester wrote;
+    /// - the purge-ledger revision is
+    ///   [`OwnerEvidence::owner_purge_ledger_revision`], read read-only from
+    ///   the ORS owner through a retained protected runtime-path lease that is
+    ///   re-proved on both sides of the read, so the record binds the owner's
+    ///   own counter rather than a requester-supplied number;
     /// - the generation handle, profile token, retained Phase-B configuration
     ///   digest and the complete approved artifact digest set are bound inside
     ///   the projector from the same owner records.
@@ -3333,14 +3510,18 @@ impl OwnerEvidence {
     /// itself weakened — before this change any non-empty claim was refused, and
     /// now a claim is refused unless it equals owner evidence.
     ///
-    /// The presented purge-ledger revision is passed through unchanged **so the
-    /// projector still refuses it**, and that refusal names a producer that does
-    /// not exist rather than a value this method chose not to read: the revision
-    /// is owner-issued by the ORS owner and `OwnerEvidence` holds no ORS handle,
-    /// because `crates/storage/AGENTS.md` forbids a second mutable root owner.
-    /// The returned [`BackupConfigProjection`] therefore carries a zero
-    /// purge-ledger revision, and the projection digest binds that absence
-    /// explicitly.
+    /// The purge-ledger revision is now **owner-issued** rather than refused.
+    /// [`OwnerEvidence::owner_purge_ledger_revision`] reads it read-only from
+    /// the ORS owner through a retained protected runtime-path lease and hands
+    /// it to the projector beside the other owner values, so the presented
+    /// revision is a **claim** the projector compares against owner evidence
+    /// rather than a number this method passes through on the caller's behalf.
+    /// Before this change the projector refused every presented revision
+    /// outright; it now has an owner-issued value to compare one against. The
+    /// value is neither a copied caller field nor a recomputed counter, and the
+    /// read that produces it leaves no store handle, no write transaction and no
+    /// retained lease behind, so it does not make this composition root a second
+    /// mutable root owner.
     ///
     /// The presented forensic note is passed through unchanged too, but its role
     /// is now a **claim**: the projector compares it against
@@ -3425,10 +3606,18 @@ impl OwnerEvidence {
         // for the same reason: a note that cannot be shaped must be a named
         // owner refusal, not a projection digest over it.
         let owner_audit = self.owner_audit_note()?;
+        // The owner-issued purge-ledger revision, observed read-only from the ORS
+        // owner through a retained protected runtime-path lease. Taken before
+        // the projection for the same reason as the two values above: a stale,
+        // unreadable or counter-less owner revision must be a named owner
+        // refusal, not a projection digest that silently binds a zero nobody
+        // issued.
+        let owner_purge_ledger_revision = self.owner_purge_ledger_revision()?;
         project_backup_config_owner_bound(
             &config,
             binding,
             &owner_lease_ref,
+            &owner_purge_ledger_revision,
             &owner_audit,
             &self.fence.authority_state_fence,
         )
