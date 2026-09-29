@@ -22,6 +22,7 @@ pub mod build_projection;
 pub mod cache_lane;
 pub mod capsule_binding;
 mod dev_fast;
+pub mod package_disposition;
 pub mod process_owner;
 pub mod profile;
 pub mod profile_run;
@@ -77,6 +78,12 @@ pub use profile_run::{
     StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
     TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
 };
+pub use package_disposition::{
+    CAPABILITY_OWNER_UNIVERSE, CONSUMER_CRATE_UNIVERSE, DISPOSITION_REVIEWED_ON, DispositionError,
+    DispositionField, ExecutionContour, INSTRUMENT_PACKAGE_FAMILY, PACKAGE_DISPOSITIONS,
+    PackageDispositionRecord, PackageRoute, PROOF_CEILING_UNIVERSE, STATE_OWNER_UNIVERSE,
+    TESTD_PROFILE_UNIVERSE, verify_disposition_coverage,
+};
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
     ConformanceError, DENOMINATOR_CONTRACT, DENOMINATOR_CONTRACT_VERSION, ProviderAvailability,
@@ -85,8 +92,9 @@ pub use provider_denominator::{
     disposition_for_parts, host_platform,
 };
 pub use registry::{
-    ExecutableIdentityCause, ProviderRegistry, RegistryEntry, RegistryError,
-    ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
+    ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, PROFILE_IDENTITY_SLOTS,
+    ProfileIdentities, ProfileIdentityParams, ProviderRegistry, RegistryEntry, RegistryError,
+    REQUIRED_IDENTITY_SLOTS, ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
