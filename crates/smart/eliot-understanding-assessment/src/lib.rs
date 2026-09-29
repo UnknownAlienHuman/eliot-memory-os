@@ -51,6 +51,15 @@
 //! the owning review path (model/harness-change review for Common Ground,
 //! product acceptance for scoped assessments) transitions the candidate.
 //!
+//! Packet-quality readiness is a second, separate boundary: the shared
+//! [`ActiveUnderstandingView::suitability`] rule is asked for
+//! [`QualityOperation::DependentAction`] at intake, so a structurally valid
+//! view whose scorecard fails, blocks or has an unresolved applicability on a
+//! required dimension is refused with a typed
+//! [`AssessmentError::QualityRefused`] instead of producing candidate material
+//! from it. A closed assessment remains candidate material either way — it
+//! grants no authority and no task Finish.
+//!
 //! Outputs are reversible candidates with the exact independently recheckable
 //! denominator (`declared_question_task_family_times_state_fence_with_
 //! onboarding_slice_plus_discriminator_plus_outcome_verifier_closure`):
@@ -73,7 +82,10 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_context_contracts::{ActiveUnderstandingView, ContextError, SemanticRole};
+use eliot_context_contracts::{
+    ActiveUnderstandingView, ContextError, QualityApplicabilityInput, QualityDimension,
+    QualityOperation, SemanticRole,
+};
 use eliot_contracts::{ArtifactId, ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::self_query::{
     AcceptedSourceProjection, AcceptedSourceRef, SelfQueryContractError,
@@ -257,6 +269,24 @@ pub enum AssessmentError {
     FenceMismatch {
         /// Field at fault.
         field: &'static str,
+    },
+    /// The compiled view's scorecard refused the operation this assessment
+    /// performs.
+    ///
+    /// Structural validity is not permission: the view validated, and this
+    /// assessment still consumes it to derive candidate material that a
+    /// planner or reviewer will act on. The typed dimensions and unresolved
+    /// applicability inputs travel with the refusal instead of being collapsed
+    /// into a generic upstream error, so the caller learns which dimension
+    /// still lacks which evidence instead of re-deriving it from the card.
+    #[error("understanding assessment: quality refused {operation:?} on {blocking:?}")]
+    QualityRefused {
+        /// The operation this assessment requested.
+        operation: QualityOperation,
+        /// Dimensions that blocked it, in canonical order.
+        blocking: Vec<QualityDimension>,
+        /// Applicability inputs that were never resolved.
+        unresolved_applicability: Vec<QualityApplicabilityInput>,
     },
     /// A cited accepted-source triple is stale or uncited.
     #[error("understanding assessment: stale citation at {field}")]
@@ -899,6 +929,28 @@ impl BindingRollup {
 /// Gate every carried fence against the assessment fence.
 fn gate_owner(owner: &OwnerContext<'_>, scope: &AssessmentScope) -> Result<(), AssessmentError> {
     owner.view.validate()?;
+    // `validate` above is structural integrity only. This intake is a dependent
+    // consumer, not a diagnostic read: the assessment it feeds is candidate
+    // material a planner or reviewer acts on, so the view's scorecard decides
+    // whether the exact anchor/provenance, active directive and verifier
+    // readiness it was graded against are still current. A structurally valid
+    // view carrying a failed, unknown, degraded, not-applicable or invalidated
+    // required dimension, or an unresolved applicability input, is refused here
+    // rather than silently producing candidate material from it. The refusal
+    // keeps the one shared rule: assembly, reactive delivery and this direct
+    // View consumer ask the same question of the same card.
+    owner
+        .view
+        .suitability(QualityOperation::DependentAction, &[])
+        .map_err(|refusal| AssessmentError::QualityRefused {
+            operation: refusal.operation,
+            blocking: refusal
+                .blocking
+                .iter()
+                .map(|result| result.dimension)
+                .collect(),
+            unresolved_applicability: refusal.unresolved_applicability,
+        })?;
     owner.sources.validate()?;
     if owner.view.binding.scope_id.as_str() != scope.scope_id {
         return Err(AssessmentError::InvalidField {
