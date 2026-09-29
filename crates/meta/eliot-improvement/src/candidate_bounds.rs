@@ -937,6 +937,15 @@ impl BoundedBacklog {
     /// refusal with the entry untouched up to the advisory chain — the same
     /// validate-then-commit discipline the lineage merge uses.
     ///
+    /// Archival is not promotion. Every hop in this chain is a non-promoting
+    /// disposition (`Stale`, `Rejected`, `Archived`) of the I12.24:70 step
+    /// "→ promote, narrow, rollback or archive →", so it needs no budget record
+    /// and carries no budget-proof argument. The I12.24:76 matched-budget gate
+    /// is bound to the transition INTO `Supported` or `Narrowed`
+    /// (`ImprovementCandidate::promote_lifecycle`) and cannot be sidestepped by
+    /// routing a candidate out of the active set instead: closing an entry never
+    /// promotes one, and never produces a promoted disposition.
+    ///
     /// Both terminal lifecycles are produced. A stale candidate's recorded
     /// disposition is `Stale` FIRST — the contract's own vocabulary for
     /// "superseded by a newer admission epoch" — and is then closed as
@@ -1336,7 +1345,10 @@ impl BoundedBacklog {
 /// Every hop is validated by `ImprovementCandidate::transition_lifecycle`, so a
 /// state this function does not anticipate is a typed refusal rather than a
 /// silent skip, and no candidate can leave the active set without its
-/// archival being a recorded `ImprovementLifecycle::Archived`.
+/// archival being a recorded `ImprovementLifecycle::Archived`. No hop is a
+/// promoting disposition, so this chain needs no budget record: the I12.24:76
+/// matched-budget gate is bound to `ImprovementCandidate::promote_lifecycle`,
+/// the only seam that admits `Supported` or `Narrowed`.
 fn archive_cause_lifecycles(
     cause: ArchiveCause,
     current: ImprovementLifecycle,

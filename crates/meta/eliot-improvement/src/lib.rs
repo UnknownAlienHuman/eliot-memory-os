@@ -176,6 +176,78 @@ impl ImprovementLifecycle {
                 | Self::Archived
         )
     }
+
+    /// The promoting dispositions of the I12.24:70 pipeline step
+    /// "→ promote, narrow, rollback or archive →".
+    ///
+    /// `Supported` is "promote" and `Narrowed` is "narrow"; `RolledBack` and
+    /// `Archived` are the other two dispositions in that same step and are not
+    /// promotions. I12.24:76 makes these two the only dispositions a
+    /// replay-only record can never reach, so every transition INTO one of them
+    /// is gated by
+    /// [`require_matched_budget_for_promotion`](crate::budget_proof::require_matched_budget_for_promotion).
+    pub fn is_promoting_disposition(self) -> bool {
+        matches!(self, Self::Supported | Self::Narrowed)
+    }
+}
+
+/// The complete owner-decision lifecycle edge table (I12.24:36-37).
+///
+/// Held as one free function so both transition entry points — the
+/// ungated [`ImprovementCandidate::transition_lifecycle`] and the
+/// budget-gated [`ImprovementCandidate::promote_lifecycle`] — validate the
+/// exact same edges, and so no entry point can hold a divergent copy of the
+/// table that decides legality.
+fn lifecycle_edge_allowed(from: ImprovementLifecycle, to: ImprovementLifecycle) -> bool {
+    matches!(
+        (from, to),
+        (
+            ImprovementLifecycle::Proposed,
+            ImprovementLifecycle::Triaged
+        ) | (
+            ImprovementLifecycle::Triaged,
+            ImprovementLifecycle::AcceptedForExperiment
+        ) | (
+            ImprovementLifecycle::AcceptedForExperiment,
+            ImprovementLifecycle::Running
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::Supported
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::Narrowed
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::Rejected
+        ) | (
+            ImprovementLifecycle::Running,
+            ImprovementLifecycle::RolledBack
+        ) | (
+            ImprovementLifecycle::Triaged,
+            ImprovementLifecycle::Rejected
+        ) | (
+            ImprovementLifecycle::Proposed,
+            ImprovementLifecycle::Rejected
+        ) | (ImprovementLifecycle::Proposed, ImprovementLifecycle::Stale)
+            | (ImprovementLifecycle::Triaged, ImprovementLifecycle::Stale)
+            | (
+                ImprovementLifecycle::Narrowed,
+                ImprovementLifecycle::Archived
+            )
+            | (
+                ImprovementLifecycle::Supported,
+                ImprovementLifecycle::Archived
+            )
+            | (
+                ImprovementLifecycle::Rejected,
+                ImprovementLifecycle::Archived
+            )
+            | (
+                ImprovementLifecycle::RolledBack,
+                ImprovementLifecycle::Archived
+            )
+            | (ImprovementLifecycle::Stale, ImprovementLifecycle::Archived)
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -482,60 +554,73 @@ impl ImprovementCandidate {
     /// `CandidateState` machine is untouched; lifecycle transitions only
     /// refresh `updated_at` and never touch `revision`, so pipeline guards
     /// keep their exact semantics.
+    ///
+    /// This entry point carries every NON-promoting disposition of the I12.24:70
+    /// step "→ promote, narrow, rollback or archive →": triage, experiment
+    /// acceptance, experiment start, rejection, rollback, staleness, and every
+    /// archival closure. It cannot promote. `Supported` and `Narrowed` are the
+    /// promoting dispositions, and I12.24:76 states the guarantee on the move
+    /// INTO them — "Replay-only evidence cannot promote… An unmatched ledger or
+    /// inconclusive complexity delta cannot promote the candidate merely because
+    /// replay or a local metric improved" — so a caller reaching one of them
+    /// here is refused with a typed
+    /// [`ImprovementError::BudgetGateViolation`] and must use
+    /// [`ImprovementCandidate::promote_lifecycle`], which is the only seam that
+    /// admits a budget record. The gate therefore lives on the transition to
+    /// promotion itself, not only on the intake path.
     pub fn transition_lifecycle(
         &mut self,
         next: ImprovementLifecycle,
     ) -> Result<(), ImprovementError> {
-        let allowed = matches!(
-            (self.lifecycle, next),
-            (
-                ImprovementLifecycle::Proposed,
-                ImprovementLifecycle::Triaged
-            ) | (
-                ImprovementLifecycle::Triaged,
-                ImprovementLifecycle::AcceptedForExperiment
-            ) | (
-                ImprovementLifecycle::AcceptedForExperiment,
-                ImprovementLifecycle::Running
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::Supported
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::Narrowed
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::Rejected
-            ) | (
-                ImprovementLifecycle::Running,
-                ImprovementLifecycle::RolledBack
-            ) | (
-                ImprovementLifecycle::Triaged,
-                ImprovementLifecycle::Rejected
-            ) | (
-                ImprovementLifecycle::Proposed,
-                ImprovementLifecycle::Rejected
-            ) | (ImprovementLifecycle::Proposed, ImprovementLifecycle::Stale)
-                | (ImprovementLifecycle::Triaged, ImprovementLifecycle::Stale)
-                | (
-                    ImprovementLifecycle::Narrowed,
-                    ImprovementLifecycle::Archived
-                )
-                | (
-                    ImprovementLifecycle::Supported,
-                    ImprovementLifecycle::Archived
-                )
-                | (
-                    ImprovementLifecycle::Rejected,
-                    ImprovementLifecycle::Archived
-                )
-                | (
-                    ImprovementLifecycle::RolledBack,
-                    ImprovementLifecycle::Archived
-                )
-                | (ImprovementLifecycle::Stale, ImprovementLifecycle::Archived)
-        );
-        if !allowed {
+        if next.is_promoting_disposition() && lifecycle_edge_allowed(self.lifecycle, next) {
+            return Err(ImprovementError::BudgetGateViolation(
+                "promote or narrow requires a matched budget-equivalence ledger and \
+                 conclusive complexity-economics delta; use promote_lifecycle",
+            ));
+        }
+        self.apply_lifecycle_edge(next)
+    }
+
+    /// Move the candidate to a promoting disposition under the I12.24:76 gate.
+    ///
+    /// `next` must be `Supported` ("promote") or `Narrowed` ("narrow"); every
+    /// other disposition is the ungated [`Self::transition_lifecycle`], which
+    /// refuses the two promoting values outright. `proof` is required by
+    /// signature — there is no form of this call that omits the budget record —
+    /// and it is judged solely by
+    /// [`require_matched_budget_for_promotion`](crate::budget_proof::require_matched_budget_for_promotion),
+    /// the single owner of the matched-budget decision: this method adds no
+    /// check, revalidation, or digest of its own. A replay-only candidate
+    /// therefore cannot be promoted or narrowed, and cannot reach either
+    /// disposition by any other route, because no other seam accepts them.
+    ///
+    /// Fails closed and validate-then-commit: the lifecycle is left at its
+    /// previous value when the edge is illegal or the gate refuses, so a
+    /// refused promotion is never half-applied.
+    pub fn promote_lifecycle(
+        &mut self,
+        next: ImprovementLifecycle,
+        proof: &BudgetProof,
+    ) -> Result<(), ImprovementError> {
+        if !next.is_promoting_disposition() {
+            return Err(ImprovementError::BudgetGateViolation(
+                "the budget gate admits only the promote and narrow dispositions",
+            ));
+        }
+        if !lifecycle_edge_allowed(self.lifecycle, next) {
+            return Err(ImprovementError::InvalidLifecycleTransition {
+                from: self.lifecycle,
+                to: next,
+            });
+        }
+        require_matched_budget_for_promotion(Some(proof))?;
+        self.apply_lifecycle_edge(next)
+    }
+
+    /// Commit one validated lifecycle edge. Both entry points reach this only
+    /// after the edge is legal under [`lifecycle_edge_allowed`].
+    fn apply_lifecycle_edge(&mut self, next: ImprovementLifecycle) -> Result<(), ImprovementError> {
+        if !lifecycle_edge_allowed(self.lifecycle, next) {
             return Err(ImprovementError::InvalidLifecycleTransition {
                 from: self.lifecycle,
                 to: next,
