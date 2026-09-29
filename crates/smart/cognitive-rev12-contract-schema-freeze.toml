@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r9"
-revision = 9
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r8"
-supersedes_freeze_digest = "sha256:154f56c186eb2353bb907e1c15fcbc7b8d50a104cf8757022a9bd40ae4abade0"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r10"
+revision = 10
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r9"
+supersedes_freeze_digest = "sha256:6656e090f7b380567bf126dbfff3762b59e4f7bb027742685f5a9a377bad628b"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -68,6 +68,37 @@ changed = "adds the field-level contract for the eliot-cue-contracts family: 19 
 reason = "The seven cue concerns were frozen at type level only, so a downstream implementation agent received function names rather than field semantics. r9 states the field contract over the types the crate already defines, and names no new owner."
 unchanged = "every [[frozen_type]] row, every enum list, every [[denominator]] id, every [[cell_binding]] order, every [[bound]] row, proof_ceiling, implementation_support and evidence_execution_status. The r8 denominator_note correction is preserved verbatim, not re-derived."
 retired_parallel_candidate = "A candidate also numbered r8 was drafted on a branch whose merge base predated the published r8. It is superseded by this r9 and is not published under a duplicate revision identity."
+issue = "#261"
+
+# r10 is the eliot-memory-curation-contracts field-level contract, plus two
+# tables that did not exist before: the disagreement register and the downstream
+# assignment bindings. Same row shape, same reading discipline and same
+# no-derived-completeness rule as r9 above.
+#
+# The disagreement register exists because W5 requires a real Rust-versus-I-section
+# conflict to be recorded where it is found rather than resolved by editing the
+# freeze to match the code. Each [[disagreement]] row names the exact field, both
+# references, the measured fact, the proposed repair and the existing owning task.
+# None of them edits a frozen type to agree with a wrong manifest, and none of them
+# adds a type to satisfy a manifest that names something the crate does not define.
+#
+# The assignment bindings exist because a downstream agent otherwise receives a
+# contract without a caller. Each [[assignment_binding]] row names the concrete
+# input and output Rust paths, the exact definition/schema revision, the first
+# real consumer found by git grep rather than a guessed one, the owned files, the
+# prerequisite field-contract rows, the typed error and unknown behaviour, ordered
+# implementation steps, and the later positive and negative acceptance. Every
+# first_consumer in these rows is a function that exists on this base commit.
+#
+# r10 was also drafted as a candidate numbered r9 and is renumbered for the same
+# reason r9 was renumbered above. Its content is unchanged by the renumbering.
+[revision_note_r10]
+revision = 10
+supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r9"
+changed = "adds the field-level contract for the eliot-memory-curation-contracts family (13 [[field_contract]] type rows, 76 [[field_contract_field]] field rows, 6 [[completeness_rule]] rows, 1 [[denominator]] row, 1 [[version_rule]] row), the [[disagreement]] register and the [[assignment_binding]] rows"
+reason = "The curation family was frozen at type level only, and the deliverable had no disagreement register and no caller binding, so an implementation agent could neither detect a real conflict nor know who calls the contract. r10 states the field contract over types the crate already defines, records the conflicts where they are, and binds the two families that already have a first consumer."
+unchanged = "every [[frozen_type]] row, every enum list, every [[cell_binding]] order, every [[bound]] row, the r8 and r9 field contracts, proof_ceiling, implementation_support and evidence_execution_status"
+retired_parallel_candidate = "A candidate also numbered r9 was drafted on a branch whose merge base predated the published r8. It is superseded by this r10 and is not published under a duplicate revision identity."
 issue = "#261"
 
 # Historical cell numbers 69, 70, 72, 73, 75 (original #223 record) have no
@@ -2286,6 +2317,1327 @@ rule = "No candidate in this family creates canonical truth, authority, scheduli
 enforced_by = "crates/smart/eliot-cue-contracts/src/index_candidate.rs::CueSnapshotBuildCandidate::validate_published"
 independent_expected_set = "not applicable; this rule is a default prohibition, not a count"
 evidence_required = "NOT_EXECUTED; static field contract only"
+
+
+# ---------------------------------------------------------------------------
+# r9 field contract for the eliot-memory-curation-contracts family.
+#
+# Same row shape and same rules as the cue family section above, and the same
+# reading discipline: `type_rust_path` is the one defining owner, `wire_name`
+# is the spelling the current serde attributes produce, `validator` and
+# `validation_error` are `path.rs::symbol` anchors that resolve on this
+# freeze's base commit, and `bound_or_variants` names either a number the
+# owner crate itself checks or a closed enum the owner declares.
+#
+# Wire naming in this family differs from the cue family in one respect worth
+# stating: every closed enum here is `#[serde(rename_all =
+# "SCREAMING_SNAKE_CASE")]` with NO `deny_unknown_fields`, while every struct
+# is `#[serde(deny_unknown_fields)]` with no rename. So a struct field's wire
+# name equals its Rust name, an enum member's wire name is the
+# SCREAMING_SNAKE_CASE form and NOT the Rust member name, and an unknown
+# enum payload key is NOT rejected at this boundary. That is recorded here as
+# the shape it is rather than described as if it were deny-unknown-fields on
+# the enum side; VR-DENY-UNKNOWN-FIELDS continues to hold on the struct side.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+type_id = "FC-CUR-REQUEST"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+disposition = "FROZEN_EXACT"
+wire_naming = "profile.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all, so every wire_name below equals the Rust field name."
+validator = "crates/smart/eliot-memory-curation-contracts/src/profile.rs::CurationScreenRequest::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Declares no disclosure class of its own and carries no finding, no protection decision and no action. The privacy posture of everything it points at is carried by the nested source and binding owners, not widened here."
+invalidation_rule = "The request pins one exact source identity at one revision and digest. Every result revalidates against it, so a screen bound to a drifted source is a BindingMismatch and never a quiet refresh. Schema compatibility is VR-CURATION-CONTRACT-VERSION: ContractVersion 1.0.0 under CONTRACT_NAME eliot.smart.memory-curation-screen, exact match only."
+
+[[field_contract_field]]
+field_id = "FC-CUR-REQUEST.source"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+wire_name = "source"
+owner_rust_type = "SourceIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a screen with no source identity has no denominator to screen and is not representable"
+bound_or_variants = "closed by the nested owner: product, source, snapshot, query, revision, digest, scope and state fence, all validated in full"
+identity_binding = "the immutable owner source identity this screen is bound to, at one revision and one content digest"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-REQUEST.denominator"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+wire_name = "denominator"
+owner_rust_type = "FiniteDenominator"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undeclared denominator cannot be reconciled against an observed page, so it is not representable"
+bound_or_variants = "closed by the nested owner; DenominatorCoverage Complete is accepted only when total_members equals the unique declared member count"
+identity_binding = "the declared member denominator for this screen. It is the INDEPENDENT expected set every coverage claim is compared against, never a copy of the observed page."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::FiniteDenominator::validate_declared"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-REQUEST.partition"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+wire_name = "partition"
+owner_rust_type = "MemberPartition"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a screen with no target/reference partition cannot bound mixed-lineage influence"
+bound_or_variants = "changed_targets and immutable_references must be disjoint, so a member cannot be proposed for change and simultaneously held as an immutable reference"
+identity_binding = "which members a later owner may consider and which it must not touch. The two sets are the boundary that keeps mixed-lineage influence visible."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::MemberPartition::validate"
+validation_error = "ContractError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-CUR-REQUEST.binding"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+wire_name = "binding"
+owner_rust_type = "RequestBinding"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a screen with no request binding has no scope, fence or attempt to answer to. The one optional leaf is binding.task_id, whose None means the screen is not task-attached, NOT that the binding is absent."
+bound_or_variants = "request_id, operation_id, attempt_id, scope and state_fence are required; task_id is Option<TaskId> and its None means no task attachment"
+identity_binding = "the exact request, operation, attempt, scope and fence the screen runs under. task_id None is recorded as un-attached and is distinct from an attached task with a different fence."
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::RequestBinding::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-REQUEST.profile"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+wire_name = "profile"
+owner_rust_type = "ScreenProfile"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a screen with no profile has no rule, no precedence and no limits"
+bound_or_variants = "ScreenLimits bounds max_items, max_references, max_bytes, max_work_units and max_output_bytes, plus an optional deadline_ms and cancellation_grace_ms; the result is rejected when coverage or usage exceeds any of them"
+identity_binding = "the policy revision and rule set this screen runs under, including precedence; a policy revision change invalidates every finding it produced"
+validator = "crates/smart/eliot-memory-curation-contracts/src/profile.rs::ScreenProfile::validate"
+validation_error = "ContractError::Bound"
+
+[[field_contract_field]]
+field_id = "FC-CUR-REQUEST.cursor"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+wire_name = "cursor"
+owner_rust_type = "Option<CumulativeCursor>"
+requiredness = "OPTIONAL_NONE_FIRST_PAGE"
+none_meaning = "None means this is the FIRST page of the screen and there is no predecessor. A genesis request that carries a predecessor digest is rejected, and None is never a way to skip the resume checks on a later page."
+bound_or_variants = "when Some, the position, processed_member_digest, usage and predecessor are reconciled against the source member order and the previous cursor"
+identity_binding = "the exact resume position and the digest of every member processed before it; it is what makes a bounded screen resumable without trusting the caller"
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::CumulativeCursor::validate_progress"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-REQUEST.cancellation_requested"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+wire_name = "cancellation_requested"
+owner_rust_type = "bool"
+requiredness = "REQUIRED"
+none_meaning = "not optional; the field is always stated, so 'cancellation unknown' is not expressible. A true value means the caller asked to stop, and it is distinct from the screen having finished."
+bound_or_variants = "bool; the profile's optional cancellation_grace_ms governs how long a cancellation is honoured for"
+identity_binding = "the caller's cancellation intent at the time of the request"
+validator = "crates/smart/eliot-memory-curation-contracts/src/profile.rs::CurationScreenRequest::validate"
+validation_error = "ContractError::Reconciliation"
+
+# --- SourceIdentity ---------------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-SOURCE-IDENTITY"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+disposition = "FROZEN_EXACT"
+wire_naming = "identity.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Identifies the source without carrying any source content. Every evidence reference in the result is an ArtifactId handle, so a screen result can be rechecked without re-reading the store."
+invalidation_rule = "Immutable at one revision and one digest. A change to either invalidates every finding, protection assessment, eligibility row and coverage entry bound to it, and the mismatch is reported as a typed error rather than a re-read."
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.product_id"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "product_id"
+owner_rust_type = "ProductId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a source with no product identity is not attributable"
+bound_or_variants = "non-blank, no control character, through crates/smart/eliot-memory-curation-contracts/src/lib.rs::text"
+identity_binding = "which product the source belongs to; it scopes the source and is not authority over it"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+validation_error = "ContractError::Blank"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.source_id"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "source_id"
+owner_rust_type = "SourceId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unnamed source cannot be rechecked"
+bound_or_variants = "non-blank, no control character"
+identity_binding = "identity of the screening source, stable across revisions"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+validation_error = "ContractError::Blank"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.snapshot_id"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "snapshot_id"
+owner_rust_type = "SnapshotId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a source with no snapshot identity has no fixed point in time"
+bound_or_variants = "non-blank, no control character"
+identity_binding = "the immutable snapshot the revision and digest describe"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+validation_error = "ContractError::Blank"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.query"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "query"
+owner_rust_type = "QueryIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a source read with no recorded query has no way to be reproduced"
+bound_or_variants = "query_id plus a query_digest of exactly 64 lowercase hexadecimal characters"
+identity_binding = "the query whose result set became the source; a different query is a different source even at the same revision"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::QueryIdentity::validate"
+validation_error = "ContractError::InvalidDigest"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.revision"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "revision"
+owner_rust_type = "u64"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the revision is the invalidation axis and cannot be absent"
+bound_or_variants = "u64; equality only, no range and no negotiation. Every bound record revalidates against this exact value."
+identity_binding = "the immutable source revision this identity is pinned to"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.digest"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested source is rejected"
+bound_or_variants = "canonical lowercase SHA-256, validated against the recorded value and never recomputed from a caller-supplied list"
+identity_binding = "content identity of the source at that revision; this is the second half of the binding and the part that catches a same-revision content change"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::Digest::new"
+validation_error = "ContractError::InvalidDigest"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.scope"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "scope"
+owner_rust_type = "WorkScopeId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unscoped source is not admissible"
+bound_or_variants = "non-blank, no control character"
+identity_binding = "the work scope the source was read under; it must agree with the request binding's scope"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-IDENTITY.state_fence"
+type_rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+wire_name = "state_fence"
+owner_rust_type = "StateFence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unfenced source cannot be compared with any other record"
+bound_or_variants = "closed by the foundation fence owner; compatibility is decided by is_compatible_with under VR-FENCE-GATE and by nothing else"
+identity_binding = "the state fence the source was read at; every cross-record acceptance in this family is checked against it"
+validator = "crates/smart/eliot-memory-curation-contracts/src/identity.rs::SourceIdentity::validate"
+validation_error = "ContractError::BindingMismatch"
+
+# --- FiniteDenominator ------------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-DENOMINATOR"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::FiniteDenominator"
+disposition = "FROZEN_EXACT"
+wire_naming = "source.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::FiniteDenominator::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Declares member identities only, never member content. A denominator is a scope claim, not an inspection result."
+invalidation_rule = "Reconciled on every use against the observed page. A declared count below the observed page, a Complete claim whose count does not equal the unique declared member count, or a duplicate declared identity is a typed rejection, never a silent correction."
+denominator_ref = "DEN-CURATION-SCREEN"
+
+[[field_contract_field]]
+field_id = "FC-CUR-DENOMINATOR.coverage"
+type_rust_path = "eliot_memory_curation_contracts::FiniteDenominator"
+wire_name = "coverage"
+owner_rust_type = "DenominatorCoverage"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no 'unknown' member, and that is deliberate: an unscoped source is declared Partial rather than left absent"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: COMPLETE, PARTIAL. There is no Unknown member, so a source that could not be scoped must be reported through SourceAvailability instead of by weakening this field."
+identity_binding = "whether the declared scope claim is authoritative. It is SEPARATE from SourceAvailability, which states whether the source could be read at all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::FiniteDenominator::validate_declared"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-DENOMINATOR.total_members"
+type_rust_path = "eliot_memory_curation_contracts::FiniteDenominator"
+wire_name = "total_members"
+owner_rust_type = "u64"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an uncounted denominator is not representable. A count is never by itself a completeness claim."
+bound_or_variants = "must be at least the unique declared_member_ids length and at least the observed page size. COMPLETE coverage additionally requires it to EQUAL the unique declared member count, so a count can never exceed the members it declares."
+identity_binding = "the declared member count of the scope, compared against an independently declared member identity list, never against the caller's own findings list"
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::FiniteDenominator::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-DENOMINATOR.declared_member_ids"
+type_rust_path = "eliot_memory_curation_contracts::FiniteDenominator"
+wire_name = "declared_member_ids"
+owner_rust_type = "Vec<MemberId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list is a real empty scope and is distinct from a scope the owner could not enumerate, which is declared through PARTIAL coverage"
+bound_or_variants = "must be duplicate-free; a duplicate is rejected rather than deduplicated silently"
+identity_binding = "the exact declared member order when the owner can enumerate the scope. This is the INDEPENDENT expected set a completeness check compares against."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::FiniteDenominator::validate_declared"
+validation_error = "ContractError::Duplicate"
+
+# --- ScreenCoverage ---------------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-COVERAGE"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+disposition = "FROZEN_EXACT"
+wire_naming = "coverage.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::ScreenCoverage::validate_against_source"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Carries member identities, dispositions and artifact handles only. It records what was looked at and how it was disposed of, not the member content, so a coverage record is not a disclosure channel."
+invalidation_rule = "Validated against the source, never self-asserted. The member identities must be a subset of the source members, the start position must reconcile against the resume cursor, and the coverage digest is compared against the recomputed value so a hand-edited coverage row is rejected."
+
+[[field_contract_field]]
+field_id = "FC-CUR-COVERAGE.denominator"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+wire_name = "denominator"
+owner_rust_type = "FiniteDenominator"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; coverage without a denominator is a count, not accounting"
+bound_or_variants = "must equal the request's denominator; a coverage row that quietly widened the denominator is a reconciliation failure"
+identity_binding = "the scope this coverage was measured against, carried here so the coverage is self-describing"
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::ScreenCoverage::validate_against_source"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-COVERAGE.start_position"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+wire_name = "start_position"
+owner_rust_type = "u64"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a coverage row with no start position cannot be located in the source member order"
+bound_or_variants = "u64; must not exceed the source member count, and must equal the resume cursor position when a cursor is present. A Complete result requires the coverage order to equal the source member order, so a nonzero start blocks Complete."
+identity_binding = "the index in the independently declared source member order at which this page begins"
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::CumulativeCursor::validate_progress"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-COVERAGE.members"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+wire_name = "members"
+owner_rust_type = "Vec<MemberCoverage>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty member list is a real observation of zero members and is distinguished from a truncated or blocked page by the sibling frontier and disposition fields"
+bound_or_variants = "each entry carries exactly one MemberDisposition; the identity set must be a subset of the source members; the result bounds the page at the profile's max_items. A Complete result rejects any Unprocessed disposition."
+identity_binding = "the per-member accounting: one disposition per observed member, plus the finding identities it produced and whether it is eligible"
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::ScreenCoverage::validate_against_source"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-COVERAGE.frontier"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+wire_name = "frontier"
+owner_rust_type = "ScreenFrontier"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the frontier is always stated, so an unstated frontier is not expressible. complete = true with a nonempty remaining list is rejected, and a Partial result with complete = true is rejected."
+bound_or_variants = "complete is a bool and remaining is a Vec<MemberId>; the two are checked together. A ResultState Complete claim requires the frontier to be exactly complete = true with an empty remaining list."
+identity_binding = "where a bounded screen resumes, expressed as the member identities not yet processed, so the omission is a value rather than an absence"
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-COVERAGE.usage"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+wire_name = "usage"
+owner_rust_type = "WorkUsage"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; work consumption is always accounted, so an unaffordable screen cannot be presented as a cheap one"
+bound_or_variants = "processed_items, work_units, input_bytes and output_bytes; the result is rejected when any exceeds the profile's max_items, max_work_units, max_bytes or max_output_bytes. Usage must be monotonically non-decreasing across resume pages."
+identity_binding = "the accumulated resource consumption of the screen, which is a cost bound and never a quality or usefulness value"
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+validation_error = "ContractError::Bound"
+
+[[field_contract_field]]
+field_id = "FC-CUR-COVERAGE.next_cursor"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+wire_name = "next_cursor"
+owner_rust_type = "Option<CumulativeCursor>"
+requiredness = "OPTIONAL_NONE_FINAL_PAGE"
+none_meaning = "None means there is NO page after this one. A ResultState Complete claim REQUIRES next_cursor to be None, so a resumable screen can never also be reported as complete, and None is never a way to drop a resume position."
+bound_or_variants = "when Some, the position, processed_member_digest, usage, predecessor digest and every scope/fence identity are reconciled against this coverage and the source member order"
+identity_binding = "the exact resume cursor for the next page, including a digest of every member processed so far so a resumed screen cannot silently skip or reorder members"
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::CumulativeCursor::validate_progress"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-COVERAGE.digest"
+type_rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested coverage row is rejected"
+bound_or_variants = "canonical lowercase SHA-256, compared against the recomputed value over the coverage content so a hand-edited coverage row cannot pass"
+identity_binding = "content identity of this coverage record, so later tampering is detectable rather than plausible"
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+validation_error = "ContractError::Reconciliation"
+
+# --- CurationFinding --------------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-FINDING"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+disposition = "FROZEN_EXACT"
+wire_naming = "finding.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate_against_profile"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Evidence is a set of ArtifactId handles, so a finding states that evidence exists without restating it. The crate is read-only and holds no mutable state, so a finding cannot be applied by anything in this crate."
+invalidation_rule = "A finding is structural evidence about one member under one profile rule. It is invalidated explicitly through invalidated_by rather than by deletion, and a finding whose source identity or profile does not match the screen is rejected. A finding applies no lifecycle change."
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.finding_id"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "finding_id"
+owner_rust_type = "FindingId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an anonymous finding cannot be cited by an eligibility row"
+bound_or_variants = "non-blank, no control character; unique within the result, and unique on the invalidated_by chain"
+identity_binding = "identity of this evidence record, not of anything it asserts"
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::validate_findings"
+validation_error = "ContractError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.source"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "source"
+owner_rust_type = "SourceIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a finding with no source binding cannot be rechecked against a snapshot"
+bound_or_variants = "must equal the screen's source identity exactly, including revision and digest"
+identity_binding = "the exact source the finding was observed in; a finding from a different source revision is rejected rather than carried forward"
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.profile_id"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "profile_id"
+owner_rust_type = "ProfileId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a finding with no profile cannot be checked against a rule"
+bound_or_variants = "must equal the request's profile id, and the rule_id must belong to that profile"
+identity_binding = "the screening policy this finding was produced under; a policy revision change invalidates it"
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate_against_profile"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.member_id"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "member_id"
+owner_rust_type = "MemberId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a finding about no member is not a finding"
+bound_or_variants = "must be a member of the source, and must be within the coverage members for the page that produced it"
+identity_binding = "the exact member this evidence is about; multiple findings may name one member and one finding may never name two"
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.rule_id"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "rule_id"
+owner_rust_type = "RuleId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a finding with no rule is an unstructured opinion and is not representable"
+bound_or_variants = "must be one of the profile's declared RuleSpec identifiers, and the finding class must equal that rule's finding_class"
+identity_binding = "which declared rule fired, so the finding is reproducible from the profile rather than trusted"
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate_against_profile"
+validation_error = "ContractError::Unsupported"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.class"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "class"
+owner_rust_type = "FindingClass"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no unclassified member, and UNPROCESSED is an explicit member rather than the absence of a class"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: DUPLICATE, STALE_SUPERSEDED, MALFORMED_INCOMPLETE, PROVENANCE_GAP, PROTECTION_GAP, CONFLICT_AMBIGUITY, BOUNDED_OUT, UNPROCESSED. It must equal the declared rule's finding_class."
+identity_binding = "what kind of structural problem was found. It is a classification, not a severity, a score or a permission."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate_against_profile"
+validation_error = "ContractError::Unsupported"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.evidence"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "evidence"
+owner_rust_type = "BTreeSet<ArtifactId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty set means the rule fired with no artifact behind it, which is a weaker claim and is not the same as a finding with evidence. It is not a way to omit required evidence silently, because the class and rule still have to reconcile."
+bound_or_variants = "set semantics, so duplicates are impossible by construction; entries are artifact handles and carry no content"
+identity_binding = "the artifacts the finding rests on. Existence of an evidence handle is not support for the conclusion and not permission to act."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.invariant"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "invariant"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a finding with no stated invariant is not expressible"
+bound_or_variants = "non-blank, no control character, through crates/smart/eliot-memory-curation-contracts/src/lib.rs::text"
+identity_binding = "the named invariant this finding says was not met; it names a property, it does not assert that the property is unimportant"
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate"
+validation_error = "ContractError::Blank"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.proof"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "proof"
+owner_rust_type = "FindingProof"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unproven finding is not representable, and UNKNOWN is an explicit member so an unproven finding can never read as a deterministic one"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: DETERMINISTIC, OBSERVED, UNKNOWN. This is the field that keeps an observed fact distinct from a computed conclusion."
+identity_binding = "how the finding was established. DETERMINISTIC and OBSERVED are different evidence strengths and neither is a score of confidence."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.invalidated_by"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "invalidated_by"
+owner_rust_type = "Option<FindingId>"
+requiredness = "OPTIONAL_NONE_STILL_STANDING"
+none_meaning = "None means this finding still stands at the source revision it was made at. It is NOT a statement that the finding is confirmed, correct or actionable, and it is never a reason to treat the member as clean."
+bound_or_variants = "when Some, it must name another finding in the same result and must not create a cycle; an identity may not be reused with changed content"
+identity_binding = "the explicit supersession chain. Invalidation is recorded as a value so a withdrawn finding stays visible instead of vanishing."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::validate_findings"
+validation_error = "ContractError::ChangedIdentity"
+
+[[field_contract_field]]
+field_id = "FC-CUR-FINDING.digest"
+type_rust_path = "eliot_memory_curation_contracts::CurationFinding"
+wire_name = "digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested finding is rejected"
+bound_or_variants = "canonical lowercase SHA-256, compared against the recomputed value; reusing a finding identity with different content is rejected as ChangedIdentity"
+identity_binding = "content identity of the finding, so a later edit under the same identity is detectable"
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate"
+validation_error = "ContractError::InvalidDigest"
+
+# --- ProtectionAssessment ---------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-PROTECTION"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+disposition = "FROZEN_EXACT"
+wire_naming = "protection.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "DisclosureCeiling is declared on the nested ProtectionEvidence and bounds what may leave the boundary, so a protection record can reduce what is disclosed but can never raise it. The assessment itself carries artifact handles only."
+invalidation_rule = "Protection is assessed independently of the finding that flagged a member, so a withdrawn finding does not silently unprotect a member. The decision is fail-closed: an evidence item that is not CurrentVerified, or whose outcome is Unknown, forces decision Unknown rather than Unprotected."
+
+[[field_contract_field]]
+field_id = "FC-CUR-PROTECTION.source"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+wire_name = "source"
+owner_rust_type = "SourceIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a protection assessment with no source cannot be rechecked"
+bound_or_variants = "must equal the screen's source identity exactly, and is passed into every nested evidence validation"
+identity_binding = "the exact source the protection evidence was observed in"
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-PROTECTION.member_id"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+wire_name = "member_id"
+owner_rust_type = "MemberId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an assessment of no member is not representable"
+bound_or_variants = "must equal the member_id of every nested evidence item; a mismatch is rejected rather than reassigned"
+identity_binding = "the exact member this protection decision is about; one assessment per member, duplicates rejected at the result level"
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-PROTECTION.applicable_rule_ids"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+wire_name = "applicable_rule_ids"
+owner_rust_type = "BTreeSet<RuleId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty set means no protection rule applies, which is a positive statement and is distinct from not having looked"
+bound_or_variants = "at most 32 entries, checked by the owner; set semantics so duplicates are impossible"
+identity_binding = "which declared rules contributed protection classes to this decision"
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Bound"
+
+[[field_contract_field]]
+field_id = "FC-CUR-PROTECTION.required"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+wire_name = "required"
+owner_rust_type = "BTreeSet<ProtectionClass>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty set means no class is required for this member. It is NOT the same as an empty evidence list, which is a weaker claim."
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: CURRENT_TRUTH, MINORITY_DISSENT, COUNTEREXAMPLE, UNRESOLVED_CONFLICT, NEGATIVE_MEMORY, AUDIT_HISTORY, RETENTION_ERASURE, PROTECTED_DEPENDENCY. Unprotected is accepted only when this set is non-empty and every required class has a CurrentVerified Absent evidence item."
+identity_binding = "which protection classes must be affirmatively cleared before the member can be called Unprotected. A missing protection record therefore reads Unknown, not Unprotected."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-PROTECTION.evidence"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+wire_name = "evidence"
+owner_rust_type = "Vec<ProtectionEvidence>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an EMPTY list forces decision Unknown and is explicitly not Unprotected, because the fail-closed rule requires at least one evidence item before an Unprotected decision can be reached"
+bound_or_variants = "evidence_id values must be unique within the assessment; each item carries a class, a state, an outcome, a DisclosureCeiling and a state fence"
+identity_binding = "the protection evidence actually observed, each item independently fence-bound and independently recheckable"
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-CUR-PROTECTION.decision"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+wire_name = "decision"
+owner_rust_type = "ProtectionDecision"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no 'not assessed' member, so an unassessable member is UNKNOWN and never UNPROTECTED"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: UNPROTECTED, PROTECTED, UNKNOWN. UNPROTECTED is accepted only with non-empty evidence, no Present outcome, no uncertain item and every required class affirmatively cleared; any evidence item that is not CurrentVerified, or whose outcome is Unknown, forces UNKNOWN."
+identity_binding = "the fail-closed protection verdict. A Protected member stays protected regardless of any other verdict on any other axis."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Reconciliation"
+
+# --- Eligibility ------------------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-ELIGIBILITY"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::Eligibility"
+disposition = "FROZEN_EXACT"
+wire_naming = "eligibility.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs::Eligibility::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Carries the protection decision and finding identities it was derived from and nothing else, so an eligibility row cannot smuggle content or an undisclosed artifact past the protection boundary."
+invalidation_rule = "Derived, not asserted: the finding identities must resolve inside the supplied finding set, and the status must agree with the protection decision. Eligibility is not authority and never names a lifecycle action; a withdrawn finding removes the member from eligibility on the next screen rather than leaving a stale eligible row."
+
+[[field_contract_field]]
+field_id = "FC-CUR-ELIGIBILITY.source"
+type_rust_path = "eliot_memory_curation_contracts::Eligibility"
+wire_name = "source"
+owner_rust_type = "SourceIdentity"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an eligibility row with no source cannot be rechecked"
+bound_or_variants = "must equal the screen's source identity exactly"
+identity_binding = "the exact source this eligibility was decided over"
+validator = "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs::Eligibility::validate"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-ELIGIBILITY.member_id"
+type_rust_path = "eliot_memory_curation_contracts::Eligibility"
+wire_name = "member_id"
+owner_rust_type = "MemberId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an eligibility row about no member is not representable"
+bound_or_variants = "must be a member of the source; duplicates within the result are rejected"
+identity_binding = "the exact member this row is about; one row per member"
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+validation_error = "ContractError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-CUR-ELIGIBILITY.protection"
+type_rust_path = "eliot_memory_curation_contracts::Eligibility"
+wire_name = "protection"
+owner_rust_type = "ProtectionDecision"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no 'protection not assessed' member, so an unassessed member is UNKNOWN here exactly as it is on the assessment"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: UNPROTECTED, PROTECTED, UNKNOWN. ELIGIBLE_FOR_SEMANTIC_CURATION is rejected unless protection is exactly UNPROTECTED, and PROTECTED or UNKNOWN can never pair with it. The field is duplicated here on purpose so the eligibility row is self-contained."
+identity_binding = "the protection decision carried forward, so eligibility can never be read without its protection basis"
+validator = "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs::Eligibility::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-ELIGIBILITY.finding_ids"
+type_rust_path = "eliot_memory_curation_contracts::Eligibility"
+wire_name = "finding_ids"
+owner_rust_type = "BTreeSet<FindingId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty set means no finding bore on this member, which is a positive statement about the screen and is not a claim that the member is clean"
+bound_or_variants = "at most 256 entries, checked by the owner; every identity must resolve inside the supplied finding set"
+identity_binding = "the exact findings this eligibility was derived from, so the decision is recheckable rather than asserted"
+validator = "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs::Eligibility::validate"
+validation_error = "ContractError::Bound"
+
+[[field_contract_field]]
+field_id = "FC-CUR-ELIGIBILITY.status"
+type_rust_path = "eliot_memory_curation_contracts::Eligibility"
+wire_name = "status"
+owner_rust_type = "EligibilityStatus"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the closed set has no default. An inconclusive screen yields INCOMPLETE_TRUNCATED, UNKNOWN_BLOCKED or STALE_UNAVAILABLE, and none of them may be read as ELIGIBLE_FOR_SEMANTIC_CURATION."
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: ELIGIBLE_FOR_SEMANTIC_CURATION, PROTECTED, MALFORMED, STALE_UNAVAILABLE, OUTSIDE_SCOPE, INCOMPLETE_TRUNCATED, UNKNOWN_BLOCKED. The first is admissible only with protection UNPROTECTED."
+identity_binding = "a neutral handoff status for a later semantic curation owner. It is NOT authority, NOT scheduling, NOT a lifecycle action and NOT a self-promotion, and it names no external effect."
+validator = "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs::Eligibility::validate"
+validation_error = "ContractError::Reconciliation"
+
+# --- MemberSets -------------------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-MEMBER-SETS"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::MemberSets"
+disposition = "FROZEN_EXACT"
+wire_naming = "result.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::MemberSets::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Member identities only. The sets describe what a LATER owner may consider, and this crate proposes nothing: it has no allowed effects and no owned mutable state."
+invalidation_rule = "Must equal the request's partition exactly, in both directions. A result that widened or narrowed the requested partition is a reconciliation failure, so mixed-lineage influence cannot be smuggled in through the result after being excluded in the request."
+
+[[field_contract_field]]
+field_id = "FC-CUR-MEMBER-SETS.changed_targets"
+type_rust_path = "eliot_memory_curation_contracts::MemberSets"
+wire_name = "changed_targets"
+owner_rust_type = "BTreeSet<MemberId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty set means nothing was proposed for change, which is a real result and not an omission"
+bound_or_variants = "set semantics; must be disjoint from immutable_references and must equal the request partition's changed_targets"
+identity_binding = "the members a later owner MAY consider for semantic change. Membership in this set is a proposal surface, not permission and not authority."
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::MemberSets::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-MEMBER-SETS.immutable_references"
+type_rust_path = "eliot_memory_curation_contracts::MemberSets"
+wire_name = "immutable_references"
+owner_rust_type = "BTreeSet<MemberId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty set means no member was held as an immutable reference, which is a positive statement and not a claim that nothing needed holding"
+bound_or_variants = "set semantics; must be disjoint from changed_targets and must equal the request partition's immutable_references"
+identity_binding = "the members held as immutable references. A member cannot be proposed for change and simultaneously held as an immutable reference, which is how mixed-lineage influence stays bounded and visible."
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::MemberSets::validate"
+validation_error = "ContractError::Reconciliation"
+
+# --- CurationScreenResult ---------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-RESULT"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+disposition = "FROZEN_EXACT"
+wire_naming = "result.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Read-only. This crate declares allowed_effects = [] and owned_mutable_state = [], so a result states evidence and never applies it. The result grants no authority over the members it names."
+invalidation_rule = "The result digest is compared against the recomputed value over its own content, and every nested collection is revalidated against the request and the source rather than trusted. A source revision change, a profile change or a fence change invalidates the whole result."
+denominator_ref = "DEN-CURATION-SCREEN"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.request"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "request"
+owner_rust_type = "CurationScreenRequest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a result that names no request cannot be checked against the scope, profile and limits it was produced under"
+bound_or_variants = "closed by the nested owner; the request is the bound the result is validated against, not a copy of it"
+identity_binding = "the exact request, including its binding, partition, profile and limits; the result's member sets must equal the request's partition"
+validator = "crates/smart/eliot-memory-curation-contracts/src/profile.rs::CurationScreenRequest::validate_snapshot"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.source"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "source"
+owner_rust_type = "SourceSnapshot"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a result with no source snapshot has no observed members to reconcile coverage against"
+bound_or_variants = "identity, denominator, partition, availability, members and page; the request is validated against it and the coverage against its members"
+identity_binding = "the immutable owner source snapshot the screen read, at one revision and one digest"
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::SourceSnapshot::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.findings"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "findings"
+owner_rust_type = "Vec<CurationFinding>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means no rule fired, which is a real observation and is not the same as not having screened"
+bound_or_variants = "every finding must bind to the source identity, the request profile and a member of the source; finding identities are unique and the invalidation chain must be acyclic"
+identity_binding = "the structural evidence found. A finding states evidence and applies nothing: it creates no canonical truth, no authority, no scheduling, no external effect and no self-promotion."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::validate_findings"
+validation_error = "ContractError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.protection"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "protection"
+owner_rust_type = "Vec<ProtectionAssessment>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means no member was assessed for protection, which is weaker than assessing and finding nothing, and the eligibility rows that would otherwise be eligible are then blocked by the Unknown protection rule"
+bound_or_variants = "one assessment per member; duplicates within the result are rejected"
+identity_binding = "the independent protection verdict per member. A Protected member stays protected regardless of any other verdict on any other axis."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.eligibility"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "eligibility"
+owner_rust_type = "Vec<Eligibility>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means no member was declared eligible, which is a bounded result and not an incomplete one on its own"
+bound_or_variants = "one row per member; duplicates within the result are rejected and each row's finding identities must resolve inside this result's findings"
+identity_binding = "the neutral per-member handoff status. Eligibility is not authority and never names a lifecycle action."
+validator = "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs::Eligibility::validate"
+validation_error = "ContractError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.coverage"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "coverage"
+owner_rust_type = "ScreenCoverage"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a result with no coverage row cannot state any completeness and is not representable"
+bound_or_variants = "validated against the source: member identities must be a subset of the source members, and coverage and usage must be inside the request profile's limits"
+identity_binding = "the per-member accounting, the frontier and the resume cursor. This is the field that decides whether `state` may be Complete."
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::ScreenCoverage::validate_against_source"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.member_sets"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "member_sets"
+owner_rust_type = "MemberSets"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a result with no target/reference boundary is not representable"
+bound_or_variants = "must equal the request's partition exactly, and the two sets must be disjoint"
+identity_binding = "the target/reference boundary handed to the later owner. It is a proposal surface and confers no authority."
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::MemberSets::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.state"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "state"
+owner_rust_type = "ResultState"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the closed set has no unclassified member. There is NO default that yields COMPLETE: an incomplete, truncated, blocked or unprocessed screen yields PARTIAL, BLOCKED or UNKNOWN, and none of them can be read as COMPLETE."
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: COMPLETE, PARTIAL, BLOCKED, UNKNOWN. COMPLETE is accepted only when the source denominator is complete, the frontier is complete with an empty remaining list, the coverage member order equals the source member order, no member is UNPROCESSED, and next_cursor is None. PARTIAL with a complete frontier is rejected."
+identity_binding = "the only field in this family that can carry a completeness claim, and each of the four members carries the conditions that make it checkable"
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-RESULT.result_digest"
+type_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+wire_name = "result_digest"
+owner_rust_type = "Digest"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an undigested result is rejected"
+bound_or_variants = "canonical lowercase SHA-256, compared against the value recomputed over the result's own content by the owner crate's contract_digest. The digest is validated against the ORIGINAL recorded value on the way in and recomputed once by the owner on the way out; this file never recomputes it."
+identity_binding = "content identity of the whole result, so a hand-edited finding, coverage row or member set cannot pass unnoticed"
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+validation_error = "ContractError::Reconciliation"
+
+# --- closed vocabularies ----------------------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-VOCABULARIES"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::CurationDimension"
+disposition = "FROZEN_EXACT"
+wire_naming = "Every closed enum in this family is #[serde(rename_all = \"SCREAMING_SNAKE_CASE\")] with no tag and no deny_unknown_fields, so the wire spelling of a unit member is its SCREAMING_SNAKE_CASE form and the Rust member name is NOT the wire spelling."
+validator = "crates/smart/eliot-memory-curation-contracts/src/dimensions.rs::CurationDimension"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "None of these vocabularies carries provenance, evidence, a disclosure class, a score or a severity. They are closed sets, so there is no field in which a judgment could hide and no free-form string through which a decision could be smuggled."
+invalidation_rule = "Adding or removing a member changes the crate's CONTRACT_VERSION triple, and a record written against a different triple is rejected by VR-CURATION-CONTRACT-VERSION exact match rather than being interpreted under the current shape. Legacy action and lifecycle fields are rejected on the current schema, not mapped onto a current field."
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.CurationDimension"
+type_rust_path = "eliot_memory_curation_contracts::CurationDimension"
+wire_name = "dimension"
+owner_rust_type = "CurationDimension"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has exactly five members and the owner exposes them as CurationDimension::ALL, so an undimensioned verdict is not expressible"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: EXISTENCE, SUPPORT, LIFECYCLE, ACCESSIBILITY, PERMITTED_INFLUENCE. The five are separate verdicts on separate axes and none implies another."
+identity_binding = "which axis a verdict is on. Existence, support, accessibility and permitted influence stay DISTINCT here: a CLEAR outcome on one axis never stands in for UNKNOWN on another, and PERMITTED_INFLUENCE is never implied by ACCESSIBILITY."
+validator = "crates/smart/eliot-memory-curation-contracts/src/dimensions.rs::MemberDimensions::validate"
+validation_error = "ContractError::Unsupported"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.DimensionOutcome"
+type_rust_path = "eliot_memory_curation_contracts::DimensionOutcome"
+wire_name = "outcome"
+owner_rust_type = "DimensionOutcome"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no default and no unclassified member, so an unevaluated axis must be UNKNOWN"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: CLEAR, FLAGGED, PROTECTED, UNKNOWN, REFERENCE"
+identity_binding = "the verdict on that one axis. It is a classification of what was observed, not a score, a rank or a permission, and it grants no influence over the member."
+validator = "crates/smart/eliot-memory-curation-contracts/src/dimensions.rs::DimensionVerdict::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.MemberDisposition"
+type_rust_path = "eliot_memory_curation_contracts::MemberDisposition"
+wire_name = "disposition"
+owner_rust_type = "MemberDisposition"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; UNPROCESSED is an explicit member, so an unprocessed member is a recorded value rather than a missing row"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: ELIGIBLE, PROTECTED, BLOCKED, PRESERVED_REFERENCE, UNPROCESSED. A COMPLETE result rejects any UNPROCESSED member."
+identity_binding = "what the screen did with one observed member. It is a screening outcome, not a lifecycle transition and not an applied action."
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::MemberCoverage::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.ResultState"
+type_rust_path = "eliot_memory_curation_contracts::ResultState"
+wire_name = "state"
+owner_rust_type = "ResultState"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the closed set has no unclassified member. UNKNOWN and BLOCKED are explicit members, so an inconclusive screen is a recorded value and can never be reported as COMPLETE by default."
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: COMPLETE, PARTIAL, BLOCKED, UNKNOWN. COMPLETE carries the five conjunction conditions named on FC-CUR-RESULT.state."
+identity_binding = "the completeness posture of the whole screen, and the only field family that can carry a Complete claim in this crate"
+validator = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.ProtectionClass"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionClass"
+wire_name = "required"
+owner_rust_type = "ProtectionClass"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no 'no protection concept' member, so a member with no protection requirement is expressed by an absent class in the required set and affirmatively cleared evidence, not by a null class"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: CURRENT_TRUTH, MINORITY_DISSENT, COUNTEREXAMPLE, UNRESOLVED_CONFLICT, NEGATIVE_MEMORY, AUDIT_HISTORY, RETENTION_ERASURE, PROTECTED_DEPENDENCY"
+identity_binding = "which protective role a member plays. A protected role constrains what a later owner may consider and never expands it."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.ProtectionEvidenceState"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionEvidenceState"
+wire_name = "state"
+owner_rust_type = "ProtectionEvidenceState"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; MISSING, STALE, MALFORMED, UNAVAILABLE and UNKNOWN are all explicit members, so a missing protection record is MISSING and forces decision UNKNOWN rather than reading as UNPROTECTED"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: CURRENT_VERIFIED, STALE, MISSING, MALFORMED, UNAVAILABLE, UNKNOWN. Any member other than CURRENT_VERIFIED forces the assessment decision to UNKNOWN."
+identity_binding = "the freshness and shape of one protection evidence item, kept separate from its outcome so an absent record is never silently read as an absent protection."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.ProtectionOutcome"
+type_rust_path = "eliot_memory_curation_contracts::ProtectionOutcome"
+wire_name = "outcome"
+owner_rust_type = "ProtectionOutcome"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; ABSENT and UNKNOWN are explicit members, so 'we looked and it is not there' is distinct from 'we could not tell' and both are distinct from MISSING evidence"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: PRESENT, ABSENT, UNKNOWN. Only CURRENT_VERIFIED ABSENT clears a required class; UNKNOWN forces the decision to UNKNOWN."
+identity_binding = "what one verified protection evidence item says about its class. Existence of the evidence is not the protection, and its absence is not its refutation."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.DisclosureCeiling"
+type_rust_path = "eliot_memory_curation_contracts::DisclosureCeiling"
+wire_name = "disclosure_ceiling"
+owner_rust_type = "DisclosureCeiling"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unbounded disclosure ceiling is not representable, so a protection record cannot be written with an implicit 'share freely' default"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: STRUCTURAL, REFERENCE_ONLY, REDACTED. It is an upper bound on what may leave the boundary, never a lower bound and never a request to disclose."
+identity_binding = "how much of the protected material may leave this boundary. It can only reduce disclosure relative to the record itself and can never raise it."
+validator = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionEvidence::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.EligibilityStatus"
+type_rust_path = "eliot_memory_curation_contracts::EligibilityStatus"
+wire_name = "status"
+owner_rust_type = "EligibilityStatus"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the closed set has no default; an inconclusive outcome is INCOMPLETE_TRUNCATED or UNKNOWN_BLOCKED and is never absent"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: ELIGIBLE_FOR_SEMANTIC_CURATION, PROTECTED, MALFORMED, STALE_UNAVAILABLE, OUTSIDE_SCOPE, INCOMPLETE_TRUNCATED, UNKNOWN_BLOCKED"
+identity_binding = "a neutral handoff status. It is not authority, not scheduling, not an applied lifecycle change and not a self-promotion, and it names no external effect."
+validator = "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs::Eligibility::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.DenominatorCoverage"
+type_rust_path = "eliot_memory_curation_contracts::DenominatorCoverage"
+wire_name = "coverage"
+owner_rust_type = "DenominatorCoverage"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the set has no Unknown member by design, so a source that could not be scoped is declared PARTIAL and the read failure is reported separately through SourceAvailability"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: COMPLETE, PARTIAL. COMPLETE is accepted only when total_members equals the unique declared member count."
+identity_binding = "whether the declared scope claim is authoritative, kept SEPARATE from whether the source could be read at all"
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::FiniteDenominator::validate_declared"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.SourceAvailability"
+type_rust_path = "eliot_memory_curation_contracts::SourceAvailability"
+wire_name = "availability"
+owner_rust_type = "SourceAvailability"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the closed set has no unclassified member; UNKNOWN is an explicit member, so an unreadable source is never reported as an empty one"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: AVAILABLE, PARTIAL, UNAVAILABLE, BLOCKED, STALE, MALFORMED, UNKNOWN"
+identity_binding = "whether the source could be read at all. It is INDEPENDENT of DenominatorCoverage, so an unavailable source with a complete declared scope is still not screenable evidence."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::SourceSnapshot::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.FindingClass"
+type_rust_path = "eliot_memory_curation_contracts::FindingClass"
+wire_name = "class"
+owner_rust_type = "FindingClass"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; the closed set has no unclassified member, and UNPROCESSED is an explicit member rather than the absence of a class"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: DUPLICATE, STALE_SUPERSEDED, MALFORMED_INCOMPLETE, PROVENANCE_GAP, PROTECTION_GAP, CONFLICT_AMBIGUITY, BOUNDED_OUT, UNPROCESSED. It must equal the declared rule's finding_class."
+identity_binding = "what kind of structural problem was found. It is a classification with no severity, no score and no permission attached."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate_against_profile"
+validation_error = "ContractError::Unsupported"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.FindingProof"
+type_rust_path = "eliot_memory_curation_contracts::FindingProof"
+wire_name = "proof"
+owner_rust_type = "FindingProof"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; UNKNOWN is an explicit member, so an unproven finding is a recorded value and can never be presented as a deterministic one"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: DETERMINISTIC, OBSERVED, UNKNOWN"
+identity_binding = "how the finding was established. It is an evidence-strength label, not a confidence score, and it never promotes a finding to a fact."
+validator = "crates/smart/eliot-memory-curation-contracts/src/finding.rs::CurationFinding::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-VOCABULARIES.SourceMemberKind"
+type_rust_path = "eliot_memory_curation_contracts::SourceMemberKind"
+wire_name = "kind"
+owner_rust_type = "SourceMemberKind"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a member of unstated kind is not representable"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: OBSERVATION, CLAIM, EXPERIENCE, RELATION"
+identity_binding = "what sort of owner artifact the member is. It classifies the member and selects no semantic curation action."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::SourceMember::validate"
+validation_error = "ContractError::Unsupported"
+
+# --- referenced-not-frozen owner types -------------------------------------
+[[field_contract]]
+type_id = "FC-CUR-SOURCE-SNAPSHOT"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::SourceSnapshot"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["FC-CUR-RESULT.source"]
+reference_gap = "The r7 [[frozen_type]] list freezes SourceIdentity, FiniteDenominator and MemberSets separately but does not freeze the snapshot record that carries them plus the members, the page and the availability. A consumer reading only the [[frozen_type]] list has no wire contract for the record the result actually embeds. Recorded, not invented."
+wire_naming = "source.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::SourceSnapshot::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Members are carried with an evidence HANDLE SET and a content digest, never with member bodies, so a screen result can be published without re-disclosing the material it screened."
+invalidation_rule = "Validated against the declared denominator and the declared partition. A source whose member count, declared identities or partition disagree is rejected, and every finding, protection and eligibility row bound to a superseded identity is invalidated rather than carried forward."
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-SNAPSHOT.availability"
+type_rust_path = "eliot_memory_curation_contracts::SourceSnapshot"
+wire_name = "availability"
+owner_rust_type = "SourceAvailability"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists and the closed set has no unclassified member, so an unreadable source is a recorded value rather than an empty snapshot"
+bound_or_variants = "wire members, SCREAMING_SNAKE_CASE: AVAILABLE, PARTIAL, UNAVAILABLE, BLOCKED, STALE, MALFORMED, UNKNOWN. It is checked independently of DenominatorCoverage."
+identity_binding = "whether the source could be read at all, as opposed to how completely its scope was declared. A COMPLETE denominator over an UNAVAILABLE source is still not screenable evidence."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::SourceSnapshot::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-SNAPSHOT.members"
+type_rust_path = "eliot_memory_curation_contracts::SourceSnapshot"
+wire_name = "members"
+owner_rust_type = "Vec<SourceMember>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty member list is a real empty scope and is distinct from an unreadable source, which is what `availability` states"
+bound_or_variants = "each member carries a kind, a revision, a content digest and an evidence handle set; the member identities must reconcile against the declared denominator and the page"
+identity_binding = "the observed members in declared order. This list is the INDEPENDENT expected set that coverage order, cursor position and the Complete claim are all compared against."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::SourceSnapshot::validate"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract_field]]
+field_id = "FC-CUR-SOURCE-SNAPSHOT.page"
+type_rust_path = "eliot_memory_curation_contracts::SourceSnapshot"
+wire_name = "page"
+owner_rust_type = "SourcePage"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; page_number 0 with has_more true is rejected and has_more false with a nonempty frontier is rejected, so a page always states where it sits and whether more exists"
+bound_or_variants = "page_number is a u64, has_more is a bool and frontier is a Vec<MemberId>; the cursor reconciliation checks the page member list against the source member slice at start_position"
+identity_binding = "the bounded read position: which page this is, whether more exists, and which members are still outstanding. It is what makes a bounded screen resumable."
+validator = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::CumulativeCursor::validate_progress"
+validation_error = "ContractError::Reconciliation"
+
+[[field_contract]]
+type_id = "FC-CUR-MEMBER-EVIDENCE"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::MemberEvidenceRefs"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["FC-CUR-SOURCE-SNAPSHOT.members"]
+reference_gap = "The r7 [[frozen_type]] list reaches this owner as a nested field of SourceMember and does not freeze it. Recorded, not invented."
+wire_naming = "source.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/source.rs::SourceMember::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Five SEPARATE handle sets, one per evidence role. Keeping them apart is what stops a protection reference from being read as provenance or an audit reference from being read as owner status; merging them would let one role's evidence stand in for another's."
+invalidation_rule = "Handles only, so nothing here is invalidated by content change; the owning member's content digest is the invalidation axis for all five sets at once."
+field_shape_note = "provenance, owner_status, protection, conflict and audit are five BTreeSet<ArtifactId> fields, each required, each non-optional and each a set so duplicates are impossible by construction. An empty set in any one of them is a positive statement that no artifact fills that role."
+
+[[field_contract]]
+type_id = "FC-CUR-LEGACY-DESCRIPTOR"
+crate = "eliot-memory-curation-contracts"
+type_rust_path = "eliot_memory_curation_contracts::LegacyMigrationDescriptor"
+disposition = "REFERENCED_NOT_FROZEN"
+referenced_by = ["VR-CURATION-CONTRACT-VERSION"]
+reference_gap = "The r7 [[frozen_type]] list does not mention legacy.rs at all, even though the crate re-exports the type and the version rule for this family depends on what happens to retired wire. Recorded, not invented."
+wire_naming = "legacy.rs declares the struct with #[serde(deny_unknown_fields)] and no rename_all."
+validator = "crates/smart/eliot-memory-curation-contracts/src/legacy.rs::LegacyMigrationDescriptor::validate"
+error_family = "crates/smart/eliot-memory-curation-contracts/src/error.rs::ContractError"
+provenance_privacy = "Explicitly INERT. It names a retired source version, the fields intentionally lost, the current target owner and the issue that owns a future decoder. It decodes nothing, applies nothing and carries no retired payload, so a legacy field can never be reintroduced through it."
+invalidation_rule = "descriptor_version must equal LEGACY_DESCRIPTOR_VERSION v1 by exact string equality, and migration_issue must be nonzero so a lost field always has a named owner. A descriptor at a different version is rejected as Unsupported rather than interpreted, and the named migration issue is what owns any future decoder."
+
+[[field_contract_field]]
+field_id = "FC-CUR-LEGACY-DESCRIPTOR.lost_fields"
+type_rust_path = "eliot_memory_curation_contracts::LegacyMigrationDescriptor"
+wire_name = "lost_fields"
+owner_rust_type = "Vec<String>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "not optional; an empty list means the migration lost nothing, which is a positive claim and is checked against the descriptor's own digest"
+bound_or_variants = "every entry must be non-blank and control-character-free, checked element by element; migration_issue must be nonzero whenever the list is nonempty, so a lost field always has a named owner"
+identity_binding = "the exact retired field names that did not survive the migration, so a loss is a recorded value and never a silent omission"
+validator = "crates/smart/eliot-memory-curation-contracts/src/legacy.rs::LegacyMigrationDescriptor::validate"
+validation_error = "ContractError::Blank"
+
+# --- completeness accounting ----------------------------------------------
+[[completeness_rule]]
+id = "CR-CUR-SCREEN-COMPLETE"
+family = "eliot-memory-curation-contracts"
+applies_to = ["FC-CUR-RESULT.state", "FC-CUR-RESULT.coverage", "FC-CUR-RESULT.source"]
+rule = "ResultState Complete is accepted only when five conditions hold together: the source denominator is complete, the frontier is complete with an empty remaining list, the coverage member order equals the source member order, no member carries the Unprocessed disposition, and next_cursor is None. Any one of them failing yields Partial, Blocked or Unknown, so incomplete, truncated, blocked or unprocessed evidence cannot become Complete by default. A Partial result carrying a complete frontier is separately rejected."
+enforced_by = "crates/smart/eliot-memory-curation-contracts/src/result.rs::CurationScreenResult::validate"
+independent_expected_set = "the SourceSnapshot's own member list and the request's FiniteDenominator, both declared by the source owner and compared against the result. The result's coverage list is the thing under test and is never used as its own expected set."
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUR-DENOMINATOR-RECONCILE"
+family = "eliot-memory-curation-contracts"
+applies_to = ["FC-CUR-DENOMINATOR.total_members", "FC-CUR-DENOMINATOR.declared_member_ids", "FC-CUR-SOURCE-SNAPSHOT.members"]
+rule = "The declared count must be at least the unique declared member identity count and at least the observed page size. Complete coverage additionally requires the count to EQUAL the unique declared member count, so a count can never exceed the members it declares and a bare count is never a completeness claim. Duplicate declared identities are rejected rather than deduplicated."
+enforced_by = "crates/smart/eliot-memory-curation-contracts/src/source.rs::FiniteDenominator::validate"
+independent_expected_set = "the owner-declared member identity list, compared against the total; the total is never compared against a list the caller derived from its own findings"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUR-COVERAGE-SUBSET"
+family = "eliot-memory-curation-contracts"
+applies_to = ["FC-CUR-RESULT.coverage.members", "FC-CUR-RESULT.coverage.next_cursor", "FC-CUR-RESULT.findings"]
+rule = "Every member the coverage names, every member a finding or protection row names, and every member an eligibility row names must be a member of the source. A resume cursor additionally reconciles its position, its processed-member digest, its usage counters and its predecessor digest against the source member order, so a bounded screen cannot skip, reorder or double-count a member across pages."
+enforced_by = "crates/smart/eliot-memory-curation-contracts/src/coverage.rs::CumulativeCursor::validate_progress"
+independent_expected_set = "the SourceSnapshot member order declared by the source owner; the coverage order is what is checked and is never its own reference"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUR-UNKNOWN-NOT-COMPLETE"
+family = "eliot-memory-curation-contracts"
+applies_to = ["FC-CUR-RESULT.state", "FC-CUR-PROTECTION.decision", "FC-CUR-ELIGIBILITY.status", "FC-CUR-FINDING.proof", "FC-CUR-SOURCE-SNAPSHOT.availability"]
+rule = "Unknown and incomplete evidence cannot become Complete or Eligible by default anywhere in this family, and each uncertainty is a NAMED value rather than an absence: SourceAvailability carries UNKNOWN and UNAVAILABLE; ProtectionEvidenceState carries STALE, MISSING, MALFORMED, UNAVAILABLE and UNKNOWN, any of which forces the decision to UNKNOWN; ProtectionDecision carries UNKNOWN; EligibilityStatus carries UNKNOWN_BLOCKED and INCOMPLETE_TRUNCATED; FindingProof carries UNKNOWN; MemberDisposition carries UNPROCESSED; and ResultState carries BLOCKED and UNKNOWN. None of them has a default that reads as the affirmative."
+enforced_by = "crates/smart/eliot-memory-curation-contracts/src/protection.rs::ProtectionAssessment::validate"
+independent_expected_set = "not applicable; this rule is a default prohibition, not a count"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUR-AXES-STAY-DISTINCT"
+family = "eliot-memory-curation-contracts"
+applies_to = ["FC-CUR-VOCABULARIES.CurationDimension", "FC-CUR-VOCABULARIES.DimensionOutcome"]
+rule = "Existence, support, lifecycle, accessibility and permitted influence are five separate axes with one DimensionOutcome each. A Clear outcome on one axis never stands in for an Unknown on another, and in particular an ACCESSIBILITY verdict is never read as a PERMITTED_INFLUENCE verdict. The five members are declared as CurationDimension::ALL by the owner, so the expected axis set comes from the owner and is not restated here."
+enforced_by = "crates/smart/eliot-memory-curation-contracts/src/dimensions.rs::MemberDimensions::validate"
+independent_expected_set = "CurationDimension::ALL as declared by the owner crate, compared against the verdicts actually present"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-CUR-NO-APPLIED-AUTHORITY"
+family = "eliot-memory-curation-contracts"
+applies_to = ["FC-CUR-ELIGIBILITY.status", "FC-CUR-RESULT.member_sets", "FC-CUR-RESULT.protection", "FC-CUR-FINDING.invalidated_by"]
+rule = "Nothing in this family applies a lifecycle change, creates canonical truth, grants authority, schedules work, produces an external effect, finishes a task or promotes itself. A finding states evidence, an eligibility row is a neutral handoff status, a protection assessment is a verdict that can only remove a member from consideration, and a member set is a proposal surface. The crate declares allowed_effects = [] and owned_mutable_state = [], so this is a structural property of the crate and not only a field rule."
+enforced_by = "crates/smart/eliot-memory-curation-contracts/module.toml"
+independent_expected_set = "not applicable; this rule is a default prohibition, not a count"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+
+# ---------------------------------------------------------------------------
+# r9 disagreement register (W5) and downstream assignment bindings (W4).
+#
+# The disagreement rows are the "report it, do not invent it" half of W5. Each
+# names the exact field, both conflicting references, the proposed repair, and
+# the EXISTING owning task, and each leaves the freeze's own rows alone so an
+# incorrect Rust or manifest row is never ratified by editing the freeze.
+# ---------------------------------------------------------------------------
+
+[[disagreement]]
+id = "DIS-CUR-PROTECTION-REASON"
+family = "eliot-memory-curation-contracts"
+disposition = "REPORTED_NOT_INVENTED"
+field = "crates/smart/eliot-memory-curation-contracts/module.toml outputs"
+code_reference = "crates/smart/eliot-memory-curation-contracts/module.toml::outputs names ProtectionReason"
+measured_fact = "ProtectionReason appears ZERO times anywhere under crates/smart/eliot-memory-curation-contracts/src. It is defined as a struct at crates/smart/eliot-dreamer-accessibility/src/lib.rs::ProtectionReason and re-declared in crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml as eliot-dreamer-accessibility:crates/smart/eliot-dreamer-accessibility/src/lib.rs:ProtectionReason. So the curation manifest names an output its own crate does not define."
+document_reference = "docs/architecture/I12-21-memory-ecology-residual-experience-and-transfer.md states the Dreamer curation boundary and that Dreamer may propose candidate bindings while Governor/Task owner validates them; it does not assign a ProtectionReason output to the screening contract crate."
+freeze_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[upstream_crate]].role already records this disagreement in prose for the curation family and correctly declines to freeze ProtectionReason as an output of this family."
+proposed_repair = "In crates/smart/eliot-memory-curation-contracts/module.toml, replace the ProtectionReason entry in outputs with the names this crate actually defines and re-exports: ProtectionAssessment and ProtectionEvidence. Do NOT add a ProtectionReason type to the curation crate and do NOT import the dreamer-accessibility one: the freeze records the read-only screening vocabulary as owner-neutral, and a screen result that carried a dreamer accessibility type would pull a Dreamer-owned concept across an owner boundary."
+owning_task = "the cognitive-wave-01 integrator declared at crates/smart/eliot-memory-curation-contracts/module.toml::integration_owner, over the crate whose module.toml [agent_task] names agent_order = 19 and write_scope crates/smart/eliot-memory-curation-contracts/**"
+rust_change_needed = false
+why_no_rust_change = "The Rust is correct and the manifest row is wrong. Adding a type to satisfy a wrong manifest would create a duplicate owner, which I5.15 forbids."
+status = "OPEN_OWNED"
+
+[[disagreement]]
+id = "DIS-CUR-OUTPUT-SET"
+family = "eliot-memory-curation-contracts"
+disposition = "REPORTED_NOT_INVENTED"
+field = "outputs agreement between crates/smart/eliot-memory-curation-contracts/module.toml and the curation [[frozen_type]] rows"
+code_reference = "crates/smart/eliot-memory-curation-contracts/module.toml::outputs names exactly five strings: CurationScreenRequest, CurationScreenResult, CurationFinding, ProtectionReason, ScreenCoverage"
+measured_fact = "The freeze's curation [[frozen_type]] rows name nine exact rust_paths. SourceIdentity, FiniteDenominator, ProtectionAssessment, Eligibility and MemberSets are frozen types that the manifest's outputs row never names, and ProtectionReason is named by the manifest but defined nowhere in the crate. So the two artifacts disagree in BOTH directions: five frozen types are unnamed and one named type does not exist here."
+document_reference = "docs/architecture/I05-15-canonical-contract-catalogue.md is the single-catalogue authority; the manifest and the freeze are both projections of it, so neither may be the sole record of this crate's output set."
+freeze_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[cell_binding]] order 19 frozen_outputs names CurationScreenRequest, CurationScreenResult, CurationFinding, ScreenCoverage and FiniteDenominator, which already disagrees with the manifest's five names."
+proposed_repair = "Reconcile once, under the I5.15 single catalogue, in the same manifest edit that resolves DIS-CUR-PROTECTION-REASON: set outputs to the exact set this crate defines and the freeze freezes, and set the cell_binding frozen_outputs to the same list. The fix belongs in the manifest and the cell_binding row together, never in one alone."
+owning_task = "the cognitive-wave-01 integrator declared at crates/smart/eliot-memory-curation-contracts/module.toml::integration_owner, together with the freeze owner who owns the order-19 cell_binding row"
+rust_change_needed = false
+why_no_rust_change = "Both sides describe the same Rust correctly; only the projections disagree."
+status = "OPEN_OWNED"
+
+[[disagreement]]
+id = "DIS-CUE-OUTPUT-SET"
+family = "eliot-cue-contracts"
+disposition = "REPORTED_NOT_INVENTED"
+field = "outputs agreement between crates/smart/eliot-cue-contracts/module.toml and the cue [[frozen_type]] rows"
+code_reference = "crates/smart/eliot-cue-contracts/module.toml::outputs names four grouped strings, being \"ObservedCue/NormalizedCue\", \"CueBindingCandidate\" and \"CueSnapshot/Activation contracts\""
+measured_fact = "The grouped strings are not exact type names, so the manifest cannot be read as a wire contract. The freeze names eleven exact cue rust_paths, and the r8 field contract additionally names seven owner types the r7 [[frozen_type]] list reaches only as nested fields: SourceHandle, CueContext, NormalizationProfile, AdmittedCueBindingProjection, RebuildIdentity, SnapshotMember and RelationEdge, each carried with disposition = REFERENCED_NOT_FROZEN. The manifest names none of those seven, and its primary_responsibility additionally claims \"invalidation schemas\" while the freeze carries no row for SnapshotInvalidation, RetrievalLineage or RedactedDiagnostic."
+document_reference = "docs/architecture/I12-06-cue-binding.md, I12-07-cue-index.md and I12-15-bounded-spreading-activation.md require observed source, canonical identity, comparison key, admitted binding, snapshot membership, direct match and relation-derived activation to stay seven distinct things, which is what the freeze rows now record and what the grouped manifest strings cannot."
+freeze_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[field_contract]] FC-CUE-PROFILE.reference_gap and the seven REFERENCED_NOT_FROZEN dispositions in the cue section"
+proposed_repair = "Do not edit the freeze. The bounded repair is on the manifest side: replace the grouped output strings with the exact exported type names, and either add the invalidation, lineage and diagnostic owners to the freeze as their own rows or record them as the same REFERENCED_NOT_FROZEN disposition the r8 section already uses. Whichever is chosen, the manifest and the freeze must end up naming the same set."
+owning_task = "the cognitive-wave integrator declared at crates/smart/eliot-cue-contracts/module.toml::integration_owner, over the crate whose module.toml names agent_order = 10"
+rust_change_needed = false
+why_no_rust_change = "The Rust already exports every named type. The disagreement is between two projections of it, and the freeze half is now recorded rather than absent."
+status = "OPEN_OWNED"
+
+[[disagreement]]
+id = "DIS-CELL-NUMBER-TOPOLOGY"
+family = "cross-wave"
+disposition = "REPORTED_NOT_INVENTED"
+field = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[cell_number_note].historical_numbers"
+code_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[cell_number_note] records historical_numbers 69, 70, 72, 73 and 75 with disposition = REPORTED_NOT_INVENTED"
+measured_fact = "Those five numbers have no referent in the current topology, which the same note states is cognitive-crate-decisions.toml orders 1-43 plus cognitive-wave-09.toml orders 76-86. The r8 additions bind orders 10 and 19, both inside 1-43, so the gap is unchanged by this work unit."
+document_reference = "docs/architecture/I05-22-schema-and-migration-rules.md requires an exact referent for a binding identifier rather than a nearest match, which is why no mapping was invented."
+proposed_repair = "Either the historical #223 record is retired explicitly with its successor named, or the five numbers are reissued as current orders by the topology owner. Until one of those happens the freeze binds only current orders and the historical numbers stay unresolved on purpose."
+owning_task = "the cognitive-wave integrator that owns cognitive-crate-decisions.toml and cognitive-wave-09.toml, named as integration_owner = \"cognitive-wave-integrator\" at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner"
+rust_change_needed = false
+why_no_rust_change = "No Rust record names these numbers; the disagreement is between the historical planning record and the current topology."
+status = "OPEN_OWNED"
+
+# ---------------------------------------------------------------------------
+# r9 downstream assignment bindings (W4).
+#
+# Each row answers the seven things the item names: the concrete input and
+# output Rust path, the exact definition/schema revision, the FIRST real
+# consumer, the owned files, the prerequisite contract, the error and unknown
+# behavior, and the later positive and negative acceptance. Every consumer
+# anchor is a real `path.rs::symbol` in this repository, measured on the freeze
+# base commit, not a proposed name.
+# ---------------------------------------------------------------------------
+
+[[assignment_binding]]
+id = "AB-CUE-NORMALIZER"
+order = 10
+crate = "eliot-cue-contracts"
+consumer_crate = "eliot-cue-normalizer"
+functional_cell = "smart.cue.contracts"
+input_rust_path = "eliot_cue_contracts::ObservedCue"
+output_rust_path = "eliot_cue_contracts::NormalizedCue"
+definition_revision = "CONTRACT_REVISION 2.0.0 by exact string equality through eliot_cue_contracts::is_supported_schema_revision; the equality is on the record's own schema_revision field, not on the crate constant alone"
+first_consumer = "crates/smart/eliot-cue-normalizer/src/lib.rs::normalize_cue"
+owned_files = ["crates/smart/eliot-cue-contracts/src/normalization.rs", "crates/smart/eliot-cue-contracts/src/observation.rs", "crates/smart/eliot-cue-contracts/src/identity.rs", "crates/smart/eliot-cue-contracts/src/context.rs", "crates/smart/eliot-cue-contracts/src/error.rs"]
+prerequisite_contract = "eliot-cue-contracts FC-CUE-OBSERVED, FC-CUE-CONTEXT, FC-CUE-SOURCE-HANDLE, FC-CUE-NORMALIZED, FC-CUE-CANONICAL, FC-CUE-COMPARISON-KEY, FC-CUE-PROFILE and FC-CUE-VOCABULARIES in crates/smart/cognitive-rev12-contract-schema-freeze.toml, plus VR-CUE-SCHEMA-REVISION"
+error_behavior = "Every rejection is a CueContractError variant, never a formatted string and never a collapsed code: a retired schema_revision is InvalidText, a blank or oversized observed value is InvalidText or BoundExceeded, a malformed nested identity is Foundation, a duplicated comparison key identity is DuplicateIdentity, and a canonical that disagrees with its outcome or its observed kind is Foundation. UNKNOWN has no representation here: an unclassifiable normalization is NormalizationOutcome::Unsupported with a reason and a None canonical, and a many-to-one mapping is Ambiguous with its rivals preserved rather than resolved."
+implementation_steps = "1. Construct ObservedCue from the caller's source material and validate it. 2. Load the NormalizationProfile and validate it; the profile_revision is the invalidation axis. 3. Produce the canonical identity and its comparison keys under that profile, or record Lossless, AuthorizedLoss, Ambiguous or Unsupported. 4. Call NormalizedCue::validate, which enforces the outcome-to-canonical coupling, the MAX_COMPARISON_KEYS 8 and MAX_TRANSFORMATION_STEPS 16 bounds, key uniqueness and match-mode admissibility. 5. Return the record; do not build a snapshot, admit a binding or schedule anything."
+acceptance_positive = "a lossless normalization under one profile yields a NormalizedCue whose canonical kind equals the observed kind and whose every comparison key carries an equal profile; a round trip of that record through the wire is byte-stable"
+acceptance_negative = "a record written against a retired schema_revision is rejected at decode rather than reinterpreted; a canonical present with outcome Ambiguous, and a canonical absent with outcome Lossless, are both rejected; a ninth comparison key is rejected as BoundExceeded; a key whose match_mode is inadmissible for the canonical kind is rejected; an oversized observed value is rejected as BoundExceeded and not truncated"
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
+
+[[assignment_binding]]
+id = "AB-CUE-BINDING"
+order = 10
+crate = "eliot-cue-contracts"
+consumer_crate = "eliot-cue-binding"
+functional_cell = "smart.cue.contracts"
+input_rust_path = "eliot_cue_contracts::NormalizedCue"
+output_rust_path = "eliot_cue_contracts::CueBindingCandidate"
+definition_revision = "CONTRACT_REVISION 2.0.0 equality; a candidate is a proposal at whatever the current revision is and never at a negotiated one"
+first_consumer = "crates/smart/eliot-cue-binding/src/derive.rs::derive_cue_binding_candidates"
+owned_files = ["crates/smart/eliot-cue-contracts/src/binding.rs", "crates/smart/eliot-cue-contracts/src/index_projection.rs", "crates/smart/eliot-cue-contracts/src/error.rs"]
+prerequisite_contract = "FC-CUE-BINDING-CANDIDATE, FC-CUE-ADMITTED-BINDING, FC-CUE-CANONICAL and FC-CUE-VOCABLARIES in the cue section of the freeze, plus the separation invariant in crates/smart/eliot-cue-contracts/src/lib.rs that observed source, canonical identity, comparison key, admitted binding, snapshot membership, direct match and relation-derived activation are seven distinct types"
+error_behavior = "A candidate is a proposal and admits nothing. A malformed nested canonical identity is Foundation, a blank or oversized target is InvalidText, a malformed digest is InvalidText, and a caller-supplied BindingDisposition of Withheld or Rejected never becomes a member. Admission is carried only by AdmittedCueBindingProjection, whose admission receipt pins candidate_id and candidate_digest; a candidate whose digest changed after admission is rejected rather than silently re-admitted."
+implementation_steps = "1. Derive candidate pairs from the observed material and the normalized identity. 2. Set role to Names, Touched or ExpectedReuse, where ExpectedReuse is a caller expectation and not evidence of reuse. 3. Set freshness from the evidence, keeping it distinct from existence, support and permitted influence. 4. Set a disposition and compute the candidate digest. 5. Call CueBindingCandidate::validate. 6. Stop. Admission belongs to the external Governor and is recorded as an AdmittedCueBindingProjection, never asserted by the derivation step."
+acceptance_positive = "a derived candidate validates, and an AdmittedCueBindingProjection whose receipt matches the candidate digest and whose task, scope and fence match the request is accepted as a snapshot member"
+acceptance_negative = "a candidate with disposition Admitted but no admission receipt is never a member; a candidate whose digest changed after admission is rejected; a target carrying control characters is rejected as InvalidText; a duplicate candidate identity in one result is rejected as DuplicateIdentity"
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
+
+[[assignment_binding]]
+id = "AB-CUE-INDEX"
+order = 10
+crate = "eliot-cue-contracts"
+consumer_crate = "eliot-cue-index"
+functional_cell = "smart.cue.contracts"
+input_rust_path = "eliot_cue_contracts::AdmittedCueBindingProjection"
+output_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+definition_revision = "INDEX_CONTRACT_REVISION 1.0.0 by exact string equality, a SEPARATE revision axis from the cue vocabulary's CONTRACT_REVISION 2.0.0. A payload written against the vocabulary revision is not a valid index envelope and vice versa."
+first_consumer = "crates/smart/eliot-cue-index/src/build.rs::build_cue_snapshot_closed"
+owned_files = ["crates/smart/eliot-cue-contracts/src/index_candidate.rs", "crates/smart/eliot-cue-contracts/src/version.rs", "crates/smart/eliot-cue-contracts/src/snapshot.rs", "crates/smart/eliot-cue-contracts/src/relation.rs"]
+prerequisite_contract = "FC-CUE-INDEX-CANDIDATE, FC-CUE-SNAPSHOT, FC-CUE-SNAPSHOT-CLOSURE, FC-CUE-REBUILD-IDENTITY, FC-CUE-SNAPSHOT-MEMBER, FC-CUE-RELATION-EDGE and DEN-CUE-SNAPSHOT-CLOSURE in the freeze, plus CR-CUE-CLOSURE-ACCOUNTING and CR-CUE-CANDIDATE-NO-PROMOTION"
+error_behavior = "A snapshot that is not self-closing is SnapshotNotRebuildable rather than an open record presented as closed. A denominator whose expected rows or edges do not reconcile against the observed members and the NAMED omissions is a typed failure; counts alone never establish closure. A source revision that is zero, or that disagrees with the closure, the rebuild source handles or the edge revision markers, is SnapshotNotRebuildable. A digest shape violation is InvalidText or Foundation. validate_published additionally requires proof_ceiling exactly CandidateArtifact."
+implementation_steps = "1. Take only admitted bindings; never admit one here. 2. Build the self-closing snapshot with its CueSnapshotClosure, naming every omitted row and edge as a CueProjectionOmission. 3. Reconcile the declared denominator against the observed members and the named omissions, and bound the fanout. 4. Set scope_id, the INDEX_CONTRACT_REVISION schema_revision and proof_ceiling CandidateArtifact. 5. Compute build_digest and call CueSnapshotBuildCandidate::validate, then validate_published. 6. Stop. The built index is a candidate artifact; publishing it is a separate governed step."
+acceptance_positive = "a build over admitted bindings with a reconciling closure validates and is publishable as a CandidateArtifact; a rebuild from the same rebuild inputs reproduces the same snapshot"
+acceptance_negative = "a candidate asserting a proof ceiling above CandidateArtifact is rejected; a closure whose expected_rows do not equal observed rows plus named omissions is rejected; an edge endpoint that resolves to no snapshot member is rejected; a relation edge whose provenance revision marker does not match the snapshot source_revision is rejected; a mix of zero retained edges and exact-key matching still produces direct activations, per CR-CUE-DIRECT-INDEPENDENCE"
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
+
+[[assignment_binding]]
+id = "AB-CUE-ACTIVATION"
+order = 10
+crate = "eliot-cue-contracts"
+consumer_crate = "eliot-cue-activation"
+functional_cell = "smart.cue.contracts"
+input_rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+output_rust_path = "eliot_cue_contracts::ActivationResult"
+definition_revision = "CONTRACT_REVISION 2.0.0 equality on the result and the request; the snapshot and profile revisions the result echoes come from the validated inputs"
+first_consumer = "crates/smart/eliot-cue-activation/src/evaluate.rs::evaluate_activation"
+owned_files = ["crates/smart/eliot-cue-contracts/src/activation.rs", "crates/smart/eliot-cue-contracts/src/error.rs", "crates/smart/eliot-cue-contracts/src/version.rs"]
+prerequisite_contract = "FC-CUE-ACTIVATION-RESULT, FC-CUE-ACTIVATION-DIRECT, FC-CUE-ACTIVATION-DERIVED, FC-CUE-SNAPSHOT, FC-CUE-RELATION-EDGE and FC-CUE-VOCABULARIES in the freeze, plus CR-CUE-DIRECT-INDEPENDENCE, CR-CUE-COMPLETE-NO-FRONTIER and VR-FENCE-GATE"
+error_behavior = "A derived activation with an empty, broken or non-seeding path is BrokenActivationPath, so relation spreading can never be the sole source of an activation. A result that claims Complete while naming a frontier is CompleteWithFrontier. A truncated result that does not name the bound it hit is TruncationWithoutBound. Bound breaches are BoundExceeded with the declared limit. A snapshot older than the request fence yields Completeness::Stale rather than a quiet read."
+implementation_steps = "1. Validate the request and the snapshot. 2. Fire exact keys first and collect the direct set; do not defer it behind the derived set. 3. Bound the traversal with ActivationBounds and MAX_RELATION_EDGES, and collect the derived set separately. 4. Decide Completeness: Complete only with an empty frontier, otherwise the exact member that describes what happened, including Stale, SourceUnavailable, NoDirectMatch, Blocked, Unknown or Partial. 5. Record the trace, bounded by MAX_TRACE_STEPS. 6. Call validate_against and validate_completeness. 7. Stop. The result is a report; it schedules nothing and finishes nothing."
+acceptance_positive = "a search over a snapshot with zero retained relation edges still produces direct activations for exact keys, and a derived activation always names its direct seed and a contiguous path"
+acceptance_negative = "Complete paired with a nonempty frontier is rejected; a truncated result with no bound_hit is rejected; a derived activation whose direct_seed is not in the result's direct set is rejected; a 257th direct activation is rejected as BoundExceeded; a result whose snapshot id or profile disagrees with the request is rejected"
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
+
+[[assignment_binding]]
+id = "AB-CUR-SCREEN"
+order = 19
+crate = "eliot-memory-curation-contracts"
+consumer_crate = "eliot-memory-curation-screen"
+functional_cell = "smart.memory.curation_contracts"
+input_rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+output_rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+definition_revision = "eliot_contracts::ContractVersion 1.0.0 under CONTRACT_NAME eliot.smart.memory-curation-screen, exact match only, with ScreenProfile.schema_revision matched exactly; legacy action and lifecycle fields are rejected on the current schema and never mapped onto a current field"
+first_consumer = "crates/smart/eliot-memory-curation-screen/src/screen.rs::screen_memory_curation"
+owned_files = ["crates/smart/eliot-memory-curation-contracts/src/profile.rs", "crates/smart/eliot-memory-curation-contracts/src/source.rs", "crates/smart/eliot-memory-curation-contracts/src/coverage.rs", "crates/smart/eliot-memory-curation-contracts/src/finding.rs", "crates/smart/eliot-memory-curation-contracts/src/protection.rs", "crates/smart/eliot-memory-curation-contracts/src/eligibility.rs", "crates/smart/eliot-memory-curation-contracts/src/result.rs", "crates/smart/eliot-memory-curation-contracts/src/dimensions.rs", "crates/smart/eliot-memory-curation-contracts/src/error.rs"]
+prerequisite_contract = "FC-CUR-REQUEST, FC-CUR-SOURCE-IDENTITY, FC-CUR-DENOMINATOR, FC-CUR-COVERAGE, FC-CUR-FINDING, FC-CUR-PROTECTION, FC-CUR-ELIGIBILITY, FC-CUR-MEMBER-SETS, FC-CUR-RESULT, FC-CUR-SOURCE-SNAPSHOT and FC-CUR-VOCABULARIES in the freeze, plus DEN-CURATION-SCREEN, VR-CURATION-CONTRACT-VERSION, CR-CUR-SCREEN-COMPLETE, CR-CUR-DENOMINATOR-RECONCILE, CR-CUR-COVERAGE-SUBSET and CR-CUR-UNKNOWN-NOT-COMPLETE"
+error_behavior = "Every rejection is a ContractError variant, never a formatted string and never a code collapsed between layers: Blank, ControlCharacter, Zero, Bound, Duplicate, BindingMismatch, ChangedIdentity, Unsupported, InvalidDigest, Reconciliation or Canonicalization. Uncertainty is a named value rather than an absence: SourceAvailability::Unknown, ProtectionEvidenceState::Missing or Stale forcing ProtectionDecision::Unknown, EligibilityStatus::UnknownBlocked or IncompleteTruncated, FindingProof::Unknown, MemberDisposition::Unprocessed, and ResultState::Blocked or Unknown. None of them has a default that reads as the affirmative."
+implementation_steps = "1. Validate the request against the source snapshot. 2. Screen within the profile limits, recording per-member disposition, frontier, usage and resume cursor as you go. 3. Assess protection independently of any finding, and fail closed: absent, stale, malformed or unknown evidence yields Unknown, never Unprotected. 4. Derive eligibility from the protection decision and the finding identities. 5. Set ResultState honestly: Complete only when all five named conditions hold together. 6. Recompute result_digest and call CurationScreenResult::validate. 7. Stop. The screen applies no lifecycle change, grants no authority and produces no external effect."
+acceptance_positive = "a screen whose coverage member order equals the source member order, whose frontier is complete and empty, whose source denominator is complete, which has no Unprocessed member and no next cursor is accepted as Complete; a Protected member is reported Protected whatever the other axes say"
+acceptance_negative = "Complete with any one of those five conditions failing is rejected as Reconciliation; a Partial result carrying a complete frontier is rejected; a declared count larger than the unique declared member count is rejected; a coverage member that is not a source member is rejected; an eligibility row claiming ELIGIBLE_FOR_SEMANTIC_CURATION while protection is Protected or Unknown is rejected twice over; an empty protection evidence list yielding Unprotected is rejected; a result_digest that does not match the recomputed value is rejected"
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
 
 
 [[version_rule]]
