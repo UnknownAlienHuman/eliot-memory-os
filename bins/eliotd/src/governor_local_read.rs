@@ -24,6 +24,20 @@
 //! Query is fully live (`Verification` + `GetEvidencePack`); projection
 //! inputs stay port-shape fail-closed `Unavailable` until MGR04 (#19)
 //! activates the storage operation.
+//!
+//! # `eliot.query` Context reconstruction (#2857)
+//!
+//! [`crate::context_reconstruction_route`] is the daemon's production edge for
+//! the one admitted request that names Context reconstruction: an `eliot.query`
+//! whose explicit intent mode is `context_reconstruction`. The Kernel admits
+//! exactly that intent to this poller
+//! (`host_request_route::local_read_selectors_from_tool` accepts any
+//! non-blank, control-free mode other than `current_position`), and the
+//! `subject:` selector of that pair is the one exact, Kernel-validated
+//! selector it carries. The route lives in its own module because it binds a
+//! different identity closure than a single bounded evidence read; this module
+//! keeps the query-only `GetEvidencePack` twin and the campaign packet lane
+//! where they are, and neither of them may reinterpret a reconstruction.
 
 use std::sync::Arc;
 
