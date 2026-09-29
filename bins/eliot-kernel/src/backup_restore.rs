@@ -807,9 +807,23 @@ impl KernelBackupRestore {
     /// The same `ors` handle is also the purge phase's owner route: it applies
     /// the archive's purge ledger through
     /// [`RedbRecoveryStore::apply_purge_ledger_entry`], so the purge-ledger
-    /// revision this restore reports is issued by the one owner that writes it
-    /// (I5.13:44, A13.7) rather than recomputed here, and the ledger is
+    /// revisions the purge phase consumes are the ones the one owner that
+    /// writes them issued, and those owner-issued revisions are bound into
+    /// this phase's evidence digest rather than recomputed here. The ledger is
     /// applied before any import.
+    ///
+    /// Precisely, and to avoid a claim this module cannot support: the
+    /// published evidence field
+    /// `provenance.purge_ledger_revision` is set from
+    /// `bundle.manifest.purge_ledger_revision` — the ARCHIVE's own declared
+    /// revision, not the value the owner returned during the purge phase — and
+    /// `eliot_backup` REQUIRES that published field to equal the archive's
+    /// declared revision. The owner-issued revisions and that published field
+    /// are therefore NOT cross-checked against each other anywhere: they are
+    /// two independent numbers, one routed through the owner into the staged
+    /// phase evidence digest, one copied from the archive manifest. This
+    /// comment does not assert they are equal, and no code here compares them;
+    /// adding that comparison is a separate change, not this one.
     pub fn restore_with_ors_journal(
         &self,
         ors: &std::sync::Arc<RedbRecoveryStore>,
@@ -890,9 +904,19 @@ impl KernelBackupRestore {
     /// [`BackupError::RestoreCapabilityUnsupported`] naming
     /// `owners::PURGE_LEDGER_OWNER` — see
     /// [`KernelRestoreTarget::apply_purge_ledger`] — instead of staging a
-    /// ledger whose revision no owner ever issued. Production composition runs
-    /// [`restore_with_ors_journal`](Self::restore_with_ors_journal), which
-    /// always supplies that owner.
+    /// ledger whose revision no owner ever issued.
+    ///
+    /// The owner route DOES exist: [`restore_with_ors_journal`](Self::restore_with_ors_journal)
+    /// supplies the composition-owned ORS handle, and
+    /// `KernelComposition::backup_restore_with_ors_journal` is the intended
+    /// production caller of it. That composition entry is recorded in
+    /// `lib.rs` as having NO caller in this repository, so the owner route is
+    /// not yet live at runtime and this entry's refusal is not currently
+    /// reachable from production. Stated rather than papered over: #963/#2569
+    /// own the front-door connection, and a guard or refusal that is only
+    /// unreachable by accident is not a guard — the purge phase's own
+    /// rehearsal and absent-owner refusals are enforced at the phase, not
+    /// here, precisely so that wiring the entry does not change them.
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
@@ -1517,11 +1541,12 @@ struct KernelRestoreTarget<'a> {
     /// skip and never a locally allocated revision.
     ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     /// Revisions the purge phase actually consumed from the ORS purge-ledger
-    /// owner, in ledger order, retained even when a later step of the same
-    /// phase fails: the owner has already committed them, so a refusal after
-    /// the application still knows exactly which revisions this execution
-    /// spent. [`KernelRestoreTarget::apply_purge_ledger`] projects them into
-    /// the staged phase evidence.
+    /// owner, in ledger order. Observable on the SUCCESS path only:
+    /// [`KernelRestoreTarget::apply_purge_ledger`] projects them into the
+    /// staged phase evidence, and that staging is what the phase receipt
+    /// digests. If a later step of the same phase fails, the target is dropped
+    /// with this field — no reader observes it on that path, and this comment
+    /// does not claim one does.
     applied_purge_revisions: Vec<AppliedPurgeRevision>,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
@@ -1603,10 +1628,57 @@ impl<'a> KernelRestoreTarget<'a> {
     /// An archive whose purge ledger is empty has nothing to apply, so the
     /// absence changes nothing that could have been applied: that case applies
     /// no entry, reports no revision, and is not a skip of an application.
+    ///
+    /// ## Rehearsal refusal rule
+    ///
+    /// An archive that carries at least one purge entry, executed as a
+    /// rehearsal, REFUSES here with the SAME
+    /// [`BackupError::RestoreCapabilityUnsupported`] naming
+    /// `owners::PURGE_LEDGER_OWNER` that the absent-owner branch above uses.
+    /// It is not a second refusal style: one typed error, one named
+    /// capability, checked before any owner call.
+    ///
+    /// WHY, stated plainly: this phase calls
+    /// [`RedbRecoveryStore::apply_purge_ledger_entry`] on the live `p07_ors`
+    /// store, and that owner is the only writer of the purge-ledger revision.
+    /// Every other phase of the restore body writes solely into the isolated
+    /// destination, so this is the one place where a rehearsal could mutate
+    /// PRODUCTION AUTHORITY. A rehearsal that applied the archive's ledger
+    /// would commit irreversible live mutations while reporting itself to its
+    /// caller as a rehearsal — the exact posture the module contract forbids
+    /// ("rehearsal never activates, retires, cuts over, or unblocks effects")
+    /// and the one
+    /// [`KernelBackupRestore::qualify_cutover`] refuses on the durable pinned
+    /// flag. The two positions are independent, so both are enforced: this
+    /// one on the write, `qualify_cutover` on the later cutover.
+    ///
+    /// The guard is deliberately placed in `apply_purge_entries` rather than
+    /// only in [`KernelBackupRestore::restore_with_ors_journal`], because
+    /// `restore_with_owner` only RELAXES journal admission for a rehearsal
+    /// (it admits fixture-flagged journals for mapping proof) and does not
+    /// refuse one, so an entry-level guard there would leave the phase open.
+    /// Placing it here holds for every future route into the phase, not just
+    /// today's one — a guard that is unreachable only by accident is not a
+    /// guard.
+    ///
+    /// An archive whose purge ledger is EMPTY still succeeds under a
+    /// rehearsal, unchanged and byte-for-byte: there is nothing that could
+    /// have been written, so the empty-ledger path applies no entry, reports
+    /// no revision, and is not a skip of an application.
     fn apply_purge_entries(
         &self,
         entries: &[PurgeLedgerEntry],
     ) -> Result<Vec<AppliedPurgeRevision>, BackupError> {
+        // A rehearsal reaches the LIVE owner: this is the only phase in the
+        // restore body that writes to the live `p07_ors` store, every other
+        // phase writes solely into the isolated destination. Refuse before
+        // any owner call, using the same typed refusal the absent-owner
+        // branch below uses, so there is no second refusal style.
+        if self.rehearsal && !entries.is_empty() {
+            return Err(BackupError::RestoreCapabilityUnsupported {
+                capability: owners::PURGE_LEDGER_OWNER,
+            });
+        }
         let Some(ors) = self.ors.as_ref() else {
             if entries.is_empty() {
                 return Ok(Vec::new());
