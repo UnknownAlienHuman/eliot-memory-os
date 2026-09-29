@@ -799,8 +799,10 @@ pub enum EventPortOutcome {
     BestEffortDropped { reason_ref: String },
 }
 
-/// Explicit event acknowledgement projection. It carries no persistence or
-/// canonical-application authority.
+/// Exact event owner phase and disposition returned to the bridge. It carries
+/// no persistence or canonical-application authority; rejected, conflicting,
+/// and unknown outcomes remain negative Core results with this acknowledgement
+/// attached instead of being flattened into a generic disposition error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventForwardAck {
     stream_id: String,
@@ -5094,6 +5096,20 @@ impl AgentBridgeCore {
             .collect()
     }
 
+    fn outstanding_delivery_for(
+        &self,
+        replay_key: &EventIdentityKey,
+    ) -> Option<OutstandingDeliveryView> {
+        let pending = self.pending_deliveries.get(replay_key)?;
+        Some(OutstandingDeliveryView {
+            stream_id: pending.event.stream_id.clone(),
+            event_id: pending.event.event_id.clone(),
+            sequence: pending.event.sequence,
+            highest_phase: pending.highest_phase,
+            required_phase: pending.required_phase,
+        })
+    }
+
     /// Admits one validated host event into the transport journal.
     ///
     /// The route fingerprint passes through untouched, the raw and
@@ -5342,7 +5358,16 @@ impl AgentBridgeCore {
             return Err(BridgeError::AckIdentityMismatch);
         }
         if ack.disposition == EventDisposition::Conflict {
-            return Err(BridgeError::InvalidEventDisposition(ack.disposition));
+            return Err(BridgeError::OwnerEventConflict {
+                acknowledgement: ack,
+                continuation: self.outstanding_delivery_for(&replay_key),
+            });
+        }
+        if ack.disposition == EventDisposition::Rejected || ack.phase == AckPhase::Rejected {
+            return Err(BridgeError::OwnerEventRejected {
+                acknowledgement: ack,
+                continuation: self.outstanding_delivery_for(&replay_key),
+            });
         }
         let previous_phase = self
             .pending_deliveries
@@ -5356,6 +5381,21 @@ impl AgentBridgeCore {
                 "owner acknowledgement regressed from {previous_phase:?} to {:?}",
                 ack.phase
             )));
+        }
+
+        if ack.phase == AckPhase::Unknown {
+            self.pending_deliveries.insert(
+                replay_key.clone(),
+                PendingDelivery {
+                    event: event.clone(),
+                    highest_phase: AckPhase::Unknown,
+                    required_phase,
+                },
+            );
+            return Err(BridgeError::OwnerEventUnknown {
+                acknowledgement: ack,
+                continuation: self.outstanding_delivery_for(&replay_key),
+            });
         }
 
         let phase_qualified = phase_reaches(required_phase, ack.phase);
@@ -6100,6 +6140,27 @@ pub enum BridgeError {
     AckIdentityMismatch,
     #[error("provider returned invalid event disposition {0:?}")]
     InvalidEventDisposition(EventDisposition),
+    #[error(
+        "event owner rejected the event with acknowledgement {acknowledgement:?}; pending continuation={continuation:?}"
+    )]
+    OwnerEventRejected {
+        acknowledgement: EventForwardAck,
+        continuation: Option<OutstandingDeliveryView>,
+    },
+    #[error(
+        "event owner reported an identity conflict with acknowledgement {acknowledgement:?}; pending continuation={continuation:?}"
+    )]
+    OwnerEventConflict {
+        acknowledgement: EventForwardAck,
+        continuation: Option<OutstandingDeliveryView>,
+    },
+    #[error(
+        "event owner outcome is unknown with acknowledgement {acknowledgement:?}; pending continuation={continuation:?}"
+    )]
+    OwnerEventUnknown {
+        acknowledgement: EventForwardAck,
+        continuation: Option<OutstandingDeliveryView>,
+    },
     #[error("invalid eliot:// resource identity: {reason}")]
     InvalidResourceUri { reason: &'static str },
     #[error("unknown resource handle: {uri}")]
