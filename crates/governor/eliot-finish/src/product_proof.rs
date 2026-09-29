@@ -112,7 +112,7 @@ impl FinishService {
     )]
     pub fn product_proof_parked(
         &self,
-        inputs: ProductProofStageInputs<'_>,
+        inputs: &ProductProofStageInputs<'_>,
     ) -> Result<ProductProofStatus, ProductProofRecordError> {
         text_field(inputs.finish_authority_ref, "finish_authority_ref")?;
         text_field(inputs.proof_ceiling, "proof_ceiling")?;
@@ -125,7 +125,7 @@ impl FinishService {
             ReportInputSource::ProductSupport,
             inputs.finish_authority_ref,
             1,
-            retained_source_bytes(&inputs).as_bytes(),
+            retained_source_bytes(inputs).as_bytes(),
         )
         .map_err(|error| ProductProofRecordError::Record(error.to_string()))?;
         let retained = ProductProofRetainedEvidence {
@@ -305,12 +305,11 @@ fn missing_evidence(
     build_evidence_present: bool,
 ) -> Vec<String> {
     let mut missing = Vec::new();
-    if !retained.installed_route_observed() {
-        if let ProductProofStageReceipt::Missing { required_proof } =
+    if !retained.installed_route_observed()
+        && let ProductProofStageReceipt::Missing { required_proof } =
             &retained.stage_receipts.installed_route
-        {
-            missing.push(required_proof.clone());
-        }
+    {
+        missing.push(required_proof.clone());
     }
     if !build_evidence_present {
         missing.push("release build evidence for the exact candidate".to_owned());

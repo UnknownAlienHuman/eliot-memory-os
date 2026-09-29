@@ -4937,7 +4937,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                         eliot_reports::projection::ReportInputSource::ProductSupport,
                         receipt.attempt_id.clone(),
                         receipt.task_revision,
-                        canonical_json_bytes(&receipt).as_slice(),
+                        &canonical_json_bytes(&receipt).map_err(product_proof_error)?,
                     )
                     .map_err(product_proof_error)?,
                 )
