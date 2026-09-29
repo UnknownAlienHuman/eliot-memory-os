@@ -1619,26 +1619,24 @@ mod lifecycle_proof_tests {
         assert_eq!(shadow.comparator.peak_memory_bytes, Some(2_048));
 
         let route = must_route(route_rollback(&RollbackRouteRequest {
-            cutover_id: "cutover-1956-rollback".to_owned(),
-            route_scope: TEST_COMPONENT.to_owned(),
-            from_generation: 3,
-            to_generation: 2,
-            old_epoch: 5,
-            new_epoch: 6,
+            cutover: cutover_record("cutover-1956-rollback", TEST_COMPONENT, 3, 2, 5, 6),
             in_flight: vec![("op-1".to_owned(), InFlightDisposition::CancelProvenNoEffect)],
             snapshot_strategy: SnapshotStrategy::PriorCompatibleSnapshot,
             state_compatible: true,
         }));
-        assert!(route.new_epoch > route.old_epoch);
-        assert_eq!(route.to_generation, 2);
+        // The proposed epoch is the record's own lineage-validated successor,
+        // and the rollback target is the record's own prior generation.
+        assert!(route
+            .cutover
+            .new_epoch
+            .is_direct_child_of(&route.cutover.old_epoch));
+        assert_eq!(route.cutover.new_generation.value(), 2);
+        assert_eq!(route.cutover_id, "cutover-1956-rollback");
 
+        // A sequence that is merely equal is not a successor: the owner refuses
+        // it, so the old epoch is never reactivated.
         let stale_epoch = route_rollback(&RollbackRouteRequest {
-            cutover_id: "cutover-1956-stale".to_owned(),
-            route_scope: TEST_COMPONENT.to_owned(),
-            from_generation: 3,
-            to_generation: 2,
-            old_epoch: 5,
-            new_epoch: 5,
+            cutover: cutover_record("cutover-1956-stale", TEST_COMPONENT, 3, 2, 5, 5),
             in_flight: Vec::new(),
             snapshot_strategy: SnapshotStrategy::ForwardRepair,
             state_compatible: true,
