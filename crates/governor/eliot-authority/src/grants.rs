@@ -1883,6 +1883,49 @@ impl GrantGraph {
         Ok(())
     }
 
+    /// Fences one owner-declared grant closure in this graph, in a single
+    /// revision step.
+    ///
+    /// `members` is the exact parent-before-child membership the owner itself
+    /// declared for this closure — the same set the durable closure receipt
+    /// commits and the Kernel already fenced. This method never re-derives
+    /// membership, so it cannot widen a fence, and it never narrows one either:
+    /// every declared member is fenced, including a member that also carries a
+    /// declared alternate path, because the surviving exact use of such a
+    /// member is admitted by the Kernel against its independent covering root
+    /// and not by this projection.
+    ///
+    /// A target or member this graph cannot resolve refuses instead of being
+    /// skipped: a grant absent from the recovered graph is a reconciliation
+    /// problem to report, never evidence that it needs no fence. The refusal
+    /// happens before any mutation, so a refused call leaves the graph exactly
+    /// as it was.
+    pub fn revoke_declared_closure(
+        &mut self,
+        target: &GrantId,
+        members: &[String],
+    ) -> Result<(), AuthorityError> {
+        if !self.grants.contains_key(target) {
+            return Err(AuthorityError::MissingParent(target.clone()));
+        }
+        let mut declared = Vec::with_capacity(members.len());
+        for member in members {
+            let grant_id = GrantId::new(member.clone())?;
+            if !self.grants.contains_key(&grant_id) {
+                return Err(AuthorityError::MissingParent(grant_id));
+            }
+            declared.push(grant_id);
+        }
+        for grant_id in declared {
+            self.revoked.insert(grant_id);
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(AuthorityError::InvalidField("grant_graph_revision"))?;
+        Ok(())
+    }
+
     /// Enumerates the exact descendant closure of one grant at the current
     /// graph revision: the target plus every transitive child on the same
     /// authority root, in parent-before-child order with the target first.
