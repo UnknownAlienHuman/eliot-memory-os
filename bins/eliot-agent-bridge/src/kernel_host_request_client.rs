@@ -1781,7 +1781,7 @@ fn host_request_observe_submit_frame(
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
 /// | `eliot.observe` | submit frame (tool bytes) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
-/// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch, Kernel material admission owns `admit_material_decision` (#1742 W4) |
+/// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch, the Kernel submit gate revalidates the act dispatch binding pre-staging, and the daemon `serve_act_material_admission` gate owns `admit_material_decision` over owner-resolved inputs; the live act claim/flight carrying owner inputs through that gate is the remaining join (#1742 W4) |
 /// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
 /// | `eliot.coordinate` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; execution-fabric join missing (#1740) |
 /// | `eliot.finish` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded finish decision receipt from the Governor finish owner; a simulated/stale/unbound/unknown-verifier candidate and a caller-supplied proof never yield `VERIFIED_COMPLETE` |
@@ -1808,9 +1808,12 @@ enum CanonicalDispatchEntry {
     /// The bridge revalidates only what it owns at dispatch time (act shape,
     /// live session/fence/connection binding, exact payload-digest linkage)
     /// and rides the same `agent_host_request_submit` entry; the Kernel
-    /// material admission owns `eliot-context-admission::admit_material_decision`
-    /// over owner-resolved inputs. The Accepted reply stays an operation
-    /// handle until the effect owner completes it.
+    /// submit entry revalidates the act dispatch binding pre-staging
+    /// (`check_act_submit_binding`); the daemon `serve_act_material_admission`
+    /// gate owns the `eliot-context-admission::admit_material_decision`
+    /// invocation over owner-resolved inputs with live-fence revalidation.
+    /// The Accepted reply stays an operation handle until the effect owner
+    /// completes it.
     SubmitActGated { completion_join: &'static str },
     /// Observe submit carrying the exact canonical tool bytes (issue #2565).
     /// Rides the same `agent_host_request_submit` entry as the digest-only
@@ -1845,7 +1848,7 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         | ToolRequest::Finish(_) => CanonicalDispatchEntry::InvokeRead,
         ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitObservePair,
         ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitActGated {
-            completion_join: "Kernel material admission admit_material_decision with dispatch-time revalidation (#1742 W4)",
+            completion_join: "live act claim/flight carrying Governor owner inputs through the daemon serve_act_material_admission gate (Kernel submit gate check_act_submit_binding and bridge dispatch revalidation done; #1742 W4)",
         },
         ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved",
@@ -2741,6 +2744,28 @@ fn expected_canonical_request_digest_by_parts(
     Ok(sha256_hex(&bytes))
 }
 
+/// Maps one durable terminal record that carries no servable result to its
+/// typed invocation outcome (issue #1739 W6).
+///
+/// The Kernel-authored failure envelope (stable disposition, verbatim reason
+/// code, typed directive, issue #1743) is the only producer of that triple,
+/// and only the Kernel can author one — the bridge never invents it here.
+/// What this preserves instead, in one stable shape rather than ad-hoc prose
+/// per site: the original operation identity and the reconcile directive,
+/// with the durable state (`Terminal` vs `Conflicted`) named so the two
+/// stay distinguishable. A terminal record WITH a servable result never
+/// reaches here: it decodes through [`decode_stored_response`] above.
+fn terminal_without_result_outcome(
+    operation_id: &str,
+    state: HostRequestRecordState,
+) -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: format!(
+            "operation {operation_id} is {state:?} without a servable result; reconcile the exact operation"
+        ),
+    }
+}
+
 fn submit_outcome(
     receipt: &HostRequestAdmissionReceipt,
     record: &AdmittedReplyView,
@@ -2779,13 +2804,15 @@ fn submit_outcome(
                     response: Box::new(response),
                 });
             }
-            Err(PortFailure::TransportBindingRejected {
-                reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-            })
+            Err(terminal_without_result_outcome(
+                &receipt.operation_id,
+                record.state,
+            ))
         }
-        HostRequestRecordState::Conflicted => Err(PortFailure::TransportBindingRejected {
-            reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-        }),
+        HostRequestRecordState::Conflicted => Err(terminal_without_result_outcome(
+            &receipt.operation_id,
+            record.state,
+        )),
     }
 }
 
@@ -2839,13 +2866,15 @@ fn submit_outcome_for_resolved(
                     response: Box::new(response),
                 });
             }
-            Err(PortFailure::TransportBindingRejected {
-                reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-            })
+            Err(terminal_without_result_outcome(
+                &record.operation_id,
+                record.state,
+            ))
         }
-        HostRequestRecordState::Conflicted => Err(PortFailure::TransportBindingRejected {
-            reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-        }),
+        HostRequestRecordState::Conflicted => Err(terminal_without_result_outcome(
+            &record.operation_id,
+            record.state,
+        )),
     }
 }
 

@@ -3618,6 +3618,75 @@ async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, St
     Ok(step(outcome))
 }
 
+/// Serves one admitted `eliot.act` effect dispatch through the material
+/// admission gate (issue #1739, #1742 W4).
+///
+/// Invokes `eliot-context-admission::admit_material_decision` over the
+/// owner-resolved inputs with dispatch-time revalidation: the admitted
+/// envelope must still name `eliot.act`, and the owners' State Fence must
+/// still equal the live fence, or the dispatch fails closed here before any
+/// effect owner is called. A swapped packet, stale fence, or incomplete
+/// floor/lineage refuses with the exact typed limitation
+/// (`DECISION_CONTEXT_INCOMPLETE` with affected references, evidence
+/// status, and allowed action); boundary failures (authentication,
+/// authority, fence, revocation, capacity) are preserved uncollapsed
+/// (I07-20). No effect dispatch follows a refusal.
+///
+/// Ownership (I01-08 canonical path): every gate input is owner-resolved —
+/// the action model and Task Controller own the impact class, task, and
+/// acceptance revision; the policy owner owns the atom policies and the
+/// Governance Profile; Context owns the prepared closure and lineage. This
+/// function resolves nothing itself and fabricates no receipt, profile,
+/// lease, or revision: a missing owner input fails closed at the compiler
+/// naming the owner that must issue it. The admitted floor handle binds the
+/// checked action parameters, packet digest, revisions, lineage, and effect
+/// ceiling into the operation; the act flight submits that handle onward,
+/// never a second verdict.
+///
+/// Caller: STITCH — no live act claim/flight exists yet (the Kernel admits
+/// digest-only act submits through the submit entry; the daemon act poller
+/// is the missing join named in the bridge dispatch map), so this gate has
+/// no production caller until that flight claims admitted act records
+/// through it. Pure admission check: no IO, no semantic interpretation
+/// beyond the named owner gate.
+#[allow(dead_code)]
+fn serve_act_material_admission(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    owners: &eliot_context_admission::OperationOwnerInputs<'_>,
+    policies: &[eliot_context_admission::FloorAtomPolicy],
+    closure: &eliot_context_contracts::AdmissionInput,
+    lineage: &eliot_context_contracts::DecisionExecutionLineageRefs,
+    live_fence: &eliot_contracts::StateFence,
+) -> Result<eliot_context_admission::AdmittedDecisionFloor, String> {
+    envelope
+        .validate()
+        .map_err(|error| format!("daemon act pair envelope is not admitted shape: {error}"))?;
+    if envelope.identity.capability != "eliot.act" {
+        return Err("daemon act pair envelope is not the admitted act capability".to_owned());
+    }
+    if owners.state_fence != live_fence {
+        return Err(
+            "daemon act owner inputs are stale: the owner fence no longer matches the live fence"
+                .to_owned(),
+        );
+    }
+    eliot_context_admission::admit_material_decision(owners, policies, closure, lineage).map_err(
+        |refusal| match refusal {
+            eliot_context_admission::MaterialDecisionRefusal::Incomplete(refusal) => format!(
+                "DECISION_CONTEXT_INCOMPLETE: {:?} affected={:?} action={:?} missing_owner={:?} gaps={:?}",
+                refusal.evidence_status,
+                refusal.affected_references,
+                refusal.allowed_action,
+                refusal.missing_owner,
+                refusal.incomplete,
+            ),
+            eliot_context_admission::MaterialDecisionRefusal::Boundary(error) => {
+                format!("daemon act material admission boundary: {error}")
+            }
+        },
+    )
+}
+
 /// Defers one served observe pair, retrying once with byte-identical
 /// arguments when the first defer fails.
 ///
