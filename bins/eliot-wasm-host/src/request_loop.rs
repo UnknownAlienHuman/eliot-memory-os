@@ -5011,6 +5011,45 @@ pub enum OrdinaryDriveError {
     Drive(DriveError),
     /// The bounded request loop failed closed.
     Loop(LoopError),
+    /// The loop failed with observations in its report. The final retry uses
+    /// the same claim-bound result owner; if that write also fails, the exact
+    /// bounded sequence remains available from this error for recovery. This
+    /// does not acknowledge or settle the operation.
+    LoopFailedWithObservations {
+        /// Failed loop report, including every exact observed result frame.
+        report: RequestLoopReport,
+        /// Result of the final same-owner persistence retry.
+        recovery_handoff: Result<(), LoopError>,
+    },
+}
+
+impl OrdinaryDriveError {
+    /// Exact sequence observed before a loop failure, when one exists.
+    ///
+    /// A failed persistence retry keeps these frames available to the caller
+    /// for recovery handling; it never turns them into success or an owner
+    /// acknowledgement.
+    #[must_use]
+    pub fn retained_observations(&self) -> Option<&[OrdinaryOutcome]> {
+        match self {
+            Self::LoopFailedWithObservations { report, .. } => Some(report.retained()),
+            _ => None,
+        }
+    }
+
+    /// Failure from the final same-owner persistence retry, if that retry
+    /// failed. The observations remain available through
+    /// [`Self::retained_observations`].
+    #[must_use]
+    pub fn recovery_handoff_error(&self) -> Option<LoopError> {
+        match self {
+            Self::LoopFailedWithObservations {
+                recovery_handoff: Err(error),
+                ..
+            } => Some(*error),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for OrdinaryDriveError {
@@ -5020,6 +5059,22 @@ impl fmt::Display for OrdinaryDriveError {
             Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
             Self::Drive(error) => write!(formatter, "{error}"),
             Self::Loop(error) => write!(formatter, "{error}"),
+            Self::LoopFailedWithObservations {
+                report,
+                recovery_handoff,
+            } => {
+                let LoopCompletion::Failed { failure } = report.completion() else {
+                    return formatter.write_str("ORDINARY_LOOP_FAILURE_WITH_SERVED_REPORT");
+                };
+                match recovery_handoff {
+                    Ok(()) => write!(formatter, "{failure}; result-recovery=retained"),
+                    Err(error) => write!(
+                        formatter,
+                        "{failure}; result-recovery=in-memory; handoff={}",
+                        error.code()
+                    ),
+                }
+            }
         }
     }
 }
@@ -5077,16 +5132,17 @@ fn seal_served_outcome(
 /// through is what keeps a transient retention failure from silently
 /// discarding the only copy, and it is a bounded finalization of
 /// already-observed bytes — not a second write scheme, not a first write, and
-/// not a new acknowledgement. Whether it lands changes nothing else: the
-/// claim stays uncertain, nothing is reclaimed, the original failure is still
-/// what the caller is told, and the guest is never re-executed.
+/// not a new acknowledgement. Whether it lands changes nothing about the
+/// claim: it stays uncertain, nothing is reclaimed, and the guest is never
+/// re-executed. The returned error keeps the report and this retry outcome
+/// together, so a failed rewrite cannot drop the exact observed sequence.
 fn hand_off_observed_sequence(
     directory: &std::path::Path,
     claim: &crate::dispatch_material::DeliveryClaim,
     events: &[OrdinaryOutcome],
-) {
+) -> Result<(), LoopError> {
     let handoff = ObservedResultRetention::new(directory, claim);
-    let _handoff_retained = handoff.retain(events);
+    handoff.retain(events)
 }
 
 /// Typed readback of the durable result record for exactly one staged replay
@@ -5275,6 +5331,8 @@ fn frame_binds_to_identity(
 /// Returns [`OrdinaryDriveError`] when the delivery set, the installation
 /// binding, the one-shot permit, the admitted world, the request source,
 /// the result sink, or a request binding fails closed.
+/// A failed request loop returns its exact observed sequence with the failure,
+/// including when the final same-owner persistence retry also fails.
 pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError> {
     let Some((staged_claim, material)) =
         read_admitted_material().map_err(OrdinaryDriveError::Drive)?
@@ -5350,7 +5408,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         &material,
         ObservedResultRetention::new(&directory, &claim),
     );
-    match report.completion() {
+    match *report.completion() {
         LoopCompletion::Served => {
             let Some(terminal) = report.served_terminal() else {
                 return Err(OrdinaryDriveError::Loop(denied("no-request")));
@@ -5362,9 +5420,13 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
             seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
             Ok(terminal.clone())
         }
-        LoopCompletion::Failed { failure } => {
-            hand_off_observed_sequence(&directory, &claim, report.retained());
-            Err(OrdinaryDriveError::Loop(*failure))
+        LoopCompletion::Failed { .. } => {
+            let recovery_handoff =
+                hand_off_observed_sequence(&directory, &claim, report.retained());
+            Err(OrdinaryDriveError::LoopFailedWithObservations {
+                report,
+                recovery_handoff,
+            })
         }
     }
 }
