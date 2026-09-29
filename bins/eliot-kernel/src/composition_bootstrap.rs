@@ -1512,10 +1512,14 @@ impl KernelComposition {
         let backup_owner_clients = BackupOwnerClients::bind_production()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         // Issue #959: hold the Kernel-owned cross-owner backup capture
-        // coordinator on the composition. It binds the work root only;
-        // captures consume already-accepted owner evidence per execution,
-        // so no live owner channel is opened here.
-        let backup_capture = KernelBackupCapture::bind(work_root.clone());
+        // coordinator on the composition. It binds the work root and this
+        // composition's own durable purge owner (`ors`, the same
+        // `RedbRecoveryStore` handle `p07_ors` keeps for #960's restore
+        // journal), so the manifest's purge-ledger revision is the revision
+        // that owner actually issued and no caller can name a different one.
+        // Everything else a capture consumes is already-accepted owner evidence
+        // per execution, so no further live owner channel is opened here.
+        let backup_capture = KernelBackupCapture::bind(work_root.clone(), Arc::clone(&ors));
         // Issue #1837: open the single durable audit chain below the
         // canonical work root and seal the restart boundary. A corrupt
         // retained chain fails construction closed: the Kernel never runs

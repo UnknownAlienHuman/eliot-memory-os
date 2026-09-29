@@ -12,14 +12,17 @@
 //! Coordinator bindings under test (see `assemble_input` and `capture`):
 //! the archive identity binds the canonical export identity (`backup_id` is
 //! the export fence `export_id`, never the caller-supplied input id); the
-//! purge revision binds the carried ledger length; class, source adapter, and
-//! schema generation cross from the frozen plan; generations bind through the
-//! cross-owner fence relation, not string equality. A lost publication
+//! purge revision is READ from the composition-bound purge owner
+//! (`RedbRecoveryStore::purge_ledger_revision`), so `coordinator` below binds a
+//! real one with the fixture's carried purge applied; class, source adapter,
+//! and schema generation cross from the frozen plan; generations bind through
+//! the cross-owner fence relation, not string equality. A lost publication
 //! response reconciles the SAME operation by identity, never by second
 //! publish.
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupError, BackupInput,
@@ -32,6 +35,7 @@ use eliot_kernel::{
     FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
     PublicationReceipt, SnapshotRelation, require_capture_admitted,
 };
+use eliot_ors::RedbRecoveryStore;
 use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
 use eliot_store_api::{
     CommitId, EventId, OperationId, OperationManifestDigest, Resubmission, ScopeId,
@@ -464,13 +468,43 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
     }
 }
 
+/// The one real purge owner this file binds, held for the process so
+/// `coordinator` and the `coordinator_input` mirror read the SAME owner rather
+/// than two stores that happen to agree.
+///
+/// A genuine `RedbRecoveryStore` over its own temporary file, with the one purge
+/// `valid_full_input` carries applied through the owner's own
+/// `apply_purge_ledger_entry`. The owner's durable counter is therefore 1 — the
+/// revision the owner actually issued — and the archive declares that, instead
+/// of this fixture agreeing with the owner by coincidence.
+fn purge_owner() -> Arc<RedbRecoveryStore> {
+    static OWNER: OnceLock<Arc<RedbRecoveryStore>> = OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            let path = std::env::temp_dir().join(format!(
+                "eliot-959-capture-owner-{}.redb",
+                std::process::id()
+            ));
+            let owner = RedbRecoveryStore::open(&path).expect("capture purge owner opens");
+            let applied = owner
+                .apply_purge_ledger_entry(&purge_entry(&base_fence()))
+                .expect("capture purge owner applies the carried purge");
+            assert_eq!(applied, 1, "owner-issued purge revision");
+            Arc::new(owner)
+        })
+        .clone()
+}
+
 fn coordinator() -> KernelBackupCapture {
-    KernelBackupCapture::bind(std::env::temp_dir().join("eliot-959-capture"))
+    let work_root = std::env::temp_dir().join("eliot-959-capture");
+    KernelBackupCapture::bind(work_root, purge_owner())
 }
 
 /// Mirrors the coordinator's `assemble_input` binding for independent digest
 /// recomputation: archive identity from the export fence, class/source/schema
-/// from the frozen plan, purge revision from the carried ledger length.
+/// from the frozen plan, and the same purge revision the coordinator declares.
+/// That revision is the purge owner's own durable counter, and this fixture
+/// carries exactly the one purge `purge_owner` applied, so the two agree.
 fn coordinator_input(request: &CaptureRequest) -> BackupInput {
     BackupInput {
         backup_id: request.export_fence.export_id.clone(),
@@ -488,11 +522,9 @@ fn coordinator_input(request: &CaptureRequest) -> BackupInput {
         watchdog_spool: request.watchdog_spool.clone(),
         host_audit: request.host_audit.clone(),
         missing_features: Vec::new(),
-        purge_ledger_revision: if request.purge_ledger.is_empty() {
-            0
-        } else {
-            request.purge_ledger.len() as u64
-        },
+        purge_ledger_revision: purge_owner()
+            .purge_ledger_revision()
+            .expect("the bound purge owner answers"),
     }
 }
 

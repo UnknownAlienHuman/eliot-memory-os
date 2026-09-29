@@ -678,8 +678,11 @@ pub struct KernelComposition {
     /// the durable journal is injected per execution, never constructed here.
     backup_restore: KernelBackupRestore,
     /// Kernel-owned cross-owner backup capture coordinator (issue #959).
-    /// Holds the work root only; every capture consumes already-accepted
-    /// owner evidence and publishes once through the admitted owner port.
+    /// Holds the work root and this composition's own durable purge owner, so
+    /// the manifest's purge-ledger revision is the revision that owner issued
+    /// rather than a count of the caller's entry list; every other capture input
+    /// consumes already-accepted owner evidence and publishes once through the
+    /// admitted owner port.
     backup_capture: KernelBackupCapture,
     /// The exact-owner backup channel clients bound in production assembly
     /// (issue #962). Held on the composition, not in process-global state: the

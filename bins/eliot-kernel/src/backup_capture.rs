@@ -65,12 +65,14 @@
 //! cut-over, or finished claims.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupInput, CanonicalRecord,
     ExportFence, HostStateAuditFence, OrsSnapshotFence, RestoreEvidenceLevel, WatchdogSpoolFence,
 };
 use eliot_contracts::{EpochRelation, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ors::RedbRecoveryStore;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
@@ -90,7 +92,9 @@ const OWNER_COUNT: usize = 6;
 ///
 /// A single struct with owned vectors and options keeps test construction
 /// direct: no live owner handle, database read path, or snapshot service
-/// travels here.
+/// travels here. The composition-owned purge owner that supplies the manifest's
+/// purge-ledger revision is bound on [`KernelBackupCapture`] instead, so it
+/// cannot be substituted from a request field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureRequest {
     /// Admitted caller authentication behind the capture.
@@ -537,18 +541,27 @@ pub struct CaptureReport {
 
 /// Kernel-owned cross-owner backup capture coordinator.
 ///
-/// Binds the Kernel work root the capture operates under. The coordinator
-/// owns no live owner channel: every capture consumes already-accepted owner
-/// evidence through `CaptureRequest`, builds and verifies through the accepted
-/// `BackupBundle` API, and publishes once through the admitted `PublicationPort`.
+/// Binds the Kernel work root the capture operates under and the composition's
+/// own purge owner, the `RedbRecoveryStore` that issues the purge-ledger
+/// revision the manifest must declare. Every other capture input consumes
+/// already-accepted owner evidence through `CaptureRequest` and builds and
+/// verifies through the accepted `BackupBundle` API, publishing once through the
+/// admitted `PublicationPort`; the purge revision is the one manifest field that
+/// is an owner-issued counter rather than carried evidence, so it is read from
+/// the owner this composition already holds instead of being derived here.
 pub struct KernelBackupCapture {
     work_root: PathBuf,
+    purge_owner: Arc<RedbRecoveryStore>,
 }
 
 impl KernelBackupCapture {
-    /// Binds the capture owner to the Kernel work root.
-    pub fn bind(work_root: PathBuf) -> Self {
-        Self { work_root }
+    /// Binds the capture owner to the Kernel work root and to the composition's
+    /// durable purge owner.
+    pub fn bind(work_root: PathBuf, purge_owner: Arc<RedbRecoveryStore>) -> Self {
+        Self {
+            work_root,
+            purge_owner,
+        }
     }
 
     /// Returns the bound work root.
@@ -557,15 +570,41 @@ impl KernelBackupCapture {
         &self.work_root
     }
 
+    /// Reads the purge-ledger revision this capture must declare, from the purge
+    /// owner itself.
+    ///
+    /// I5.13:44 requires the manifest to bind the "purge-ledger revision", and
+    /// the restore side compares that declaration against the revisions
+    /// `RedbRecoveryStore::apply_purge_ledger_entry` issues for the carried
+    /// entries. Those are two readings of ONE quantity: the owner allocates each
+    /// applied revision from its durable counter inside the transaction that
+    /// makes the row durable, so the only value the declaration can carry is that
+    /// counter, read through [`RedbRecoveryStore::purge_ledger_revision`].
+    ///
+    /// A count of the caller's own entry list is a DIFFERENT quantity that
+    /// happens to share the name: it agrees with the owner only on a store that
+    /// has never applied a purge, and it made every non-empty-ledger restore
+    /// refuse on every store that has. No value is derived, defaulted or
+    /// recomputed here. An owner that cannot answer is a typed refusal
+    /// ([`KernelCaptureError::OwnerEvidenceInvalid`]), because a stand-in
+    /// revision would pass the archive builder and then be compared against a
+    /// different quantity during restore.
+    fn owner_purge_ledger_revision(&self) -> Result<u64, KernelCaptureError> {
+        self.purge_owner
+            .purge_ledger_revision()
+            .map_err(|error| KernelCaptureError::OwnerEvidenceInvalid(error.to_string()))
+    }
+
     /// Executes one admitted capture: admit, freeze, gate, relate, bound,
     /// build, verify, publish exactly once.
     ///
     /// Order: (a) caller admission and frozen-plan validation before touching
     /// evidence; (b) class capability gate with no silent downgrade;
     /// (c) snapshot-relation build and validation; (d) complete-denominator
-    /// check; (e) per-owner and cumulative budget check; (f) exact
-    /// `BackupBundle` build, repeated validation, and encoding; (g) a single
-    /// `publish_once` under the operation identity and idempotency key, with a
+    /// check; (e) per-owner and cumulative budget check; (f) the purge owner's
+    /// own declared revision, then the exact `BackupBundle` build, repeated
+    /// validation, and encoding; (g) a single `publish_once` under the
+    /// operation identity and idempotency key, with a
     /// lost response reconciled by identity through `reconcile` (never a
     /// second publish). Bounded unresolved operations are not corruption: a
     /// `full_recovery` capture with suspended entries still completes and
@@ -587,10 +626,10 @@ impl KernelBackupCapture {
     /// revisions": the Kernel's own fence is therefore the only acceptable
     /// authority for the evidence it admits, and a presented fence that is not
     /// it is not a proof of anything this owner is willing to act on.
-    #[allow(
-        clippy::unused_self,
-        reason = "governed owner seam keeps &self receivers; the work root binds composition"
-    )]
+    ///
+    /// The manifest's purge-ledger revision is the one field this owner reads
+    /// from a live owner rather than from the request: see
+    /// `KernelBackupCapture::owner_purge_ledger_revision`.
     pub fn capture(
         &self,
         request: &CaptureRequest,
@@ -612,7 +651,14 @@ impl KernelBackupCapture {
         let member_dispositions = check_denominator(request)?;
         check_budgets(request)?;
         duration.check()?;
-        let bundle = BackupBundle::build(assemble_input(request))
+        // The purge revision is READ, last and once, immediately before the
+        // archive is assembled, so the declared value is the owner's counter at
+        // the instant this capture forms. It is not compared against anything
+        // here: `eliot-backup` owns the coherence rule between a declared
+        // revision and a carried ledger, and the restore owner owns the closure
+        // check against the revisions its own purge owner issues.
+        let purge_ledger_revision = self.owner_purge_ledger_revision()?;
+        let bundle = BackupBundle::build(assemble_input(request, purge_ledger_revision))
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
         duration.check()?;
         bundle
@@ -1808,21 +1854,28 @@ fn check_budgets(request: &CaptureRequest) -> Result<(), KernelCaptureError> {
 /// Assembles the exact `BackupInput` from validated request fields: the
 /// archive identity binds the canonical export identity (nothing invented),
 /// class, source, and schema come from the frozen plan, and every evidence
-/// section crosses byte-identical. The purge revision binds the carried
-/// ledger: zero with an empty ledger, the entry count otherwise.
+/// section crosses byte-identical.
 ///
-/// ASSUMPTION (purge-ledger revision). I5.13:44 requires the manifest to bind
-/// the "purge-ledger revision", and `eliot-backup` leaves that value to the
-/// producer: it only refuses a nonzero revision with no ledger and a zero
-/// revision with a non-empty one (`BackupBundle::validate`, "the purge revision
-/// binds the purge ledger carried here"). No accepted owner-neutral purge API
-/// reachable from this owner publishes a ledger-wide revision — the closest
-/// thing, Host's `BackupConfigProjection::purge_ledger_revision`, lives in
-/// `bins/eliot-host`, which this composition root may not depend on. The
-/// carried entry count is therefore used as the binding over the ledger this
-/// owner actually validated, and it is stated here rather than presented as the
-/// purge owner's own declared revision.
-fn assemble_input(request: &CaptureRequest) -> BackupInput {
+/// `purge_ledger_revision` is not derived from the request: it is the value
+/// [`KernelBackupCapture::owner_purge_ledger_revision`] read from the purge
+/// owner, passed in whole. I5.13:44 requires the manifest to bind the
+/// "purge-ledger revision", and the owner allocates exactly one ledger-wide
+/// revision per applied purge from its durable counter
+/// (`RedbRecoveryStore::apply_purge_ledger_entry`), which is what
+/// `RedbRecoveryStore::purge_ledger_revision` reports. The restore owner
+/// compares this declaration against the revisions its own purge owner issues
+/// for the carried entries (`check_purge_revision_closure`), so both sides must
+/// name the same quantity: this field used to be
+/// `request.purge_ledger.len()`, the caller's own entry count, which agrees with
+/// the owner only on a store that has never applied a purge and made every
+/// non-empty-ledger restore refuse on every store that has.
+///
+/// The revision is recorded as read for every class, including one whose carried
+/// ledger is empty: the owner's counter is the owner's answer either way, and
+/// substituting a zero for it here is the same substitution this field no longer
+/// makes. Whether a declared revision and a carried ledger are coherent is
+/// `BackupBundle::validate`'s rule, not a second one restated here.
+fn assemble_input(request: &CaptureRequest, purge_ledger_revision: u64) -> BackupInput {
     BackupInput {
         backup_id: request.export_fence.export_id.clone(),
         class: request.plan.class,
@@ -1839,10 +1892,6 @@ fn assemble_input(request: &CaptureRequest) -> BackupInput {
         watchdog_spool: request.watchdog_spool.clone(),
         host_audit: request.host_audit.clone(),
         missing_features: Vec::new(),
-        purge_ledger_revision: if request.purge_ledger.is_empty() {
-            0
-        } else {
-            request.purge_ledger.len() as u64
-        },
+        purge_ledger_revision,
     }
 }
