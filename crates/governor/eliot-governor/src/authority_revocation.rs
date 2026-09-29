@@ -361,7 +361,9 @@ fn require_recorded_fields_bind_closure(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| {
-                owner_refused(format!("revocation record carries no {name} binding parameter"))
+                owner_refused(format!(
+                    "revocation record carries no {name} binding parameter"
+                ))
             })
     };
     let durable_affected = closure.declaration.affected_grants();
