@@ -199,6 +199,9 @@ pub(super) fn persist_pending_recovery(
     host_state_root: &Path,
     registry: &mut ApprovedGenerationRegistry,
     host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    profile_selection: Option<
+        &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    >,
     pending: &eliot_installation::PendingActivation,
     reason: &str,
 ) -> Result<(), HostError> {
@@ -245,7 +248,11 @@ pub(super) fn persist_pending_recovery(
         // #1339, A13.9: short-lived open-use-drop CAS; the handle is dropped
         // before the readback open below, so concurrent Watchdog/installer
         // readers never observe a Host-held exclusive lock.
-        let store = crate::open_registry_store_at_profile(host_state_root, profile)?;
+        let store = crate::open_registry_store_at_profile(
+            host_state_root,
+            profile,
+            profile_selection,
+        )?;
         store.mark_pending_recovery(
             host_capability,
             expected_revision,
@@ -254,7 +261,11 @@ pub(super) fn persist_pending_recovery(
         )
     };
     let durable = {
-        let store = crate::open_registry_store_at_profile(host_state_root, profile)?;
+        let store = crate::open_registry_store_at_profile(
+            host_state_root,
+            profile,
+            profile_selection,
+        )?;
         store.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "{reason}; recovery disposition outcome is unknown and registry readback failed: {readback_error}"
