@@ -4471,7 +4471,6 @@ impl KernelStoreGateway {
         clippy::too_many_lines,
         reason = "the admission observation, durable claim, send, and claim disposition form one auditable gate"
     )]
-
     /// Applies one closed Dreamer ledger operation through the active Kernel
     /// generation route (T12-04 K1, owner #779). Public input/output remain
     /// exactly the S0 K0 types. Gates mirror `initialize_genesis` (flight
