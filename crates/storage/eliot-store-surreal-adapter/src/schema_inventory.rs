@@ -511,7 +511,10 @@ impl fmt::Display for SelectionPathClosure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyClass { class } => {
-                write!(formatter, "no selection path is recorded for class {class:?}")
+                write!(
+                    formatter,
+                    "no selection path is recorded for class {class:?}"
+                )
             }
             Self::UndeclaredRoot {
                 class,
@@ -522,7 +525,11 @@ impl fmt::Display for SelectionPathClosure {
                 formatter,
                 "{path}::{symbol} is recorded as a {class:?} selecting {root}, which the current schema owner does not declare as a non-executable migration root"
             ),
-            Self::DuplicateEntry { class, path, symbol } => write!(
+            Self::DuplicateEntry {
+                class,
+                path,
+                symbol,
+            } => write!(
                 formatter,
                 "the {class:?} selection path {path}::{symbol} is recorded more than once"
             ),
@@ -715,7 +722,10 @@ impl fmt::Display for ExecutableBodyRefusal {
                 "{path}::{symbol} is a recorded {class:?} outside the current schema owner and is not executable through it: {rationale}"
             ),
             Self::SelectionPathClosure { omission } => {
-                write!(formatter, "the recorded selection paths are not closed: {omission}")
+                write!(
+                    formatter,
+                    "the recorded selection paths are not closed: {omission}"
+                )
             }
             Self::NonExecutableRoot {
                 path,
