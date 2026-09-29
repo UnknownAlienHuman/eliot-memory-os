@@ -71,7 +71,13 @@
 //!    channel cannot carry a verify effect, and in particular
 //!    `BackupRole::Verifier` — the only role whose
 //!    `BackupArchiveValidityAttestation::validate_against` accepts — is bound to
-//!    no channel on this product.
+//!    no channel on this product. (`OwnerRole` is a closed two-variant enum whose
+//!    only mappings are `InstallationAuthority` and `SpoolOwner`, so no third
+//!    role can appear without a new `OwnerRole` variant.) The Watchdog DOES hold
+//!    `BackupRole::CaptureOwner`, so a capture receipt is role-plausible on its
+//!    own; it is still unreachable, for two independent reasons: `RequestCapture`
+//!    is outside that owner's registered operation table, and the verify route
+//!    contacts no owner client at all.
 //!
 //! Consequently the production answer is
 //! [`OwnerProvenanceEvidence::unissued`]: the three #2862 identity fields stay
@@ -291,8 +297,19 @@ impl OwnerProvenanceEvidence {
     /// owner wrote on it, and an absent one becomes `None`; a present
     /// attestation becomes the RECORDED `attestation_digest`, and an absent one
     /// becomes `None`. There is no `Default`, no `..rest`, no silently dropped
-    /// field and no field invented here, so a field added to the ORS identity is
-    /// a compile error at this constructor rather than a silent omission
+    /// field and no field invented here, so every one of the identity's owner-
+    /// evidence fields is written here deliberately.
+    ///
+    /// Be precise about what that buys. It IS total over the evidence as it
+    /// stands: each present owner value is projected and each absent one is
+    /// explicitly `None`. It is NOT a compile-time exhaustive guard — this is a
+    /// field-by-field assignment, not a struct literal, so adding a fourth
+    /// owner-evidence field to the ORS identity would NOT be a compile error
+    /// here; the struct-literal site that IS exhaustive is
+    /// `backup_verify_admitted_identity`, one layer up, and the I5.27
+    /// `BackupVerifyIdentityPreimage` is likewise a struct literal. The property
+    /// that would make it mechanical — one test that perturbs each owner-evidence
+    /// field and asserts the request digest moves — is deferred to the test phase
     /// (I5.27: a field affecting authority, scope, ordering, privacy or effect
     /// cannot be omitted or defaulted silently).
     ///
@@ -300,10 +317,12 @@ impl OwnerProvenanceEvidence {
     /// validated owner value. They are NOT recomputed here and never stand in
     /// for validating what the owner recorded: [`check_provenance_binding`]
     /// runs first and calls each value's own `validate()`, which is what proves
-    /// the recorded digest is the digest of that recorded value. I5.27's
-    /// `canonical_request_hash` then binds all three fields, so a different
-    /// handle, receipt or attestation under one operation identity is the
-    /// identity conflict acceptance clause 3 names, not a second answer.
+    /// the recorded digest is the digest of that recorded value. That proof is
+    /// carried by call order, not by the type — neither digest gets an ORS shape
+    /// check of its own here — so the two must not be reordered past each other.
+    /// I5.27's `canonical_request_hash` then binds all three fields, so a
+    /// different handle, receipt or attestation under one operation identity is
+    /// the identity conflict acceptance clause 3 names, not a second answer.
     ///
     /// The projected [`BackupVerifyArchiveHandleRef`] is shape-checked through
     /// its own ORS `validate()` before it is written, so the adapter never
