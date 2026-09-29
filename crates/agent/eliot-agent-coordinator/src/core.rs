@@ -555,9 +555,12 @@ fn offer_class_head(
     //
     // Termination and cost: the walk is over `view.ready`, the per-class
     // admitted list that `class_views` has already materialised for this pull,
-    // so it visits each item at most once and ends at the newest admitted item.
-    // The window is what bounds the items that could still be *served*, which
-    // is the part that decides this pull.
+    // so each item is visited at most once. That list is finite and already
+    // bounded: `admit` and `reassign` refuse to push the coordinator past the
+    // positive, validated `CoordinatorConfig::max_admitted_attempts`, so this
+    // loop cannot outlast a bounded admitted set. The item ceiling is what
+    // bounds the items that could still be *served*, which is the part that
+    // decides this pull.
     let mut window_used = 0usize;
     for (_, attempt) in &view.ready {
         view.scanned += 1;
