@@ -2052,8 +2052,7 @@ fn canonicalize_comparisons(
 ) -> Result<Vec<CanonicalComparisonPair>, ConflictAnalysisError> {
     let handles = position_source_handles(conflict_set);
     let mut seen_pairs: Vec<String> = Vec::with_capacity(supplements.comparisons.len());
-    let mut pairs: Vec<CanonicalComparisonPair> =
-        Vec::with_capacity(supplements.comparisons.len());
+    let mut pairs: Vec<CanonicalComparisonPair> = Vec::with_capacity(supplements.comparisons.len());
     for comparison in &supplements.comparisons {
         check_comparison_denominator(&handles, comparison, &mut seen_pairs)?;
         let pair = CanonicalComparisonPair::from_supplied(
@@ -2629,7 +2628,9 @@ fn position_compatibility(
         });
         match &entry.outcome {
             CanonicalDimensionOutcome::Differing { .. } => differing.push(entry.dimension),
-            CanonicalDimensionOutcome::Unnormalizable { .. } => unnormalizable.push(entry.dimension),
+            CanonicalDimensionOutcome::Unnormalizable { .. } => {
+                unnormalizable.push(entry.dimension);
+            }
             CanonicalDimensionOutcome::Equal { .. } => {}
         }
     }
@@ -2782,7 +2783,6 @@ fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRe
 fn dispose_position(
     index: usize,
     conflict_set: &ConflictSet,
-    supplements: &ConflictSupplements,
     classes: &[ConflictKind],
     pairs: &[CanonicalComparisonPair],
 ) -> PositionAnalysis {
@@ -3729,7 +3729,11 @@ impl PreservationIdentity {
     /// Projects the emitted preservation report onto the preimage.
     fn new(preservation: &PreservationReport) -> Self {
         Self {
-            verdicts: preservation.verdicts.iter().map(VerdictIdentity::new).collect(),
+            verdicts: preservation
+                .verdicts
+                .iter()
+                .map(VerdictIdentity::new)
+                .collect(),
         }
     }
 }
@@ -3794,7 +3798,11 @@ impl CandidateIdentity {
                 .iter()
                 .map(CommonModeRiskIdentity::new)
                 .collect(),
-            objections: candidate.objections.iter().map(ObjectionIdentity::new).collect(),
+            objections: candidate
+                .objections
+                .iter()
+                .map(ObjectionIdentity::new)
+                .collect(),
             counterevidence: candidate.counterevidence.clone(),
             unknowns: candidate.unknowns.clone(),
             assumptions: candidate.assumptions.clone(),
@@ -3908,7 +3916,8 @@ pub fn validate_candidate_digest(
         return Ok(());
     }
     Err(ConflictAnalysisError::Digest {
-        detail: "the carried candidate digest is not this candidate's recomputed identity".to_owned(),
+        detail: "the carried candidate digest is not this candidate's recomputed identity"
+            .to_owned(),
     })
 }
 
@@ -4113,13 +4122,7 @@ pub fn analyze_conflict(
         let mut positions: Vec<PositionAnalysis> = Vec::with_capacity(conflict_set.positions.len());
         let mut index = 0usize;
         while index < conflict_set.positions.len() {
-            positions.push(dispose_position(
-                index,
-                conflict_set,
-                supplements,
-                &classes,
-                &pairs,
-            ));
+            positions.push(dispose_position(index, conflict_set, &classes, &pairs));
             index = index.saturating_add(1);
         }
         let (groups, independent) = group_lineage(conflict_set, supplements);
@@ -4144,13 +4147,7 @@ pub fn analyze_conflict(
     let mut positions: Vec<PositionAnalysis> = Vec::with_capacity(conflict_set.positions.len());
     let mut index = 0usize;
     while index < conflict_set.positions.len() {
-        positions.push(dispose_position(
-            index,
-            conflict_set,
-            supplements,
-            &classes,
-            &pairs,
-        ));
+        positions.push(dispose_position(index, conflict_set, &classes, &pairs));
         index = index.saturating_add(1);
     }
     let (groups, independent) = group_lineage(conflict_set, supplements);
