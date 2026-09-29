@@ -766,7 +766,7 @@ pub struct LiveSkillWorld<'a> {
     pub tools: &'a dyn KnownTools,
 }
 
-impl<'a> LiveSkillWorld<'a> {
+impl LiveSkillWorld<'_> {
     pub fn validate(&self) -> Result<(), SkillError> {
         for dependency in self.current_dependencies {
             dependency.validate()?;
@@ -1389,31 +1389,20 @@ impl SkillCatalogue {
         skill_id: &str,
         receipt: &HotsetDeliveryReceipt,
         ack: &HotsetDeliveryAck,
-        tools: &dyn KnownTools,
-        current_dependencies: &[DependencyVersion],
-        live_host_version: &str,
-        live_profile_version: &str,
-        live_definition_version: &str,
+        world: &LiveSkillWorld<'_>,
     ) -> Result<ActivatedSkillDisplay, SkillError> {
         // Pre-serve sweep: persist drift marks before serving. The outcome
         // list is intentionally not served — refusals flow through the
         // existing gate and display paths below with their typed reasons.
-        let world = LiveSkillWorld {
-            current_dependencies,
-            live_host_version,
-            live_profile_version,
-            live_definition_version,
-            tools,
-        };
-        self.reconcile_staleness(&world)?;
+        self.reconcile_staleness(world)?;
         let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
         entry.validate()?;
         super::activation::gate_material_use(
             entry.status,
             &entry.dependencies,
-            current_dependencies,
+            world.current_dependencies,
         )?;
-        self.activation_display(skill_id, receipt, ack, tools)
+        self.activation_display(skill_id, receipt, ack, world.tools)
     }
 }
 
