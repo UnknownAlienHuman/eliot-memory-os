@@ -874,6 +874,13 @@ pub fn admit_canonical_write(
 /// task the admitted request names (the request-context task, or the envelope
 /// task when the context names none — the same value admission compared),
 /// never the evidence's own value.
+///
+/// Designated caller (STITCH, daemon composition lane): the pre-commit effect
+/// gate in `DaemonComposition::commit_canonical_and_refresh`
+/// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
+/// and the scope-sensitive trigger, passing the admitted request task, the
+/// envelope scope, the readiness fence as presented, and the live Governor
+/// kernel-snapshot fence as live.
 pub fn revalidate_task_bound_for_effect(
     evidence: &TaskSelectionEvidence,
     admitted_task_ref: Option<&str>,

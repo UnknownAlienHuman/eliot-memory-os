@@ -1111,36 +1111,6 @@ impl DaemonComposition {
                 "cold unbound observation candidate admitted at the daemon edge: durably retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
             );
         }
-        // Issue #1746 (W6/A5): the admitted task-bound identity carries its
-        // exact selection evidence into dispatch instead of a mutable ambient
-        // selection. Revalidate it here at the effect gate against the live
-        // Governor fence: a task, scope, or generation change between the
-        // bootstrap admission above and this commit conflicts for rebind
-        // (`TASK_SCOPE_INCOMPATIBLE`) instead of rebinding silently,
-        // duplicating the operation, or rewriting it under the old identity.
-        // The admitted task is the exact task the admitted request names —
-        // the request-context task, or the envelope task when the context
-        // names none — the same value admission compared, never the
-        // evidence's own value. Rejection changes nothing and reaches no
-        // owner; already possible effects keep their original identity.
-        if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(evidence) = &admission
-        {
-            let admitted_task_ref = identity
-                .request
-                .metadata
-                .task_id
-                .as_ref()
-                .map(|task| task.as_str())
-                .or_else(|| envelope.task_id.as_deref());
-            let live_fence = self.governor.kernel_snapshot().state_fence();
-            crate::task_binding_admission::revalidate_task_bound_for_effect(
-                evidence,
-                admitted_task_ref,
-                envelope.scope_id.as_str(),
-                readiness.fence,
-                &live_fence,
-            )?;
-        }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
         // any commit. The caller must supply the actual observed `WorkScope` and
         // source closure; the Governor never reconstructs identity from the

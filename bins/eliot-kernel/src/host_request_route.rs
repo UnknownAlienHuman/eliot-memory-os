@@ -3727,35 +3727,30 @@ pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
 
 /// Whether one requested capability is task-relative or effectful and
-/// therefore needs the exact applicable task binding (issue #1746, W1/W2).
+/// therefore needs the exact applicable task binding (issue #1746, W2).
 ///
-/// Frozen canonical-operation table (I7.8 steps 1-12: freeze against the
-/// accepted contracts, never gate every request identically):
+/// This is a fail-closed safe-capability allowlist. Unknown capabilities are
+/// task-relative until explicitly classified safe; host-request admission
+/// separately checks the capability against the current Kernel descriptor.
 ///
-/// - authenticated discovery / read-only, reachable without a selected task:
-///   `eliot.state` (session/scope/task-selection/bootstrap orientation) and
-///   `eliot.query` (bounded evidence reads);
-/// - safe raw capture, reachable without a task and granting no task effect:
-///   `eliot.observe` raw-capture suboperations (the task-relative
-///   `influence_ack` suboperation is re-resolved from the digest-linked tool
-///   bytes by [`check_observe_tool_linkage`], never inherited here) and
-///   `eliot.watchdog.intent.submit` (parentless observation submission);
-/// - task-relative / effectful, requiring the exact applicable task evidence
-///   (task, `WorkScope`, fence revision): `eliot.packet`,
-///   `eliot.task-controller`, `eliot.act`, `eliot.finish`, `skill.activate`,
-///   `skill.execute`, and every other capability, including an unclassified
-///   future name, which remains task-relative until an explicit safe
-///   classification exists.
-///
-/// Unauthenticated requests never gain these exceptions, and the `HostRequest`
-/// route provides no preselection access when activation returns
-/// `TaskSelectionRequired`. Host-request admission separately checks the
-/// capability against the current Kernel descriptor.
+/// - `eliot.packet` is `Packet`, classified `TaskRelativeEffectful` with
+///   `ExactApplicableTask`;
+/// - `skill.activate` and `skill.execute` activate or run a task-scoped skill,
+///   which is control/action work and needs the same exact task binding;
+/// - `eliot.state` and `eliot.query` are authenticated discovery/read-only and
+///   may omit task fields after a `Resolved` activation;
+/// - `eliot.observe` is resolved from its digest-linked suboperation: four
+///   kinds are safe raw capture and `influence_ack` is task-relative; and
+///   the Watchdog intent route is a parentless observation submission; and
+/// - every other capability, including an unclassified future name, remains
+///   task-relative until an explicit safe classification exists. The current
+///   `HostRequest` route does not provide preselection access when activation
+///   returns `TaskSelectionRequired`.
 fn host_request_capability_is_task_relative(capability: &str) -> bool {
-    match capability {
-        "eliot.state" | "eliot.query" | "eliot.observe" | "eliot.watchdog.intent.submit" => false,
-        _ => true,
-    }
+    !matches!(
+        capability,
+        "eliot.state" | "eliot.query" | "eliot.observe" | "eliot.watchdog.intent.submit"
+    )
 }
 
 /// Bound on queued observe pairs for the daemon observe poller.
