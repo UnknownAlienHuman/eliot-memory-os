@@ -4,6 +4,16 @@
 //! does not own PIDs, pipes, Job Objects, process health, route cutover, or
 //! Kernel operational recovery state. A generation admission is an immutable
 //! handoff to the Kernel Generation Registry; it is not activation authority.
+//!
+//! It also owns the declared invalidation graph
+//! ([`ModuleDependency::invalidation_triggers`]) and the versioned restart policy
+//! ([`ModuleManifest::restart_policy`]). [`ModuleCatalog::select_invalidation_dependents`]
+//! answers "which modules does replacing this one actually invalidate?" from
+//! those declared edges, and the answer is recorded on
+//! [`PreparedCatalogTransition::invalidated_dependents`] so the owner that
+//! performs the restart cannot substitute a different set. Selecting by startup
+//! order, by iteration order, or by "everything currently running" is the defect
+//! this module exists to prevent.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
@@ -756,6 +766,19 @@ pub struct PreparedCatalogTransition {
     pub canonical_request_digest: String,
     pub state_fence: StateFence,
     pub admission_contract_digest: String,
+    /// Dependents this transition invalidates, selected from the declared
+    /// invalidation edges of the affected module.
+    ///
+    /// It is recorded rather than left implicit so the operational owner
+    /// restarts exactly this set. It is empty for a change that replaces
+    /// nothing and is derived by selection, never supplied by a caller: a
+    /// caller-chosen list would be a copy of the caller's intent, not the
+    /// graph.
+    pub invalidated_dependents: Vec<ModuleId>,
+    /// The declared trigger the selection was made under. It is absent exactly
+    /// when no selection was made, so an empty set can never be read as "the
+    /// graph was consulted and found nothing" unless the trigger says so.
+    pub invalidation_trigger: Option<RestartInvalidationTrigger>,
     pub approval_refs: Vec<String>,
 }
 
@@ -777,7 +800,60 @@ impl PreparedCatalogTransition {
             .validate()
             .map_err(|error| ModuleError::Contract(error.to_string()))?;
         text(&self.idempotency_key, "idempotency_key")?;
+        unique(
+            self.invalidated_dependents.iter().cloned(),
+            "invalidated_dependents",
+        )?;
+        // A recorded dependent set without its trigger cannot be checked
+        // against the graph, so the two are admitted or refused together.
+        if self.invalidated_dependents.is_empty() != self.invalidation_trigger.is_none() {
+            return Err(ModuleError::InvalidField {
+                field: "invalidation_trigger",
+                reason: "the selected dependent set and its trigger must agree",
+            });
+        }
         unique(self.approval_refs.iter().cloned(), "approval_refs")?;
+        Ok(())
+    }
+
+    /// Checks the recorded dependent set against an expected set derived
+    /// independently from the declared invalidation edges.
+    ///
+    /// `expected` must be the graph's own answer, not a copy of
+    /// `self.invalidated_dependents`: this compares two separately derived sets
+    /// so a selection that quietly dropped a declared dependent, or swept in an
+    /// undeclared one, is caught. An absent trigger means nothing was selected
+    /// and the set must be empty.
+    pub fn verify_invalidation_dependents(
+        &self,
+        expected: &[ModuleId],
+    ) -> Result<(), ModuleError> {
+        if self.invalidation_trigger.is_none() {
+            return if self.invalidated_dependents.is_empty() {
+                Ok(())
+            } else {
+                Err(ModuleError::InvalidField {
+                    field: "invalidated_dependents",
+                    reason: "a set was recorded without a declared trigger",
+                })
+            };
+        }
+        let recorded: BTreeSet<&ModuleId> = self.invalidated_dependents.iter().collect();
+        let expected: BTreeSet<&ModuleId> = expected.iter().collect();
+        if recorded != expected {
+            return Err(ModuleError::InvalidField {
+                field: "invalidated_dependents",
+                reason: "the selected set does not match the declared invalidation edges",
+            });
+        }
+        // The subject is always in its own affected set: a module that does not
+        // join its own recovery was not selected at all.
+        if !recorded.contains(&self.module_id) {
+            return Err(ModuleError::InvalidField {
+                field: "invalidated_dependents",
+                reason: "the affected module is missing from its own dependent set",
+            });
+        }
         Ok(())
     }
 }
@@ -926,6 +1002,16 @@ impl ModuleCatalog {
         }
         let before = self.snapshot()?;
         let mut entry = self.entries.get(&request.module_id).cloned();
+        // Only a generation acceptance replaces a running module, so only it
+        // selects affected dependents. `Upsert` and `SetState` change desired
+        // state and invalidate nothing that is already running.
+        let mut invalidated_dependents = Vec::new();
+        let mut invalidation_trigger = None;
+        // The expected set is derived from the pre-transition graph, before the
+        // accepted generation is recorded. It is an independent derivation from
+        // the recorded one, so the verification below compares two answers
+        // rather than comparing the selection with itself.
+        let mut expected_dependents: Option<Vec<ModuleId>> = None;
         match &request.mutation {
             CatalogMutation::Upsert {
                 manifest,
@@ -1003,6 +1089,17 @@ impl ModuleCatalog {
                 current.catalog_revision = self.revision + 1;
                 current.state_fence = self.state_fence.clone();
                 current.validate()?;
+                // A new generation is a new protocol identity for this module,
+                // so every dependent that declared `RequiredProtocolDigestMismatch`
+                // on it is genuinely invalidated and must be recovered with it.
+                // The set is derived from the declared edges here; no caller
+                // supplies it, so it cannot be a copy of the caller's intent.
+                invalidated_dependents = self.select_invalidation_dependents(
+                    &request.module_id,
+                    RestartInvalidationTrigger::RequiredProtocolDigestMismatch,
+                )?;
+                invalidation_trigger =
+                    Some(RestartInvalidationTrigger::RequiredProtocolDigestMismatch);
                 entry = Some(current);
             }
         }
@@ -1021,9 +1118,25 @@ impl ModuleCatalog {
             canonical_request_digest: request.canonical_request_digest()?,
             state_fence: self.state_fence.clone(),
             admission_contract_digest: digest_value(&request.mutation)?,
+            invalidated_dependents,
+            invalidation_trigger,
             approval_refs: request.approval_refs.clone(),
         };
         prepared.validate()?;
+        // Re-derive the affected set from the post-transition graph and check the
+        // recorded selection against it. Two independent derivations of the same
+        // declared edges must agree, so a selection that dropped a declared
+        // dependent or swept in an undeclared one is refused before the
+        // transition is returned to its owner. The check cannot pass by
+        // comparing nothing: an empty selection is verified against an
+        // independently derived empty set, not skipped.
+        if let Some(trigger) = prepared.invalidation_trigger {
+            expected_dependents =
+                Some(self.select_invalidation_dependents(&request.module_id, trigger)?);
+        }
+        prepared.verify_invalidation_dependents(
+            expected_dependents.as_deref().unwrap_or_default(),
+        )?;
         Ok(prepared)
     }
 
