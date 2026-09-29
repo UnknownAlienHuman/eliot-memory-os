@@ -1712,39 +1712,7 @@ pub fn backup_verify(
                 );
             }
             apply_verify_evidence(&mut outcome, &evidence);
-            // The owner did prove this archive's identity and class at every
-            // level it names, so both are reported exactly as answered. The
-            // match is on the TYPED level and is exhaustive over
-            // [`VerifyProofLevel`], so a level added to the vocabulary is a
-            // compile error here rather than a silently unhandled state.
-            match evidence.level {
-                VerifyProofLevel::ProvenanceBound | VerifyProofLevel::ClassQualified => {
-                    BACKUP_STATE_VERIFIED.clone_into(&mut outcome.state);
-                    outcome.proof_level = BackupStage::Verified;
-                    outcome.reason = format!(
-                        "owner accepted verification level {} with class ceiling {}; backup existence is not recovery proof, so rehearse the isolated restore before treating it as a recovery point",
-                        evidence.level.wire_name(),
-                        evidence.class_ceiling.wire_name()
-                    );
-                }
-                VerifyProofLevel::StructuralCandidate => {
-                    // The proven level deliberately stays
-                    // [`BackupStage::Requested`]: a structurally valid
-                    // archive without retained capture provenance is an
-                    // untrusted candidate, and naming the exact absent owner
-                    // obligation keeps that gap explicit.
-                    BACKUP_STATE_CANDIDATE.clone_into(&mut outcome.state);
-                    outcome.missing_obligations = vec![
-                        "retained capture artifact handle and owner-issued publication receipt (no artifact owner issues one on this path)"
-                            .to_owned(),
-                    ];
-                    outcome.reason = format!(
-                        "owner reported structural candidate level {} with class ceiling {} and no retained capture provenance; the archive is an untrusted candidate, not a verified recovery point",
-                        evidence.level.wire_name(),
-                        evidence.class_ceiling.wire_name()
-                    );
-                }
-            }
+            apply_verified_level(&mut outcome, &evidence);
             outcome.next_reconciliation =
                 next_action(&outcome.state, BACKUP_VERIFY_OPERATION, &operation_id);
         }
@@ -2189,6 +2157,42 @@ fn apply_verify_evidence(outcome: &mut BackupOperationOutcome, evidence: &Verify
 /// outcome reports [`BACKUP_STATE_REFUSED`], names the exact owner evidence the
 /// claim needed as its one missing obligation, carries the bounded reason, and
 /// keeps the same operation identity for same-operation reconciliation. The
+/// Projects the owner's own verified level onto the outcome.
+///
+/// The owner proved this archive's identity and class at every level it names, so
+/// both are reported exactly as answered. The match is on the TYPED level and is
+/// exhaustive over [`VerifyProofLevel`], so a level added to the vocabulary is a
+/// compile error here rather than a silently unhandled state.
+fn apply_verified_level(outcome: &mut BackupOperationOutcome, evidence: &VerifyEvidence<'_>) {
+    match evidence.level {
+        VerifyProofLevel::ProvenanceBound | VerifyProofLevel::ClassQualified => {
+            BACKUP_STATE_VERIFIED.clone_into(&mut outcome.state);
+            outcome.proof_level = BackupStage::Verified;
+            outcome.reason = format!(
+                "owner accepted verification level {} with class ceiling {}; backup existence is not recovery proof, so rehearse the isolated restore before treating it as a recovery point",
+                evidence.level.wire_name(),
+                evidence.class_ceiling.wire_name()
+            );
+        }
+        VerifyProofLevel::StructuralCandidate => {
+            // The proven level deliberately stays [`BackupStage::Requested`]: a
+            // structurally valid archive without retained capture provenance is an
+            // untrusted candidate, and naming the exact absent owner obligation
+            // keeps that gap explicit.
+            BACKUP_STATE_CANDIDATE.clone_into(&mut outcome.state);
+            outcome.missing_obligations = vec![
+                "retained capture artifact handle and owner-issued publication receipt (no artifact owner issues one on this path)"
+                    .to_owned(),
+            ];
+            outcome.reason = format!(
+                "owner reported structural candidate level {} with class ceiling {} and no retained capture provenance; the archive is an untrusted candidate, not a verified recovery point",
+                evidence.level.wire_name(),
+                evidence.class_ceiling.wire_name()
+            );
+        }
+    }
+}
+
 /// routed `command` is the caller's own declaration and the operation selector
 /// is read back from the outcome that is being refused, so a refusal can never
 /// be reported under another operation's identity or name. No claimed evidence
