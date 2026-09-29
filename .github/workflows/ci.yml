@@ -64,36 +64,71 @@ jobs:
       - name: Run MergeCompile verification profile
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile
-  recovery-inputs:
-    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'read exact kernel recovery inputs') }}
+  recovery-verify:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run recovered kernel patch verification') }}
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: 581a834a0fb30e94c84f261cd11e63de0897ef56
           fetch-depth: 1
           persist-credentials: false
-      - name: Acquire pinned read-only input collector
+      - name: Acquire exact reviewed inputs
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $sha='bcb16eb1ffb12c7d52ed9306428edc8a3f13ccf5'
           $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json'}
-          $blob=Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$sha" -Headers $headers
-          $path=Join-Path $env:RUNNER_TEMP 'kernel-recovery-read.py'
-          [IO.File]::WriteAllBytes($path,[Convert]::FromBase64String($blob.content))
-          if ((((git hash-object --no-filters $path)|Out-String).Trim()) -ne $sha) { throw 'Collector identity mismatch' }
-      - name: Collect source and verified documentation without credentials
+          $root=Join-Path $env:RUNNER_TEMP 'kernel-recovery-candidate-inputs'
+          New-Item -ItemType Directory -Path $root -Force|Out-Null
+          $inputs=@('bb83a9d1a300d86ec6ffa5cc324c1922204f56ea','95f68951586a02bf1c3b7fc764531e0175206740','5a57793a2967c5cceae4c59073bddb6eab30c883','25b7d5cc291f06e436439d3b63856fb12d3b4b8d','0217c7d4f4d34d2ff98ee3d4d778069e1d09ae80','ca0ebf8b950501c0b5f279c05ea6791ac459aef6','5f3c26da4fd95ed028742ea24ca95f1d041f2702','4e86c6c9a8655a71d99ada8ec5cf52c43822cd3e')
+          foreach ($sha in $inputs) {
+            $blob=Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$sha" -Headers $headers
+            $path=Join-Path $root $sha
+            [IO.File]::WriteAllBytes($path,[Convert]::FromBase64String($blob.content))
+            if ((((git hash-object --no-filters $path)|Out-String).Trim()) -ne $sha) { throw 'Input identity mismatch' }
+          }
+      - name: Verify exact candidate without credentials
         shell: pwsh
         run: |
-          python (Join-Path $env:RUNNER_TEMP 'kernel-recovery-read.py')
+          python (Join-Path $env:RUNNER_TEMP 'kernel-recovery-candidate-inputs/bb83a9d1a300d86ec6ffa5cc324c1922204f56ea')
           exit $LASTEXITCODE
+      - name: Preserve verified candidate blobs without changing a ref
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'kernel-recovery-verification'
+          $summary=Join-Path $root 'summary.json'
+          if (-not (Test-Path $summary)) { exit 0 }
+          $s=Get-Content $summary -Raw|ConvertFrom-Json
+          $allowed=@('bins/eliot-kernel/src/dispatch_launch.rs','bins/eliot-kernel/src/dreamer_job_dispatch.rs','bins/eliot-kernel/src/host_request_route.rs','bins/eliot-kernel/src/hot_path_runtime.rs','bins/eliot-kernel/src/tests.rs','crates/foundation/eliot-runtime-contracts/src/hot_path.rs','crates/foundation/eliot-runtime-contracts/tests/hot_path_queue_binding.rs','crates/kernel/eliot-platform-windows/src/lib.rs')
+          $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json'}
+          $published=@{}
+          foreach ($p in $s.candidate_files.PSObject.Properties) {
+            if ($allowed -cnotcontains $p.Name) { throw 'Unexpected path' }
+            $path=Join-Path (Join-Path $root 'candidate') $p.Name
+            $expected=$p.Value.git_blob
+            if ((((git hash-object --no-filters $path)|Out-String).Trim()) -ne $expected) { throw 'Changed candidate bytes' }
+            $body=@{encoding='base64';content=[Convert]::ToBase64String([IO.File]::ReadAllBytes($path))}|ConvertTo-Json -Compress
+            $response=Invoke-RestMethod -Method Post -Uri 'https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs' -Headers $headers -ContentType 'application/json' -Body $body
+            if ($response.sha -ne $expected) { throw 'Published blob mismatch' }
+            $published[$p.Name]=$response.sha
+          }
+          $published|ConvertTo-Json|Set-Content (Join-Path $root 'published-blobs.json')
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
         with:
-          name: kernel-recovery-inputs-581a834a
-          path: ${{ runner.temp }}/kernel-recovery-read/
+          name: kernel-recovery-verification-581a834a
+          path: |
+            ${{ runner.temp }}/kernel-recovery-verification/*.json
+            ${{ runner.temp }}/kernel-recovery-verification/*.log
+            ${{ runner.temp }}/kernel-recovery-verification/*.md
+            ${{ runner.temp }}/kernel-recovery-verification/*.patch
+            ${{ runner.temp }}/kernel-recovery-verification/candidate/
           if-no-files-found: error
           retention-days: 5
