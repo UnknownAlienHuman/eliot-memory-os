@@ -1713,6 +1713,426 @@ impl Drop for HostOwnerLease {
     }
 }
 
+/// Prefix for the cross-process exclusive Kernel owner object.
+///
+/// The object is keyed by installation *and* activation identity, so two
+/// Kernels launched for two different activations of one installation use two
+/// different objects, while a second process claiming the same activation
+/// contour collides with the object the first process created.
+pub const KERNEL_OWNER_MUTEX_PREFIX: &str = "Global\\Eliot-Kernel-Owner-";
+
+/// Canonical failure disposition for one activation's exclusive Kernel owner
+/// object.
+///
+/// I14.16 requires the replacement Kernel to hold this object exclusively
+/// before Host may mark it active, and requires Host to observe the retired
+/// contour's object released before it issues the activation nonce. Only the
+/// process that created the object owns it; a pre-existing object is never
+/// permission to proceed, and an unclassifiable result is never a release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelOwnerLeaseError {
+    /// A pre-existing named object cannot be trusted without a DACL proof, and
+    /// a process that already owns a different contour may not take a second
+    /// one. Neither is permission to proceed.
+    ExistingObject,
+    /// Windows could not classify the owner state; recovery is required.
+    OwnershipUncertain { win32_error: u32 },
+    /// Creation failed before ownership could be classified.
+    CreationFailed { win32_error: u32 },
+    /// This primitive is intentionally unavailable off Windows.
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for KernelOwnerLeaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExistingObject => {
+                formatter.write_str("Kernel owner object already exists; refusing ownership")
+            }
+            Self::OwnershipUncertain { win32_error } => {
+                write!(formatter, "Kernel owner state is uncertain (Win32 error {win32_error})")
+            }
+            Self::CreationFailed { win32_error } => {
+                write!(formatter, "Kernel owner creation failed (Win32 error {win32_error})")
+            }
+            Self::UnsupportedPlatform => {
+                formatter.write_str("exclusive Kernel ownership requires Windows")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KernelOwnerLeaseError {}
+
+/// Failure returned when an explicit Kernel owner release cannot classify its
+/// `ReleaseMutex`/`CloseHandle` effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelOwnerLeaseReleaseError {
+    /// Releasing mutex ownership failed; the handle is retained.
+    ReleaseMutex { win32_error: u32 },
+    /// Closing the owner handle failed after ownership was released.
+    CloseHandle { win32_error: u32 },
+    /// This primitive is intentionally unavailable off Windows.
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for KernelOwnerLeaseReleaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReleaseMutex { win32_error } => {
+                write!(formatter, "Kernel owner ReleaseMutex failed (Win32 error {win32_error})")
+            }
+            Self::CloseHandle { win32_error } => {
+                write!(formatter, "Kernel owner CloseHandle failed (Win32 error {win32_error})")
+            }
+            Self::UnsupportedPlatform => {
+                formatter.write_str("exclusive Kernel owner release requires Windows")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KernelOwnerLeaseReleaseError {}
+
+/// Returns the canonical named object for one installation/activation pair.
+///
+/// Neither identity enters the object-manager name verbatim. `SHA-256` keeps
+/// the name deterministic across the Host and Kernel processes that must agree
+/// on it while avoiding truncation or collisions from operator-supplied text.
+#[must_use]
+pub fn kernel_owner_mutex_name(
+    installation: &PlatformHandle,
+    activation: &PlatformHandle,
+) -> String {
+    let digest =
+        Sha256::digest(format!("{}:{}", installation.as_str(), activation.as_str()).as_bytes());
+    let mut suffix = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{KERNEL_OWNER_MUTEX_PREFIX}{suffix}")
+}
+
+/// Shared in-process authority gate between one Kernel owner lease and every
+/// capability derived from it.
+#[derive(Debug, Default)]
+struct KernelOwnerAuthority {
+    gate: Mutex<()>,
+    revoked: AtomicBool,
+    installation: Option<PlatformHandle>,
+    activation: Option<PlatformHandle>,
+}
+
+/// Process-owned exclusive Kernel owner object for one activation contour.
+///
+/// This is the operating-system half of the I14.16 side-by-side cutover: the
+/// object is created by exactly one process, and every other process that
+/// asks for the same installation/activation pair is refused. It is not a
+/// durable record and grants no authority by itself; it only makes two Kernels
+/// holding the same activation contour unrepresentable, and it disappears when
+/// the owning process exits.
+pub struct KernelOwnerLease {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    owns: bool,
+    name: String,
+    authority: Arc<KernelOwnerAuthority>,
+}
+
+/// Compile-time proof that this process created and still owns one exact
+/// activation's Kernel owner object.
+///
+/// The field is private and the only constructor is
+/// [`KernelOwnerLease::owner_capability`], so a consumer can carry the proof
+/// across crate boundaries but cannot forge or deserialize one.
+#[derive(Debug)]
+pub struct KernelOwnerCapability {
+    authority: Arc<KernelOwnerAuthority>,
+}
+
+/// Opaque live guard held while a consumer proves it still owns the object.
+#[must_use]
+pub struct KernelOwnerGuard<'a> {
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl KernelOwnerCapability {
+    /// Returns whether this capability was minted for one exact
+    /// installation/activation contour. The comparison uses the retained
+    /// owner identities, never caller-supplied name text.
+    #[must_use]
+    pub fn is_for(&self, installation: &PlatformHandle, activation: &PlatformHandle) -> bool {
+        self.authority.installation.as_ref() == Some(installation)
+            && self.authority.activation.as_ref() == Some(activation)
+    }
+
+    /// Acquires a live guard while this capability is still backed by its
+    /// unreleased owner object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WindowsAdapterError::IdentityMismatch`] once the object has
+    /// been released or dropped, or when the authority gate is poisoned.
+    pub fn live_guard(&self) -> Result<KernelOwnerGuard<'_>, WindowsAdapterError> {
+        let gate = self
+            .authority
+            .gate
+            .lock()
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        if self.authority.revoked.load(Ordering::Acquire) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(KernelOwnerGuard { _gate: gate })
+    }
+}
+
+impl KernelOwnerLease {
+    /// Creates and owns the canonical object for one activation contour.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the object already exists, when creation or
+    /// ownership classification fails, or when the platform is unsupported.
+    pub fn acquire(
+        installation: &PlatformHandle,
+        activation: &PlatformHandle,
+    ) -> Result<Self, KernelOwnerLeaseError> {
+        Self::create(
+            kernel_owner_mutex_name(installation, activation),
+            Some((installation.clone(), activation.clone())),
+        )
+    }
+
+    /// Creates and owns one exact named object.
+    ///
+    /// The name is never normalized or extended. A pre-existing object is
+    /// closed immediately and reported as [`KernelOwnerLeaseError::ExistingObject`];
+    /// it is never waited on and never treated as permission to proceed,
+    /// because its DACL and ownership history are not independently verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the object already exists, when creation or
+    /// ownership classification fails, or when the platform is unsupported.
+    pub fn acquire_named(name: &str) -> Result<Self, KernelOwnerLeaseError> {
+        Self::create(name.to_owned(), None)
+    }
+
+    fn create(
+        name: String,
+        identity: Option<(PlatformHandle, PlatformHandle)>,
+    ) -> Result<Self, KernelOwnerLeaseError> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{
+                ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError,
+            };
+            use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+            use windows_sys::Win32::System::Threading::CreateMutexW;
+
+            let wide_name = nul_terminated_wide(std::ffi::OsStr::new(&name)).map_err(|_| {
+                KernelOwnerLeaseError::CreationFailed {
+                    win32_error: ERROR_INVALID_PARAMETER,
+                }
+            })?;
+            let descriptor = OwnedSecurityDescriptor::for_kernel_owner().map_err(|_| {
+                KernelOwnerLeaseError::CreationFailed {
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
+                    win32_error: unsafe { GetLastError() },
+                }
+            })?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).map_err(
+                    |_| KernelOwnerLeaseError::CreationFailed {
+                        win32_error: ERROR_INVALID_PARAMETER,
+                    },
+                )?,
+                lpSecurityDescriptor: descriptor.raw,
+                bInheritHandle: 0,
+            };
+            // SAFETY: `wide_name`, `descriptor`, and `attributes` remain live
+            // for the complete CreateMutexW call.  The returned handle is
+            // transferred to this RAII owner exactly once.
+            let handle = unsafe { CreateMutexW(&raw const attributes, 1, wide_name.as_ptr()) };
+            // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+            // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+            // dereference.
+            let creation_error = unsafe { GetLastError() };
+            if handle.is_null() {
+                return Err(KernelOwnerLeaseError::CreationFailed {
+                    win32_error: creation_error,
+                });
+            }
+            let mut created = Self {
+                handle,
+                owns: true,
+                name,
+                authority: Arc::new(KernelOwnerAuthority {
+                    installation: identity.as_ref().map(|(installation, _)| installation.clone()),
+                    activation: identity.as_ref().map(|(_, activation)| activation.clone()),
+                    ..KernelOwnerAuthority::default()
+                }),
+            };
+            match creation_error {
+                0 => Ok(created),
+                ERROR_ALREADY_EXISTS => {
+                    // Never wait on or join an object this process did not create.
+                    // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+                    // a successful CreateMutexW; return checked for ownership uncertainty; no double close and no use
+                    // after close.
+                    let closed = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
+                    let close_error = unsafe { GetLastError() };
+                    created.owns = false;
+                    created.handle = std::ptr::null_mut();
+                    drop(created);
+                    if closed == 0 {
+                        Err(KernelOwnerLeaseError::OwnershipUncertain {
+                            win32_error: close_error,
+                        })
+                    } else {
+                        Err(KernelOwnerLeaseError::ExistingObject)
+                    }
+                }
+                win32_error => {
+                    // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+                    // a successful CreateMutexW; return checked for ownership uncertainty; no double close and no use
+                    // after close.
+                    let closed = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
+                    let close_error = unsafe { GetLastError() };
+                    created.owns = false;
+                    created.handle = std::ptr::null_mut();
+                    drop(created);
+                    if closed == 0 {
+                        Err(KernelOwnerLeaseError::OwnershipUncertain {
+                            win32_error: close_error,
+                        })
+                    } else {
+                        Err(KernelOwnerLeaseError::OwnershipUncertain { win32_error })
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            let _ = identity;
+            Err(KernelOwnerLeaseError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the exact canonical object name held by this lease.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns whether this lease was created for one exact
+    /// installation/activation contour.
+    #[must_use]
+    pub fn is_for(&self, installation: &PlatformHandle, activation: &PlatformHandle) -> bool {
+        self.name == kernel_owner_mutex_name(installation, activation)
+    }
+
+    /// Returns a compile-time ownership proof while this lease is held.
+    #[must_use]
+    pub fn owner_capability(&self) -> KernelOwnerCapability {
+        KernelOwnerCapability {
+            authority: Arc::clone(&self.authority),
+        }
+    }
+
+    /// Releases the owner object.
+    ///
+    /// A failed `ReleaseMutex` retains both ownership state and the handle so
+    /// a later retry can still be classified. Callers must finalize clean
+    /// state only after `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when releasing or closing the object fails, or
+    /// when this operation is unavailable on the current platform.
+    pub fn release(&mut self) -> Result<(), KernelOwnerLeaseReleaseError> {
+        // Serialize revocation with every derived ownership proof. A poisoned
+        // gate is still recovered so the capability is revoked before the OS
+        // object is touched.
+        let _gate = self
+            .authority
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.authority.revoked.store(true, Ordering::Release);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+            use windows_sys::Win32::System::Threading::ReleaseMutex;
+            if self.handle.is_null() {
+                return Ok(());
+            }
+            // SAFETY: ReleaseMutex releases the owned mutex handle while it remains valid until CloseHandle;
+            // this strand holds ownership after fresh creation; return checked; no release of an abandoned or
+            // foreign handle.
+            if self.owns && unsafe { ReleaseMutex(self.handle) } == 0 {
+                return Err(KernelOwnerLeaseReleaseError::ReleaseMutex {
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
+                    win32_error: unsafe { GetLastError() },
+                });
+            }
+            self.owns = false;
+            // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+            // a successful CreateMutexW; return checked; no double close and no use after close.
+            if unsafe { CloseHandle(self.handle) } == 0 {
+                return Err(KernelOwnerLeaseReleaseError::CloseHandle {
+                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                    // dereference.
+                    win32_error: unsafe { GetLastError() },
+                });
+            }
+            self.handle = std::ptr::null_mut();
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(KernelOwnerLeaseReleaseError::UnsupportedPlatform)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KernelOwnerLease {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        let _gate = self
+            .authority
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.authority.revoked.store(true, Ordering::Release);
+        if self.handle.is_null() {
+            return;
+        }
+        if self.owns {
+            // SAFETY: this process owns the object after fresh creation; the
+            // handle remains valid until CloseHandle.
+            let _ = unsafe { ReleaseMutex(self.handle) };
+        }
+        // SAFETY: this wrapper uniquely owns the handle until Drop.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
 /// Returns the stable identity of one existing regular file without following
 /// a reparse point.
 ///
@@ -2153,6 +2573,15 @@ impl OwnedSecurityDescriptor {
     }
 
     fn for_host_owner() -> Result<Self, WindowsAdapterError> {
+        Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+    }
+
+    /// Exact protected DACL for the cross-process exclusive Kernel owner
+    /// object.  It is the same principal set as the Host owner object because
+    /// both supervised services run under the same service-account family, and
+    /// Kernel ownership of an activation contour must stay unreachable from an
+    /// unprivileged interactive principal.
+    fn for_kernel_owner() -> Result<Self, WindowsAdapterError> {
         Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
     }
 

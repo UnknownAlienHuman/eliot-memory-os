@@ -689,6 +689,15 @@ pub struct KernelComposition {
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
     supervision_lease_authority: Option<Arc<KernelSupervisionLeaseAuthority>>,
+    /// I14.16 side-by-side cutover: the exclusive Kernel owner object for the
+    /// exact installation/activation contour Host bound to this process. It is
+    /// created when Host reconciles the candidate - before any authority
+    /// exists - and is held for the process lifetime, so a second Kernel
+    /// claiming the same contour cannot also create it. `None` before that
+    /// reconcile; the composition is a shadow candidate with zero authority
+    /// until then.
+    #[cfg(windows)]
+    kernel_owner: Mutex<Option<eliot_platform_windows::KernelOwnerLease>>,
     /// The atomically retained Host-approved bridge profile and its protected
     /// declaration, if the active candidate supplied one.
     #[cfg(windows)]

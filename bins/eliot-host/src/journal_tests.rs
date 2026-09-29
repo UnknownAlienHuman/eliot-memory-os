@@ -339,7 +339,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
             authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
-    driver.handoff_prepared()?;
+    driver.handoff_prepared(None)?;
     driver.prior_disposition_committed()?;
     let permit = driver.issue_nonce(&candidate, ResourceGeneration::genesis())?;
     driver.activating()?;
@@ -2878,7 +2878,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
             authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
-    driver.handoff_prepared()?;
+    driver.handoff_prepared(None)?;
     driver.prior_disposition_committed()?;
     let permit = driver.issue_nonce(&candidate, ResourceGeneration::genesis())?;
     driver.activating()?;
