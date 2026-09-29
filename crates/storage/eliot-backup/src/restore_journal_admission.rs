@@ -35,11 +35,16 @@
 //!   with is written by the existing compare-and-swap, not here.
 //!
 //! Existence and shape prove nothing. [`RestoreJournalAdmission::binds_owner_record`]
-//! re-reads both the durable journal and the owner's record for the exact
-//! operation this plan names, and requires exact agreement on the owner
-//! binding, the database, the installation, the generation, the journal
-//! identity and the receipt, so an admission that is well formed but borrowed
-//! from a different operation or installation fails closed.
+//! re-reads the owner's own record for the exact operation this plan names and
+//! requires exact agreement on the owner binding, the database, the
+//! installation, the generation, the journal identity, the receipt and the
+//! transaction, so an admission that is well formed but borrowed from a
+//! different operation or installation fails closed.
+//!
+//! The live journal is a corroboration of that record, not a substitute for it.
+//! When a row already exists under this operation's key it must carry this
+//! transaction; a fresh operation has none, because the engine creates it when
+//! the engine starts. The primary proof is always the owner's durable record.
 //!
 //! This crate supplies no owner of its own. The durable owner of a restore
 //! journal is the composition that holds that journal together with the
@@ -99,8 +104,9 @@ pub struct DurableJournalRecord {
 /// implementation must answer from its own persisted state, read at call time,
 /// for the journal identity the plan derives. An implementation that echoes a
 /// presented value is not an owner, and the binding check below will not rescue
-/// it: the check compares that answer against the durable journal row, so a
-/// value that was never committed to that row cannot agree with it.
+/// it: the check compares that answer, transaction included, against a second
+/// read of the same owner, so a value that was never committed durably cannot
+/// agree with itself across the two reads of a live store.
 pub trait RestoreJournalAdmissionOwner {
     /// Reads the owner's durable journal record for `journal_key`.
     ///
