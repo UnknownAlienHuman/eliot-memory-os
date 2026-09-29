@@ -45,6 +45,249 @@ pub const MAX_HOST_REQUEST_SEND_ATTEMPTS: usize = 2;
 /// timeout; expiry moves an uncertain claim to reconciliation and never frees
 /// it for another send.
 pub const HOST_REQUEST_SEND_CLAIM_LEASE_MS: u64 = 30_000;
+
+/// Versioned canonical ToolRequest schema retained for recoverable Observe
+/// execution. The bridge and Kernel both validate this identity before staging.
+pub const HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
+
+/// Hard ceiling for one complete retained executable ToolRequest.
+pub const MAX_HOST_REQUEST_EXECUTABLE_INPUT_BYTES: u64 = 64 * 1024;
+
+/// Current version of the encrypted executable-input carrier on a host request.
+pub const HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION: u16 = 1;
+
+/// Stable encoding used by the retained executable-input carrier.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestExecutableInputEncoding {
+    /// Canonical JSON bytes from the shared `ToolRequest` contract.
+    CanonicalJsonV1,
+}
+
+/// Protected canonical ToolRequest bytes and their exact admitted binding.
+///
+/// The clear fields are bounded identities/digests only. The exact request
+/// bytes remain inside the existing protected recovery envelope; the
+/// commitment binds those bytes' digest and encoding to the durable request,
+/// principal, authenticated peer, Session/scope/task, fence, deadline and
+/// cancellation identity already held by the HostRequest row.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestExecutableInput {
+    pub contract_version: u16,
+    pub schema_id: OpaqueLabel,
+    pub encoding: HostRequestExecutableInputEncoding,
+    pub payload_length: u64,
+    pub payload_sha256: String,
+    /// SID actually observed by the Kernel for the admitted bridge peer.
+    pub authenticated_principal_ref: OpaqueLabel,
+    /// Windows interactive session observed on the admitted peer token.
+    pub authenticated_host_session_id: u32,
+    pub descriptor_sha256: String,
+    pub peer_admission_receipt_sha256: String,
+    /// Stable digest of the request and origin binding plus protected envelope.
+    pub commitment_sha256: String,
+    /// Exact ToolRequest bytes protected for the current Windows user.
+    pub protected_payload: RecoveryPayloadEnvelope,
+}
+
+#[derive(Serialize)]
+struct HostRequestExecutableInputCommitment<'a> {
+    domain: &'static str,
+    operation_id: &'a OperationIdentity,
+    kind: &'a HostRequestKind,
+    request_id: &'a OpaqueLabel,
+    correlation_projection: &'a Option<eliot_contracts::HostCorrelationProjection>,
+    idempotency_key: &'a OpaqueLabel,
+    cancellation_id: &'a OpaqueLabel,
+    parent_operation_id: &'a Option<OpaqueLabel>,
+    request_digest: &'a str,
+    payload_digest: &'a str,
+    connection_ref: &'a OpaqueLabel,
+    session_ref: &'a Option<OpaqueLabel>,
+    task_ref: &'a Option<OpaqueLabel>,
+    scope_ref: &'a Option<OpaqueLabel>,
+    capability_ref: &'a OpaqueLabel,
+    fence_digest: &'a str,
+    authority_epoch: &'a EpochId,
+    generation: u64,
+    deadline_unix_ms: u64,
+    schema_id: &'a OpaqueLabel,
+    encoding: HostRequestExecutableInputEncoding,
+    payload_length: u64,
+    payload_sha256: &'a str,
+    authenticated_principal_ref: &'a OpaqueLabel,
+    authenticated_host_session_id: u32,
+    descriptor_sha256: &'a str,
+    peer_admission_receipt_sha256: &'a str,
+    privacy_and_visibility_class: &'a RecoveryAccessClass,
+    protected_payload_sha256: &'a str,
+    protected_payload_length: u64,
+    protected_payload_key: &'a SecretReference,
+    protected_payload_created_at_ms: i64,
+    protected_payload_known_at_ms: i64,
+    protected_payload_expires_at_ms: Option<i64>,
+}
+
+impl HostRequestExecutableInput {
+    /// Computes the stable input commitment over one exact durable request row.
+    pub fn computed_commitment_sha256(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<String, OrsError> {
+        let RecoveryPayload::Encrypted { key, .. } = &self.protected_payload.payload else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_executable_input_payload",
+                reason: "executable input requires an encrypted recovery payload",
+            });
+        };
+        let material = HostRequestExecutableInputCommitment {
+            domain: "eliot.host-request.executable-input.v1",
+            operation_id: &record.operation_id,
+            kind: &record.kind,
+            request_id: &record.request_id,
+            correlation_projection: &record.correlation_projection,
+            idempotency_key: &record.idempotency_key,
+            cancellation_id: &record.cancellation_id,
+            parent_operation_id: &record.parent_operation_id,
+            request_digest: &record.request_digest,
+            payload_digest: &record.payload_digest,
+            connection_ref: &record.connection_ref,
+            session_ref: &record.session_ref,
+            task_ref: &record.task_ref,
+            scope_ref: &record.scope_ref,
+            capability_ref: &record.capability_ref,
+            fence_digest: &record.fence_digest,
+            authority_epoch: &record.authority_epoch,
+            generation: record.generation,
+            deadline_unix_ms: record.deadline_unix_ms,
+            schema_id: &self.schema_id,
+            encoding: self.encoding,
+            payload_length: self.payload_length,
+            payload_sha256: &self.payload_sha256,
+            authenticated_principal_ref: &self.authenticated_principal_ref,
+            authenticated_host_session_id: self.authenticated_host_session_id,
+            descriptor_sha256: &self.descriptor_sha256,
+            peer_admission_receipt_sha256: &self.peer_admission_receipt_sha256,
+            privacy_and_visibility_class: &self
+                .protected_payload
+                .privacy_and_visibility_class,
+            protected_payload_sha256: &self.protected_payload.payload_sha256,
+            protected_payload_length: self.protected_payload.payload_length,
+            protected_payload_key: key,
+            protected_payload_created_at_ms: self.protected_payload.created_at_ms,
+            protected_payload_known_at_ms: self.protected_payload.known_at_ms,
+            protected_payload_expires_at_ms: self.protected_payload.expires_at_ms,
+        };
+        let bytes = canonical_json_bytes(&material)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Validates an executable input against the exact HostRequest row.
+    pub fn validate_for_record(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        if record.kind != HostRequestKind::Invocation
+            || record.capability_ref.as_str() != "eliot.observe"
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_executable_input_owner",
+                reason: "the protected executable-input carrier is reserved for Observe invocations",
+            });
+        }
+        if self.contract_version != HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION {
+            return Err(OrsError::InvalidField {
+                field: "host_request_executable_input_contract_version",
+                reason: "unsupported executable-input contract version",
+            });
+        }
+        if self.schema_id.as_str() != HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID
+            || self.encoding != HostRequestExecutableInputEncoding::CanonicalJsonV1
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_executable_input_schema",
+                reason: "unsupported ToolRequest schema or encoding",
+            });
+        }
+        if self.payload_length == 0
+            || self.payload_length > MAX_HOST_REQUEST_EXECUTABLE_INPUT_BYTES
+            || self.payload_digest_mismatch(record)
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_executable_input_payload",
+                reason: "payload size or HostRequest digest binding is invalid",
+            });
+        }
+        validate_digest(
+            &self.payload_sha256,
+            "host_request_executable_input_payload_sha256",
+        )?;
+        validate_text(
+            self.authenticated_principal_ref.as_str(),
+            "host_request_executable_input_principal",
+        )?;
+        validate_digest(
+            &self.descriptor_sha256,
+            "host_request_executable_input_descriptor_sha256",
+        )?;
+        validate_digest(
+            &self.peer_admission_receipt_sha256,
+            "host_request_executable_input_peer_receipt_sha256",
+        )?;
+        validate_digest(
+            &self.commitment_sha256,
+            "host_request_executable_input_commitment_sha256",
+        )?;
+
+        self.protected_payload.validate()?;
+        let protected = &self.protected_payload;
+        if protected.operation_or_checkpoint_id != record.operation_id
+            || protected.write_binding.is_some()
+            || protected.expires_at_ms.is_some()
+            || protected.privacy_and_visibility_class.privacy != PrivacyClass::Secret
+            || protected.privacy_and_visibility_class.visibility.as_str() != "owner-only"
+            || protected.privacy_and_visibility_class.instruction_taint
+                != InstructionTaint::CommandLike
+            || !matches!(&protected.payload, RecoveryPayload::Encrypted { .. })
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "host_request_executable_input",
+                reason: "protected payload owner, privacy, or operation binding differs".to_owned(),
+            });
+        }
+        protected
+            .state_fence
+            .validate_against_epoch(&record.authority_epoch)?;
+        if protected.authority_epoch.current.lineage_id.as_str()
+            != record.authority_epoch.lineage_id.as_str()
+            || protected.authority_epoch.current.epoch != record.authority_epoch.sequence.get()
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        let recovered_fence: StateFence = serde_json::from_str(&protected.state_fence.canonical_json)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let fence_bytes = serde_json::to_vec(&recovered_fence)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&fence_bytes) != record.fence_digest
+            || recovered_fence.authority_epoch != record.authority_epoch
+            || recovered_fence.resource_generation.value() != record.generation
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if self.computed_commitment_sha256(record)? != self.commitment_sha256 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "host_request_executable_input",
+                reason: "input commitment does not bind this request and protected payload".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn payload_digest_mismatch(&self, record: &HostRequestRecord) -> bool {
+        record.payload_digest != self.payload_sha256
+            || self.protected_payload.payload_length == 0
+            || self.protected_payload.payload_sha256.is_empty()
+    }
+}
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A validated opaque label that carries no semantic authority.
@@ -1894,7 +2137,7 @@ impl EpochIdentity {
 }
 
 /// Opaque payload representation. ORS owns neither keys nor locator contents.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum RecoveryPayload {
     Encrypted {
@@ -1932,7 +2175,7 @@ pub const ROOT_TRANSITION_REQUEST_VERSION: u16 = 1;
 /// re-derives or downgrades it. `PrivacyClass` and `InstructionTaint` are
 /// closed enums, so an unknown variant cannot be constructed or deserialized;
 /// the field is required on the wire by `deny_unknown_fields`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryAccessClass {
     /// Admitted privacy class of the pending payload (I5.5 `privacy_class`).
@@ -1966,7 +2209,7 @@ impl RecoveryAccessClass {
 /// the reservation without making ORS an interpreter of either value. The
 /// operation identity is repeated deliberately: it is checked against the
 /// envelope key and survives as part of the token and poll identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryWriteBinding {
     /// Version of the admitted `VersionedWriteSubmission` protocol.
@@ -2119,7 +2362,7 @@ impl RecoveryWriteBinding {
 /// retention class, type or field beyond `created_at_and_expires_at`; a separate
 /// retention member would be an invented field, so none is added and
 /// `expires_at_ms` remains the single cleanup horizon.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryPayloadEnvelope {
     pub contract_version: u16,
@@ -6657,6 +6900,11 @@ pub enum HostRequestState {
 pub struct HostRequestAttempt {
     pub attempt_id: OpaqueLabel,
     pub generation: u64,
+    /// Exact accepted executable input this claim may deliver. Legacy and
+    /// non-executable records omit it and cannot prove an Observe input claim.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_commitment_sha256: Option<String>,
     /// Absolute lease expiry for this claim, present only in the v1 custody
     /// protocol. Expiry is reconciliation evidence, never permission to resend.
     #[serde(default)]
@@ -7071,6 +7319,7 @@ impl HostRequestAttempt {
     pub(crate) fn same_claim(&self, other: &Self) -> bool {
         self.attempt_id == other.attempt_id
             && self.generation == other.generation
+            && self.input_commitment_sha256 == other.input_commitment_sha256
             && self.claim_expires_at_unix_ms == other.claim_expires_at_unix_ms
             && self.fence_digest == other.fence_digest
             && self.owner_connection_ref == other.owner_connection_ref
@@ -7102,6 +7351,9 @@ impl HostRequestAttempt {
             });
         }
         validate_digest(&self.fence_digest, "host_request_attempt_fence_digest")?;
+        if let Some(commitment) = &self.input_commitment_sha256 {
+            validate_digest(commitment, "host_request_attempt_input_commitment_sha256")?;
+        }
         if let Some(channel_binding_sha256) = &self.channel_binding_sha256 {
             validate_digest(
                 channel_binding_sha256,
@@ -7611,6 +7863,12 @@ pub struct HostRequestRecord {
     pub parent_operation_id: Option<OpaqueLabel>,
     pub request_digest: String,
     pub payload_digest: String,
+    /// Versioned protected executable input when this operation has an
+    /// admitted daemon payload. Older digest-only rows remain readable but
+    /// cannot be turned into executable queue entries without this carrier.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_input: Option<HostRequestExecutableInput>,
     pub connection_ref: OpaqueLabel,
     pub session_ref: Option<OpaqueLabel>,
     pub task_ref: Option<OpaqueLabel>,
@@ -7725,6 +7983,8 @@ impl HostRequestRecord {
             && self.parent_operation_id == other.parent_operation_id
             && self.request_digest == other.request_digest
             && self.payload_digest == other.payload_digest
+            && self.executable_input.as_ref().map(|input| &input.commitment_sha256)
+                == other.executable_input.as_ref().map(|input| &input.commitment_sha256)
             && self.connection_ref == other.connection_ref
             && self.session_ref == other.session_ref
             && self.task_ref == other.task_ref
@@ -7881,6 +8141,9 @@ impl HostRequestRecord {
         }
         validate_digest(&self.request_digest, "host_request_request_digest")?;
         validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        if let Some(executable_input) = &self.executable_input {
+            executable_input.validate_for_record(self)?;
+        }
         match (
             self.send_claim_protocol_version,
             self.transport_channel_binding_sha256.as_deref(),
@@ -7904,6 +8167,7 @@ impl HostRequestRecord {
         }
         for (index, attempt) in self.attempt_history.iter().enumerate() {
             attempt.validate(&self.fence_digest)?;
+            self.validate_attempt_input_binding(attempt)?;
             if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
                 && attempt.claim_expires_at_unix_ms.is_none()
             {
@@ -7976,6 +8240,7 @@ impl HostRequestRecord {
         }
         if let Some(attempt) = &self.attempt {
             attempt.validate(&self.fence_digest)?;
+            self.validate_attempt_input_binding(attempt)?;
             if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
                 && attempt.claim_expires_at_unix_ms.is_none()
             {
@@ -8045,6 +8310,20 @@ impl HostRequestRecord {
             target.validate()?;
         }
         Ok(())
+    }
+
+    fn validate_attempt_input_binding(&self, attempt: &HostRequestAttempt) -> Result<(), OrsError> {
+        match (
+            self.executable_input.as_ref(),
+            attempt.input_commitment_sha256.as_deref(),
+        ) {
+            (Some(input), Some(commitment)) if input.commitment_sha256 == commitment => Ok(()),
+            (None, None) => Ok(()),
+            _ => Err(OrsError::InvalidField {
+                field: "host_request_attempt_input_commitment_sha256",
+                reason: "attempt input commitment must match the retained executable input",
+            }),
+        }
     }
 
     #[allow(

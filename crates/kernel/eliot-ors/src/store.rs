@@ -6968,6 +6968,7 @@ impl RedbRecoveryStore {
             let mut expected = record.clone();
             expected.operation_id.clone_from(&binding.operation_id);
             expected.request_digest.clone_from(&binding.request_digest);
+            expected.executable_input = None;
             if !expected.same_binding(binding) {
                 return Err(OrsError::InvalidField {
                     field: "host_request_identity_binding",
@@ -33333,6 +33334,7 @@ mod host_request_result_tests {
             parent_operation_id: None,
             request_digest: digest.to_owned(),
             payload_digest: "b".repeat(64),
+            executable_input: None,
             connection_ref: label("conn-1"),
             session_ref: Some(label("session-1")),
             task_ref: None,

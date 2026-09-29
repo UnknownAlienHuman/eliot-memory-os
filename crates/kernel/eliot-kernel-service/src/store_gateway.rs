@@ -2625,6 +2625,7 @@ impl KernelStoreGateway {
                 ),
             )?,
             generation: attempt_generation,
+            input_commitment_sha256: None,
             claim_expires_at_unix_ms: Some(claim_expires_at_unix_ms),
             fence_digest,
             owner_connection_ref,
@@ -2837,6 +2838,7 @@ impl KernelStoreGateway {
             )?),
             request_digest: obligation.request_digest.clone(),
             payload_digest,
+            executable_input: None,
             connection_ref: obligation_label(
                 obligation,
                 USER_AUTOMATION_RUNTIME_CHANNEL.to_owned(),

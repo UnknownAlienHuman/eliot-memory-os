@@ -25,8 +25,10 @@
 //!   produces `VERIFIED_COMPLETE`. It returns admission receipts and durable
 //!   ORS records only. Semantic Sessions are created exactly once by the
 //!   bridge activation path, and only for a `Resolved` disposition.
-//! - Payloads travel by digest only and are never parsed here; capability
-//!   membership is enforced by the admission gate, never interpreted.
+//! - Payloads travel by digest only except for the closed `eliot.observe`
+//!   ToolRequest carrier: its canonical bytes are protected and retained with
+//!   the existing ORS HostRequest row before acknowledgement. Capability
+//!   membership remains enforced by the admission gate.
 //! - The one exception is the closed Watchdog intent route
 //!   (`WATCHDOG_INTENT_SUBMIT_OPERATION`): it decodes its own typed
 //!   `WatchdogSpoolIntentBatchPayload` because the Watchdog's original
@@ -59,15 +61,17 @@ use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
-use eliot_contracts::{BridgeRecoverySelector, RequestId};
+use eliot_contracts::{BridgeRecoverySelector, RequestId, canonical_json_bytes, sha256_hex};
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, EpochIdentity, EpochLineage, HostRequestAttempt,
+    HostRequestEffectEvidence, HostRequestExecutableInput, HostRequestExecutableInputEncoding,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
     HostRequestRetainedResultClass, HostRequestRetainedSourceRevision, HostRequestState,
-    OpaqueLabel, OperationIdentity, OrsError, RedbRecoveryStore,
+    OpaqueLabel, OperationIdentity, OrsError, RecoveryAccessClass, RecoveryEnvelopeContext,
+    RecoveryPayload, RecoveryPayloadEnvelope, RedbRecoveryStore, StateFenceSnapshot,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
@@ -75,10 +79,14 @@ use eliot_protocol::{
     AgentHostRequestFailure, AgentResponseDisposition, DeliveryClass, EventEnvelope,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
-    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
+    HostRequestIdentity, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
+    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    host_request_operation_id, HOST_REQUEST_WIRE_ID,
 };
 use eliot_runtime_contracts::RecoveryDirective;
+use eliot_platform::SecretReference;
+use eliot_platform_windows::ProtectedSecret;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use eliot_store_api::{
     CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
     ScopeId,
@@ -568,6 +576,10 @@ impl KernelComposition {
                     ))
                     .map_err(|_| TransportError::SessionFenced)?,
                     generation,
+                    input_commitment_sha256: stored
+                        .executable_input
+                        .as_ref()
+                        .map(|input| input.commitment_sha256.clone()),
                     claim_expires_at_unix_ms: None,
                     fence_digest: stored.fence_digest.clone(),
                     owner_connection_ref: OpaqueLabel::new(session.connection_id.clone())
@@ -649,6 +661,22 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         task_relative_tool: Option<bool>,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        self.admit_host_request_envelope_with_observe_input_under_transition(
+            envelope,
+            task_relative_tool,
+            None,
+        )
+    }
+
+    /// Admits one invocation and, for the closed Observe route, retains the
+    /// exact validated canonical ToolRequest bytes in the existing HostRequest
+    /// ORS row before the caller can acknowledge it.
+    fn admit_host_request_envelope_with_observe_input_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        task_relative_tool: Option<bool>,
+        observe_tool: Option<&serde_json::Value>,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         Self::validate_host_request_admission(envelope)?;
         let now = unix_ms();
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
@@ -676,7 +704,16 @@ impl KernelComposition {
             } else {
                 None
             };
-        let requested = requested_host_request_record(envelope)?;
+        if let Some(tool) = observe_tool {
+            if envelope.kind != HostRequestKind::Invocation
+                || envelope.identity.capability != OBSERVE_CAPABILITY
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            check_observe_tool_linkage(envelope, tool)?;
+            self.validate_observe_peer_origin(envelope, &descriptor, &receipt)?;
+        }
+        let mut requested = requested_host_request_record(envelope)?;
         let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
             .map_err(|_| TransportError::SessionFenced)?;
         let existing = self
@@ -684,6 +721,37 @@ impl KernelComposition {
             .ors
             .load_host_request(&operation_id, &envelope.envelope_sha256)
             .map_err(|_| TransportError::SessionFenced)?;
+        if let Some(existing) = existing.as_ref() {
+            if let Some(retained) = existing.executable_input.as_ref() {
+                if let Some(tool) = observe_tool {
+                    let (retained_envelope, retained_tool) =
+                        self.read_observe_executable_input(existing)?;
+                    if retained_envelope != *envelope
+                        || retained_tool != *tool
+                        || retained.authenticated_principal_ref.as_str() != receipt.observed_sid
+                        || retained.authenticated_host_session_id != receipt.observed_session_id
+                        || retained.descriptor_sha256 != descriptor.descriptor_sha256
+                        || retained.peer_admission_receipt_sha256 != receipt.receipt_sha256
+                    {
+                        return Err(TransportError::IdentityConflict);
+                    }
+                }
+                requested.executable_input = Some(retained.clone());
+            } else if observe_tool.is_some() && !expired {
+                // A digest-only row may have been acknowledged by an older
+                // Kernel. Never attach newly presented bytes to that old
+                // operation or turn its replay into a fresh executable claim.
+                return Err(TransportError::SessionFenced);
+            }
+        } else if let Some(tool) = observe_tool.filter(|_| !expired) {
+            requested.executable_input = Some(self.protect_observe_executable_input(
+                envelope,
+                &requested,
+                tool,
+                &descriptor,
+                &receipt,
+            )?);
+        }
         // Exact replay of an admitted or terminal operation remains an
         // observation path. A fresh or still-Requested Invocation can still
         // grant authority, so reject it before service admission and before
@@ -770,6 +838,185 @@ impl KernelComposition {
         self.note_host_request_operation_under_transition(envelope)?;
         self.audit_host_request_admission(envelope, &admission_receipt, &admitted);
         Ok((admission_receipt, admitted))
+    }
+
+    fn validate_observe_peer_origin(
+        &self,
+        envelope: &HostRequestEnvelope,
+        descriptor: &AgentBridgeAdmissionDescriptor,
+        receipt: &AgentBridgePeerAdmissionReceipt,
+    ) -> Result<(), TransportError> {
+        receipt.validate().map_err(|_| TransportError::SessionFenced)?;
+        if receipt.compute_digest().map_err(|_| TransportError::SessionFenced)?
+            != receipt.receipt_sha256
+            || receipt.connection_id != envelope.connection_id
+            || receipt.descriptor_sha256 != descriptor.descriptor_sha256
+            || descriptor.descriptor_sha256 != envelope.descriptor_sha256
+            || descriptor.approved_user_sid != receipt.observed_sid
+            || receipt.receipt_sha256 != envelope.peer_admission_receipt_sha256
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let connection = connections
+            .get(&envelope.connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        let process = connection
+            .peer
+            .process_binding()
+            .ok_or(TransportError::SessionFenced)?;
+        match &connection.peer {
+            PeerIdentity::Authenticated {
+                user_identity,
+                session_identity,
+                ..
+            } if user_identity == &receipt.observed_sid
+                && session_identity == &receipt.observed_session_id.to_string()
+                && process.process_id() == receipt.observed_process_id
+                && process.start_time_100ns() == receipt.observed_process_start_time_100ns
+                && process.image_path() == receipt.observed_image_path =>
+            {
+                Ok(())
+            }
+            _ => Err(TransportError::SessionFenced),
+        }
+    }
+
+    fn protect_observe_executable_input(
+        &self,
+        envelope: &HostRequestEnvelope,
+        record: &HostRequestRecord,
+        tool: &serde_json::Value,
+        descriptor: &AgentBridgeAdmissionDescriptor,
+        receipt: &AgentBridgePeerAdmissionReceipt,
+    ) -> Result<HostRequestExecutableInput, TransportError> {
+        self.validate_observe_peer_origin(envelope, descriptor, receipt)?;
+        if envelope.identity.payload_schema_id != eliot_ors::HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID {
+            return Err(TransportError::SessionFenced);
+        }
+        let bytes = canonical_json_bytes(tool).map_err(|_| TransportError::SessionFenced)?;
+        if bytes.is_empty()
+            || bytes.len() > MAX_OBSERVE_TOOL_BYTES
+            || bytes.len() as u64 > eliot_ors::MAX_HOST_REQUEST_EXECUTABLE_INPUT_BYTES
+            || sha256_hex(&bytes) != record.payload_digest
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope: envelope.clone(),
+            tool: tool.clone(),
+        }
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+
+        let captured_at_ms = i64::try_from(unix_ms()).map_err(|_| TransportError::SessionFenced)?;
+        let protected = self
+            .platform
+            .protect_secret(&bytes)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let lineage_id = OpaqueLabel::new(envelope.state_fence.authority_epoch.lineage_id.as_str())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let epoch = envelope.state_fence.authority_epoch.sequence.get();
+        let protected_payload = RecoveryPayloadEnvelope::encrypted(
+            RecoveryEnvelopeContext {
+                operation_or_checkpoint_id: record.operation_id.clone(),
+                privacy_and_visibility_class: RecoveryAccessClass {
+                    privacy: PrivacyClass::Secret,
+                    visibility: OpaqueLabel::new("owner-only")
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    instruction_taint: InstructionTaint::CommandLike,
+                },
+                authority_epoch: EpochLineage {
+                    current: EpochIdentity { lineage_id, epoch },
+                    predecessor: None,
+                },
+                state_fence: StateFenceSnapshot::capture(&envelope.state_fence, epoch)
+                    .map_err(|_| TransportError::SessionFenced)?,
+                created_at_ms: captured_at_ms,
+                known_at_ms: captured_at_ms,
+                expires_at_ms: None,
+            },
+            SecretReference::new("dpapi", "current-user")
+                .map_err(|_| TransportError::SessionFenced)?,
+            protected.as_bytes().to_vec(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let mut input = HostRequestExecutableInput {
+            contract_version: eliot_ors::HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION,
+            schema_id: OpaqueLabel::new(envelope.identity.payload_schema_id.clone())
+                .map_err(|_| TransportError::SessionFenced)?,
+            encoding: HostRequestExecutableInputEncoding::CanonicalJsonV1,
+            payload_length: u64::try_from(bytes.len()).map_err(|_| TransportError::SessionFenced)?,
+            payload_sha256: sha256_hex(&bytes),
+            authenticated_principal_ref: OpaqueLabel::new(receipt.observed_sid.clone())
+                .map_err(|_| TransportError::SessionFenced)?,
+            authenticated_host_session_id: receipt.observed_session_id,
+            descriptor_sha256: descriptor.descriptor_sha256.clone(),
+            peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+            commitment_sha256: String::new(),
+            protected_payload,
+        };
+        input.commitment_sha256 = input
+            .computed_commitment_sha256(record)
+            .map_err(|_| TransportError::SessionFenced)?;
+        input
+            .validate_for_record(record)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(input)
+    }
+
+    fn read_observe_executable_input(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<(HostRequestEnvelope, serde_json::Value), TransportError> {
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        input
+            .validate_for_record(record)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let RecoveryPayload::Encrypted { key, ciphertext } = &input.protected_payload.payload else {
+            return Err(TransportError::SessionFenced);
+        };
+        if key.provider.as_str() != "dpapi" || key.key.as_str() != "current-user" {
+            return Err(TransportError::SessionFenced);
+        }
+        let protected = ProtectedSecret::from_ciphertext(ciphertext.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let plaintext = self
+            .platform
+            .unprotect_secret(&protected)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let bytes = plaintext.expose();
+        if u64::try_from(bytes.len()).map_err(|_| TransportError::SessionFenced)?
+            != input.payload_length
+            || sha256_hex(bytes) != input.payload_sha256
+            || input.payload_sha256 != record.payload_digest
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let tool: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if canonical_json_bytes(&tool).map_err(|_| TransportError::SessionFenced)? != bytes {
+            return Err(TransportError::SessionFenced);
+        }
+        let envelope = host_request_envelope_from_executable_input(record, input)?;
+        HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope: envelope.clone(),
+            tool: tool.clone(),
+        }
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+        check_observe_tool_linkage(&envelope, &tool)?;
+        Ok((envelope, tool))
     }
 
     /// Appends durable audit evidence for one admitted envelope (issue #1837).
@@ -3802,9 +4049,10 @@ impl KernelComposition {
         let operation_id = operation.as_str().to_owned();
         let reservation = self.reserve_observe_queue_slot(envelope, &operation_id)?;
 
-        let admitted = match self.admit_host_request_envelope_with_tool_binding_under_transition(
+        let admitted = match self.admit_host_request_envelope_with_observe_input_under_transition(
             envelope,
             task_relative_tool,
+            Some(tool),
         ) {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -3830,7 +4078,38 @@ impl KernelComposition {
             ObserveQueueReservation::Reserved {
                 token,
                 had_reference,
-            } => self.fill_observe_reservation(envelope, tool, token, had_reference, admitted),
+            } => {
+                let (readback_envelope, readback_tool) = match
+                    self.read_observe_executable_input(&admitted.1)
+                {
+                    Ok(readback) => readback,
+                    Err(error) => {
+                        self.rollback_observe_reservation(
+                            &operation_id,
+                            &envelope.envelope_sha256,
+                            token,
+                            had_reference,
+                        );
+                        return Err(error);
+                    }
+                };
+                if readback_envelope != *envelope || readback_tool != *tool {
+                    self.rollback_observe_reservation(
+                        &operation_id,
+                        &envelope.envelope_sha256,
+                        token,
+                        had_reference,
+                    );
+                    return Err(TransportError::IdentityConflict);
+                }
+                self.fill_observe_reservation(
+                    envelope,
+                    &readback_tool,
+                    token,
+                    had_reference,
+                    admitted,
+                )
+            }
         }
     }
 
@@ -4179,11 +4458,17 @@ impl KernelComposition {
                 let Some(stored) = stored else {
                     return Err(TransportError::UnknownRequest);
                 };
-                let expected = requested_host_request_record(envelope)?;
+                let mut expected = requested_host_request_record(envelope)?;
+                expected.executable_input = stored.executable_input.clone();
                 if stored.operation_id != operation_id
                     || stored.request_digest != request_digest
                     || !stored.same_binding(&expected)
                 {
+                    return Err(TransportError::SessionFenced);
+                }
+                let (readback_envelope, readback_tool) =
+                    self.read_observe_executable_input(&stored)?;
+                if readback_envelope != *envelope || readback_tool != *tool {
                     return Err(TransportError::SessionFenced);
                 }
                 let executable = matches!(
@@ -4841,13 +5126,17 @@ fn host_request_identity_binding_records(
 ) -> Result<[HostRequestRecord; 3], TransportError> {
     let binding_digest = sha256_json(&HOST_REQUEST_IDENTITY_BINDING_LABEL)
         .map_err(|_| TransportError::SessionFenced)?;
-    let make = |prefix: &str, value: &str| -> Result<HostRequestRecord, TransportError> {
-        let mut binding = requested.clone();
-        binding.operation_id = OperationIdentity::new(format!("{prefix}{value}"))
-            .map_err(|_| TransportError::SessionFenced)?;
-        binding.request_digest.clone_from(&binding_digest);
-        binding
-            .validate()
+        let make = |prefix: &str, value: &str| -> Result<HostRequestRecord, TransportError> {
+            let mut binding = requested.clone();
+            binding.operation_id = OperationIdentity::new(format!("{prefix}{value}"))
+                .map_err(|_| TransportError::SessionFenced)?;
+            binding.request_digest.clone_from(&binding_digest);
+            // Identity namespace rows prove collisions only. Keeping the
+            // protected executable body in the primary operation row avoids
+            // duplicating private ciphertext under three aliases.
+            binding.executable_input = None;
+            binding
+                .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(binding)
     };
@@ -4998,6 +5287,7 @@ pub(crate) fn requested_host_request_record(
         parent_operation_id: optional_label(envelope.identity.parent_operation_id.as_ref())?,
         request_digest: envelope.envelope_sha256.clone(),
         payload_digest: envelope.identity.payload_sha256.clone(),
+        executable_input: None,
         connection_ref: label(&envelope.connection_id)?,
         session_ref: optional_label(envelope.identity.session_id.as_ref())?,
         task_ref: optional_label(envelope.identity.task_id.as_ref())?,
@@ -5018,6 +5308,60 @@ pub(crate) fn requested_host_request_record(
         result_lineage: None,
         commit_order: 0,
     })
+}
+
+fn host_request_envelope_from_executable_input(
+    record: &HostRequestRecord,
+    input: &HostRequestExecutableInput,
+) -> Result<HostRequestEnvelope, TransportError> {
+    if record.kind != OrsHostRequestKind::Invocation
+        || record.capability_ref.as_str() != OBSERVE_CAPABILITY
+        || input.schema_id.as_str() != eliot_ors::HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let state_fence: eliot_contracts::StateFence =
+        serde_json::from_str(&input.protected_payload.state_fence.canonical_json)
+            .map_err(|_| TransportError::SessionFenced)?;
+    let envelope = HostRequestEnvelope {
+        wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+        wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+        kind: HostRequestKind::Invocation,
+        connection_id: record.connection_ref.as_str().to_owned(),
+        identity: HostRequestIdentity {
+            request_id: RequestId::new(record.request_id.as_str().to_owned())
+                .map_err(|_| TransportError::SessionFenced)?,
+            correlation_projection: record.correlation_projection.clone(),
+            idempotency_key: record.idempotency_key.as_str().to_owned(),
+            cancellation_id: record.cancellation_id.as_str().to_owned(),
+            parent_operation_id: record
+                .parent_operation_id
+                .as_ref()
+                .map(|parent| parent.as_str().to_owned()),
+            deadline_unix_ms: record.deadline_unix_ms,
+            capability: record.capability_ref.as_str().to_owned(),
+            session_id: record.session_ref.as_ref().map(|value| value.as_str().to_owned()),
+            task_id: record.task_ref.as_ref().map(|value| value.as_str().to_owned()),
+            work_scope_id: record.scope_ref.as_ref().map(|value| value.as_str().to_owned()),
+            payload_schema_id: input.schema_id.as_str().to_owned(),
+            payload_sha256: record.payload_digest.clone(),
+        },
+        state_fence,
+        descriptor_sha256: input.descriptor_sha256.clone(),
+        peer_admission_receipt_sha256: input.peer_admission_receipt_sha256.clone(),
+        activation_binding: None,
+        envelope_sha256: record.request_digest.clone(),
+    };
+    envelope
+        .validate_for_admission()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if OperationIdentity::new(host_request_operation_id(&envelope))
+        .map_err(|_| TransportError::SessionFenced)?
+        != record.operation_id
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(envelope)
 }
 
 /// Derives the exact ORS key of the parent operation targeted by a
@@ -6978,6 +7322,7 @@ fn watchdog_intent_projection_record(
         parent_operation_id: None,
         request_digest: intent.record_digest.clone(),
         payload_digest: intent.payload_digest.clone(),
+        executable_input: None,
         connection_ref: label(&payload.sink_id)?,
         session_ref: None,
         task_ref: None,
