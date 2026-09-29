@@ -4194,6 +4194,24 @@ impl KernelComposition {
         let retained_result = current.state == HostRequestState::ResultReceived
             && current.result_digest.is_some()
             && current.result_response.is_some();
+        // Issue #1739 W2: bind the exact typed payload bytes durably before
+        // the in-memory observe pair is attached and the claim is handed out.
+        // A digest alone cannot execute after a restart.
+        if executable {
+            match self.bind_observe_payload_before_claim(
+                envelope,
+                tool,
+                &admitted.1.operation_id,
+                token,
+                had_reference,
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    drop(admission_owner);
+                    return Err(error);
+                }
+            }
+        }
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -4230,6 +4248,56 @@ impl KernelComposition {
             Ok((admitted.0, current))
         } else {
             Err(TransportError::SessionFenced)
+        }
+    }
+
+    /// Binds the exact typed payload bytes durably before the observe claim.
+    ///
+    /// An out-of-band body that is not the admitted bytes conflicts instead
+    /// of replacing the admitted operation; every failure rolls the observe
+    /// reservation back so no claim is handed out for unbound bytes.
+    fn bind_observe_payload_before_claim(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        operation_id: &OperationIdentity,
+        token: u64,
+        had_reference: bool,
+    ) -> Result<(), TransportError> {
+        let bound = self.generation_gateway.ors.bind_host_request_payload(
+            operation_id,
+            &envelope.envelope_sha256,
+            tool,
+        );
+        match bound {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                self.rollback_observe_reservation(
+                    operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                Err(TransportError::UnknownRequest)
+            }
+            Err(OrsError::HostRequestIdentityConflict { .. }) => {
+                self.rollback_observe_reservation(
+                    operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                Err(TransportError::IdentityConflict)
+            }
+            Err(_) => {
+                self.rollback_observe_reservation(
+                    operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                Err(TransportError::SessionFenced)
+            }
         }
     }
 
@@ -5145,8 +5213,10 @@ fn retained_result_provenance(
 /// Builds the `Requested` ORS record for one validated envelope.
 ///
 /// Every identity is preserved opaquely: Session, task, scope, capability,
-/// fence, and payload values become exact bytes or digests for replay
-/// comparison and are never interpreted here.
+/// fence, payload schema, and payload values become exact bytes or digests
+/// for replay comparison and are never interpreted here. The exact payload
+/// bytes bind later through `bind_host_request_payload`, before the observe
+/// claim is handed out (issue #1739 W2).
 pub(crate) fn requested_host_request_record(
     envelope: &HostRequestEnvelope,
 ) -> Result<HostRequestRecord, TransportError> {
@@ -5173,6 +5243,8 @@ pub(crate) fn requested_host_request_record(
         parent_operation_id: optional_label(envelope.identity.parent_operation_id.as_ref())?,
         request_digest: envelope.envelope_sha256.clone(),
         payload_digest: envelope.identity.payload_sha256.clone(),
+        payload_schema_id: Some(label(&envelope.identity.payload_schema_id)?),
+        payload_body: None,
         connection_ref: label(&envelope.connection_id)?,
         session_ref: optional_label(envelope.identity.session_id.as_ref())?,
         task_ref: optional_label(envelope.identity.task_id.as_ref())?,
@@ -7157,6 +7229,10 @@ fn watchdog_intent_projection_record(
         parent_operation_id: None,
         request_digest: intent.record_digest.clone(),
         payload_digest: intent.payload_digest.clone(),
+        // Digest-only reconciliation intent: no envelope, hence no staged
+        // schema or payload bytes. Any future bind still proves the digest.
+        payload_schema_id: None,
+        payload_body: None,
         connection_ref: label(&payload.sink_id)?,
         session_ref: None,
         task_ref: None,

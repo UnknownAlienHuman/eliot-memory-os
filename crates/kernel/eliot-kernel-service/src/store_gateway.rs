@@ -2837,6 +2837,8 @@ impl KernelStoreGateway {
             )?),
             request_digest: obligation.request_digest.clone(),
             payload_digest,
+            payload_schema_id: None,
+            payload_body: None,
             connection_ref: obligation_label(
                 obligation,
                 USER_AUTOMATION_RUNTIME_CHANNEL.to_owned(),
