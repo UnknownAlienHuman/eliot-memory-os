@@ -383,7 +383,10 @@ impl NotifyReserve {
     ) -> Result<NotifyPermit, NotifyReserveError> {
         validate_text(owner, "notify_permit.owner")?;
         validate_text(operation_id, "notify_permit.operation_id")?;
-        if !cas_add_one(&self.inner.protected_in_flight, self.inner.protected_capacity) {
+        if !cas_add_one(
+            &self.inner.protected_in_flight,
+            self.inner.protected_capacity,
+        ) {
             return Err(NotifyReserveError::ProtectedReserveExhausted {
                 bottleneck: NOTIFICATION_INBOX_BOTTLENECK,
                 operation,
