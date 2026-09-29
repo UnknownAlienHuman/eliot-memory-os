@@ -11,13 +11,16 @@
 #![forbid(unsafe_code)]
 
 pub mod bridge_contract;
+mod coverage_manifest_driver;
+pub use coverage_manifest_driver::drive_coverage_manifest;
 mod durable_host_event_ingest;
 pub use durable_host_event_ingest::{
-    BestEffortDropGap, BestEffortDropReason, CoverageManifestPlan,
+    AllowedHostManifestView, BestEffortDropGap, BestEffortDropReason, CoverageManifestPlan,
     DURABLE_INGEST_TRANSFORMATION_VERSION, DurableHostEventJournal, DurableHostEventRecord,
     EventKey, IngestError, REDACTED_PROJECTION_MARKER, RecordDisposition, RedactionReason,
-    RedactionReceipt, ReplayItem, StageAllowed, StageOutcome, StageRedacted, StoredPayload,
-    StreamCursorState, contains_forbidden_content, deterministic_redacted_bytes,
+    RedactionReceipt, ReplayItem, ResolvedHostComplianceFacts, ResolvedHostRecord, StageAllowed,
+    StageOutcome, StageRedacted, StoredPayload, StreamCursorState, contains_forbidden_content,
+    deterministic_redacted_bytes,
 };
 mod host_event_producer;
 pub use host_event_producer::{
