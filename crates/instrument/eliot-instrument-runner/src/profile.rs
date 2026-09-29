@@ -1875,20 +1875,35 @@ impl AdmittedStage {
     ///
     /// The caller must supply the launcher-observed machine identity: every
     /// external stage launches only under an owner-observed executable, so a
-    /// missing observation never yields a launchable grant. The request
-    /// snapshot must equal the observation, and the observation must name
-    /// the admitted file, carry the pinned version, and match the receipt.
-    /// Returns the content digest bound into the process grant.
+    /// missing observation never yields a launchable grant. The observation
+    /// reference itself is re-validated through the owning constructor under
+    /// the admitted spec identity first, so a malformed or forged identity
+    /// bridged by any entry point fails closed here instead of reaching the
+    /// file, version, and receipt checks. The request snapshot must then
+    /// equal the observation, and the observation must name the admitted
+    /// file, carry the pinned version, and match the receipt. Returns the
+    /// content digest bound into the process grant.
     ///
     /// # Errors
     ///
     /// Returns [`AdmissionError::ExecutableMismatch`] when the identity is
-    /// unknown, changed, or claimed without observation.
+    /// unknown, changed, malformed, or claimed without observation.
     fn check_executable(
         &self,
         request: &InstrumentAdmissionRequest,
         observed: &ResolvedExecutableIdentity,
     ) -> Result<String, AdmissionError> {
+        ResolvedExecutableIdentity::new(
+            self.spec.as_str(),
+            observed.canonical_path.clone(),
+            observed.content_digest.clone(),
+            observed.tool_version.clone(),
+            observed.environment_digest.clone(),
+            observed.arguments.clone(),
+        )
+        .map_err(|error| AdmissionError::ExecutableMismatch {
+            detail: error.to_string(),
+        })?;
         if request.executable_path.as_deref() != Some(observed.canonical_path.as_str())
             || request.executable_digest.as_deref() != Some(observed.content_digest.as_str())
             || request.executable_version != observed.tool_version
@@ -1946,7 +1961,7 @@ impl AdmittedStage {
     /// (profile, revision) differ from the admitted stage identity, the kind
     /// ID is unregistered, the class differs, an argument carries shell text
     /// or leaves the fixed template, or the executable identity is unknown,
-    /// changed, or unobserved.
+    /// changed, malformed, or unobserved.
     pub fn admit(
         &self,
         request: &InstrumentAdmissionRequest,
