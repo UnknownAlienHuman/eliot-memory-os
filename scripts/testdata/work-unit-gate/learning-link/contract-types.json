@@ -1,0 +1,72 @@
+{
+  "contract_crate": "crates/smart/eliot-learning-contracts",
+  "contract_crate_root": "crates/smart/eliot-learning-contracts/src/lib.rs",
+  "frozen_base": "0cf7860dc728cb87babbffe83af6f8974baeb776",
+  "issue": 970,
+  "note": "Frozen A-32 public contract identity that A-37 imports. Recorded from the accepted A-32 sources at the frozen base; each symbol is re-exported by the contract crate root and declared in the module file named here.",
+  "required_types": [
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::ContractBinding",
+      "module_file": "crates/smart/eliot-learning-contracts/src/identity.rs",
+      "reason": "immutable evidence lineage binding carried by an improvement module",
+      "symbol": "ContractBinding"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::CampaignId",
+      "module_file": "crates/smart/eliot-learning-contracts/src/identity.rs",
+      "reason": "campaign identity the module reads from evidence, never derives",
+      "symbol": "CampaignId"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::AttemptLearningDeltaCandidate",
+      "module_file": "crates/smart/eliot-learning-contracts/src/delta.rs",
+      "reason": "candidate-only attempt delta input consumed by A-37",
+      "symbol": "AttemptLearningDeltaCandidate"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::CampaignLearningStateView",
+      "module_file": "crates/smart/eliot-learning-contracts/src/state_view.rs",
+      "reason": "immutable state projection the module reads, never rebuilds",
+      "symbol": "CampaignLearningStateView"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::CampaignHarnessOverlayCandidate",
+      "module_file": "crates/smart/eliot-learning-contracts/src/overlay.rs",
+      "reason": "candidate overlay input; activation is out of scope",
+      "symbol": "CampaignHarnessOverlayCandidate"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::PromotionBoundaryCandidate",
+      "module_file": "crates/smart/eliot-learning-contracts/src/promotion.rs",
+      "reason": "candidate promotion boundary input consumed by A-37",
+      "symbol": "PromotionBoundaryCandidate"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::SlotSpec",
+      "module_file": "crates/smart/eliot-learning-contracts/src/state_view.rs",
+      "reason": "declared slot identity the module validates against",
+      "symbol": "SlotSpec"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::OwnerProof",
+      "module_file": "crates/smart/eliot-learning-contracts/src/closure.rs",
+      "reason": "owner proof contract type required by the closure input",
+      "symbol": "OwnerProof"
+    },
+    {
+      "dependency": "eliot-learning-contracts",
+      "imported_as": "eliot_learning_contracts::LearningContractError",
+      "module_file": "crates/smart/eliot-learning-contracts/src/error.rs",
+      "reason": "contract error type the module maps, never redefines",
+      "symbol": "LearningContractError"
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "added_dependencies": [
+    "eliot-learning-contracts"
+  ],
+  "base_dependencies": {
+    "blake3": "1.8.5",
+    "eliot-context-contracts": {
+      "path": "../../smart/eliot-context-contracts",
+      "version": "0.1.0"
+    },
+    "eliot-contracts": {
+      "workspace": true
+    },
+    "eliot-evidence": {
+      "path": "../../foundation/eliot-evidence",
+      "version": "0.1.0"
+    },
+    "eliot-governor": {
+      "workspace": true
+    },
+    "eliot-receipts": {
+      "path": "../../foundation/eliot-receipts",
+      "version": "0.1.0"
+    },
+    "serde": {
+      "features": [
+        "derive"
+      ],
+      "version": "1.0.228"
+    },
+    "thiserror": "2.0.17",
+    "time": {
+      "features": [
+        "serde",
+        "formatting",
+        "parsing"
+      ],
+      "version": "0.3.44"
+    },
+    "uuid": {
+      "features": [
+        "serde",
+        "v7"
+      ],
+      "version": "1.18.1"
+    }
+  },
+  "expected_dependencies": {
+    "blake3": "1.8.5",
+    "eliot-context-contracts": {
+      "path": "../../smart/eliot-context-contracts",
+      "version": "0.1.0"
+    },
+    "eliot-contracts": {
+      "workspace": true
+    },
+    "eliot-evidence": {
+      "path": "../../foundation/eliot-evidence",
+      "version": "0.1.0"
+    },
+    "eliot-governor": {
+      "workspace": true
+    },
+    "eliot-learning-contracts": {
+      "workspace": true
+    },
+    "eliot-receipts": {
+      "path": "../../foundation/eliot-receipts",
+      "version": "0.1.0"
+    },
+    "serde": {
+      "features": [
+        "derive"
+      ],
+      "version": "1.0.228"
+    },
+    "thiserror": "2.0.17",
+    "time": {
+      "features": [
+        "serde",
+        "formatting",
+        "parsing"
+      ],
+      "version": "0.3.44"
+    },
+    "uuid": {
+      "features": [
+        "serde",
+        "v7"
+      ],
+      "version": "1.18.1"
+    }
+  },
+  "expected_dev_dependencies": {
+    "eliot-agent-contracts": {
+      "path": "../../agent/eliot-agent-contracts",
+      "version": "0.1.0"
+    }
+  },
+  "frozen_base": "0cf7860dc728cb87babbffe83af6f8974baeb776",
+  "issue": 970,
+  "manifest": "crates/meta/eliot-improvement/Cargo.toml",
+  "note": "Declaration-for-declaration record of the consumer manifest at the frozen base. base_dependencies is the pre-existing set; the added set is the only difference this work unit may introduce."
+}

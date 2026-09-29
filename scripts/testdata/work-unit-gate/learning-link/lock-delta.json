@@ -1,0 +1,48 @@
+{
+  "added_dependencies_by_package": {
+    "eliot-improvement": [
+      "eliot-learning-contracts"
+    ]
+  },
+  "checksum_added_packages": {},
+  "eliot_improvement_entry": {
+    "dependencies": [
+      "blake3",
+      "eliot-agent-contracts",
+      "eliot-context-contracts",
+      "eliot-contracts",
+      "eliot-evidence",
+      "eliot-governor",
+      "eliot-learning-contracts",
+      "eliot-receipts",
+      "serde",
+      "thiserror",
+      "time",
+      "uuid"
+    ],
+    "name": "eliot-improvement",
+    "version": "0.1.0"
+  },
+  "eliot_learning_contracts_entry": {
+    "dependencies": [
+      "eliot-agent-contracts",
+      "eliot-contracts",
+      "eliot-evidence",
+      "eliot-receipts",
+      "schemars",
+      "serde",
+      "serde_json",
+      "thiserror"
+    ],
+    "name": "eliot-learning-contracts",
+    "version": "0.1.0"
+  },
+  "frozen_base": "0cf7860dc728cb87babbffe83af6f8974baeb776",
+  "issue": 970,
+  "lock": "Cargo.lock",
+  "lock_version": 4,
+  "note": "The complete link delta of this preparation. Every category other than added_dependencies_by_package is empty by claim, and each is re-derived from the live lock rather than trusted.",
+  "removed_dependencies_by_package": {},
+  "source_added_packages": {},
+  "version_changed_packages": {}
+}

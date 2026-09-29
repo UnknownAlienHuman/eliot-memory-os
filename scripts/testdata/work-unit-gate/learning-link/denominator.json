@@ -1,0 +1,42 @@
+{
+  "cases": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12
+  ],
+  "denominator_body": {
+    "affected_manifests": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/meta/eliot-improvement/Cargo.toml",
+      "crates/smart/eliot-learning-contracts/Cargo.toml"
+    ],
+    "dependency_edges": [
+      {
+        "consumer": "crates/meta/eliot-improvement",
+        "declaration": "eliot-learning-contracts.workspace = true",
+        "dependency": "eliot-learning-contracts",
+        "line": 14,
+        "manifest": "crates/meta/eliot-improvement/Cargo.toml",
+        "owner": "crates/smart/eliot-learning-contracts",
+        "symbol": "eliot_learning_contracts"
+      }
+    ],
+    "excluded_manifests": [
+      "crates/meta/eliot-self-quality/Cargo.toml"
+    ]
+  },
+  "denominator_digest": "322beecbc053ef38d74311992379a71c8a71e0124c2ce5845f8fe1e598d3e43e",
+  "frozen_base": "0cf7860dc728cb87babbffe83af6f8974baeb776",
+  "issue": 970,
+  "scope": "preparation-only dependency-readiness receipt for A-37 #819"
+}

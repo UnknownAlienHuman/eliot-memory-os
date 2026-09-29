@@ -1,0 +1,26 @@
+{
+  "expected_default_members": [
+    "bins/eliot",
+    "bins/eliot-host",
+    "bins/eliot-kernel",
+    "bins/eliot-store-surreal",
+    "bins/eliot-watchdog",
+    "bins/eliotd"
+  ],
+  "expected_learning_family_members": [
+    "crates/smart/eliot-learning-contracts",
+    "crates/smart/eliot-learning-state-view",
+    "crates/smart/eliot-learning-delta",
+    "crates/smart/eliot-learning-overlay",
+    "crates/meta/eliot-learning-activation-assessment",
+    "crates/meta/eliot-improvement",
+    "crates/meta/eliot-self-quality"
+  ],
+  "frozen_base": "0cf7860dc728cb87babbffe83af6f8974baeb776",
+  "frozen_exclude": [],
+  "improvement_member": "crates/meta/eliot-improvement",
+  "issue": 970,
+  "members_added_by_970": [],
+  "members_removed_by_970": [],
+  "note": "Workspace membership is inherited, not created, by this work unit. The roster below is the expected Learning family plus the A-38 Self-Quality package, which this issue does not modify."
+}

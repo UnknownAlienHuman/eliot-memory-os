@@ -1,0 +1,40 @@
+{
+  "a38_paths": [
+    "crates/meta/eliot-self-quality/Cargo.toml",
+    "crates/meta/eliot-self-quality/src"
+  ],
+  "consumer_crate_root": "crates/meta/eliot-improvement/src/lib.rs",
+  "expected_improvement_modules": [
+    "application_class",
+    "brief",
+    "budget_proof",
+    "candidate_bounds",
+    "evidence_sources",
+    "governed_screen",
+    "intake",
+    "learning_closure",
+    "overlay_policy_routing",
+    "producer",
+    "promotion_input"
+  ],
+  "expected_router_symbols": [
+    "ImprovementCandidateDraft",
+    "route_rejected_surface"
+  ],
+  "forbidden_improvement_imports": [
+    "eliot_learning_state_view",
+    "eliot_learning_delta",
+    "eliot_learning_overlay",
+    "eliot_learning_activation_assessment",
+    "eliot_learning_contracts",
+    "eliot_store_api",
+    "eliot_store_memory",
+    "eliot_store_surreal_adapter",
+    "eliot_wasm_runtime",
+    "eliot_host_service"
+  ],
+  "frozen_base": "0cf7860dc728cb87babbffe83af6f8974baeb776",
+  "issue": 970,
+  "note": "Frozen source-scope boundary. The consumer module surface is the pre-A-37 state; the forbidden import list is the algorithm, provider, Store and runtime vocabulary this preparation must not reach.",
+  "router_source": "crates/meta/eliot-improvement/src/overlay_policy_routing.rs"
+}

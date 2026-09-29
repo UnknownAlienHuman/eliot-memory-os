@@ -1,0 +1,409 @@
+{
+  "dependency_pin_drift": [
+    {
+      "case": "preexisting version bumped",
+      "dependencies": {
+        "blake3": "1.8.5",
+        "eliot-context-contracts": {
+          "path": "../../smart/eliot-context-contracts",
+          "version": "0.1.0"
+        },
+        "eliot-contracts": {
+          "workspace": true
+        },
+        "eliot-evidence": {
+          "path": "../../foundation/eliot-evidence",
+          "version": "0.1.0"
+        },
+        "eliot-governor": {
+          "workspace": true
+        },
+        "eliot-learning-contracts": {
+          "workspace": true
+        },
+        "eliot-receipts": {
+          "path": "../../foundation/eliot-receipts",
+          "version": "0.1.0"
+        },
+        "serde": {
+          "features": [
+            "derive"
+          ],
+          "version": "1.0.300"
+        },
+        "thiserror": "2.0.17",
+        "time": {
+          "features": [
+            "serde",
+            "formatting",
+            "parsing"
+          ],
+          "version": "0.3.44"
+        },
+        "uuid": {
+          "features": [
+            "serde",
+            "v7"
+          ],
+          "version": "1.18.1"
+        }
+      }
+    },
+    {
+      "case": "feature added to an existing pin",
+      "dependencies": {
+        "blake3": "1.8.5",
+        "eliot-context-contracts": {
+          "path": "../../smart/eliot-context-contracts",
+          "version": "0.1.0"
+        },
+        "eliot-contracts": {
+          "workspace": true
+        },
+        "eliot-evidence": {
+          "path": "../../foundation/eliot-evidence",
+          "version": "0.1.0"
+        },
+        "eliot-governor": {
+          "workspace": true
+        },
+        "eliot-learning-contracts": {
+          "workspace": true
+        },
+        "eliot-receipts": {
+          "path": "../../foundation/eliot-receipts",
+          "version": "0.1.0"
+        },
+        "serde": {
+          "features": [
+            "derive"
+          ],
+          "version": "1.0.228"
+        },
+        "thiserror": "2.0.17",
+        "time": {
+          "features": [
+            "serde",
+            "formatting",
+            "parsing"
+          ],
+          "version": "0.3.44"
+        },
+        "uuid": {
+          "features": [
+            "serde",
+            "v7",
+            "v4"
+          ],
+          "version": "1.18.1"
+        }
+      }
+    },
+    {
+      "case": "path repointed to a different package path",
+      "dependencies": {
+        "blake3": "1.8.5",
+        "eliot-context-contracts": {
+          "path": "../../smart/eliot-context-contracts",
+          "version": "0.1.0"
+        },
+        "eliot-contracts": {
+          "workspace": true
+        },
+        "eliot-evidence": {
+          "path": "../../foundation/eliot-evidence",
+          "version": "0.1.0"
+        },
+        "eliot-governor": {
+          "workspace": true
+        },
+        "eliot-learning-contracts": {
+          "workspace": true
+        },
+        "eliot-receipts": {
+          "path": "../../foundation/eliot-other",
+          "version": "0.1.0"
+        },
+        "serde": {
+          "features": [
+            "derive"
+          ],
+          "version": "1.0.228"
+        },
+        "thiserror": "2.0.17",
+        "time": {
+          "features": [
+            "serde",
+            "formatting",
+            "parsing"
+          ],
+          "version": "0.3.44"
+        },
+        "uuid": {
+          "features": [
+            "serde",
+            "v7"
+          ],
+          "version": "1.18.1"
+        }
+      }
+    },
+    {
+      "case": "workspace alias replaced by a local path pin",
+      "dependencies": {
+        "blake3": "1.8.5",
+        "eliot-context-contracts": {
+          "path": "../../smart/eliot-context-contracts",
+          "version": "0.1.0"
+        },
+        "eliot-contracts": {
+          "workspace": true
+        },
+        "eliot-evidence": {
+          "path": "../../foundation/eliot-evidence",
+          "version": "0.1.0"
+        },
+        "eliot-governor": {
+          "workspace": true
+        },
+        "eliot-learning-contracts": {
+          "path": "../../smart/eliot-learning-contracts",
+          "version": "0.1.0"
+        },
+        "eliot-receipts": {
+          "path": "../../foundation/eliot-receipts",
+          "version": "0.1.0"
+        },
+        "serde": {
+          "features": [
+            "derive"
+          ],
+          "version": "1.0.228"
+        },
+        "thiserror": "2.0.17",
+        "time": {
+          "features": [
+            "serde",
+            "formatting",
+            "parsing"
+          ],
+          "version": "0.3.44"
+        },
+        "uuid": {
+          "features": [
+            "serde",
+            "v7"
+          ],
+          "version": "1.18.1"
+        }
+      }
+    },
+    {
+      "case": "sibling algorithm edge added",
+      "dependencies": {
+        "blake3": "1.8.5",
+        "eliot-context-contracts": {
+          "path": "../../smart/eliot-context-contracts",
+          "version": "0.1.0"
+        },
+        "eliot-contracts": {
+          "workspace": true
+        },
+        "eliot-evidence": {
+          "path": "../../foundation/eliot-evidence",
+          "version": "0.1.0"
+        },
+        "eliot-governor": {
+          "workspace": true
+        },
+        "eliot-learning-contracts": {
+          "workspace": true
+        },
+        "eliot-learning-delta": {
+          "workspace": true
+        },
+        "eliot-receipts": {
+          "path": "../../foundation/eliot-receipts",
+          "version": "0.1.0"
+        },
+        "serde": {
+          "features": [
+            "derive"
+          ],
+          "version": "1.0.228"
+        },
+        "thiserror": "2.0.17",
+        "time": {
+          "features": [
+            "serde",
+            "formatting",
+            "parsing"
+          ],
+          "version": "0.3.44"
+        },
+        "uuid": {
+          "features": [
+            "serde",
+            "v7"
+          ],
+          "version": "1.18.1"
+        }
+      }
+    },
+    {
+      "case": "prepared edge removed",
+      "dependencies": {
+        "blake3": "1.8.5",
+        "eliot-context-contracts": {
+          "path": "../../smart/eliot-context-contracts",
+          "version": "0.1.0"
+        },
+        "eliot-contracts": {
+          "workspace": true
+        },
+        "eliot-evidence": {
+          "path": "../../foundation/eliot-evidence",
+          "version": "0.1.0"
+        },
+        "eliot-governor": {
+          "workspace": true
+        },
+        "eliot-receipts": {
+          "path": "../../foundation/eliot-receipts",
+          "version": "0.1.0"
+        },
+        "serde": {
+          "features": [
+            "derive"
+          ],
+          "version": "1.0.228"
+        },
+        "thiserror": "2.0.17",
+        "time": {
+          "features": [
+            "serde",
+            "formatting",
+            "parsing"
+          ],
+          "version": "0.3.44"
+        },
+        "uuid": {
+          "features": [
+            "serde",
+            "v7"
+          ],
+          "version": "1.18.1"
+        }
+      }
+    }
+  ],
+  "dev_dependency_drift": [
+    {
+      "case": "dev-dependency version bumped",
+      "dependencies": {
+        "eliot-agent-contracts": {
+          "path": "../../agent/eliot-agent-contracts",
+          "version": "0.2.0"
+        }
+      }
+    },
+    {
+      "case": "dev-dependency replaced by a registry pin",
+      "dependencies": {
+        "eliot-agent-contracts": "1.0.0"
+      }
+    }
+  ],
+  "frozen_base": "0cf7860dc728cb87babbffe83af6f8974baeb776",
+  "issue": 970,
+  "lock_drift": [
+    {
+      "case": "path package acquires a registry source and checksum",
+      "entry": {
+        "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+        "dependencies": [
+          "eliot-agent-contracts",
+          "eliot-contracts",
+          "eliot-evidence",
+          "eliot-receipts",
+          "schemars",
+          "serde",
+          "serde_json",
+          "thiserror"
+        ],
+        "name": "eliot-learning-contracts",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.1.0"
+      },
+      "entry_key": "eliot_learning_contracts_entry",
+      "package": "eliot-learning-contracts"
+    },
+    {
+      "case": "path package version changed",
+      "entry": {
+        "dependencies": [
+          "eliot-agent-contracts",
+          "eliot-contracts",
+          "eliot-evidence",
+          "eliot-receipts",
+          "schemars",
+          "serde",
+          "serde_json",
+          "thiserror"
+        ],
+        "name": "eliot-learning-contracts",
+        "version": "0.2.0"
+      },
+      "entry_key": "eliot_learning_contracts_entry",
+      "package": "eliot-learning-contracts"
+    },
+    {
+      "case": "prepared lock edge removed",
+      "entry": {
+        "dependencies": [
+          "blake3",
+          "eliot-agent-contracts",
+          "eliot-context-contracts",
+          "eliot-contracts",
+          "eliot-evidence",
+          "eliot-governor",
+          "eliot-receipts",
+          "serde",
+          "thiserror",
+          "time",
+          "uuid"
+        ],
+        "name": "eliot-improvement",
+        "version": "0.1.0"
+      },
+      "entry_key": "eliot_improvement_entry",
+      "package": "eliot-improvement"
+    },
+    {
+      "case": "unrelated Store and runtime edges added to the lock",
+      "entry": {
+        "dependencies": [
+          "blake3",
+          "eliot-agent-contracts",
+          "eliot-context-contracts",
+          "eliot-contracts",
+          "eliot-evidence",
+          "eliot-governor",
+          "eliot-learning-contracts",
+          "eliot-receipts",
+          "eliot-store-api",
+          "eliot-wasm-runtime",
+          "serde",
+          "thiserror",
+          "time",
+          "uuid"
+        ],
+        "name": "eliot-improvement",
+        "version": "0.1.0"
+      },
+      "entry_key": "eliot_improvement_entry",
+      "package": "eliot-improvement"
+    }
+  ],
+  "note": "Finite drift table. Each entry is fed to the same validators the passing cases use, so a rejected mutation is proven by the real comparison rather than by an identity check on a local variable."
+}
