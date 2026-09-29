@@ -13,7 +13,7 @@
 pub mod bridge_contract;
 mod coverage_manifest_driver;
 pub use coverage_manifest_driver::{
-    CoverageManifestRun, drive_coverage_manifest, run_coverage_manifest,
+    CoverageManifestRun, CoverageManifestRunOutcome, drive_coverage_manifest, run_coverage_manifest,
 };
 mod durable_host_event_ingest;
 pub use durable_host_event_ingest::{

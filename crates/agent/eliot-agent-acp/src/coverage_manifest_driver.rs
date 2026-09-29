@@ -1,17 +1,20 @@
 //! Coverage-manifest driver for durable host-event ingest (issue #1936, I7.23).
 //!
-//! [`drive_coverage_manifest`] is the per-fingerprint production caller for
-//! [`DurableHostEventJournal::record_coverage_manifest`]: for one
+//! [`run_coverage_manifest`] is the per-fingerprint production caller: for one
 //! product/session/attempt/route fingerprint it resolves the host-observed
 //! compliance facts for every named stream against the caller-supplied allowed
 //! Tool/Facet manifest revision, verifies the denominator plan binds that same
-//! revision, and then records the joined coverage denominator. Resolution runs
-//! before retention, so staged-but-uncommitted facts abort with
-//! [`IngestError::NotCommitted`] before any manifest is retained. The resolved
-//! facts are returned for the downstream evidence-assembly owner; this driver
-//! mints no declarations (expected sources, observable split, denominator
-//! origin, completeness, invalidation) — those arrive in the caller plan,
-//! which the run owner that knows the fingerprint supplies per fingerprint.
+//! revision, records the joined coverage denominator through
+//! [`DurableHostEventJournal::record_coverage_manifest`], and returns the run
+//! outcome (resolved facts plus the retained manifest) for the downstream
+//! evidence-assembly owner. Resolution runs before retention, so
+//! staged-but-uncommitted facts abort with [`IngestError::NotCommitted`]
+//! before any manifest is retained. This driver mints no declarations
+//! (expected sources, observable split, denominator origin, completeness,
+//! invalidation) — those arrive in the caller plan, which the run owner that
+//! knows the fingerprint supplies per fingerprint.
+
+use eliot_evaluation_contracts::ObservationCoverageManifest;
 
 use crate::{
     AllowedHostManifestView, CoverageManifestPlan, DurableHostEventJournal, IngestError,
@@ -41,27 +44,51 @@ pub struct CoverageManifestRun<'a> {
     pub plan: CoverageManifestPlan<'a>,
 }
 
+/// Complete production output of one fingerprint run (issue #1936 W1, I7.23).
+///
+/// The downstream evidence-assembly owner consumes both halves: the resolved
+/// per-stream facts map into immutable host evidence, and the retained
+/// denominator binds the derived compliance trace. Both halves come from the
+/// same run, so they always agree on the fingerprint and the allowed-manifest
+/// revision.
+#[derive(Clone, Debug)]
+pub struct CoverageManifestRunOutcome {
+    /// Facts resolved per observed stream against the pinned allowed revision.
+    pub facts: Vec<ResolvedHostComplianceFacts>,
+    /// Denominator retained under the run fingerprint, read back from the
+    /// journal after recording.
+    pub manifest: ObservationCoverageManifest,
+}
+
 /// Runs the journal-owner coverage-manifest flow for one fingerprint: binds
-/// the owner-resolved allowed revision into the resolution view, then invokes
+/// the owner-resolved allowed revision into the resolution view, invokes
 /// [`drive_coverage_manifest`] with the owner-resolved streams, view, and
-/// plan, returning the resolved facts for the downstream evidence-assembly
-/// owner.
+/// plan, and returns the run outcome (resolved facts plus the retained
+/// manifest) for the downstream evidence-assembly owner.
 ///
 /// The plan-to-revision binding still verifies inside
 /// [`drive_coverage_manifest`]: a plan digest that does not equal the
 /// owner-resolved revision digest fails closed with
-/// [`IngestError::InvalidInput`] and retains nothing.
+/// [`IngestError::InvalidInput`] and retains nothing. The retained manifest
+/// is read back under the plan fingerprint, so the returned halves always
+/// agree; a missing retained manifest after a successful record fails closed
+/// with [`IngestError::InvalidInput`] and never yields a partial outcome.
 pub fn run_coverage_manifest(
     owner: &mut DurableHostEventJournal,
     run: &CoverageManifestRun<'_>,
-) -> Result<Vec<ResolvedHostComplianceFacts>, IngestError> {
+) -> Result<CoverageManifestRunOutcome, IngestError> {
     let allowed = AllowedHostManifestView {
         manifest_digest: run.manifest_digest,
         manifest_revision: run.manifest_revision,
         declared_tool_names: run.declared_tool_names,
         forbidden_tool_names: run.forbidden_tool_names,
     };
-    drive_coverage_manifest(owner, run.stream_ids, &allowed, &run.plan)
+    let facts = drive_coverage_manifest(owner, run.stream_ids, &allowed, &run.plan)?;
+    let manifest = owner
+        .coverage_manifest(run.plan.fingerprint)
+        .cloned()
+        .ok_or(IngestError::InvalidInput("coverage_manifest.fingerprint"))?;
+    Ok(CoverageManifestRunOutcome { facts, manifest })
 }
 
 /// Drives coverage-denominator production for one fingerprint: resolve facts
