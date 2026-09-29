@@ -119,8 +119,9 @@ use eliot_observation::{
 };
 use eliot_observation_contracts::{MaintenanceRecord, MaintenanceResultV1};
 use eliot_problem::{
-    DeliveryState, OwnerRef, Problem, ProblemId, ProblemState, Signal, SignalAttribution,
-    SignalDisposition, SignalId, SignalProcessingState, SignalSeverity,
+    DeliveryState, Incident, IncidentId, IncidentReason, IncidentReviewRequest, IncidentState,
+    OwnerRef, Problem, ProblemId, ProblemState, Signal, SignalAttribution, SignalDisposition,
+    SignalId, SignalProcessingState, SignalSeverity,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -1671,7 +1672,9 @@ fn watchdog_submission(
 /// Proves a gap-like entry yields a `ProblemCandidate` signal and a legal
 /// `Open -> Triaged` problem edge on scratch copies only. Severity is fixed
 /// `Info` and the transition target is fixed to `Triaged`: an incident is
-/// never self-certified here.
+/// never self-certified here. The same Signal may record an Incident review
+/// request, which leaves the Incident a `Candidate` (see
+/// [`check_incident_review_only`]).
 fn check_watchdog_gap_candidate(
     fence: &StateFence,
     batch_id: &str,
@@ -1751,6 +1754,72 @@ fn check_watchdog_gap_candidate(
                 "watchdog gap problem cannot legally become a candidate: {error}"
             ))
         })?;
+    check_incident_review_only(fence, batch_id, entry, &signal, &scratch)
+}
+
+/// Proves a supervision Signal can request Incident review but cannot open one.
+///
+/// The Signal is the evidence: the request is built from `signal`'s own
+/// severity and evidence handles, so it is refused if it restates anything the
+/// Signal did not carry. After the request is recorded the Incident must still
+/// be a `Candidate` with no committed promotion — the model-derived severity
+/// names no `PromotionAuthority`, so nothing here reaches `Open`.
+fn check_incident_review_only(
+    fence: &StateFence,
+    batch_id: &str,
+    entry: &WatchdogEntryAdmission,
+    signal: &Signal,
+    source_problem: &Problem,
+) -> Result<(), CompositionError> {
+    let request = IncidentReviewRequest {
+        reason: IncidentReason::CriticalTelemetryOrControlPathLost,
+        source_problem: source_problem.problem_id.clone(),
+        signal_id: signal.signal_id.clone(),
+        evidence_refs: signal.evidence_handles.clone(),
+        signal_severity: signal.severity,
+    };
+    let mut incident = Incident {
+        incident_id: IncidentId::new(format!(
+            "watchdog-gap-incident:{batch_id}:{}",
+            entry.sequence
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?,
+        title: format!(
+            "watchdog coverage gap review candidate batch {batch_id} sequence {}",
+            entry.sequence
+        ),
+        scope_id: GOVERNOR_SCOPE_ID.to_owned(),
+        owner: OwnerRef {
+            principal: GOVERNOR_SCOPE_ID.to_owned(),
+            generation: fence.resource_generation.value().to_string(),
+        },
+        state: IncidentState::Candidate,
+        evidence_refs: signal.evidence_handles.clone(),
+        source_problem: None,
+        promotion: None,
+        review_requests: Vec::new(),
+        acknowledged_by: None,
+        state_fence: fence.clone(),
+        revision: 1,
+        reopen_count: 0,
+    };
+    incident.validate().map_err(|error| {
+        owner_refused(format!(
+            "watchdog gap incident scratch state is not admissible: {error}"
+        ))
+    })?;
+    incident
+        .request_review(fence, signal, request)
+        .map_err(|error| {
+            owner_refused(format!(
+                "watchdog gap signal cannot request incident review: {error}"
+            ))
+        })?;
+    if incident.state != IncidentState::Candidate || incident.promotion.is_some() {
+        return Err(owner_refused(
+            "a supervision signal must not open an incident".to_owned(),
+        ));
+    }
     Ok(())
 }
 
