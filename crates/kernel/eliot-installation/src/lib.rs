@@ -9821,7 +9821,7 @@ where
             )?;
             match self
                 .port
-                .inspect_current_user_task(&task_request, None)
+                .inspect_current_user_task(task_request, None)
                 .map_err(|error| InstallationError::Platform(error.to_string()))?
             {
                 CurrentUserTaskObservation::Absent {
@@ -9831,7 +9831,7 @@ where
                 } => {
                     let precondition = current_user_task_absence_precondition(
                         &probe.precondition,
-                        &task_request,
+                        task_request,
                         &transaction
                             .profile_selection_receipt()
                             .ok_or_else(|| InstallationError::MigrationRequired {
@@ -9893,7 +9893,7 @@ where
             })?;
         let observation = self
             .port
-            .inspect_current_user_task(&task_request, None)
+            .inspect_current_user_task(task_request, None)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         match observation {
             CurrentUserTaskObservation::Matching { receipt, .. } => {
@@ -9925,7 +9925,7 @@ where
                 session_id,
             } => {
                 if unknown_cleanup
-                    || !current_user_task_absence_matches(snapshot, &task_request, &task_name, &sid, session_id)
+                    || !current_user_task_absence_matches(snapshot, task_request, &task_name, &sid, session_id)
                 {
                     return Err(InstallationError::IncompleteObservation(
                         "UserMode Task absence did not resolve the retained registration outcome"
@@ -9938,7 +9938,7 @@ where
             }
         }
 
-        match self.port.register_current_user_task(&task_request) {
+        match self.port.register_current_user_task(task_request) {
             Ok(receipt) => {
                 if receipt.request != *task_request
                     || !current_user_task_receipt_matches_absence(snapshot, &receipt)

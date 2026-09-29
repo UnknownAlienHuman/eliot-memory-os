@@ -2120,7 +2120,7 @@ impl InstallationTransaction {
             .ok_or_else(|| InstallationError::IncompleteObservation(
                 "Task Scheduler run receipt requires its pre-call intent".to_owned(),
             ))?;
-        self.validate_current_user_task_run_receipt(task_receipt, intent, &receipt)?;
+        Self::validate_current_user_task_run_receipt(task_receipt, intent, &receipt)?;
         match self.effect_progress[positions.task]
             .current_user_task_run_receipt
             .as_ref()
@@ -2356,7 +2356,6 @@ impl InstallationTransaction {
     }
 
     fn validate_current_user_task_run_receipt(
-        &self,
         task_receipt: &CurrentUserTaskReceipt,
         intent: &CurrentUserTaskRunIntent,
         receipt: &CurrentUserTaskRunReceipt,
@@ -3415,7 +3414,7 @@ impl InstallationTransaction {
                                 Self::validate_current_user_task_run_intent(receipt, intent)?;
                             }
                             (Some(intent), Some(run_receipt)) => {
-                                self.validate_current_user_task_run_receipt(
+                                Self::validate_current_user_task_run_receipt(
                                     receipt,
                                     intent,
                                     run_receipt,
