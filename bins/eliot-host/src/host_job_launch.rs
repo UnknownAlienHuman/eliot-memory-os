@@ -21,10 +21,10 @@ use eliot_kernel_service::semantic_store_config_hash_from_json;
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, ProfileRootPaths, ProfileRootRequest,
-    ProfileSelection, ProfileSelectionReceipt, RunningJobChild, SuspendedJobChild,
+    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
     SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
     observe_loopback_tcp_listener_owner,
+    profile_supervision::{ProfileRootPaths, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt},
 };
 
 #[cfg(windows)]
