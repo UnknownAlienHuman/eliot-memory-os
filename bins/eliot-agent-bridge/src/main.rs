@@ -13,8 +13,8 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    CoverageGap, DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
-    RecoveryProjectionPage, ResourceHandle, SessionId,
+    CoverageGap, DemandId, EventForwardStatus, FencingToken, Generation, HostEventEnvelope,
+    ReconnectRequest, RecoveryProjectionPage, ResourceHandle, SessionId,
 };
 use eliot_contracts::{
     BridgeEventCapacityPressure, BridgeTransportBackpressure, EpochId, HostCorrelationDomain,
@@ -35,7 +35,8 @@ use eliot_mcp::{
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
 use eliot_protocol::{
-    AgentActivationResolutionDisposition, EventEnvelope, HARD_STRUCTURED_RESPONSE_BYTES,
+    AckPhase, AgentActivationResolutionDisposition, EventDisposition, EventEnvelope,
+    HARD_STRUCTURED_RESPONSE_BYTES,
 };
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
@@ -366,6 +367,8 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reactive_receipts: Vec<InjectionReceipt>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_forwarding: Option<EventForwardingView>,
     },
     /// Typed refusal to allocate a bridge-event slot. The exact exhausted
     /// resource, permitted reconciliation path, and ORS-local acceptance
@@ -490,6 +493,62 @@ enum Response {
         directive_kind: String,
         detail: Option<AgentActivationResolutionDisposition>,
     },
+}
+
+/// Public projection of the exact forwarding result returned by the bridge
+/// core. In particular, an owner acknowledgement is not upgraded locally:
+/// phase, disposition, and cursor advancement are the values returned by the
+/// retained event owner.
+#[derive(Debug, Serialize)]
+struct EventForwardingView {
+    stream_id: String,
+    event_id: String,
+    outcome: EventForwardingOutcomeView,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum EventForwardingOutcomeView {
+    OwnerAcknowledged {
+        phase: AckPhase,
+        disposition: EventDisposition,
+        cursor_advanced: bool,
+    },
+    BestEffortForwarded,
+    BestEffortGapSignalled {
+        gap_id: String,
+        reason_ref: String,
+    },
+}
+
+impl EventForwardingView {
+    fn from_owner(event: &EventEnvelope, status: EventForwardStatus) -> Self {
+        let outcome = match status {
+            EventForwardStatus::Durable {
+                phase,
+                disposition,
+                cursor_advanced,
+            } => EventForwardingOutcomeView::OwnerAcknowledged {
+                phase,
+                disposition,
+                cursor_advanced,
+            },
+            EventForwardStatus::BestEffortForwarded => {
+                EventForwardingOutcomeView::BestEffortForwarded
+            }
+            EventForwardStatus::BestEffortGapSignalled { gap } => {
+                EventForwardingOutcomeView::BestEffortGapSignalled {
+                    gap_id: gap.gap_id,
+                    reason_ref: gap.reason_ref,
+                }
+            }
+        };
+        Self {
+            stream_id: event.stream_id.clone(),
+            event_id: event.event_id.clone(),
+            outcome,
+        }
+    }
 }
 
 /// Bounded sticky-attention projection for the Status frame.
@@ -1487,6 +1546,7 @@ fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> 
                 Response::Forwarded {
                     bootstrap: None,
                     reactive_receipts: receipts,
+                    event_forwarding: None,
                 },
                 false,
             ),
@@ -1505,13 +1565,15 @@ fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> 
 /// [`handle_forward_hook`]: no planning, no assessment, no minting.
 fn handle_forward_event(runner: &mut BridgeRunner, event: &EventEnvelope) -> (Response, bool) {
     match runner.forward_event(event) {
-        Ok(_) => {
+        Ok(status) => {
+            let event_forwarding = Some(EventForwardingView::from_owner(event, status));
             let response_id = format!("forward-event:{}", event.event_id);
             match runner.deliver_reactive_pending_via_response(&response_id) {
                 Ok(receipts) => (
                     Response::Forwarded {
                         bootstrap: None,
                         reactive_receipts: receipts,
+                        event_forwarding,
                     },
                     false,
                 ),
@@ -1531,6 +1593,7 @@ fn handle_forward_gap(runner: &mut BridgeRunner, gap: &CoverageGap) -> (Response
             Response::Forwarded {
                 bootstrap: None,
                 reactive_receipts: Vec::new(),
+                event_forwarding: None,
             },
             false,
         ),
@@ -4419,6 +4482,7 @@ mod tests {
         let empty = Response::Forwarded {
             bootstrap: None,
             reactive_receipts: Vec::new(),
+            event_forwarding: None,
         };
         let empty_value = serde_json::to_value(&empty).expect("forwarded must serialize");
         assert_eq!(empty_value["status"], Value::String("forwarded".to_owned()));
@@ -4429,6 +4493,7 @@ mod tests {
         let carried = Response::Forwarded {
             bootstrap: None,
             reactive_receipts: vec![receipt],
+            event_forwarding: None,
         };
         let value = serde_json::to_value(&carried).expect("carried must serialize");
         let receipts = value["reactive_receipts"]
@@ -4808,6 +4873,7 @@ mod tests {
         let mut first = Response::Forwarded {
             bootstrap: None,
             reactive_receipts: Vec::new(),
+            event_forwarding: None,
         };
         attach_auto_bootstrap(&mut runner, &mut first);
         let Response::Forwarded {
@@ -4824,6 +4890,7 @@ mod tests {
         let mut second = Response::Forwarded {
             bootstrap: None,
             reactive_receipts: Vec::new(),
+            event_forwarding: None,
         };
         attach_auto_bootstrap(&mut runner, &mut second);
         assert!(
@@ -4831,7 +4898,8 @@ mod tests {
                 second,
                 Response::Forwarded {
                     bootstrap: None,
-                    reactive_receipts: _
+                    reactive_receipts: _,
+                    ..
                 }
             ),
             "bootstrap must be injected exactly once"
