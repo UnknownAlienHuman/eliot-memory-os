@@ -4797,10 +4797,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
+        // The retained snapshot's own fence, owned here because the projection
+        // builds a fresh `StateFence`. The read borrows it, and the binding
+        // check below compares against the same owned value, so neither use
+        // moves it.
         let fence = self.snapshot.state_fence();
         let job = self
             .kernel
-            .load_durable_job(job_id, fence)
+            .load_durable_job(job_id, &fence)
             .map_err(CompositionError::Kernel)?;
         if let Some(job) = &job {
             job.validate().map_err(|error| {
@@ -4808,7 +4812,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     "retained durable maintenance job is invalid: {error}"
                 ))
             })?;
-            if job.job_id != job_id || job.state_fence != *fence {
+            if job.job_id != job_id || job.state_fence != fence {
                 return Err(CompositionError::Recovery(
                     "retained durable maintenance job is not bound to this fence and identity"
                         .to_owned(),
