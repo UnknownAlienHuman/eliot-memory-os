@@ -6,8 +6,8 @@
 
 #![forbid(unsafe_code)]
 
-mod revocation_digest;
 mod native_resource_lease;
+mod revocation_digest;
 mod surface_types;
 mod validation;
 

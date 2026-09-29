@@ -127,9 +127,9 @@ impl NativeResourceMeasurement {
             &self.measurement_digest,
             NativeResourceLeaseField::MeasurementDigest,
         )?;
-        self.state_fence
-            .validate()
-            .map_err(|_| NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence))?;
+        self.state_fence.validate().map_err(|_| {
+            NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence)
+        })?;
         if self.measured_at == 0 {
             return Err(NativeResourceLeaseError::InvalidField(
                 NativeResourceLeaseField::MeasuredAt,
@@ -203,9 +203,9 @@ impl NativeResourceLease {
             &self.measurement_digest,
             NativeResourceLeaseField::MeasurementDigest,
         )?;
-        self.state_fence
-            .validate()
-            .map_err(|_| NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence))?;
+        self.state_fence.validate().map_err(|_| {
+            NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence)
+        })?;
         if !self
             .state_fence
             .authority_epoch
@@ -365,9 +365,9 @@ impl NativeResourceLeaseConsumptionReceipt {
         {
             return Err(NativeResourceLeaseError::ReceiptBindingMismatch);
         }
-        self.state_fence
-            .validate()
-            .map_err(|_| NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence))?;
+        self.state_fence.validate().map_err(|_| {
+            NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence)
+        })?;
         if self.consumed_at < lease.issued_at || self.consumed_at >= lease.expires_at {
             return Err(NativeResourceLeaseError::Expired);
         }
