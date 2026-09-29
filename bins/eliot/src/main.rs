@@ -2534,7 +2534,7 @@ where
     let transaction = match GenerationPackagePlanner::plan_with_published_profile_binding(
         input,
         &profile_selection,
-        source_publication.profile_governed_roots,
+        &source_publication.profile_governed_roots,
         source_publication.retained_profile_anchor,
         source_publication.source_identity,
         source_publication.files,
@@ -3859,7 +3859,7 @@ fn user_mode_task_request_for_transaction(
     transaction: &InstallationTransaction,
 ) -> std::result::Result<
     (
-        eliot_installation::CurrentUserTaskRequest,
+        eliot_platform_windows::profile_supervision::CurrentUserTaskRequest,
         eliot_platform_windows::profile_supervision::ProfileRootLeaseSet,
     ),
     InstallationError,
@@ -3950,7 +3950,7 @@ fn user_mode_task_request_for_transaction(
 fn register_or_reconcile_user_mode_task(
     coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
     transaction_id: &PlatformHandle,
-    request: &eliot_installation::CurrentUserTaskRequest,
+    request: &eliot_platform_windows::profile_supervision::CurrentUserTaskRequest,
 ) -> std::result::Result<InstallationStepOutcome, InstallationError> {
     let receipt = coordinator.register_or_reconcile_current_user_task(
         transaction_id,
@@ -4003,7 +4003,7 @@ fn register_or_reconcile_user_mode_task(
 #[cfg(windows)]
 fn user_mode_task_registration_is_durable(
     transaction: &InstallationTransaction,
-    request: &eliot_installation::CurrentUserTaskRequest,
+    request: &eliot_platform_windows::profile_supervision::CurrentUserTaskRequest,
 ) -> bool {
     transaction
         .installer_effects
@@ -4932,7 +4932,7 @@ fn reconcile_host_activation_terminal(
             let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
                 return Ok(None);
             };
-            registry.load()?
+            registry
         }
         InstallationProfile::UserMode | InstallationProfile::PortableDev => {
             let host_root = UserOwnedRootLease::open_existing(host_state_root)
