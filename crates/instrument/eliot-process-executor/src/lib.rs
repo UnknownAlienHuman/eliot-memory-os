@@ -4009,11 +4009,22 @@ fn open_executable_for_hash(path: &Path) -> Result<std::fs::File, std::io::Error
     Ok(file)
 }
 
-/// Opens an executable for hashing on non-Windows platforms (plain open:
-/// no deny-write share semantics exist here; the retained cross-launch pin
-/// remains the kernel lease on its owning platform).
+/// Opens an executable for hashing on non-Windows platforms.
+///
+/// No deny-write share semantics exist here; the retained cross-launch pin
+/// remains the kernel lease on its owning platform. Symlinks are still
+/// refused fail-closed: the link itself is inspected without following it
+/// (same refusal shape as the Windows variant), so a symlink can never
+/// stand in for the executable at the observation instant.
 #[cfg(not(windows))]
 fn open_executable_for_hash(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "executable is not a plain file",
+        ));
+    }
     std::fs::File::open(path)
 }
 
