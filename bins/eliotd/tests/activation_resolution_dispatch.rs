@@ -277,11 +277,18 @@ fn current_ingress_maps_to_typed_submit_and_receiver_contract() -> TestResult {
         1,
         "current ingress, typed resolution, submission, and receiver contract",
     )?;
+    // #839 (W5): the claim -> resolve -> dispatch spine now lives in the
+    // retained activation flight, so the anchor pair is the resolve step that
+    // acquires the composition guard and the stage-aware shutdown drain that
+    // ends the spine. The retired `start_valid_claim_step` / "Bounded shutdown
+    // drain for one in-flight activation" pair names symbols issue #2559
+    // removed, so `slice_between` could not find either anchor and this case
+    // failed before asserting anything.
     let runtime = source("src/daemon_runtime.rs")?;
     let claim_step = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn start_activation_resolve(",
+        "async fn drain_flights_on_shutdown(",
     )?;
     assert_ordered(
         claim_step,
@@ -298,14 +305,18 @@ fn current_ingress_maps_to_typed_submit_and_receiver_contract() -> TestResult {
         "pub async fn submit_agent_activation_result(",
         "pub async fn reconcile_agent_activation_result(",
     )?;
+    // #839 (W4/A4): the typed `ActivationSubmitResponse` replaces the retired
+    // `value.get("ack")` map read, and the accepted-payload validator stays in
+    // the daemon's `classify_submit_ack` arm (#1115), so the client leg
+    // validates the recorded acknowledgement and its replay identity itself.
     assert_ordered(
         submit,
         &[
             "AgentActivationResultSubmit::new_with_owner_readback",
             "\"agent_activation_submit\"",
-            "value.get(\"ack\")",
+            "ActivationSubmitResponse",
             "AgentActivationResultAck",
-            "ack.validate_against_result(result)",
+            "ack.validate()",
         ],
     )?;
 
@@ -315,11 +326,16 @@ fn current_ingress_maps_to_typed_submit_and_receiver_contract() -> TestResult {
         "\n            \"agent_activation_submit\" => {",
         "\n            \"agent_activation_reconcile\" => {",
     )?;
+    // #839 (W4/A4): the receiver arm names the envelope through its namespaced
+    // decoder `decode_agent_activation_result_submit` and the authenticated
+    // submit entry point; the bare `AgentActivationResultSubmit` type name is
+    // not in this arm, so the previous marker asserted against text that is
+    // not there.
     assert_ordered(
         receiver,
         &[
-            "AgentActivationResultSubmit",
-            "submit_agent_activation_result",
+            "decode_agent_activation_result_submit",
+            "submit_agent_activation_result_authenticated",
             "activation_result_daemon_response",
         ],
     )?;
@@ -340,18 +356,25 @@ fn valid_ticket_reaches_actual_daemon_v2_dispatch_path() -> TestResult {
         other => return Err(format!("valid ticket must enter Valid claim arm: {other:?}").into()),
     }
 
+    // #839 (W5): same retired anchor pair as case 1. The dispatch step now
+    // destructures the retained `ActivationResolvedTicket` rather than taking
+    // `&ticket, result, owner_readback`, so the ordered marker names the
+    // retained-identity fields the current call actually forwards.
     let runtime = source("src/daemon_runtime.rs")?;
     let claim_step = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn start_activation_resolve(",
+        "async fn drain_flights_on_shutdown(",
     )?;
     assert_ordered(
         claim_step,
         &[
             "resolve_agent_activation_v2",
             "let retained = RetainedActivationIdentity",
-            "dispatch_agent_activation_result(&kernel_clone, &ticket, result, owner_readback)",
+            "dispatch_agent_activation_result(",
+            "resolved.ticket",
+            "resolved.result",
+            "resolved.owner_readback",
         ],
     )?;
     assert!(!claim_step.contains("map_activation_snapshot"));
@@ -380,11 +403,14 @@ fn accepted_exact_replay_reuses_one_resolution_identity() -> TestResult {
     assert_eq!(replay.result_sha256, result.result_sha256);
     assert_eq!(replay.result.as_ref(), Some(&result));
 
+    // #839 (W5): same retired anchor pair as case 1. The replay retention is
+    // proved by the spine containing exactly one resolution call: the dispatch
+    // step reuses `resolved.result` and never resolves again.
     let runtime = source("src/daemon_runtime.rs")?;
     let claim_step = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn start_activation_resolve(",
+        "async fn drain_flights_on_shutdown(",
     )?;
     assert_eq!(claim_step.matches("resolve_agent_activation_v2").count(), 1);
     let dispatch = slice_between(
@@ -500,11 +526,12 @@ fn v1_compatibility_retired_v2_resolution_is_the_spine() -> TestResult {
     assert!(!projection.contains("AgentActivationResolutionDecision"));
     assert!(projection.contains("map_governor_outcome_to_protocol"));
 
+    // #839 (W5): same retired anchor pair as case 1.
     let runtime = source("src/daemon_runtime.rs")?;
     let claim_step = slice_between(
         &runtime,
-        "fn start_valid_claim_step(\n",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn start_activation_resolve(",
+        "async fn drain_flights_on_shutdown(",
     )?;
     assert!(!claim_step.contains("map_activation_snapshot"));
     assert!(!claim_step.contains("AgentActivationResolutionDecision"));
@@ -590,6 +617,13 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
         );
     }
 
+    // #839 (W2/W15/A7, W5): the three terminal-result constructors gained a
+    // `*_with_observation` production variant when successor observation became
+    // mandatory, and the loop now dispatches through the `AgentActivationResolver`
+    // trait by fully qualified call. The production names below are the ones
+    // main actually calls; the retired bare names and the inherent
+    // `.resolve_agent_activation_v2(&ticket, now)` form no longer exist, so this
+    // case was asserting against symbols that had been removed.
     let library = source("src/lib.rs")?;
     let library_production = library
         .split("\n#[cfg(test)]\nmod tests;")
@@ -597,9 +631,10 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
         .ok_or("daemon library test boundary is missing")?;
     for marker in [
         "activation_projection::map_governor_outcome_to_protocol(",
-        "activation_projection::stale_fence_for_resolved_mismatch(",
-        "activation_projection::failed_internal_for_unready_governor(",
-        "activation_projection::failed_internal_for_mapping_failure(",
+        "activation_projection::map_governor_outcome_to_protocol_for_successor(",
+        "activation_projection::stale_fence_for_resolved_mismatch_with_observation(",
+        "activation_projection::failed_internal_for_unready_governor_with_observation(",
+        "activation_projection::failed_internal_for_mapping_failure_with_observation(",
         "DaemonComposition::resolve_agent_activation_v2(self, ticket, now)",
     ] {
         assert!(
@@ -608,13 +643,15 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
         );
     }
 
+    // Same retired anchor pair as case 1. The trait-dispatch production caller
+    // is the fully qualified call, so that is the marker asserted here.
     let runtime = source("src/daemon_runtime.rs")?;
     let claim_step = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn start_activation_resolve(",
+        "async fn drain_flights_on_shutdown(",
     )?;
-    assert!(claim_step.contains(".resolve_agent_activation_v2(&ticket, now)"));
+    assert!(claim_step.contains("AgentActivationResolver::resolve_agent_activation_v2("));
     let dispatch = slice_between(
         &runtime,
         "async fn dispatch_agent_activation_result(",
@@ -705,11 +742,12 @@ fn activation_source_excludes_unowned_effects_and_duplicate_paths() -> TestResul
         ],
     )?;
 
+    // #839 (W5): same retired anchor pair as case 1.
     let runtime = source("src/daemon_runtime.rs")?;
     let claim_step = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn start_activation_resolve(",
+        "async fn drain_flights_on_shutdown(",
     )?;
     assert!(!claim_step.contains("map_activation_snapshot"));
     assert!(!claim_step.contains("AgentActivationResolutionDecision"));
