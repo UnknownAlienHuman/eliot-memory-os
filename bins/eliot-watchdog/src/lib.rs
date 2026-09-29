@@ -41,7 +41,7 @@ pub use eliot_runtime_contracts::{
     SUPERVISION_LEASE_FILE_NAME, WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_FILE_NAME,
 };
 use eliot_runtime_contracts::{VerifiedSupervisionLease, WatchdogAdmissionTemplate};
-use eliot_watchdog_core::{Epoch, Watchdog};
+use eliot_watchdog_core::{Epoch, ReopenCondition, Watchdog};
 use thiserror::Error;
 
 use redb::Database;
@@ -115,6 +115,12 @@ pub use watchdog_spool::{
 pub(crate) use watchdog_spool::{
     SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
 };
+/// Durable failure-episode deduplication and recurrence state (I8.3, I8.9).
+///
+/// Re-exported so the sensor's observation path names the episode owner by a
+/// short, unambiguous path instead of repeating this owner's module path in
+/// every call. The module itself is `pub(crate)`, so this adds no public API.
+pub(crate) use watchdog_spool::episode;
 
 #[cfg(test)]
 impl WatchdogSpool {
@@ -1070,11 +1076,24 @@ impl IndependentKernelSensor {
     /// supervision failure into a success or vice versa.
     fn observe_supervision_outcome(
         &self,
+        lease: &VerifiedSupervisionLease,
         outcome: Result<(), KernelWatchdogError>,
     ) -> Result<(), KernelWatchdogError> {
+        // I8.3/I8.9: the durable failure-episode state is persisted *before*
+        // anything downstream reads the outcome, in the same owner transaction
+        // that appends the record an accepted revision produced. A refusal is an
+        // observation outcome, so it never changes the returned error.
         match &outcome {
-            Ok(()) => self.observe_governor_recovered(),
-            Err(error) => self.observe_supervision_unavailable(error),
+            Ok(()) => {
+                self.close_signal_episodes_after_admission();
+                self.observe_governor_recovered();
+            }
+            Err(error) => {
+                let reason = kernel_gap_reason(error);
+                let observed_at_ms = current_unix_ms().map_or(0, |value| value.max(1));
+                self.observe_supervision_rejection_episode(lease, reason, observed_at_ms);
+                self.observe_supervision_unavailable(error);
+            }
         }
         outcome
     }
@@ -1160,13 +1179,198 @@ impl IndependentKernelSensor {
             .map(|_| ())
             .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))
     }
+
+    /// Records one genuinely observed supervision rejection against its durable
+    /// failure episode (I8.3, I8.9).
+    ///
+    /// This is the production caller of the episode machinery, and it runs on
+    /// the real rejection contour: a signed lease this sensor verified and then
+    /// the Watchdog's own epoch/window checks refused, or the Kernel refused.
+    /// Every identity it uses is owner-issued — the lease's own identity, its own
+    /// scope, its own epoch generation, and the authenticated payload digest of
+    /// the exact lease bytes — and the failure class is the closed reason the
+    /// refusal actually reported. Nothing here is a cwd string, a path, or hook
+    /// text, and a caller cannot choose the class.
+    ///
+    /// The source event is the *lease identity*, and its payload digest is the
+    /// authenticated digest of that exact lease. So:
+    ///
+    /// * the same lease re-observed on a later tick, a duplicate tick, or after
+    ///   a restart is the same event with the same payload: it reuses the
+    ///   revision the episode already accepted, appends no record, and neither
+    ///   advances the independent occurrence count nor refreshes the episode's
+    ///   evidence time;
+    /// * a genuinely different lease under the same scope, subject, generation
+    ///   and class is a new event: evidence is appended, the accepted revision
+    ///   advances, and exactly one record is minted;
+    /// * the same lease identity carrying a *different* payload is a typed
+    ///   conflict. It is never a silent overwrite and never a second episode.
+    ///
+    /// Non-fatal by construction: a refusal is an observation outcome, and an
+    /// observation problem never turns into a supervision failure. The original
+    /// `KernelWatchdogError` is returned unchanged whatever happens here.
+    fn observe_supervision_rejection_episode(
+        &self,
+        lease: &VerifiedSupervisionLease,
+        reason: GapRecoveryReason,
+        observed_at_ms: u64,
+    ) {
+        let Some(failure_class) = episode::failure_class_of_reason(reason) else {
+            // Retention pressure is this owner's own storage pressure, not an
+            // observed failure of a supervised subject. It keeps its existing
+            // plain gap record and never opens a failure episode, so a busy
+            // spool cannot manufacture episodes.
+            return;
+        };
+        // The source event identity is the lease's own identity and the payload
+        // digest is the authenticated digest of that exact lease's canonical
+        // bytes, so both halves are what the signing owner issued rather than
+        // anything this owner composed.
+        let Ok(payload_digest) = lease.payload_digest() else {
+            return;
+        };
+        let Ok(source_event) = eliot_watchdog_core::AcceptedSourceEvent::new(
+            lease.lease().lease_id.clone(),
+            payload_digest,
+        ) else {
+            return;
+        };
+        // The observed subject is this owner's own retained installation
+        // identity — the subject this Watchdog actually supervises — and the
+        // observed scope and generation are the verified lease's own scope and
+        // epoch sequence. The lease *identity* is deliberately not the subject:
+        // it is the source event below. Keeping them separate is what lets a
+        // second, genuinely different lease under the same scope, subject and
+        // generation append evidence to this same episode rather than open a
+        // parallel one, while a new epoch generation correctly starts a distinct
+        // episode.
+        //
+        // A lease that carries no initialized epoch cannot name a generation, so
+        // it names no episode: a zero generation is never substituted to make a
+        // key derivable.
+        let generation = lease.lease().watchdog_epoch.value();
+        if generation == 0 {
+            return;
+        }
+        let identity = eliot_watchdog_core::FailureEpisodeIdentity {
+            rule: eliot_watchdog_core::RuleRevision {
+                rule_id: episode::SUPERVISION_GAP_RULE_ID.to_owned(),
+                revision: episode::SUPERVISION_GAP_RULE_REVISION,
+            },
+            target: eliot_watchdog_core::SignalTarget {
+                subject_id: self.installation_id.clone(),
+                scope_id: lease.lease().scope_ref.clone(),
+                generation,
+            },
+            failure_class,
+        };
+        let outcome = self.spool.observe_signal_episode(
+            episode::SignalEpisodeObservation {
+                identity,
+                source_event,
+                // A recurrence is a genuinely new source event; a retransmission
+                // is not, so this condition can never reopen on re-delivery.
+                reopen_condition: ReopenCondition::RecurrenceWithNewSourceEvent,
+                observed_at_ms,
+                producer_generation: self.watchdog_generation,
+                record_reason: reason,
+            },
+        );
+        match outcome {
+            Ok(episode::SignalEpisodeOutcome::Accepted {
+                revision,
+                independent_occurrences,
+                sequence,
+                reopened,
+                ..
+            }) => tracing::warn!(
+                event = "watchdog.signal_episode_accepted",
+                observation = "accepted",
+                revision = revision,
+                independent_occurrences = independent_occurrences,
+                sequence = sequence,
+                reopened = reopened,
+                "a genuinely new source event advanced one durable failure episode and appended its record"
+            ),
+            Ok(episode::SignalEpisodeOutcome::Reused {
+                revision,
+                independent_occurrences,
+                sequence,
+                ..
+            }) => tracing::debug!(
+                event = "watchdog.signal_episode_reused",
+                observation = "retransmission",
+                revision = revision,
+                independent_occurrences = independent_occurrences,
+                sequence = sequence,
+                "a retransmitted source event reused the revision this episode already accepted"
+            ),
+            Ok(episode::SignalEpisodeOutcome::Refused(refusal)) => {
+                tracing::warn!(
+                    event = "watchdog.signal_episode_refused",
+                    observation = "refused",
+                    reason_code = match refusal {
+                        episode::SignalEpisodeRefusal::ConflictingSourceEventPayload { .. } => {
+                            "CONFLICTING_SOURCE_EVENT_PAYLOAD"
+                        }
+                        episode::SignalEpisodeRefusal::SourceEventHistoryFull { .. } => {
+                            "SOURCE_EVENT_HISTORY_FULL"
+                        }
+                        episode::SignalEpisodeRefusal::ReopenHistoryFull { .. } => {
+                            "REOPEN_HISTORY_FULL"
+                        }
+                    },
+                    "one offered observation was refused; nothing was written and no new episode opened"
+                );
+            }
+            Err(error) => tracing::debug!(
+                event = "watchdog.signal_episode_failed",
+                observation = "fenced",
+                reason_code = crate::diagnostics::spool_error_observation(&error),
+                "watchdog could not record the failure episode; the observation stays an observation"
+            ),
+        }
+    }
+
+    /// Closes every open failure episode after a live, verified supervision
+    /// admission.
+    ///
+    /// A live admission is the only closer, exactly as it is for the escalation
+    /// episode: no timer, no export acknowledgement, and no caller-chosen reason
+    /// reaches it. Closing withdraws nothing — every episode keeps its accepted
+    /// source events, accepted revision, exact record reference and reopen
+    /// history — so a later recurrence is recognised as a recurrence of *that*
+    /// episode and appends a reopen record beside it instead of starting an
+    /// unrelated first observation.
+    fn close_signal_episodes_after_admission(&self) {
+        match self
+            .spool
+            .close_signal_episodes()
+        {
+            Ok(0) => {}
+            Ok(closed) => tracing::debug!(
+                event = "watchdog.signal_episode_closed",
+                observation = "reconciled",
+                closed = closed,
+                "a live supervision admission closed its open failure episodes; their history stays retained"
+            ),
+            Err(error) => tracing::debug!(
+                event = "watchdog.signal_episode_close_failed",
+                observation = "fenced",
+                reason_code = crate::diagnostics::spool_error_observation(&error),
+                "watchdog could not close its failure episodes; no episode was silently dropped"
+            ),
+        }
+    }
 }
 impl KernelWatchdogPort for IndependentKernelSensor {
     fn supervise<'a>(
         &'a self,
         lease: &'a VerifiedSupervisionLease,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
-        Box::pin(async move { self.observe_supervision_outcome(self.record_heartbeat(lease)) })
+        Box::pin(async move {
+            self.observe_supervision_outcome(lease, self.record_heartbeat(lease))
+        })
     }
 
     fn report_gap<'a>(
