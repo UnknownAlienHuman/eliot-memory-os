@@ -90,6 +90,12 @@ use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
 };
+/// Durable failure-episode deduplication and recurrence state (I8.3, I8.9).
+///
+/// Re-exported so the sensor's observation path names the episode owner by a
+/// short, unambiguous path instead of repeating this owner's module path in
+/// every call. The module itself is `pub(crate)`, so this adds no public API.
+pub(crate) use watchdog_spool::episode;
 pub use watchdog_spool::export_driver::{
     KernelFrontDoorWatchdogIntentSink, WatchdogEntryView, WatchdogExportSink,
     WatchdogIntentAcknowledgement, WatchdogIntentExportBatch, WatchdogIntentReconciliation,
@@ -115,12 +121,6 @@ pub use watchdog_spool::{
 pub(crate) use watchdog_spool::{
     SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
 };
-/// Durable failure-episode deduplication and recurrence state (I8.3, I8.9).
-///
-/// Re-exported so the sensor's observation path names the episode owner by a
-/// short, unambiguous path instead of repeating this owner's module path in
-/// every call. The module itself is `pub(crate)`, so this adds no public API.
-pub(crate) use watchdog_spool::episode;
 
 #[cfg(test)]
 impl WatchdogSpool {
@@ -1264,8 +1264,9 @@ impl IndependentKernelSensor {
             },
             failure_class,
         };
-        let outcome = self.spool.observe_signal_episode(
-            episode::SignalEpisodeObservation {
+        let outcome = self
+            .spool
+            .observe_signal_episode(episode::SignalEpisodeObservation {
                 identity,
                 source_event,
                 // A recurrence is a genuinely new source event; a retransmission
@@ -1274,8 +1275,7 @@ impl IndependentKernelSensor {
                 observed_at_ms,
                 producer_generation: self.watchdog_generation,
                 record_reason: reason,
-            },
-        );
+            });
         match outcome {
             Ok(episode::SignalEpisodeOutcome::Accepted {
                 revision,
@@ -1343,10 +1343,7 @@ impl IndependentKernelSensor {
     /// episode and appends a reopen record beside it instead of starting an
     /// unrelated first observation.
     fn close_signal_episodes_after_admission(&self) {
-        match self
-            .spool
-            .close_signal_episodes()
-        {
+        match self.spool.close_signal_episodes() {
             Ok(0) => {}
             Ok(closed) => tracing::debug!(
                 event = "watchdog.signal_episode_closed",
@@ -1368,9 +1365,9 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         &'a self,
         lease: &'a VerifiedSupervisionLease,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.observe_supervision_outcome(lease, self.record_heartbeat(lease))
-        })
+        Box::pin(
+            async move { self.observe_supervision_outcome(lease, self.record_heartbeat(lease)) },
+        )
     }
 
     fn report_gap<'a>(

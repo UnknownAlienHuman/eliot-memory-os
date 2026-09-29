@@ -24,15 +24,6 @@ use crate::{
 
 pub(crate) mod backup;
 mod codec;
-pub mod export_driver;
-/// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`) and
-/// the Watchdog-owned deterministic escalation rule that mints them.
-/// The shared owner-neutral export classes stay unextended: intents persist as
-/// codec variants, travel inside their export window under the existing
-/// `Recovery` class, are reconciled through the fenced Kernel
-/// `watchdog-spool-batch-v1` intent route, and are never removed by compaction
-/// so the original Watchdog record stays linked to the Governor's decision.
-pub(crate) mod intent;
 /// Durable failure-episode deduplication and recurrence state (I8.3, I8.9).
 ///
 /// The episode key and the source-event admission decision are derived in the
@@ -43,6 +34,15 @@ pub(crate) mod intent;
 /// an in-memory set, and it is not a compaction candidate, so an unresolved
 /// episode is never dropped.
 pub(crate) mod episode;
+pub mod export_driver;
+/// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`) and
+/// the Watchdog-owned deterministic escalation rule that mints them.
+/// The shared owner-neutral export classes stay unextended: intents persist as
+/// codec variants, travel inside their export window under the existing
+/// `Recovery` class, are reconciled through the fenced Kernel
+/// `watchdog-spool-batch-v1` intent route, and are never removed by compaction
+/// so the original Watchdog record stays linked to the Governor's decision.
+pub(crate) mod intent;
 
 pub use backup::{
     CaptureFenceParams, SpoolCoverageDenominator, SpoolFenceEntryKind,
@@ -1721,11 +1721,8 @@ impl WatchdogSpool {
                         reason: observation.record_reason,
                         coverage_claimed: false,
                     };
-                    let (_appended, created) = Self::append_in_transaction(
-                        &write,
-                        observation.observed_at_ms,
-                        payload,
-                    )?;
+                    let (_appended, created) =
+                        Self::append_in_transaction(&write, observation.observed_at_ms, payload)?;
                     // The identity of the record this transaction just created,
                     // bound the way an export batch binds it. A
                     // retention-pressure gap record written ahead of it can
@@ -1792,11 +1789,7 @@ impl WatchdogSpool {
     ) -> Option<episode::SignalEpisodeOutcome> {
         let read = self.database.begin_read().ok()?;
         let state = episode::read_episode(&read, ledger_key).ok()??;
-        if state
-            .classify(source_event)
-            .ok()?
-            .is_new_evidence()
-        {
+        if state.classify(source_event).ok()?.is_new_evidence() {
             return None;
         }
         let (revision, record) = state.accepted().ok()?;

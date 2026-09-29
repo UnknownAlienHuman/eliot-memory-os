@@ -725,10 +725,8 @@ impl StoredSignalEpisode {
         };
         self.accepted_source_events
             .push(StoredSourceEvent::from_core(&observation.source_event));
-        self.independent_occurrences = self
-            .independent_occurrences
-            .checked_add(1)
-            .ok_or_else(|| {
+        self.independent_occurrences =
+            self.independent_occurrences.checked_add(1).ok_or_else(|| {
                 SpoolError::Corrupt(
                     "watchdog signal episode occurrence count overflowed".to_owned(),
                 )
@@ -853,10 +851,9 @@ where
     else {
         return Ok(None);
     };
-    let episode: StoredSignalEpisode =
-        serde_json::from_slice(value.value()).map_err(|error| {
-            SpoolError::Corrupt(format!("watchdog signal episode row is invalid: {error}"))
-        })?;
+    let episode: StoredSignalEpisode = serde_json::from_slice(value.value()).map_err(|error| {
+        SpoolError::Corrupt(format!("watchdog signal episode row is invalid: {error}"))
+    })?;
     episode.validate()?;
     if episode_ledger_key(&episode.episode_key) != ledger_key {
         return Err(SpoolError::Corrupt(
