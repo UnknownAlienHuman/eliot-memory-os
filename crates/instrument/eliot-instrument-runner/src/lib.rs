@@ -72,13 +72,15 @@ pub use process_owner::{
 };
 pub use profile::{
     ADMITTED_SCOPE_CLASS, ADMITTED_WORKTREE_CLASS, AdmissionError, AdmittedProfile, AdmittedStage,
-    BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION, BUNDLE_VERIFICATION_ROUTE, COMPILER_PROFILE,
-    CompiledProfile, ISOLATED_PROCESS_CLASS, InstrumentClass, InstrumentKindId, InstrumentProfile,
-    InstrumentProfileResolver, InstrumentRegistry, InstrumentRegistrySnapshot, InstrumentSpec,
-    InstrumentSpecParams, PACKAGE_VERIFICATION_ROUTE, ProfileCompiler, ProfileError,
-    ProfileScopeClasses, REGISTRY_SNAPSHOT_SCHEMA, REGISTRY_SNAPSHOT_SCHEMA_VERSION,
-    ResolvedProfile, ResolvedStage, ResourceLimits, StageDag, StageDecl, StageEnvironment,
-    TEST_PROFILE, TargetLayout, WorkScope, bundle_verification_profile, compiler_profile,
+    BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION, BUNDLE_VERIFICATION_ALIAS,
+    BUNDLE_VERIFICATION_ROUTE, COMPILER_PROFILE, CompiledProfile, ISOLATED_PROCESS_CLASS,
+    InstrumentClass, InstrumentKindId, InstrumentProfile, InstrumentProfileResolver,
+    InstrumentRegistry, InstrumentRegistrySnapshot, InstrumentSpec, InstrumentSpecParams,
+    PACKAGE_VERIFICATION_ALIAS, PACKAGE_VERIFICATION_ROUTE, PROFILE_ALIASES, ProfileAlias,
+    ProfileCompiler, ProfileError, ProfileScopeClasses, REGISTRY_SNAPSHOT_SCHEMA,
+    REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage, ResourceLimits, StageDag,
+    StageDecl, StageEnvironment, TEST_PROFILE, TargetLayout, WorkScope,
+    admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
     package_verification_profile, test_profile,
 };
 pub use profile_run::{

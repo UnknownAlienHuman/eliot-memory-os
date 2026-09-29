@@ -115,6 +115,12 @@ pub enum ProfileError {
         /// Requested revision.
         revision: u64,
     },
+    /// A requested alias is outside the closed [`PROFILE_ALIASES`] table.
+    #[error("'{alias}' is not an admitted profile alias")]
+    UnknownAlias {
+        /// Requested alias name.
+        alias: String,
+    },
     /// A stage references an [`InstrumentSpec`] the registry never admitted.
     #[error("profile '{profile}' stage '{stage}' references unknown spec '{spec}'")]
     UnknownSpec {
@@ -1175,6 +1181,88 @@ pub fn bundle_verification_profile() -> Result<InstrumentProfile, ProfileError> 
             ADMITTED_SCOPE_CLASS.to_owned(),
         )?,
     )
+}
+
+/// Alias naming the package-verification route at its shipped revision.
+///
+/// An alias is a stable, closed name a thin invoker (a workflow, a wrapper
+/// script, a Justfile recipe) passes instead of restating a command list. It
+/// carries no command, no shell string, no executable path, and no environment
+/// selection: it names exactly one admitted profile revision and nothing else.
+pub const PACKAGE_VERIFICATION_ALIAS: &str = "package-verification";
+/// Alias naming the bundle-verification route at its shipped revision.
+pub const BUNDLE_VERIFICATION_ALIAS: &str = "bundle-verification";
+
+/// One entry of the closed [`PROFILE_ALIASES`] table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileAlias {
+    /// Stable alias name an invoker passes.
+    pub alias: &'static str,
+    /// Admitted profile the alias resolves to.
+    pub profile: &'static str,
+    /// Exact admitted revision the alias pins.
+    pub revision: u64,
+}
+
+/// The closed alias table: the only way a caller names a verification route
+/// (issue #1914 W4).
+///
+/// I18.21 requires "there is no hidden CI-only verifier command list". A
+/// command list is unverifiable precisely because it is a second copy of an
+/// order the shared owner already defines: it drifts without failing anything.
+/// An alias is the opposite of a command list — it is a name, resolved through
+/// the same registry both a local entrypoint and CI admit, so a run cannot
+/// execute a stage the registry never admitted.
+///
+/// The table is a `const` slice of a fixed element type, so it cannot grow at
+/// runtime, take caller data, or be extended by a stringly-typed lookup. It
+/// admits exactly the two versioned verification routes and nothing else: an
+/// alias outside this slice is refused with
+/// [`ProfileError::UnknownAlias`], never normalized, trimmed, case-folded, or
+/// mapped to a neighbouring route. There is no default alias and no
+/// head-revision resolution — each entry pins one exact revision, so an alias
+/// that a registry does not admit at that revision fails closed rather than
+/// resolving to whatever revision happens to be the highest.
+pub const PROFILE_ALIASES: &[ProfileAlias] = &[
+    ProfileAlias {
+        alias: PACKAGE_VERIFICATION_ALIAS,
+        profile: PACKAGE_VERIFICATION_ROUTE,
+        revision: BUILTIN_PROFILE_REVISION,
+    },
+    ProfileAlias {
+        alias: BUNDLE_VERIFICATION_ALIAS,
+        profile: BUNDLE_VERIFICATION_ROUTE,
+        revision: BUILTIN_PROFILE_REVISION,
+    },
+];
+
+/// Resolves one closed alias name to its admitted profile at its pinned
+/// revision (issue #1914 W4).
+///
+/// This is the one entry a thin invoker uses to name a verification route. The
+/// name is matched exactly against [`PROFILE_ALIASES`] — no trimming, case
+/// folding, prefix match, or alias-of-alias — and the pinned revision is then
+/// resolved through the registry at that exact revision, so a registry that
+/// does not admit it fails closed with [`ProfileError::UnknownRevision`]
+/// instead of falling back to the route's head revision or to another route.
+///
+/// # Errors
+///
+/// Returns [`ProfileError::UnknownAlias`] when the name is outside the closed
+/// table, and [`ProfileError::UnknownProfile`] or
+/// [`ProfileError::UnknownRevision`] when the table's pinned revision is not
+/// admitted by this registry.
+pub fn admitted_profile_for_alias(
+    alias: &str,
+    registry: &InstrumentRegistry,
+) -> Result<&InstrumentProfile, ProfileError> {
+    let entry = PROFILE_ALIASES
+        .iter()
+        .find(|entry| entry.alias == alias)
+        .ok_or_else(|| ProfileError::UnknownAlias {
+            alias: alias.to_owned(),
+        })?;
+    registry.admitted(entry.profile, entry.revision)
 }
 
 /// Admission registry for versioned specs and profiles (I10.8.1).

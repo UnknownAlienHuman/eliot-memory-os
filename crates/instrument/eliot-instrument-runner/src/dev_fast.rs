@@ -25,7 +25,7 @@ use thiserror::Error;
 use crate::InstrumentRunner;
 use crate::profile::{
     InstrumentProfile, InstrumentRegistry, ProfileCompiler, ProfileError, ProfileScopeClasses,
-    StageEnvironment, TargetLayout, WorkScope,
+    StageEnvironment, TargetLayout, WorkScope, admitted_profile_for_alias,
 };
 use crate::profile_run::{
     AggregateStatus, InstrumentRun, ProfileAggregate, RetainedExitOutcome, RetainedToolIdentity,
@@ -963,16 +963,22 @@ pub fn dev_fast_caller_plan(
 ///
 /// The exact admitted revision, the profile digest, the stage DAG digest, and
 /// the resolution digest are all read back from the same
-/// [`ProfileCompiler::resolve_route`] result, so local and CI cannot report
-/// different revisions for one route. A route the registry never admitted fails
-/// closed; a caller never falls back to a neighbouring profile or a default.
+/// [`ProfileCompiler::resolve_full`] result, so local and CI cannot report
+/// different revisions for one route.
+///
+/// `request.route` is a profile ALIAS, not a profile name, a command, or a
+/// stage list: it must appear in the closed
+/// [`PROFILE_ALIASES`](crate::profile::PROFILE_ALIASES) table, which pins one
+/// exact admitted revision per alias. An alias outside that table fails closed,
+/// a pinned revision the registry does not admit fails closed, and there is no
+/// fallback to a neighbouring route and no default.
 ///
 /// # Errors
 ///
 /// Returns [`DevFastError::Admission`] carrying the registry or
-/// [`ProfileCompiler::resolve_route`] failure when a receipt is refused, the
-/// route admits no revision, or a binding is refused, and
-/// [`DevFastError::ReceiptMismatch`] when
+/// [`admitted_profile_for_alias`] failure when a receipt is refused, the alias
+/// is outside the closed table, the pinned revision admits nothing, or a
+/// binding is refused, and [`DevFastError::ReceiptMismatch`] when
 /// [`build_verification_profile_receipt`](crate::verification_profile::build_verification_profile_receipt)
 /// refuses the run for a missing identity, a missing provenance receipt, a
 /// profile-identity divergence, or an undeclared stage.
@@ -1016,13 +1022,22 @@ pub fn resolve_verification_route(
             DevFastError::Admission(format!("verification registry refused: {error}"))
         })?;
     let compiler = ProfileCompiler::new(&registry);
-    // `resolve_route` takes the environment by value, but the receipt below
-    // still has to bind the exact environment this resolution ran under, so
-    // the owned value is cloned for the move and the original is what the
-    // receipt reads.
+    // The route is an alias, not a command: `route` must be a name in the
+    // closed alias table, and it resolves to the exact revision that table
+    // pins. A free-form profile name that is not an alias, or a registry that
+    // does not admit the pinned revision, refuses here before any receipt is
+    // built — there is no fallback to a neighbouring route and no default.
+    let route_profile = admitted_profile_for_alias(&route, &registry)
+        .map_err(|error| DevFastError::Admission(format!("profile alias refused: {error}")))?;
+    let route_revision = route_profile.revision;
+    let route_name = route_profile.name.clone();
+    // The full resolution takes the environment by value, but the receipt
+    // below still has to bind the exact environment this resolution ran
+    // under, so the owned value is cloned for the move and the original is
+    // what the receipt reads.
     let environment_identity = environment.clone();
     let resolved = compiler
-        .resolve_route(&route, layout, scope, environment)
+        .resolve_full(&route_name, route_revision, layout, scope, environment)
         .map_err(|error| DevFastError::Admission(format!("profile route refused: {error}")))?;
     let admitted = compiler
         .compile_exact(&resolved.name, resolved.revision)
