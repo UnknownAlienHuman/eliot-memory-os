@@ -43,15 +43,24 @@
 //! attachment claim. The attachment claim is *Store attachment ownership* —
 //! the single attachment slot #1086 retains across an idempotent reconnect and
 //! refuses a second attachment — and an attached gateway is neither a workload
-//! lease nor proof that work is finished. The owner read that could answer the
-//! full denominator is
-//! `RedbRecoveryStore::load_runtime_lease_census_by_state_fence(&StateFence,
-//! Option<&OperationIdentity>)`, and it does not exist on current source: a
-//! `#1751` residual recorded as
-//! [`CensusUnavailability::RuntimeLeaseCensusOwnerAbsent`]. Until that owner
-//! lands, the leg cannot answer `KnownZero` and never installs a default-zero
-//! stub in its place.
+//! lease nor proof that work is finished.
 //!
+//! # Exact-fence runtime-lease rows (#1918)
+//!
+//! The runtime leg answers the full denominator through the landed owner read
+//! [`RedbRecoveryStore::load_runtime_leases_by_state_fence`]: the exact-fence
+//! `RuntimeLease` current set from the canonical `ors_runtime_lease_current_v1`
+//! table, re-validated on readback and ordered by lease id. A non-terminal row
+//! for the current fence is a proven blocking obligation and reports
+//! [`KernelIdleLeaseCensus::RuntimeLeased`]; a verified empty set is the
+//! observed store fact, never a caller-supplied default. The durable issuance
+//! writer for that table belongs to #1751; until it lands, the table holds no
+//! rows. The supervision half of the same owner read,
+//! [`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`], serves the
+//! authenticated `ReadRuntimeLeaseCensus` wire for Host generation retirement.
+//!
+//! [`RedbRecoveryStore::load_runtime_leases_by_state_fence`]: eliot_ors::RedbRecoveryStore::load_runtime_leases_by_state_fence
+//! [`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`]: eliot_ors::RedbRecoveryStore::load_runtime_lease_census_by_state_fence
 //! The census is read-only: it issues no lease, revokes nothing, and never
 //! infers an obligation from a live process, an open pipe, or a heartbeat.
 
@@ -84,14 +93,11 @@ pub(crate) enum CensusUnavailability {
     /// The Kernel's admitted host-request connection index guard is poisoned. A
     /// poisoned guard is fenced, not an empty set of operations.
     HostRequestIndexUnreadable,
-    /// The data leg has no owner read on current source. The exact
-    /// `RedbRecoveryStore::load_runtime_lease_census_by_state_fence(&StateFence,
-    /// Option<&OperationIdentity>)` read that binds live `RuntimeLease`,
-    /// data/maintenance reservation, and unresolved Store-dependent effect
-    /// obligations to the current State Fence is a `#1751` residual. Without
-    /// it, zero obligations cannot be proven and no default-zero stub may
-    /// stand in for it.
-    RuntimeLeaseCensusOwnerAbsent,
+    /// The exact-fence runtime-lease owner read could not be established:
+    /// the current fence is unreadable or the store read itself failed. An
+    /// unprovable runtime set is not evidence that the installation is idle,
+    /// so the drain gate stays closed.
+    RuntimeCensusUnreadable,
 }
 
 impl CensusUnavailability {
@@ -117,8 +123,8 @@ impl CensusUnavailability {
             Self::HostRequestIndexUnreadable => {
                 "host-request-connection-index-guard-poisoned:cannot-read-host-request-operations"
             }
-            Self::RuntimeLeaseCensusOwnerAbsent => {
-                "RedbRecoveryStore::load_runtime_lease_census_by_state_fence(&StateFence,Option<&OperationIdentity>):absent-runtime-lease-census-owner-read:#1751-residual"
+            Self::RuntimeCensusUnreadable => {
+                "runtime-lease-census-owner-read-unavailable:cannot-establish-exact-fence-runtime-set"
             }
         }
     }
@@ -136,6 +142,9 @@ pub(crate) enum KernelIdleLeaseCensus {
     BridgeSessionLeased,
     /// An admitted host-request operation is still outstanding.
     HostRequestLeased,
+    /// A durable exact-fence `RuntimeLease` row is still non-terminal, so a
+    /// workload obligation remains that shutdown may not abandon.
+    RuntimeLeased,
     /// A canonical-data obligation is known outstanding. The only proven
     /// blocking fact available today is the mechanical I14.23
     /// canonical-data precondition; it is never treated as an obligation
@@ -161,6 +170,7 @@ impl KernelIdleLeaseCensus {
             Self::SupervisionLeased => "supervision-leased",
             Self::BridgeSessionLeased => "bridge-session-leased",
             Self::HostRequestLeased => "host-request-leased",
+            Self::RuntimeLeased => "runtime-leased",
             Self::CanonicalDataLeased => "canonical-data-leased",
             Self::Unavailable(_) => "unavailable",
         }
@@ -191,8 +201,8 @@ impl KernelComposition {
         // The existing I14.23 lease-zero precondition stays the single owner of
         // the mechanical canonical-data fact, but the Store attachment claim it
         // is fed is ownership, not a lease denominator. Its satisfaction is
-        // therefore not a zero proof: the leg reports the missing owner read
-        // instead of `Idle` (#2625, #1751 residual).
+        // therefore not a zero proof: the exact-fence runtime-lease owner read
+        // below answers the remaining denominator (#1918, #2625).
         let census = match ShutdownDrainCoordinator::check_lease_zero(
             self.canonical_store_claimed
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -203,14 +213,118 @@ impl KernelComposition {
             // workload lease exists.
             Err(_) => KernelIdleLeaseCensus::CanonicalDataLeased,
             // Nothing is blocked mechanically, which is not evidence that no
-            // data/maintenance or unresolved Store-dependent obligation
-            // remains. Name the exact missing read contract instead of
+            // durable runtime obligation remains. The runtime-lease leg reads
+            // the exact-fence current set from its owner instead of
             // installing a default-zero stub.
-            Ok(()) => KernelIdleLeaseCensus::Unavailable(
-                CensusUnavailability::RuntimeLeaseCensusOwnerAbsent,
-            ),
+            Ok(()) => self.runtime_lease_leg(),
         };
         publish_census(census)
+    }
+
+    /// Reads the exact-fence `RuntimeLease` current set for the fence the
+    /// Kernel already admitted, through the generation gateway's canonical
+    /// recovery store — the same store the supervision authority reads, so no
+    /// second source is consulted and no composed authority is required.
+    ///
+    /// The current fence is copied out of the front-door policy and every
+    /// guard is released before the ORS read: the store performs synchronous
+    /// Redb I/O and a mutex must never be held across I/O, following the
+    /// supervision leg's own lock discipline. A non-terminal row for this
+    /// fence is a proven blocking obligation. An unreadable fence or a failed
+    /// store read is unprovable and answers `Unavailable`, never `Idle`.
+    #[cfg(windows)]
+    fn runtime_lease_leg(&self) -> KernelIdleLeaseCensus {
+        use eliot_runtime_contracts::LeaseState;
+
+        let fence = match self.front_door_policy.lock() {
+            Ok(policy) => policy.module_generation.state_fence.clone(),
+            Err(_) => {
+                return KernelIdleLeaseCensus::Unavailable(
+                    CensusUnavailability::RuntimeCensusUnreadable,
+                );
+            }
+        };
+        let Ok(rows) = self
+            .generation_gateway
+            .ors
+            .load_runtime_leases_by_state_fence(&fence)
+        else {
+            return KernelIdleLeaseCensus::Unavailable(
+                CensusUnavailability::RuntimeCensusUnreadable,
+            );
+        };
+        // The terminal set mirrors the retirement gate the Host consumes
+        // (`RuntimeLeaseCensus::is_fully_retired`): only a terminal row stops
+        // blocking the drain.
+        let live = rows.iter().any(|lease| {
+            !matches!(
+                lease.state,
+                LeaseState::Released
+                    | LeaseState::Expired
+                    | LeaseState::Revoked
+                    | LeaseState::Superseded
+                    | LeaseState::Closed
+            )
+        });
+        if live {
+            return KernelIdleLeaseCensus::RuntimeLeased;
+        }
+        KernelIdleLeaseCensus::Idle
+    }
+
+    /// The Kernel has no ORS supervision authority or exact-fence runtime
+    /// surface on non-Windows targets (I1.7), so the runtime leg cannot be
+    /// established there. The drain gate stays closed through the legs that
+    /// remain, exactly like the supervision and session legs.
+    #[cfg(not(windows))]
+    fn runtime_lease_leg(&self) -> KernelIdleLeaseCensus {
+        KernelIdleLeaseCensus::Unavailable(CensusUnavailability::RuntimeCensusUnreadable)
+    }
+
+    /// Serves one exact-fence retirement census from the canonical ORS owner
+    /// for the authenticated `ReadRuntimeLeaseCensus` wire (#1918 ACT-1/A4).
+    ///
+    /// This cannot issue or renew authority: it reads the current supervision
+    /// row and the exact-fence `RuntimeLease` set both bound to the presented
+    /// fence through the generation gateway's canonical recovery store, then
+    /// validates the composed census before returning it. Every failure — an
+    /// unreadable row, a foreign fence, or an invalid composition — is the
+    /// boundary's own `SessionFenced`, so an unprovable census is never
+    /// served as an empty one.
+    #[cfg(windows)]
+    pub(crate) fn read_runtime_lease_census(
+        &self,
+        fence: &eliot_contracts::StateFence,
+        supervision_lease_id: &str,
+    ) -> Result<eliot_kernel_service::RuntimeLeaseCensus, eliot_ipc::TransportError> {
+        let lease_id = eliot_ors::OperationIdentity::new(supervision_lease_id.to_owned())
+            .map_err(|_| eliot_ipc::TransportError::SessionFenced)?;
+        let rows = self
+            .generation_gateway
+            .ors
+            .load_runtime_lease_census_by_state_fence(fence, &lease_id)
+            .map_err(|_| eliot_ipc::TransportError::SessionFenced)?;
+        let census = eliot_kernel_service::RuntimeLeaseCensus {
+            state_fence: fence.clone(),
+            supervision_lease_id: supervision_lease_id.to_owned(),
+            runtime_leases: rows.runtime_leases,
+            supervision_lease: rows.supervision,
+        };
+        census
+            .validate()
+            .map_err(|_| eliot_ipc::TransportError::SessionFenced)?;
+        Ok(census)
+    }
+
+    /// The retirement census has no ORS surface on non-Windows targets (I1.7):
+    /// the authenticated wire is unsupported there and the read is refused.
+    #[cfg(not(windows))]
+    pub(crate) fn read_runtime_lease_census(
+        &self,
+        _fence: &eliot_contracts::StateFence,
+        _supervision_lease_id: &str,
+    ) -> Result<eliot_kernel_service::RuntimeLeaseCensus, eliot_ipc::TransportError> {
+        Err(eliot_ipc::TransportError::SessionFenced)
     }
 
     /// Reads the exact ORS supervision-lease head for the activation contour
