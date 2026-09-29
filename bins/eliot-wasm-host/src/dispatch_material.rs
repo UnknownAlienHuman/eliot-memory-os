@@ -2132,10 +2132,10 @@ impl OwnerDeliveryIdentity {
 /// Owner publication state for one generation slot (#2786 steps 2/3/7):
 /// wire mirror of `eliot_kernel_service::WasmPublicationState`. The owner
 /// writes `PENDING` before staging payloads, the ready marker last, and
-/// `FAILED` with recovery evidence when staging fails, so a slot without a
-/// ready marker is never a complete set. The failure reason is retained
-/// here for shape only and never echoed.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+/// `FAILED` with recovery evidence when staging or an exact pre-claim fixed
+/// name exposure fails, so incomplete material is never treated as ready.
+/// The failure reason is never echoed.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum OwnerPublicationState {
     /// Publication started; the immutable set is not yet complete.
@@ -2579,8 +2579,8 @@ fn read_delivery_publication_unlocked(
 ) -> Result<Option<OwnerPublicationState>, MaterialError> {
     let slot = delivery_slot_dir(install_dir, claim);
     for file_name in [
-        WASM_DELIVERY_READY_FILE_NAME,
         WASM_DELIVERY_FAILED_FILE_NAME,
+        WASM_DELIVERY_READY_FILE_NAME,
         WASM_DELIVERY_PENDING_FILE_NAME,
     ] {
         let bytes = match read_staged_bytes(&slot.join(file_name)) {
@@ -2610,6 +2610,57 @@ fn read_delivery_publication_unlocked(
         return Ok(Some(state));
     }
     Ok(None)
+}
+
+/// Records a failed fixed-name exposure only while its exact owner publication
+/// and a pre-claim disposition remain authoritative. The immutable slot is
+/// retained for reconciliation. `FAILED.json` is committed before the stale
+/// READY projection is removed, so an interrupted cleanup remains fail-closed
+/// when both markers are present.
+fn fail_ready_publication_for_material_gap_unlocked(
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+    reason: &'static str,
+) -> Result<bool, MaterialError> {
+    let Some(OwnerPublicationState::Ready { identity }) =
+        read_delivery_publication_unlocked(install_dir, claim)?
+    else {
+        return Ok(false);
+    };
+    if !identity.names(claim) {
+        return Ok(false);
+    }
+
+    let record = read_owner_disposition_unlocked(install_dir, claim)?;
+    if record.disposition.identity() != &identity
+        || record.disposition.request_commitment() != claim.envelope_digest.as_str()
+        || !matches!(
+            &record.disposition,
+            OwnerDeliveryDisposition::Ready { .. }
+                | OwnerDeliveryDisposition::LaunchReserved { .. }
+        )
+    {
+        return Ok(false);
+    }
+
+    let slot = delivery_slot_dir(install_dir, claim);
+    let failed = OwnerPublicationState::Failed {
+        identity,
+        _reason: reason.to_owned(),
+    };
+    let bytes = serde_json::to_vec(&failed).map_err(|_| MaterialError::Malformed)?;
+    write_atomic_locked(
+        &slot.join(WASM_DELIVERY_FAILED_FILE_NAME),
+        &bytes,
+        OWNER_DISPOSITION_MAX_BYTES,
+    )
+    .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+
+    match std::fs::remove_file(slot.join(WASM_DELIVERY_READY_FILE_NAME)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(MaterialError::Unreadable(error.kind().to_string())),
+    }
 }
 
 fn read_owner_disposition_unlocked(
@@ -2726,10 +2777,31 @@ fn acquire_delivery_claim_unlocked(
     runtime_request_digest: &Sha256Digest,
     now_ms: u64,
 ) -> Result<DeliveryClaimOutcome, MaterialError> {
-    let Some((current, _material)) = read_claimed_dispatch_material_unlocked(install_dir)? else {
-        return Ok(DeliveryClaimOutcome::Conflict);
+    let (current, _material) = match read_claimed_dispatch_material_unlocked(install_dir) {
+        Ok(Some(staged)) => staged,
+        Ok(None) => {
+            fail_ready_publication_for_material_gap_unlocked(
+                install_dir,
+                &staged.identity,
+                "fixed-material-missing",
+            )?;
+            return Ok(DeliveryClaimOutcome::Conflict);
+        }
+        Err(error) => {
+            fail_ready_publication_for_material_gap_unlocked(
+                install_dir,
+                &staged.identity,
+                fixed_material_gap_reason(&error),
+            )?;
+            return Err(error);
+        }
     };
     if current.identity != staged.identity {
+        fail_ready_publication_for_material_gap_unlocked(
+            install_dir,
+            &staged.identity,
+            "fixed-material-replaced",
+        )?;
         return Ok(DeliveryClaimOutcome::Conflict);
     }
     let Some(publication) = read_delivery_publication_unlocked(install_dir, &staged.identity)?
@@ -2763,6 +2835,17 @@ fn acquire_delivery_claim_unlocked(
         record,
         &binding,
     )
+}
+
+fn fixed_material_gap_reason(error: &MaterialError) -> &'static str {
+    match error {
+        MaterialError::Missing => "fixed-material-missing",
+        MaterialError::Unreadable(_) => "fixed-material-unavailable",
+        MaterialError::TooLarge
+        | MaterialError::Malformed
+        | MaterialError::DigestMismatch
+        | MaterialError::InvalidRecord { .. } => "fixed-material-incomplete",
+    }
 }
 
 fn resolve_delivery_claim_unlocked(
@@ -2911,11 +2994,11 @@ fn replay_delivery_claim(
 /// Restart discovers owner publication state here, not arbitrary files
 /// alone: the marker is looked up by the claim's own generation and
 /// material-set digest, and a marker naming another delivery is reported
-/// as such rather than treated as this claim's evidence. The owner's
-/// precedence is mirrored exactly — ready, then failed, then pending — so a
-/// slot that both failed and kept its pending marker reports the failure.
-/// A slot with no parsable marker is not a state at all, never a complete
-/// set.
+/// as such rather than treated as this claim's evidence. Failed takes
+/// precedence over Ready so a crash after recording a fixed-material failure
+/// but before removing the stale Ready marker cannot revive the publication.
+/// Pending is considered only when neither terminal marker exists. A slot
+/// with no parsable marker is not a state at all, never a complete set.
 ///
 /// `Ok(None)` means the owner recorded no publication for this delivery.
 /// It is diagnostic absence only and never authorizes legacy execution; the
