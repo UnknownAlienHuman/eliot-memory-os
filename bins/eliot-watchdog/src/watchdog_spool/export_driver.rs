@@ -17,7 +17,19 @@
 //! never removes an intent) so the Kernel record and the Governor's later
 //! canonical Problem/Incident decision stay forensically linked to it.
 
-use eliot_protocol::watchdog_intent_reconciliation_idempotency_key;
+use eliot_contracts::{
+    ArtifactId, ClockReading, ContractId, ContractVersion, ProductId, RequestId, RequestMetadata,
+    SourceId, canonical_json_bytes, sha256_hex,
+};
+use eliot_protocol::{
+    ClientHello, EliotPipeName, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
+    ProtocolRange, ProtocolVersion, WATCHDOG_SPOOL_BATCH_ROUTE,
+    WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID, WatchdogIntentKind, WatchdogSpoolIntentBatchPayload,
+    WatchdogSpoolIntentSubmission, watchdog_intent_reconciliation_idempotency_key,
+};
+use eliot_runtime_contracts::{
+    ModuleContract, ModuleGeneration, ModuleGenerationState, VerifiedSupervisionLease,
+};
 use eliot_watchdog_core::{
     WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch, WatchdogSpoolPayloadKind,
     validate_batch, validate_batch_freshness,
@@ -26,7 +38,11 @@ use eliot_watchdog_core::{
 use crate::watchdog_spool::intent::{
     IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentSubmission,
 };
-use crate::{IndependentKernelSensor, SpoolError, WatchdogSpoolExportLimits, current_unix_ms};
+use crate::{
+    IndependentKernelSensor, SERVICE_NAME, SpoolError, WatchdogSpoolExportLimits, current_unix_ms,
+};
+
+const WATCHDOG_FRONT_DOOR_MODULE_ID: &str = "eliot-watchdog";
 
 /// Pure admission-entry projection of one export batch, in batch order.
 ///
@@ -260,12 +276,11 @@ impl WatchdogIntentExportBatch {
 
 /// Transport-agnostic fenced Kernel route for one Watchdog intent submission.
 ///
-/// The real EBP client implements this trait against the admitted
-/// `watchdog-spool-batch-v1` Kernel route. This crate ships no transport
-/// client and no in-memory implementation: the port exists so the Watchdog can
-/// present the exact original record, evidence, and lineage through a fenced
-/// Kernel mutation and then persist its submit-once receipt from the returned
-/// acknowledgement, with no semantic interpretation on this side.
+/// The production EBP client below implements this trait against the admitted
+/// `watchdog-spool-batch-v1` Kernel route. It presents the exact original
+/// record, evidence, and lineage through a fenced Kernel mutation, then lets
+/// the owner persist its submit-once receipt from the correlated response.
+/// This side makes no semantic interpretation.
 pub trait WatchdogIntentSink {
     /// Returns the bound sink identity this reconciliation contour uses.
     ///
@@ -300,6 +315,522 @@ pub trait WatchdogIntentSink {
         supervision_lease_id: &str,
         batch: &WatchdogIntentExportBatch,
     ) -> Result<Vec<WatchdogIntentAcknowledgement>, SpoolError>;
+}
+
+/// Authenticated Kernel front-door sink for the Watchdog's retained intent
+/// records. The constructor binds every connection to fields in the already
+/// verified signed lease; no endpoint, peer identity, or server artifact is
+/// accepted from the caller.
+pub struct KernelFrontDoorWatchdogIntentSink {
+    lease: VerifiedSupervisionLease,
+    sink_id: String,
+}
+
+impl KernelFrontDoorWatchdogIntentSink {
+    /// Binds a stable sink identity and authenticated server expectation to
+    /// the exact verified supervision lease.
+    #[must_use]
+    pub fn new(lease: VerifiedSupervisionLease) -> Self {
+        let payload = lease.lease();
+        let sink_id = format!(
+            "watchdog-kernel-frontdoor:{}:{}",
+            payload.installation_id,
+            payload.activation_generation.value()
+        );
+        Self { lease, sink_id }
+    }
+}
+
+impl WatchdogIntentSink for KernelFrontDoorWatchdogIntentSink {
+    fn sink_id(&self) -> &str {
+        &self.sink_id
+    }
+
+    fn submit_intent(
+        &self,
+        supervision_lease_id: &str,
+        batch: &WatchdogIntentExportBatch,
+    ) -> Result<Vec<WatchdogIntentAcknowledgement>, SpoolError> {
+        if supervision_lease_id != self.lease.lease().lease_id
+            || batch.export_batch.installation_id != self.lease.lease().installation_id
+            || batch.export_batch.watchdog_generation
+                != self.lease.lease().activation_generation.value()
+            || batch.export_batch.watchdog_epoch != self.lease.lease().watchdog_epoch.value()
+        {
+            return Err(SpoolError::LeaseFenced(
+                "intent batch does not match the signed supervision lease lineage".to_owned(),
+            ));
+        }
+        let payload = intent_batch_payload(supervision_lease_id, self.sink_id(), batch)?;
+        #[cfg(windows)]
+        {
+            tokio::runtime::Handle::try_current()
+                .map_err(|error| {
+                    SpoolError::Corrupt(format!("Kernel sink requires Tokio: {error}"))
+                })?
+                .block_on(transact_intent_batch(&self.lease, &payload))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = payload;
+            Err(SpoolError::Corrupt(
+                "authenticated Kernel front-door transport is available only on Windows".to_owned(),
+            ))
+        }
+    }
+}
+
+fn intent_batch_payload(
+    supervision_lease_id: &str,
+    sink_id: &str,
+    batch: &WatchdogIntentExportBatch,
+) -> Result<WatchdogSpoolIntentBatchPayload, SpoolError> {
+    let export = &batch.export_batch;
+    let intents = batch
+        .intents
+        .iter()
+        .map(|pending| intent_batch_submission(&export.installation_id, pending))
+        .collect::<Result<Vec<_>, SpoolError>>()?;
+    WatchdogSpoolIntentBatchPayload {
+        wire_id: WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID.to_owned(),
+        wire_version: WatchdogSpoolIntentBatchPayload::CONTRACT_VERSION,
+        route: WATCHDOG_SPOOL_BATCH_ROUTE.to_owned(),
+        installation_id: export.installation_id.clone(),
+        watchdog_generation: export.watchdog_generation,
+        watchdog_epoch: export.watchdog_epoch,
+        supervision_lease_id: supervision_lease_id.to_owned(),
+        sink_id: sink_id.to_owned(),
+        predecessor_sequence: export.predecessor_cursor.acknowledged_sequence,
+        first_sequence: export.first_sequence,
+        last_sequence: export.last_sequence,
+        high_water_sequence: export.high_water_sequence,
+        created_at_ms: export.created_at_ms,
+        expires_at_ms: export.expires_at_ms,
+        batch_id: export.batch_id.clone(),
+        batch_digest: export.batch_digest.clone(),
+        intents,
+        payload_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .and_then(|payload| {
+        payload.validate()?;
+        Ok(payload)
+    })
+    .map_err(|error| SpoolError::Corrupt(format!("invalid Kernel intent batch: {error}")))
+}
+
+fn intent_batch_submission(
+    installation_id: &str,
+    pending: &PendingWatchdogIntent,
+) -> Result<WatchdogSpoolIntentSubmission, SpoolError> {
+    let (
+        intent_kind,
+        evidence_refs,
+        lineage_installation_id,
+        lineage_generation,
+        lineage_epoch,
+        governor_unavailable_reason,
+    ) = match &pending.record.payload {
+        super::WatchdogSpoolPayload::ProblemIntent {
+            evidence_refs,
+            lineage_installation_id,
+            lineage_generation,
+            lineage_epoch,
+            governor_unavailable_reason,
+            ..
+        } => (
+            WatchdogIntentKind::ProblemIntent,
+            evidence_refs,
+            lineage_installation_id,
+            *lineage_generation,
+            *lineage_epoch,
+            serde_json::to_value(governor_unavailable_reason),
+        ),
+        super::WatchdogSpoolPayload::IncidentIntent {
+            evidence_refs,
+            lineage_installation_id,
+            lineage_generation,
+            lineage_epoch,
+            governor_unavailable_reason,
+            ..
+        } => (
+            WatchdogIntentKind::IncidentIntent,
+            evidence_refs,
+            lineage_installation_id,
+            *lineage_generation,
+            *lineage_epoch,
+            serde_json::to_value(governor_unavailable_reason),
+        ),
+        _ => {
+            return Err(SpoolError::Corrupt(
+                "pending Watchdog intent no longer has an intent payload".to_owned(),
+            ));
+        }
+    };
+    let governor_unavailable_reason = governor_unavailable_reason
+        .map_err(|error| SpoolError::Serialization(error.to_string()))?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            SpoolError::Corrupt(
+                "Watchdog intent reason did not serialize as its closed wire code".to_owned(),
+            )
+        })?;
+    Ok(WatchdogSpoolIntentSubmission {
+        sequence: pending.record.sequence,
+        intent_kind,
+        record_digest: pending.record_digest.clone(),
+        payload_digest: pending.payload_digest.clone(),
+        observed_at_ms: pending.record.observed_at_ms,
+        idempotency_key: watchdog_intent_reconciliation_idempotency_key(
+            installation_id,
+            pending.record.sequence,
+            &pending.record_digest,
+        ),
+        evidence_refs: evidence_refs.clone(),
+        lineage_installation_id: lineage_installation_id.clone(),
+        lineage_generation,
+        lineage_epoch,
+        lineage_epoch_id: pending.epoch_lineage.as_str().to_owned(),
+        governor_unavailable_reason,
+        record: serde_json::to_value(&pending.record)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?,
+    })
+}
+
+#[cfg(windows)]
+async fn transact_intent_batch(
+    lease: &VerifiedSupervisionLease,
+    payload: &WatchdogSpoolIntentBatchPayload,
+) -> Result<Vec<WatchdogIntentAcknowledgement>, SpoolError> {
+    use eliot_ipc::{DeliveryOutcome, TransportLimits};
+
+    let signed = lease.lease();
+    let connection_id = format!("{}:{}", SERVICE_NAME, signed.lease_id);
+    let (mut transport, protocol_version) =
+        connect_watchdog_front_door(lease, &connection_id).await?;
+    let limits = TransportLimits::default();
+    let frame = watchdog_intent_request(lease, payload, &connection_id, protocol_version)?;
+    let request_id = frame.request_id.clone().ok_or_else(|| {
+        SpoolError::Corrupt("Kernel intent request omitted its request ID".to_owned())
+    })?;
+    if transport
+        .send_frame(&frame, limits)
+        .await
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?
+        != DeliveryOutcome::Delivered
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel intent batch delivery was not proven".to_owned(),
+        ));
+    }
+    let response = transport
+        .receive_frame(limits)
+        .await
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    if response.validate().is_err()
+        || response.connection_id != connection_id
+        || response.request_id.as_ref() != Some(&request_id)
+        || response.kind != FrameKind::Response
+        || response.message_type != MessageType::Result
+        || response.request_identity.is_some()
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel intent response did not correlate to the submitted batch".to_owned(),
+        ));
+    }
+    let ProtocolPayload::Json(value) = response.payload else {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel intent response was not JSON".to_owned(),
+        ));
+    };
+    acknowledgements_from_kernel_outcome(&value, payload)
+}
+
+#[cfg(windows)]
+async fn connect_watchdog_front_door(
+    lease: &VerifiedSupervisionLease,
+    connection_id: &str,
+) -> Result<(eliot_ipc::NamedPipeTransport, ProtocolVersion), SpoolError> {
+    use std::time::Duration;
+
+    use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
+    use eliot_platform_windows::{KernelFrontDoorAclMode, KernelFrontDoorServerExpectation};
+
+    let signed = lease.lease();
+    let expectation = KernelFrontDoorServerExpectation::new(
+        signed.kernel_front_door_server_sid.as_str(),
+        signed.kernel_front_door_session_id,
+        signed.kernel_front_door_artifact_sha256.as_str(),
+        KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient,
+    )
+    .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    let mut transport = NamedPipeTransport::connect_authenticated_kernel_front_door(
+        &EliotPipeName::kernel_frontdoor().to_string(),
+        Duration::from_secs(5),
+        &expectation,
+    )
+    .await
+    .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    match transport.peer_identity() {
+        eliot_ipc::PeerIdentity::Authenticated {
+            process_id,
+            user_identity,
+            session_identity,
+            ..
+        } if *process_id != 0
+            && user_identity == signed.kernel_front_door_server_sid.as_str()
+            && session_identity == &signed.kernel_front_door_session_id.to_string() => {}
+        _ => {
+            return Err(SpoolError::LeaseFenced(
+                "authenticated Kernel peer identity differed from the signed front-door lease"
+                    .to_owned(),
+            ));
+        }
+    }
+    let limits = TransportLimits::default();
+    let hello = watchdog_client_hello(lease)?;
+    let hello_frame = eliot_ipc::client_hello_frame(connection_id, &hello)
+        .map_err(|error| SpoolError::Corrupt(error.to_string()))?;
+    if transport
+        .send_frame(&hello_frame, limits)
+        .await
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?
+        != DeliveryOutcome::Delivered
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel hello delivery was not proven".to_owned(),
+        ));
+    }
+    let server_frame = transport
+        .receive_frame(limits)
+        .await
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    let server = eliot_ipc::decode_server_hello_frame(&server_frame, connection_id)
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    if server.selected_protocol != ProtocolVersion::CURRENT
+        || !server
+            .authority_epoch
+            .is_same_authority(&signed.kernel_epoch)
+        || !server
+            .allowed_capabilities
+            .iter()
+            .any(|item| item == "watchdog_intent_submit")
+        || server.rejection_reason.is_some()
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel denied the Watchdog intent capability or lease epoch".to_owned(),
+        ));
+    }
+    Ok((transport, server.selected_protocol))
+}
+
+#[cfg(windows)]
+fn watchdog_intent_request(
+    lease: &VerifiedSupervisionLease,
+    payload: &WatchdogSpoolIntentBatchPayload,
+    connection_id: &str,
+    protocol_version: ProtocolVersion,
+) -> Result<Frame, SpoolError> {
+    use std::collections::BTreeMap;
+
+    let signed = lease.lease();
+    let sequence = payload.intents.first().map_or(0, |item| item.sequence);
+    let request_id = RequestId::new(format!("watchdog:{}:{sequence}", payload.batch_id))
+        .map_err(|error| SpoolError::Corrupt(error.to_string()))?;
+    let fence = signed.state_fence.clone();
+    let now_ms = crate::current_unix_ms()?.max(1);
+    let metadata = RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new(SERVICE_NAME)
+            .map_err(|error| SpoolError::Corrupt(error.to_string()))?,
+        source_id: SourceId::new(SERVICE_NAME)
+            .map_err(|error| SpoolError::Corrupt(error.to_string()))?,
+        state_fence: fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: i64::try_from(now_ms).ok(),
+            known_time_ms: i64::try_from(now_ms).ok(),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    let identity = eliot_protocol::RequestIdentity {
+        request: eliot_receipts::RequestBinding {
+            metadata,
+            state_fence: fence,
+        },
+        idempotency_key: format!("watchdog-intent:{}:{sequence}", payload.batch_id),
+        deadline_unix_ms: now_ms.saturating_add(10_000),
+        cancellation_id: format!("watchdog-intent:{}:{sequence}:cancel", payload.batch_id),
+    };
+    Ok(Frame {
+        protocol_version,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.to_owned(),
+        request_id: Some(request_id),
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: Some(identity),
+        payload: ProtocolPayload::Json(serde_json::json!({
+            "operation": "watchdog_intent_submit",
+            "intent_batch": payload,
+        })),
+        trace_context: BTreeMap::new(),
+    })
+}
+
+#[cfg(windows)]
+fn acknowledgements_from_kernel_outcome(
+    outcome: &serde_json::Value,
+    payload: &WatchdogSpoolIntentBatchPayload,
+) -> Result<Vec<WatchdogIntentAcknowledgement>, SpoolError> {
+    if outcome.get("status").and_then(serde_json::Value::as_str) != Some("known") {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel did not return a known intent outcome".to_owned(),
+        ));
+    }
+    let known = outcome.get("value").ok_or_else(|| {
+        SpoolError::LeaseFenced("Kernel known intent outcome omitted its value".to_owned())
+    })?;
+    if known.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
+        || known.get("sink_id").and_then(serde_json::Value::as_str)
+            != Some(payload.sink_id.as_str())
+        || outcome.get("recovery") != Some(&serde_json::Value::Null)
+    {
+        return Err(SpoolError::LeaseFenced("Kernel intent outcome did not affirm the bound sink and non-canonical pending projection".to_owned()));
+    }
+    let projections = known
+        .get("intents")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            SpoolError::LeaseFenced("Kernel intent outcome omitted its projections".to_owned())
+        })?;
+    if projections.len() != payload.intents.len() {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel intent outcome coverage differed from submitted records".to_owned(),
+        ));
+    }
+    let acknowledgement_digest = sha256_hex(
+        &canonical_json_bytes(outcome).map_err(|error| SpoolError::Corrupt(error.to_string()))?,
+    );
+    projections
+        .iter()
+        .zip(&payload.intents)
+        .map(|(projection, submitted)| {
+            if projection
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                != Some(submitted.sequence)
+                || projection
+                    .get("idempotency_key")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.idempotency_key.as_str())
+                || projection
+                    .get("intent_kind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.intent_kind.as_str())
+                || projection
+                    .get("record_digest")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.record_digest.as_str())
+                || projection
+                    .get("payload_digest")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(submitted.payload_digest.as_str())
+                || projection.get("state").and_then(serde_json::Value::as_str) != Some("ADMITTED")
+                || projection
+                    .get("operation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(str::is_empty)
+                || projection
+                    .get("admitted_now")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_none()
+            {
+                return Err(SpoolError::LeaseFenced(
+                    "Kernel intent projection did not bind the exact retained record".to_owned(),
+                ));
+            }
+            Ok(WatchdogIntentAcknowledgement {
+                sequence: submitted.sequence,
+                sink_id: payload.sink_id.clone(),
+                idempotency_key: submitted.idempotency_key.clone(),
+                acknowledgement_digest: acknowledgement_digest.clone(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn watchdog_client_hello(lease: &VerifiedSupervisionLease) -> Result<ClientHello, SpoolError> {
+    let signed = lease.lease();
+    let module_id = ContractId::new(WATCHDOG_FRONT_DOOR_MODULE_ID)
+        .map_err(|error| SpoolError::Corrupt(error.to_string()))?;
+    let artifact_id = ArtifactId::new(signed.kernel_front_door_artifact_sha256.as_str())
+        .map_err(|error| SpoolError::Corrupt(error.to_string()))?;
+    let contract = watchdog_module_contract(module_id.clone(), artifact_id.clone());
+    let generation = ModuleGeneration {
+        module_id,
+        generation: signed.activation_generation,
+        artifact_id,
+        state: ModuleGenerationState::Starting,
+        health: eliot_runtime_contracts::HealthVector::healthy(),
+        state_fence: signed.state_fence.clone(),
+    };
+    Ok(ClientHello {
+        protocol_range: ProtocolRange {
+            minimum: ProtocolVersion::CURRENT,
+            maximum: ProtocolVersion::CURRENT,
+        },
+        module_bridge_identity: WATCHDOG_FRONT_DOOR_MODULE_ID.to_owned(),
+        artifact_hash: generation.artifact_id.clone(),
+        module_contract: contract,
+        module_generation: generation,
+        launch_nonce: signed.lease_id.clone(),
+        capabilities: vec!["watchdog_intent_submit".to_owned()],
+        privacy_classes: vec!["PUBLIC".to_owned()],
+        max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
+            .map_err(|error| SpoolError::Corrupt(error.to_string()))?,
+        authority_epoch: signed.kernel_epoch.clone(),
+    })
+}
+
+#[cfg(windows)]
+fn watchdog_module_contract(module_id: ContractId, artifact_id: ArtifactId) -> ModuleContract {
+    ModuleContract {
+        module_id,
+        version: ContractVersion::new(1, 0, 0),
+        artifact_id,
+        protocols: vec![crate::PROTOCOL_VERSION.to_owned()],
+        capabilities: Vec::new(),
+        required_capabilities: Vec::new(),
+        optional_capabilities: Vec::new(),
+        advisory_capabilities: Vec::new(),
+        state_owner: SERVICE_NAME.to_owned(),
+        failure_domain: "watchdog".to_owned(),
+        owner: SERVICE_NAME.to_owned(),
+        hot_replace: true,
+        startup_after: Vec::new(),
+        drain_before: Vec::new(),
+        invalidation_triggers: Vec::new(),
+        supervision_plan: "one_for_one".to_owned(),
+        child_restart: "transient".to_owned(),
+        restart_intensity: "3/10m".to_owned(),
+        resource_profile: "background-medium".to_owned(),
+        privacy_classes: vec!["PUBLIC".to_owned()],
+        permissions: Vec::new(),
+        health_contract: "health/eliot-watchdog-v1".to_owned(),
+        checkpoint_contract: "checkpoint/watchdog-v1".to_owned(),
+        compatibility_state: "rebuildable".to_owned(),
+        independent_test_profile: "module/eliot-watchdog".to_owned(),
+        contract_fixture_set: "eliot.watchdog.v1/watchdog".to_owned(),
+        affected_test_tags: vec!["eliot-watchdog".to_owned()],
+        architecture: Vec::new(),
+        telemetry: "telemetry/eliot-watchdog-v1".to_owned(),
+        removal_boundary: "eliot-watchdog".to_owned(),
+    }
 }
 
 /// Why the oldest unsubmitted intent is not in the current exact export window.

@@ -91,10 +91,10 @@ use watchdog_publication_readback::{
     verify_against_durable_current,
 };
 pub use watchdog_spool::export_driver::{
-    WatchdogEntryView, WatchdogExportSink, WatchdogIntentAcknowledgement,
-    WatchdogIntentExportBatch, WatchdogIntentReconciliation, WatchdogIntentSink,
-    WatchdogIntentWindowBlock, export_once, reconcile_watchdog_intents, watchdog_entry_views,
-    watchog_entry_views,
+    KernelFrontDoorWatchdogIntentSink, WatchdogEntryView, WatchdogExportSink,
+    WatchdogIntentAcknowledgement, WatchdogIntentExportBatch, WatchdogIntentReconciliation,
+    WatchdogIntentSink, WatchdogIntentWindowBlock, export_once, reconcile_watchdog_intents,
+    watchdog_entry_views, watchog_entry_views,
 };
 pub(crate) use watchdog_spool::intent::{
     GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
@@ -1180,6 +1180,23 @@ impl KernelWatchdogPort for IndependentKernelSensor {
     fn spool_backup_port(&self) -> Option<Arc<WatchdogBackupPort>> {
         Some(Arc::clone(&self.backup_port))
     }
+
+    fn reconcile_intents(
+        self: Arc<Self>,
+        lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<WatchdogIntentReconciliation, SpoolError>> + Send>>
+    {
+        Box::pin(async move {
+            let sink = KernelFrontDoorWatchdogIntentSink::new(lease);
+            tokio::task::spawn_blocking(move || reconcile_watchdog_intents(&self, &sink))
+                .await
+                .map_err(|error| {
+                    SpoolError::Corrupt(format!(
+                        "Kernel intent reconciliation worker failed: {error}"
+                    ))
+                })?
+        })
+    }
 }
 
 /// Closed observation-source label for an admission-reload rejection.
@@ -1254,6 +1271,21 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
         &'a self,
         lease: &'a VerifiedSupervisionLease,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>>;
+
+    /// Starts one bounded owner-spool reconciliation pass through the
+    /// authenticated Kernel front door. Implementations without the
+    /// Watchdog-owned spool fail closed; they never synthesize an acknowledgement.
+    fn reconcile_intents(
+        self: Arc<Self>,
+        _lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<WatchdogIntentReconciliation, SpoolError>> + Send>>
+    {
+        Box::pin(async {
+            Err(SpoolError::Corrupt(
+                "KernelWatchdogPort has no Watchdog intent spool owner".to_owned(),
+            ))
+        })
+    }
 
     /// Emits a bounded non-authoritative gap when continuous admission fails.
     /// Implementations which do not own a durable observation spool may leave
@@ -2792,6 +2824,9 @@ mod tests {
             activation_id: eliot_ors::OperationIdentity::new("activation-1")?,
             activation_generation: eliot_contracts::ResourceGeneration::new(1)?,
             kernel_epoch: test_epoch(2),
+            kernel_front_door_server_sid: "S-1-5-19".to_owned(),
+            kernel_front_door_session_id: 0,
+            kernel_front_door_artifact_sha256: "a".repeat(64),
             watchdog_epoch: AuthorityEpoch::new(1)?,
             generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
                 target_id: "target-1".to_owned(),

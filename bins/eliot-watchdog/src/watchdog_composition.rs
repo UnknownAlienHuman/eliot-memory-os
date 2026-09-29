@@ -322,6 +322,10 @@ impl WatchdogComposition {
         let task_authority_state = authority_state.clone();
         let task_heartbeat = heartbeat.clone();
         let task_kernel = Arc::clone(&kernel);
+        // Reconciliation is a separate bounded side task: authenticated IPC
+        // waits and durable receipt writes cannot lengthen a heartbeat tick.
+        let intent_reconciliation_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        let task_intent_reconciliation_slot = Arc::clone(&intent_reconciliation_slot);
         // I8.2 (#1755 W1/W5): one coverage cell per composition, shared with
         // the owner-bound backup port so the readiness claim and any capture
         // read the same publication. It is opened with the owner clock, and it
@@ -342,6 +346,8 @@ impl WatchdogComposition {
                 let authority_state = task_authority_state.clone();
                 let heartbeat = task_heartbeat.clone();
                 let coverage = task_coverage.clone();
+                let intent_reconciliation_slot =
+                    Arc::clone(&task_intent_reconciliation_slot);
                 async move {
                     loop {
                         tokio::select! {
@@ -477,6 +483,54 @@ impl WatchdogComposition {
                                     interval.as_millis(),
                                 )
                                 .await;
+                                // Submit retained Watchdog intents only after
+                                // this exact signed lease passed continuous
+                                // admission and Kernel supervision. One
+                                // in-flight pass bounds background work; the
+                                // next live tick retries any retained record
+                                // after a failed/unknown transport outcome.
+                                if let Ok(permit) = Arc::clone(&intent_reconciliation_slot)
+                                    .try_acquire_owned()
+                                {
+                                    let reconcile_kernel = Arc::clone(&kernel);
+                                    let verified_lease = admission.lease().clone();
+                                    tokio::spawn(async move {
+                                        match reconcile_kernel
+                                            .reconcile_intents(verified_lease)
+                                            .await
+                                        {
+                                            Ok(crate::WatchdogIntentReconciliation::NothingPending) => {}
+                                            Ok(crate::WatchdogIntentReconciliation::Reconciled {
+                                                first_sequence,
+                                                recorded,
+                                                already_submitted,
+                                            }) => tracing::info!(
+                                                event = "watchdog.intent_reconciliation_recorded",
+                                                first_sequence,
+                                                recorded,
+                                                already_submitted,
+                                                canonical_decision = "pending_governor_decision",
+                                                "Kernel recorded Watchdog intents for later Governor decision"
+                                            ),
+                                            Ok(crate::WatchdogIntentReconciliation::Blocked {
+                                                pending_sequence,
+                                                reason,
+                                                ..
+                                            }) => tracing::warn!(
+                                                event = "watchdog.intent_reconciliation_blocked",
+                                                pending_sequence,
+                                                reason = ?reason,
+                                                "retained Watchdog intent is outside the current bounded export window"
+                                            ),
+                                            Err(error) => tracing::debug!(
+                                                event = "watchdog.intent_reconciliation_skipped",
+                                                error = %error,
+                                                "Watchdog intent reconciliation did not receive a verified Kernel acknowledgement"
+                                            ),
+                                        }
+                                        drop(permit);
+                                    });
+                                }
                             }
                             Err(error) => {
                                 authority_state.publish_no_authority();

@@ -3542,6 +3542,13 @@ impl KernelComposition {
         Self::progress_answer_envelope(None, None, Some(error.code()), &proof, &accepted)
     }
 
+    #[cfg(windows)]
+    fn supervision_kernel_artifact(&self) -> Result<&str, TransportError> {
+        self.kernel_artifact_sha256
+            .as_deref()
+            .ok_or(TransportError::SessionFenced)
+    }
+
     /// Drives one per-tick progress submit from observed daemon evidence
     /// through the typed renewal route (Implements #88, wave 3).
     ///
@@ -3603,6 +3610,7 @@ impl KernelComposition {
             .supervision_lease_authority
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
+        let artifact = self.supervision_kernel_artifact()?;
         let renewal = Self::renew_current_supervision_with_progress(
             authority.as_ref(),
             &contour,
@@ -3610,6 +3618,7 @@ impl KernelComposition {
             &mut progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             unix_ms(),
+            artifact,
         );
         let (snapshot, decision, receipt) = match renewal {
             Ok(decided) => decided,

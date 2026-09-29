@@ -1945,6 +1945,9 @@ fn superseded_replay_requires_the_exact_terminal_signature_and_history() {
         activation_id: OperationIdentity::new("activation-1").expect("activation"),
         activation_generation: ResourceGeneration::genesis(),
         kernel_epoch: test_epoch(1),
+        kernel_front_door_server_sid: "S-1-5-19".to_owned(),
+        kernel_front_door_session_id: 0,
+        kernel_front_door_artifact_sha256: "a".repeat(64),
         watchdog_epoch: AuthorityEpoch::genesis(),
         generation_binding: SupervisionGenerationBinding {
             target_id: "eliotd-artifact".to_owned(),
