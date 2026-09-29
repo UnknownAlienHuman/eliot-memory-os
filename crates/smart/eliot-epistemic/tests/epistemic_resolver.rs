@@ -25,8 +25,8 @@ use eliot_evidence::{
 };
 
 fn test_epoch(sequence: u64) -> EpochId {
-    let lineage =
-        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+        .expect("canonical test lineage-A");
     EpochId::new(
         lineage,
         NonZeroU64::new(sequence).expect("non-zero test sequence"),
@@ -86,12 +86,7 @@ fn record(
         handle: id(handle),
         subject: format!("subject:{handle}"),
         scope: "scope".to_owned(),
-        evidence: envelope(
-            status,
-            freshness,
-            &format!("source:{handle}"),
-            handle,
-        ),
+        evidence: envelope(status, freshness, &format!("source:{handle}"), handle),
         supersedes,
         note: None,
     }

@@ -604,9 +604,19 @@ fn collect_epistemic(
                 .map_err(|_| ContextError::InvalidField("epistemic.contribution"))?;
             registered_slot_for(contribution.provider.as_str())?
         }
-        _ => slot.clone(),
+        // Only a CURRENT position is re-derived through the provider registry.
+        // A superseded one keeps the slot the input already named: it is not a
+        // provider decision, and the current crate's `Currentness` is closed at
+        // Current and Superseded, so this arm is total today and names the
+        // non-current case explicitly rather than matching a wildcard that
+        // would silently widen if the enum grows.
+        Currentness::Superseded => slot.clone(),
     };
-    let derived = derive_epistemic(input, &registered.provider, AtomAvailability::PresentCurrent)?;
+    let derived = derive_epistemic(
+        input,
+        &registered.provider,
+        AtomAvailability::PresentCurrent,
+    )?;
     for member in &derived {
         let rule = kind_rule(PROVIDER_EPISTEMIC, member.kind.as_str())
             .ok_or(ContextError::InvalidField("epistemic.kind"))?;
