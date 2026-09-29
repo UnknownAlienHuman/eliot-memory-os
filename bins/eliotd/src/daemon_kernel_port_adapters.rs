@@ -16,8 +16,8 @@
 //! interpretation of its own.
 
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes,
-    sha256_hex,
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_governor::{
     CompositionError, GovernorComposition, KernelDurableJobPort, KernelGenerationPort,
@@ -98,8 +98,7 @@ impl KernelDurableJobPort for DaemonKernelClient {
     fn save_durable_job(&self, job: &MaintenanceJob) -> Result<(), KernelPortError> {
         // #740: request/result span over the durable-job save boundary.
         let _span = tracing::info_span!("eliotd.kernel_durable_save").entered();
-        let value =
-            self.request_blocking("save_durable_job", serde_json::json!({ "job": job }))?;
+        let value = self.request_blocking("save_durable_job", serde_json::json!({ "job": job }))?;
         // #1694 W4: a transport acknowledgement is not proof of a canonical
         // decision commit. Require the Kernel-owned durable-job receipt to
         // carry the exact persisted job and bind it to the submitted trigger,
