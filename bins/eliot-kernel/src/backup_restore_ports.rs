@@ -447,10 +447,13 @@ pub fn require_production_admitted(
 /// re-checked at each phase boundary by the target. The durable journal
 /// itself is NOT carried here: it is injected as `J: RestoreJournalPort`
 /// (see [`require_production_admitted`]) so no substitute can hide inside
-/// this bundle. Owner channels that bind later (#962: canonical Store #952,
-/// ORS recovery #953, Watchdog spool #955, Blob #956, installation #958)
-/// arrive as evidence obligations in the finalized receipt, never as live
-/// handles in this struct.
+/// this bundle. Owner channels that are not yet bound here (canonical Store,
+/// ORS recovery, Watchdog spool, Blob, installation identity) arrive as
+/// evidence obligations in the finalized receipt, never as live handles in
+/// this struct. The issues that delivered those owner sides — #952 (PR #3881),
+/// #953 (PR #3833), #955 (PR #2716), #956 (PR #2435) and #958 (PR #3879) — are
+/// all MERGED in `merged-ledger.tsv`; what is absent is the Kernel-side
+/// producer of the corresponding evidence, not the owner itself.
 pub struct RestorePorts<'a> {
     /// Owner-issued journal admission for the injected durable journal.
     pub journal_admission: &'a RestoreJournalAdmission,
@@ -460,7 +463,13 @@ pub struct RestorePorts<'a> {
     pub keys: Option<&'a eliot_backup::WrappedKeyManifest>,
     /// Destination blob scope for destination-owned re-sealing.
     pub blob_scope: Option<&'a eliot_backup::DestinationScope>,
-    /// Owner-approved destination manifest evidence (#958 issuer).
+    /// Owner-approved destination manifest evidence.
+    ///
+    /// The issuing owner is the Host-side manifest binding that merged as PR
+    /// #3879 (issue #958, `merged-ledger.tsv` `2026-09-29T00:53:12Z 958 3879`).
+    /// #958 is CLOSED: it delivered the Host-side preparation owner, and it did
+    /// NOT deliver a producer of this Kernel-side value, so this is a record of
+    /// provenance, not an open blocker and not a claim that an emitter exists.
     pub manifest_evidence: Option<DestinationManifestEvidence>,
     /// Rehearsal mode: isolated import runs, but cutover refuses and no
     /// activation, retirement, or effect unblocking exists on any path.
@@ -672,7 +681,13 @@ pub struct OrsRestoreBinding {
     /// Exact archive class of that source. A class is never silently changed
     /// to make an effect admissible.
     pub archive_class: RestoreJournalArchiveClass,
-    /// Exact isolated destination identity (owner-issued by #958).
+    /// Exact isolated destination identity, declared by live composition.
+    ///
+    /// It is checked against the destination this execution constructs and
+    /// against the destination the ORS owner durably bound to the stream, so a
+    /// binding that names another destination refuses on read and on append. It
+    /// is a composition-declared owner fact like `writer_id`, not a value taken
+    /// from a request.
     pub destination_ref: String,
     /// Exact Kernel writer identity that owns the stream.
     pub writer_id: String,
