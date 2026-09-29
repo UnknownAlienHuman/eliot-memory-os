@@ -714,11 +714,7 @@ fn check_cache_identity(
 /// observations differ.
 fn semantic_digest(receipt: &TypedReceipt) -> Sha256Digest {
     fn push_field(canonical: &mut Vec<u8>, value: &[u8]) {
-        canonical.extend_from_slice(
-            &u64::try_from(value.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
+        canonical.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
         canonical.extend_from_slice(value);
     }
 
@@ -726,32 +722,20 @@ fn semantic_digest(receipt: &TypedReceipt) -> Sha256Digest {
     push_field(&mut canonical, receipt.proof.as_bytes());
     push_field(&mut canonical, receipt.world.as_bytes());
     push_field(&mut canonical, receipt.package_id.as_bytes());
-    push_field(
-        &mut canonical,
-        receipt.artifact_digest.as_str().as_bytes(),
-    );
+    push_field(&mut canonical, receipt.artifact_digest.as_str().as_bytes());
     push_field(&mut canonical, &receipt.artifact_bytes.to_be_bytes());
     push_field(&mut canonical, receipt.engine_version.as_bytes());
     push_field(&mut canonical, receipt.wit_digest.as_str().as_bytes());
-    push_field(
-        &mut canonical,
-        receipt.cache_identity.as_str().as_bytes(),
-    );
+    push_field(&mut canonical, receipt.cache_identity.as_str().as_bytes());
     for import in &receipt.actual_imports {
         push_field(&mut canonical, import.as_bytes());
     }
     for export in &receipt.actual_exports {
         push_field(&mut canonical, export.as_bytes());
     }
-    push_field(
-        &mut canonical,
-        receipt.input_digest.as_str().as_bytes(),
-    );
+    push_field(&mut canonical, receipt.input_digest.as_str().as_bytes());
     push_field(&mut canonical, &receipt.input_bytes.to_be_bytes());
-    push_field(
-        &mut canonical,
-        receipt.output_digest.as_str().as_bytes(),
-    );
+    push_field(&mut canonical, receipt.output_digest.as_str().as_bytes());
     push_field(&mut canonical, &receipt.output_bytes.to_be_bytes());
     push_field(&mut canonical, &receipt.instances.to_be_bytes());
     for identity in [
