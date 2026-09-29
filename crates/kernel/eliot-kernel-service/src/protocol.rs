@@ -35,7 +35,8 @@ pub use native_worker_claim::{
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
-    NativeWorkerClaimResponse, NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
+    NativeWorkerClaimResponse, NativeWorkerExecutableBinding,
+    NativeWorkerExecutableBindingPublication, NativeWorkerExecutableExpectation,
 };
 pub use native_worker_replay::{
     NATIVE_WORKER_REPLAY_MAX_EVENT_BYTES, NATIVE_WORKER_REPLAY_MAX_EVENT_REFS,

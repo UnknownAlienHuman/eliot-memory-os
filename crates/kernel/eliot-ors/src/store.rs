@@ -3952,6 +3952,16 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         record: &crate::NativeWorkerClaimRecord,
     ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError>;
+    /// Binds the full validated Governor owner record and its exact M1
+    /// projection to an already staged `Requested` claim row. The CAS writes
+    /// only the existing claim row: a missing claim returns `None`, an exact
+    /// replay returns the retained row, and a changed owner record conflicts.
+    fn bind_native_worker_claim_executable_binding(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        record_json: &str,
+        projection: &crate::NativeWorkerClaimExecutableBindingProjection,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
     /// Advances one staged claim to its next mechanical state.
     ///
     /// An exact repeat of an applied advance returns the durable record
@@ -20547,6 +20557,81 @@ impl RedbRecoveryStore {
         })
     }
 
+    /// Atomically attaches one complete Governor binding to its existing
+    /// `Requested` claim row. No sidecar row is created.
+    pub fn bind_native_worker_claim_executable_binding(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        record_json: &str,
+        projection: &crate::NativeWorkerClaimExecutableBindingProjection,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        projection.validate()?;
+        if projection.claim_id != claim_id.as_str() {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: claim_id.as_str().to_owned(),
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = claim_id.as_str().to_owned();
+        let existing = {
+            let table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::NativeWorkerClaimRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(mut durable) = existing else {
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        };
+        durable.validate()?;
+        if durable.claim_id != *claim_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "native_worker_claim",
+                reason: "claim record identity does not match its key".to_owned(),
+            });
+        }
+        if let (Some(existing_digest), Some(existing_json), Some(existing_projection)) = (
+            durable.executable_binding_digest.as_deref(),
+            durable.executable_binding_record_json.as_deref(),
+            durable.executable_binding_projection.as_ref(),
+        ) {
+            if existing_digest == projection.executable_binding_digest
+                && existing_json == record_json
+                && existing_projection == projection
+            {
+                write.commit().map_err(storage)?;
+                return Ok(Some(durable));
+            }
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: claim_id.as_str().to_owned(),
+            });
+        }
+        if durable.state != crate::NativeWorkerClaimState::Requested
+            || durable.executable_binding_digest.is_some()
+            || durable.executable_binding_record_json.is_some()
+            || durable.executable_binding_projection.is_some()
+        {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: claim_id.as_str().to_owned(),
+            });
+        }
+        durable.executable_binding_digest = Some(projection.executable_binding_digest.clone());
+        durable.executable_binding_record_json = Some(record_json.to_owned());
+        durable.executable_binding_projection = Some(projection.clone());
+        durable.validate()?;
+        {
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let payload = encode(&durable)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(durable))
+    }
+
     /// Loads one native-worker claim by exact claim identity.
     pub fn load_native_worker_claim(
         &self,
@@ -31847,6 +31932,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::stage_native_worker_claim(self, record)
     }
 
+    fn bind_native_worker_claim_executable_binding(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        record_json: &str,
+        projection: &crate::NativeWorkerClaimExecutableBindingProjection,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        RedbRecoveryStore::bind_native_worker_claim_executable_binding(
+            self,
+            claim_id,
+            record_json,
+            projection,
+        )
+    }
+
     fn advance_native_worker_claim(
         &self,
         claim_id: &crate::OperationIdentity,
@@ -32526,6 +32625,17 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         record: &NativeWorkerClaimRecord,
     ) -> Result<NativeWorkerClaimStageOutcome, OrsError> {
         self.store.stage_native_worker_claim(record)
+    }
+
+    /// Binds the full Governor owner binding into the single claim row.
+    pub fn bind_native_worker_claim_executable_binding(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        record_json: &str,
+        projection: &crate::NativeWorkerClaimExecutableBindingProjection,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        self.store
+            .bind_native_worker_claim_executable_binding(claim_id, record_json, projection)
     }
 
     /// Advances one staged claim to its next mechanical state.

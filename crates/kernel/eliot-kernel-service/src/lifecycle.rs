@@ -29,7 +29,8 @@ use crate::protocol::{
     KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
     NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
-    NativeWorkerClaimResponse,
+    NativeWorkerClaimResponse, NativeWorkerExecutableBindingPublication,
+    NativeWorkerExecutableExpectation,
 };
 use crate::validate_text;
 
@@ -1582,7 +1583,12 @@ fn native_worker_claim_identity<T>(
 /// from the exact presented bytes so replay comparison is byte-exact.
 fn native_worker_claim_staged_record(
     request: &NativeWorkerClaimRequest,
+    owner_binding: Option<&NativeWorkerExecutableBindingPublication>,
 ) -> Result<NativeWorkerClaimRecord, KernelServiceError> {
+    let owner_json = owner_binding
+        .map(NativeWorkerExecutableBindingPublication::canonical_record_json)
+        .transpose()?;
+    let owner_projection = owner_binding.map(|binding| binding.to_ors_projection());
     Ok(NativeWorkerClaimRecord {
         contract_version: eliot_ors::CONTRACT_VERSION,
         claim_id: native_worker_claim_identity(
@@ -1636,6 +1642,9 @@ fn native_worker_claim_staged_record(
             "native_worker_claim.predecessor_revision",
         )?,
         resource_envelope_digest: native_worker_claim_resource_envelope_digest(request)?,
+        executable_binding_digest: owner_binding.map(|binding| binding.binding_digest.clone()),
+        executable_binding_record_json: owner_json,
+        executable_binding_projection: owner_projection,
         state: NativeWorkerClaimState::Requested,
         receipt_digest: None,
         admitted_at_unix_ms: None,
@@ -1704,6 +1713,18 @@ fn native_worker_claim_changed_fields(
         "resource_envelope",
     );
     note(
+        durable.executable_binding_digest == staged.executable_binding_digest,
+        "executable_binding_digest",
+    );
+    note(
+        durable.executable_binding_record_json == staged.executable_binding_record_json,
+        "executable_binding_record",
+    );
+    note(
+        durable.executable_binding_projection == staged.executable_binding_projection,
+        "executable_binding_projection",
+    );
+    note(
         durable.request_digest == staged.request_digest,
         "request_digest",
     );
@@ -1711,6 +1732,31 @@ fn native_worker_claim_changed_fields(
         changed.push("binding_digest".to_owned());
     }
     changed
+}
+
+/// Reports owner-record differences that the worker request digest might not
+/// expose (the full Governor record contains fields outside the worker join).
+fn native_worker_claim_owner_binding_changed(
+    durable: &NativeWorkerClaimRecord,
+    staged: &NativeWorkerClaimRecord,
+) -> bool {
+    durable.executable_binding_digest != staged.executable_binding_digest
+        || durable.executable_binding_record_json != staged.executable_binding_record_json
+        || durable.executable_binding_projection != staged.executable_binding_projection
+}
+
+fn native_worker_claim_rejection(
+    request: &NativeWorkerClaimRequest,
+    reason: NativeWorkerClaimRejectionReason,
+    detail: &'static str,
+    now_unix_ms: u64,
+) -> NativeWorkerClaimResponse {
+    NativeWorkerClaimResponse::Rejected(NativeWorkerClaimRejection {
+        claim_id: request.claim_id.clone(),
+        reason,
+        detail: detail.to_owned(),
+        rejected_at_unix_ms: now_unix_ms,
+    })
 }
 
 /// Builds the changed-work conflict for one durable claim binding.
@@ -1755,6 +1801,21 @@ impl KernelService {
         &self,
         store: &S,
         request: &NativeWorkerClaimRequest,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        self.admit_native_worker_claim_with_expectation(store, request, None, None, now_unix_ms)
+    }
+
+    /// Admits one worker claim only after the independent owner publication
+    /// has been validated and joined to the request before ORS admission.
+    /// With no owner record, the exact request is retained as `Requested`
+    /// and a typed refusal is returned so the owner publisher can retry.
+    pub fn admit_native_worker_claim_with_expectation<S: OperationalRecoveryStore>(
+        &self,
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        owner_binding: Option<&NativeWorkerExecutableBindingPublication>,
+        expectation: Option<&NativeWorkerExecutableExpectation>,
         now_unix_ms: u64,
     ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
         self.admit_shadow_effect()?;
@@ -1812,7 +1873,101 @@ impl KernelService {
                 "native_worker_claim.deadline_unix_ms",
             ));
         }
-        Self::stage_and_finish_native_worker_claim_admission(store, request, now_unix_ms)
+        let Some(owner_binding) = owner_binding else {
+            let staged = native_worker_claim_staged_record(request, None)?;
+            match store.stage_native_worker_claim(&staged) {
+                Ok(_) => {}
+                Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
+                    let claim_id = native_worker_claim_identity(
+                        OperationIdentity::new(request.claim_id.as_str()),
+                        "native_worker_claim.claim_id",
+                    )?;
+                    let durable = store
+                        .load_native_worker_claim(&claim_id)
+                        .map_err(|error| native_worker_claim_store_error(&error))?
+                        .ok_or_else(|| {
+                            KernelServiceError::Platform(
+                                "conflicting claim disappeared before reconciliation".to_owned(),
+                            )
+                        })?;
+                    if durable.binding_digest == staged.binding_digest
+                        && native_worker_claim_owner_binding_changed(&durable, &staged)
+                    {
+                        return Ok(native_worker_claim_rejection(
+                            request,
+                            NativeWorkerClaimRejectionReason::MissingOwnerField,
+                            "native_worker_claim.executable_binding_pending",
+                            now_unix_ms,
+                        ));
+                    }
+                    let conflict = native_worker_claim_conflict(&durable, request, &staged)?;
+                    return Ok(NativeWorkerClaimResponse::Conflict(conflict));
+                }
+                Err(error) => return Err(native_worker_claim_store_error(&error)),
+            }
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::MissingOwnerField,
+                "native_worker_claim.executable_binding_pending",
+            ));
+        };
+        let Some(expectation) = expectation else {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::MissingOwnerField,
+                "native_worker_claim.executable_binding_expectation",
+            ));
+        };
+        if let Err(error) = owner_binding.validate_original_binding() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        if expectation != &owner_binding.to_kernel_expectation()
+            || owner_binding.claim_id != request.claim_id
+            || owner_binding.registration_id != request.registration_id
+            || owner_binding.task_id != request.task_id
+            || owner_binding.work_scope_id != request.work_scope_id
+            || owner_binding.operation_id != request.operation_id
+            || owner_binding.worker_generation != request.worker_generation
+            || owner_binding.installation_id != request.installation_id
+            || owner_binding.artifact_digest != request.worker_artifact_digest
+            || owner_binding.config_digest != request.worker_config_digest
+            || !owner_binding
+                .authority_epoch
+                .is_same_authority(&request.authority_epoch)
+            || owner_binding.state_fence != request.state_fence
+            || owner_binding.deadline_unix_ms != request.deadline_unix_ms
+            || now_unix_ms >= owner_binding.deadline_unix_ms
+            || now_unix_ms >= owner_binding.expires_at_unix_ms
+        {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::BindingConflict,
+                "native_worker_claim.executable_binding",
+            ));
+        }
+        if let Err(error) = request.require_executable_binding(expectation, now_unix_ms) {
+            let reason = match error {
+                KernelServiceError::HandshakeMismatch { field } if field.ends_with(".expired") => {
+                    NativeWorkerClaimRejectionReason::ExpiredDeadline
+                }
+                KernelServiceError::HandshakeMismatch { field }
+                    if field.ends_with(".epoch_binding") =>
+                {
+                    NativeWorkerClaimRejectionReason::StaleEpoch
+                }
+                KernelServiceError::HandshakeMismatch { field }
+                    if field.ends_with(".fence_binding") =>
+                {
+                    NativeWorkerClaimRejectionReason::StaleFence
+                }
+                _ => NativeWorkerClaimRejectionReason::BindingConflict,
+            };
+            return Ok(rejected(reason, "native_worker_claim.executable_binding"));
+        }
+        Self::stage_and_finish_native_worker_claim_admission(
+            store,
+            request,
+            Some(owner_binding),
+            now_unix_ms,
+        )
     }
 
     /// Stages one validated claim intent and binds its admission receipt.
@@ -1827,9 +1982,10 @@ impl KernelService {
     fn stage_and_finish_native_worker_claim_admission<S: OperationalRecoveryStore>(
         store: &S,
         request: &NativeWorkerClaimRequest,
+        owner_binding: Option<&NativeWorkerExecutableBindingPublication>,
         now_unix_ms: u64,
     ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
-        let staged = native_worker_claim_staged_record(request)?;
+        let staged = native_worker_claim_staged_record(request, owner_binding)?;
         let durable = match store.stage_native_worker_claim(&staged) {
             Ok(outcome) => outcome.record().clone(),
             Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
@@ -1845,6 +2001,16 @@ impl KernelService {
                             "conflicting claim disappeared before reconciliation".to_owned(),
                         )
                     })?;
+                if durable.binding_digest == staged.binding_digest
+                    && native_worker_claim_owner_binding_changed(&durable, &staged)
+                {
+                    return Ok(native_worker_claim_rejection(
+                        request,
+                        NativeWorkerClaimRejectionReason::BindingConflict,
+                        "native_worker_claim.executable_binding_conflict",
+                        now_unix_ms,
+                    ));
+                }
                 let conflict = native_worker_claim_conflict(&durable, request, &staged)?;
                 return Ok(NativeWorkerClaimResponse::Conflict(conflict));
             }
@@ -1903,6 +2069,16 @@ impl KernelService {
                         )
                     })?;
                 if !current.same_binding(&staged) {
+                    if current.binding_digest == staged.binding_digest
+                        && native_worker_claim_owner_binding_changed(&current, &staged)
+                    {
+                        return Ok(native_worker_claim_rejection(
+                            request,
+                            NativeWorkerClaimRejectionReason::BindingConflict,
+                            "native_worker_claim.executable_binding_conflict",
+                            now_unix_ms,
+                        ));
+                    }
                     let conflict = native_worker_claim_conflict(&current, request, &staged)?;
                     return Ok(NativeWorkerClaimResponse::Conflict(conflict));
                 }
@@ -2173,7 +2349,10 @@ impl KernelService {
                 "native_worker_ready.generation",
             ));
         }
-        let staged = native_worker_claim_staged_record(request)?;
+        let mut staged = native_worker_claim_staged_record(request, None)?;
+        staged.executable_binding_digest = durable.executable_binding_digest.clone();
+        staged.executable_binding_record_json = durable.executable_binding_record_json.clone();
+        staged.executable_binding_projection = durable.executable_binding_projection.clone();
         if !durable.same_binding(&staged) {
             // Changed work under one claim identity conflicts before effect,
             // regardless of the durable state: the admitted binding stands.
