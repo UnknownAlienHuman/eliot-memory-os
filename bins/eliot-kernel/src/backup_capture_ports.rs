@@ -436,7 +436,7 @@ impl<'a> CapturePorts<'a> {
         watchdog_spool: Option<&'a WatchdogSpoolFence>,
         host_audit: Option<&'a HostStateAuditFence>,
     ) -> Result<Self, KernelCaptureError> {
-        let ports = Self {
+        let ports = CapturePorts {
             caller,
             kernel_fence,
             export_fence,
@@ -811,12 +811,6 @@ impl KernelArchiveOwner {
             ))
         })?;
         Ok(Self { area })
-    }
-
-    /// Retained-archive area root.
-    #[must_use]
-    pub fn area(&self) -> &Path {
-        &self.area
     }
 
     /// The one directory this publication operation owns.
