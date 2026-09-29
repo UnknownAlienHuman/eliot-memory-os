@@ -560,7 +560,7 @@ fn backup_prepare_note_event_log_unavailable() {
 /// operation/installation strings.
 #[must_use]
 fn preparation_error_category(error: &PreparationError) -> (&'static str, &'static str) {
-    match *error {
+    match error {
         PreparationError::InvalidRequest { field, .. } => ("invalid_request", field),
         PreparationError::UnapprovedGeneration { .. } => ("unapproved_generation", "generation"),
         PreparationError::UnapprovedTarget { field, .. } => ("unapproved_target", field),
