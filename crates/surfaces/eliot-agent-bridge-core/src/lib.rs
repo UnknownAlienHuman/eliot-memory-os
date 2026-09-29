@@ -36,7 +36,8 @@ pub use eliot_observation_contracts::{
 };
 pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{
-    AckPhase, AgentHostRequestFailure, DeliveryClass, EventDisposition, EventEnvelope,
+    AckPhase, AgentHostRequestFailure, DeliveryClass, EventAckReceipt, EventDisposition,
+    EventEnvelope,
 };
 use eliot_protocol::{EventIdentityKey, ReplayLedger};
 use eliot_skill::{
@@ -1010,6 +1011,7 @@ pub struct RecoveryStreamView {
     acked_base: u64,
     durable_cursor: u64,
     contiguous_frontier: u64,
+    receiver_acknowledged_frontier: u64,
     highest_observed: u64,
     next_after: u64,
     recovered_events: u64,
@@ -1033,6 +1035,13 @@ impl RecoveryStreamView {
 
     pub const fn contiguous_frontier(&self) -> u64 {
         self.contiguous_frontier
+    }
+
+    /// Contiguous sequence frontier justified by receiver receipts and the
+    /// configured phase policy; the owner staged durable frontier is exposed
+    /// separately above.
+    pub const fn receiver_acknowledged_frontier(&self) -> u64 {
+        self.receiver_acknowledged_frontier
     }
 
     pub const fn highest_observed(&self) -> u64 {
@@ -1199,14 +1208,16 @@ pub enum RecoveryProjectionObligation {
     Covered,
 }
 
-/// One imported event receipt and its current bridge-local obligation state.
-/// The public receipt is digest-only; a checked small source, when available,
-/// remains private to the recovery adapter.
+/// One imported event fact and its current bridge-local obligation state.
+/// The public page contains the receiver phase and disposition, while the
+/// full checked receiver receipt remains within the recovery adapter.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryProjectionEvent {
     pub receipt: RecoveredEventFact,
     pub obligation: RecoveryProjectionObligation,
+    pub receiver_phase: Option<AckPhase>,
+    pub receiver_disposition: Option<EventDisposition>,
 }
 
 const MAX_RECOVERY_PROJECTION_ITEMS: usize = 32;
@@ -1681,6 +1692,7 @@ fn advance_recovery_projection_stream(
         acked_base: progress.acked_base,
         durable_cursor: progress.durable_cursor,
         contiguous_frontier: progress.contiguous_frontier,
+        receiver_acknowledged_frontier: progress.receiver_acknowledged_frontier,
         highest_observed: progress.highest_observed,
         next_after: progress.next_after,
         recovered_events: progress.events.len() as u64,
@@ -1733,6 +1745,14 @@ fn advance_recovery_projection_event(
     let record = RecoveryProjectionRecord::Event(RecoveryProjectionEvent {
         receipt: event.clone(),
         obligation,
+        receiver_phase: event
+            .receiver_receipt
+            .as_ref()
+            .map(|receipt| receipt.acknowledgement.phase),
+        receiver_disposition: event
+            .receiver_receipt
+            .as_ref()
+            .map(|receipt| receipt.acknowledgement.disposition),
     });
     if !page.push(record)? {
         return Ok(false);
@@ -1797,8 +1817,8 @@ fn advance_recovery_projection_unscoped_gap(
     Ok(true)
 }
 
-/// One recovered-but-unforwarded obligation: a retained owner receipt the
-/// bridge has not yet covered with its own acknowledgement.
+/// One recovered-but-unforwarded obligation: a retained event fact the bridge
+/// has not yet covered with its receiving-side acknowledgement.
 ///
 /// These facts stay visible for the live walk while forwarding is
 /// interrupted, so pending work is delayed but never erased owner-side and
@@ -1810,7 +1830,11 @@ pub struct RecoveredPendingView {
     stream_id: String,
     event_id: String,
     sequence: u64,
+    /// ORS/source-owner staging phase; it is not the receiving phase below.
     phase: AckPhase,
+    receiver_phase: Option<AckPhase>,
+    receiver_disposition: Option<EventDisposition>,
+    delivery_class: Option<DeliveryClass>,
     envelope_digest: String,
 }
 
@@ -1829,6 +1853,18 @@ impl RecoveredPendingView {
 
     pub const fn phase(&self) -> AckPhase {
         self.phase
+    }
+
+    pub const fn receiver_phase(&self) -> Option<AckPhase> {
+        self.receiver_phase
+    }
+
+    pub const fn receiver_disposition(&self) -> Option<EventDisposition> {
+        self.receiver_disposition
+    }
+
+    pub const fn delivery_class(&self) -> Option<DeliveryClass> {
+        self.delivery_class
     }
 
     pub fn envelope_digest(&self) -> &str {
@@ -2129,6 +2165,16 @@ pub const RECOVERY_PARTIAL_UNPROVEN_SCOPE: &str = "unproven-scope-present";
 /// stage/ack/compaction); the walk needs a refresh, never a silent stitch.
 pub const RECOVERY_PARTIAL_WINDOW_MOVED: &str = "window-moved-refresh-required";
 pub const RECOVERY_PARTIAL_WINDOW_EXPIRED: &str = "window-expired-refresh-required";
+/// The finite owner inventory has pages, but at least one event lacks a
+/// checked receiving-side phase and delivery class.
+pub const RECOVERY_PARTIAL_RECEIVER_ACCOUNTING: &str = "receiver-accounting-pending";
+/// The owner completed pagination but left a sequence inside its declared
+/// retained interval without an event identity or explicit coverage gap.
+pub const RECOVERY_PARTIAL_OWNER_WINDOW_HOLE: &str = "owner-window-interval-unaccounted";
+/// Retained rows begin after an unproven compacted receiver prefix; an ORS
+/// producer cursor cannot supply the missing receiver phase evidence.
+pub const RECOVERY_PARTIAL_RECEIVER_BASE_UNPROVEN: &str =
+    "receiver-compacted-prefix-unproven";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryWindowStatus {
@@ -2295,11 +2341,129 @@ impl RecoveredSourceProjection {
     }
 }
 
-/// One checked retained-event receipt fact restored from an owner page.
+/// Versioned receiving-side acknowledgement restored with one owner event.
 ///
-/// The public projection is digest-only. An optional checked small source is
-/// retained for the recovery adapter but omitted from serialized projection
-/// pages; metadata never fabricates an [`EventEnvelope`].
+/// The ORS staged phase remains a separate source-owner fact on
+/// [`RecoveredEventFact`]. This receipt binds the receiving owner's phase to
+/// the exact event sequence and envelope digest; it never upgrades the ORS
+/// phase by inference.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveredReceiverReceipt {
+    version: u16,
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    envelope_sha256: String,
+    acknowledgement: EventAckReceipt,
+}
+
+pub const RECOVERED_RECEIVER_RECEIPT_VERSION: u16 = 1;
+
+impl fmt::Debug for RecoveredReceiverReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveredReceiverReceipt")
+            .field("version", &self.version)
+            .field("stream_id", &self.stream_id)
+            .field("event_id", &self.event_id)
+            .field("sequence", &self.sequence)
+            .field("envelope_sha256", &self.envelope_sha256)
+            .field("phase", &self.acknowledgement.phase)
+            .field("disposition", &self.acknowledgement.disposition)
+            .finish()
+    }
+}
+
+impl RecoveredReceiverReceipt {
+    /// Validates the versioned receiver receipt and its exact event identity.
+    #[allow(clippy::result_large_err)]
+    pub fn checked(
+        version: u16,
+        stream_id: String,
+        event_id: String,
+        sequence: u64,
+        envelope_sha256: String,
+        acknowledgement: EventAckReceipt,
+    ) -> Result<Self, BridgeError> {
+        if version != RECOVERED_RECEIVER_RECEIPT_VERSION {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_receiver_receipt.version",
+                reason: "unsupported receiver receipt version",
+            });
+        }
+        validate_text(&stream_id, "recovered_receiver_receipt.stream_id")?;
+        validate_text(&event_id, "recovered_receiver_receipt.event_id")?;
+        if stream_id.contains("::") || event_id.contains("::") || sequence == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_receiver_receipt.identity",
+                reason: "stream/event identity and nonzero sequence are required",
+            });
+        }
+        if envelope_sha256.len() != 64
+            || !envelope_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_receiver_receipt.envelope_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        acknowledgement
+            .validate()
+            .map_err(|_| BridgeError::InvalidContract {
+                field: "recovered_receiver_receipt.acknowledgement",
+                reason: "event acknowledgement receipt is invalid",
+            })?;
+        if acknowledgement.stream_id != stream_id || acknowledgement.event_id != event_id {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_receiver_receipt.acknowledgement",
+                reason: "acknowledgement identity conflicts with its event",
+            });
+        }
+        Ok(Self {
+            version,
+            stream_id,
+            event_id,
+            sequence,
+            envelope_sha256,
+            acknowledgement,
+        })
+    }
+
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn envelope_sha256(&self) -> &str {
+        &self.envelope_sha256
+    }
+
+    pub const fn acknowledgement(&self) -> &EventAckReceipt {
+        &self.acknowledgement
+    }
+}
+
+/// One checked retained-event fact restored from an owner page.
+///
+/// `phase` is the ORS/source-owner staging phase. The optional delivery class
+/// and versioned receiver receipt are separate facts; no receiving phase is
+/// inferred from staging. A checked small source is retained for the recovery
+/// adapter but omitted from serialized projection pages; metadata never
+/// fabricates an [`EventEnvelope`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveredEventFact {
     stream_id: String,
@@ -2310,6 +2474,10 @@ pub struct RecoveredEventFact {
     producer_id: String,
     producer_generation: u64,
     staging_connection: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_class: Option<DeliveryClass>,
+    #[serde(skip_serializing)]
+    receiver_receipt: Option<RecoveredReceiverReceipt>,
     #[serde(skip_serializing)]
     source_projection: Option<RecoveredSourceProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2366,9 +2534,59 @@ impl RecoveredEventFact {
             producer_id,
             producer_generation,
             staging_connection,
+            delivery_class: None,
+            receiver_receipt: None,
             source_projection: None,
             source_unavailable: None,
         })
+    }
+
+    /// Adds the owner's exact persisted delivery class. It is not derived
+    /// from the ORS staged phase or from the existence of an acknowledgement.
+    #[allow(clippy::result_large_err)]
+    pub fn with_delivery_class(
+        mut self,
+        delivery_class: DeliveryClass,
+    ) -> Result<Self, BridgeError> {
+        if let Some(projection) = self.source_projection.as_ref()
+            && projection.kind == RecoveredSourceKind::AdmittedInline
+        {
+            let envelope: EventEnvelope = serde_json::from_str(&projection.source_utf8).map_err(|_| {
+                BridgeError::InvalidContract {
+                    field: "recovered_event.delivery_class",
+                    reason: "admitted source is not an event envelope",
+                }
+            })?;
+            if envelope.delivery_class != delivery_class {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_event.delivery_class",
+                    reason: "delivery class differs from the retained event envelope",
+                });
+            }
+        }
+        self.delivery_class = Some(delivery_class);
+        Ok(self)
+    }
+
+    /// Adds a checked versioned receiving receipt bound to this event's
+    /// stream, event, sequence, and immutable envelope hash.
+    #[allow(clippy::result_large_err)]
+    pub fn with_receiver_receipt(
+        mut self,
+        receipt: RecoveredReceiverReceipt,
+    ) -> Result<Self, BridgeError> {
+        if receipt.stream_id != self.stream_id
+            || receipt.event_id != self.event_id
+            || receipt.sequence != self.sequence
+            || receipt.envelope_sha256 != self.envelope_digest
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.receiver_receipt",
+                reason: "receiver receipt does not bind the exact recovered event identity",
+            });
+        }
+        self.receiver_receipt = Some(receipt);
+        Ok(self)
     }
 
     #[allow(clippy::result_large_err)]
@@ -2413,6 +2631,9 @@ impl RecoveredEventFact {
                 || envelope.sequence != self.sequence
                 || envelope.producer_id != self.producer_id
                 || envelope.producer_generation.value() != self.producer_generation
+                || self
+                    .delivery_class
+                    .is_some_and(|delivery_class| envelope.delivery_class != delivery_class)
                 || eliot_contracts::canonical_json_bytes(&envelope).map_err(|_| {
                     BridgeError::InvalidContract {
                         field: "recovered_event.source_projection",
@@ -2453,6 +2674,14 @@ impl RecoveredEventFact {
         self.source_unavailable
     }
 
+    pub const fn delivery_class(&self) -> Option<DeliveryClass> {
+        self.delivery_class
+    }
+
+    pub fn receiver_receipt(&self) -> Option<&RecoveredReceiverReceipt> {
+        self.receiver_receipt.as_ref()
+    }
+
     pub fn stream_id(&self) -> &str {
         &self.stream_id
     }
@@ -2483,6 +2712,53 @@ impl RecoveredEventFact {
 
     pub fn staging_connection(&self) -> &str {
         &self.staging_connection
+    }
+
+    fn permits_recovery_update(&self, next: &Self) -> bool {
+        if self.stream_id != next.stream_id
+            || self.event_id != next.event_id
+            || self.sequence != next.sequence
+            || self.phase != next.phase
+            || self.envelope_digest != next.envelope_digest
+            || self.producer_id != next.producer_id
+            || self.producer_generation != next.producer_generation
+            || self.staging_connection != next.staging_connection
+            || self.source_projection != next.source_projection
+            || self.source_unavailable != next.source_unavailable
+        {
+            return false;
+        }
+        let class_compatible = match (self.delivery_class, next.delivery_class) {
+            (Some(previous), Some(current)) => previous == current,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        let receiver_compatible = match (&self.receiver_receipt, &next.receiver_receipt) {
+            (Some(previous), Some(current)) => {
+                if previous.version != current.version
+                    || previous.stream_id != current.stream_id
+                    || previous.event_id != current.event_id
+                    || previous.sequence != current.sequence
+                    || previous.envelope_sha256 != current.envelope_sha256
+                {
+                    false
+                } else if previous == current {
+                    true
+                } else {
+                    previous.acknowledgement.phase != current.acknowledgement.phase
+                        && previous.acknowledgement.state_fence
+                            == current.acknowledgement.state_fence
+                        && EventAckReceipt::validate_advance(
+                            previous.acknowledgement.phase,
+                            current.acknowledgement.phase,
+                        )
+                        .is_ok()
+                }
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        class_compatible && receiver_compatible
     }
 }
 
@@ -2614,12 +2890,13 @@ impl RecoveredGapFact {
 /// and the page's own bounded continuation.
 ///
 /// The accounting derivation lives here, not at the transport boundary:
-/// [`RecoveredStreamFacts::checked`] recomputes the contiguous durable
-/// frontier (the contiguous DURABLE-or-later run above the acked base) and
-/// the highest observed sequence from the carried facts, and refuses an
-/// incoherent page. An individually durable out-of-order event may
-/// legitimately exceed the contiguous frontier; it is retained above the
-/// hole, never acknowledged past it.
+/// [`RecoveredStreamFacts::checked`] recomputes the contiguous ORS-staged
+/// durable frontier and highest observed sequence from the carried facts.
+/// `acked_cursor` is the ORS producer-presented cursor; it is not a receiver
+/// acknowledgement and never seeds Core's phase-aware cursor. The separate
+/// receiver frontier is derived only from exact receiving receipts after
+/// import. An individually durable out-of-order event may legitimately
+/// exceed either contiguous frontier; it is retained above the hole.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredStreamFacts {
     stream_id: String,
@@ -2753,9 +3030,10 @@ impl RecoveryStreamCut {
 
 impl RecoveredStreamFacts {
     /// Checks one wire-decoded stream page and derives its accounting.
-    /// Events must arrive strictly increasing with nonzero sequences above
-    /// the acked base and without duplicate identities; `acked` must not
-    /// exceed the contiguous durable cursor; a continuation must name the
+    /// Retained events must arrive strictly increasing with nonzero
+    /// sequences and without duplicate identities; the ORS producer-presented
+    /// `acked_cursor` must not exceed the contiguous staged-durable cursor;
+    /// a continuation must name the
     /// page's last sequence (which may exceed contiguous durable); a complete
     /// page carries no continuation.
     #[allow(clippy::result_large_err)]
@@ -2781,7 +3059,11 @@ impl RecoveredStreamFacts {
                 reason: "acknowledged cursor must not exceed the contiguous durable cursor",
             });
         }
-        Self::check_event_run(&stream_id, acked_cursor, &events)?;
+        // `acked_cursor` is the ORS producer-presented cursor. It is not a
+        // receiving-side acknowledgement, so recovery pages may include
+        // retained rows below it. The owner cut below supplies the actual
+        // retained lower bound.
+        Self::check_event_run(&stream_id, 0, &events)?;
         Self::check_gap_scope(&stream_id, &gaps)?;
         Self::check_continuation(
             page_continuation,
@@ -2882,6 +3164,16 @@ impl RecoveredStreamFacts {
                 reason: "observed stream facts exceed the owner-issued finite bound",
             });
         }
+        if self
+            .events
+            .iter()
+            .any(|event| event.sequence < cut.retention_floor())
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_stream.retention_floor",
+                reason: "recovered event precedes the owner-issued retained interval",
+            });
+        }
         self.recovery_cut = Some(cut);
         Ok(self)
     }
@@ -2918,17 +3210,17 @@ impl RecoveredStreamFacts {
         self.stream_proof.as_deref()
     }
 
-    /// Rejects foreign-stream events, sequences at or below the acked base,
-    /// non-increasing order and duplicate sequences or identities.
+    /// Rejects foreign-stream events, non-increasing order and duplicate
+    /// sequences or identities at or below the supplied page lower bound.
     #[allow(clippy::result_large_err)]
     fn check_event_run(
         stream_id: &str,
-        acked_cursor: u64,
+        exclusive_lower_bound: u64,
         events: &[RecoveredEventFact],
     ) -> Result<(), BridgeError> {
         let mut seen_sequences = BTreeSet::new();
         let mut seen_identities = BTreeSet::new();
-        let mut previous = acked_cursor;
+        let mut previous = exclusive_lower_bound;
         for event in events {
             if event.stream_id != stream_id {
                 return Err(BridgeError::InvalidContract {
@@ -2936,10 +3228,10 @@ impl RecoveredStreamFacts {
                     reason: "page event names a foreign stream",
                 });
             }
-            if event.sequence <= acked_cursor {
+            if event.sequence <= exclusive_lower_bound {
                 return Err(BridgeError::InvalidContract {
                     field: "recovered_stream.event",
-                    reason: "page event does not advance past the acknowledged base",
+                    reason: "page event does not advance past the exclusive lower bound",
                 });
             }
             if event.sequence <= previous {
@@ -3778,6 +4070,17 @@ struct PendingDelivery {
     required_phase: AckPhase,
 }
 
+/// Offside replacement for the process-local receiving consumer. It is
+/// prepared before the forwarding owner commits its matching cache half.
+#[derive(Clone)]
+struct RecoveryConsumerState {
+    replay: ReplayLedger,
+    acknowledged_phases: BTreeMap<EventIdentityKey, AckPhase>,
+    pending_deliveries: BTreeMap<EventIdentityKey, PendingDelivery>,
+    acknowledged_out_of_order: BTreeMap<String, BTreeSet<u64>>,
+    cursors: BTreeMap<String, u64>,
+}
+
 struct ActiveAttach {
     binding: AttachBinding,
     reconciliation_required: bool,
@@ -3787,11 +4090,13 @@ struct ActiveAttach {
 
 /// One stream's imported recovery state inside the declared window.
 ///
-/// `acked_base` is the retention floor observed when the stream entered
-/// the window: pages below it are owner-confirmed history, pages above it
-/// are the walk's required material. `events` retains every checked fact
-/// by sequence, including durable out-of-order events above the contiguous
-/// frontier, so holes are preserved instead of excluded.
+/// `acked_base`/`acked_high` mirror the ORS producer-presented cursor and are
+/// kept only for owner paging/accounting compatibility. Neither is receiver
+/// evidence. `receiver_acknowledged_frontier` starts at zero and advances
+/// only through checked per-event receipts meeting the local cursor policy.
+/// `events` retains every checked fact by sequence, including durable
+/// out-of-order events above either contiguous frontier, so holes remain
+/// visible instead of being skipped.
 #[derive(Clone)]
 struct RecoveryStreamProgress {
     owner_namespace: Option<String>,
@@ -3802,6 +4107,7 @@ struct RecoveryStreamProgress {
     acked_high: u64,
     durable_cursor: u64,
     contiguous_frontier: u64,
+    receiver_acknowledged_frontier: u64,
     highest_observed: u64,
     next_after: u64,
     stream_proof: Option<String>,
@@ -3822,18 +4128,30 @@ impl RecoveryStreamProgress {
     }
 }
 
-type RecoveryProgressSnapshot = (u64, u64, u64, u64, u64, u64, bool, usize, usize);
+type RecoveryProgressSnapshot = (
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    bool,
+    BTreeMap<u64, RecoveredEventFact>,
+    usize,
+);
 
 fn recovery_progress_snapshot(progress: &RecoveryStreamProgress) -> RecoveryProgressSnapshot {
     (
         progress.acked_high,
         progress.durable_cursor,
         progress.contiguous_frontier,
+        progress.receiver_acknowledged_frontier,
         progress.highest_observed,
         progress.next_after,
         progress.next_gap_offset,
         progress.page_complete,
-        progress.events.len(),
+        progress.events.clone(),
         progress.gaps.len(),
     )
 }
@@ -3849,7 +4167,7 @@ fn recovery_stream_facts_compatible(
         if progress
             .events
             .get(&event.sequence)
-            .is_some_and(|existing| existing != event)
+            .is_some_and(|existing| !existing.permits_recovery_update(event))
             || progress.events.values().any(|existing| {
                 existing.event_id == event.event_id && existing.sequence != event.sequence
             })
@@ -3870,13 +4188,17 @@ fn recovery_stream_facts_compatible(
 fn merge_recovery_stream_records(
     progress: &mut RecoveryStreamProgress,
     facts: &RecoveredStreamFacts,
+    cursor_policy: CursorPolicy,
 ) -> bool {
     progress.acked_high = progress.acked_high.max(facts.acked_cursor);
     for event in facts.events() {
-        progress
-            .events
-            .entry(event.sequence)
-            .or_insert_with(|| event.clone());
+        match progress.events.get_mut(&event.sequence) {
+            Some(existing) if existing != event => existing.clone_from(event),
+            Some(_) => {}
+            None => {
+                progress.events.insert(event.sequence, event.clone());
+            }
+        }
     }
     for gap in facts.gaps() {
         progress
@@ -3895,21 +4217,119 @@ fn merge_recovery_stream_records(
         }
     }
     progress.contiguous_frontier = contiguous;
+    progress.receiver_acknowledged_frontier = recovered_receiver_frontier(
+        progress.receiver_acknowledged_frontier,
+        &progress.events,
+        cursor_policy,
+    );
     progress.highest_observed = progress
         .highest_observed
         .max(facts.highest_observed_sequence)
         .max(facts.durable_cursor);
+    let retained_base = facts
+        .recovery_cut()
+        .map_or(facts.acked_cursor, |cut| cut.retention_floor().saturating_sub(1));
     progress.next_after = progress
         .events
         .last_key_value()
-        .map_or(acked, |(sequence, _)| *sequence)
-        .max(facts.page_continuation.unwrap_or(0))
+        .map_or(retained_base, |(sequence, _)| *sequence)
+        .max(facts.page_continuation.unwrap_or(retained_base))
         .max(progress.next_after);
     if let Some(next) = facts.gap_continuation() {
         if next < progress.next_gap_offset {
             return true;
         }
         progress.next_gap_offset = next;
+    }
+    false
+}
+
+fn recovered_receiver_frontier(
+    acknowledged_base: u64,
+    events: &BTreeMap<u64, RecoveredEventFact>,
+    cursor_policy: CursorPolicy,
+) -> u64 {
+    let mut frontier = acknowledged_base;
+    while let Some(next) = frontier.checked_add(1) {
+        let Some(event) = events.get(&next) else {
+            break;
+        };
+        let Some(delivery_class) = event.delivery_class else {
+            break;
+        };
+        let Some(required_phase) = cursor_policy.required_for(delivery_class) else {
+            break;
+        };
+        let Some(receiver_receipt) = event.receiver_receipt.as_ref() else {
+            break;
+        };
+        if receiver_receipt.acknowledgement.disposition == EventDisposition::Conflict {
+            break;
+        }
+        if !recovered_receipt_qualifies(required_phase, receiver_receipt.acknowledgement()) {
+            break;
+        }
+        frontier = next;
+    }
+    frontier
+}
+
+fn recovered_receipt_qualifies(
+    required_phase: AckPhase,
+    acknowledgement: &EventAckReceipt,
+) -> bool {
+    match acknowledgement.disposition {
+        EventDisposition::Accepted | EventDisposition::Duplicate => {
+            acknowledgement.phase != AckPhase::Rejected
+                && phase_reaches(required_phase, acknowledgement.phase)
+        }
+        EventDisposition::Rejected => {
+            required_phase == AckPhase::Rejected && acknowledgement.phase == AckPhase::Rejected
+        }
+        EventDisposition::Conflict => false,
+    }
+}
+
+fn recovery_stream_interval_accounted(
+    stream_id: &str,
+    progress: &RecoveryStreamProgress,
+) -> bool {
+    let Some(cut) = progress.cut else {
+        return false;
+    };
+    let lower = cut.retention_floor();
+    let upper = cut.upper_sequence();
+    if lower == 0 && upper == 0 {
+        return progress.events.is_empty()
+            && progress.gaps.values().all(|gap| gap.stream_id != stream_id);
+    }
+    let mut intervals = Vec::with_capacity(progress.events.len() + progress.gaps.len());
+    intervals.extend(
+        progress
+            .events
+            .values()
+            .map(|event| (event.sequence, event.sequence)),
+    );
+    intervals.extend(
+        progress
+            .gaps
+            .values()
+            .filter(|gap| gap.stream_id == stream_id && gap.end_sequence >= lower)
+            .map(|gap| (gap.start_sequence.max(lower), gap.end_sequence)),
+    );
+    intervals.sort_unstable();
+    let mut next_required = lower;
+    for (start, end) in intervals {
+        if start != next_required || end < start || end > upper {
+            return false;
+        }
+        let Some(next) = end.checked_add(1) else {
+            return end == upper;
+        };
+        next_required = next;
+        if next_required > upper {
+            return true;
+        }
     }
     false
 }
@@ -3924,12 +4344,13 @@ fn recovery_progress_changed(
     progress.acked_high != previous.0
         || progress.durable_cursor != previous.1
         || progress.contiguous_frontier != previous.2
-        || progress.highest_observed != previous.3
-        || progress.next_after != previous.4
-        || progress.next_gap_offset != previous.5
-        || progress.page_complete != previous.6
-        || progress.events.len() != previous.7
-        || progress.gaps.len() != previous.8
+        || progress.receiver_acknowledged_frontier != previous.3
+        || progress.highest_observed != previous.4
+        || progress.next_after != previous.5
+        || progress.next_gap_offset != previous.6
+        || progress.page_complete != previous.7
+        || progress.events != previous.8
+        || progress.gaps.len() != previous.9
 }
 
 /// The declared finite recovery window: one coherent owner observation
@@ -4031,13 +4452,37 @@ impl RecoveryWindow {
             };
         }
         for stream_id in &self.stream_order {
-            let complete = self
-                .streams
-                .get(stream_id)
-                .is_some_and(|progress| progress.page_complete);
-            if !complete {
+            let Some(progress) = self.streams.get(stream_id) else {
                 return RecoveryDisposition::Partial {
                     reason: RECOVERY_PARTIAL_PAGE_CONTINUATION,
+                };
+            };
+            if !progress.page_complete {
+                return RecoveryDisposition::Partial {
+                    reason: RECOVERY_PARTIAL_PAGE_CONTINUATION,
+                };
+            }
+            if progress
+                .cut
+                .is_none_or(|cut| cut.retention_floor() > 1)
+            {
+                return RecoveryDisposition::Partial {
+                    reason: RECOVERY_PARTIAL_RECEIVER_BASE_UNPROVEN,
+                };
+            }
+            if !recovery_stream_interval_accounted(stream_id, progress) {
+                return RecoveryDisposition::Partial {
+                    reason: RECOVERY_PARTIAL_OWNER_WINDOW_HOLE,
+                };
+            }
+            if progress.events.values().any(|event| {
+                event.delivery_class.is_none()
+                    || event.receiver_receipt.as_ref().is_none_or(|receipt| {
+                        receipt.acknowledgement.phase == AckPhase::Unknown
+                    })
+            }) {
+                return RecoveryDisposition::Partial {
+                    reason: RECOVERY_PARTIAL_RECEIVER_ACCOUNTING,
                 };
             }
         }
@@ -4060,6 +4505,8 @@ impl RecoveryWindow {
                             acked_base: progress.acked_base,
                             durable_cursor: progress.durable_cursor,
                             contiguous_frontier: progress.contiguous_frontier,
+                            receiver_acknowledged_frontier: progress
+                                .receiver_acknowledged_frontier,
                             highest_observed: progress.highest_observed,
                             next_after: progress.next_after,
                             recovered_events: progress.events.len() as u64,
@@ -4369,6 +4816,7 @@ impl AgentBridgeCore {
             let disposition = Self::apply_recovery_window(
                 &active.binding,
                 &mut candidate,
+                self.cursor_policy,
                 true,
                 permit.response_selector,
                 permit.request_continuation_proof.as_deref(),
@@ -4466,6 +4914,7 @@ impl AgentBridgeCore {
             let disposition = Self::apply_recovery_window(
                 &active.binding,
                 &mut candidate,
+                self.cursor_policy,
                 false,
                 permit.response_selector,
                 permit.request_continuation_proof.as_deref(),
@@ -4506,6 +4955,12 @@ impl AgentBridgeCore {
             import_result = import_result
                 .with_recovery_candidate_stream_facts(candidate.owner_candidate_stream_facts()?);
         }
+        let consumer_state = match prepared.as_ref() {
+            Some((Some(candidate), _)) => {
+                Some(self.prepare_recovery_consumer_state(binding, candidate)?)
+            }
+            _ => None,
+        };
         // Joint commit (issue #2799): the transport half swaps first; the
         // core half below publishes through infallible field moves, so a
         // failure here leaves both halves untouched.
@@ -4515,11 +4970,153 @@ impl AgentBridgeCore {
                 .map_err(BridgeError::from_forwarding_failure)?;
         }
         if let Some((candidate, disposition)) = prepared {
+            if let Some(consumer_state) = consumer_state {
+                self.replay = consumer_state.replay;
+                self.acknowledged_phases = consumer_state.acknowledged_phases;
+                self.pending_deliveries = consumer_state.pending_deliveries;
+                self.acknowledged_out_of_order = consumer_state.acknowledged_out_of_order;
+                self.cursors = consumer_state.cursors;
+            }
             let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
             active.recovery = candidate;
             return Ok(Some(disposition));
         }
         Ok(None)
+    }
+
+    fn prepare_recovery_consumer_state(
+        &self,
+        binding: &AttachBinding,
+        window: &RecoveryWindow,
+    ) -> Result<RecoveryConsumerState, BridgeError> {
+        let mut state = RecoveryConsumerState {
+            replay: self.replay.clone(),
+            acknowledged_phases: self.acknowledged_phases.clone(),
+            pending_deliveries: self.pending_deliveries.clone(),
+            acknowledged_out_of_order: self.acknowledged_out_of_order.clone(),
+            cursors: self.cursors.clone(),
+        };
+        for stream_id in &window.stream_order {
+            let progress = window
+                .streams
+                .get(stream_id)
+                .ok_or(BridgeError::InvalidTransition(
+                    "recovery stream order names missing progress",
+                ))?;
+            let receiver_frontier = state.cursors.get(stream_id).copied().unwrap_or(0);
+            if let Some(out_of_order) = state.acknowledged_out_of_order.get_mut(stream_id) {
+                out_of_order.retain(|sequence| *sequence > receiver_frontier);
+            }
+
+            for event in progress.events.values() {
+                let key = EventIdentityKey::new(&event.stream_id, &event.event_id);
+                let inline_envelope = match event.source_projection.as_ref() {
+                    Some(projection) if projection.kind == RecoveredSourceKind::AdmittedInline => {
+                        let envelope: EventEnvelope =
+                            serde_json::from_str(&projection.source_utf8).map_err(|_| {
+                                BridgeError::InvalidContract {
+                                    field: "recovered_event.source_projection",
+                                    reason: "admitted inline source is not an event envelope",
+                                }
+                            })?;
+                        Some(envelope)
+                    }
+                    _ => None,
+                };
+                if let Some(envelope) = inline_envelope.as_ref() {
+                    match state
+                        .replay
+                        .observe(envelope)
+                        .map_err(|error| BridgeError::ProviderContract(error.to_string()))?
+                    {
+                        EventDisposition::Accepted | EventDisposition::Duplicate => {}
+                        disposition => {
+                            return Err(BridgeError::InvalidEventDisposition(disposition));
+                        }
+                    }
+                }
+                let Some(receiver_receipt) = event.receiver_receipt.as_ref() else {
+                    continue;
+                };
+                Self::validate_recovered_receiver_binding(binding, receiver_receipt)?;
+                let Some(delivery_class) = event.delivery_class else {
+                    continue;
+                };
+                let acknowledgement = receiver_receipt.acknowledgement();
+                if acknowledgement.phase == AckPhase::Unknown {
+                    continue;
+                }
+                if acknowledgement.disposition == EventDisposition::Conflict {
+                    continue;
+                }
+                let previous_phase = state
+                    .pending_deliveries
+                    .get(&key)
+                    .map(|pending| pending.highest_phase)
+                    .or_else(|| state.acknowledged_phases.get(&key).copied());
+                if let Some(previous_phase) = previous_phase
+                    && !readback_phase_reaches(previous_phase, acknowledgement.phase)
+                {
+                    return Err(BridgeError::ProviderContract(format!(
+                        "recovered receiver acknowledgement regressed from {previous_phase:?} to {:?}",
+                        acknowledgement.phase
+                    )));
+                }
+                let required_phase = self.cursor_policy.required_for(delivery_class);
+                let phase_qualified = required_phase.is_some_and(|required| {
+                    recovered_receipt_qualifies(required, acknowledgement)
+                });
+                if phase_qualified {
+                    state.pending_deliveries.remove(&key);
+                    state
+                        .acknowledged_phases
+                        .insert(key, acknowledgement.phase);
+                    advance_recovered_contiguous_cursor(
+                        &mut state.cursors,
+                        &mut state.acknowledged_out_of_order,
+                        &event.stream_id,
+                        event.sequence,
+                    );
+                } else if acknowledgement.disposition != EventDisposition::Rejected
+                    && let (Some(required_phase), Some(envelope)) =
+                        (required_phase, inline_envelope)
+                {
+                    state.pending_deliveries.insert(
+                        key,
+                        PendingDelivery {
+                            event: envelope,
+                            highest_phase: acknowledgement.phase,
+                            required_phase,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    fn validate_recovered_receiver_binding(
+        binding: &AttachBinding,
+        receipt: &RecoveredReceiverReceipt,
+    ) -> Result<(), BridgeError> {
+        let acknowledgement = receipt.acknowledgement();
+        if !acknowledgement
+            .state_fence
+            .authority_epoch
+            .is_same_authority(binding.state_fence.authority_epoch())
+        {
+            return Err(BridgeError::StaleAuthority);
+        }
+        let session = acknowledgement
+            .receipt
+            .core
+            .session
+            .as_ref()
+            .ok_or(BridgeError::StaleAuthority)?;
+        if session.session_id.as_str() != binding.session_id.as_str() {
+            return Err(BridgeError::StaleAuthority);
+        }
+        Ok(())
     }
 
     /// Returns the read-only progress of the declared recovery window, if any.
@@ -4602,6 +5199,15 @@ impl AgentBridgeCore {
                     event_id: event.event_id.clone(),
                     sequence: event.sequence,
                     phase: event.phase,
+                    receiver_phase: event
+                        .receiver_receipt
+                        .as_ref()
+                        .map(|receipt| receipt.acknowledgement.phase),
+                    receiver_disposition: event
+                        .receiver_receipt
+                        .as_ref()
+                        .map(|receipt| receipt.acknowledgement.disposition),
+                    delivery_class: event.delivery_class,
                     envelope_digest: event.envelope_digest.clone(),
                 });
             }
@@ -4630,6 +5236,7 @@ impl AgentBridgeCore {
     fn apply_recovery_window(
         binding: &AttachBinding,
         recovery: &mut Option<RecoveryWindow>,
+        cursor_policy: CursorPolicy,
         allow_refresh_candidate: bool,
         response_selector: RecoveryResponseSelector,
         request_continuation_proof: Option<&str>,
@@ -4670,8 +5277,13 @@ impl AgentBridgeCore {
             request_continuation_proof,
         )?;
         let previous_incomplete_reason = window.incomplete_reason;
-        let facts_changed =
-            Self::apply_recovery_window_facts(window, new_window, response_selector, facts)?;
+        let facts_changed = Self::apply_recovery_window_facts(
+            window,
+            new_window,
+            response_selector,
+            facts,
+            cursor_policy,
+        )?;
         let presentation_changed = facts.window_status == RecoveryWindowStatus::Active
             && (window.live_generation != facts.live_generation.get()
                 || window.presenting_connection != facts.presenting_connection);
@@ -4812,6 +5424,7 @@ impl AgentBridgeCore {
         new_window: bool,
         response_selector: RecoveryResponseSelector,
         facts: &RecoveryWindowFacts,
+        cursor_policy: CursorPolicy,
     ) -> Result<bool, BridgeError> {
         let full_window = matches!(
             response_selector,
@@ -4876,7 +5489,7 @@ impl AgentBridgeCore {
             || response_selector == RecoveryResponseSelector::Stream
         {
             for stream_facts in &facts.stream_facts {
-                changed |= Self::apply_recovery_stream(window, stream_facts)
+                changed |= Self::apply_recovery_stream(window, stream_facts, cursor_policy)
                     .ok_or(BridgeError::StaleAuthority)?;
             }
         }
@@ -4965,6 +5578,7 @@ impl AgentBridgeCore {
     fn apply_recovery_stream(
         window: &mut RecoveryWindow,
         facts: &RecoveredStreamFacts,
+        cursor_policy: CursorPolicy,
     ) -> Option<bool> {
         if let Some(progress) = window.streams.get(&facts.stream_id) {
             if !progress.matches_owner(facts) {
@@ -4981,6 +5595,9 @@ impl AgentBridgeCore {
             .get(&facts.stream_id)
             .map(recovery_progress_snapshot);
         let is_new_stream = previous_progress.is_none();
+        let initial_after = facts.recovery_cut().map_or(facts.acked_cursor, |cut| {
+            cut.retention_floor().saturating_sub(1)
+        });
         let progress = window
             .streams
             .entry(facts.stream_id.clone())
@@ -4996,8 +5613,9 @@ impl AgentBridgeCore {
                 acked_high: facts.acked_cursor,
                 durable_cursor: facts.acked_cursor,
                 contiguous_frontier: facts.acked_cursor,
+                receiver_acknowledged_frontier: 0,
                 highest_observed: facts.acked_cursor,
-                next_after: facts.acked_cursor,
+                next_after: initial_after,
                 stream_proof: None,
                 page_complete: false,
                 events: BTreeMap::new(),
@@ -5006,7 +5624,8 @@ impl AgentBridgeCore {
         if !window.stream_order.contains(&facts.stream_id) {
             window.stream_order.push(facts.stream_id.clone());
         }
-        let gap_cursor_regressed = merge_recovery_stream_records(progress, facts);
+        let gap_cursor_regressed =
+            merge_recovery_stream_records(progress, facts, cursor_policy);
         if gap_cursor_regressed {
             let changed = window.incomplete_reason != Some(RECOVERY_PARTIAL_WINDOW_MOVED);
             window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
@@ -5387,26 +6006,12 @@ impl AgentBridgeCore {
     /// a missing sequence. A subsequent receipt can close the hole and advance
     /// through every already-qualified successor in one local transition.
     fn advance_contiguous_cursor(&mut self, stream_id: &str, sequence: u64) -> bool {
-        let mut frontier = self.cursors.get(stream_id).copied().unwrap_or(0);
-        let ready = self
-            .acknowledged_out_of_order
-            .entry(stream_id.to_owned())
-            .or_default();
-        if sequence > frontier {
-            ready.insert(sequence);
-        }
-        let previous = frontier;
-        while let Some(next) = frontier.checked_add(1) {
-            if !ready.remove(&next) {
-                break;
-            }
-            frontier = next;
-        }
-        if frontier != previous {
-            self.cursors.insert(stream_id.to_owned(), frontier);
-            return true;
-        }
-        false
+        advance_recovered_contiguous_cursor(
+            &mut self.cursors,
+            &mut self.acknowledged_out_of_order,
+            stream_id,
+            sequence,
+        )
     }
 
     fn forward_best_effort(
@@ -5523,6 +6128,33 @@ fn validate_authority_binding(
         });
     }
     validate_text(state_fence.nonce(), "state_fence.nonce")
+}
+
+fn advance_recovered_contiguous_cursor(
+    cursors: &mut BTreeMap<String, u64>,
+    acknowledged_out_of_order: &mut BTreeMap<String, BTreeSet<u64>>,
+    stream_id: &str,
+    sequence: u64,
+) -> bool {
+    let mut frontier = cursors.get(stream_id).copied().unwrap_or(0);
+    let ready = acknowledged_out_of_order
+        .entry(stream_id.to_owned())
+        .or_default();
+    if sequence > frontier {
+        ready.insert(sequence);
+    }
+    let previous = frontier;
+    while let Some(next) = frontier.checked_add(1) {
+        if !ready.remove(&next) {
+            break;
+        }
+        frontier = next;
+    }
+    if frontier != previous {
+        cursors.insert(stream_id.to_owned(), frontier);
+        return true;
+    }
+    false
 }
 
 const fn phase_reaches(required: AckPhase, observed: AckPhase) -> bool {
