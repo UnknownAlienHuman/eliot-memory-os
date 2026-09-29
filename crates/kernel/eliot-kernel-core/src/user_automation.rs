@@ -3314,7 +3314,14 @@ pub enum UserAutomationOperation {
     /// Create the first immutable revision.
     Create {
         /// Revision to persist through the existing canonical write path.
-        revision: UserAutomationRevision,
+        ///
+        /// Boxed because this operation and `Edit` are the only two variants
+        /// that carry a whole immutable revision, and inlining them made this
+        /// enum by far the largest value on the operator boundary. The box is a
+        /// storage detail only: serde encodes a boxed value exactly as the
+        /// unboxed one, so the wire bytes and the required-field decode
+        /// behavior are unchanged.
+        revision: Box<UserAutomationRevision>,
     },
     /// List visible revisions.
     List {
@@ -3348,9 +3355,13 @@ pub enum UserAutomationOperation {
     /// Edit by creating a new immutable superseding revision.
     Edit {
         /// Current revision that must be superseded.
-        previous_revision: UserAutomationRevision,
+        ///
+        /// Boxed for the same storage reason as [`Self::Create::revision`].
+        previous_revision: Box<UserAutomationRevision>,
         /// New immutable revision.
-        revision: UserAutomationRevision,
+        ///
+        /// Boxed for the same storage reason as [`Self::Create::revision`].
+        revision: Box<UserAutomationRevision>,
     },
     /// Run once using an explicit nonce without mutating the schedule.
     RunNow {
