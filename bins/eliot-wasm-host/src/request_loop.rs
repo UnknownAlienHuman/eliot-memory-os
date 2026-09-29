@@ -1965,6 +1965,29 @@ impl ControlPollClass {
 /// admission instead of growing work without bound.
 const CONTROL_POLL_READ_BUDGET: usize = WASM_CONTROL_SPOOL_MAX_DELIVERIES * 3;
 
+/// Predecessor-evidence outcome for one delivery's ordering link (audit
+/// 5868408122, defect 2). Four values, because a Boolean cannot tell "chain
+/// verified" from "chain never looked at": only [`Self::Conflict`] authorizes
+/// a terminal refused ack, while the two pending values leave the delivery
+/// staged and unacknowledged for a later poll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviousDisposition {
+    /// The declared previous-digest link was compared against the retained
+    /// predecessor ack and matches (or sequence zero declares no link).
+    Verified,
+    /// The predecessor ack is absent or undecodable, so the declared link
+    /// was never compared against anything. The delivery is skipped, never
+    /// admitted or attested as validated.
+    AwaitingEvidence,
+    /// The control-poll read budget was spent before the predecessor ack
+    /// could be read. The walk stops and resumes next tick; the delivery is
+    /// never refused for a read that was only deferred.
+    BudgetDeferred,
+    /// The declared link was compared against retained evidence and
+    /// disagrees with it. Only this value refuses the delivery.
+    Conflict,
+}
+
 /// Resolution of one delivery's ack slot.
 #[derive(Clone, Debug)]
 enum AckSlot {
@@ -2237,15 +2260,26 @@ impl KernelControlReader {
                 self.refuse_slot(generation, sequence, &delivery, refusal.field, slot_taken);
                 continue;
             }
-            if !self.check_previous(generation, sequence, &delivery, &mut reads) {
-                self.refuse_slot(
-                    generation,
-                    sequence,
-                    &delivery,
-                    "control-previous",
-                    slot_taken,
-                );
-                continue;
+            match self.check_previous(generation, sequence, &delivery, &mut reads) {
+                PreviousDisposition::Verified => {}
+                // A deferred read is not evidence: stop the walk and resume
+                // on the next tick instead of refusing a delivery whose
+                // predecessor was never examined.
+                PreviousDisposition::BudgetDeferred => return None,
+                // No evidence to compare against: leave the delivery staged
+                // and unacknowledged rather than admit an unchecked link.
+                PreviousDisposition::AwaitingEvidence => continue,
+                // Only a compared-and-mismatching link is proven conflict.
+                PreviousDisposition::Conflict => {
+                    self.refuse_slot(
+                        generation,
+                        sequence,
+                        &delivery,
+                        "control-previous",
+                        slot_taken,
+                    );
+                    continue;
+                }
             }
             let kind = identity.control_kind;
             if !class.admits(kind) {
@@ -2321,35 +2355,47 @@ impl KernelControlReader {
         }
     }
 
-    /// Checks the previous-delivery link: sequence zero must open the stream,
-    /// and a later sequence must chain to its retained predecessor. A retired
-    /// predecessor (no ack to check against) cannot wedge the stream: the
-    /// delivery is accepted without the link.
+    /// Resolves the previous-delivery link against retained predecessor
+    /// evidence. Sequence zero must open the stream, so only a declared
+    /// absence verifies there; a later sequence must chain to its retained
+    /// predecessor ack. Absent or undecodable predecessor bytes are
+    /// [`PreviousDisposition::AwaitingEvidence`], never an admission: a
+    /// Cancel/Shutdown whose link was never compared is not validated. A
+    /// spent read budget is [`PreviousDisposition::BudgetDeferred`], never a
+    /// refusal. Only a compared-and-mismatching link is
+    /// [`PreviousDisposition::Conflict`].
     fn check_previous(
         &self,
         generation: u64,
         sequence: u64,
         delivery: &WasmControlDelivery,
         reads: &mut usize,
-    ) -> bool {
+    ) -> PreviousDisposition {
         let previous = delivery.identity.previous_delivery_digest.as_ref();
         if sequence == 0 {
-            return previous.is_none();
+            if previous.is_none() {
+                return PreviousDisposition::Verified;
+            }
+            return PreviousDisposition::Conflict;
         }
         if *reads >= CONTROL_POLL_READ_BUDGET {
-            return false;
+            return PreviousDisposition::BudgetDeferred;
         }
         *reads += 1;
         let path = self
             .directory
             .join(control_ack_name(generation, sequence - 1));
         let Ok(bytes) = read_control_bytes(&path) else {
-            return true;
+            return PreviousDisposition::AwaitingEvidence;
         };
         let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
-            return true;
+            return PreviousDisposition::AwaitingEvidence;
         };
-        previous.is_some_and(|digest| *digest == ack.delivery_digest)
+        if previous.is_some_and(|digest| *digest == ack.delivery_digest) {
+            PreviousDisposition::Verified
+        } else {
+            PreviousDisposition::Conflict
+        }
     }
 
     /// Stages one typed refused ack at an exact free slot. Best-effort: a
