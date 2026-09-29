@@ -7309,15 +7309,12 @@ impl KernelComposition {
     /// the host path's parent, never a caller string. Publication requires
     /// a fence-bound session on a Ready, unfenced Kernel; the claim and its
     /// snapshot must speak for this session's authority at this generation.
-    /// After staging, the re-hashed host image is started through the
-    /// admitted process gateway with argv from the validated material, so a
-    /// real ordinary request reaches the host request loop; a refused start
-    /// fails the operation closed (the staged set stays for the delivery
-    /// owner — cleanup is `#2786` territory, never an invented delete
-    /// here). The computed one-shot join gate is projected into the receipt,
-    /// and the composition-retained join table holds the one-shot
-    /// consumption across calls, so an exact same-delivery replay answers
-    /// spent state instead of relaunching the guest.
+    /// After staging, the installation-root delivery owner must durably
+    /// reserve this exact delivery before the re-hashed host image can start
+    /// through the admitted process gateway. Only `Acquired` permits launch;
+    /// existing or retained dispositions return their exact recovery reference,
+    /// and owner errors fail closed. A refused start leaves the staged set for
+    /// the delivery owner (`#2786`); cleanup is never invented here.
     #[allow(
         clippy::too_many_lines,
         reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, demand-start, and receipt projection in one audited order"
@@ -7418,88 +7415,74 @@ impl KernelComposition {
             artifact_bytes: operation.artifact_bytes,
             input_bytes: operation.input_bytes,
         };
-        // Publisher concurrency (#2786 step 4): sessions run as `JoinSet`
-        // tasks on the multi-threaded `#[tokio::main]` runtime, so two
-        // `publish_wasm_dispatch_bundle` calls can interleave on different
-        // threads — no single-publisher ownership is claimed. The
-        // publisher serializes replacements only through the live-envelope
-        // gate (claim-by-rename plus per-step re-verification), not a
-        // lock; the residual per-file window is stated at the reclaim.
-        let mut joins = eliot_kernel_service::WasmJoinTable::default();
-        let bundle = match eliot_kernel_service::publish_wasm_dispatch_bundle(
-            host_executable_path.as_str(),
-            host_artifact_digest.as_str(),
+        // The publisher still accepts a transient join projection for its
+        // returned bundle, but it is not launch authority. Durable
+        // Ready -> LaunchReserved admission below is serialized by the
+        // installation-root delivery owner and survives Kernel restarts.
+        let bundle = {
+            let mut publication_joins = eliot_kernel_service::WasmJoinTable::default();
+            match eliot_kernel_service::publish_wasm_dispatch_bundle(
+                host_executable_path.as_str(),
+                host_artifact_digest.as_str(),
+                install_dir,
+                &claim,
+                &mut publication_joins,
+            ) {
+                Ok(bundle) => bundle,
+                // Typed bounded backpressure (#2786 step 4): another live
+                // delivery owns the fixed names, so this publication is
+                // refused without touching a byte. The exact retry condition
+                // is retained in the response, never collapsed into a fence.
+                Err(eliot_kernel_service::WasmDispatchError::Backpressure(live)) => {
+                    return Ok(serde_json::json!({
+                        "kind": "wasm_dispatch_backpressure",
+                        "value": {
+                            "live_generation": live.live_generation,
+                            "live_operation_id": live.live_operation_id,
+                            "live_expires_at": live.live_expires_at,
+                            "retry_condition": live.retry_condition,
+                        },
+                    }));
+                }
+                Err(_) => return Err(TransportError::SessionFenced),
+            }
+        };
+        // Durable launch admission (#2786): the owner re-reads the exact
+        // publication record and atomically reserves its first launch under
+        // the installation-root lock. Only Acquired may start the host;
+        // every replay/recovery disposition returns without another process
+        // start, and an unavailable/conflicting owner fails closed.
+        let launch_incarnation = match eliot_kernel_service::claim_wasm_dispatch_launch(
             install_dir,
-            &claim,
-            &mut joins,
+            &bundle.delivery,
+            &bundle.join,
+            unix_ms(),
         ) {
-            Ok(bundle) => bundle,
-            // Typed bounded backpressure (#2786 step 4): another live
-            // delivery owns the fixed names, so this publication is
-            // refused without touching a byte. The exact retry condition
-            // is retained in the response, never collapsed into a fence.
-            Err(eliot_kernel_service::WasmDispatchError::Backpressure(live)) => {
+            Ok(eliot_kernel_service::WasmLaunchDisposition::Acquired {
+                launch_incarnation,
+            }) => launch_incarnation,
+            Ok(eliot_kernel_service::WasmLaunchDisposition::ExistingInFlight {
+                recovery_reference,
+            }) => {
                 return Ok(serde_json::json!({
-                    "kind": "wasm_dispatch_backpressure",
+                    "kind": "wasm_dispatch_in_progress",
                     "value": {
-                        "live_generation": live.live_generation,
-                        "live_operation_id": live.live_operation_id,
-                        "live_expires_at": live.live_expires_at,
-                        "retry_condition": live.retry_condition,
+                        "recovery_reference": recovery_reference,
+                    },
+                }));
+            }
+            Ok(eliot_kernel_service::WasmLaunchDisposition::RetainedResult {
+                recovery_reference,
+            }) => {
+                return Ok(serde_json::json!({
+                    "kind": "wasm_dispatch_result_reconciliation",
+                    "value": {
+                        "recovery_reference": recovery_reference,
                     },
                 }));
             }
             Err(_) => return Err(TransportError::SessionFenced),
         };
-        // Launch-gate admission (#2786 steps 3 and 8): the staged bundle
-        // executes only against its matching owner join/grant. The local
-        // table above stays publish scratch (file staging never runs under
-        // the retained lock); the published bundle merges into the
-        // composition-retained join table and admits under one short lock
-        // holding no file I/O and never crossing an await, so concurrent
-        // same-delivery calls linearize here: the first consumes the
-        // one-shot admission and any exact replay observes the spent
-        // record. Expiry is re-verified at launch instant (closing the
-        // validation-to-start window), so this is a real expiry gate
-        // (`Stale` can fire here). A failed launch stays consumed — an
-        // unknown outcome reconciles, it is never blindly retried under
-        // the same delivery — and recovery resubmits under fresh claim
-        // authority (#2786 A7). Anything else fails closed before the
-        // child starts.
-        let admission = {
-            let mut retained = self
-                .wasm_join_table
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let now_ms = unix_ms();
-            retained.prune(now_ms);
-            retained.register_delivery(&bundle.join, &bundle.delivery);
-            retained.admit_claim(
-                bundle.material.claim_id.as_str(),
-                bundle.material.operation_id.as_str(),
-                bundle.join.invocation_digest.as_str(),
-                bundle.delivery.envelope_digest.as_str(),
-                now_ms,
-            )
-        };
-        match admission {
-            Ok(()) => {}
-            // Same-delivery replay (#2786 step 3): the retained spent
-            // record stands and no second guest effect starts. The caller
-            // receives the exact spent identity, never a fresh launch.
-            Err(eliot_kernel_service::JoinDeny::Replayed) => {
-                return Ok(serde_json::json!({
-                    "kind": "wasm_dispatch_replay",
-                    "value": {
-                        "claim_id": bundle.material.claim_id,
-                        "operation_id": bundle.material.operation_id,
-                        "expires_at": bundle.join.expires_at,
-                        "retry_condition": "resubmit under fresh claim authority",
-                    },
-                }));
-            }
-            Err(_) => return Err(TransportError::SessionFenced),
-        }
         let material_digest = sha256_hex(
             &eliot_kernel_service::material_bytes(&bundle.material)
                 .map_err(|_| TransportError::SessionFenced)?,
@@ -7517,6 +7500,7 @@ impl KernelComposition {
             "value": {
                 "claim_id": bundle.material.claim_id,
                 "operation_id": bundle.material.operation_id,
+                "launch_incarnation": launch_incarnation,
                 "grant_digest": bundle.material.grant.grant_digest,
                 "invocation_digest": bundle.join.invocation_digest,
                 "expires_at": bundle.join.expires_at,
