@@ -32,6 +32,11 @@
 
 use std::path::Path;
 
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::io::Read;
+
 use crate::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity, NamedPipeAuthDiscriminator,
     ProcessIdentity, WindowsAdapterError, file_identity, inspect_process_identity, job_process_ids,
@@ -159,6 +164,7 @@ pub struct NamedPipePeerExpectation {
     approved_job_process: Option<NamedPipePeerJobBinding>,
     dynamic_image_path: Option<String>,
     dynamic_executable_file: Option<FileIdentity>,
+    expected_executable_sha256: Option<String>,
     builtin_administrators: bool,
 }
 
@@ -182,6 +188,7 @@ impl NamedPipePeerExpectation {
             approved_job_process: None,
             dynamic_image_path: None,
             dynamic_executable_file: None,
+            expected_executable_sha256: None,
             builtin_administrators: false,
         })
     }
@@ -203,6 +210,7 @@ impl NamedPipePeerExpectation {
             approved_job_process: None,
             dynamic_image_path: None,
             dynamic_executable_file: None,
+            expected_executable_sha256: None,
             builtin_administrators: true,
         })
     }
@@ -232,6 +240,46 @@ impl NamedPipePeerExpectation {
             approved_job_process: None,
             dynamic_image_path: Some(image_path),
             dynamic_executable_file: Some(executable_file),
+            expected_executable_sha256: None,
+            builtin_administrators: false,
+        })
+    }
+
+    /// Creates an expectation for one exact observed process whose current
+    /// no-follow image file must match an independently pinned SHA-256.
+    ///
+    /// This is used when a protected launch declaration commits the image
+    /// digest but does not commit an image path. The supplied process binding
+    /// must have been obtained from a live OS process handle; the digest is
+    /// checked again against the process handle's OS-reported image path at
+    /// pipe authentication time.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the SID, session, digest, or retained file
+    /// identity is invalid.
+    pub fn new_with_process_binding_and_executable_sha256(
+        expected_sid: impl Into<String>,
+        expected_session_id: u32,
+        approved_process: NamedPipePeerProcessBinding,
+        expected_executable_sha256: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let expected_sid = expected_sid.into();
+        let expected_executable_sha256 = expected_executable_sha256.into();
+        if !valid_sid_text(&expected_sid)
+            || expected_session_id == 0
+            || !crate::valid_sha256_hex(&expected_executable_sha256)
+            || approved_process.executable_file_identity().is_none()
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            expected_sid,
+            expected_session_id,
+            approved_process: Some(approved_process),
+            approved_job_process: None,
+            dynamic_image_path: None,
+            dynamic_executable_file: None,
+            expected_executable_sha256: Some(expected_executable_sha256),
             builtin_administrators: false,
         })
     }
@@ -359,15 +407,62 @@ impl NamedPipePeerExpectation {
         self.dynamic_executable_file
     }
 
+    /// Returns whether peer authentication must hash the OS-observed image
+    /// file through a no-follow handle.
+    #[must_use]
+    pub const fn requires_executable_sha256(&self) -> bool {
+        self.expected_executable_sha256.is_some()
+    }
+
+    pub(crate) fn requires_executable_sha256_for(
+        &self,
+        process: &ProcessIdentity,
+        sid: &str,
+        session_id: u32,
+    ) -> bool {
+        self.expected_executable_sha256.is_some()
+            && self.expected_sid == sid
+            && self.expected_session_id == session_id
+            && self
+                .approved_process_binding()
+                .is_some_and(|approved| same_process_identity(process, approved.identity()))
+    }
+
+    pub(crate) fn executable_sha256_matches(&self, observed: Option<&str>) -> bool {
+        self.expected_executable_sha256
+            .as_deref()
+            .is_none_or(|expected| observed == Some(expected))
+    }
+
+    pub(crate) fn expected_executable_sha256_for(
+        &self,
+        process: &ProcessIdentity,
+        sid: &str,
+        session_id: u32,
+    ) -> Option<&str> {
+        self.requires_executable_sha256_for(process, sid, session_id)
+            .then(|| self.expected_executable_sha256.as_deref())
+            .flatten()
+    }
+
     pub(crate) fn matches_dynamic_observation(&self, evidence: &NamedPipePeerEvidence) -> bool {
-        if !self.is_dynamic_process() || evidence.sid != self.expected_sid {
+        self.matches_dynamic_identity(&evidence.process, &evidence.sid, evidence.executable_file)
+    }
+
+    pub(crate) fn matches_dynamic_identity(
+        &self,
+        process: &ProcessIdentity,
+        sid: &str,
+        executable_file: Option<FileIdentity>,
+    ) -> bool {
+        if !self.is_dynamic_process() || sid != self.expected_sid {
             return false;
         }
         let Some(image_path) = self.dynamic_image_path.as_deref() else {
             return false;
         };
-        same_process_image_path(&evidence.process.image_path, image_path)
-            && evidence.executable_file == self.dynamic_executable_file
+        same_process_image_path(&process.image_path, image_path)
+            && executable_file == self.dynamic_executable_file
     }
 
     pub(crate) fn matches_evidence(&self, evidence: &NamedPipePeerEvidence) -> bool {
@@ -378,10 +473,16 @@ impl NamedPipePeerExpectation {
             if !evidence.builtin_administrators {
                 return false;
             }
-        } else if self.is_dynamic_process() {
-            if evidence.session_id == 0
-                || !evidence.interactive_session
-                || !self.matches_dynamic_observation(evidence)
+        } else if self.is_dynamic_process() || self.requires_executable_sha256() {
+            if evidence.session_id == 0 || !evidence.interactive_session {
+                return false;
+            }
+            if self.is_dynamic_process() {
+                if !self.matches_dynamic_observation(evidence) {
+                    return false;
+                }
+            } else if evidence.sid != self.expected_sid
+                || evidence.session_id != self.expected_session_id
             {
                 return false;
             }
@@ -509,6 +610,102 @@ pub(crate) fn admit_named_pipe_peer_process(
         }
     }
     Ok(())
+}
+
+/// Hashes the current no-follow file resolved from one OS-observed process
+/// image path and verifies that both the retained handle and path still name
+/// the same file object after the read.
+///
+/// This proves the current on-disk image identity. It does not inspect the
+/// process's mapped image pages; callers must not describe it as an in-memory
+/// code measurement.
+///
+/// # Errors
+/// Returns `IdentityMismatch` if the OS image path cannot be safely opened,
+/// the file changes identity during the read, or the path is rebound.
+#[cfg(windows)]
+pub(crate) fn observe_process_image_file_sha256(
+    process: &ProcessIdentity,
+) -> Result<(FileIdentity, String), WindowsAdapterError> {
+    if !process.is_usable() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let image_path = Path::new(&process.image_path);
+    let (opened_identity, mut file) = open_image_file_no_write_share(image_path)?;
+    let length_before = file
+        .metadata()
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?
+        .len();
+    let handle_identity_before = crate::process_identity::file_identity_from_handle(&file)
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    if handle_identity_before != opened_identity {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+
+    let handle_identity_after = crate::process_identity::file_identity_from_handle(&file)
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    let length_after = file
+        .metadata()
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?
+        .len();
+    let (path_identity_after, _path_file) = open_image_file_no_write_share(image_path)?;
+    if handle_identity_after != opened_identity
+        || path_identity_after != opened_identity
+        || length_after != length_before
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok((opened_identity, format!("{:x}", digest.finalize())))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn observe_process_image_file_sha256(
+    _process: &ProcessIdentity,
+) -> Result<(FileIdentity, String), WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+#[cfg(windows)]
+fn open_image_file_no_write_share(
+    path: &Path,
+) -> Result<(FileIdentity, std::fs::File), WindowsAdapterError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(FILE_GENERIC_READ)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let identity = crate::process_identity::file_identity_from_handle(&file)
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    if identity.volume_serial_number == 0 || identity.file_index == 0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok((identity, file))
 }
 
 /// Observes the current process token for use as an inert named-pipe server

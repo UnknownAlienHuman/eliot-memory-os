@@ -12,6 +12,21 @@
 
 use super::*;
 
+#[cfg(windows)]
+const USER_BROKER_LAUNCH_BINDING_PATH: &str = "Eliot/user-broker/launch.json";
+#[cfg(windows)]
+const USER_BROKER_LAUNCH_BINDING_SCHEMA: &str = "eliot.user-broker.launch-binding.v2";
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedUserBrokerLaunchBinding {
+    schema: String,
+    registration: eliot_user_broker_core::RegistrationRequest,
+    operator_artifact: eliot_user_broker_core::OperatorArtifact,
+    launch_authority_fence: StateFence,
+}
+
 fn observe_front_door_session(event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
@@ -87,12 +102,10 @@ impl DaemonSessionBindingAuditEvidence {
 /// against the live server policy by
 /// [`KernelComposition::validate_doctor_client_binding`].
 ///
-/// NOTE (platform boundary): the OS pipe peer set
-/// (`NamedPipePeerSet`, `MAX_ENTRIES = 3`) admits exactly one Host, Eliotd,
-/// and `AgentBridge` role and lives in `eliot-platform-windows`, outside Slice-B
-/// scope. A dedicated fourth OS Doctor role needs that platform change; until
-/// then the Doctor rides an already-authenticated pipe peer and is bound at
-/// session scope here. Invalid peer or epoch gets no protected input.
+/// NOTE (platform boundary): the OS pipe peer set admits the five bounded
+/// Host, Eliotd, AgentBridge, UserBroker, and Watchdog roles. Doctor and Testd
+/// still ride an already-authenticated pipe peer and are bound at session
+/// scope here. Invalid peer or epoch gets no protected input.
 pub(crate) const DOCTOR_MODULE_ID: &str = "eliot-doctor";
 
 /// Stable module identity of the one-shot testd admission worker (T6-X1 P-07).
@@ -103,12 +116,10 @@ pub(crate) const DOCTOR_MODULE_ID: &str = "eliot-doctor";
 /// against the live server policy by
 /// [`KernelComposition::validate_testd_client_binding`].
 ///
-/// NOTE (platform boundary): the OS pipe peer set
-/// (`NamedPipePeerSet`, `MAX_ENTRIES = 3`) admits exactly one Host, Eliotd,
-/// and `AgentBridge` role and lives in `eliot-platform-windows`, outside Slice-B
-/// scope. A dedicated fourth OS testd role needs that platform change; until
-/// then testd rides an already-authenticated pipe peer and is bound at
-/// session scope here. Invalid peer or epoch gets no protected input.
+/// NOTE (platform boundary): the OS pipe peer set admits the five bounded
+/// Host, Eliotd, AgentBridge, UserBroker, and Watchdog roles. Testd still rides
+/// an already-authenticated pipe peer and is bound at session scope here.
+/// Invalid peer or epoch gets no protected input.
 pub(crate) const TESTD_MODULE_ID: &str = "eliot-testd";
 
 /// Stable module identity of the one-shot native-worker claim worker
@@ -143,6 +154,9 @@ pub(crate) const NATIVE_MODULE_ID: &str = "eliot-native-worker";
 /// gateway. It requires no agent-bridge Session, no bridge activation, and no
 /// bridge profile.
 pub(crate) const WATCHDOG_MODULE_ID: &str = "eliot-watchdog";
+
+/// Stable module identity reserved for the OS-pinned User Broker peer role.
+pub(crate) const USER_BROKER_MODULE_ID: &str = "eliot-user-broker";
 
 /// Builds the front-door `Watchdog` peer role, or `None` when no Watchdog
 /// service process is currently observable.
@@ -181,6 +195,70 @@ fn front_door_watchdog_peer_profile(
     NamedPipePeerProfile::new(NamedPipePeerKind::Watchdog, expectation, None)
         .map(Some)
         .map_err(|error| KernelBuildError::Principal(error.to_string()))
+}
+
+/// Loads the protected User Broker launch declaration and creates a peer role
+/// only when the current OS process named by that declaration can be observed
+/// and pinned. Any missing, malformed, inaccessible, or changed declaration
+/// yields no UserBroker role; it never broadens another role or trusts a
+/// digest received over the pipe.
+///
+/// The platform adapter hashes the current no-follow file resolved from the
+/// OS-reported image path at connection authentication and binds that digest
+/// to this protected declaration. This proves current on-disk image identity,
+/// not the process's mapped in-memory pages.
+#[cfg(windows)]
+fn front_door_user_broker_peer_profile() -> Option<NamedPipePeerProfile> {
+    let result = (|| {
+        let path =
+            eliot_platform_windows::protected_program_data_path(USER_BROKER_LAUNCH_BINDING_PATH)
+                .ok()?;
+        let lease =
+            eliot_platform_windows::ProtectedPathLease::open_existing_absolute(&path).ok()?;
+        lease.verify_stable_identity().ok()?;
+        lease.verify_path_identity().ok()?;
+        let bytes = lease.read_bounded(64 * 1024).ok()?;
+        let binding: ProtectedUserBrokerLaunchBinding = serde_json::from_slice(&bytes).ok()?;
+        if binding.schema != USER_BROKER_LAUNCH_BINDING_SCHEMA
+            || binding.registration.validate().is_err()
+            || binding.operator_artifact.validate().is_err()
+            || binding.launch_authority_fence.validate().is_err()
+        {
+            return None;
+        }
+        let process_id = binding
+            .registration
+            .broker_process_id
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value != 0)
+            .filter(|value| value.to_string() == binding.registration.broker_process_id)?;
+        let session_id = binding
+            .registration
+            .interactive_session_id
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value != 0)
+            .filter(|value| value.to_string() == binding.registration.interactive_session_id)?;
+        let observed = observe_named_pipe_peer_process(process_id).ok()?;
+        if observed.process_id() != process_id || observed.executable_file_identity().is_none() {
+            return None;
+        }
+        let expectation = NamedPipePeerExpectation::new_with_process_binding_and_executable_sha256(
+            binding.registration.windows_sid,
+            session_id,
+            observed,
+            binding.registration.broker_artifact_digest,
+        )
+        .ok()?;
+        lease.verify_stable_identity().ok()?;
+        lease.verify_path_identity().ok()?;
+        NamedPipePeerProfile::new(NamedPipePeerKind::UserBroker, expectation, None).ok()
+    })();
+    if result.is_none() {
+        observe_front_door_session("kernel.front_door_user_broker_peer", "not_admitted");
+    }
+    result
 }
 
 /// The only transport implementation admitted by the Windows-first Kernel.
@@ -342,6 +420,10 @@ impl KernelComposition {
                 )
                 .map_err(|error| KernelBuildError::Principal(error.to_string()))?,
             );
+        }
+
+        if let Some(profile) = front_door_user_broker_peer_profile() {
+            entries.push(profile);
         }
 
         // The Watchdog is an SCM-owned sibling of the Host service, so the
@@ -648,6 +730,13 @@ impl KernelComposition {
         if client.module_bridge_identity == AGENT_BRIDGE_MODULE_ID {
             // The bridge has a server-first transport owner. It must never
             // enter the legacy client-first Session/dispatch path.
+            return Err(TransportError::SessionFenced);
+        }
+        #[cfg(windows)]
+        if client.module_bridge_identity == USER_BROKER_MODULE_ID {
+            // User Broker authority is admitted only by its dedicated
+            // challenge/redeem route. Never fall through to the generic
+            // front-door policy or inherit its capability/effect set.
             return Err(TransportError::SessionFenced);
         }
         #[cfg(windows)]

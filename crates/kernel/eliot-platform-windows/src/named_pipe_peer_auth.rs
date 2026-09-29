@@ -24,7 +24,9 @@
 //! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
 //! sharded fragments named per anchor above.
 
-use crate::named_pipe_process_admission::{NamedPipePeerExpectation, NamedPipePeerJobBinding};
+use crate::named_pipe_process_admission::{
+    NamedPipePeerExpectation, NamedPipePeerJobBinding, observe_process_image_file_sha256,
+};
 use crate::{ProcessIdentity, WindowsAdapterError, same_process_identity};
 
 #[cfg(windows)]
@@ -168,7 +170,17 @@ pub fn authenticate_named_pipe_server(
         if sid != expectation.expected_sid() || session_id != expectation.expected_session_id() {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
-        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
+        let expected_sha256 =
+            expectation.expected_executable_sha256_for(&identity, &sid, session_id);
+        let executable_file = if let Some(expected_sha256) = expected_sha256 {
+            let (file_identity, observed_sha256) = observe_process_image_file_sha256(&identity)?;
+            if observed_sha256 != expected_sha256 {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            Some(file_identity)
+        } else {
+            file_identity(Path::new(&identity.image_path)).ok()
+        };
         Ok(NamedPipePeerEvidence {
             process: identity,
             sid,
@@ -257,7 +269,20 @@ pub fn authenticate_named_pipe_client(
         if !principal_matches {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
-        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
+        let expected_sha256 = expectation.expected_executable_sha256_for(
+            &identity,
+            &process_token.0,
+            process_token.1,
+        );
+        let executable_file = if let Some(expected_sha256) = expected_sha256 {
+            let (file_identity, observed_sha256) = observe_process_image_file_sha256(&identity)?;
+            if observed_sha256 != expected_sha256 {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            Some(file_identity)
+        } else {
+            file_identity(Path::new(&identity.image_path)).ok()
+        };
         Ok(NamedPipePeerEvidence {
             process: identity,
             sid: process_token.0,
@@ -319,7 +344,16 @@ pub fn authenticate_named_pipe_server_with_peer_set(
         } else {
             false
         };
-        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
+        let expected_sha256 = peers.expected_executable_sha256_for(&identity, &sid, session_id);
+        let (executable_file, executable_sha256) = if let Some(expected_sha256) = expected_sha256 {
+            let (file_identity, observed_sha256) = observe_process_image_file_sha256(&identity)?;
+            if observed_sha256 != expected_sha256 {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            (Some(file_identity), Some(observed_sha256))
+        } else {
+            (file_identity(Path::new(&identity.image_path)).ok(), None)
+        };
         let job_name = observed_peer_job_name(process_id, peers)?;
         let mut evidence = NamedPipePeerEvidence {
             process: identity,
@@ -331,14 +365,17 @@ pub fn authenticate_named_pipe_server_with_peer_set(
             interactive_session: false,
         };
         if session_id != 0
-            && peers
-                .entries()
-                .iter()
-                .any(|entry| entry.expectation().matches_dynamic_observation(&evidence))
+            && peers.requires_active_interactive_session_for(
+                &evidence.process,
+                &evidence.sid,
+                evidence.session_id,
+                evidence.executable_file,
+            )
         {
             evidence.interactive_session = active_interactive_session(session_id)?;
         }
-        let selection = peers.select(&evidence)?;
+        let selection =
+            peers.select_with_executable_sha256(&evidence, executable_sha256.as_deref())?;
         Ok((evidence, selection))
     })();
     // SAFETY: `process` is the live handle returned by OpenProcess and is
@@ -396,7 +433,16 @@ pub fn authenticate_named_pipe_client_with_peer_set(
         } else {
             false
         };
-        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
+        let expected_sha256 = peers.expected_executable_sha256_for(&identity, &sid, session_id);
+        let (executable_file, executable_sha256) = if let Some(expected_sha256) = expected_sha256 {
+            let (file_identity, observed_sha256) = observe_process_image_file_sha256(&identity)?;
+            if observed_sha256 != expected_sha256 {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            (Some(file_identity), Some(observed_sha256))
+        } else {
+            (file_identity(Path::new(&identity.image_path)).ok(), None)
+        };
         let job_name = observed_peer_job_name(process_id, peers)?;
         let mut evidence = NamedPipePeerEvidence {
             process: identity,
@@ -408,14 +454,17 @@ pub fn authenticate_named_pipe_client_with_peer_set(
             interactive_session: false,
         };
         if session_id != 0
-            && peers
-                .entries()
-                .iter()
-                .any(|entry| entry.expectation().matches_dynamic_observation(&evidence))
+            && peers.requires_active_interactive_session_for(
+                &evidence.process,
+                &evidence.sid,
+                evidence.session_id,
+                evidence.executable_file,
+            )
         {
             evidence.interactive_session = active_interactive_session(session_id)?;
         }
-        let selection = peers.select(&evidence)?;
+        let selection =
+            peers.select_with_executable_sha256(&evidence, executable_sha256.as_deref())?;
         Ok((evidence, selection))
     })();
     // SAFETY: `process` is the live handle returned by OpenProcess and is

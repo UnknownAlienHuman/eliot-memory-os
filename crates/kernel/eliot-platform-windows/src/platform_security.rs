@@ -21,6 +21,9 @@ pub enum NamedPipePeerKind {
     Eliotd,
     /// The separately installed agent bridge module.
     AgentBridge,
+    /// The interactive User Broker process admitted from its exact installed
+    /// image and current OS-observed user session.
+    UserBroker,
     /// The independent supervision service, observed live from its own SCM
     /// service identity.
     ///
@@ -41,6 +44,7 @@ impl NamedPipePeerKind {
             Self::Host => "eliot-host",
             Self::Eliotd => "eliotd",
             Self::AgentBridge => "eliot-agent-bridge",
+            Self::UserBroker => "eliot-user-broker",
             Self::Watchdog => "eliot-watchdog",
         }
     }
@@ -69,7 +73,13 @@ impl NamedPipePeerProfile {
             || (kind == NamedPipePeerKind::AgentBridge && profile_id.is_none())
             || (kind != NamedPipePeerKind::AgentBridge && profile_id.is_some())
             || (kind == NamedPipePeerKind::AgentBridge && !expectation.is_dynamic_process())
-            || (kind != NamedPipePeerKind::AgentBridge && expectation.is_dynamic_process())
+            || (kind == NamedPipePeerKind::UserBroker
+                && (expectation.is_dynamic_process()
+                    || !expectation.requires_executable_sha256()
+                    || expectation.approved_process_binding().is_none()))
+            || (kind != NamedPipePeerKind::AgentBridge
+                && kind != NamedPipePeerKind::UserBroker
+                && (expectation.is_dynamic_process() || expectation.requires_executable_sha256()))
         {
             return Err(WindowsAdapterError::InvalidInput);
         }
@@ -115,10 +125,10 @@ pub struct NamedPipePeerSet {
 
 impl NamedPipePeerSet {
     /// Maximum number of local peer roles in one set.
-    pub const MAX_ENTRIES: usize = 4;
+    pub const MAX_ENTRIES: usize = 5;
 
-    /// Seals a bounded set with at most one Host, Eliotd, `AgentBridge`, and
-    /// `Watchdog`.
+    /// Seals a bounded set with at most one Host, Eliotd, `AgentBridge`,
+    /// `UserBroker`, and `Watchdog`.
     pub fn new(mut entries: Vec<NamedPipePeerProfile>) -> Result<Self, WindowsAdapterError> {
         if entries.is_empty() || entries.len() > Self::MAX_ENTRIES {
             return Err(WindowsAdapterError::InvalidInput);
@@ -126,10 +136,20 @@ impl NamedPipePeerSet {
         if entries.iter().any(|entry| {
             let static_process = entry.expectation.approved_process_binding();
             let dynamic_process = entry.expectation.is_dynamic_process();
-            let valid = if entry.kind == NamedPipePeerKind::AgentBridge {
-                dynamic_process
-            } else {
-                !dynamic_process && static_process.is_some()
+            let valid = match entry.kind {
+                NamedPipePeerKind::AgentBridge => dynamic_process,
+                NamedPipePeerKind::UserBroker => {
+                    !dynamic_process
+                        && static_process.is_some()
+                        && entry.expectation.requires_executable_sha256()
+                }
+                NamedPipePeerKind::Host
+                | NamedPipePeerKind::Eliotd
+                | NamedPipePeerKind::Watchdog => {
+                    !dynamic_process
+                        && static_process.is_some()
+                        && !entry.expectation.requires_executable_sha256()
+                }
             };
             !valid
         }) {
@@ -169,9 +189,41 @@ impl NamedPipePeerSet {
     /// interactive session during live authentication.
     #[must_use]
     pub fn requires_active_interactive_session(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.expectation.is_dynamic_process())
+        self.entries.iter().any(|entry| {
+            entry.expectation.is_dynamic_process() || entry.expectation.requires_executable_sha256()
+        })
+    }
+
+    pub(crate) fn requires_active_interactive_session_for(
+        &self,
+        process: &crate::ProcessIdentity,
+        sid: &str,
+        session_id: u32,
+        executable_file: Option<FileIdentity>,
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            entry
+                .expectation
+                .matches_dynamic_identity(process, sid, executable_file)
+                || entry
+                    .expectation
+                    .requires_executable_sha256_for(process, sid, session_id)
+        })
+    }
+
+    pub(crate) fn expected_executable_sha256_for(
+        &self,
+        process: &crate::ProcessIdentity,
+        sid: &str,
+        session_id: u32,
+    ) -> Option<&str> {
+        let mut matches = self.entries.iter().filter_map(|entry| {
+            entry
+                .expectation
+                .expected_executable_sha256_for(process, sid, session_id)
+        });
+        let expected = matches.next()?;
+        matches.next().is_none().then_some(expected)
     }
 
     /// Returns the approved SID principals used to build and verify a set DACL.
@@ -196,16 +248,45 @@ impl NamedPipePeerSet {
         &self,
         evidence: &crate::NamedPipePeerEvidence,
     ) -> Result<NamedPipePeerSelection, WindowsAdapterError> {
+        self.select_with_executable_sha256(evidence, None)
+    }
+
+    pub(crate) fn select_with_executable_sha256(
+        &self,
+        evidence: &crate::NamedPipePeerEvidence,
+        executable_sha256: Option<&str>,
+    ) -> Result<NamedPipePeerSelection, WindowsAdapterError> {
+        if self.entries.iter().any(|entry| {
+            entry.expectation.requires_executable_sha256_for(
+                &evidence.process,
+                &evidence.sid,
+                evidence.session_id,
+            ) && !entry
+                .expectation
+                .executable_sha256_matches(executable_sha256)
+        }) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
         let matches = self
             .entries
             .iter()
-            .filter(|entry| entry.expectation.matches_evidence(evidence))
+            .filter(|entry| {
+                entry.expectation.matches_evidence(evidence)
+                    && entry
+                        .expectation
+                        .executable_sha256_matches(executable_sha256)
+            })
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [entry] => Ok(NamedPipePeerSelection {
                 kind: entry.kind,
                 module_id: entry.module_id.clone(),
                 profile_id: entry.profile_id.clone(),
+                executable_sha256: entry
+                    .expectation
+                    .requires_executable_sha256()
+                    .then(|| executable_sha256.map(str::to_owned))
+                    .flatten(),
             }),
             _ => Err(WindowsAdapterError::IdentityMismatch),
         }
@@ -218,6 +299,7 @@ pub struct NamedPipePeerSelection {
     kind: NamedPipePeerKind,
     module_id: String,
     profile_id: Option<String>,
+    executable_sha256: Option<String>,
 }
 
 impl NamedPipePeerSelection {
@@ -237,6 +319,13 @@ impl NamedPipePeerSelection {
     #[must_use]
     pub fn profile_id(&self) -> Option<&str> {
         self.profile_id.as_deref()
+    }
+
+    /// Returns the current on-disk image digest observed through a no-follow
+    /// handle when this role required an immutable executable binding.
+    #[must_use]
+    pub fn executable_sha256(&self) -> Option<&str> {
+        self.executable_sha256.as_deref()
     }
 }
 

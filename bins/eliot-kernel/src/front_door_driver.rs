@@ -260,6 +260,7 @@ async fn serve_connection(
 ) -> Result<(), TransportError> {
     let limits = kernel.ipc_limits();
     let peer = front_door.peer_identity().clone();
+    let user_broker_peer = selection.kind() == NamedPipePeerKind::UserBroker;
     if selection.kind() == NamedPipePeerKind::AgentBridge {
         return Box::pin(serve_agent_bridge_connection(
             kernel, front_door, shutdown, selection, peer,
@@ -273,6 +274,11 @@ async fn serve_connection(
     };
     let connection_id = client_frame.connection_id.clone();
     if decode_control_request_frame(&client_frame).is_ok() {
+        if user_broker_peer {
+            // User Broker receives no bootstrap/control route. Its only
+            // admitted operations are the dedicated Kernel binding selectors.
+            return Ok(());
+        }
         return Box::pin(serve_control_connection(
             kernel,
             front_door,
@@ -292,6 +298,26 @@ async fn serve_connection(
             return Ok(());
         }
     };
+    let user_broker_hello =
+        client.module_bridge_identity == NamedPipePeerKind::UserBroker.module_id();
+    if user_broker_peer != user_broker_hello {
+        let rejection = handshake_rejection_frame(
+            &connection_id,
+            "named-pipe role and User Broker ClientHello identity disagree".to_owned(),
+        )?;
+        send_checked(&mut front_door, &rejection, limits).await?;
+        return Ok(());
+    }
+    if user_broker_peer {
+        // Keep the authenticated process out of the generic Session policy
+        // until the dedicated challenge/redeem dispatcher is installed.
+        let rejection = handshake_rejection_frame(
+            &connection_id,
+            "User Broker binding route is unavailable".to_owned(),
+        )?;
+        send_checked(&mut front_door, &rejection, limits).await?;
+        return Ok(());
+    }
     let handshake = match kernel.bind_session(connection_id.clone(), peer, &client) {
         Ok(handshake) => handshake,
         Err(error) => {
