@@ -2371,7 +2371,7 @@ pub fn prepare_doctor_launch(
     // material gate acquires it itself. So snapshot the live contour under the
     // lock, release it, run the gate, then re-acquire and revalidate the exact
     // contour before any typed admission. Never hold `kernel.service` across
-    // `admit_material_authority_for_fence`.
+    // `admit_material_authority_for_governor_issued_fence`.
     let (authority_epoch, generation, response) = {
         let (epoch, generation_value) = {
             let service = kernel.service.lock().map_err(|_| {
