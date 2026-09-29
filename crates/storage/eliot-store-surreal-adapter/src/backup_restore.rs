@@ -31,12 +31,15 @@
 //! batch's archive member digest, its admitted operation and the member's
 //! domain-qualified logical identity, and every identity field of that row is
 //! taken from the batch while only the payload, its owner-attested digest and
-//! its declared length come from the retained reference. Resolution then reads
-//! those rows back — the ones this operation wrote, under this operation's own
-//! key — and compares every field against the batch's own member before the
-//! payload is used, including the owner's attested payload digest, which is
-//! validated against the bytes the carrier actually holds. An absent carrier is
-//! an unresolved member, never a member with empty content. The resolved
+//! its declared length come from the retained reference. An importable member
+//! that retains no payload is refused typed before any write, because a batch
+//! that carries no content must not be able to answer with a well-formed
+//! partial receipt. Resolution then reads those rows back — the ones this
+//! operation wrote, under this operation's own key — and compares every field
+//! against the batch's own member before the payload is used, including the
+//! owner's attested payload digest, which is validated against the bytes the
+//! carrier actually holds. A carrier this operation published and cannot read
+//! back is an unresolved member, never a member with empty content. The resolved
 //! payloads stay private to this execution path and are re-read out of the
 //! destination before any receipt reports a member restored.
 //!
@@ -2403,10 +2406,13 @@ struct PublishedCarrier {
 /// half-published batch that would report some members restored and leave the
 /// rest silently unresolved.
 ///
-/// A member with no retained reference is not published: an absent payload is
-/// not an empty one, and the member then stays unresolved. A member that is
-/// purge-suppressed is not published either, so a record the current ledger
-/// keeps out of the destination never has its bytes staged in it.
+/// The retained reference is mandatory for every member this port would import:
+/// an importable member that carries none is refused here, typed, before any
+/// write. Degrading it to an unresolved member instead would hand back a
+/// well-formed `Partial` receipt for a batch that never carried the content it
+/// claims to restore, which is the same silent-zero path as a batch whose
+/// payloads simply went missing. A member the current purge ledger keeps out of
+/// the destination is never published, because it is never imported either.
 ///
 /// Publication is create-only. A duplicate is resolved by reading this
 /// operation's own row back and comparing its content, so an exact replay of
@@ -2437,7 +2443,10 @@ async fn publish_archive_member_carriers(
             .iter()
             .find(|retained| retained.member_id == member.member_id)
         else {
-            continue;
+            return Err(StoreError::InvalidField {
+                field: "restore.retained_members",
+                reason: "admitted member carries no retained archive payload",
+            });
         };
         let carrier = carrier_for(batch, member, retained)?;
         let (payload, value_digest) = encode_document(&carrier)?;
@@ -2478,10 +2487,9 @@ async fn publish_archive_member_carriers(
                 // unresolved rather than restored.
                 if let Some(existing) =
                     read_archive_member(transport, config, batch, &entry.member).await?
+                    && existing != entry.carrier
                 {
-                    if existing != entry.carrier {
-                        return Err(StoreError::IdentityConflict);
-                    }
+                    return Err(StoreError::IdentityConflict);
                 }
             }
             Ok(published)
@@ -2618,7 +2626,7 @@ fn carrier_answers_for(
     batch: &CanonicalRestoreBatch,
     member: &eliot_store_api::SnapshotMember,
 ) -> bool {
-    carrier.operation_id == batch.operation.operation_id
+    carrier.operation_id == batch.operation.operation_id.as_str()
         && carrier.source_store_id == batch.source.store_id
         && carrier.source_installation_id == batch.source.installation_id
         && carrier.source_schema_generation == batch.source.schema
@@ -4028,7 +4036,9 @@ impl SurrealStoreAdapter {
         // resolved is unresolved, never restored. The carriers are published
         // first, under this exact admitted operation and only where the current
         // purge ledger leaves the member servable, so resolution reads back a row
-        // this operation owns rather than one that happens to exist.
+        // this operation owns rather than one that happens to exist — and an
+        // importable member that retained no payload is refused typed here,
+        // before the commit, instead of being carried to a partial receipt.
         let published = if scope_disposition == MemberDisposition::Restored {
             publish_archive_member_carriers(
                 transport,
@@ -4408,8 +4418,8 @@ fn imported_payload_bytes(imports: &[&ResolvedArchiveMember]) -> Result<u64, Sto
 fn carrier_payload_bytes(published: &[PublishedCarrier]) -> Result<u64, StoreError> {
     let mut total = 0_u64;
     for entry in published {
-        let bytes = u64::try_from(entry.row.payload.len())
-            .map_err(|_| StoreError::PayloadTooLarge)?;
+        let bytes =
+            u64::try_from(entry.row.payload.len()).map_err(|_| StoreError::PayloadTooLarge)?;
         total = total
             .checked_add(bytes)
             .ok_or(StoreError::PayloadTooLarge)?;

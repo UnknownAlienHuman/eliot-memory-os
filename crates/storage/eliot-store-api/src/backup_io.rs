@@ -1078,12 +1078,14 @@ pub struct CanonicalRestoreBatch {
     /// The archive/artifact owner's retained canonical payloads for this batch.
     ///
     /// The retained reference the member list cannot be: a member's digest names
-    /// content, never carries it. Absent by default, and that absence is
-    /// fail-closed rather than empty — a batch that retains nothing resolves no
-    /// member payload, and every member whose payload was not resolved stays
-    /// unresolved instead of being restored from its digest. Retaining one is a
-    /// source-resolution fact, not a shape fact, so completeness is deliberately
-    /// not required here.
+    /// content, never carries it. Every member the destination would import —
+    /// every member that is not a reference edge — must be named here exactly
+    /// once, and the port refuses a batch that omits one rather than answering
+    /// with a well-formed partial receipt for content it never received. That
+    /// decision belongs to the port, which owns source resolution, so an absent
+    /// key decodes as no retained reference here and is refused there with the
+    /// typed error that names the member; a member this structure cannot import
+    /// is never asked to retain anything.
     #[serde(default)]
     pub retained_members: Vec<RetainedArchiveMember>,
 }
@@ -1163,9 +1165,11 @@ impl CanonicalRestoreBatch {
     ///
     /// Every retained entry names one admitted member exactly once, and a
     /// reference edge retains nothing because a reference edge is never imported
-    /// as a row of its own. This is shape, not completeness: an importable
-    /// member with no retained entry is a source-resolution gap the port decides
-    /// per member, never a malformed batch, and the two answers stay distinct.
+    /// as a row of its own. This is shape: whether the port can actually resolve
+    /// a payload is decided against the destination, where a member with no
+    /// retained entry is a typed refusal, so a structural gap here and a
+    /// resolution gap there stay two distinct answers instead of one silent
+    /// partial result.
     fn validate_retained_members(&self) -> Result<(), StoreError> {
         if self.retained_members.len() > MAX_RESTORE_MEMBERS {
             return Err(StoreError::PayloadTooLarge);
