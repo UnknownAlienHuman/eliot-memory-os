@@ -70,7 +70,10 @@ pub enum OperatorIntentEffectDisposition {
     /// The owner issued this effect and the link carries its receipt.
     Issued { effect_ref: ArtifactId },
     /// The owner cannot say whether this effect was issued.
-    IssueUnknown { effect_ref: ArtifactId, reason: String },
+    IssueUnknown {
+        effect_ref: ArtifactId,
+        reason: String,
+    },
 }
 
 /// One admitted plan revision joined to the job, attempt and result that
@@ -166,7 +169,10 @@ impl OperatorIntentExecutionLink {
             .verifier
             .as_ref()
             .ok_or(OperatorIntentExecutionError::UnverifiedClaim)?;
-        if artifact_ids.iter().any(|id| !verifier.artifact_ids.contains(id)) {
+        if artifact_ids
+            .iter()
+            .any(|id| !verifier.artifact_ids.contains(id))
+        {
             return Err(OperatorIntentExecutionError::UnverifiedClaim);
         }
         Ok(())
