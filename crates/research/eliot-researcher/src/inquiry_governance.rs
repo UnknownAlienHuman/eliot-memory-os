@@ -2759,19 +2759,19 @@ fn independence_shortfall(profile: &IndependenceProfile) -> String {
         .iter()
         .filter(|measurement| !measurement.meets_requirement)
         .map(|measurement| {
-            if !measurement.unknown_handles.is_empty() {
-                format!(
-                    "{}: {} of {} eligible member(s) have no established group",
-                    measurement.dimension.wire_name(),
-                    measurement.unknown_handles.len(),
-                    measurement.groups.len() + measurement.unknown_handles.len()
-                )
-            } else {
+            if measurement.unknown_handles.is_empty() {
                 format!(
                     "{}: {} distinct group(s) do not meet the declared minimum {}",
                     measurement.dimension.wire_name(),
                     measurement.groups.len(),
                     measurement.required_groups
+                )
+            } else {
+                format!(
+                    "{}: {} of {} eligible member(s) have no established group",
+                    measurement.dimension.wire_name(),
+                    measurement.unknown_handles.len(),
+                    measurement.groups.len() + measurement.unknown_handles.len()
                 )
             }
         })

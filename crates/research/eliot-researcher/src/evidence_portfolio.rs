@@ -1989,20 +1989,14 @@ impl CoverageAccount {
     pub fn recovered_members(&self) -> Vec<(String, &'static str, &'static str)> {
         self.outcomes
             .iter()
-            .filter(|(_, accounting)| {
-                accounting.attempts.len() > 1 && accounting.closes()
-            })
+            .filter(|(_, accounting)| accounting.attempts.len() > 1 && accounting.closes())
             .map(|(member, accounting)| {
                 let first = accounting
                     .attempts
                     .first()
                     .map_or(SourceDisposition::Unknown, |attempt| attempt.disposition);
                 let latest = accounting.disposition();
-                (
-                    member.clone(),
-                    first.wire_name(),
-                    latest.wire_name(),
-                )
+                (member.clone(), first.wire_name(), latest.wire_name())
             })
             .collect()
     }
@@ -2024,7 +2018,11 @@ impl CoverageAccount {
             // stops a recovery from presenting itself as an unbroken success.
             push_count(preimage, "attempts", accounting.attempts.len());
             for attempt in &accounting.attempts {
-                push_field(preimage, "attempt_disposition", attempt.disposition.wire_name());
+                push_field(
+                    preimage,
+                    "attempt_disposition",
+                    attempt.disposition.wire_name(),
+                );
                 push_field(
                     preimage,
                     "attempt_links_earlier",
@@ -3145,14 +3143,8 @@ impl NoMatchEvaluationIssuer {
                 });
             }
             let record = handle.and_then(|handle| records.get(handle.as_str()));
-            let (result, grade) = self.result_for(
-                member,
-                handle,
-                record,
-                manifest,
-                &predicate_digest,
-                now_ms,
-            )?;
+            let (result, grade) =
+                self.result_for(member, handle, record, manifest, &predicate_digest, now_ms)?;
             results.push(result);
             grades.push(grade);
         }
