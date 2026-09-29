@@ -782,7 +782,7 @@ impl RestartIntensityLedger {
     /// failed attempts that led here.
     pub fn rebind_policy(&mut self, policy_digest: &str) -> Result<(), RestartPolicyError> {
         text(policy_digest, "policy_digest")?;
-        self.policy_digest = policy_digest.to_owned();
+        self.policy_digest.clone_from(&policy_digest.to_owned());
         Ok(())
     }
 
