@@ -59,14 +59,17 @@
 //!   [`MaintenanceRoute::Blocked`] for every family, and neither admits a
 //!   start, because the maintenance Durable Job admission itself is unreachable
 //!   from `eliotd`: see [`DURABLE_JOB_ADMISSION_BLOCKERS`], which names each
-//!   missing symbol exactly. Families are registered and deterministically
+//!   missing symbol exactly. A [`MaintenanceRoute::Blocked`] route additionally
+//!   never admits a start no matter how that shared list changes, so clearing
+//!   the common blockers in a later integration cannot make an unavailable
+//!   family look startable. Families are registered and deterministically
 //!   blocked with that reason; none is omitted and none is silently ignored.
 
 #![forbid(unsafe_code)]
 
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, DecisionReason, MaintenanceAutomationMode,
-    MaintenanceFamily, MaintenanceTrigger,
+    MaintenanceError, MaintenanceFamily, MaintenanceTrigger,
 };
 
 use crate::SERVICE_NAME;
@@ -150,6 +153,112 @@ impl MaintenanceDedupScope {
             Self::FamilyScopeAndGeneration => &["family", "scope_ref", "resource_generation"],
         }
     }
+
+    /// Builds the canonical deduplication key for one trigger evaluation.
+    ///
+    /// This is the one key builder: the trigger path, the board lookup and the
+    /// job lookup all compare the key it returns, so two evaluations of the
+    /// same family, scope, subset and generation coalesce onto one record and
+    /// two disjoint subsets (or two generations) never suppress each other.
+    /// The key carries no clock, counter or process-local value.
+    ///
+    /// `FamilyScopeAndSubset` rejects a missing or empty subset identity
+    /// rather than coalescing cross-subset work: without the subset the caller
+    /// cannot prove two triggers concern disjoint work, so the evaluation
+    /// fails closed. `FamilyScopeAndGeneration` renders the typed generation
+    /// explicitly, so a generation change invalidates the old key even though
+    /// the scope reference already embeds it; invalidating the key does not
+    /// settle the older job's possible effects or release its resource
+    /// custody, and that obligation is reconciled at adoption before
+    /// conflicting work is allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] when the origin or scope
+    /// reference is empty, or when the scope is `FamilyScopeAndSubset` and no
+    /// non-empty subset identity is supplied.
+    pub fn dedup_key(
+        &self,
+        identity: &MaintenanceDedupIdentity,
+    ) -> Result<String, MaintenanceError> {
+        if identity.origin.is_empty() {
+            return Err(MaintenanceError::InvalidField("dedup.origin"));
+        }
+        if identity.scope_ref.is_empty() {
+            return Err(MaintenanceError::InvalidField("dedup.scope_ref"));
+        }
+        match self {
+            Self::FamilyAndScope => Ok(format!(
+                "{scope}:{origin}:{family}:{scope_ref}",
+                scope = self.scope_name(),
+                origin = identity.origin,
+                family = identity.family,
+                scope_ref = identity.scope_ref,
+            )),
+            Self::FamilyScopeAndSubset => {
+                let subset = identity
+                    .subset_ref
+                    .filter(|subset| !subset.is_empty())
+                    .ok_or(MaintenanceError::InvalidField("dedup.subset_ref"))?;
+                Ok(format!(
+                    "{scope}:{origin}:{family}:{scope_ref}:{subset}",
+                    scope = self.scope_name(),
+                    origin = identity.origin,
+                    family = identity.family,
+                    scope_ref = identity.scope_ref,
+                    subset = subset,
+                ))
+            }
+            Self::FamilyScopeAndGeneration => Ok(format!(
+                "{scope}:{origin}:{family}:{scope_ref}@{generation}",
+                scope = self.scope_name(),
+                origin = identity.origin,
+                family = identity.family,
+                scope_ref = identity.scope_ref,
+                generation = identity.resource_generation,
+            )),
+        }
+    }
+}
+
+/// Typed identity a [`MaintenanceDedupScope`] key is built from.
+///
+/// Every field is carried separately so the trigger path, the board lookup and
+/// the job lookup all compare the same canonical key instead of three
+/// spellings of it. `subset_ref` is `None` when the trigger site observes no
+/// subset identity; `resource_generation` is the live fence generation the
+/// evaluation runs under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaintenanceDedupIdentity<'a> {
+    /// The registered family the trigger concerns.
+    pub family: MaintenanceFamily,
+    /// Wire name of the trigger event that raised this evaluation.
+    pub origin: &'a str,
+    /// Affected scope the evaluation runs under.
+    pub scope_ref: &'a str,
+    /// Named affected subset, when the trigger site observes one.
+    pub subset_ref: Option<&'a str>,
+    /// Live resource generation the evaluation runs under.
+    pub resource_generation: u64,
+}
+
+/// Concrete material one trigger evaluation observed, bound separately from
+/// every requirement list.
+///
+/// [`MaintenanceRecommendation::evidence`] states the evidence kinds a future
+/// result must carry; this states what this evaluation actually saw. The two
+/// are never mixed: this is never filled from the requirement list, and a
+/// missing publisher is carried as `None`/empty rather than as an invented
+/// value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceObservedEvidence {
+    /// Wire name of the trigger event that raised this evaluation.
+    pub trigger_event: &'static str,
+    /// Evidence identities actually observed at the trigger site.
+    pub observed_refs: Vec<String>,
+    /// Selected Human policy revision bound to this evaluation, or `None`
+    /// while the policy publisher does not exist.
+    pub policy_revision: Option<u64>,
 }
 
 /// One admission condition a family's start must clear, in I14.22's own
@@ -415,13 +524,22 @@ impl MaintenanceRoute {
 
     /// Whether this route admits a start today.
     ///
-    /// It admits none. I14.22 routes every start through a Durable Job request,
-    /// and [`DURABLE_JOB_ADMISSION_BLOCKERS`] names every symbol missing from
-    /// that request's path out of `eliotd`. The answer becomes `true` only when
-    /// that list is empty, which is a change to the list, not to this function.
+    /// It admits none yet, and a `Blocked` route admits none ever through this
+    /// function however the shared list below changes. I14.22 routes every
+    /// start through a Durable Job request, and
+    /// [`DURABLE_JOB_ADMISSION_BLOCKERS`] names every symbol missing from
+    /// that request's path out of `eliotd`. Clearing that list is necessary
+    /// but not sufficient: the route must also be an implemented family route,
+    /// so removing the common blockers in a later integration cannot make an
+    /// unavailable family look startable. Per-evaluation admission (the
+    /// Governor owner's current decision) is resolved separately in
+    /// [`ResolvedMaintenanceCapability`]; the catalog itself grants neither.
     #[must_use]
     pub const fn admits_start(&self) -> bool {
-        self.admission_blockers().is_empty()
+        match self {
+            Self::DurableJobRequest { .. } => self.admission_blockers().is_empty(),
+            Self::Blocked { .. } => false,
+        }
     }
 
     /// The `path::symbol` of the owner this route targets, or the exact absent
@@ -442,6 +560,54 @@ impl MaintenanceRoute {
             Self::DurableJobRequest { missing_route, .. } => missing_route,
             Self::Blocked { dependency } => dependency,
         }
+    }
+}
+
+/// Per-evaluation resolved capability, distinct from catalog metadata.
+///
+/// [`MaintenanceRoute`] is catalog metadata: it says where a family's start
+/// must go. It grants nothing by itself. Whether a start is admitted today is
+/// resolved per evaluation from the Governor owner's own decision plus the
+/// shared wiring state, and this value carries that resolution next to the
+/// route instead of folding it into the route. A `Blocked` route never
+/// resolves to startable no matter what the other inputs say, so clearing the
+/// shared wiring blockers in a later integration cannot enable a family that
+/// has no execution owner; unavailable families stay registered with their
+/// exact residual.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedMaintenanceCapability {
+    /// The Governor owner's per-evaluation admission: only a `Start` decision
+    /// admits one job from this evaluation. A `Start` is produced only when
+    /// the evaluator's policy, route, budget and session gates all admit, so
+    /// this carries the current policy/budget/owner admission the route alone
+    /// cannot state. The runtime lease itself is admitted at adopt time by the
+    /// narrow Governor maintenance admission, not here.
+    pub governor_admits_job: bool,
+    /// Whether every shared Durable Job wiring blocker is cleared.
+    pub shared_wiring_clear: bool,
+}
+
+impl ResolvedMaintenanceCapability {
+    /// Resolves the capability for one Governor decision. Pure: no I/O, no
+    /// clock, no default.
+    #[must_use]
+    pub const fn resolve(decision: &AutomationTriggerDecision) -> Self {
+        Self {
+            governor_admits_job: decision.admits_job,
+            shared_wiring_clear: DURABLE_JOB_ADMISSION_BLOCKERS.is_empty(),
+        }
+    }
+
+    /// Whether a start is admitted today for this route under this resolution.
+    ///
+    /// Requires all three at once: an implemented family route, the Governor
+    /// owner's current admission, and clear shared wiring. The catalog grants
+    /// none of them.
+    #[must_use]
+    pub fn admits_start(&self, route: &MaintenanceRoute) -> bool {
+        matches!(route, MaintenanceRoute::DurableJobRequest { .. })
+            && self.governor_admits_job
+            && self.shared_wiring_clear
     }
 }
 
@@ -596,7 +762,14 @@ pub struct MaintenanceFamilyDecision {
     /// Where this family's start must go, or the exact capability that is absent.
     pub route: MaintenanceRoute,
     /// Whether that route admits a start today.
+    ///
+    /// Resolved per evaluation from the route plus the Governor owner's own
+    /// decision and the shared wiring state (see
+    /// [`ResolvedMaintenanceCapability`]), never from the catalog alone.
     pub admits_start: bool,
+    /// The per-evaluation capability resolution behind `admits_start`, kept
+    /// beside the route so a reader can see which half denied the start.
+    pub resolved_capability: ResolvedMaintenanceCapability,
     /// The shared Durable Job admission blockers.
     pub admission_blockers: &'static [MaintenanceAdmissionBlocker],
     /// Where this family's result is observed.
@@ -609,10 +782,45 @@ pub struct MaintenanceFamilyDecision {
     pub governor_reason: DecisionReason,
     /// Whether the Governor owner admits one job from this decision.
     pub governor_admits_job: bool,
+    /// The Governor owner's board/job receipt for this decision, when the
+    /// decision admitted one. `None` states explicitly that no job was
+    /// admitted on this evaluation; it is never filled from a requirement
+    /// list or invented.
+    pub durable_job_ref: Option<String>,
+    /// The trigger event that raised this evaluation, bound separately from
+    /// the trigger identity. `None` states explicitly that the binding leg did
+    /// not observe the event (the notification projection re-resolves the
+    /// decision without the trigger site beside it).
+    pub trigger_event: Option<String>,
+    /// Evidence identities actually observed at the trigger site. Empty states
+    /// explicitly that none was bound on this leg; these are never filled
+    /// from [`MaintenanceRecommendation::evidence`], which states what a
+    /// future result must carry rather than what was already observed.
+    pub observed_evidence_refs: Vec<String>,
+    /// Selected Human policy revision bound to this evaluation. `None` states
+    /// explicitly that the policy publisher does not exist; it is never a
+    /// defaulted revision.
+    pub policy_revision: Option<u64>,
     /// The trigger identity the deduplication scope is applied to.
     pub trigger_id: String,
     /// The affected scope the decision ran under.
     pub scope_ref: String,
+}
+
+impl MaintenanceFamilyDecision {
+    /// Binds what the trigger site actually observed, separately from the
+    /// Governor projection and from every requirement list.
+    ///
+    /// [`MaintenanceFamilyEntry::decide`] stays a pure projection of the
+    /// Governor decision, so the legs that re-resolve it without the trigger
+    /// site beside them (the notification projection) keep explicit-missing
+    /// evidence instead of invented evidence. The trigger path calls this
+    /// once with what it really saw; nothing else may call it.
+    pub fn bind_observed(&mut self, observed: MaintenanceObservedEvidence) {
+        self.trigger_event = Some(observed.trigger_event.to_owned());
+        self.observed_evidence_refs = observed.observed_refs;
+        self.policy_revision = observed.policy_revision;
+    }
 }
 
 impl MaintenanceFamilyDecision {
@@ -846,14 +1054,20 @@ impl MaintenanceFamilyEntry {
     /// The durable, inspectable decision for one triggered family.
     ///
     /// This is the catalog's half of the record the Governor owner's decision
-    /// belongs to, and it is a pure function of this entry plus the decision the
-    /// Governor already made: no I/O, no probe, no clock, and no default. The
-    /// Governor stays the single producer of the decision and the reason; this
-    /// only resolves the route, the owner or the exact unavailable dependency,
-    /// and the one recommendation that goes with them.
+    /// belongs to, and it stays a projection of that decision: no I/O, no
+    /// probe, no clock, and no default. The Governor stays the single producer
+    /// of the decision and the reason; this only resolves the route, the
+    /// per-evaluation capability, the owner or the exact unavailable
+    /// dependency, the board/job receipt the decision carried, and the one
+    /// recommendation that goes with them. What the trigger site observed
+    /// (the event, the observed evidence identities, the selected policy
+    /// revision) is bound separately afterwards through
+    /// [`MaintenanceFamilyDecision::bind_observed`], never projected from the
+    /// requirement lists.
     #[must_use]
     pub fn decide(&self, decision: &AutomationTriggerDecision) -> MaintenanceFamilyDecision {
         let route = self.start_route();
+        let resolved_capability = ResolvedMaintenanceCapability::resolve(decision);
         MaintenanceFamilyDecision {
             family: self.family,
             obligation: self.obligation,
@@ -861,7 +1075,8 @@ impl MaintenanceFamilyEntry {
             eligibility: self.eligibility,
             conditions: self.conditions,
             dedup: self.dedup,
-            admits_start: route.admits_start(),
+            admits_start: resolved_capability.admits_start(&route),
+            resolved_capability,
             admission_blockers: route.admission_blockers(),
             route,
             observation: self.observation,
@@ -869,6 +1084,10 @@ impl MaintenanceFamilyEntry {
             governor_decision: decision.decision,
             governor_reason: decision.reason,
             governor_admits_job: decision.admits_job,
+            durable_job_ref: decision.durable_job_ref.clone(),
+            trigger_event: None,
+            observed_evidence_refs: Vec::new(),
+            policy_revision: None,
             trigger_id: decision.trigger_id.clone(),
             scope_ref: decision.scope_ref.clone(),
         }
@@ -886,14 +1105,30 @@ impl MaintenanceFamilyEntry {
     /// `eliotd::diagnostics` target the rest of the daemon uses.
     ///
     /// Every field emitted here is read off the [`MaintenanceFamilyDecision`]
-    /// that [`MaintenanceFamilyEntry::decide`] resolves, so the operational line
+    /// that [`MaintenanceFamilyEntry::decide`] resolves, plus the observed
+    /// evidence the trigger site binds through
+    /// [`MaintenanceFamilyDecision::bind_observed`], so the operational line
     /// and the durable decision value cannot report different facts about the
     /// same trigger. The line itself is a rotating operational log; the decision
     /// value is what a later durable record carries.
-    pub fn record_start_route(&self, decision: &AutomationTriggerDecision) {
-        let recorded = self.decide(decision);
+    ///
+    /// The receipt references below are named `required_receipt_refs` on
+    /// purpose: they are the references a future result for this family must
+    /// carry, never receipts already observed. What this evaluation actually
+    /// saw travels in the separate `observed_evidence_refs`, `trigger_event`
+    /// and `policy_revision` fields, and the board/job receipt in
+    /// `durable_job_ref`; each missing binding is stated explicitly rather
+    /// than projected from the requirement list.
+    pub fn record_start_route(
+        &self,
+        decision: &AutomationTriggerDecision,
+        observed: MaintenanceObservedEvidence,
+    ) {
+        let mut recorded = self.decide(decision);
+        recorded.bind_observed(observed);
         let route = recorded.route;
         let blockers = admission_blocker_text(recorded.admission_blockers);
+        let observed_refs = recorded.observed_evidence_refs.join("+");
         tracing::info!(
             target: "eliotd::diagnostics",
             event = "eliotd.maintenance_family_route",
@@ -912,11 +1147,16 @@ impl MaintenanceFamilyEntry {
             execution_owner = ?recorded.execution_owner(),
             missing_route = route.missing(),
             admits_start = recorded.admits_start,
+            shared_wiring_clear = recorded.resolved_capability.shared_wiring_clear,
             admission_blockers = %blockers,
             cost_class = recorded.recommendation.cost.class_name(),
             observation_path = SYSTEM_OBSERVATION_PATH,
             effect_evidence_owner = recorded.observation.effect_evidence_owner,
-            receipt_refs = %recorded.observation.receipt_refs.join("+"),
+            required_receipt_refs = %recorded.observation.receipt_refs.join("+"),
+            trigger_event = recorded.trigger_event.as_deref().unwrap_or("unobserved"),
+            observed_evidence_refs = %if observed_refs.is_empty() { "unobserved" } else { &observed_refs },
+            policy_revision = ?recorded.policy_revision,
+            durable_job_ref = recorded.durable_job_ref.as_deref().unwrap_or("unrecorded"),
             governor_decision = ?recorded.governor_decision,
             governor_reason = ?recorded.governor_reason,
             governor_admits_job = recorded.governor_admits_job,

@@ -147,8 +147,8 @@ use eliot_kernel_core::{
     DeadlineOrReview, DeliveryChannel, NotificationDraft, NotificationSeverity,
 };
 use eliot_maintenance::{
-    AutomationTriggerDecision, MaintenanceAutomationMode, MaintenancePolicyEvidence,
-    MaintenanceRouteEvidence,
+    AutomationDecision, AutomationTriggerDecision, MaintenanceAutomationMode,
+    MaintenancePolicyEvidence, MaintenanceRouteEvidence,
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::RequestIdentity;
@@ -374,7 +374,8 @@ fn automation_failure_key_with_family_decision(
         summary: format!(
             "maintenance automation {family} at {} evaluated {outcome} for reason {reason}; \
              Governor admits job: {}; catalog route admits start: {}; trigger identity {}; \
-             policy episode {}; requested route {} (missing {}); actual route {}",
+             policy episode {}; requested route {} (missing {}); actual route {}; \
+             board/job receipt {}",
             decision.scope_ref,
             decision.admits_job,
             family_decision.admits_start,
@@ -383,6 +384,7 @@ fn automation_failure_key_with_family_decision(
             requested_route.0,
             requested_route.1,
             actual_route_summary(evidence),
+            decision.durable_job_ref.as_deref().unwrap_or("unrecorded"),
         ),
         // Preserve the Governor's closed reason above and carry the catalog's
         // exact one actionable recommendation, including its reason, evidence,
@@ -527,20 +529,29 @@ pub async fn notification_already_recorded(
 /// decision whose record is already stored is I11.12's repeat rather than a
 /// new occurrence; both return `Ok(None)` without touching the store.
 ///
-/// `Off` returns before any canonical read/write. This prevents a missing route
-/// from becoming a proactive recommendation when automation is disabled. The
-/// verified mandatory safety/recovery evidence needed for I14.22's exception is
-/// not published to this path, so it does not bypass this guard.
+/// `Off` withholds proactive recommendations, never the durable record of a
+/// refusal. A `Start` or `Suggest` decision under `Off` returns before any
+/// canonical read/write, so a missing route cannot become a proactive board
+/// recommendation when automation is disabled; the verified mandatory
+/// safety/recovery evidence needed for I14.22's exception is not published to
+/// this path, so it does not bypass that refusal. A `Block` or `Defer`
+/// decision under `Off` is the durable record of the refusal itself rather
+/// than a recommendation to act, so it reaches the store through the existing
+/// owner chain instead of being silently ignored. At most the action the
+/// Governor decision allows is published, and a replayed decision re-derives
+/// the same failure fingerprint, so a repeat coalesces onto the one stored
+/// record instead of notifying again.
 ///
 /// Stated rather than implied: the second guard below,
 /// `decision.admits_job && family_decision.admits_start`, cannot short-circuit
-/// today. `MaintenanceRoute::admits_start` is
-/// `DURABLE_JOB_ADMISSION_BLOCKERS.is_empty()` over a shared four-element
-/// non-empty list, so it is `false` for all fifteen families and the arm is
-/// currently unreachable. It is left exactly as it is: it is the correct
-/// condition, and it becomes live when that shared list empties, which is a
-/// change to the list rather than to this function. Do not read it as a gate
-/// that is currently refusing anything.
+/// today. `MaintenanceRoute::admits_start` requires an implemented family
+/// route on top of the shared wiring state, and
+/// `DURABLE_JOB_ADMISSION_BLOCKERS` is a shared four-element non-empty list,
+/// so the arm is `false` for all fifteen families and currently unreachable.
+/// It is left exactly as it is: it is the correct condition, and it becomes
+/// live only when the Governor admits a job for an implemented route whose
+/// shared wiring is clear. Do not read it as a gate that is currently
+/// refusing anything.
 ///
 /// # Errors
 ///
@@ -556,10 +567,18 @@ pub async fn emit_blocked_automation_notification(
 ) -> Result<Option<NotificationStateEmit>, NotificationEmitError> {
     let family_entry = super::maintenance_family_catalog::entry_for(decision.family);
     evidence.validate_for(decision)?;
-    // Off must not turn a missing route into a proactive board recommendation.
-    // The verified mandatory safety/recovery publisher is not connected here,
-    // so this path has no safety bypass. Return before any canonical read/write.
-    if evidence.policy.mode == MaintenanceAutomationMode::Off {
+    // Off must not turn a missing route into a proactive board recommendation:
+    // a Start or Suggest decision stays refused before any canonical
+    // read/write. A Block or Defer decision is the durable record of that
+    // refusal rather than a recommendation, so it reaches the store. The
+    // verified mandatory safety/recovery publisher is not connected here, so
+    // this path has no safety bypass.
+    if evidence.policy.mode == MaintenanceAutomationMode::Off
+        && matches!(
+            decision.decision,
+            AutomationDecision::Start | AutomationDecision::Suggest
+        )
+    {
         return Ok(None);
     }
     let family_decision = family_entry.decide(decision);

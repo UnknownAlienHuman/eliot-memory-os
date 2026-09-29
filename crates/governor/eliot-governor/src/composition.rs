@@ -70,7 +70,8 @@ use eliot_instrument_nextest::{
     NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
 };
 use eliot_maintenance::{
-    MaintenanceController, MaintenanceError, MaintenanceJob, MaintenanceStateStore,
+    AutomationDecision, AutomationTriggerDecision, MaintenanceController, MaintenanceError,
+    MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenanceStateStore,
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
@@ -78,7 +79,7 @@ use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
 use eliot_runtime_contracts::{
-    AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState,
+    AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState, RuntimeLease,
 };
 use eliot_security_contracts::PrivacyClass;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
@@ -4160,6 +4161,36 @@ fn cold_start_readiness_token(lifecycle: ReadinessLifecycle) -> &'static str {
     }
 }
 
+/// Owned preparation of this composition's existing maintenance admission
+/// (issue #1693).
+///
+/// Produced by [`GovernorComposition::prepare_maintenance_admission`] under
+/// the composition's current state and fence, carried by the caller across
+/// its outside-borrow owner I/O, and consumed by
+/// [`GovernorComposition::adopt_maintenance_admission`], which rechecks the
+/// fence and the revision before constructing anything. The `job_id` is the
+/// exact identity the admission would persist, so the caller's load observes
+/// the same key the adoption constructs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedMaintenanceAdmission {
+    /// Fence the admission was prepared under; adoption requires the active
+    /// fence to still match it exactly.
+    pub state_fence: StateFence,
+    /// Maintenance named-read revision at preparation; adoption requires it
+    /// to be unchanged.
+    pub maintenance_revision: u64,
+    /// Registered maintenance family the prepared decision admits.
+    pub family: MaintenanceFamily,
+    /// Affected scope the prepared decision admits.
+    pub scope_ref: String,
+    /// Trigger identity the prepared decision admits.
+    pub trigger_id: String,
+    /// Durable idempotency identity the admission would persist. The caller
+    /// loads this key through its own Durable Job store handle outside any
+    /// composition borrow.
+    pub job_id: String,
+}
+
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
@@ -4238,6 +4269,167 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Prepares this composition's existing maintenance admission under its
+    /// current state and fence (issue #1693).
+    ///
+    /// This is the narrow maintenance admission seam, and the reason no
+    /// unrestricted `owners_mut` exists: preparing (and, separately, adopting)
+    /// this one admission is everything an `eliotd` caller needs, and it never
+    /// exposes any other owner mutably. Preparation is a pure read of the
+    /// current fence and the maintenance named-read revision plus a check
+    /// that the Governor decision admits one job; it performs no owner I/O.
+    /// The caller performs the owner I/O itself — loading the prior job for
+    /// [`PreparedMaintenanceAdmission::job_id`] through its own Durable Job
+    /// store handle — outside any composition borrow, and then adopts the
+    /// result through [`Self::adopt_maintenance_admission`], which rechecks
+    /// the fence and the revision before anything is constructed. The existing
+    /// Durable Job store is the only persistence involved; no maintenance
+    /// runner is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not
+    /// ready, or [`CompositionError::Recovery`] when the decision does not
+    /// admit a job, its identities are empty, or the maintenance named read
+    /// is missing.
+    pub fn prepare_maintenance_admission(
+        &self,
+        decision: &AutomationTriggerDecision,
+    ) -> Result<PreparedMaintenanceAdmission, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        if decision.decision != AutomationDecision::Start || !decision.admits_job {
+            return Err(CompositionError::Recovery(
+                "maintenance admission preparation requires a START decision that admits one job"
+                    .to_owned(),
+            ));
+        }
+        if decision.trigger_id.is_empty() || decision.scope_ref.is_empty() {
+            return Err(CompositionError::Recovery(
+                "maintenance admission preparation requires a non-empty trigger and scope identity"
+                    .to_owned(),
+            ));
+        }
+        let state_fence = self.snapshot.state_fence();
+        let maintenance_revision = self
+            .recovery
+            .owner_read(RecoveryOwner::Maintenance)?
+            .revision;
+        // The exact identity `MaintenanceController::admit` would persist for
+        // this decision, so the caller's outside-borrow load observes the same
+        // key the adoption below constructs.
+        let job_id = format!("maintenance:{}:{}", decision.family, decision.trigger_id);
+        Ok(PreparedMaintenanceAdmission {
+            state_fence,
+            maintenance_revision,
+            family: decision.family,
+            scope_ref: decision.scope_ref.clone(),
+            trigger_id: decision.trigger_id.clone(),
+            job_id,
+        })
+    }
+
+    /// Adopts a prepared maintenance admission after rechecking the fence and
+    /// the revision (issue #1693).
+    ///
+    /// The caller passes what its outside-borrow owner I/O saw: the prior job
+    /// stored under the prepared identity, if any, plus the freshly observed
+    /// lease, budget reference, attempt bound and session requirement. This
+    /// method rechecks that the composition still stands on the prepared fence
+    /// and the prepared maintenance revision, refuses an already-recorded
+    /// identity and refuses conflicting work while an older job's effects are
+    /// unsettled or its resource custody unreleased, then constructs the
+    /// admitted job exactly as `MaintenanceController::admit` would — without
+    /// persisting it. Persisting the returned job through the caller's own
+    /// Durable Job store handle stays outside the composition borrow.
+    ///
+    /// A generation change invalidates the old key's applicability but settles
+    /// nothing: only a prior job in a terminal state (`Cancelled`,
+    /// `Completed`, `Failed`) releases its scope. Any other prior job for the
+    /// same family and scope — an older generation's unsettled effects as much
+    /// as a same-generation duplicate — is refused until that obligation is
+    /// reconciled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not
+    /// ready, or [`CompositionError::Recovery`] when the fence or the revision
+    /// moved since preparation, the identity is already recorded, a prior job
+    /// for the same family and scope is not settled, or the constructed job
+    /// does not validate.
+    pub fn adopt_maintenance_admission(
+        &self,
+        prepared: &PreparedMaintenanceAdmission,
+        prior_job: Option<&MaintenanceJob>,
+        runtime_lease: RuntimeLease,
+        budget_ref: String,
+        max_attempts: u32,
+        user_session_required: bool,
+    ) -> Result<MaintenanceJob, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        if self.snapshot.state_fence() != prepared.state_fence {
+            return Err(CompositionError::Recovery(
+                "maintenance admission preparation is not bound to the active fence".to_owned(),
+            ));
+        }
+        let maintenance_revision = self
+            .recovery
+            .owner_read(RecoveryOwner::Maintenance)?
+            .revision;
+        if maintenance_revision != prepared.maintenance_revision {
+            return Err(CompositionError::Recovery(
+                "maintenance revision moved since admission preparation".to_owned(),
+            ));
+        }
+        if let Some(prior) = prior_job {
+            if prior.job_id == prepared.job_id {
+                return Err(CompositionError::Recovery(
+                    "maintenance admission identity is already recorded".to_owned(),
+                ));
+            }
+            let settled = matches!(
+                prior.state,
+                MaintenanceJobState::Cancelled
+                    | MaintenanceJobState::Completed
+                    | MaintenanceJobState::Failed
+            );
+            if prior.family == prepared.family && prior.scope_ref == prepared.scope_ref && !settled
+            {
+                return Err(CompositionError::Recovery(
+                    "an older maintenance job for this family and scope is not settled: reconcile its effects and release its resource custody before admitting conflicting work"
+                        .to_owned(),
+                ));
+            }
+        }
+        if budget_ref.is_empty() {
+            return Err(CompositionError::Recovery(
+                "maintenance admission requires a non-empty budget reference".to_owned(),
+            ));
+        }
+        let job = MaintenanceJob {
+            job_id: prepared.job_id.clone(),
+            trigger_id: prepared.trigger_id.clone(),
+            family: prepared.family,
+            scope_ref: prepared.scope_ref.clone(),
+            state_fence: prepared.state_fence.clone(),
+            runtime_lease,
+            state: MaintenanceJobState::Admitted,
+            checkpoint: None,
+            max_attempts,
+            attempts: 0,
+            budget_ref,
+            outcome_ref: None,
+            user_session_required,
+        };
+        job.validate().map_err(|error| {
+            CompositionError::Recovery(format!("adopted maintenance job is invalid: {error}"))
+        })?;
+        Ok(job)
     }
 
     /// Returns the latest process-local scope-identity mismatch projection
