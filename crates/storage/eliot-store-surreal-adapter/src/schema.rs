@@ -252,8 +252,9 @@ pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
 
 /// Erasure intent/outcome tables (688-B). Additive delta applied on top of a
 /// v2 baseline: `erasure_intent` carries the exact durable intent row bound by
-/// `erasure_transaction_bindings` (`operation_id`, `subject`, `scope_id`,
-/// `surfaces`, `state_fence`, `operation_count`), and `erasure_outcome`
+/// `erasure_transaction_bindings` (`operation_id`, `subject`, `payload_ref`,
+/// `encryption_key_ref`, `deadline_unix_ms`, `scope_id`, `surfaces`,
+/// `state_fence`, `operation_count`), and `erasure_outcome`
 /// carries the sealed per-surface outcomes (`operation_id`, `outcomes`).
 /// `operation_id` is unique in each table; one intent row plus its single
 /// outcome seal per operation — never a second ledger.
@@ -261,6 +262,9 @@ pub(crate) const ERASURE_TABLES_DDL: &str = r"
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
 DEFINE FIELD subject ON erasure_intent TYPE string;
+DEFINE FIELD payload_ref ON erasure_intent TYPE string;
+DEFINE FIELD encryption_key_ref ON erasure_intent TYPE string;
+DEFINE FIELD deadline_unix_ms ON erasure_intent TYPE int;
 DEFINE FIELD scope_id ON erasure_intent TYPE string;
 DEFINE FIELD surfaces ON erasure_intent TYPE array;
 DEFINE FIELD state_fence ON erasure_intent TYPE object;
@@ -539,6 +543,9 @@ DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
 DEFINE FIELD subject ON erasure_intent TYPE string;
+DEFINE FIELD payload_ref ON erasure_intent TYPE string;
+DEFINE FIELD encryption_key_ref ON erasure_intent TYPE string;
+DEFINE FIELD deadline_unix_ms ON erasure_intent TYPE int;
 DEFINE FIELD scope_id ON erasure_intent TYPE string;
 DEFINE FIELD surfaces ON erasure_intent TYPE array;
 DEFINE FIELD state_fence ON erasure_intent TYPE object;

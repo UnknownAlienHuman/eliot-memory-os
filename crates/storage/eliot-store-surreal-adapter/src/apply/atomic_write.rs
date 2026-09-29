@@ -52,7 +52,7 @@ IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_
 /// refuses with `erasure_intent_conflict` when the same `operation_id`
 /// already names a different intent. First statement of the erasure atomic
 /// transaction — before any destructive statement.
-const TX_ERASURE_INTENT: &str = "LET $erasure_existing = (SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id, surfaces: surfaces, state_fence: state_fence, operation_count: operation_count } FROM ONLY type::record($erasure_table, $erasure_operation_id)); IF type::is_object($erasure_existing) { IF $erasure_existing != $erasure_intent_expected { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_table, $erasure_operation_id) CONTENT $erasure_intent_record; };";
+const TX_ERASURE_INTENT: &str = "LET $erasure_existing = (SELECT VALUE { operation_id: operation_id, subject: subject, payload_ref: payload_ref, encryption_key_ref: encryption_key_ref, deadline_unix_ms: deadline_unix_ms, scope_id: scope_id, surfaces: surfaces, state_fence: state_fence, operation_count: operation_count } FROM ONLY type::record($erasure_table, $erasure_operation_id)); IF type::is_object($erasure_existing) { IF $erasure_existing != $erasure_intent_expected { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_table, $erasure_operation_id) CONTENT $erasure_intent_record; };";
 
 /// Scrubs exactly the selected subject's payload-authority entries admitted
 /// under the exact recorded scope. `{i}` selects the binding index. The row
@@ -1260,13 +1260,18 @@ impl SurrealSurfaceOutcome {
 ///
 /// `operation_id` is the caller-supplied stable identity (never regenerated
 /// on retry); `subject` + `scope_id` name the exact admitted pair;
-/// `surfaces` is the exact admitted denominator; `state_fence` pins the
-/// fence the destructive calls execute under.
+/// `payload_ref` and `encryption_key_ref` name the exact payload/blob and
+/// key identities the deletion touches; `deadline_unix_ms` is the exact
+/// deadline identity; `surfaces` is the exact admitted denominator;
+/// `state_fence` pins the fence the destructive calls execute under.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurrealErasureIntent {
     pub operation_id: String,
     pub subject: String,
+    pub payload_ref: String,
+    pub encryption_key_ref: String,
+    pub deadline_unix_ms: u64,
     pub scope_id: ScopeId,
     pub surfaces: Vec<SurrealErasureSurface>,
     pub state_fence: StateFence,
@@ -1277,6 +1282,14 @@ impl SurrealErasureIntent {
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_erasure_text(&self.operation_id, "erasure.operation_id")?;
         validate_erasure_text(&self.subject, "erasure.subject")?;
+        validate_erasure_text(&self.payload_ref, "erasure.payload_ref")?;
+        validate_erasure_text(&self.encryption_key_ref, "erasure.encryption_key_ref")?;
+        if self.deadline_unix_ms == 0 {
+            return Err(StoreError::InvalidField {
+                field: "erasure.deadline_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
@@ -1380,6 +1393,9 @@ pub(crate) fn erasure_transaction_bindings(
     let intent_value = json!({
         "operation_id": intent.operation_id,
         "subject": intent.subject,
+        "payload_ref": intent.payload_ref,
+        "encryption_key_ref": intent.encryption_key_ref,
+        "deadline_unix_ms": intent.deadline_unix_ms,
         "scope_id": intent.scope_id.to_string(),
         "surfaces": surfaces,
         "state_fence": intent.state_fence,

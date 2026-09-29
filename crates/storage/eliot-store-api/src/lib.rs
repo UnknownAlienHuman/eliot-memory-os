@@ -257,7 +257,8 @@ pub use capability_evidence_store::{
 };
 
 pub use erasure_admission::{
-    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_REASON, ERASURE_PARAM_REQUESTER,
+    ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF, ERASURE_PARAM_OPERATION_ID,
+    ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_REASON, ERASURE_PARAM_REQUESTER,
     ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ERASURE_SURFACE_SEPARATOR,
     ErasureAdmissionRequest, admit_erasure_transition, decode_erasure_surfaces,
     encode_erasure_surfaces,
@@ -5942,7 +5943,8 @@ pub enum ErasureSurfaceKind {
 ///
 /// The store never invents this record: it carries the stable operation
 /// identity, the digest binding the exact admitted request bytes, the subject,
-/// the surface plan in deterministic canonical order, and the
+/// the exact payload/blob and encryption-key identities, the exact deadline
+/// identity, the surface plan in deterministic canonical order, and the
 /// policy/closure/fence binding. Every planned surface starts `NotAttempted`
 /// (see [`ErasureIntentRecord::initial_state`]) and advances only through
 /// owner-reported [`ErasureSurfaceOutcome`] values aggregated by
@@ -5953,6 +5955,13 @@ pub struct ErasureIntentRecord {
     pub operation_id: OperationId,
     pub request_digest: String,
     pub subject: String,
+    /// Exact payload/blob handle identity this recorded plan removes.
+    pub payload_ref: String,
+    /// Exact encryption-key identity whose destruction this plan authorises.
+    pub encryption_key_ref: String,
+    /// Exact deadline identity, in Unix milliseconds, after which this plan
+    /// performs no effect.
+    pub deadline_unix_ms: u64,
     pub surfaces: Vec<ErasureSurfaceKind>,
     pub policy_digest: String,
     pub closure_digest: String,
@@ -5965,6 +5974,14 @@ impl ErasureIntentRecord {
         validate_text(self.operation_id.as_str(), "erasure.operation_id")?;
         validate_digest(&self.request_digest, "erasure.request_digest")?;
         validate_text(&self.subject, "erasure.subject")?;
+        validate_text(&self.payload_ref, "erasure.payload_ref")?;
+        validate_text(&self.encryption_key_ref, "erasure.encryption_key_ref")?;
+        if self.deadline_unix_ms == 0 {
+            return Err(StoreError::InvalidField {
+                field: "erasure.deadline_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
         if self.surfaces.is_empty() {
             return Err(StoreError::Empty {
                 field: "erasure.surfaces",
@@ -6739,6 +6756,9 @@ mod tests {
             ordering_scope: OrderingScopeId::new("scope-erasure-18")?,
             state_fence: fence(),
             subject: "subject-18".to_owned(),
+            payload_ref: "payload:blob-18".to_owned(),
+            encryption_key_ref: "key:erasure-18".to_owned(),
+            deadline_unix_ms: 1_700_000_000_000,
             surfaces: vec!["Index".to_owned()],
             reason: "user requested deletion".to_owned(),
             requester: "user:alice".to_owned(),
@@ -6994,6 +7014,9 @@ mod tests {
             operation_id: id("erasure-op-1").expect("operation id"),
             request_digest: "c".repeat(64),
             subject: "subject-1".to_owned(),
+            payload_ref: "payload:blob-1".to_owned(),
+            encryption_key_ref: "key:erasure-1".to_owned(),
+            deadline_unix_ms: 1_700_000_000_000,
             surfaces: vec![
                 ErasureSurfaceKind::Observations,
                 ErasureSurfaceKind::Projections,
@@ -7113,6 +7136,10 @@ mod tests {
                 idempotency_key: "erasure-retry-1".to_owned(),
                 canonical_request_hash: intent.request_digest.clone(),
             },
+            subject: intent.subject.clone(),
+            payload_ref: intent.payload_ref.clone(),
+            encryption_key_ref: intent.encryption_key_ref.clone(),
+            deadline_unix_ms: intent.deadline_unix_ms,
             surfaces: intent.surfaces.clone(),
             intent,
         };

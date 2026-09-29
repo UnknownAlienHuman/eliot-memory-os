@@ -45,6 +45,9 @@ fn intent() -> ErasureIntentRecord {
         operation_id: OperationId::new("op-688-purge-contract").unwrap(),
         request_digest: "a".repeat(64),
         subject: "subject:purge-contract".to_string(),
+        payload_ref: "payload:blob-purge-contract".to_string(),
+        encryption_key_ref: "key:purge-contract-1".to_string(),
+        deadline_unix_ms: 1_700_000_000_000,
         surfaces: all_surfaces(),
         policy_digest: "b".repeat(64),
         closure_digest: "c".repeat(64),
@@ -60,6 +63,10 @@ fn wrapper() -> ErasureSurfaceRequest {
             idempotency_key: "idem-688-purge-contract".to_owned(),
             canonical_request_hash: record.request_digest.clone(),
         },
+        subject: record.subject.clone(),
+        payload_ref: record.payload_ref.clone(),
+        encryption_key_ref: record.encryption_key_ref.clone(),
+        deadline_unix_ms: record.deadline_unix_ms,
         intent: record,
         surfaces: all_surfaces(),
     }
@@ -346,6 +353,10 @@ fn store_port_fixture_and_source_guard() {
     // refuse and are never advertised as working.
     let request = ErasureSurfaceRequest {
         identity: wrapper().identity,
+        subject: fixture.intent.subject.clone(),
+        payload_ref: fixture.intent.payload_ref.clone(),
+        encryption_key_ref: fixture.intent.encryption_key_ref.clone(),
+        deadline_unix_ms: fixture.intent.deadline_unix_ms,
         intent: fixture.intent.clone(),
         surfaces: fixture.surfaces.clone(),
     };
