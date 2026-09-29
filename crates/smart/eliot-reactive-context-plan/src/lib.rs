@@ -39,10 +39,10 @@ pub use reactive_owner_suppliers::{
     ReactiveMissingOwner, ReactiveOwnerSupply,
 };
 pub use result::{
-    ActivationEvidenceKind, DeliveryDisposition, InertDeliveryRequest, NoInjectionDisposition,
-    PendingContextInjectionPlan, PlannedAttentionBinding, PlannedContextItem, PlannedItemKind,
-    PlanningAccounting, PlanningErrorDisposition, PlanningErrorKind, ReactiveContextPlanResult,
-    ReactiveContextPlanningError,
+    ActivationEvidenceKind, BridgeAdmissionInvalidation, DeliveryDisposition, InertDeliveryRequest,
+    NoInjectionDisposition, PendingContextInjectionPlan, PlannedAttentionBinding,
+    PlannedContextItem, PlannedItemKind, PlanningAccounting, PlanningErrorDisposition,
+    PlanningErrorKind, ReactiveContextPlanResult, ReactiveContextPlanningError,
 };
 pub use retrieval_plan::{
     CampaignBudgets, CampaignExperienceQuery, CampaignIntent, CampaignOutputMode, MAX_PLAN_HANDLES,

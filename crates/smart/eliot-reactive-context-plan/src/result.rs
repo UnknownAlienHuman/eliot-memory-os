@@ -7,7 +7,8 @@ use eliot_context_contracts::{
     SnapshotCompleteness, SnapshotDenominator,
 };
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractIdentity, OperationId, RequestId, StateFence, TaskId,
+    ArtifactId, ClockReading, ContractIdentity, OperationId, RequestId, SessionId, StateFence,
+    TaskId,
 };
 use eliot_cue_contracts::ActivationResult;
 use eliot_protocol::{ReactiveContextContentRef, ReactiveContextPrivacy};
@@ -45,6 +46,19 @@ pub enum ActivationEvidenceKind {
     Direct,
     Derived,
     DirectAndDerived,
+}
+
+/// Exact historical bridge item whose session dedup must be reopened after
+/// its owner-issued source, content, or delivery profile changed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeAdmissionInvalidation {
+    /// Cue source identity used by the bridge admission ledger.
+    pub cue_source: String,
+    /// Exact historical cue/item identity to invalidate.
+    pub cue_id: String,
+    /// Session that owns the historical delivery.
+    pub session_id: SessionId,
 }
 
 /// Semantic kind of one accounted item; identity is never inferred from text.
@@ -233,7 +247,7 @@ pub struct PendingContextInjectionPlan {
     pub items: Vec<PlannedContextItem>,
     pub accounting: PlanningAccounting,
     pub frontier: Vec<String>,
-    pub invalidation: Vec<String>,
+    pub invalidation: Vec<BridgeAdmissionInvalidation>,
     pub request: InertDeliveryRequest,
 }
 
@@ -268,7 +282,7 @@ pub struct NoInjectionDisposition {
     pub items: Vec<PlannedContextItem>,
     pub accounting: PlanningAccounting,
     pub frontier: Vec<String>,
-    pub invalidation: Vec<String>,
+    pub invalidation: Vec<BridgeAdmissionInvalidation>,
 }
 
 /// The operation's three possible outcomes.

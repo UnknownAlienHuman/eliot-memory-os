@@ -19,10 +19,10 @@ use eliot_receipts::ProofCeiling;
 
 use crate::input::{AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy};
 use crate::result::{
-    ActivationEvidenceKind, DeliveryDisposition, InertDeliveryRequest, NoInjectionDisposition,
-    PendingContextInjectionPlan, PlannedAttentionBinding, PlannedContextItem, PlannedItemKind,
-    PlanningAccounting, PlanningErrorDisposition, PlanningErrorKind, ReactiveContextPlanResult,
-    ReactiveContextPlanningError,
+    ActivationEvidenceKind, BridgeAdmissionInvalidation, DeliveryDisposition, InertDeliveryRequest,
+    NoInjectionDisposition, PendingContextInjectionPlan, PlannedAttentionBinding,
+    PlannedContextItem, PlannedItemKind, PlanningAccounting, PlanningErrorDisposition,
+    PlanningErrorKind, ReactiveContextPlanResult, ReactiveContextPlanningError,
 };
 
 const MAX_DIAGNOSTIC: usize = 256;
@@ -1003,7 +1003,7 @@ fn emit_pending(
 fn session_source_invalidations(
     items: &[PlannedContextItem],
     session: &SessionDeliverySnapshot,
-) -> Vec<String> {
+) -> Vec<BridgeAdmissionInvalidation> {
     let mut invalidations = BTreeSet::new();
     for item in items
         .iter()
@@ -1028,11 +1028,21 @@ fn session_source_invalidations(
                 || record.source != *source
                 || record.profile != item.profile;
             if dependencies_changed {
-                invalidations.insert(record.source.contract.name.as_str().to_owned());
+                invalidations.insert((
+                    record.source.contract.name.as_str().to_owned(),
+                    record.item_id.clone(),
+                ));
             }
         }
     }
-    invalidations.into_iter().collect()
+    invalidations
+        .into_iter()
+        .map(|(cue_source, cue_id)| BridgeAdmissionInvalidation {
+            cue_source,
+            cue_id,
+            session_id: session.session_id.clone(),
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3212,7 +3222,7 @@ fn output_digest(
     items: &[PlannedContextItem],
     accounting: &PlanningAccounting,
     frontier: &[String],
-    invalidation: &[String],
+    invalidation: &[BridgeAdmissionInvalidation],
     request: Option<&InertDeliveryRequest>,
 ) -> Result<String, ReactiveInputError> {
     canonical_planning_digest(&(
