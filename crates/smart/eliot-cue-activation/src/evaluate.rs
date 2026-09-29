@@ -1,11 +1,13 @@
 //! Bounded A14 activation over an immutable A10 build candidate.
 use crate::derived_stage::{DerivedStage, RelationCoverage};
+use crate::profile::RelationDirection;
+use crate::publication::PublicationGrant;
 use crate::{ActivationError, ActivationProfile};
 use eliot_cue_contracts::{
     ActivationRequest, ActivationResult, ActivationResultSpec, ActivationStrength, ActivationTrace,
     AdmittedCueBindingProjection, BoundKind, Completeness, CueContractError,
     CueSnapshotBuildCandidate, DerivedActivation, DirectActivation, LifecycleState, MatchMode,
-    NormalizedCue, RelationEdge, RelationEdgeId, TargetHandle, TraceStep,
+    NormalizedCue, RelationEdge, RelationEdgeId, TargetHandle, TraceStep, WorkScopeId,
 };
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
 use serde::Serialize;
@@ -102,6 +104,36 @@ pub fn evaluate_activation(
     };
     validate_output(&evaluation, request)?;
     Ok(evaluation)
+}
+
+/// Evaluates a request against a live publication grant.
+///
+/// This is the entry point the runtime composition uses. It resolves the exact
+/// publication, disclosure and influence state through the caller's grant
+/// before any evaluation runs, so a build candidate or a self-consistent
+/// receipt is never evaluated as if it were a live publication, and a direct
+/// read that is limited stays an explicit limitation.
+///
+/// The direct domain is unaffected by the optional relation domain in both
+/// directions: a limited direct read is refused here rather than answered from
+/// relation coverage, and a grant is not withdrawn because relation evidence
+/// is absent.
+///
+/// # Errors
+/// Refuses a grant that does not authorize exactly this request, and a request
+/// whose direct domain cannot be answered under the grant. Every refusal is a
+/// typed [`ActivationError`]; none of them is a successful evaluation.
+pub fn evaluate_published_activation(
+    grant: &PublicationGrant,
+    request: &ActivationRequest,
+    profile: &ActivationProfile,
+    scope_id: &WorkScopeId,
+) -> Result<CueActivationEvaluation, ActivationError> {
+    grant.validate_for(request, scope_id)?;
+    if !grant.is_direct_granted() {
+        return Err(ActivationError::StaleInput);
+    }
+    evaluate_activation(&grant.candidate, request, profile)
 }
 
 /// The optional stage's contribution and its typed disposition.
@@ -851,6 +883,7 @@ fn spread_phase(
         direct,
         &run.derived_states,
         &candidate.relation_edges,
+        profile,
         trace_limit(request),
     )?;
     // An admitted bound that stopped this optional stage never retracts the
@@ -875,10 +908,30 @@ fn spread_phase(
         },
         None => DerivedStage::Evaluated,
     };
-    let completeness = match bounded {
+    let completeness = spread_completeness(bounded, &unreported, &run);
+    Ok(DerivedOutcome {
+        derived,
+        trace,
+        completeness,
+        stage,
+    })
+}
+
+/// The completeness the optional stage's own run actually reached.
+///
+/// An admitted bound always reports `Partial` with the un-followed remainder, a
+/// depth or fan-out stop reports `Truncated` with its own stopped frontier, and
+/// only a run that followed every supplied edge and stopped for no reason
+/// reports `Complete`. No cap can collapse into `Complete`.
+fn spread_completeness(
+    bounded: Option<(&'static str, Vec<RelationEdgeId>)>,
+    unreported: &[RelationEdgeId],
+    run: &SpreadRun,
+) -> Completeness {
+    match bounded {
         Some((_, frontier)) => Completeness::Partial { frontier },
         None if !unreported.is_empty() => Completeness::Partial {
-            frontier: unreported,
+            frontier: unreported.to_vec(),
         },
         None if run.stopped_frontier.is_empty() => Completeness::Complete,
         None => Completeness::Truncated {
@@ -887,15 +940,9 @@ fn spread_phase(
             } else {
                 BoundKind::Depth
             },
-            frontier: run.stopped_frontier,
+            frontier: run.stopped_frontier.clone(),
         },
-    };
-    Ok(DerivedOutcome {
-        derived,
-        trace,
-        completeness,
-        stage,
-    })
+    }
 }
 
 /// Every supplied relation edge the traversal did not follow.
@@ -986,7 +1033,7 @@ impl SpreadWork<'_> {
                 return Ok(());
             }
             let edge = &self.candidate.relation_edges[index];
-            if edge.from == state.target && self.profile.relation_weight(edge.kind).is_some() {
+            if self.departures(&state.target, edge) {
                 outgoing.push(index);
             }
         }
@@ -1037,6 +1084,15 @@ impl SpreadWork<'_> {
         self.frontier.clear();
     }
 
+    /// Whether this edge departs `from` in a direction the profile admits.
+    ///
+    /// Direction is read from the profile rule for the edge's own kind, so an
+    /// unadmitted kind is never traversed and a reverse or bidirectional rule
+    /// is traversed the way the profile names rather than by assumption.
+    fn departs(&self, from: &TargetHandle, edge: &RelationEdge) -> bool {
+        arrival_of(self.profile, edge, from).is_some()
+    }
+
     /// Returns `true` when this edge may not extend the path under the
     /// admitted path-length bound.
     fn expand_edge(
@@ -1044,8 +1100,11 @@ impl SpreadWork<'_> {
         state: &SearchState,
         edge: &RelationEdge,
     ) -> Result<bool, ActivationError> {
+        let Some(arrival) = arrival_of(self.profile, edge, &state.target) else {
+            return Ok(false);
+        };
         if state.path.iter().any(|id| id == &edge.relation_edge_id)
-            || edge_in_path_target(state, edge, &self.candidate.relation_edges)
+            || path_revisits(state, &arrival, &self.candidate.relation_edges, self.profile)
         {
             return Ok(false);
         }
@@ -1071,14 +1130,14 @@ impl SpreadWork<'_> {
         let depth = u8::try_from(path.len()).map_err(|_| ActivationError::Limit {
             field: "activation.max_depth",
         })?;
-        let key = (edge.to.clone(), depth, state.direct_seed.clone());
+        let key = (arrival.clone(), depth, state.direct_seed.clone());
         let improve = self.best.get(&key).is_none_or(|(old_score, old_path)| {
             score > *old_score || (score == *old_score && path < *old_path)
         });
         if improve {
             self.best.insert(key, (score, path.clone()));
             let next = SearchState {
-                target: edge.to.clone(),
+                target: arrival,
                 direct_seed: state.direct_seed.clone(),
                 score,
                 path,
@@ -1198,12 +1257,9 @@ fn trace_for(
     direct: &[DirectActivation],
     states: &[SearchState],
     edges: &[RelationEdge],
+    profile: &ActivationProfile,
     trace_limit: usize,
 ) -> Result<ActivationTrace, ActivationError> {
-    let edge_targets: BTreeMap<_, _> = edges
-        .iter()
-        .map(|edge| (&edge.relation_edge_id, &edge.to))
-        .collect();
     let mut steps = Vec::new();
     for hit in direct {
         if steps.len() >= trace_limit {
@@ -1214,26 +1270,46 @@ fn trace_for(
         steps.push(TraceStep::new(None, 0, hit.target.clone()));
     }
     for state in states {
-        for (index, edge_id) in state.path.iter().enumerate() {
-            if steps.len() >= trace_limit {
-                return Err(ActivationError::Limit {
-                    field: "activation.trace",
-                });
-            }
-            let depth = u8::try_from(index + 1).map_err(|_| ActivationError::Limit {
-                field: "activation.trace",
-            })?;
-            let target = edge_targets.get(edge_id).ok_or(ActivationError::Contract(
-                CueContractError::BrokenActivationPath,
-            ))?;
-            steps.push(TraceStep::new(
-                Some(edge_id.clone()),
-                depth,
-                (*target).clone(),
-            ));
-        }
+        trace_state(state, edges, profile, trace_limit, &mut steps)?;
     }
     Ok(ActivationTrace::new(steps))
+}
+
+/// Records the trace steps one search state actually walked.
+///
+/// Each step names the node that step reached, resolved through the profile's
+/// direction for that edge's kind, so the trace of a reverse or bidirectional
+/// profile reports the real arrival rather than the edge's stored destination.
+fn trace_state(
+    state: &SearchState,
+    edges: &[RelationEdge],
+    profile: &ActivationProfile,
+    trace_limit: usize,
+    steps: &mut Vec<TraceStep>,
+) -> Result<(), ActivationError> {
+    let mut current = state.direct_seed.clone();
+    for (index, edge_id) in state.path.iter().enumerate() {
+        if steps.len() >= trace_limit {
+            return Err(ActivationError::Limit {
+                field: "activation.trace",
+            });
+        }
+        let depth = u8::try_from(index + 1).map_err(|_| ActivationError::Limit {
+            field: "activation.trace",
+        })?;
+        let edge = edges
+            .iter()
+            .find(|candidate| &candidate.relation_edge_id == edge_id)
+            .ok_or(ActivationError::Contract(
+                CueContractError::BrokenActivationPath,
+            ))?;
+        let reached = arrival_of(profile, edge, &current).ok_or(ActivationError::Contract(
+            CueContractError::BrokenActivationPath,
+        ))?;
+        steps.push(TraceStep::new(Some(edge_id.clone()), depth, reached.clone()));
+        current = reached;
+    }
+    Ok(())
 }
 
 fn assemble_result(
@@ -1329,17 +1405,58 @@ fn validate_output(
     Ok(())
 }
 
-fn edge_in_path_target(state: &SearchState, edge: &RelationEdge, edges: &[RelationEdge]) -> bool {
-    if edge.to == state.target || edge.to == state.direct_seed {
+/// Whether reaching `arrival` would revisit a node already on this path.
+///
+/// The nodes already visited are the direct seed, the current target, and the
+/// node reached at each earlier step. Those earlier arrivals are recomputed by
+/// walking the path in order from the seed, because a bidirectional edge's
+/// arrival depends on the node it departed from. Recomputing the walk is what
+/// keeps the check honest for a non-forward profile: a reverse or bidirectional
+/// step is compared against the node it actually reached.
+fn path_revisits(
+    state: &SearchState,
+    arrival: &TargetHandle,
+    edges: &[RelationEdge],
+    profile: &ActivationProfile,
+) -> bool {
+    if *arrival == state.target || *arrival == state.direct_seed {
         return true;
     }
-    state
-        .path
-        .iter()
-        .filter_map(|id| {
-            edges
-                .iter()
-                .find(|candidate| &candidate.relation_edge_id == id)
-        })
-        .any(|previous| previous.from == edge.to)
+    let mut visited = BTreeSet::new();
+    visited.insert(state.direct_seed.clone());
+    let mut current = state.direct_seed.clone();
+    for id in &state.path {
+        let Some(edge) = edges.iter().find(|edge| &edge.relation_edge_id == id) else {
+            // A path naming an edge the publication does not carry cannot be
+            // described by this profile, so it is not one this call extends.
+            return true;
+        };
+        let Some(reached) = arrival_of(profile, edge, &current) else {
+            return true;
+        };
+        visited.insert(reached.clone());
+        current = reached;
+    }
+    visited.contains(arrival)
+}
+
+/// The endpoint `edge` reaches when it departs `from` in its admitted
+/// direction.
+///
+/// Returns `None` when the edge does not depart `from` in any direction the
+/// profile admits for its kind.
+fn arrival_of(
+    profile: &ActivationProfile,
+    edge: &RelationEdge,
+    from: &TargetHandle,
+) -> Option<TargetHandle> {
+    match profile.relation_direction(edge.kind)? {
+        RelationDirection::Forward if edge.from == *from => Some(edge.to.clone()),
+        RelationDirection::Reverse if edge.to == *from => Some(edge.from.clone()),
+        RelationDirection::Bidirectional if edge.from == *from => Some(edge.to.clone()),
+        RelationDirection::Bidirectional if edge.to == *from => Some(edge.from.clone()),
+        RelationDirection::Forward
+        | RelationDirection::Reverse
+        | RelationDirection::Bidirectional => None,
+    }
 }

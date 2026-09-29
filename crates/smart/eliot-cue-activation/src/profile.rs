@@ -30,18 +30,62 @@ impl MatchRule {
     }
 }
 
+/// The direction an admitted relation kind may be traversed in.
+///
+/// Direction is profile semantics, not traversal policy decided at runtime: a
+/// kind the profile admits is admitted in one named direction, and the
+/// evaluator reads that direction rather than assuming a forward walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RelationDirection {
+    /// Traverse the edge from its source endpoint to its destination.
+    #[default]
+    Forward,
+    /// Traverse the edge from its destination endpoint to its source.
+    Reverse,
+    /// Traverse the edge in either direction.
+    Bidirectional,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RelationRule {
     pub kind: RelationKind,
     pub weight_milli: u16,
+    /// Direction this kind may be traversed in.
+    ///
+    /// Absent in older records means [`RelationDirection::Forward`]: a rule
+    /// that named no direction was a forward rule, and reading it as anything
+    /// else would silently widen a qualified configuration.
+    #[serde(default)]
+    pub direction: RelationDirection,
 }
 
 impl RelationRule {
+    /// Admits a kind as a forward relation at the given weight.
     #[must_use]
     pub const fn new(kind: RelationKind, weight_milli: u16) -> Self {
-        Self { kind, weight_milli }
+        Self {
+            kind,
+            weight_milli,
+            direction: RelationDirection::Forward,
+        }
+    }
+
+    /// Admits a kind in an explicit direction at the given weight.
+    #[must_use]
+    pub const fn directed(
+        kind: RelationKind,
+        weight_milli: u16,
+        direction: RelationDirection,
+    ) -> Self {
+        Self {
+            kind,
+            weight_milli,
+            direction,
+        }
     }
 }
 
@@ -123,6 +167,14 @@ impl ActivationProfile {
             .iter()
             .find(|rule| rule.kind == kind)
             .map(|rule| rule.weight_milli)
+    }
+
+    /// The direction this profile admits for one relation kind.
+    pub(crate) fn relation_direction(&self, kind: RelationKind) -> Option<RelationDirection> {
+        self.relation_rules
+            .iter()
+            .find(|rule| rule.kind == kind)
+            .map(|rule| rule.direction)
     }
 
     fn validate_shape(&self) -> Result<(), CueContractError> {

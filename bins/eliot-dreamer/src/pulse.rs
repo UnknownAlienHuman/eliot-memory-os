@@ -60,7 +60,11 @@ use eliot_context_contracts::{
     SerializedContextMeasurement,
 };
 use eliot_contracts::StateFence;
-use eliot_cue_activation::{ActivationProfile, CueActivationEvaluation, evaluate_activation};
+use eliot_cue_activation::{
+    ActivationProfile, CueActivationEvaluation, PublicationGrant, SpreadEnablement,
+    SpreadQualification, blocking_evidence, direct_activations, evaluate_activation,
+    evaluate_published_activation, resolve_enablement,
+};
 use eliot_cue_contracts::{ActivationRequest, CueSnapshotBuildCandidate};
 use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
 use eliot_dreamer_classification::{ClassificationPolicy, ClassificationResult, classify};
@@ -107,6 +111,21 @@ pub(crate) struct CueActivationStage<'a> {
     pub request: &'a ActivationRequest,
     /// Caller-supplied versioned numerical profile.
     pub profile: &'a ActivationProfile,
+    /// Work scope this operation is admitted in.
+    pub scope_id: eliot_cue_contracts::WorkScopeId,
+    /// Runtime identity the qualification is compared against.
+    pub runtime_identity: &'a str,
+    /// Immutable qualification evidence for enabling relation spreading.
+    ///
+    /// `None` is the default and means spreading stays disabled. A
+    /// direct-only request never consults it.
+    pub qualification: Option<&'a SpreadQualification>,
+    /// Live publication grant this operation reads under.
+    ///
+    /// `None` means the caller supplied only a build candidate. That is enough
+    /// for the pure seam, and it is not enough to claim a live publication, so
+    /// the stage records that the evaluated publication was not granted.
+    pub publication: Option<&'a PublicationGrant>,
 }
 
 /// Caller-supplied understanding stage inputs (owner-built, never inferred).
@@ -673,8 +692,16 @@ pub(crate) fn run_cue_stage(
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::CueActivation)),
         |inputs| {
-            let output = evaluate_activation(inputs.candidate, inputs.request, inputs.profile)
-                .map_err(|_| PulseError::CueActivation)?;
+            check_spread_enablement(inputs)?;
+            let output = evaluate_under_publication(inputs)?;
+            // The pulse records the blocking disposition this stage carries. A
+            // derived-only result carries none, so a graph score cannot reach
+            // the packet as a block; an exact direct hit still can, on the
+            // direct activations named rather than on a summary.
+            let blocking = cue_blocking_disposition(&output);
+            if blocking && direct_activations(&output.result).is_empty() {
+                return Err(PulseError::CueActivation);
+            }
             let commitment = output_digest(&output).ok_or(PulseError::CueActivation)?;
             Ok(PulseStage::executed(
                 PulseStageId::CueActivation,
@@ -683,6 +710,54 @@ pub(crate) fn run_cue_stage(
             ))
         },
     )
+}
+
+/// Refuses relation spreading that no qualification admits.
+///
+/// Default enablement is decided at the runtime composition, not in a source
+/// comment. A request that asks for relation spreading carries immutable
+/// qualification evidence naming the exact weights, registry, normalization
+/// revision and runtime identity; without a matching qualification the stage
+/// refuses rather than running an unqualified spread. A direct-only request
+/// needs no qualification and keeps its exact cue either way.
+fn check_spread_enablement(inputs: &CueActivationStage<'_>) -> Result<(), PulseError> {
+    if inputs.request.is_direct_only() {
+        return Ok(());
+    }
+    let enablement = resolve_enablement(
+        inputs.qualification,
+        inputs.profile,
+        &inputs.request.normalization_profile,
+        &inputs.scope_id,
+        inputs.runtime_identity,
+        &inputs.request.observed_at,
+    );
+    if enablement == SpreadEnablement::Disabled {
+        return Err(PulseError::CueActivation);
+    }
+    Ok(())
+}
+
+/// Evaluates the request under the publication evidence the caller supplied.
+///
+/// With a grant, the exact live publication, disclosure and influence state are
+/// bound before evaluation, so a build candidate is never evaluated as a live
+/// publication and a limited direct read is refused rather than answered.
+/// Without one the pure seam runs, and the caller is the party that knows no
+/// publication was granted; this seam does not manufacture a grant.
+fn evaluate_under_publication(
+    inputs: &CueActivationStage<'_>,
+) -> Result<CueActivationEvaluation, PulseError> {
+    match inputs.publication {
+        Some(grant) => evaluate_published_activation(
+            grant,
+            inputs.request,
+            inputs.profile,
+            &inputs.scope_id,
+        ),
+        None => evaluate_activation(inputs.candidate, inputs.request, inputs.profile),
+    }
+    .map_err(|_| PulseError::CueActivation)
 }
 
 pub(crate) fn run_epistemic_stage(
@@ -815,6 +890,21 @@ pub(crate) fn run_probe_stage(
             ))
         },
     )
+}
+
+/// The blocking disposition this cue stage is allowed to carry into the pulse.
+///
+/// This is the consumer-side answer to "may this result block?". It is a
+/// projection of the owner-produced result, not a new authority: an exact direct
+/// hit may block, and only on the direct activations named here, so the evidence
+/// a block would rest on is carried rather than summarized. A derived-only
+/// result is advisory and never blocks. A real safety rule reached through a
+/// derived candidate must still pass its own exact scope, trigger and authority
+/// gate; this seam does not attempt that gate and does not claim it passed.
+fn cue_blocking_disposition(output: &CueActivationEvaluation) -> bool {
+    blocking_evidence(&output.result)
+        .map(|evidence| !evidence.is_empty())
+        .unwrap_or(false)
 }
 
 /// Pending reason when the candidate stage has owner inputs but the CC-004
