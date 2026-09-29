@@ -2466,10 +2466,12 @@ fn parse_reclaim_aside_number<'a>(
 fn looks_like_reclaiming_suffix(file_name: &str) -> bool {
     let file_name = file_name.as_bytes();
     file_name
-        .get(file_name.len().saturating_sub(DELIVERY_RECLAIM_ASIDE_SUFFIX.len())..)
-        .is_some_and(|suffix| {
-            suffix.eq_ignore_ascii_case(DELIVERY_RECLAIM_ASIDE_SUFFIX.as_bytes())
-        })
+        .get(
+            file_name
+                .len()
+                .saturating_sub(DELIVERY_RECLAIM_ASIDE_SUFFIX.len())..,
+        )
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(DELIVERY_RECLAIM_ASIDE_SUFFIX.as_bytes()))
 }
 
 /// Parses the claim-bound host aside spelling. Its readable claim fragment is
@@ -2548,7 +2550,12 @@ fn delivery_claim_fragment(claim_id: &str) -> String {
 }
 
 fn unique_delivery_row_index(
-    rows: &[(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    rows: &[(
+        String,
+        std::path::PathBuf,
+        WasmDeliveryPublicationSnapshot,
+        u64,
+    )],
     matches_identity: impl Fn(&WasmDeliveryIdentity) -> bool,
 ) -> Result<usize, WasmDispatchError> {
     let mut matched = None;
@@ -2563,7 +2570,12 @@ fn unique_delivery_row_index(
 }
 
 fn account_delivery_root_bytes(
-    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    rows: &mut [(
+        String,
+        std::path::PathBuf,
+        WasmDeliveryPublicationSnapshot,
+        u64,
+    )],
     retained_bytes: &mut u64,
     row_index: usize,
     bytes: u64,
@@ -2581,9 +2593,7 @@ fn account_delivery_root_bytes(
     Ok(())
 }
 
-fn read_delivery_root_file(
-    path: &std::path::Path,
-) -> Result<(u64, Vec<u8>), WasmDispatchError> {
+fn read_delivery_root_file(path: &std::path::Path) -> Result<(u64, Vec<u8>), WasmDispatchError> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
     if metadata.file_type().is_symlink()
@@ -2600,7 +2610,12 @@ fn read_delivery_root_file(
 }
 
 fn account_reclaim_aside(
-    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    rows: &mut [(
+        String,
+        std::path::PathBuf,
+        WasmDeliveryPublicationSnapshot,
+        u64,
+    )],
     retained_bytes: &mut u64,
     path: &std::path::Path,
     aside: DeliveryReclaimAsideName<'_>,
@@ -2633,9 +2648,7 @@ fn account_reclaim_aside(
     account_delivery_root_bytes(rows, retained_bytes, row_index, aside_bytes)
 }
 
-fn fixed_delivery_root_name(
-    name: &str,
-) -> Result<Option<&'static str>, WasmDispatchError> {
+fn fixed_delivery_root_name(name: &str) -> Result<Option<&'static str>, WasmDispatchError> {
     for candidate in [
         WASM_HOST_MATERIAL_FILE_NAME,
         WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
@@ -2670,7 +2683,12 @@ fn is_delivery_partial_root_name(name: &str) -> bool {
 }
 
 fn account_fixed_delivery_files(
-    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    rows: &mut [(
+        String,
+        std::path::PathBuf,
+        WasmDeliveryPublicationSnapshot,
+        u64,
+    )],
     retained_bytes: &mut u64,
     fixed_files: &[(&'static str, std::path::PathBuf)],
 ) -> Result<(), WasmDispatchError> {
@@ -2693,12 +2711,7 @@ fn account_fixed_delivery_files(
     let material_row_index =
         unique_delivery_row_index(rows, |identity| identity.matches_material(&material))?;
     let fixed_identity = rows[material_row_index].2.disposition.identity().clone();
-    account_delivery_root_bytes(
-        rows,
-        retained_bytes,
-        material_row_index,
-        material_bytes_len,
-    )?;
+    account_delivery_root_bytes(rows, retained_bytes, material_row_index, material_bytes_len)?;
 
     for (file_name, path) in fixed_files.iter().filter(|(name, _)| {
         *name == WASM_HOST_GUEST_ARTIFACT_FILE_NAME || *name == WASM_HOST_GUEST_INPUT_FILE_NAME
@@ -2720,7 +2733,12 @@ fn account_fixed_delivery_files(
 
 fn account_delivery_root_files(
     install_dir: &std::path::Path,
-    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    rows: &mut [(
+        String,
+        std::path::PathBuf,
+        WasmDeliveryPublicationSnapshot,
+        u64,
+    )],
     retained_bytes: &mut u64,
 ) -> Result<(), WasmDispatchError> {
     let directory_metadata = std::fs::symlink_metadata(install_dir)
@@ -2743,7 +2761,10 @@ fn account_delivery_root_files(
         let raw_name = entry.file_name();
         let name = raw_name.to_string_lossy();
         if let Some(file_name) = fixed_delivery_root_name(&name)? {
-            if fixed_files.iter().any(|(existing, _)| *existing == file_name) {
+            if fixed_files
+                .iter()
+                .any(|(existing, _)| *existing == file_name)
+            {
                 return Err(WasmDispatchError::DeliveryUnavailable);
             }
             fixed_files.push((file_name, path));
@@ -2762,8 +2783,8 @@ fn account_delivery_root_files(
         let name = raw_name
             .to_str()
             .ok_or(WasmDispatchError::DeliveryUnavailable)?;
-        let aside = parse_reclaim_aside_name(name)?
-            .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+        let aside =
+            parse_reclaim_aside_name(name)?.ok_or(WasmDispatchError::DeliveryUnavailable)?;
         account_reclaim_aside(rows, retained_bytes, &path, aside)?;
     }
     account_fixed_delivery_files(rows, retained_bytes, &fixed_files)
@@ -2788,9 +2809,10 @@ fn scan_publication_snapshots(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(WasmDispatchError::DeliveryUnavailable),
     };
-    if directory_metadata.as_ref().is_some_and(|metadata| {
-        metadata.file_type().is_symlink() || !metadata.is_dir()
-    }) {
+    if directory_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
         return Err(WasmDispatchError::DeliveryUnavailable);
     }
     let mut rows = Vec::new();

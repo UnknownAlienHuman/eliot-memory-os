@@ -1526,21 +1526,12 @@ fn read_retained_owner_material_unlocked(
     install_dir: &std::path::Path,
     claim: &StagedDeliveryIdentity,
 ) -> Result<[Vec<u8>; 3], MaterialError> {
-    let artifact = read_retained_owner_file_unlocked(
-        install_dir,
-        claim,
-        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
-    )?;
-    let input = read_retained_owner_file_unlocked(
-        install_dir,
-        claim,
-        WASM_HOST_GUEST_INPUT_FILE_NAME,
-    )?;
-    let material = read_retained_owner_file_unlocked(
-        install_dir,
-        claim,
-        WASM_HOST_MATERIAL_FILE_NAME,
-    )?;
+    let artifact =
+        read_retained_owner_file_unlocked(install_dir, claim, WASM_HOST_GUEST_ARTIFACT_FILE_NAME)?;
+    let input =
+        read_retained_owner_file_unlocked(install_dir, claim, WASM_HOST_GUEST_INPUT_FILE_NAME)?;
+    let material =
+        read_retained_owner_file_unlocked(install_dir, claim, WASM_HOST_MATERIAL_FILE_NAME)?;
     Ok([artifact, input, material])
 }
 
@@ -1800,20 +1791,20 @@ fn reconcile_claimed_asides_after_successor_unlocked(
         }
     }
 
-    let aside_bytes = match read_verified_claimed_asides_unlocked(
-        install_dir,
+    let aside_bytes =
+        match read_verified_claimed_asides_unlocked(install_dir, identity, &paths, &present) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Some(ClaimedReclamation::RetainedForRecovery {
+                    claimed: identity.clone(),
+                });
+            }
+        };
+    Some(delete_claimed_asides_unlocked(
         identity,
         &paths,
-        &present,
-    ) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return Some(ClaimedReclamation::RetainedForRecovery {
-                claimed: identity.clone(),
-            });
-        }
-    };
-    Some(delete_claimed_asides_unlocked(identity, &paths, &aside_bytes))
+        &aside_bytes,
+    ))
 }
 
 fn claimed_reclaim_aside_paths(
@@ -1827,9 +1818,7 @@ fn claimed_reclaim_aside_paths(
     ]
 }
 
-fn claimed_reclaim_aside_presence_unlocked(
-    paths: &[std::path::PathBuf; 3],
-) -> Option<[bool; 3]> {
+fn claimed_reclaim_aside_presence_unlocked(paths: &[std::path::PathBuf; 3]) -> Option<[bool; 3]> {
     let mut present = [false; 3];
     for (slot, aside) in present.iter_mut().zip(paths) {
         match std::fs::symlink_metadata(aside) {
@@ -1850,11 +1839,8 @@ fn read_verified_claimed_asides_unlocked(
 ) -> Result<[Option<Vec<u8>>; 3], MaterialError> {
     let owner_copy = read_retained_owner_material_unlocked(install_dir, claim)?;
     let mut aside_bytes: [Option<Vec<u8>>; 3] = std::array::from_fn(|_| None);
-    for (index, ((aside, is_present), retained)) in paths
-        .iter()
-        .zip(present)
-        .zip(owner_copy.iter())
-        .enumerate()
+    for (index, ((aside, is_present), retained)) in
+        paths.iter().zip(present).zip(owner_copy.iter()).enumerate()
     {
         if !*is_present {
             continue;
@@ -1881,10 +1867,7 @@ fn delete_claimed_asides_unlocked(
         ReclaimOutcome::NotFound,
         ReclaimOutcome::NotFound,
     ];
-    for (outcome, (aside, bytes)) in outcomes
-        .iter_mut()
-        .zip(paths.iter().zip(verified_asides))
-    {
+    for (outcome, (aside, bytes)) in outcomes.iter_mut().zip(paths.iter().zip(verified_asides)) {
         if bytes.is_some() {
             *outcome = consume_staged_unlocked(aside);
         }
