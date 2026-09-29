@@ -57,7 +57,7 @@ pub struct SealedSupervisionAuthorityKey {
     pub trust_anchor: SupervisionTrustAnchor,
 }
 
-/// Secret-free request for a UserMode Credential Manager authority key.
+/// Secret-free request for a `UserMode` Credential Manager authority key.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserModeSupervisionAuthorityCredentialRequest {
@@ -105,7 +105,7 @@ impl UserModeSupervisionAuthorityCredentialRequest {
     }
 }
 
-/// Public, secret-free receipt for a transaction-owned UserMode authority key.
+/// Public, secret-free receipt for a transaction-owned `UserMode` authority key.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserModeSupervisionAuthorityCredentialReceipt {
@@ -119,7 +119,7 @@ pub struct UserModeSupervisionAuthorityCredentialReceipt {
     pub trust_anchor: SupervisionTrustAnchor,
 }
 
-/// Secret-free transaction request for one disposable PortableDev key file.
+/// Secret-free transaction request for one disposable `PortableDev` key file.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortableDevSupervisionAuthorityKeyRequest {
@@ -139,7 +139,7 @@ pub struct PortableDevSupervisionAuthorityKeyRequest {
     pub signer_id: String,
     /// Generation-specific public key identity.
     pub key_id: String,
-    /// Exact repository root selected by the PortableDev descriptor.
+    /// Exact repository root selected by the `PortableDev` descriptor.
     pub repository_root: PathBuf,
     /// Repository-root file-object identity retained before key materialization.
     pub repository_root_identity: FileIdentity,
@@ -178,7 +178,7 @@ impl PortableDevSupervisionAuthorityKeyRequest {
     }
 }
 
-/// Public, secret-free receipt for one transaction-owned PortableDev key.
+/// Public, secret-free receipt for one transaction-owned `PortableDev` key.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortableDevSupervisionAuthorityKeyReceipt {
@@ -220,7 +220,7 @@ impl PortableDevSupervisionAuthorityKeyReceipt {
     }
 }
 
-/// Read-only observation of the exact repository-local PortableDev key path
+/// Read-only observation of the exact repository-local `PortableDev` key path
 /// before its seed has been prepared.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -245,7 +245,7 @@ pub enum PortableDevSupervisionAuthorityKeyTargetObservation {
     },
 }
 
-/// Exact post-attempt inspection against the original PortableDev key receipt.
+/// Exact post-attempt inspection against the original `PortableDev` key receipt.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
@@ -270,7 +270,7 @@ pub enum PortableDevSupervisionAuthorityKeyObservation {
     },
 }
 
-/// Prepared PortableDev key kept in memory until the caller durably records
+/// Prepared `PortableDev` key kept in memory until the caller durably records
 /// [`PortableDevSupervisionAuthorityKeyReceipt`].
 pub struct PreparedPortableDevSupervisionAuthorityKey {
     receipt: PortableDevSupervisionAuthorityKeyReceipt,
@@ -285,7 +285,7 @@ impl PreparedPortableDevSupervisionAuthorityKey {
     }
 }
 
-/// Outcome of one create-only PortableDev key-file write attempt.
+/// Outcome of one create-only `PortableDev` key-file write attempt.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
@@ -338,7 +338,7 @@ impl UserModeSupervisionAuthorityCredentialReceipt {
     }
 }
 
-/// Exact observation of the UserMode authority target against its original
+/// Exact observation of the `UserMode` authority target against its original
 /// transaction receipt and public trust anchor.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -393,7 +393,7 @@ pub enum UserModeSupervisionAuthorityCredentialTargetObservation {
     },
 }
 
-/// Outcome of one UserMode authority-key write attempt.
+/// Outcome of one `UserMode` authority-key write attempt.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
@@ -428,10 +428,10 @@ impl PreparedUserModeSupervisionAuthorityCredential {
     }
 }
 
-/// Current-token Credential Manager provider for UserMode supervision keys.
+/// Current-token Credential Manager provider for `UserMode` supervision keys.
 ///
 /// This owner uses a purpose-specific target and exact current-user SID. It
-/// does not access SCM, ProgramData, LocalService, or installer-root HMAC keys.
+/// does not access SCM, `ProgramData`, `LocalService`, or installer-root HMAC keys.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsUserModeSupervisionAuthorityCredentialProvider {
     primitive: WindowsCurrentUserSupervisionCredentialProvider,
@@ -617,8 +617,10 @@ impl WindowsUserModeSupervisionAuthorityCredentialProvider {
                             receipt: receipt.clone(),
                         },
                     ),
-                    Err(SupervisionAuthorityKeyError::InvalidBinding)
-                    | Err(SupervisionAuthorityKeyError::KeyInvalid) => Ok(
+                    Err(
+                        SupervisionAuthorityKeyError::InvalidBinding
+                        | SupervisionAuthorityKeyError::KeyInvalid,
+                    ) => Ok(
                         UserModeSupervisionAuthorityCredentialObservation::Mismatch {
                             owner_sid,
                             target: receipt.target.clone(),
@@ -723,14 +725,14 @@ impl WindowsUserModeSupervisionAuthorityCredentialProvider {
             .primitive
             .read(&target, &owner_sid)
             .map_err(map_current_user_credential_error)?;
-        signer_for_anchor(secret, trust_anchor)
+        signer_for_anchor(&secret, trust_anchor)
     }
 }
 
-/// Explicitly disposable repository-local key provider for PortableDev.
+/// Explicitly disposable repository-local key provider for `PortableDev`.
 ///
 /// Key bytes exist only in the retained current-user file below the selected
-/// repository root. This provider has no service, ProgramData, Credential
+/// repository root. This provider has no service, `ProgramData`, Credential
 /// Manager, or production fallback path.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsPortableDevSupervisionAuthorityKeyProvider;
@@ -833,15 +835,12 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
             Ok(file) => file,
             Err(error) => {
                 return match std::fs::symlink_metadata(&path) {
-                    Ok(_) => {
-                        Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt })
-                    }
                     Err(metadata_error)
                         if metadata_error.kind() == std::io::ErrorKind::NotFound =>
                     {
                         Err(map_user_owned_path_error(error))
                     }
-                    Err(_) => {
+                    Ok(_) | Err(_) => {
                         Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt })
                     }
                 };
@@ -860,9 +859,10 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
             Ok(PortableDevSupervisionAuthorityKeyObservation::Matching { .. }) => {
                 Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Created { receipt })
             }
-            Ok(PortableDevSupervisionAuthorityKeyObservation::Absent { .. })
-            | Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch { .. })
-            | Err(_) => Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt }),
+            Ok(
+                PortableDevSupervisionAuthorityKeyObservation::Absent { .. }
+                | PortableDevSupervisionAuthorityKeyObservation::Mismatch { .. },
+            ) | Err(_) => Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt }),
         }
     }
 
@@ -931,12 +931,14 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
         }
         let secret = CredentialSecret::from_bytes(bytes)
             .map_err(|_| SupervisionAuthorityKeyError::KeyInvalid)?;
-        match signer_for_anchor(secret, &receipt.trust_anchor) {
+        match signer_for_anchor(&secret, &receipt.trust_anchor) {
             Ok(_) => Ok(PortableDevSupervisionAuthorityKeyObservation::Matching {
                 receipt: receipt.clone(),
             }),
-            Err(SupervisionAuthorityKeyError::KeyInvalid)
-            | Err(SupervisionAuthorityKeyError::InvalidBinding) => {
+            Err(
+                SupervisionAuthorityKeyError::KeyInvalid
+                | SupervisionAuthorityKeyError::InvalidBinding,
+            ) => {
                 Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch {
                     relative_path: request.relative_path.clone(),
                 })
@@ -975,7 +977,7 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
             return Err(SupervisionAuthorityKeyError::InvalidBinding);
         }
         signer_for_anchor(
-            CredentialSecret::from_bytes(bytes)
+            &CredentialSecret::from_bytes(bytes)
                 .map_err(|_| SupervisionAuthorityKeyError::KeyInvalid)?,
             &receipt.trust_anchor,
         )?;
@@ -1009,7 +1011,7 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
         }
     }
 
-    /// Loads a signer only from the reference below the retained PortableDev
+    /// Loads a signer only from the reference below the retained `PortableDev`
     /// repository-root identity and compares the derived public key to the
     /// original descriptor trust anchor.
     pub fn load_signer_for_kernel(
@@ -1039,7 +1041,7 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
             return Err(SupervisionAuthorityKeyError::KeyInvalid);
         }
         signer_for_anchor(
-            CredentialSecret::from_bytes(bytes)
+            &CredentialSecret::from_bytes(bytes)
                 .map_err(|_| SupervisionAuthorityKeyError::KeyInvalid)?,
             trust_anchor,
         )
@@ -1525,7 +1527,7 @@ fn open_portable_dev_parent(
                 missing_ancestor = true;
                 break;
             }
-            Err(error) => return Err(map_io_error(error)),
+            Err(error) => return Err(map_io_error(&error)),
         }
     }
     if missing_ancestor {
@@ -1557,7 +1559,7 @@ fn open_portable_dev_parent(
                 None
             }
         }
-        Err(error) => return Err(map_io_error(error)),
+        Err(error) => return Err(map_io_error(&error)),
     };
     if let Some(parent) = &parent {
         let canonical = parent.canonical_path().map_err(map_user_owned_path_error)?;
@@ -1579,7 +1581,7 @@ fn open_portable_dev_parent(
 }
 
 fn signer_for_anchor(
-    secret: CredentialSecret,
+    secret: &CredentialSecret,
     trust_anchor: &SupervisionTrustAnchor,
 ) -> Result<Ed25519SupervisionLeaseSigner, SupervisionAuthorityKeyError> {
     trust_anchor.validate().map_err(map_contract_error)?;
@@ -1603,12 +1605,12 @@ fn signer_for_anchor(
 
 fn map_user_owned_path_error(error: ProtectedPathError) -> SupervisionAuthorityKeyError {
     match error {
-        ProtectedPathError::AclMismatch => SupervisionAuthorityKeyError::AccessDenied,
+        ProtectedPathError::AclMismatch
+        | ProtectedPathError::Win32 { code: 5, .. } => SupervisionAuthorityKeyError::AccessDenied,
         ProtectedPathError::InvalidRoot
         | ProtectedPathError::InvalidPath
         | ProtectedPathError::ReparsePoint
         | ProtectedPathError::IdentityMismatch => SupervisionAuthorityKeyError::InvalidBinding,
-        ProtectedPathError::Win32 { code: 5, .. } => SupervisionAuthorityKeyError::AccessDenied,
         ProtectedPathError::Io
         | ProtectedPathError::Win32 { .. }
         | ProtectedPathError::SizeExceeded
@@ -1618,7 +1620,7 @@ fn map_user_owned_path_error(error: ProtectedPathError) -> SupervisionAuthorityK
     }
 }
 
-fn map_io_error(error: std::io::Error) -> SupervisionAuthorityKeyError {
+fn map_io_error(error: &std::io::Error) -> SupervisionAuthorityKeyError {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => SupervisionAuthorityKeyError::AccessDenied,
         std::io::ErrorKind::NotFound => SupervisionAuthorityKeyError::InvalidBinding,
