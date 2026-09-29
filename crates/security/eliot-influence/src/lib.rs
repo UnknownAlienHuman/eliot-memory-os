@@ -841,6 +841,17 @@ impl BoundedRevocationOutcome {
     /// a revocation: an outcome read back from storage, or presented by
     /// another owner, is only usable once it has been re-bound to the exact
     /// request that is being served now.
+    ///
+    /// The binding covers the dependent projections as well as the request
+    /// identity. `affected_refs` is re-derived from the request's own
+    /// qualified-edge graph (see `permitted_dependent_closure`) and compared
+    /// by content, because no digest in this outcome covers that field; a
+    /// receipt naming a dependent the request's graph cannot reach from the
+    /// origin, repeating one, or omitting the origin itself refuses. The check
+    /// is a superset test, so a paged or bound-truncated outcome is never
+    /// refused for being short. `frontier` and `omissions` are deliberately
+    /// excluded, since an omitted dependent is retained in the frontier exactly
+    /// when its edge was never propagated.
     pub fn verify_binding(
         &self,
         request: &BoundedRevocationRequest,
@@ -867,8 +878,74 @@ impl BoundedRevocationOutcome {
                 "outcome.continuation_identity",
             ));
         }
+        // The dependent projections this receipt reports are re-derived from
+        // the request the consumer holds, because nothing else in this outcome
+        // authenticates them. `request_digest` and `bounds_digest` bind the
+        // REQUEST; `continuation_digest` binds the continuation; no digest
+        // covers `affected_refs`. An outcome whose affected set was shortened
+        // or widened after the fact therefore carried every digest compared
+        // above and still passed, which made this guard the one place where a
+        // stored or foreign outcome became usable as a revocation's dependent
+        // closure while that closure was the one field the guard did not
+        // prove. Deriving it here is what makes the documented purpose of this
+        // function true.
+        //
+        // Only `affected_refs` is checked. `frontier` and `omissions` are
+        // deliberately NOT: an omitted dependent is retained in the frontier
+        // precisely when its edge was never propagated, so requiring frontier
+        // membership in the implied closure would refuse every honest
+        // cross-scope or stale omission.
+        let implied = permitted_dependent_closure(request)?;
+        let mut affected = BTreeSet::new();
+        for reference in &self.affected_refs {
+            // A duplicate would let one member of a rewritten set read as two
+            // denominators, and a reference the request's own graph cannot
+            // reach from the origin is a revocation claim no traversal of this
+            // request could have produced.
+            if !affected.insert(reference.clone()) || !implied.contains(reference) {
+                return Err(InfluenceError::OutcomeBindingMismatch(
+                    "outcome.affected_refs",
+                ));
+            }
+        }
+        // The origin is always admitted first, so a receipt that does not
+        // report the root as affected is not this request's closure.
+        if !affected.contains(&request.root_ref) {
+            return Err(InfluenceError::OutcomeBindingMismatch(
+                "outcome.affected_refs",
+            ));
+        }
         Ok(())
     }
+}
+
+/// The dependent set this request's own qualified-edge graph implies.
+///
+/// Recomputed from the request the consumer holds and never read back from
+/// the receipt, so the comparison in `BoundedRevocationOutcome::verify_binding`
+/// is against an independent expected set rather than a second copy of the
+/// caller's own list. Only
+/// [`InfluenceEdgeDisposition::PermittedCurrent`] edges propagate, which is
+/// exactly the filter the bounded engine applies before it admits a
+/// dependent, so this set is a superset of anything a legitimate engine run
+/// can emit under any bound: bounds only ever shrink the admitted set, never
+/// widen it. A legitimately paged or truncated outcome is therefore never
+/// refused here.
+fn permitted_dependent_closure(
+    request: &BoundedRevocationRequest,
+) -> Result<BTreeSet<String>, InfluenceError> {
+    let edges = request
+        .edges
+        .iter()
+        .filter(|edge| edge.disposition == InfluenceEdgeDisposition::PermittedCurrent)
+        .map(|edge| InfluenceEdge {
+            source_ref: edge.source_ref.clone(),
+            dependent_ref: edge.dependent_ref.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(traverse_dependency_closure(&request.root_ref, &edges)
+        .into_iter()
+        .collect())
 }
 
 impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
