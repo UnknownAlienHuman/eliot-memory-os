@@ -257,15 +257,15 @@ pub fn select_profile_roots(
             };
             text(generation, "generation")?;
             let state_root = joined_windows_path(&repository, PORTABLE_STATE_DIR);
-            let config_root = joined_windows_path(&state_root, USER_CONFIG_DIR);
-            let cache_root = joined_windows_path(&state_root, USER_CACHE_DIR);
+            let config_root = joined_windows_path(&repository, ".eliot-dev\\config");
+            let cache_root = joined_windows_path(&repository, ".eliot-dev\\cache");
             ProfileGovernedRoots {
                 profile,
                 immutable_binaries: joined_windows_path(
                     &joined_windows_path(&repository, PORTABLE_BINARIES_DIR),
                     generation,
                 ),
-                durable_data: joined_windows_path(&state_root, "state"),
+                durable_data: state_root,
                 user_config: config_root,
                 user_cache: cache_root,
             }

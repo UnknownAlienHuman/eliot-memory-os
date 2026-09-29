@@ -47,9 +47,17 @@ use eliot_platform_windows::{
     ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceRegistrationRuntimeReadback, ServiceStartMode,
     ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
+    SupervisionAuthorityKeyStoreRequest,
+    CurrentUserTaskObservation, CurrentUserTaskReceipt, CurrentUserTaskRequest,
+    PreparedUserModeSupervisionAuthorityCredential,
+    UserModeSupervisionAuthorityCredentialReceipt,
+    UserModeSupervisionAuthorityCredentialRequest,
+    UserModeSupervisionAuthorityCredentialTargetObservation,
+    UserModeSupervisionAuthorityCredentialWriteOutcome, UserOwnedPathLease,
+    WindowsInstallerRootPrimitive,
     WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
+    WindowsSupervisionAuthorityKeyStore,
+    WindowsUserModeSupervisionAuthorityCredentialProvider, current_user_local_app_data_root,
     fresh_service_registration_nonce, observe_running_eliot_host_process,
     protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
 };
@@ -212,6 +220,209 @@ pub use credential_provision::{
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest,
     validate_store_credential_target,
 };
+
+/// Exact durable Host request for UserMode phase-B materialization.
+///
+/// This is committed before Host is called. It binds the selected transaction,
+/// effect, plan and candidate without carrying credential bytes or a second
+/// credential/root digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModePhaseBMaterializationRequest {
+    /// Required breaking request discriminator.
+    pub wire: ContractVersion,
+    /// Durable installation transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Exact `MaterializeUserModePhaseB` effect identity.
+    pub effect_id: PlatformHandle,
+    /// Distinct exact Task Scheduler effect identity. Host places this value
+    /// on the returned request and never derives an effect ID itself.
+    pub task_effect_id: PlatformHandle,
+    /// Digest of the immutable installation plan containing this request.
+    pub installation_plan_digest: PlatformHandle,
+    /// Digest of the exact candidate manifest.
+    pub candidate_manifest_digest: PlatformHandle,
+    /// Deterministic Host launch configuration.
+    pub static_template: HostPhaseBStaticTemplate,
+    /// Optional admitted agent-bridge source materialization request.
+    pub agent_bridge_source: Option<Box<AgentBridgeSourceMaterializationPlan>>,
+    /// Digest of this complete typed request, excluding this field.
+    pub request_digest: PlatformHandle,
+}
+
+impl UserModePhaseBMaterializationRequest {
+    /// Current typed UserMode phase-B materialization request wire.
+    pub const WIRE: ContractVersion = ContractVersion::new(1, 0, 0);
+
+    fn from_transaction_effect(
+        transaction: &InstallationTransaction,
+        effect_id: PlatformHandle,
+        task_effect_id: PlatformHandle,
+        static_template: HostPhaseBStaticTemplate,
+        agent_bridge_source: Option<Box<AgentBridgeSourceMaterializationPlan>>,
+    ) -> Result<Self, InstallationError> {
+        let mut value = Self {
+            wire: Self::WIRE,
+            transaction_id: transaction.transaction_id.clone(),
+            effect_id,
+            task_effect_id,
+            installation_plan_digest: transaction.installer_plan_digest.clone(),
+            candidate_manifest_digest: transaction.candidate_manifest.compute_digest()?,
+            static_template,
+            agent_bridge_source,
+            request_digest: PlatformHandle::new("pending")
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+        };
+        value.request_digest = value.computed_request_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Computes the domain-separated digest of this exact request.
+    pub fn computed_request_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        let bytes = canonical_json_bytes(&(
+            "eliot.installation.user-mode-phase-b.request.v1\0",
+            self.wire,
+            self.transaction_id.as_str(),
+            self.effect_id.as_str(),
+            self.task_effect_id.as_str(),
+            self.installation_plan_digest.as_str(),
+            self.candidate_manifest_digest.as_str(),
+            &self.static_template,
+            &self.agent_bridge_source,
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "user_mode_phase_b_request".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes))
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Validates every request binding and its self-digest.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.wire != Self::WIRE {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "UserMode phase-B request wire {} requires explicit migration to {}",
+                    self.wire,
+                    Self::WIRE
+                ),
+            });
+        }
+        handle(&self.transaction_id, "user_mode_phase_b.transaction_id")?;
+        handle(&self.effect_id, "user_mode_phase_b.effect_id")?;
+        handle(&self.task_effect_id, "user_mode_phase_b.task_effect_id")?;
+        sha256_handle(
+            &self.installation_plan_digest,
+            "user_mode_phase_b.installation_plan_digest",
+        )?;
+        sha256_handle(
+            &self.candidate_manifest_digest,
+            "user_mode_phase_b.candidate_manifest_digest",
+        )?;
+        self.static_template.validate()?;
+        if let Some(source) = &self.agent_bridge_source {
+            source.validate()?;
+        }
+        sha256_handle(&self.request_digest, "user_mode_phase_b.request_digest")?;
+        if self.request_digest != self.computed_request_digest()? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Result of UserMode Host phase-B materialization or read-only reconciliation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum UserModePhaseBOutcome {
+    /// Host materialized the exact launch surface and returned its current-user
+    /// scheduler task request.
+    Ready {
+        /// Exact Host-owned materialization receipt.
+        receipt: HostPhaseBMaterializationReceipt,
+        /// Runtime launch descriptor assembled from the materialized surface.
+        launch: RuntimeLaunchDescriptor,
+        /// Exact current-user Task Scheduler request; registration remains a
+        /// separate transaction effect.
+        task_request: CurrentUserTaskRequest,
+        /// Fresh OS identity observations for every selected mutable root.
+        profile_selection: eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    },
+    /// Host cannot yet prove whether its exact materialization completed.
+    Unknown {
+        /// Stable Host recovery reference.
+        pending_ref: PlatformHandle,
+    },
+}
+
+/// Host action selected only after the transaction durably records the exact
+/// UserMode phase-B request intent.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum UserModePhaseBCall {
+    /// Phase-B is already transaction-owned and the caller should continue
+    /// with the exact persisted task request without calling Host again.
+    AlreadyApplied {
+        /// Durable Host receipt.
+        receipt: HostPhaseBMaterializationReceipt,
+        /// Durable launch descriptor.
+        launch: RuntimeLaunchDescriptor,
+        /// Exact persisted task request.
+        task_request: CurrentUserTaskRequest,
+        /// Exact persisted retained-root identity selection.
+        profile_selection:
+            eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    },
+    /// First invocation for this committed intent.
+    Materialize {
+        /// Exact durable Host request.
+        request: UserModePhaseBMaterializationRequest,
+        /// Original transaction-owned current-user authority receipt.
+        authority_receipt: UserModeSupervisionAuthorityCredentialReceipt,
+    },
+    /// Read-only reconciliation of an intent whose result is unknown.
+    Reconcile {
+        /// Exact durable Host request.
+        request: UserModePhaseBMaterializationRequest,
+        /// Original transaction-owned current-user authority receipt.
+        authority_receipt: UserModeSupervisionAuthorityCredentialReceipt,
+    },
+}
+
+/// Durable pre-write Host record for one UserMode phase-B publication.
+///
+/// The wrapper joins the exact installer request and original current-user
+/// authority receipt to Host's prepared publication record. It is deliberately
+/// separate from the SCM `phase_b_intent` and never grants service authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModePhaseBPreparedMaterialization {
+    /// Exact durable UserMode request staged by the installer transaction.
+    pub request: UserModePhaseBMaterializationRequest,
+    /// Original current-user authority receipt committed before key creation.
+    pub authority_receipt: UserModeSupervisionAuthorityCredentialReceipt,
+    /// Host-owned prepared record committed before any destination write.
+    pub prepared: HostPhaseBPreparedMaterialization,
+}
+
+impl UserModePhaseBPreparedMaterialization {
+    /// Validates all request and Host preparation joins for UserMode only.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        self.request.validate()?;
+        self.prepared.validate()?;
+        if self.prepared.transaction_id != self.request.transaction_id
+            || self.prepared.effect_id != self.request.effect_id
+            || self.prepared.manifest_digest != self.request.candidate_manifest_digest
+            || self.prepared.request_digest != self.request.request_digest
+            || self.prepared.launch.profile != InstallationProfile::UserMode
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
 pub use package::{PackageObservationSnapshot, PackageObservedFile};
 use package::{
     execute_package, inspect_package, is_request_correlated_package_staging_unknown,
@@ -229,6 +440,7 @@ pub use package_planner::{
 pub use plan::{
     InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole,
     PackageArtifactDigest, PlannedChange, SupervisionAuthorityProvisionPlan,
+    UserModeSupervisionAuthorityProvisionPlan,
 };
 use plan::{validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings};
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
@@ -339,8 +551,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// into the durable registration receipt and its canonical marker digest.
 /// Version 25 requires the retained I3.1 profile-root binding on every current
 /// executable transaction and carries the corresponding launch descriptor
-/// shape. Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(25, 0, 0);
+/// shape. Version 26 adds the original UserMode authority key receipt and
+/// terminal no-effect-abort progress. Older wires require explicit migration
+/// and are never synthesized.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(27, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -351,7 +565,7 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 /// service-control grant receipt. Version 17 carries launch descriptors with
 /// their mandatory retained I3.1 profile-root binding.
 /// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(17, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(18, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -2809,6 +3023,45 @@ pub enum InstallationEffectAction {
 /// Exact precondition bound into an effect intent.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UserModeAuthorityAbsentSnapshot {
+    /// Current-user SID that observed the target absent.
+    pub owner_sid: PlatformHandle,
+    /// Exact transaction/effect-specific current-user Credential Manager target.
+    pub target: PlatformHandle,
+}
+
+impl UserModeAuthorityAbsentSnapshot {
+    fn validate(&self) -> Result<(), InstallationError> {
+        handle(&self.owner_sid, "user_mode_authority_snapshot.owner_sid")?;
+        if !self.owner_sid.as_str().starts_with("S-")
+            || self.owner_sid.as_str().chars().any(char::is_control)
+        {
+            return Err(InstallationError::InvalidField {
+                field: "user_mode_authority_snapshot.owner_sid".to_owned(),
+                reason: "must be an exact Windows SID".to_owned(),
+            });
+        }
+        let suffix = self
+            .target
+            .as_str()
+            .strip_prefix("eliot/supervision-authority/user-mode/v1/")
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "user_mode_authority_snapshot.target".to_owned(),
+                reason: "must use the purpose-bound UserMode authority target".to_owned(),
+            })?;
+        let digest = PlatformHandle::new(suffix.to_owned()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_authority_snapshot.target".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        sha256_handle(&digest, "user_mode_authority_snapshot.target")
+    }
+}
+
+/// Exact precondition bound into an effect intent.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstallationEffectPrecondition {
     /// Evidence references captured for the matching planned change.
     pub evidence_refs: Vec<PlatformHandle>,
@@ -2818,6 +3071,8 @@ pub struct InstallationEffectPrecondition {
     pub credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
     /// Trusted package source observation bound to the exact retained root and manifest.
     pub package_snapshot: Option<PackageObservationSnapshot>,
+    /// Exact current-user UserMode authority-target absence observation.
+    pub user_mode_authority_snapshot: Option<UserModeAuthorityAbsentSnapshot>,
     /// Digest binding the planned references and typed snapshots in order.
     pub digest: PlatformHandle,
 }
@@ -2848,11 +3103,40 @@ impl InstallationEffectPrecondition {
         Self::new(self.evidence_refs.clone(), None, None, Some(snapshot))
     }
 
+    fn with_user_mode_authority_snapshot(
+        &self,
+        snapshot: UserModeAuthorityAbsentSnapshot,
+    ) -> Result<Self, InstallationError> {
+        Self::new_with_user_mode_authority_snapshot(
+            self.evidence_refs.clone(),
+            None,
+            None,
+            None,
+            Some(snapshot),
+        )
+    }
+
     fn new(
         evidence_refs: Vec<PlatformHandle>,
         os_snapshot: Option<InstallationRootAbsentSnapshot>,
         credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
         package_snapshot: Option<PackageObservationSnapshot>,
+    ) -> Result<Self, InstallationError> {
+        Self::new_with_user_mode_authority_snapshot(
+            evidence_refs,
+            os_snapshot,
+            credential_snapshot,
+            package_snapshot,
+            None,
+        )
+    }
+
+    fn new_with_user_mode_authority_snapshot(
+        evidence_refs: Vec<PlatformHandle>,
+        os_snapshot: Option<InstallationRootAbsentSnapshot>,
+        credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
+        package_snapshot: Option<PackageObservationSnapshot>,
+        user_mode_authority_snapshot: Option<UserModeAuthorityAbsentSnapshot>,
     ) -> Result<Self, InstallationError> {
         #[derive(Serialize)]
         struct DigestInput<'a> {
@@ -2860,6 +3144,7 @@ impl InstallationEffectPrecondition {
             os_snapshot: &'a Option<InstallationRootAbsentSnapshot>,
             credential_snapshot: &'a Option<StoreCredentialAbsentSnapshot>,
             package_snapshot: &'a Option<PackageObservationSnapshot>,
+            user_mode_authority_snapshot: &'a Option<UserModeAuthorityAbsentSnapshot>,
         }
         let digest = PlatformHandle::new(sha256_hex(
             &serde_json::to_vec(&DigestInput {
@@ -2867,6 +3152,7 @@ impl InstallationEffectPrecondition {
                 os_snapshot: &os_snapshot,
                 credential_snapshot: &credential_snapshot,
                 package_snapshot: &package_snapshot,
+                user_mode_authority_snapshot: &user_mode_authority_snapshot,
             })
             .map_err(|error| InstallationError::InvalidField {
                 field: "effect.precondition".to_owned(),
@@ -2879,6 +3165,7 @@ impl InstallationEffectPrecondition {
             os_snapshot,
             credential_snapshot,
             package_snapshot,
+            user_mode_authority_snapshot,
             digest,
         };
         value.validate()?;
@@ -2892,6 +3179,7 @@ impl InstallationEffectPrecondition {
             os_snapshot: &'a Option<InstallationRootAbsentSnapshot>,
             credential_snapshot: &'a Option<StoreCredentialAbsentSnapshot>,
             package_snapshot: &'a Option<PackageObservationSnapshot>,
+            user_mode_authority_snapshot: &'a Option<UserModeAuthorityAbsentSnapshot>,
         }
 
         handles(
@@ -2908,9 +3196,13 @@ impl InstallationEffectPrecondition {
         if let Some(snapshot) = &self.package_snapshot {
             snapshot.validate()?;
         }
+        if let Some(snapshot) = &self.user_mode_authority_snapshot {
+            snapshot.validate()?;
+        }
         let snapshot_count = u8::from(self.os_snapshot.is_some())
             + u8::from(self.credential_snapshot.is_some())
-            + u8::from(self.package_snapshot.is_some());
+            + u8::from(self.package_snapshot.is_some())
+            + u8::from(self.user_mode_authority_snapshot.is_some());
         if snapshot_count > 1 {
             return Err(InstallationError::InvalidField {
                 field: "effect.precondition.snapshot".to_owned(),
@@ -2924,6 +3216,7 @@ impl InstallationEffectPrecondition {
                 os_snapshot: &self.os_snapshot,
                 credential_snapshot: &self.credential_snapshot,
                 package_snapshot: &self.package_snapshot,
+                user_mode_authority_snapshot: &self.user_mode_authority_snapshot,
             })
             .map_err(|error| InstallationError::InvalidField {
                 field: "effect.precondition".to_owned(),
@@ -3009,6 +3302,10 @@ pub struct InstallationEffectRequest {
     pub store_credential: Option<StoreCredentialProgress>,
     /// Typed durable package receipt for a committed stage/recovery request.
     pub staging_receipt: Option<StagingReceipt>,
+    /// Original current-user UserMode key receipt, persisted before the one
+    /// permitted Credential Manager write and used to reconcile the exact
+    /// transaction/effect target.
+    pub user_mode_authority_receipt: Option<UserModeSupervisionAuthorityCredentialReceipt>,
     /// Apply or exact-identity rollback.
     pub action: InstallationEffectAction,
     /// Required exact identity for rollback; absent for apply.
@@ -3081,6 +3378,66 @@ impl InstallationEffectRequest {
             if let Some(snapshot) = &self.precondition.package_snapshot {
                 validate_staging_receipt_for_observation(snapshot, receipt)?;
             }
+        }
+        match (
+            &self.plan,
+            self.action,
+            &self.precondition.user_mode_authority_snapshot,
+            &self.user_mode_authority_receipt,
+        ) {
+            (
+                InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. },
+                InstallationEffectAction::Apply,
+                None,
+                None,
+            ) if self.attempt == 1 => {}
+            (
+                InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. },
+                InstallationEffectAction::Apply,
+                Some(snapshot),
+                None,
+            ) => {
+                snapshot.validate()?;
+                if self.profile != InstallationProfile::UserMode
+                    || snapshot.owner_sid != provision.owner_sid
+                    || snapshot.target != provision.target
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            (
+                InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. },
+                InstallationEffectAction::Apply | InstallationEffectAction::Rollback,
+                Some(snapshot),
+                Some(receipt),
+            ) => {
+                snapshot.validate()?;
+                receipt.validate().map_err(|error| InstallationError::InvalidField {
+                    field: "effect.user_mode_authority_receipt".to_owned(),
+                    reason: error.to_string(),
+                })?;
+                if self.profile != InstallationProfile::UserMode
+                    || snapshot.owner_sid != provision.owner_sid
+                    || snapshot.target != provision.target
+                    || snapshot.target != receipt.target
+                    || receipt.target != provision.target
+                    || receipt.request.transaction_id != self.transaction_id.as_str()
+                    || receipt.request.effect_id != self.effect_id.as_str()
+                    || receipt.request.installation_id != provision.installation_id.as_str()
+                    || receipt.request.candidate_generation
+                        != provision.candidate_generation.as_str()
+                    || receipt.request.authority_generation != provision.authority_generation
+                    || receipt.request.supervision_lease_scope_id
+                        != provision.supervision_lease_scope_id.as_str()
+                    || receipt.request.signer_id != provision.signer_id.as_str()
+                    || receipt.request.key_id != provision.key_id.as_str()
+                    || receipt.request.owner_sid != provision.owner_sid.as_str()
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            (_, _, None, None) => {}
+            _ => return Err(InstallationError::IdentityConflict),
         }
         match (&self.plan, self.action, &self.ownership_secret) {
             (
@@ -3337,6 +3694,7 @@ impl InstallationEffectObservation {
                 | InstallerEffectPlan::StartService { .. }
                 | InstallerEffectPlan::StagePackage { .. }
                 | InstallerEffectPlan::MaterializePhaseB { .. }
+                | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
         ))?;
         let matching_control_grant = match self {
             Self::Matching {
@@ -3346,6 +3704,19 @@ impl InstallationEffectObservation {
             Self::Absent { .. } | Self::Mismatch { .. } => None,
         };
         match effect {
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+                if let Self::Absent {
+                    observed_precondition,
+                    ..
+                } = self
+                    && (observed_precondition.user_mode_authority_snapshot.is_none()
+                        || observed_precondition.os_snapshot.is_some()
+                        || observed_precondition.credential_snapshot.is_some()
+                        || observed_precondition.package_snapshot.is_some())
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
             InstallerEffectPlan::RegisterService {
                 role: InstallerServiceRole::Watchdog,
                 ..
@@ -3661,6 +4032,35 @@ pub(crate) trait InstallationEffectPort: Send {
         PortOutcome::Unknown(UnknownReason::Unsupported)
     }
 
+    /// Generates one UserMode key seed and returns its secret-free receipt.
+    /// The caller must commit that receipt with the exact effect intent before
+    /// invoking `execute`; an absent post-intent readback is terminal because
+    /// the seed is intentionally not regenerated after restart.
+    fn prepare_user_mode_authority(
+        &mut self,
+        _request: &InstallationEffectRequest,
+    ) -> PortOutcome<UserModeSupervisionAuthorityCredentialReceipt> {
+        PortOutcome::Unknown(UnknownReason::Unsupported)
+    }
+
+    /// Reports whether this live port still holds the one prepared seed for
+    /// this exact receipt. This is process-local and never reconstructed from
+    /// a durable digest.
+    fn has_prepared_user_mode_authority(
+        &self,
+        _receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+    ) -> bool {
+        false
+    }
+
+    /// Drops an uncommitted in-memory UserMode seed after its transaction CAS
+    /// fails. It does not inspect or change Credential Manager.
+    fn discard_prepared_user_mode_authority(
+        &mut self,
+        _receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+    ) {
+    }
+
     /// Creates or reopens the installer-held ownership key only after its
     /// exact reference and effect intent were durably committed.
     fn provision_ownership_secret(
@@ -3716,8 +4116,10 @@ struct WindowsInstallationEffectPort {
     primitive: WindowsInstallerRootPrimitive,
     secrets: WindowsInstallerSecretProvider,
     prepared_ownership_secret: Option<PreparedOwnershipSecret>,
+    prepared_user_mode_authority: Option<PreparedUserModeSupervisionAuthorityCredential>,
     store_target_generator: WindowsStoreCredentialTargetGenerator,
     supervision_keys: WindowsSupervisionAuthorityKeyStore,
+    user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider,
 }
 
 struct PreparedOwnershipSecret {
@@ -3732,8 +4134,10 @@ impl WindowsInstallationEffectPort {
             primitive: WindowsInstallerRootPrimitive::new(),
             secrets: WindowsInstallerSecretProvider::new(),
             prepared_ownership_secret: None,
+            prepared_user_mode_authority: None,
             store_target_generator: WindowsStoreCredentialTargetGenerator::new(),
             supervision_keys: WindowsSupervisionAuthorityKeyStore::new(),
+            user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider::new(),
         }
     }
 
@@ -3741,6 +4145,172 @@ impl WindowsInstallationEffectPort {
         &self,
     ) -> Result<PlatformHandle, eliot_platform_windows::WindowsAdapterError> {
         self.store_target_generator.fresh_target()
+    }
+
+    fn user_mode_authority_request(
+        request: &InstallationEffectRequest,
+    ) -> Result<UserModeSupervisionAuthorityCredentialRequest, PortError> {
+        let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. } =
+            &request.plan
+        else {
+            return Err(PortError::InvalidRequestMetadata);
+        };
+        if request.profile != InstallationProfile::UserMode {
+            return Err(PortError::InvalidRequestMetadata);
+        }
+        Ok(UserModeSupervisionAuthorityCredentialRequest {
+            transaction_id: provision.transaction_id.as_str().to_owned(),
+            effect_id: provision.effect_id.as_str().to_owned(),
+            installation_id: provision.installation_id.as_str().to_owned(),
+            candidate_generation: provision.candidate_generation.as_str().to_owned(),
+            authority_generation: provision.authority_generation,
+            supervision_lease_scope_id: provision.supervision_lease_scope_id.as_str().to_owned(),
+            signer_id: provision.signer_id.as_str().to_owned(),
+            key_id: provision.key_id.as_str().to_owned(),
+            owner_sid: provision.owner_sid.as_str().to_owned(),
+        })
+    }
+
+    fn user_mode_authority_absence(
+        request: &InstallationEffectRequest,
+        owner_sid: PlatformHandle,
+        target: PlatformHandle,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. } =
+            &request.plan
+        else {
+            return Err(PortError::InvalidRequestMetadata);
+        };
+        if owner_sid != provision.owner_sid || target != provision.target {
+            return Ok(InstallationEffectObservation::Mismatch {
+                pending_ref: PlatformHandle::new(format!(
+                    "mismatch:user-mode-authority:{}",
+                    sha256_hex(target.as_str().as_bytes())
+                ))
+                .map_err(|_| PortError::InvalidRequestMetadata)?,
+            });
+        }
+        let snapshot = UserModeAuthorityAbsentSnapshot { owner_sid, target };
+        let observed_precondition = request
+            .precondition
+            .with_user_mode_authority_snapshot(snapshot.clone())
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let snapshot_bytes = serde_json::to_vec(&snapshot)
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let evidence = PlatformHandle::new(format!(
+            "user-mode-authority-absent:{}",
+            sha256_hex(&snapshot_bytes)
+        ))
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+        Ok(InstallationEffectObservation::Absent {
+            observed_precondition,
+            evidence: vec![evidence],
+            service_runtime_lineage: None,
+        })
+    }
+
+    fn inspect_user_mode_authority(
+        &self,
+        request: &InstallationEffectRequest,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let key_request = Self::user_mode_authority_request(request)?;
+        match self
+            .user_mode_supervision_keys
+            .inspect_target(&key_request)
+            .map_err(supervision_key_port_error)?
+        {
+            UserModeSupervisionAuthorityCredentialTargetObservation::Absent {
+                owner_sid,
+                target,
+            } => Self::user_mode_authority_absence(request, owner_sid, target),
+            UserModeSupervisionAuthorityCredentialTargetObservation::Present {
+                owner_sid,
+                target,
+            } => {
+                let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+                    provision, ..
+                } = &request.plan
+                else {
+                    return Err(PortError::InvalidRequestMetadata);
+                };
+                if owner_sid == provision.owner_sid && target == provision.target {
+                    Ok(InstallationEffectObservation::Mismatch {
+                        pending_ref: PlatformHandle::new(format!(
+                            "mismatch:user-mode-authority-preexisting:{}",
+                            sha256_hex(target.as_str().as_bytes())
+                        ))
+                        .map_err(|_| PortError::InvalidRequestMetadata)?,
+                    })
+                } else {
+                    Ok(InstallationEffectObservation::Mismatch {
+                        pending_ref: PlatformHandle::new(
+                            "mismatch:user-mode-authority-target-substituted",
+                        )
+                        .map_err(|_| PortError::InvalidRequestMetadata)?,
+                    })
+                }
+            }
+        }
+    }
+
+    fn reconcile_user_mode_authority(
+        &self,
+        request: &InstallationEffectRequest,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let expected_request = Self::user_mode_authority_request(request)?;
+        let receipt = request
+            .user_mode_authority_receipt
+            .as_ref()
+            .ok_or(PortError::InvalidRequestMetadata)?;
+        receipt
+            .validate()
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. } =
+            &request.plan
+        else {
+            return Err(PortError::InvalidRequestMetadata);
+        };
+        if receipt.request != expected_request
+            || receipt.target != provision.target
+            || receipt.request.owner_sid != provision.owner_sid.as_str()
+        {
+            return Err(PortError::InvalidRequestMetadata);
+        }
+        match self
+            .user_mode_supervision_keys
+            .inspect(receipt)
+            .map_err(supervision_key_port_error)?
+        {
+            UserModeSupervisionAuthorityCredentialObservation::Absent { owner_sid, target } => {
+                Self::user_mode_authority_absence(request, owner_sid, target)
+            }
+            UserModeSupervisionAuthorityCredentialObservation::Matching { receipt } => {
+                let fingerprint = &receipt.trust_anchor.public_key_fingerprint;
+                let evidence = PlatformHandle::new(format!("user-mode-authority-key:{fingerprint}"))
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+                Ok(InstallationEffectObservation::Matching {
+                    disposition: InstallationEffectDisposition::CreatedByTransaction,
+                    external_identity: receipt.target,
+                    evidence: vec![evidence],
+                    postcondition_digest: PlatformHandle::new(fingerprint.clone())
+                        .map_err(|_| PortError::InvalidRequestMetadata)?,
+                    service_control_grant: None,
+                    credential_receipt: None,
+                    staging_receipt: None,
+                    phase_b_receipt: None,
+                    service_runtime_lineage: None,
+                })
+            }
+            UserModeSupervisionAuthorityCredentialObservation::Mismatch { .. } => {
+                Ok(InstallationEffectObservation::Mismatch {
+                    pending_ref: PlatformHandle::new(format!(
+                        "mismatch:user-mode-authority-readback:{}",
+                        sha256_hex(receipt.target.as_str().as_bytes())
+                    ))
+                    .map_err(|_| PortError::InvalidRequestMetadata)?,
+                })
+            }
+        }
     }
 
     fn service_context(
@@ -5675,6 +6245,65 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         PortOutcome::Known(proof)
     }
 
+    fn prepare_user_mode_authority(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<UserModeSupervisionAuthorityCredentialReceipt> {
+        if request.profile != InstallationProfile::UserMode
+            || request.action != InstallationEffectAction::Apply
+            || request.user_mode_authority_receipt.is_some()
+            || self.prepared_user_mode_authority.is_some()
+        {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        }
+        let key_request = match Self::user_mode_authority_request(request) {
+            Ok(request) => request,
+            Err(error) => return PortOutcome::Error(error),
+        };
+        let prepared = match self.user_mode_supervision_keys.prepare(key_request) {
+            Ok(prepared) => prepared,
+            Err(error) => return PortOutcome::Error(supervision_key_port_error(error)),
+        };
+        let receipt = prepared.receipt().clone();
+        if request
+            .validate()
+            .is_err()
+            || receipt.target.as_str()
+                != match &request.plan {
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+                        provision, ..
+                    } => provision.target.as_str(),
+                    _ => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+                }
+        {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        }
+        self.prepared_user_mode_authority = Some(prepared);
+        PortOutcome::Known(receipt)
+    }
+
+    fn has_prepared_user_mode_authority(
+        &self,
+        receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+    ) -> bool {
+        self.prepared_user_mode_authority
+            .as_ref()
+            .is_some_and(|prepared| prepared.receipt() == receipt)
+    }
+
+    fn discard_prepared_user_mode_authority(
+        &mut self,
+        receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+    ) {
+        if self
+            .prepared_user_mode_authority
+            .as_ref()
+            .is_some_and(|prepared| prepared.receipt() == receipt)
+        {
+            self.prepared_user_mode_authority = None;
+        }
+    }
+
     fn provision_ownership_secret(
         &mut self,
         request: &InstallationEffectRequest,
@@ -5781,6 +6410,73 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectExecution> {
+        if matches!(
+            &request.plan,
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+        ) {
+            let Some(receipt) = request.user_mode_authority_receipt.as_ref() else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
+            };
+            match request.action {
+                InstallationEffectAction::Apply => {
+                    let Some(prepared) = self.prepared_user_mode_authority.take() else {
+                        return PortOutcome::Unknown(UnknownReason::NotObserved);
+                    };
+                    if prepared.receipt() != receipt {
+                        return PortOutcome::Error(PortError::InvalidRequestMetadata);
+                    }
+                    match self.user_mode_supervision_keys.write_prepared(prepared) {
+                        Ok(UserModeSupervisionAuthorityCredentialWriteOutcome::Created {
+                            receipt: observed,
+                        }) if &observed == receipt => {
+                            return PortOutcome::Known(InstallationEffectExecution {
+                                evidence: vec![
+                                    PlatformHandle::new("user-mode-authority-write-readback")
+                                        .unwrap_or_else(|_| unreachable!()),
+                                ],
+                                create_disposition: None,
+                                credential_receipt: None,
+                                staging_receipt: None,
+                                phase_b_receipt: None,
+                                service_start_disposition: None,
+                                service_runtime_lineage: None,
+                            });
+                        }
+                        Ok(UserModeSupervisionAuthorityCredentialWriteOutcome::Unknown {
+                            receipt: observed,
+                        }) if &observed == receipt => {
+                            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                        }
+                        Ok(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+                        Err(error) => {
+                            return PortOutcome::Error(supervision_key_port_error(error));
+                        }
+                    }
+                }
+                InstallationEffectAction::Rollback => {
+                    if request.expected_external_identity.as_ref() != Some(&receipt.target) {
+                        return PortOutcome::Error(PortError::InvalidRequestMetadata);
+                    }
+                    match self.user_mode_supervision_keys.delete_if_matching(receipt) {
+                        Ok(()) => PortOutcome::Known(InstallationEffectExecution {
+                            evidence: vec![
+                                PlatformHandle::new("user-mode-authority-exact-delete")
+                                    .unwrap_or_else(|_| unreachable!()),
+                            ],
+                            create_disposition: None,
+                            credential_receipt: None,
+                            staging_receipt: None,
+                            phase_b_receipt: None,
+                            service_start_disposition: None,
+                            service_runtime_lineage: None,
+                        }),
+                        Err(error) => {
+                            PortOutcome::Error(supervision_key_port_error(error))
+                        }
+                    }
+                }
+            }
+        }
         if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
             let key = match self.credential_secret(request) {
                 Ok(key) => key,
@@ -6113,7 +6809,12 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectObservation> {
-        let result = if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
+        let result = if matches!(
+            &request.plan,
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+        ) {
+            self.inspect_user_mode_authority(request)
+        } else if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
             self.inspect_service(request)
         } else if matches!(&request.plan, InstallerEffectPlan::StartService { .. }) {
             self.service_start_inspect(request)
@@ -6142,7 +6843,12 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         if matches!(&request.plan, InstallerEffectPlan::MaterializePhaseB { .. }) {
             return self.reconcile_phase_b(request);
         }
-        let result = if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
+        let result = if matches!(
+            &request.plan,
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+        ) {
+            self.reconcile_user_mode_authority(request)
+        } else if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
             self.reconcile_service(request)
         } else if matches!(&request.plan, InstallerEffectPlan::StartService { .. }) {
             self.service_start_reconcile(request)
@@ -7532,8 +8238,14 @@ where
             !matches!(
                 progress.state,
                 InstallationEffectProgressState::Applied { .. }
+                    | InstallationEffectProgressState::NoEffectAborted { .. }
             )
         }) else {
+            if matches!(transaction.stage, InstallationStage::RollbackRequired) {
+                return Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: transaction.pending_external_changes.clone(),
+                });
+            }
             return Ok(InstallationStepOutcome::Applied {
                 stage: transaction.stage,
                 evidence_refs: transaction.observed_postconditions.clone(),
@@ -7542,6 +8254,7 @@ where
         let attempt = match transaction.effect_progress[index].state {
             InstallationEffectProgressState::Pending => 1,
             InstallationEffectProgressState::IntentCommitted { attempt, .. } => attempt,
+            InstallationEffectProgressState::NoEffectAborted { .. } => unreachable!(),
             InstallationEffectProgressState::Unknown { ref pending_ref } => {
                 return Ok(InstallationStepOutcome::RollbackRequired {
                     pending_refs: vec![pending_ref.clone()],
@@ -7831,6 +8544,35 @@ where
                 phase_b_receipt,
                 service_runtime_lineage,
             } => {
+                if matches!(
+                    transaction.installer_effects[index],
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                ) {
+                    let Some(receipt) = transaction.effect_progress[index]
+                        .user_mode_authority_receipt
+                        .as_ref()
+                    else {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:missing-user-mode-authority-receipt")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    };
+                    if !was_intent
+                        || disposition != InstallationEffectDisposition::CreatedByTransaction
+                        || external_identity != receipt.target
+                        || postcondition_digest.as_str()
+                            != receipt.trust_anchor.public_key_fingerprint
+                    {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:user-mode-authority-receipt-readback")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    }
+                }
                 let caller_start_lineage_matches = match transaction.effect_progress[index]
                     .service_start_proof
                     .as_ref()
@@ -7900,6 +8642,7 @@ where
                         transaction.installer_effects[index],
                         InstallerEffectPlan::RegisterService { .. }
                             | InstallerEffectPlan::StartService { .. }
+                            | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                             | InstallerEffectPlan::MaterializePhaseB { .. }
                     )
                     && transaction.effect_progress[index]
@@ -7917,9 +8660,13 @@ where
                     );
                 } else if was_intent
                     && disposition == InstallationEffectDisposition::PreexistingMatching
-                    && transaction.effect_progress[index]
+                    && (transaction.effect_progress[index]
                         .ownership_secret
                         .is_some()
+                        || matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                        ))
                 {
                     return self.persist_unknown(
                         transaction,
@@ -7968,6 +8715,12 @@ where
                             && observed_precondition.os_snapshot.is_none()
                             && observed_precondition.package_snapshot.is_none()
                     }
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+                        observed_precondition.user_mode_authority_snapshot.is_some()
+                            && observed_precondition.os_snapshot.is_none()
+                            && observed_precondition.credential_snapshot.is_none()
+                            && observed_precondition.package_snapshot.is_none()
+                    }
                     InstallerEffectPlan::StagePackage { .. } => {
                         observed_precondition.package_snapshot.is_some()
                             && observed_precondition.os_snapshot.is_none()
@@ -7993,8 +8746,37 @@ where
                         transaction,
                         index,
                         PlatformHandle::new("mismatch:precondition")
-                            .map_err(|error| platform_error(&error))?,
+                        .map_err(|error| platform_error(&error))?,
                     );
+                }
+                if was_intent
+                    && matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                    )
+                {
+                    let receipt = transaction.effect_progress[index]
+                        .user_mode_authority_receipt
+                        .clone()
+                        .ok_or(InstallationError::IdentityConflict)?;
+                    let (intent_attempt, intent_digest) =
+                        match &transaction.effect_progress[index].state {
+                            InstallationEffectProgressState::IntentCommitted {
+                                attempt,
+                                intent_digest,
+                            } => (*attempt, intent_digest.clone()),
+                            _ => return Err(InstallationError::IdentityConflict),
+                        };
+                    if !self.port.has_prepared_user_mode_authority(&receipt) {
+                        return self.persist_user_mode_no_effect_aborted(
+                            transaction,
+                            index,
+                            intent_attempt,
+                            intent_digest,
+                            observed_precondition,
+                            evidence,
+                        );
+                    }
                 }
                 if was_intent
                     && matches!(
@@ -8041,6 +8823,7 @@ where
                     InstallerEffectPlan::CreateRoot { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::StagePackage { .. }
+                        | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                 );
                 let next_attempt = if was_intent && !preserves_secret_attempt {
                     attempt
@@ -8109,22 +8892,70 @@ where
                                 });
                         }
                     }
+                    if matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                    ) {
+                        let provisional = effect_request(
+                            &transaction,
+                            index,
+                            attempt,
+                            InstallationEffectAction::Apply,
+                            None,
+                        )?;
+                        let receipt = match self.port.prepare_user_mode_authority(&provisional) {
+                            PortOutcome::Known(receipt) => receipt,
+                            PortOutcome::Error(_) | PortOutcome::Unknown(_) => {
+                                // Preparation generates an in-memory seed and
+                                // a secret-free commitment only; it performs
+                                // no external write. Without that receipt there
+                                // is no effect intent to reconcile or roll back.
+                                return Err(InstallationError::Platform(
+                                    "current-user authority prewrite receipt could not be prepared"
+                                        .to_owned(),
+                                ));
+                            }
+                        };
+                        transaction.effect_progress[index].user_mode_authority_receipt =
+                            Some(receipt.clone());
+                    }
                 }
-                let mut request = effect_request(
-                    &transaction,
-                    index,
-                    next_attempt,
-                    InstallationEffectAction::Apply,
-                    None,
-                )?;
-                transaction.effect_progress[index].state =
-                    InstallationEffectProgressState::IntentCommitted {
-                        attempt: next_attempt,
-                        intent_digest: request.intent_digest()?,
-                    };
-                increment_revision(&mut transaction)?;
-                transaction.validate()?;
-                self.store.compare_and_save(expected, &transaction)?;
+                let prepared_user_mode_receipt = transaction.effect_progress[index]
+                    .user_mode_authority_receipt
+                    .clone()
+                    .filter(|_| {
+                        matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                        ) && !was_intent
+                    });
+                let intent_commit = (|| {
+                    let request = effect_request(
+                        &transaction,
+                        index,
+                        next_attempt,
+                        InstallationEffectAction::Apply,
+                        None,
+                    )?;
+                    transaction.effect_progress[index].state =
+                        InstallationEffectProgressState::IntentCommitted {
+                            attempt: next_attempt,
+                            intent_digest: request.intent_digest()?,
+                        };
+                    increment_revision(&mut transaction)?;
+                    transaction.validate()?;
+                    self.store.compare_and_save(expected, &transaction)?;
+                    Ok::<_, InstallationError>(request)
+                })();
+                let mut request = match intent_commit {
+                    Ok(request) => request,
+                    Err(error) => {
+                        if let Some(receipt) = prepared_user_mode_receipt.as_ref() {
+                            self.port.discard_prepared_user_mode_authority(receipt);
+                        }
+                        return Err(error);
+                    }
+                };
                 if matches!(
                     transaction.installer_effects[index],
                     InstallerEffectPlan::CreateRoot { .. }
@@ -8274,6 +9105,17 @@ where
                         // the next process to reconcile SCM before any new
                         // start call can be considered. Unknown does not
                         // authorize a replay or a rollback stop.
+                        return Ok(InstallationStepOutcome::Rejected);
+                    }
+                    PortOutcome::Unknown(_reason)
+                        if matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                        ) && request.action == InstallationEffectAction::Apply =>
+                    {
+                        // The original receipt and intent remain durable. The
+                        // next pass must read back that exact commitment; it
+                        // never generates a replacement seed under this effect.
                         return Ok(InstallationStepOutcome::Rejected);
                     }
                     PortOutcome::Unknown(_reason)
@@ -8483,6 +9325,7 @@ where
                     (InstallerEffectPlan::CreateRoot { .. }, None)
                     | (
                         InstallerEffectPlan::ApplyAcl { .. }
+                        | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::MaterializePhaseB { .. }
                         | InstallerEffectPlan::StagePackage { .. }
@@ -8500,6 +9343,7 @@ where
                         InstallerEffectPlan::ApplyAcl { .. }
                         | InstallerEffectPlan::RegisterService { .. }
                         | InstallerEffectPlan::StartService { .. }
+                        | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::MaterializePhaseB { .. }
                         | InstallerEffectPlan::StagePackage { .. },
@@ -8699,6 +9543,12 @@ where
                                         transaction.installer_effects[index],
                                         InstallerEffectPlan::MaterializePhaseB { .. }
                                     ) && phase_b_receipt.is_some())
+                                    || (matches!(
+                                        transaction.installer_effects[index],
+                                        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                                    ) && transaction.effect_progress[index]
+                                        .user_mode_authority_receipt
+                                        .is_some())
                             }
                             InstallationEffectDisposition::PreexistingMatching => {
                                 ownership.is_none()
@@ -8875,6 +9725,7 @@ where
                         progress.state,
                         InstallationEffectProgressState::Unknown { .. }
                             | InstallationEffectProgressState::IntentCommitted { .. }
+                            | InstallationEffectProgressState::NoEffectAborted { .. }
                     )
                 });
             if !has_durable_rejection {
@@ -8895,6 +9746,9 @@ where
                         InstallationEffectProgressState::IntentCommitted {
                             intent_digest, ..
                         } => Some(intent_digest.clone()),
+                        InstallationEffectProgressState::NoEffectAborted {
+                            absence_digest, ..
+                        } => Some(absence_digest.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -8938,7 +9792,8 @@ where
                         .or_else(|| Some(intent_digest.clone()))
                 }
                 InstallationEffectProgressState::Pending
-                | InstallationEffectProgressState::Applied { .. } => None,
+                | InstallationEffectProgressState::Applied { .. }
+                | InstallationEffectProgressState::NoEffectAborted { .. } => None,
             });
         if let Some(pending_ref) = unreconciled {
             return self.persist_quarantined(transaction, pending_ref);
@@ -9444,6 +10299,65 @@ where
         })
     }
 
+    fn persist_user_mode_no_effect_aborted(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        index: usize,
+        attempt: u32,
+        intent_digest: PlatformHandle,
+        observed_precondition: InstallationEffectPrecondition,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        if !matches!(
+            transaction.installer_effects.get(index),
+            Some(InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. })
+        ) || attempt == 0
+            || evidence.is_empty()
+            || transaction.effect_progress[index].admitted_precondition.as_ref()
+                != Some(&observed_precondition)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let request = effect_request(
+            &transaction,
+            index,
+            attempt,
+            InstallationEffectAction::Apply,
+            None,
+        )?;
+        let matches_intent = matches!(
+            &transaction.effect_progress[index].state,
+            InstallationEffectProgressState::IntentCommitted {
+                attempt: committed_attempt,
+                intent_digest: committed_digest,
+            } if *committed_attempt == attempt && *committed_digest == intent_digest
+        );
+        if !matches_intent
+            || request.intent_digest()? != intent_digest
+            || request.precondition != observed_precondition
+            || observed_precondition.user_mode_authority_snapshot.is_none()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let absence_digest = observed_precondition.digest.clone();
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.effect_progress[index].state =
+            InstallationEffectProgressState::NoEffectAborted {
+                attempt,
+                intent_digest,
+                absence_digest,
+                evidence: evidence.clone(),
+            };
+        transaction.pending_external_changes = evidence.clone();
+        transaction.stage = InstallationStage::RollbackRequired;
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: evidence,
+        })
+    }
+
     /// Persists a durable typed rejection for a non-effect failure observed
     /// after the Host bootstrap prefix (retained Host-root reopen, registry
     /// projection open/load).
@@ -9722,6 +10636,87 @@ where
         ))
     }
 
+    /// Drives the UserMode prefix up to, but not through, Host phase-B
+    /// materialization. SCM effects are refused for this profile.
+    pub fn drive_until_user_mode_phase_b(
+        &mut self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let initial = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        if initial.profile != InstallationProfile::UserMode {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode bounded drive requires the UserMode profile".to_owned(),
+            ));
+        }
+        let max_steps = initial
+            .installer_effects
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "installer_effects".to_owned(),
+                reason: "bounded prefix limit overflow".to_owned(),
+            })?;
+        for _ in 0..max_steps {
+            let current = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+                InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                }
+            })?;
+            let Some(index) = current.effect_progress.iter().position(|progress| {
+                !matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Applied { .. }
+                        | InstallationEffectProgressState::NoEffectAborted { .. }
+                )
+            }) else {
+                return Ok(InstallationStepOutcome::Applied {
+                    stage: current.stage,
+                    evidence_refs: current.observed_postconditions,
+                });
+            };
+            if matches!(
+                current.installer_effects[index],
+                InstallerEffectPlan::MaterializeUserModePhaseB { .. }
+            ) {
+                return Ok(InstallationStepOutcome::Applied {
+                    stage: current.stage,
+                    evidence_refs: current.observed_postconditions,
+                });
+            }
+            if matches!(
+                current.installer_effects[index],
+                InstallerEffectPlan::RegisterService { .. }
+                    | InstallerEffectPlan::StartService { .. }
+                    | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                    | InstallerEffectPlan::MaterializePhaseB { .. }
+            ) {
+                return Err(InstallationError::ProfileViolation(
+                    "UserMode prefix contains a SystemService-only effect".to_owned(),
+                ));
+            }
+            match self.inner.drive_effect(transaction_id)? {
+                applied @ InstallationStepOutcome::Applied { .. } => {
+                    if self.inner.store().load(transaction_id)?.is_some_and(|transaction| {
+                        transaction.effect_progress.iter().any(|progress| matches!(
+                            progress.state,
+                            InstallationEffectProgressState::Unknown { .. }
+                        ))
+                    }) {
+                        return Ok(applied);
+                    }
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+        Err(InstallationError::IncompleteObservation(
+            "bounded UserMode prefix drive exhausted before Host phase-B".to_owned(),
+        ))
+    }
+
     /// Drives all immutable effects through the bounded installer-core loop.
     pub fn drive_all_effects_until_blocked(
         &mut self,
@@ -9776,6 +10771,656 @@ where
 }
 
 impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
+    /// Stages the exact UserMode activation projection after the durable
+    /// current-user prefix. The transaction CAS precedes the registry CAS and
+    /// the projection carries the exact Host phase-B request and authority
+    /// receipt required by Host.
+    pub fn stage_user_mode_pending_activation(
+        &mut self,
+        registry: &RedbInstallationRegistry,
+        transaction_id: &PlatformHandle,
+        expected_registry_revision: u64,
+    ) -> Result<(), InstallationError> {
+        let transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        if transaction.profile != InstallationProfile::UserMode {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode pending activation requires the UserMode profile".to_owned(),
+            ));
+        }
+        registry.stage_pending_activation_bootstrap(
+            self.inner.store_mut(),
+            transaction_id,
+            expected_registry_revision,
+        )
+    }
+
+    /// Commits the exact UserMode Host request before returning the first Host
+    /// action. A repeated call after the intent CAS is always read-only and
+    /// returns `Reconcile`; an already-applied receipt returns its persisted
+    /// values so task-only recovery does not re-enter publication.
+    pub fn begin_user_mode_phase_b(
+        &mut self,
+        registry: &RedbInstallationRegistry,
+        transaction_id: &PlatformHandle,
+    ) -> Result<UserModePhaseBCall, InstallationError> {
+        let mut transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        if transaction.profile != InstallationProfile::UserMode
+            || transaction.stage != InstallationStage::Activating
+        {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode phase-B handoff requires its staged Activating transaction".to_owned(),
+            ));
+        }
+        let pending = registry.load()?.pending_activation().cloned().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode Host phase-B requires its pending activation projection".to_owned(),
+            )
+        })?;
+        if pending.transaction_id != *transaction_id
+            || pending.plan_digest != transaction.installer_plan_digest
+            || pending.manifest != transaction.candidate_manifest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let (request, authority_receipt) =
+            approved_generation_registry::user_mode_phase_b_stage_binding(&transaction)?;
+        if pending.user_mode_phase_b_request.as_ref() != Some(&request)
+            || pending.user_mode_authority_receipt.as_ref() != Some(&authority_receipt)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let index = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| {
+                matches!(effect, InstallerEffectPlan::MaterializeUserModePhaseB { .. })
+            })
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "UserMode transaction has no phase-B materialization effect".to_owned(),
+                )
+            })?;
+        let progress = &transaction.effect_progress[index];
+        if matches!(progress.state, InstallationEffectProgressState::Applied { .. }) {
+            return Ok(UserModePhaseBCall::AlreadyApplied {
+                receipt: progress
+                    .user_mode_phase_b_receipt
+                    .clone()
+                    .ok_or(InstallationError::IdentityConflict)?,
+                launch: progress
+                    .user_mode_launch
+                    .clone()
+                    .ok_or(InstallationError::IdentityConflict)?,
+                task_request: progress
+                    .user_mode_task_request
+                    .clone()
+                    .ok_or(InstallationError::IdentityConflict)?,
+                profile_selection: progress
+                    .user_mode_profile_selection
+                    .clone()
+                    .ok_or(InstallationError::IdentityConflict)?,
+            });
+        }
+        match progress.state.clone() {
+            InstallationEffectProgressState::Pending => {
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.effect_progress[index].user_mode_phase_b_request =
+                    Some(request.clone());
+                transaction.effect_progress[index].user_mode_authority_receipt =
+                    Some(authority_receipt.clone());
+                transaction.effect_progress[index].state =
+                    InstallationEffectProgressState::IntentCommitted {
+                        attempt: 1,
+                        intent_digest: request.request_digest.clone(),
+                    };
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+                    self.inner.store_mut(), expected, &transaction,
+                )?;
+                Ok(UserModePhaseBCall::Materialize {
+                    request,
+                    authority_receipt,
+                })
+            }
+            InstallationEffectProgressState::IntentCommitted { .. }
+            | InstallationEffectProgressState::Unknown { .. } => {
+                if transaction.effect_progress[index].user_mode_phase_b_request.as_ref()
+                    != Some(&request)
+                    || transaction.effect_progress[index]
+                        .user_mode_authority_receipt
+                        .as_ref()
+                        != Some(&authority_receipt)
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(UserModePhaseBCall::Reconcile {
+                    request,
+                    authority_receipt,
+                })
+            }
+            InstallationEffectProgressState::NoEffectAborted { .. } => {
+                Err(InstallationError::IncompleteObservation(
+                    "UserMode phase-B effect was terminally aborted".to_owned(),
+                ))
+            }
+            InstallationEffectProgressState::Applied { .. } => unreachable!(),
+        }
+    }
+
+    /// CAS-records the exact Host phase-B receipt (or typed uncertainty) for
+    /// the previously committed UserMode request. It never calls Host or
+    /// performs another publication.
+    pub fn record_user_mode_phase_b_outcome(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        outcome: UserModePhaseBOutcome,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        if transaction.profile != InstallationProfile::UserMode
+            || transaction.stage != InstallationStage::Activating
+        {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode phase-B receipt requires its staged Activating transaction".to_owned(),
+            ));
+        }
+        let index = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| {
+                matches!(effect, InstallerEffectPlan::MaterializeUserModePhaseB { .. })
+            })
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "UserMode transaction has no phase-B materialization effect".to_owned(),
+                )
+            })?;
+        let progress = &transaction.effect_progress[index];
+        let request = progress
+            .user_mode_phase_b_request
+            .clone()
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "Host result requires the exact durable UserMode phase-B request".to_owned(),
+                )
+            })?;
+        if request.transaction_id != *transaction_id
+            || request.installation_plan_digest != transaction.installer_plan_digest
+            || request.candidate_manifest_digest
+                != candidate_manifest_digest(&transaction.candidate_manifest)?
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if progress.user_mode_authority_receipt.is_none() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if !matches!(
+            progress.state,
+            InstallationEffectProgressState::IntentCommitted { .. }
+                | InstallationEffectProgressState::Unknown { .. }
+        ) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let expected = TransactionVersion::of(&transaction)?;
+        match outcome {
+            UserModePhaseBOutcome::Unknown { pending_ref } => {
+                handle(&pending_ref, "user_mode_phase_b.pending_ref")?;
+                if transaction.effect_progress[index]
+                    .user_mode_phase_b_pending_ref
+                    .as_ref()
+                    .is_some_and(|existing| existing != &pending_ref)
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                transaction.effect_progress[index].user_mode_phase_b_pending_ref =
+                    Some(pending_ref.clone());
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+                    self.inner.store_mut(), expected, &transaction,
+                )?;
+                Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: vec![pending_ref],
+                })
+            }
+            UserModePhaseBOutcome::Ready {
+                receipt,
+                launch,
+                task_request,
+                profile_selection,
+            } => {
+                receipt.validate()?;
+                launch.validate()?;
+                let task_roots = &task_request.roots.roots;
+                let expected_runtime_roots = launch
+                    .runtime_state_roots
+                    .root_fields()
+                    .into_iter()
+                    .map(|(role, path)| {
+                        (role.to_owned(), PathBuf::from(path.as_str()))
+                    })
+                    .collect::<Vec<_>>();
+                if receipt.transaction_id != *transaction_id
+                    || receipt.effect_id != transaction.effect_progress[index].effect_id
+                    || receipt.candidate_manifest_digest != request.candidate_manifest_digest
+                    || receipt.request_digest != request.request_digest
+                    || launch.profile != InstallationProfile::UserMode
+                    || launch.generation != transaction.candidate_manifest.generation
+                    || launch.installation_epoch != transaction.installation_epoch
+                    || launch.runtime_state_roots_digest
+                        != transaction.candidate_manifest.runtime_state_roots_digest
+                    || launch.host_executable_path
+                        != transaction.candidate_manifest.host_executable_path
+                    || task_request.executable
+                        != PathBuf::from(transaction.candidate_manifest.host_executable_path.as_str())
+                    || task_request.executable_sha256
+                        != transaction.candidate_manifest.host_artifact_digest.as_str()
+                    || task_request.roots.profile
+                        != eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+                    || task_request.roots.installation_id
+                        != transaction.installation_epoch.installation.as_str()
+                    || task_roots.immutable_binaries
+                        != PathBuf::from(
+                            launch.profile_governed_roots.immutable_binaries.as_str(),
+                        )
+                    || task_roots.durable_data
+                        != PathBuf::from(launch.profile_governed_roots.durable_data.as_str())
+                    || task_roots.user_config
+                        != PathBuf::from(launch.profile_governed_roots.user_config.as_str())
+                    || task_roots.user_cache
+                        != PathBuf::from(launch.profile_governed_roots.user_cache.as_str())
+                    || task_roots.runtime_state_roots != expected_runtime_roots
+                    || receipt.provisioned_supervision_authority
+                        != launch.provisioned_supervision_authority()?.clone()
+                    || profile_selection.profile != InstallationProfile::UserMode
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                if let Some(existing) = &transaction.effect_progress[index].user_mode_phase_b_receipt
+                    && (existing != &receipt
+                        || transaction.effect_progress[index].user_mode_launch.as_ref()
+                            != Some(&launch)
+                        || transaction.effect_progress[index].user_mode_task_request.as_ref()
+                            != Some(&task_request)
+                        || transaction.effect_progress[index].user_mode_profile_selection.as_ref()
+                            != Some(&profile_selection))
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                transaction.effect_progress[index].user_mode_phase_b_receipt =
+                    Some(receipt.clone());
+                transaction.effect_progress[index].user_mode_launch = Some(launch);
+                transaction.effect_progress[index].user_mode_task_request =
+                    Some(task_request);
+                transaction.effect_progress[index].user_mode_profile_selection =
+                    Some(profile_selection);
+                transaction.effect_progress[index].user_mode_phase_b_pending_ref = None;
+                transaction.effect_progress[index].state = InstallationEffectProgressState::Applied {
+                    disposition: InstallationEffectDisposition::CreatedByTransaction,
+                    external_identity: receipt.receipt_digest.clone(),
+                    evidence: vec![receipt.receipt_digest.clone()],
+                    postcondition_digest: receipt.receipt_digest,
+                };
+                transaction
+                    .observed_postconditions
+                    .push(transaction.effect_progress[index].user_mode_phase_b_receipt
+                        .as_ref()
+                        .ok_or(InstallationError::IdentityConflict)?
+                        .receipt_digest
+                        .clone());
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+                    self.inner.store_mut(), expected, &transaction,
+                )?;
+                Ok(InstallationStepOutcome::Applied {
+                    stage: transaction.stage,
+                    evidence_refs: transaction.observed_postconditions,
+                })
+            }
+        }
+    }
+
+    /// Reconciles or executes the exact UserMode Task Scheduler effect.
+    /// Request and authoritative pre-write absence are committed before the
+    /// first registration call; once intent exists, this method is read-only.
+    pub fn drive_until_user_mode_task(
+        &mut self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        if transaction.profile != InstallationProfile::UserMode
+            || transaction.stage != InstallationStage::Activating
+        {
+            return Err(InstallationError::ProfileViolation(
+                "Task Scheduler effect requires a staged UserMode activation".to_owned(),
+            ));
+        }
+        let phase_b_index = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| {
+                matches!(effect, InstallerEffectPlan::MaterializeUserModePhaseB { .. })
+            })
+            .ok_or_else(|| InstallationError::IdentityConflict)?;
+        if !matches!(
+            transaction.effect_progress[phase_b_index].state,
+            InstallationEffectProgressState::Applied { .. }
+        ) {
+            return Err(InstallationError::IncompleteObservation(
+                "Task Scheduler registration is fenced until UserMode phase-B is applied"
+                    .to_owned(),
+            ));
+        }
+        let task_index = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::RegisterUserModeTask { .. }))
+            .ok_or_else(|| InstallationError::IdentityConflict)?;
+        if task_index != phase_b_index + 1 {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let request = transaction.effect_progress[phase_b_index]
+            .user_mode_task_request
+            .clone()
+            .ok_or(InstallationError::IdentityConflict)?;
+        let expected_selection = transaction.effect_progress[phase_b_index]
+            .user_mode_profile_selection
+            .clone()
+            .ok_or(InstallationError::IdentityConflict)?;
+        let state = transaction.effect_progress[task_index].state.clone();
+        match state {
+            InstallationEffectProgressState::Pending => {
+                let observation =
+                    eliot_platform_windows::profile_supervision::inspect_current_user_task(
+                        &request, None,
+                    )
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                let eliot_platform_windows::profile_supervision::CurrentUserTaskObservation::Absent {
+                    ..
+                } = &observation
+                else {
+                    return Err(InstallationError::IdentityConflict);
+                };
+                let expected = TransactionVersion::of(&transaction)?;
+                let intent_digest = user_mode_task_intent_digest(&request, &observation)?;
+                transaction.effect_progress[task_index].user_mode_task_request =
+                    Some(request.clone());
+                transaction.effect_progress[task_index].user_mode_task_absence =
+                    Some(observation.clone());
+                transaction.effect_progress[task_index].state =
+                    InstallationEffectProgressState::IntentCommitted {
+                        attempt: 1,
+                        intent_digest,
+                    };
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+                    self.inner.store_mut(), expected, &transaction,
+                )?;
+                match eliot_platform_windows::profile_supervision::register_current_user_task(
+                    &request,
+                ) {
+                    Ok(receipt) => {
+                        let observed = eliot_platform_windows::profile_supervision::inspect_current_user_task(
+                            &request,
+                            Some(&receipt),
+                        )
+                        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                        let eliot_platform_windows::profile_supervision::CurrentUserTaskObservation::Matching {
+                            receipt: exact_receipt,
+                            ..
+                        } = observed
+                        else {
+                            return self.persist_user_mode_task_unknown(
+                                transaction_id,
+                                user_mode_task_pending_ref(transaction.effect_progress[task_index].effect_id.as_str())?,
+                            );
+                        };
+                        if receipt != exact_receipt
+                            || receipt.request != request
+                            || receipt.selection != expected_selection
+                        {
+                            return self.persist_user_mode_task_unknown(
+                                transaction_id,
+                                user_mode_task_pending_ref(transaction.effect_progress[task_index].effect_id.as_str())?,
+                            );
+                        }
+                        self.persist_user_mode_task_receipt(
+                            transaction_id,
+                            task_index,
+                            receipt,
+                        )
+                    }
+                    Err(error) => {
+                        let pending_ref = user_mode_task_pending_ref(
+                            transaction.effect_progress[task_index].effect_id.as_str(),
+                        )?;
+                        match error {
+                            eliot_platform_windows::profile_supervision::CurrentUserTaskRegistrationError::Rejected(
+                                cause,
+                            ) => Err(InstallationError::Platform(cause.to_string())),
+                            eliot_platform_windows::profile_supervision::CurrentUserTaskRegistrationError::CleanupRequired { .. }
+                            | eliot_platform_windows::profile_supervision::CurrentUserTaskRegistrationError::CommittedUnknown { .. } => {
+                                self.persist_user_mode_task_unknown(transaction_id, pending_ref)
+                            }
+                        }
+                    }
+                }
+            }
+            InstallationEffectProgressState::IntentCommitted { .. }
+            | InstallationEffectProgressState::Unknown { .. } => {
+                if transaction.effect_progress[task_index]
+                    .user_mode_task_request
+                    .as_ref()
+                    != Some(&request)
+                    || !matches!(
+                        transaction.effect_progress[task_index]
+                            .user_mode_task_absence,
+                        Some(eliot_platform_windows::profile_supervision::CurrentUserTaskObservation::Absent { .. })
+                    )
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let observation =
+                    eliot_platform_windows::profile_supervision::inspect_current_user_task(
+                        &request, None,
+                    )
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                match observation {
+                    eliot_platform_windows::profile_supervision::CurrentUserTaskObservation::Matching {
+                        receipt,
+                        ..
+                    } if receipt.request == request && receipt.selection == expected_selection => {
+                        self.persist_user_mode_task_receipt(transaction_id, task_index, receipt)
+                    }
+                    eliot_platform_windows::profile_supervision::CurrentUserTaskObservation::Absent { .. }
+                    | eliot_platform_windows::profile_supervision::CurrentUserTaskObservation::Mismatch { .. }
+                    | eliot_platform_windows::profile_supervision::CurrentUserTaskObservation::Matching { .. } => {
+                        let pending_ref = user_mode_task_pending_ref(
+                            transaction.effect_progress[task_index].effect_id.as_str(),
+                        )?;
+                        self.persist_user_mode_task_unknown(transaction_id, pending_ref)
+                    }
+                }
+            }
+            InstallationEffectProgressState::Applied { .. } => {
+                Ok(InstallationStepOutcome::Applied {
+                    stage: transaction.stage,
+                    evidence_refs: transaction.observed_postconditions,
+                })
+            }
+            InstallationEffectProgressState::NoEffectAborted { .. } => {
+                Err(InstallationError::IncompleteObservation(
+                    "UserMode Task Scheduler effect was terminally aborted".to_owned(),
+                ))
+            }
+        }
+    }
+
+
+    fn persist_user_mode_task_receipt(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        effect_index: usize,
+        receipt: CurrentUserTaskReceipt,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let progress = transaction
+            .effect_progress
+            .get(effect_index)
+            .ok_or(InstallationError::IdentityConflict)?;
+        if transaction.profile != InstallationProfile::UserMode
+            || transaction.stage != InstallationStage::Activating
+            || !matches!(
+                progress.state,
+                InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Unknown { .. }
+            )
+            || progress.user_mode_task_request.as_ref() != Some(&receipt.request)
+            || !matches!(
+                progress.user_mode_task_absence,
+                Some(CurrentUserTaskObservation::Absent { .. })
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let phase_b = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::MaterializeUserModePhaseB { .. }))
+            .ok_or(InstallationError::IdentityConflict)?;
+        let expected_selection = transaction.effect_progress[phase_b]
+            .user_mode_profile_selection
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?;
+        let progress = &transaction.effect_progress[effect_index];
+        if receipt.request.transaction_id != *transaction_id
+            || receipt.request.effect_id != progress.effect_id
+            || receipt.selection != *expected_selection
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if let Some(existing) = &progress.user_mode_task_receipt
+            && existing != &receipt
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let external_identity = PlatformHandle::new(receipt.task_xml_sha256.clone()).map_err(
+            |error| InstallationError::InvalidField {
+                field: "user_mode_task_receipt.task_xml_sha256".to_owned(),
+                reason: error.to_string(),
+            },
+        )?;
+        sha256_handle(&external_identity, "user_mode_task_receipt.task_xml_sha256")?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.effect_progress[effect_index].user_mode_task_receipt = Some(receipt);
+        transaction.effect_progress[effect_index].user_mode_task_pending_ref = None;
+        transaction.effect_progress[effect_index].state =
+            InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                external_identity: external_identity.clone(),
+                evidence: vec![external_identity.clone()],
+                postcondition_digest: external_identity.clone(),
+            };
+        transaction.observed_postconditions.push(external_identity);
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            self.inner.store_mut(),
+            expected,
+            &transaction,
+        )?;
+        Ok(InstallationStepOutcome::Applied {
+            stage: transaction.stage,
+            evidence_refs: transaction.observed_postconditions,
+        })
+    }
+
+    fn persist_user_mode_task_unknown(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        handle(&pending_ref, "user_mode_task.pending_ref")?;
+        let mut transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let task_index = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::RegisterUserModeTask { .. }))
+            .ok_or(InstallationError::IdentityConflict)?;
+        let progress = &transaction.effect_progress[task_index];
+        if transaction.profile != InstallationProfile::UserMode
+            || transaction.stage != InstallationStage::Activating
+            || progress.user_mode_task_request.is_none()
+            || !matches!(
+                progress.user_mode_task_absence,
+                Some(CurrentUserTaskObservation::Absent { .. })
+            )
+            || !matches!(
+                progress.state,
+                InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Unknown { .. }
+            )
+            || progress.user_mode_task_receipt.is_some()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if progress
+            .user_mode_task_pending_ref
+            .as_ref()
+            .is_some_and(|existing| existing != &pending_ref)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.effect_progress[task_index].user_mode_task_pending_ref =
+            Some(pending_ref.clone());
+        transaction.effect_progress[task_index].state =
+            InstallationEffectProgressState::Unknown {
+                pending_ref: pending_ref.clone(),
+            };
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            self.inner.store_mut(),
+            expected,
+            &transaction,
+        )?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: vec![pending_ref],
+        })
+    }
+
     /// Rolls back a first-install activation intent only after the Host-owned
     /// registry has durably acknowledged the exact `ABORTED` terminal.
     ///
@@ -10140,6 +11785,33 @@ fn increment_revision(transaction: &mut InstallationTransaction) -> Result<(), I
     Ok(())
 }
 
+fn user_mode_task_intent_digest(
+    request: &CurrentUserTaskRequest,
+    absence: &CurrentUserTaskObservation,
+) -> Result<PlatformHandle, InstallationError> {
+    if !matches!(absence, CurrentUserTaskObservation::Absent { .. }) {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let bytes = canonical_json_bytes(&("eliot.user-mode-task-intent.v1", request, absence))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "user_mode_task.intent_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+    PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+        field: "user_mode_task.intent_digest".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn user_mode_task_pending_ref(effect_id: &str) -> Result<PlatformHandle, InstallationError> {
+    PlatformHandle::new(format!("user-mode-task-pending:{effect_id}")).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "user_mode_task.pending_ref".to_owned(),
+            reason: error.to_string(),
+        }
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "W3-02 will extract the effect-request capability cell"
@@ -10222,6 +11894,7 @@ fn effect_request(
             .clone()
             .or(inherited_store_credential),
         staging_receipt: progress.staging_receipt.clone(),
+        user_mode_authority_receipt: progress.user_mode_authority_receipt.clone(),
         action,
         expected_external_identity,
         service_bootstrap: is_service

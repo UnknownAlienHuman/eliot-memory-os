@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use super::profile_governed_roots::ProfileGovernedRoots;
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
 use super::{
-    InstallationError, PlatformHandle, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider,
+    InstallationError, WindowsPathIdentity, WindowsRuntimeRootLeaseProvider,
     joined_windows_path, text,
 };
 

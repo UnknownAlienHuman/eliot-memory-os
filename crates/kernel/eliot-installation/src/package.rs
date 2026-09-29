@@ -481,6 +481,7 @@ fn stage_package_authorization(
         manifest,
         staging_root,
         destination_root,
+        ..
     } = &request.plan
     else {
         return Err(PackageStagingError::Io);

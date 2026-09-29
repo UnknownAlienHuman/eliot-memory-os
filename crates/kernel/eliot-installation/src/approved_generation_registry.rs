@@ -833,6 +833,60 @@ impl AgentBridgePhaseBBinding {
     }
 }
 
+pub(super) fn user_mode_phase_b_stage_binding(
+    transaction: &InstallationTransaction,
+) -> Result<(
+    super::UserModePhaseBMaterializationRequest,
+    eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt,
+), InstallationError> {
+    if transaction.profile != InstallationProfile::UserMode {
+        return Err(InstallationError::ProfileViolation(
+            "UserMode phase-B staging requires the UserMode profile".to_owned(),
+        ));
+    }
+    let (effect_id, static_template, agent_bridge_source) = transaction
+        .installer_effects()
+        .iter()
+        .find_map(|effect| match effect {
+            super::InstallerEffectPlan::MaterializeUserModePhaseB {
+                effect_id,
+                static_template,
+                agent_bridge_source,
+                ..
+            } => Some((effect_id.clone(), static_template.clone(), agent_bridge_source.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode transaction has no phase-B materialization effect".to_owned(),
+            )
+        })?;
+    let authority_receipt = transaction
+        .installer_effects()
+        .iter()
+        .zip(transaction.effect_progress())
+        .find_map(|(effect, progress)| {
+            matches!(
+                effect,
+                super::InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+            )
+            .then(|| progress.user_mode_authority_receipt.clone())
+            .flatten()
+        })
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode phase-B staging requires the original authority receipt".to_owned(),
+            )
+        })?;
+    let request = super::UserModePhaseBMaterializationRequest::from_transaction_effect(
+        transaction,
+        effect_id,
+        static_template,
+        agent_bridge_source,
+    )?;
+    Ok((request, authority_receipt))
+}
+
 /// Host-owned durable preparation record for one Phase-B publication.
 ///
 /// The record is committed before the first destination write.  It is the
@@ -2812,6 +2866,21 @@ pub struct PendingActivation {
     /// the pending generation. This is query/reconcile evidence only; it does
     /// not make the pending registry generation active.
     pub phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
+    /// Exact UserMode Host request staged by the transaction before Host is
+    /// allowed to publish any phase-B destination.
+    pub user_mode_phase_b_request: Option<super::UserModePhaseBMaterializationRequest>,
+    /// Original UserMode authority receipt joined to the staged request.
+    pub user_mode_authority_receipt:
+        Option<eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt>,
+    /// Durable pre-write UserMode Host preparation, separate from SCM intent.
+    pub user_mode_phase_b_prepared: Option<super::UserModePhaseBPreparedMaterialization>,
+    /// Durable UserMode root identities returned by the retained Host leases.
+    pub user_mode_profile_selection:
+        Option<eliot_platform_windows::profile_supervision::ProfileSelectionReceipt>,
+    /// Host's UserMode Phase-B receipt for the exact request.
+    pub user_mode_phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
+    /// Host recovery reference retained when phase-B publication is uncertain.
+    pub user_mode_phase_b_pending_ref: Option<PlatformHandle>,
     /// Durable recovery disposition after an interrupted/failed attempt.
     pub state: PendingActivationState,
 }
@@ -3128,6 +3197,12 @@ impl ApprovedGenerationRegistry {
             phase_b_prepared_receipt: None,
             phase_b_agent_bridge_stage_prepared: None,
             phase_b_receipt: None,
+            user_mode_phase_b_request: None,
+            user_mode_authority_receipt: None,
+            user_mode_phase_b_prepared: None,
+            user_mode_profile_selection: None,
+            user_mode_phase_b_receipt: None,
+            user_mode_phase_b_pending_ref: None,
             state: PendingActivationState::Pending,
         };
         if let Some(existing) = &self.pending_activation {
@@ -3241,7 +3316,23 @@ impl ApprovedGenerationRegistry {
             approval,
             &activation_intent_digest,
             &approvals,
-        )
+        )?;
+        if transaction.profile == InstallationProfile::UserMode {
+            let (request, authority_receipt) =
+                user_mode_phase_b_stage_binding(transaction)?;
+            let pending = self.pending_activation.as_mut().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            if pending.user_mode_phase_b_request.as_ref().is_some_and(|existing| existing != &request)
+                || pending.user_mode_authority_receipt.as_ref().is_some_and(|existing| existing != &authority_receipt)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            pending.user_mode_phase_b_request = Some(request);
+            pending.user_mode_authority_receipt = Some(authority_receipt);
+            self.validate()?;
+        }
+        Ok(())
     }
 
     /// Applies the exact replay/conflict rule for one already-identified
@@ -4792,6 +4883,10 @@ impl PendingActivation {
             || self.phase_b_prepared_receipt.is_some()
             || self.phase_b_agent_bridge_stage_prepared.is_some()
             || self.phase_b_receipt.is_some()
+            || self.user_mode_phase_b_request.is_some()
+            || self.user_mode_phase_b_prepared.is_some()
+            || self.user_mode_phase_b_receipt.is_some()
+            || self.user_mode_phase_b_pending_ref.is_some()
         {
             return Err(InstallationError::IncompleteObservation(
                 "pending activation has Phase-B progress; abort would erase a recovery carrier"
@@ -5009,6 +5104,71 @@ impl PendingActivation {
                 }
                 _ => return Err(InstallationError::IdentityConflict),
             }
+        }
+        let user_mode_fields_present = self.user_mode_phase_b_request.is_some()
+            || self.user_mode_authority_receipt.is_some()
+            || self.user_mode_phase_b_prepared.is_some()
+            || self.user_mode_profile_selection.is_some()
+            || self.user_mode_phase_b_receipt.is_some()
+            || self.user_mode_phase_b_pending_ref.is_some();
+        if user_mode_fields_present
+            && self.manifest.runtime_launch.profile != InstallationProfile::UserMode
+        {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode phase-B projection fields require the UserMode profile".to_owned(),
+            ));
+        }
+        if let Some(request) = &self.user_mode_phase_b_request {
+            request.validate()?;
+            if request.transaction_id != self.transaction_id
+                || request.installation_plan_digest != self.plan_digest
+                || request.candidate_manifest_digest != self.manifest_digest
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if self.user_mode_authority_receipt.is_none() {
+                return Err(InstallationError::IncompleteObservation(
+                    "UserMode phase-B request requires the original authority receipt".to_owned(),
+                ));
+            }
+        } else if self.user_mode_authority_receipt.is_some()
+            || self.user_mode_phase_b_prepared.is_some()
+            || self.user_mode_profile_selection.is_some()
+            || self.user_mode_phase_b_receipt.is_some()
+            || self.user_mode_phase_b_pending_ref.is_some()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if let Some(prepared) = &self.user_mode_phase_b_prepared {
+            prepared.validate()?;
+            if Some(&prepared.request) != self.user_mode_phase_b_request.as_ref()
+                || Some(&prepared.authority_receipt) != self.user_mode_authority_receipt.as_ref()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        if let Some(receipt) = &self.user_mode_phase_b_receipt {
+            receipt.validate()?;
+            let request = self
+                .user_mode_phase_b_request
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            let prepared = self
+                .user_mode_phase_b_prepared
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            if receipt.transaction_id != request.transaction_id
+                || receipt.effect_id != request.effect_id
+                || receipt.candidate_manifest_digest != request.candidate_manifest_digest
+                || receipt.request_digest != request.request_digest
+                || self.user_mode_profile_selection.is_none()
+                || prepared.prepared.transaction_id != receipt.transaction_id
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        if let Some(pending_ref) = &self.user_mode_phase_b_pending_ref {
+            handle(pending_ref, "pending_activation.user_mode_phase_b_pending_ref")?;
         }
         if let PendingActivationState::RecoveryRequired { reason } = &self.state {
             text(reason, "pending_activation.state.reason")?;

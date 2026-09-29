@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     InstallationError, PlatformHandle, WindowsPathIdentity, current_user_local_app_data_root,
     joined_windows_path, protected_program_data_root, runtime_sha256_handle, same_windows_root,
-    sha256_hex, text, valid_installation_key, validate_installation_key,
+    sha256_hex, text, validate_installation_key,
 };
 
 /// The supported installation supervision and path profiles.
@@ -273,9 +273,14 @@ impl RuntimeStateRoots {
         }
         Self::validate_profile_anchor_path_os(profile, &profile_anchor_root)?;
         validate_installation_key(installation_key)?;
+        let installation_suffix = match profile {
+            InstallationProfile::SystemService => "Eliot\\installations",
+            InstallationProfile::UserMode => "Eliot\\data\\installations",
+            InstallationProfile::PortableDev => unreachable!("PortableDev is rejected above"),
+        };
         let installation_root = PlatformHandle::new(joined_windows_path(
             profile_anchor_root.as_str(),
-            &format!("Eliot\\installations\\{installation_key}"),
+            &format!("{installation_suffix}\\{installation_key}"),
         ))
         .map_err(|error| InstallationError::InvalidField {
             field: "runtime_state_roots.installation_root".to_owned(),
@@ -292,10 +297,18 @@ impl RuntimeStateRoots {
             InstallationProfile::PortableDev,
             &retained_portable_root,
         )?;
+        let state_root = PlatformHandle::new(joined_windows_path(
+            retained_portable_root.as_str(),
+            ".eliot-dev\\state",
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "runtime_state_roots.installation_root".to_owned(),
+            reason: error.to_string(),
+        })?;
         Self::derived(
             InstallationProfile::PortableDev,
-            retained_portable_root.clone(),
             retained_portable_root,
+            state_root,
         )
     }
 
@@ -391,7 +404,7 @@ impl RuntimeStateRoots {
 
     pub(super) fn installer_profile_root(&self) -> Result<PlatformHandle, InstallationError> {
         match self.profile {
-            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+            InstallationProfile::SystemService => {
                 PlatformHandle::new(joined_windows_path(
                     self.profile_anchor_root.as_str(),
                     "Eliot",
@@ -401,6 +414,14 @@ impl RuntimeStateRoots {
                     reason: error.to_string(),
                 })
             }
+            InstallationProfile::UserMode => PlatformHandle::new(joined_windows_path(
+                self.profile_anchor_root.as_str(),
+                "Eliot\\data",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.profile_root".to_owned(),
+                reason: error.to_string(),
+            }),
             InstallationProfile::PortableDev => Ok(self.installation_root.clone()),
         }
     }
@@ -454,12 +475,32 @@ impl RuntimeStateRoots {
                         field: "runtime_state_roots.installations_root".to_owned(),
                         reason: error.to_string(),
                     })?;
+            if self.profile == InstallationProfile::UserMode {
+                let product_root = PlatformHandle::new(joined_windows_path(
+                    self.profile_anchor_root.as_str(),
+                    "Eliot",
+                ))
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "runtime_state_roots.profile_root".to_owned(),
+                    reason: error.to_string(),
+                })?;
+                hierarchy.push(("product_root", product_root));
+            }
             hierarchy.push(("profile_root", profile_root));
             hierarchy.push(("packages_root", packages_root));
             hierarchy.push(("installations_root", installations_root));
         }
         hierarchy.push(("installation_root", self.installation_root.clone()));
         if self.profile == InstallationProfile::PortableDev {
+            let dev_root = PlatformHandle::new(joined_windows_path(
+                self.profile_anchor_root.as_str(),
+                ".eliot-dev",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.portable_dev_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            hierarchy.insert(0, ("portable_dev_root", dev_root));
             hierarchy.extend(
                 self.root_fields()
                     .into_iter()
@@ -574,32 +615,29 @@ impl RuntimeStateRoots {
                     ));
                 };
                 validate_installation_key(key)?;
-                if installation.components.len() < 3
-                    || !installation.ends_with(&["eliot", "installations", key])
+                let expected_suffix = match self.profile {
+                    InstallationProfile::SystemService => ["eliot", "installations", key],
+                    InstallationProfile::UserMode => ["eliot", "data", "installations", key],
+                    InstallationProfile::PortableDev => unreachable!(),
+                };
+                if installation.components.len() < expected_suffix.len()
+                    || !installation.ends_with(&expected_suffix)
                 {
                     return Err(InstallationError::ProfileViolation(
-                        "profiled installation root must end in Eliot/installations/<key>"
+                        "profiled installation root must follow its current I3.1 data contour"
                             .to_owned(),
                     ));
                 }
             }
             InstallationProfile::PortableDev => {
-                if anchor != installation {
+                if !anchor.contains(&installation)
+                    || installation == anchor
+                    || !installation.ends_with(&[".eliot-dev", "state"])
+                {
                     return Err(InstallationError::ProfileViolation(
-                        "portable_dev installation root must equal its retained portable root"
+                        "portable_dev installation root must be .eliot-dev/state below its retained repository root"
                             .to_owned(),
                     ));
-                }
-                if installation.components.len() >= 3 {
-                    let last = installation.components.last().map_or("", String::as_str);
-                    if valid_installation_key(last)
-                        && installation.ends_with(&["eliot", "installations", last])
-                    {
-                        return Err(InstallationError::ProfileViolation(
-                            "portable_dev must not alias a profiled durable installation root"
-                                .to_owned(),
-                        ));
-                    }
                 }
             }
         }

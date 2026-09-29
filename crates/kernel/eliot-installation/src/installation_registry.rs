@@ -749,6 +749,170 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Atomically records the UserMode Host preparation after its exact typed
+    /// request and original authority receipt have been staged. This is a
+    /// separate durable carrier and never uses the SCM `phase_b_intent` path.
+    pub fn record_pending_user_mode_phase_b_prepared(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        request: &super::UserModePhaseBMaterializationRequest,
+        authority_receipt: &eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt,
+        prepared: &HostPhaseBPreparedMaterialization,
+    ) -> Result<super::UserModePhaseBPreparedMaterialization, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        request.validate()?;
+        prepared.validate()?;
+        let request = request.clone();
+        let authority_receipt = authority_receipt.clone();
+        let prepared = prepared.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            self.validate_host_owner_binding(host, pending)?;
+            if pending.manifest.runtime_launch.profile != InstallationProfile::UserMode
+                || pending.phase_b_intent.is_some()
+                || pending.user_mode_phase_b_request.as_ref() != Some(&request)
+                || pending.user_mode_authority_receipt.as_ref() != Some(&authority_receipt)
+                || prepared.transaction_id != request.transaction_id
+                || prepared.effect_id != request.effect_id
+                || prepared.manifest_digest != request.candidate_manifest_digest
+                || prepared.request_digest != request.request_digest
+                || prepared.launch.profile != InstallationProfile::UserMode
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let wrapper = super::UserModePhaseBPreparedMaterialization {
+                request: request.clone(),
+                authority_receipt: authority_receipt.clone(),
+                prepared: prepared.clone(),
+            };
+            wrapper.validate()?;
+            if let Some(existing) = &pending.user_mode_phase_b_prepared {
+                if existing != &wrapper {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                return Ok(existing.clone());
+            }
+            let pending = registry.pending_activation.as_mut().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            pending.user_mode_phase_b_prepared = Some(wrapper.clone());
+            registry.validate()?;
+            Ok(wrapper)
+        })
+    }
+
+    /// Atomically records the exact UserMode phase-B receipt and root identity
+    /// selection. Host publication is a query/reconcile proof and does not
+    /// activate the pending generation.
+    pub fn record_pending_user_mode_phase_b_receipt(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        request: &super::UserModePhaseBMaterializationRequest,
+        receipt: &HostPhaseBMaterializationReceipt,
+        profile_selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    ) -> Result<HostPhaseBMaterializationReceipt, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        request.validate()?;
+        receipt.validate()?;
+        let request = request.clone();
+        let receipt = receipt.clone();
+        let profile_selection = profile_selection.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            self.validate_host_owner_binding(host, pending)?;
+            let prepared = pending
+                .user_mode_phase_b_prepared
+                .as_ref()
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "UserMode receipt requires its durable pre-write preparation".to_owned(),
+                    )
+                })?;
+            if pending.manifest.runtime_launch.profile != InstallationProfile::UserMode
+                || pending.phase_b_intent.is_some()
+                || pending.user_mode_phase_b_request.as_ref() != Some(&request)
+                || prepared.request != request
+                || receipt.transaction_id != request.transaction_id
+                || receipt.effect_id != request.effect_id
+                || receipt.candidate_manifest_digest != request.candidate_manifest_digest
+                || receipt.request_digest != request.request_digest
+                || prepared.prepared.transaction_id != receipt.transaction_id
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if let Some(existing) = &pending.user_mode_phase_b_receipt {
+                if existing != &receipt
+                    || pending.user_mode_profile_selection.as_ref() != Some(&profile_selection)
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                return Ok(existing.clone());
+            }
+            let pending = registry.pending_activation.as_mut().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            pending.user_mode_phase_b_receipt = Some(receipt.clone());
+            pending.user_mode_profile_selection = Some(profile_selection);
+            pending.user_mode_phase_b_pending_ref = None;
+            registry.validate()?;
+            Ok(receipt)
+        })
+    }
+
+    /// Retains a typed uncertainty reference for one exact UserMode phase-B
+    /// request. Reconciliation reads the durable preparation and never
+    /// republishes merely because this method was called again.
+    pub fn record_pending_user_mode_phase_b_unknown(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        request: &super::UserModePhaseBMaterializationRequest,
+        pending_ref: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        request.validate()?;
+        handle(pending_ref, "user_mode_phase_b.pending_ref")?;
+        let request = request.clone();
+        let pending_ref = pending_ref.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            self.validate_host_owner_binding(host, pending)?;
+            if pending.manifest.runtime_launch.profile != InstallationProfile::UserMode
+                || pending.user_mode_phase_b_request.as_ref() != Some(&request)
+                || pending.user_mode_phase_b_prepared.is_none()
+                || pending.user_mode_phase_b_receipt.is_some()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let pending = registry.pending_activation.as_mut().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            if pending
+                .user_mode_phase_b_pending_ref
+                .as_ref()
+                .is_some_and(|existing| existing != &pending_ref)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            pending.user_mode_phase_b_pending_ref = Some(pending_ref);
+            registry.validate()
+        })
+    }
+
     /// Atomically records the prepared Phase-B receipt. This is a distinct
     /// durable state and cannot satisfy the final receipt field.
     pub fn record_pending_phase_b_prepared_receipt(

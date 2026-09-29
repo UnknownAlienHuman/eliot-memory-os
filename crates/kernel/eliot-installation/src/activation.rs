@@ -184,6 +184,9 @@ impl InstallationActivationApproval {
     fn require_activation_contour(
         transaction: &InstallationTransaction,
     ) -> Result<(), InstallationError> {
+        if transaction.profile == super::InstallationProfile::UserMode {
+            return transaction.require_user_mode_pending_activation_effects();
+        }
         let has_bootstrap_host_start = transaction.installer_effects.iter().any(|effect| {
             matches!(
                 effect,

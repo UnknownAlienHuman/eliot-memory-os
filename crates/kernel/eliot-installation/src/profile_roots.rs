@@ -6,11 +6,10 @@ use super::{InstallationError, WindowsPathIdentity, text};
 
 /// Breaking revision of the persisted four-root installation binding.
 ///
-/// Version 1 is the first versioned binding: profile plus immutable, durable,
-/// user-configuration and user-cache roots with the digest-bound runtime
-/// topology. Older unversioned projections require explicit migration and are
-/// never defaulted into this shape.
-pub const INSTALLATION_ROOT_BINDING_VERSION: u32 = 1;
+/// Version 2 corrects UserMode and PortableDev to the exact I3.1 sibling
+/// durable/config/cache roots. Version 1 persisted the wrong mutable layout
+/// and therefore requires explicit migration rather than path reinterpretation.
+pub const INSTALLATION_ROOT_BINDING_VERSION: u32 = 2;
 
 /// Installation/package roots plus the typed mutable runtime topology.
 ///
@@ -168,11 +167,9 @@ impl InstallationRoots {
 
     /// Binds the I3.1 durable root to the proved runtime topology.
     ///
-    /// `system_service` names the runtime profile root itself as durable
-    /// state; `user_mode` refines that contour into per-role children, so each
-    /// of its durable, configuration and cache roots must sit strictly below
-    /// it. `portable_dev` is explicitly disposable, so profile agreement and
-    /// root separation above are its complete join.
+    /// `system_service` names the runtime profile root itself as durable state.
+    /// UserMode and PortableDev use the I3.1 sibling data/config/cache layout;
+    /// their seven runtime roots are children of the exact durable state root.
     fn validate_durable_runtime_join(
         &self,
         profile: InstallationProfile,
@@ -195,19 +192,58 @@ impl InstallationRoots {
                 let user_config =
                     WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
                 let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
-                for (field, root) in [
-                    ("durable_data", &durable),
-                    ("user_config", &user_config),
-                    ("user_cache", &user_cache),
-                ] {
-                    if !profile_root.contains(root) || profile_root == *root {
-                        return Err(InstallationError::ProfileViolation(format!(
-                            "{field} must sit strictly below the runtime profile root"
-                        )));
-                    }
+                let product_root = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(
+                        self.runtime_state_roots.profile_anchor_root.as_str(),
+                        "Eliot",
+                    ),
+                    "user_mode.product_root",
+                )?;
+                let expected_config = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(product_root.as_str(), "config"),
+                    "user_config",
+                )?;
+                let expected_cache = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(product_root.as_str(), "cache"),
+                    "user_cache",
+                )?;
+                if durable != profile_root
+                    || user_config != expected_config
+                    || user_cache != expected_cache
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "UserMode must use Eliot\\data with sibling Eliot\\config and Eliot\\cache roots"
+                            .to_owned(),
+                    ));
                 }
             }
-            InstallationProfile::PortableDev => {}
+            InstallationProfile::PortableDev => {
+                let repository = WindowsPathIdentity::parse_root(
+                    self.runtime_state_roots.profile_anchor_root.as_str(),
+                    "portable_dev.repository_root",
+                )?;
+                let dev_root = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(repository.as_str(), ".eliot-dev"),
+                    "portable_dev.dev_root",
+                )?;
+                let expected_config = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(dev_root.as_str(), "config"),
+                    "user_config",
+                )?;
+                let expected_cache = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(dev_root.as_str(), "cache"),
+                    "user_cache",
+                )?;
+                if durable != profile_root
+                    || user_config != expected_config
+                    || user_cache != expected_cache
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "PortableDev must use sibling .eliot-dev/state, config and cache roots"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
