@@ -152,11 +152,15 @@ pub(super) fn terminated_prior_kernel(
 /// observation naming a different approved config, or a valid but unrelated
 /// current manifest therefore refuses the restart instead of authorizing it.
 ///
-/// The remaining config leg joins the relaunch descriptor to the active
-/// manifest: `materialized_config_digest` (the Phase-B config the relaunch
-/// will actually start) must equal `approved_config` (the active manifest's
-/// approved config digest), mirroring the Store leg's `approved_config_hash`
-/// requirement digest bind. The fence bind requires the record's
+/// The remaining config leg joins the relaunch descriptor to the approved
+/// Phase-B config: `materialized_config_digest` (the Phase-B config the
+/// relaunch will actually start) must equal `approved_config` (the Phase-B
+/// digest the committed activation fence binds to the active manifest),
+/// mirroring the Store leg's `approved_config_hash` requirement digest bind.
+/// Both config legs therefore read the Phase-B live domain — never the
+/// manifest's Phase-A staged-file digest — so the gate stays satisfiable on
+/// a normally materialised contour and still refuses live drift. The fence
+/// bind requires the record's
 /// `RecordFence` to equal the fence recomputed from the current Host
 /// installation epoch, activation id and activation generation, so a
 /// stale-activation record cannot authorize a restart. Absence, invalidity, an
@@ -217,6 +221,10 @@ pub(super) fn require_journal_kernel_restart_record(
 
 /// Reports whether the retained journal state binds `approved_config` to
 /// `current` as one record-bound approval pair.
+///
+/// `approved_config` is stated in the Phase-B live domain: the retained
+/// observation carries the Phase-B digest admitted at readiness, so the
+/// caller resolves the manifest's approval into that domain before calling.
 ///
 /// The binding is proved by the journal's own owner: the authorizing record's
 /// journal checksum is recomputed from the record the journal itself retained,

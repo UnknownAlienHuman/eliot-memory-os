@@ -7582,6 +7582,46 @@ impl HostComposition {
         )
     }
 
+    /// Resolves the approved config digest for `manifest` in the Phase-B live
+    /// domain the restart gate joins.
+    ///
+    /// I1.9 A1/GATE digest-domain bind: the journal's record-bound config
+    /// approval (`KernelReadinessObservationRecord.config_digest`) and the
+    /// relaunch descriptor (`HostJobBranches.config_digest`) both carry the
+    /// Phase-B live digest, which is intentionally distinct from the
+    /// manifest's Phase-A staged-file digest. The approved Phase-B value is
+    /// therefore read from the registry's committed activation fence, which
+    /// durably binds the active manifest's generation and Phase-A
+    /// `config_digest` to its committed `materialized_config_digest`, never
+    /// recomputed from live bytes. An absent, invalid, or foreign fence
+    /// refuses the restart as manual recovery.
+    #[cfg(windows)]
+    fn approved_phase_b_config_for_manifest(
+        &self,
+        manifest: &CandidateManifest,
+    ) -> Result<PlatformHandle, HostError> {
+        let fence = self
+            .registry
+            .last_committed_activation_fence()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Kernel restart has no committed activation fence binding the approved config; manual recovery required".to_owned(),
+                )
+            })?;
+        fence.validate().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Kernel restart refused: committed activation fence is invalid ({error}); manual recovery required"
+            ))
+        })?;
+        if fence.generation != manifest.generation || fence.config_digest != manifest.config_digest
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel restart refused: committed activation fence does not bind the active manifest; manual recovery required".to_owned(),
+            ));
+        }
+        Ok(fence.materialized_config_digest.clone())
+    }
+
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -7686,11 +7726,16 @@ impl HostComposition {
                     .to_owned(),
             )
         })?;
+        // I1.9 A1/GATE digest-domain bind: the gate states the approved
+        // config in the Phase-B live domain, so it is resolved from the
+        // committed activation fence bound to this manifest, never from the
+        // manifest's Phase-A staged-file digest.
+        let approved_config = self.approved_phase_b_config_for_manifest(&active_manifest)?;
         require_journal_kernel_restart_record(
             &current_kernel,
             &readiness_observations,
             kernel_artifact,
-            &active_manifest.config_digest,
+            &approved_config,
             &materialized_config_digest,
             &self.host,
             &self.activation_id,
@@ -9342,11 +9387,17 @@ impl HostComposition {
             // manifest, and refuses a stale-activation record instead of
             // restarting from prior lineage. The snapshot above already fails
             // a corrupt journal.
+            // I1.9 A1/GATE digest-domain bind: the gate states the approved
+            // config in the Phase-B live domain, so it is resolved from the
+            // committed activation fence bound to this manifest, never from
+            // the manifest's Phase-A staged-file digest.
+            let approved_config =
+                self.approved_phase_b_config_for_manifest(&active.manifest)?;
             require_journal_kernel_restart_record(
                 &current,
                 &readiness_observations,
                 kernel_artifact,
-                &active.manifest.config_digest,
+                &approved_config,
                 &materialized_config_digest,
                 &self.host,
                 &self.activation_id,
