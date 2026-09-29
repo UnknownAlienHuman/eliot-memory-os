@@ -341,8 +341,32 @@ fn migration_preflight(
     ))
 }
 
-/// Builds the receipt of one applied migration and compares every bound value
-/// with the migration that was applied.
+/// Builds the receipt of one applied migration and compares every plan-bound
+/// value with the migration that was applied.
+///
+/// This is the only production constructor of a migration receipt, and it
+/// fills `operation`, `root_identity`, `state_fence`, `provider_protocol_major`
+/// and `provider_artifact_sha256` from the migration, the adapter
+/// configuration and the state fence this operation was admitted under.
+///
+/// Those five values are not bound the same way, and the difference matters:
+///
+/// - `operation` is derived here from this root, fence and plan and compared
+///   in `validate_against` against a fresh derivation from the same inputs, so
+///   it fails for any other migration, root or fence.
+/// - `state_fence` is bound by construction *and* by comparison: the apply
+///   paths below compare it against the provider's durable canonical fence
+///   before this function is reached, and the Store bootstrap binding outside
+///   this crate compares it against the launch fence again.
+/// - `root_identity` and `provider_artifact_sha256` are bound by construction
+///   only. No comparator of `root_identity` or `provider_artifact_sha256`
+///   exists anywhere in the repository: `validate_against` requires both to be
+///   non-empty and compares nothing else, so "a receipt cannot name another
+///   root or provider" rests on this function being their only production
+///   producer, not on a comparison.
+/// - `provider_protocol_major` is filled from
+///   `config.expected_provider_major`, which `SurrealAdapterConfig::validate`
+///   already refuses unless it equals the pinned generation.
 ///
 /// A receipt that cannot be re-derived from the plan, the root, the fence and
 /// the provider is a partial outcome: it is never handed out as a success.
@@ -357,7 +381,7 @@ fn migration_receipt(
         state_fence,
         config.expected_provider_major,
         &config.provider_artifact_digest,
-    );
+    )?;
     receipt.validate_against(migration).map_err(|reason| {
         AdapterError::Config(format!("migration receipt is not provable: {reason}"))
     })?;

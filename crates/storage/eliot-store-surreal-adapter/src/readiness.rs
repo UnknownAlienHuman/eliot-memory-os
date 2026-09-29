@@ -7,7 +7,10 @@
 //! under migration authority.
 
 use eliot_store_api::sha256_hex;
-use eliot_store_api::{StateFence, generated_operation_manifests, operation_manifest_set_digest};
+use eliot_store_api::{
+    OperationId, OperationIdentity, StateFence, StoreError, canonical_json_bytes,
+    generated_operation_manifests, operation_manifest_set_digest,
+};
 
 use crate::config::SchemaGeneration;
 use crate::schema_inventory;
@@ -147,12 +150,52 @@ impl CompiledMigration {
     }
 }
 
+/// Derives the deterministic operation identity of one applied migration.
+///
+/// `apply_migration` admits no caller operation identity, so the receipt's
+/// identity is derived from the admitted content exactly as
+/// `backup_restore::prepare_operation_identity` derives the identity of a
+/// restore preparation that arrives without one: a canonical digest over the
+/// binding values, carried as `schema-migration-{digest}`. Two receipts of the
+/// same plan, root and fence therefore share one identity, and any difference
+/// in the root, the fence, the migration identity, the DDL bytes or the
+/// reached generation yields a different one.
+fn migration_operation_identity(
+    migration: &CompiledMigration,
+    root_identity: &str,
+    state_fence: &StateFence,
+) -> Result<OperationIdentity, StoreError> {
+    let bytes = canonical_json_bytes(&(
+        root_identity,
+        state_fence,
+        migration.migration_id.as_str(),
+        migration.checksum_sha256.as_str(),
+        migration.generation_after.as_str(),
+    ))
+    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let digest = sha256_hex(&bytes);
+    let identity = format!("schema-migration-{digest}");
+    let operation = OperationIdentity {
+        operation_id: OperationId::new(identity.clone()).map_err(|_error| {
+            StoreError::InvalidField {
+                field: "migration.operation_id",
+                reason: "derived migration operation identity is invalid",
+            }
+        })?,
+        idempotency_key: identity,
+        canonical_request_hash: digest,
+    };
+    operation.validate()?;
+    Ok(operation)
+}
+
 /// Durable outcome of one applied migration.
 ///
 /// It binds the applied plan identity — predecessor, target generation, DDL
 /// digest, bridge range and operation manifest set — to the root, state fence
-/// and provider generation the operation actually ran against, so the receipt
-/// of one migration cannot be read as the receipt of another.
+/// and provider generation the operation actually ran against, and it carries
+/// the operation identity derived from that same binding, so the receipt of
+/// one migration cannot be read as the receipt of another.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MigrationReceipt {
     pub migration_id: String,
@@ -162,6 +205,9 @@ pub struct MigrationReceipt {
     pub bridge_range: String,
     pub operation_manifest_set_digest: String,
     pub generation_after: SchemaGeneration,
+    /// Operation identity of the migration operation, derived from this
+    /// receipt's own root, fence and plan bindings.
+    pub operation: OperationIdentity,
     /// Canonical data root this migration was applied to. `I5.9` admits one
     /// writer per root, so a receipt for another root is not this receipt.
     pub root_identity: String,
@@ -177,15 +223,18 @@ pub struct MigrationReceipt {
 
 impl MigrationReceipt {
     /// Builds the receipt for one applied migration.
-    #[must_use]
+    ///
+    /// The operation identity is derived here from the same root, fence and
+    /// plan bindings the receipt carries, so it cannot name another
+    /// operation.
     pub fn applied(
         migration: &CompiledMigration,
         root_identity: &str,
         state_fence: &StateFence,
         provider_protocol_major: u16,
         provider_artifact_sha256: &str,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
             migration_id: migration.migration_id.clone(),
             predecessor_migration_id: migration.predecessor_migration_id.clone(),
             predecessor_generation: migration.predecessor_generation.clone(),
@@ -193,19 +242,46 @@ impl MigrationReceipt {
             bridge_range: migration.bridge_range.clone(),
             operation_manifest_set_digest: migration.operation_manifest_set_digest.clone(),
             generation_after: migration.generation_after.clone(),
+            operation: migration_operation_identity(migration, root_identity, state_fence)?,
             root_identity: root_identity.to_owned(),
             state_fence: state_fence.clone(),
             provider_protocol_major,
             provider_artifact_sha256: provider_artifact_sha256.to_owned(),
-        }
+        })
     }
 
     /// Rejects a receipt whose content does not match the migration it claims.
     ///
     /// The plan is revalidated with its own [`CompiledMigration::validate`], so
     /// a receipt cannot launder a plan that no longer binds the published
-    /// predecessor, bridge range or operation manifest set, and every bound
+    /// predecessor, bridge range or operation manifest set, and every plan
     /// value is compared with this migration rather than merely present.
+    ///
+    /// `operation` is re-derived from this receipt's own root, fence and plan
+    /// bindings and compared with the identity the receipt carries, so a
+    /// receipt for another root, fence, migration id, DDL body or reached
+    /// generation fails here. That is a comparison, not a presence check: the
+    /// two derivations are equal only for one exact (root, fence, migration,
+    /// bytes, generation) tuple.
+    ///
+    /// `root_identity` and `provider_artifact_sha256` are required to be
+    /// non-empty and `state_fence` is required to be internally valid.
+    /// `state_fence` is additionally compared in production against the
+    /// provider's durable canonical fence in the apply paths and, outside this
+    /// crate, against the launch binding; `root_identity` and
+    /// `provider_artifact_sha256` are bound by construction, because no
+    /// comparator of `root_identity` or `provider_artifact_sha256` exists
+    /// anywhere in the repository. `migration_receipt` in `apply` is the only
+    /// production constructor, and it fills them from the adapter
+    /// configuration and the admitted state fence, so a receipt cannot name a
+    /// different root or provider than the one it was issued for.
+    ///
+    /// The provider protocol generation is compared here against the pinned
+    /// provider generation this owner supports. That re-asserts a constant
+    /// `SurrealAdapterConfig::validate` already enforces and every adapter
+    /// constructor already calls, so on an adapter built through the public
+    /// constructors it cannot fail; it can only fail for a receipt not built
+    /// by `migration_receipt`.
     pub(crate) fn validate_against(
         &self,
         migration: &CompiledMigration,
@@ -223,6 +299,15 @@ impl MigrationReceipt {
         }
         if self.root_identity.trim().is_empty() || self.provider_artifact_sha256.trim().is_empty() {
             return Err("migration receipt does not name the root and provider it ran against");
+        }
+        if self.provider_protocol_major != crate::config::PINNED_SURREALDB_MAJOR {
+            return Err("migration receipt names an unsupported provider protocol generation");
+        }
+        if self.operation
+            != migration_operation_identity(migration, &self.root_identity, &self.state_fence)
+                .map_err(|_error| "migration receipt operation identity is not derivable")?
+        {
+            return Err("migration receipt does not name the operation it applied");
         }
         self.state_fence
             .validate()

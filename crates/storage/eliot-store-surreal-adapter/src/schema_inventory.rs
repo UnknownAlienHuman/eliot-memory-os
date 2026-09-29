@@ -284,7 +284,10 @@ pub(crate) enum ExecutableBodyRefusal {
         note: &'static str,
     },
     /// The presented identity names a migration root the current owner
-    /// declares non-executable.
+    /// declares non-executable: the root's recorded identity, its exact
+    /// repository path, or a path beneath its directory prefix (see
+    /// [`non_executable_root_for`]). A root that is a single file rather than
+    /// a directory matches only its identity and its exact path.
     NonExecutableRoot {
         /// Repository path of the root.
         path: &'static str,
@@ -1212,6 +1215,31 @@ pub(crate) fn validate_legacy_table_mapping() -> Result<(), LegacyMappingOmissio
     Ok(())
 }
 
+/// Finds the declared non-executable root a presented identity names.
+///
+/// Three arms reach a root, and all three resolve to the same
+/// [`ExecutableBodyRefusal::NonExecutableRoot`]: the recorded identity, the
+/// exact repository path, and the `root.path` directory prefix with its `/`
+/// separator. The third arm is what refuses a file inside
+/// `crates/eliot-store/migrations/` or `crates/eliot-store/src/surql/`.
+///
+/// The retired root `migrations/0001_bootstrap.surql.retired` is a single
+/// file, so the directory arm is vacuous for it: only its recorded identity
+/// and its exact path reach this variant. Any other spelling of it —
+/// `migrations/0001_bootstrap.surql` in particular — reaches no arm here and
+/// is refused as [`ExecutableBodyRefusal::UnknownIdentity`] instead, because
+/// it is neither a published executable body nor a declared root. The refusal
+/// is the same either way; only the typed reason differs.
+fn non_executable_root_for(identity: &str) -> Option<&'static NonExecutableRoot> {
+    NON_EXECUTABLE_MIGRATION_ROOTS.iter().find(|root| {
+        root.identity == identity
+            || root.path == identity
+            || identity
+                .strip_prefix(root.path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Fail-closed resolution: is the presented body executable by the current
 /// owner?
 ///
@@ -1219,7 +1247,11 @@ pub(crate) fn validate_legacy_table_mapping() -> Result<(), LegacyMappingOmissio
 /// the executable graph and the presented statements, digest and target
 /// generation are exactly the published ones. Every other outcome is a typed
 /// [`ExecutableBodyRefusal`]; there is no default-allow path and no way for a
-/// caller to name a different body, directory or DDL text.
+/// caller to name a different body, directory or DDL text. A declared
+/// non-executable root is refused as
+/// [`ExecutableBodyRefusal::NonExecutableRoot`] for the three spellings
+/// [`non_executable_root_for`] matches; any other identity that names no
+/// published body is refused as [`ExecutableBodyRefusal::UnknownIdentity`].
 pub(crate) fn resolve_executable_body(
     identity: &str,
     statements: &str,
@@ -1247,10 +1279,7 @@ pub(crate) fn resolve_executable_body(
             disposition: table.disposition,
         });
     }
-    if let Some(root) = NON_EXECUTABLE_MIGRATION_ROOTS
-        .iter()
-        .find(|root| root.identity == identity || root.path == identity)
-    {
+    if let Some(root) = non_executable_root_for(identity) {
         return Err(ExecutableBodyRefusal::NonExecutableRoot {
             path: root.path,
             disposition: root.disposition,
