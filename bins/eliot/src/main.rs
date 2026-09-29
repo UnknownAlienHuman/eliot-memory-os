@@ -4059,10 +4059,14 @@ fn run_installation_effect(
             revalidate_recorded_profile_selection_receipt(store_path, &preflight_transaction)
     {
         write_installation_error(
-            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+            if recover {
+                "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
+            } else {
+                "INSTALLATION_APPLY_RECOVERY_REQUIRED"
+            },
             &format!("current-user retained root selection revalidation failed: {error}"),
         );
-        return Ok(INVALID_REQUEST_EXIT);
+        return Ok(UNKNOWN_OUTCOME_EXIT);
     }
     let preflight_status = if uses_user_owned_supervision(preflight_transaction.profile)
         && preflight_transaction.stage() == InstallationStage::ActiveVerified
@@ -4117,24 +4121,15 @@ fn run_installation_effect(
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                let recovery_required = installation_error_requires_recovery(&error);
                 write_installation_error(
-                    if recovery_required && recover {
+                    if recover {
                         "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
-                    } else if recovery_required {
-                        "INSTALLATION_APPLY_RECOVERY_REQUIRED"
-                    } else if recover {
-                        "INSTALLATION_RECOVER_ERROR"
                     } else {
-                        "INSTALLATION_APPLY_ERROR"
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED"
                     },
                     &format!("Host activation terminal query failed: {error}"),
                 );
-                return Ok(if recovery_required {
-                    UNKNOWN_OUTCOME_EXIT
-                } else {
-                    INVALID_REQUEST_EXIT
-                });
+                return Ok(UNKNOWN_OUTCOME_EXIT);
             }
         };
         if let Some(outcome) = host_terminal_outcome {
@@ -4664,20 +4659,15 @@ fn run_installation_effect(
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
-            let recovery_required = installation_error_requires_recovery(&error);
             write_installation_error(
-                if recovery_required {
-                    "INSTALLATION_APPLY_RECOVERY_REQUIRED"
+                if recover {
+                    "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
                 } else {
-                    "INSTALLATION_STATE_INVALID"
+                    "INSTALLATION_APPLY_RECOVERY_REQUIRED"
                 },
                 &format!("Host activation terminal reconciliation failed: {error}"),
             );
-            return Ok(if recovery_required {
-                UNKNOWN_OUTCOME_EXIT
-            } else {
-                INVALID_REQUEST_EXIT
-            });
+            return Ok(UNKNOWN_OUTCOME_EXIT);
         }
     };
     let transaction = if host_terminal_outcome.is_some() {
@@ -4863,14 +4853,13 @@ fn reconcile_host_activation_terminal(
             registry
         }
     };
-    let receipt = match registry.read_committed_activation_receipt(
+    let receipt = registry.read_optional_committed_activation_receipt(
         &transaction.transaction_id,
         &transaction.installer_plan_digest,
         &transaction.candidate_manifest.generation,
-    ) {
-        Ok(receipt) => receipt,
-        Err(InstallationError::IncompleteObservation(_)) => return Ok(None),
-        Err(error) => return Err(error),
+    )?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
     };
     let evidence = vec![
         receipt.terminal_digest().clone(),
