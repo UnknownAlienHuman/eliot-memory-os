@@ -286,11 +286,11 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: String,
     },
-    /// Run an applied PortableDev profile in this foreground process.
+    /// Run an applied `PortableDev` profile in this foreground process.
     ///
     /// The current-user Host remains inside a kill-on-close Job owned by this
     /// command. Ctrl+C closes the owner and terminates the contained tree.
-    /// This command reports PENDING_RUNTIME because process launch is not an
+    /// This command reports `PENDING_RUNTIME` because process launch is not an
     /// authenticated Host readiness receipt.
     RunPortableDev {
         /// Absolute path to an existing transaction redb file.
@@ -315,7 +315,7 @@ enum InstallationCommand {
     /// Reports the selected profile, its four resolved root roles, its
     /// supervision type, its enforced/unsupported guarantees, and the
     /// structural proof that a non-service selection requires no SCM,
-    /// administrative authority or ProgramData anchor. Creates nothing, reserves
+    /// administrative authority or `ProgramData` anchor. Creates nothing, reserves
     /// no service, and mutates nothing. An invalid profile, a missing or
     /// ambiguous anchor, or a write into the versioned immutable binaries root
     /// is a typed refusal.
@@ -2515,7 +2515,7 @@ fn run_installation_generate(
         output,
         store_path,
         source_publication,
-        profile_selection,
+        &profile_selection,
         write_transaction_artifact,
     )
 }
@@ -2525,7 +2525,7 @@ fn run_installation_generate_with_output_writer<F>(
     output: PathBuf,
     store_path: PathBuf,
     source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
-    profile_selection: ProfileSelectionInput,
+    profile_selection: &ProfileSelectionInput,
     write_output: F,
 ) -> Result<InstallationGenerationOutcome>
 where
@@ -2533,7 +2533,7 @@ where
 {
     let transaction = match GenerationPackagePlanner::plan_with_published_profile_binding(
         input,
-        &profile_selection,
+        profile_selection,
         &source_publication.profile_governed_roots,
         source_publication.retained_profile_anchor,
         source_publication.source_identity,
@@ -4636,7 +4636,7 @@ fn run_installation_effect(
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
-                };
+                }
                 if let Err(error) = host_root.verify_stable_identity() {
                     write_installation_error(
                         "INSTALLATION_APPLY_RECOVERY_REQUIRED",
