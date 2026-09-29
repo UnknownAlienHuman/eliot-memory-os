@@ -286,14 +286,15 @@ pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclos
 pub use scope_identity_admission::{
     BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
     HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,
-    PrivacyProfile, ProposalSource, RegisteredInstanceEvidence, ResolutionAuthentication,
-    ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint, ScopeRelocationOrAttachReceipt,
-    ScopeResolution, SessionTaskClaim, TaskScopeCheck, TaskScopeOutcome, TriggerReport,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
-    WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity, check_at_trigger,
-    check_task_observation, derive_observed_resources, identity_legs, issue_resolution_receipt,
-    produce_attach_receipt, rebind_with_receipt, require_fresh_matched_binding,
+    ObservedScopeResources, PrivacyProfile, ProposalSource, RegisteredInstanceEvidence,
+    ResolutionAuthentication, ResolutionOutcome, ResolutionRequest, ResolutionTier,
+    ResumedTaskEvidence, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint,
+    ScopeRelocationOrAttachReceipt, ScopeResolution, SessionTaskClaim, TaskScopeCheck,
+    TaskScopeOutcome, TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    WorkScopeDescriptor, WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity,
+    check_at_trigger, check_task_observation, derive_observed_resources, identity_legs,
+    issue_resolution_receipt, produce_attach_receipt, rebind_with_receipt,
+    require_fresh_matched_binding, require_matched_guard_at_use_boundary,
 };
 pub use selection_chain::{
     ADMISSION_STAGE_ID, ADMISSION_TRANSFORMER_REVISION, INITIAL_MEMBERSHIP_STAGE_ID,
