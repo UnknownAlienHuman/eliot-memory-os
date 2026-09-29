@@ -72,6 +72,7 @@ fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
         activation_request_sha256: request.request_sha256.clone(),
         peer_admission_receipt_sha256: request.peer_admission_receipt_sha256.clone(),
         connection_id: request.connection_id.clone(),
+        workspace_selector: request.workspace_selector.clone(),
         cancellation_id: request.request_identity.cancellation_id.clone(),
         state_fence,
         kernel_deadline_unix_ms: deadline,
@@ -257,6 +258,7 @@ fn activation_v2_ticket(ticket_id: &str, deadline: u64) -> AgentActivationResolu
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-test".to_owned(),
+        workspace_selector: None,
         cancellation_id: "activation-cancellation-test".to_owned(),
         state_fence: StateFence::new(
             test_epoch(1),

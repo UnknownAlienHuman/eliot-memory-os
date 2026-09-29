@@ -16,7 +16,7 @@ use crate::{AgentActivationResolutionTicket, ProtocolError};
 
 pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-result";
-pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION: u16 = 2;
+pub const AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION: u16 = 3;
 /// Stable semantic owner identity for activation results produced by `eliotd`.
 ///
 /// This is evidence about the authenticated producer of the semantic
@@ -766,6 +766,41 @@ impl AgentActivationResolutionDisposition {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AgentActivationColdStartQuestion {
+    /// Stable scanner status; only the bounded privacy boundary question is
+    /// eligible for this non-ready activation projection.
+    pub code: String,
+    /// The scanner's smallest missing-input question. This value is carried
+    /// only after Host observation and remains covered by the result digest.
+    pub discriminative_question: String,
+}
+
+impl AgentActivationColdStartQuestion {
+    pub fn new(code: String, discriminative_question: String) -> Result<Self, ProtocolError> {
+        if code != "SCAN_PRIVACY_BOUNDARY_REQUIRED" {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_cold_start_question.code",
+                reason: "only the scanner privacy-boundary question is supported",
+            });
+        }
+        bounded_text(&code, "agent_activation_cold_start_question.code")?;
+        bounded_text(
+            &discriminative_question,
+            "agent_activation_cold_start_question.discriminative_question",
+        )?;
+        Ok(Self {
+            code,
+            discriminative_question,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        Self::new(self.code.clone(), self.discriminative_question.clone()).map(|_| ())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentActivationResolutionResult {
     pub wire_id: String,
     pub wire_version: u16,
@@ -783,6 +818,10 @@ pub struct AgentActivationResolutionResult {
     /// every negative disposition.
     #[serde(default)]
     pub owner_evidence: Option<AgentActivationOwnerEvidence>,
+    /// Optional Host-observed cold-start question. It grants no readiness or
+    /// task authority and is present only for the privacy-boundary hold.
+    #[serde(default)]
+    pub cold_start_question: Option<AgentActivationColdStartQuestion>,
     pub result_sha256: String,
 }
 
@@ -846,6 +885,7 @@ impl AgentActivationResolutionResult {
             disposition,
             dependency_observation: None,
             owner_evidence,
+            cold_start_question: None,
             result_sha256: String::new(),
         }
         .with_computed_digest()?;
@@ -927,6 +967,29 @@ impl AgentActivationResolutionResult {
         Ok(self)
     }
 
+    /// Attaches the exact scanner question to a resolved activation result
+    /// and reseals its digest before Kernel submission.
+    pub fn with_cold_start_question(
+        mut self,
+        question: AgentActivationColdStartQuestion,
+    ) -> Result<Self, ProtocolError> {
+        if !matches!(
+            self.disposition,
+            AgentActivationResolutionDisposition::Resolved { .. }
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_result.cold_start_question",
+                reason: "a cold-start question may accompany only a resolved activation",
+            });
+        }
+        question.validate()?;
+        self.cold_start_question = Some(question);
+        self.result_sha256.clear();
+        self.result_sha256 = self.compute_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.wire_id != AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID
             || self.wire_version != Self::CONTRACT_VERSION
@@ -958,6 +1021,18 @@ impl AgentActivationResolutionResult {
             });
         }
         self.disposition.validate()?;
+        if let Some(question) = &self.cold_start_question {
+            question.validate()?;
+            if !matches!(
+                self.disposition,
+                AgentActivationResolutionDisposition::Resolved { .. }
+            ) {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_result.cold_start_question",
+                    reason: "a cold-start question may accompany only a resolved activation",
+                });
+            }
+        }
         if let Some(observation) = &self.dependency_observation {
             observation.validate()?;
         }
