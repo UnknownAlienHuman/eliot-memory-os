@@ -1085,6 +1085,28 @@ impl SkillRegistry {
         Ok(conflict)
     }
 
+    /// Stamps the owner-observed filing binding onto presented execution records.
+    ///
+    /// Wire-carried binding values are replaced wholesale, so a forged stamp
+    /// on the wire can never reach the store.
+    fn stamp_filing_binding(
+        skill_id: &str,
+        ingest_attempt_id: &str,
+        observed_fence: &StateFence,
+        executions: &[SkillExecutionEvidence],
+    ) -> Result<Vec<SkillExecutionEvidence>, SkillError> {
+        let mut stamped = Vec::with_capacity(executions.len());
+        for evidence in executions {
+            let mut bound = evidence.clone();
+            bound.observed_skill_id = Some(skill_id.to_owned());
+            bound.observed_attempt_ref = Some(ingest_attempt_id.to_owned());
+            bound.observed_fence = Some(observed_fence.clone());
+            bound.validate()?;
+            stamped.push(bound);
+        }
+        Ok(stamped)
+    }
+
     /// Admits one attempt for Material use behind its exact harness receipt.
     ///
     /// The receipt is validated, bound to the stored view's exact skill
@@ -1215,21 +1237,15 @@ impl SkillRegistry {
             return Err(SkillError::IdentityMismatch);
         }
         let mut retained = previous.execution_evidence.clone();
-        let mut changed = false;
         // The owner stamps the filing binding onto its own retained copy: the
         // presented Skill identity, the authenticated ingest attempt, and the
-        // retained fence. Wire-carried binding values are replaced wholesale,
-        // so a forged stamp on the wire can never reach the store.
-        let observed_fence = previous.state_fence.clone();
-        let mut stamped: Vec<SkillExecutionEvidence> = Vec::with_capacity(executions.len());
-        for evidence in executions {
-            let mut bound = evidence.clone();
-            bound.observed_skill_id = Some(skill_id.to_owned());
-            bound.observed_attempt_ref = Some(ingest_attempt_id.to_owned());
-            bound.observed_fence = Some(observed_fence.clone());
-            bound.validate()?;
-            stamped.push(bound);
-        }
+        // retained fence.
+        let stamped = Self::stamp_filing_binding(
+            skill_id,
+            ingest_attempt_id,
+            &previous.state_fence,
+            executions,
+        )?;
         for evidence in &stamped {
             // Exact replay under the same execution identity is idempotent; a
             // changed record under that identity is a conflict, not an
@@ -1245,7 +1261,6 @@ impl SkillRegistry {
                 Some(_) => {}
                 None => {
                     retained.push(evidence.clone());
-                    changed = true;
                 }
             }
         }
