@@ -7,34 +7,7 @@
 //! mutates nothing. Briefs are constructed only via
 //! [`brief_at_safe_boundary`], which requires an active Main Agent or Human
 //! reference at a safe boundary.
-//!
-//! # The boundary is OBSERVED, never named
-//!
-//! [`SafeBoundary`] has no public fields and no literal construction. Its only
-//! constructor, [`SafeBoundary::from_observed_closure`], reads the Governor's
-//! OWN committed learning-closure image
-//! ([`eliot_governor::CanonicalLearningDeltaStore`]) and takes the boundary
-//! from a record an owner actually closed. Both values on the result are
-//! therefore observations:
-//!
-//! - `active_main_agent_or_human_ref` is the `actor_id` the closure owner
-//!   recorded for the attempt (`ClosureIdentityInput::actor_id`), i.e. the
-//!   identity that executed the consequential work — a principal, not a label.
-//! - `boundary_ref` is the `consequential_boundary` that
-//!   `eliot_learning_delta::derive_boundaries` DERIVED from the lifecycle
-//!   activities the same owner recorded. I12.24:181 makes that derivation the
-//!   definition of a consequential boundary and states that an ordinary
-//!   `read_file`/`read`/`grep` is not one; a non-consequential activity set
-//!   never reaches the store at all, because
-//!   `LearningClosureService::close_attempt` returns
-//!   `NonConsequential` before committing. So a record in that image already
-//!   IS a derived consequential boundary and is read here, never asserted.
-//!
-//! An empty image, or an unreadable one, is [`ImprovementError::UnsafeBoundary`]:
-//! the fail-closed direction. No formatted constant, owner name, or scope
-//! reference stands in for an observation that was not made.
 
-use eliot_governor::CanonicalLearningDeltaStore;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -84,22 +57,6 @@ pub enum OwnerDecisionKind {
     Experiment,
 }
 
-impl OwnerDecisionKind {
-    /// Whether this disposition authorizes no change (I12.24:81-82, "advisory —
-    /// default; changes nothing until owner acts").
-    ///
-    /// `reject` and `investigate` are the two non-mutating selections of
-    /// I12.24:65; `work_item` and `experiment` release into the mutating
-    /// work-item/canary/rollback lane. The property lives on the KIND so an
-    /// intake can refuse a mutating disposition before it has an owner to record
-    /// it under; [`OwnerDecision::is_non_mutating`] applies the same property to
-    /// the produced record.
-    #[must_use]
-    pub const fn is_non_mutating(self) -> bool {
-        matches!(self, Self::Reject | Self::Investigate)
-    }
-}
-
 /// Pure record of the named owner's decision on a brief.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OwnerDecision {
@@ -112,89 +69,22 @@ pub struct OwnerDecision {
 }
 
 impl OwnerDecision {
-    /// Whether this recorded disposition authorizes no change.
-    ///
-    /// Checked against the RECORD rather than against a caller's assertion, so
-    /// an intake that only admits non-mutating dispositions verifies the exact
-    /// artifact it is about to make durable.
-    #[must_use]
     pub fn is_non_mutating(&self) -> bool {
-        self.kind.is_non_mutating()
+        matches!(
+            self.kind,
+            OwnerDecisionKind::Reject | OwnerDecisionKind::Investigate
+        )
     }
 }
 
 /// Safe-boundary gate: an active Main Agent or Human plus a boundary ref.
-///
-/// # Why the fields are private
-///
-/// The fields are private and the only constructor is
-/// [`Self::from_observed_closure`], which takes its two values from a record
-/// the Governor's learning-closure owner actually committed. That is what makes
-/// the boundary DERIVED rather than NAMED: with a public struct literal, any
-/// caller could satisfy the gate by formatting a string, which is precisely the
-/// "a check that reads a literal" shape this type must not have. Serialization
-/// is retained so a brief committed alongside the boundary still round-trips
-/// the two observed values into the durable learning record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SafeBoundary {
-    /// Identity that executed the consequential attempt (`actor_id`).
-    active_main_agent_or_human_ref: String,
-    /// Derived consequential boundary name the closure recorded.
-    boundary_ref: String,
+    pub active_main_agent_or_human_ref: String,
+    pub boundary_ref: String,
 }
 
 impl SafeBoundary {
-    /// Reads the boundary from the owner-observed closure image.
-    ///
-    /// `store` is the single Governor-owned
-    /// [`eliot_governor::CanonicalLearningDeltaStore`] the daemon already holds
-    /// (`DaemonComposition::learning_closure().store()`); this performs a read
-    /// of already-committed in-process state and opens no transport, no store
-    /// client and no new durability path.
-    ///
-    /// The MOST RECENT committed record is the one observed boundary: a closure
-    /// commit appends to the image, so the last element is the newest
-    /// owner-observed consequential boundary this process holds. Both values are
-    /// that record's own fields —
-    /// `StoredLearningDelta::consequential_boundary` and
-    /// `StoredLearningDelta::actor_id` — and neither is formatted, defaulted or
-    /// synthesized here.
-    ///
-    /// # Errors
-    ///
-    /// [`ImprovementError::UnsafeBoundary`] when the image is empty, when the
-    /// store cannot be read, or when the observed record carries an empty
-    /// principal or boundary. An absent observation is a refusal, never a
-    /// substituted constant.
-    pub fn from_observed_closure(
-        store: &CanonicalLearningDeltaStore,
-    ) -> Result<Self, ImprovementError> {
-        let (records, _version) = store
-            .load()
-            .map_err(|_| ImprovementError::UnsafeBoundary)?;
-        let record = records.last().ok_or(ImprovementError::UnsafeBoundary)?;
-        // The boundary enum type itself is deliberately not named: this crate
-        // has no `eliot-learning-delta` edge, and reading the record's own
-        // public field is the whole observation. `as_str` is the boundary's own
-        // canonical spelling, so the recorded name is the owner's vocabulary
-        // rather than a string spelled here.
-        let boundary_ref = record.consequential_boundary.as_str().to_owned();
-        let active_main_agent_or_human_ref = record.actor_id.clone();
-        let boundary = Self {
-            active_main_agent_or_human_ref,
-            boundary_ref,
-        };
-        boundary.validate()?;
-        Ok(boundary)
-    }
-
-    /// Rejects a boundary that names no principal or no derived boundary.
-    ///
-    /// This is a shape check on values that
-    /// [`Self::from_observed_closure`] already read from a committed record;
-    /// it cannot be satisfied by a formatted constant because the struct has no
-    /// public constructor. It remains because a deserialized boundary reaches
-    /// the same gate through [`brief_at_safe_boundary`].
     pub fn validate(&self) -> Result<(), ImprovementError> {
         if self.active_main_agent_or_human_ref.trim().is_empty()
             || self.boundary_ref.trim().is_empty()
