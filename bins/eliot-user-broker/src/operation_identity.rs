@@ -50,6 +50,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use eliot_protocol::RequestIdentity;
+use eliot_user_broker_core::ISSUED_OPERATION_IDENTITY_VERSION;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -69,6 +70,10 @@ const BROKER_SOURCE_ID: &str = "user-broker-transport";
 
 /// Fresh absolute transport deadline horizon per operation, in milliseconds.
 pub(crate) const OPERATION_IDENTITY_TTL_MS: u64 = 30_000;
+
+/// Pre-v2 durable identity rows have no original `RequestIdentity` or caller
+/// launch idempotency key and can only be restored as tombstones.
+const LEGACY_ISSUED_OPERATION_IDENTITY_VERSION: u16 = 1;
 
 /// Bounded regeneration attempts for a colliding random identity field.
 const IDENTITY_REGENERATION_LIMIT: usize = 3;
@@ -193,16 +198,17 @@ pub(crate) struct ProcessLineageEntry {
 /// One issued operation identity as it is retained across a broker restart
 /// (issue #74 A4).
 ///
-/// The retained shape is deliberately the *transport* half of the minted
-/// [`RequestIdentity`]: operation selector, canonical payload digest, the
-/// three identity strings, the absolute deadline, and the mint instant. The
-/// state fence is deliberately absent — it is re-bound from the live
-/// installation declaration and the Kernel-issued registration epoch on every
-/// restart, so a durable row can never pin a historical authority fence.
-/// Nothing here is authority: the row proves only which request, cancellation,
-/// and idempotency strings were already spent.
+/// Current rows retain the complete original [`RequestIdentity`] and the
+/// exact registration digest/epoch that admitted it. Recovery never rebuilds
+/// the identity against a newer fence. Legacy version 1 rows lack this proof
+/// and are imported only as spent-ID tombstones. Nothing here is authority:
+/// the row proves only which request, cancellation, and idempotency strings
+/// were already spent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DurableIssuedIdentity {
+    /// Explicit durable row schema version. Version 1 rows are imported as
+    /// tombstones because they did not preserve the original `RequestIdentity`.
+    pub(crate) schema_version: u16,
     /// Closed Kernel operation selector that owns the identity.
     pub(crate) operation: String,
     /// Lowercase SHA-256 of the canonical payload bytes it is bound to.
@@ -215,10 +221,19 @@ pub(crate) struct DurableIssuedIdentity {
     pub(crate) cancellation_id: String,
     /// Absolute transport deadline the identity was minted with.
     pub(crate) deadline_unix_ms: u64,
+    /// Exact registration generation that admitted this identity, when one
+    /// existed at issuance time.
+    pub(crate) registration_digest: Option<String>,
+    pub(crate) user_broker_epoch: Option<u64>,
+    /// Immutable original transport identity; never rebuilt using a later
+    /// current fence during recovery.
+    pub(crate) request_identity: Option<RequestIdentity>,
     /// Observation instant the identity was minted at.
     pub(crate) issued_at_ms: u64,
     /// Caller request id when a launch caller link owned this issuance.
     pub(crate) caller_request_id: Option<String>,
+    /// Caller launch idempotency key, separate from the transport key.
+    pub(crate) caller_idempotency_key: Option<String>,
 }
 
 /// Typed fail-closed issuance failures. No stub or default identity exists.
@@ -259,12 +274,14 @@ struct LedgerEntry {
     identity: RequestIdentity,
     request_id: String,
     caller_request_id: Option<String>,
+    caller_idempotency_key: Option<String>,
 }
 
 /// Issues fresh per-operation [`RequestIdentity`] values with exact-retry and
-/// identity-conflict semantics. All state is broker-process-local: a restart
-/// starts from an empty ledger, so historical request ids are never revived;
-/// the next registration carries fresh timestamps and therefore fresh bytes.
+/// identity-conflict semantics. The executable retry map is process-local;
+/// recovery rebuilds it only from the exact original identity under the same
+/// active registration, fence, and unexpired deadline. Other retained rows
+/// remain spent tombstones.
 ///
 /// The current fence is held as the exact epoch-binding JSON observed from
 /// the protected launch declaration (or refreshed from a Kernel-issued
@@ -273,12 +290,15 @@ struct LedgerEntry {
 pub(crate) struct OperationIdentityIssuer {
     binding_digest: Option<String>,
     current_fence: Option<Value>,
+    current_registration_digest: Option<String>,
+    current_user_broker_epoch: Option<u64>,
     ledger: BTreeMap<LedgerKey, LedgerEntry>,
     by_idempotency: BTreeMap<String, LedgerKey>,
     by_request: BTreeMap<String, LedgerKey>,
     by_cancellation: BTreeMap<String, LedgerKey>,
     by_caller_request: BTreeMap<String, LedgerKey>,
     caller_launch_keys: BTreeMap<String, String>,
+    legacy_authorize_launch_tombstone: bool,
     launch_lineage: Vec<LaunchLineageEntry>,
     process_lineage: Vec<ProcessLineageEntry>,
     issued: BTreeMap<LedgerKey, DurableIssuedIdentity>,
@@ -298,12 +318,15 @@ impl OperationIdentityIssuer {
         Ok(Self {
             binding_digest: Some(binding_digest),
             current_fence: Some(fence),
+            current_registration_digest: None,
+            current_user_broker_epoch: None,
             ledger: BTreeMap::new(),
             by_idempotency: BTreeMap::new(),
             by_request: BTreeMap::new(),
             by_cancellation: BTreeMap::new(),
             by_caller_request: BTreeMap::new(),
             caller_launch_keys: BTreeMap::new(),
+            legacy_authorize_launch_tombstone: false,
             launch_lineage: Vec::new(),
             process_lineage: Vec::new(),
             issued: BTreeMap::new(),
@@ -319,39 +342,49 @@ impl OperationIdentityIssuer {
         Self {
             binding_digest: None,
             current_fence: None,
+            current_registration_digest: None,
+            current_user_broker_epoch: None,
             ledger: BTreeMap::new(),
             by_idempotency: BTreeMap::new(),
             by_request: BTreeMap::new(),
             by_cancellation: BTreeMap::new(),
             by_caller_request: BTreeMap::new(),
             caller_launch_keys: BTreeMap::new(),
+            legacy_authorize_launch_tombstone: false,
             launch_lineage: Vec::new(),
             process_lineage: Vec::new(),
             issued: BTreeMap::new(),
         }
     }
 
-    /// Refreshes the carried registration/epoch fence from a Kernel-issued
-    /// registration authority epoch, serialized as its exact JSON value.
-    /// Only the lineage-aware epoch moves; the installation resource
-    /// generation stays stable. The merged fence is revalidated before it is
-    /// retained, so a malformed epoch can never poison later identities.
-    pub(crate) fn note_authority_epoch(
+    /// Binds future identities to one exact Kernel-issued registration.
+    ///
+    /// The authority epoch is merged into the installation fence without
+    /// changing any other fence field. Identities admitted by an older
+    /// registration or fence stay in the spent ledger but leave the executable
+    /// retry map; they are never rewritten to this registration.
+    pub(crate) fn note_registration_binding(
         &mut self,
+        registration_digest: &str,
+        user_broker_epoch: u64,
         epoch: &Value,
     ) -> Result<(), OperationIdentityError> {
+        if !is_lowercase_sha256(registration_digest) || user_broker_epoch == 0 {
+            return Err(OperationIdentityError::InvalidIdentity(
+                "registration binding is invalid".to_owned(),
+            ));
+        }
         if !epoch.is_object() {
             return Err(OperationIdentityError::InvalidIdentity(
                 "authority epoch must be a JSON object".to_owned(),
             ));
         }
-        let fence = self.current_fence.as_mut().ok_or_else(|| {
-            if self.binding_digest.is_none() {
-                OperationIdentityError::MissingBinding
-            } else {
-                OperationIdentityError::MissingFence
-            }
-        })?;
+        let missing_fence = if self.binding_digest.is_none() {
+            OperationIdentityError::MissingBinding
+        } else {
+            OperationIdentityError::MissingFence
+        };
+        let fence = self.current_fence.as_mut().ok_or(missing_fence)?;
         let mut merged = fence.clone();
         merged
             .as_object_mut()
@@ -359,7 +392,40 @@ impl OperationIdentityIssuer {
             .insert("authority_epoch".to_owned(), epoch.clone());
         validate_fence_value(&merged)?;
         *fence = merged;
+        self.current_registration_digest = Some(registration_digest.to_owned());
+        self.current_user_broker_epoch = Some(user_broker_epoch);
+        self.retire_replays_outside_current_registration();
         Ok(())
+    }
+
+    fn retire_replays_outside_current_registration(&mut self) {
+        let Some(current_registration_digest) = self.current_registration_digest.as_deref() else {
+            return;
+        };
+        let Some(current_user_broker_epoch) = self.current_user_broker_epoch else {
+            return;
+        };
+        let Some(current_fence) = self.current_fence.as_ref() else {
+            return;
+        };
+        let stale = self
+            .ledger
+            .keys()
+            .filter(|key| {
+                self.issued.get(*key).is_none_or(|issued| {
+                    issued.registration_digest.as_deref() != Some(current_registration_digest)
+                        || issued.user_broker_epoch != Some(current_user_broker_epoch)
+                        || issued.request_identity.as_ref().is_none_or(|identity| {
+                            fence_value(&identity.request.state_fence)
+                                .is_none_or(|fence| &fence != current_fence)
+                        })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale {
+            self.ledger.remove(&key);
+        }
     }
 
     /// Returns the number of distinct operation identities issued.
@@ -405,35 +471,17 @@ impl OperationIdentityIssuer {
     /// Re-seeds one durably retained identity into this issuer (issue #74 A4).
     ///
     /// The historical request id, cancellation id, and idempotency key become
-    /// spent before any new issuance: a fresh mint can never reuse them, a
-    /// replayed key under different canonical bytes is an
-    /// [`OperationIdentityError::IdentityConflict`], and an exact retry of the
-    /// same revision resolves to that same historical identity. A retained
-    /// row that contradicts an already-issued identity, or that is internally
-    /// inconsistent, fails closed instead of overwriting live state.
+    /// spent before any new issuance. Only an original identity that still
+    /// matches the active registration, fence, and deadline can serve an exact
+    /// retry; all other rows remain tombstones. A retained row that contradicts
+    /// an already-issued identity, or that is internally inconsistent, fails
+    /// closed instead of overwriting live state.
     pub(crate) fn restore_issued(
         &mut self,
         retained: &DurableIssuedIdentity,
+        restored_at_unix_ms: u64,
     ) -> Result<(), OperationIdentityError> {
         validate_retained_identity(retained)?;
-        let fence = self.current_fence.clone().ok_or_else(|| {
-            if self.binding_digest.is_none() {
-                OperationIdentityError::MissingBinding
-            } else {
-                OperationIdentityError::MissingFence
-            }
-        })?;
-        // The retained transport half is rebuilt against the *live* fence: a
-        // durable row can never pin a historical authority fence, and the
-        // absolute deadline and mint instant stay exactly as they were.
-        let identity = build_identity(
-            &retained.request_id,
-            &retained.idempotency_key,
-            retained.deadline_unix_ms,
-            &retained.cancellation_id,
-            &fence,
-            retained.issued_at_ms,
-        )?;
         let key = (
             retained.operation.clone(),
             retained.canonical_digest.clone(),
@@ -448,38 +496,63 @@ impl OperationIdentityIssuer {
                 )))
             };
         }
-        if self
-            .by_request
-            .get(&retained.request_id)
-            .is_some_and(|owner| owner != &key)
-            || self
-                .by_cancellation
-                .get(&retained.cancellation_id)
-                .is_some_and(|owner| owner != &key)
-            || self
-                .by_idempotency
-                .get(&retained.idempotency_key)
-                .is_some_and(|owner| owner != &key)
+        if self.by_request.contains_key(&retained.request_id)
+            || self.by_cancellation.contains_key(&retained.cancellation_id)
+            || self.by_idempotency.contains_key(&retained.idempotency_key)
         {
             return Err(OperationIdentityError::IdentityConflict(format!(
                 "retained request/cancellation/idempotency identity of {} is already bound to another operation",
                 retained.operation
             )));
         }
-        if retained.caller_request_id.as_deref().is_some_and(|caller| {
-            self.by_caller_request
-                .get(caller)
-                .is_some_and(|owner| owner != &key)
-                || self
-                    .caller_launch_keys
-                    .get(&retained.idempotency_key)
-                    .is_some_and(|digest| digest != &retained.canonical_digest)
-        }) {
+        if retained
+            .caller_request_id
+            .as_deref()
+            .is_some_and(|caller| self.by_caller_request.contains_key(caller))
+        {
             return Err(OperationIdentityError::IdentityConflict(format!(
                 "retained caller launch binding of {} is already bound to another launch",
                 retained.operation
             )));
         }
+        if retained
+            .caller_idempotency_key
+            .as_deref()
+            .is_some_and(|caller_key| self.caller_launch_keys.contains_key(caller_key))
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "retained caller launch idempotency key of {} is already bound to different bytes",
+                retained.operation
+            )));
+        }
+        if retained.schema_version == LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
+            && retained.operation == AUTHORIZE_LAUNCH_OPERATION
+        {
+            // The old row retained its caller request id but not the caller's
+            // idempotency key. Keep issuance closed rather than treating that
+            // unknown spent key as available to another launch.
+            self.legacy_authorize_launch_tombstone = true;
+        }
+
+        // A row is executable only in the exact registration generation and
+        // State Fence that admitted its original typed identity, and only
+        // while that original deadline remains live. Legacy rows and rows
+        // whose binding is historical still reserve every spent identifier,
+        // but are not put in the replay ledger.
+        let replay_identity = retained.request_identity.as_ref().filter(|identity| {
+            retained.schema_version == ISSUED_OPERATION_IDENTITY_VERSION
+                && self.current_registration_digest.as_deref()
+                    == retained.registration_digest.as_deref()
+                && self.current_registration_digest.is_some()
+                && self.current_user_broker_epoch == retained.user_broker_epoch
+                && self.current_user_broker_epoch.is_some()
+                && self.current_fence.as_ref().is_some_and(|current_fence| {
+                    fence_value(&identity.request.state_fence)
+                        .is_some_and(|original_fence| &original_fence == current_fence)
+                })
+                && retained.deadline_unix_ms > restored_at_unix_ms
+        });
+
         self.by_idempotency
             .insert(retained.idempotency_key.clone(), key.clone());
         self.by_request
@@ -488,19 +561,22 @@ impl OperationIdentityIssuer {
             .insert(retained.cancellation_id.clone(), key.clone());
         if let Some(caller) = retained.caller_request_id.clone() {
             self.by_caller_request.insert(caller, key.clone());
-            self.caller_launch_keys.insert(
-                retained.idempotency_key.clone(),
-                retained.canonical_digest.clone(),
+        }
+        if let Some(caller_key) = retained.caller_idempotency_key.clone() {
+            self.caller_launch_keys
+                .insert(caller_key, retained.canonical_digest.clone());
+        }
+        if let Some(identity) = replay_identity {
+            self.ledger.insert(
+                key.clone(),
+                LedgerEntry {
+                    identity: identity.clone(),
+                    request_id: retained.request_id.clone(),
+                    caller_request_id: retained.caller_request_id.clone(),
+                    caller_idempotency_key: retained.caller_idempotency_key.clone(),
+                },
             );
         }
-        self.ledger.insert(
-            key.clone(),
-            LedgerEntry {
-                identity,
-                request_id: retained.request_id.clone(),
-                caller_request_id: retained.caller_request_id.clone(),
-            },
-        );
         self.issued.insert(key, retained.clone());
         Ok(())
     }
@@ -552,6 +628,12 @@ impl OperationIdentityIssuer {
         payload: &Value,
         now_unix_ms: u64,
     ) -> Result<IssuedIdentity, OperationIdentityError> {
+        if self.legacy_authorize_launch_tombstone {
+            return Err(OperationIdentityError::IdentityConflict(
+                "legacy authorize-launch history omitted caller idempotency keys; new launches are refused"
+                    .to_owned(),
+            ));
+        }
         let canonical_digest = canonical_digest_of(payload)?;
         if let Some(known) = self.caller_launch_keys.get(caller_idempotency_key)
             && known != &canonical_digest
@@ -559,6 +641,16 @@ impl OperationIdentityIssuer {
             return Err(OperationIdentityError::IdentityConflict(
                 "caller launch idempotency key is already bound to different launch bytes"
                     .to_owned(),
+            ));
+        }
+        let caller_ledger_key = ledger_key(BrokerOperation::AuthorizeLaunch, &canonical_digest);
+        if self
+            .by_caller_request
+            .get(caller_request_id)
+            .is_some_and(|owner| owner != &caller_ledger_key)
+        {
+            return Err(OperationIdentityError::IdentityConflict(
+                "caller launch request id is already bound to another launch".to_owned(),
             ));
         }
         let link = CallerLink::launch(
@@ -627,9 +719,36 @@ impl OperationIdentityIssuer {
                 "idempotency_key",
             ));
         }
+        if now_unix_ms == 0 {
+            return Err(OperationIdentityError::InvalidClock);
+        }
         let canonical_digest = canonical_digest_of(payload)?;
         let key = ledger_key(operation, &canonical_digest);
         if let Some(entry) = self.ledger.get(&key) {
+            let retained = self.issued.get(&key).ok_or_else(|| {
+                OperationIdentityError::IdentityConflict(
+                    "executable operation identity has no durable spent row".to_owned(),
+                )
+            })?;
+            if !self.matches_current_binding(retained) {
+                return Err(OperationIdentityError::IdentityConflict(
+                    "exact operation replay is outside the current registration or State Fence"
+                        .to_owned(),
+                ));
+            }
+            if entry.identity.idempotency_key != idempotency_key
+                || entry.caller_request_id != caller.caller_request_id
+                || entry.caller_idempotency_key != caller.caller_idempotency_key
+            {
+                return Err(OperationIdentityError::IdentityConflict(
+                    "exact operation replay changed its idempotency or caller binding".to_owned(),
+                ));
+            }
+            if entry.identity.deadline_unix_ms <= now_unix_ms {
+                return Err(OperationIdentityError::IdentityConflict(
+                    "the original operation identity deadline has expired".to_owned(),
+                ));
+            }
             return Ok(IssuedIdentity {
                 identity: entry.identity.clone(),
                 operation,
@@ -638,13 +757,44 @@ impl OperationIdentityIssuer {
                 caller_request_id: entry.caller_request_id.clone(),
             });
         }
-        if let Some(owner) = self.by_idempotency.get(idempotency_key)
-            && owner != &key
-        {
+        if self.issued.contains_key(&key) {
+            return Err(OperationIdentityError::IdentityConflict(
+                "historical operation identity is reserved and cannot be replayed or reminted"
+                    .to_owned(),
+            ));
+        }
+        if let Some(owner) = self.by_idempotency.get(idempotency_key) {
+            let reason = if owner == &key {
+                "idempotency key is reserved by a non-replayable historical identity"
+            } else {
+                "idempotency key is already bound to different canonical operation bytes"
+            };
             return Err(OperationIdentityError::IdentityConflict(format!(
-                "idempotency key is already bound to {} with different canonical bytes",
-                owner.0
+                "{reason}: {}",
+                owner.0,
             )));
+        }
+        if caller
+            .caller_request_id
+            .as_ref()
+            .is_some_and(|caller_request_id| {
+                self.by_caller_request
+                    .get(caller_request_id)
+                    .is_some_and(|owner| owner != &key)
+            })
+        {
+            return Err(OperationIdentityError::IdentityConflict(
+                "caller launch request id is already bound to different canonical bytes".to_owned(),
+            ));
+        }
+        if caller
+            .caller_idempotency_key
+            .as_ref()
+            .is_some_and(|caller_key| self.caller_launch_keys.contains_key(caller_key))
+        {
+            return Err(OperationIdentityError::IdentityConflict(
+                "caller launch idempotency key is already spent".to_owned(),
+            ));
         }
         self.mint(
             key,
@@ -653,8 +803,20 @@ impl OperationIdentityIssuer {
             &canonical_digest,
             idempotency_key,
             now_unix_ms,
-            caller.caller_request_id.clone(),
+            caller,
         )
+    }
+
+    fn matches_current_binding(&self, issued: &DurableIssuedIdentity) -> bool {
+        let Some(identity) = issued.request_identity.as_ref() else {
+            return false;
+        };
+        issued.schema_version == ISSUED_OPERATION_IDENTITY_VERSION
+            && issued.registration_digest == self.current_registration_digest
+            && issued.user_broker_epoch == self.current_user_broker_epoch
+            && fence_value(&identity.request.state_fence)
+                .zip(self.current_fence.as_ref())
+                .is_some_and(|(issued_fence, current_fence)| &issued_fence == current_fence)
     }
 
     /// Records the process/effect lineage for one prepared grant without
@@ -720,9 +882,11 @@ impl OperationIdentityIssuer {
         canonical_digest: &str,
         idempotency_key: &str,
         now_unix_ms: u64,
-        caller_request_id: Option<String>,
+        caller: &CallerLink,
     ) -> Result<IssuedIdentity, OperationIdentityError> {
         let _ = payload;
+        let caller_request_id = caller.caller_request_id.clone();
+        let caller_idempotency_key = caller.caller_idempotency_key.clone();
         let fence = self.current_fence.clone().ok_or_else(|| {
             if self.binding_digest.is_none() {
                 OperationIdentityError::MissingBinding
@@ -737,14 +901,15 @@ impl OperationIdentityIssuer {
             .checked_add(OPERATION_IDENTITY_TTL_MS)
             .filter(|deadline| *deadline > now_unix_ms)
             .ok_or(OperationIdentityError::InvalidClock)?;
-        if self
-            .by_idempotency
-            .get(idempotency_key)
-            .is_some_and(|owner| owner != &key)
-        {
+        if let Some(owner) = self.by_idempotency.get(idempotency_key) {
+            let reason = if owner == &key {
+                "idempotency key is already spent by a historical identity"
+            } else {
+                "idempotency key is already bound to different canonical bytes"
+            };
             return Err(OperationIdentityError::IdentityConflict(format!(
-                "idempotency key is already bound to {} with different canonical bytes",
-                self.by_idempotency[idempotency_key].0
+                "{reason}: {}",
+                owner.0,
             )));
         }
         for _ in 0..IDENTITY_REGENERATION_LIMIT {
@@ -763,31 +928,45 @@ impl OperationIdentityIssuer {
                 &fence,
                 now_unix_ms,
             )?;
+            let issued = DurableIssuedIdentity {
+                schema_version: ISSUED_OPERATION_IDENTITY_VERSION,
+                operation: operation.selector().to_owned(),
+                canonical_digest: canonical_digest.to_owned(),
+                request_id: request_id.clone(),
+                idempotency_key: idempotency_key.to_owned(),
+                cancellation_id: identity.cancellation_id.clone(),
+                deadline_unix_ms,
+                registration_digest: self.current_registration_digest.clone(),
+                user_broker_epoch: self.current_user_broker_epoch,
+                request_identity: Some(identity.clone()),
+                issued_at_ms: now_unix_ms,
+                caller_request_id: caller_request_id.clone(),
+                caller_idempotency_key: caller_idempotency_key.clone(),
+            };
+            validate_retained_identity(&issued)?;
             self.by_idempotency
                 .insert(idempotency_key.to_owned(), key.clone());
             self.by_request.insert(request_id.clone(), key.clone());
-            self.by_cancellation.insert(cancellation_id, key.clone());
+            self.by_cancellation
+                .insert(cancellation_id.clone(), key.clone());
+            if let Some(caller_request_id) = caller_request_id.as_ref() {
+                self.by_caller_request
+                    .insert(caller_request_id.clone(), key.clone());
+            }
+            if let Some(caller_key) = issued.caller_idempotency_key.as_ref() {
+                self.caller_launch_keys
+                    .insert(caller_key.clone(), canonical_digest.to_owned());
+            }
             self.ledger.insert(
                 key.clone(),
                 LedgerEntry {
                     identity: identity.clone(),
                     request_id: request_id.clone(),
                     caller_request_id: caller_request_id.clone(),
+                    caller_idempotency_key: issued.caller_idempotency_key.clone(),
                 },
             );
-            self.issued.insert(
-                key,
-                DurableIssuedIdentity {
-                    operation: operation.selector().to_owned(),
-                    canonical_digest: canonical_digest.to_owned(),
-                    request_id: request_id.clone(),
-                    idempotency_key: idempotency_key.to_owned(),
-                    cancellation_id: identity.cancellation_id.clone(),
-                    deadline_unix_ms,
-                    issued_at_ms: now_unix_ms,
-                    caller_request_id: caller_request_id.clone(),
-                },
-            );
+            self.issued.insert(key, issued);
             return Ok(IssuedIdentity {
                 identity,
                 operation,
@@ -887,6 +1066,73 @@ fn validate_retained_identity(
             "retained operation identity clock is not exact".to_owned(),
         ));
     }
+    validate_retained_caller_and_registration(retained)?;
+    match retained.schema_version {
+        LEGACY_ISSUED_OPERATION_IDENTITY_VERSION => {
+            let selector_admitted = matches!(
+                retained.operation.as_str(),
+                REGISTER_OPERATION
+                    | HEARTBEAT_OPERATION
+                    | AUTHORIZE_LAUNCH_OPERATION
+                    | FENCE_OPERATION
+                    | "eliot.user-broker.cancel"
+                    | "eliot.user-broker.reconcile"
+            );
+            if retained.request_identity.is_some()
+                || retained.registration_digest.is_some()
+                || retained.user_broker_epoch.is_some()
+                || retained.caller_idempotency_key.is_some()
+                || !selector_admitted
+                || (retained.operation == AUTHORIZE_LAUNCH_OPERATION)
+                    != retained.caller_request_id.is_some()
+            {
+                return Err(OperationIdentityError::InvalidIdentity(
+                    "legacy identity row carries fields unavailable in its schema".to_owned(),
+                ));
+            }
+            // Explicit legacy rows are valid spent-ID tombstones. They do not
+            // contain enough information to build a replay identity.
+            return Ok(());
+        }
+        ISSUED_OPERATION_IDENTITY_VERSION => {}
+        _ => {
+            return Err(OperationIdentityError::InvalidIdentity(
+                "retained identity row schema version is unsupported".to_owned(),
+            ));
+        }
+    }
+    let is_kernel_operation = matches!(
+        retained.operation.as_str(),
+        REGISTER_OPERATION | HEARTBEAT_OPERATION | AUTHORIZE_LAUNCH_OPERATION | FENCE_OPERATION
+    );
+    let is_control_operation = matches!(
+        retained.operation.as_str(),
+        "eliot.user-broker.cancel" | "eliot.user-broker.reconcile"
+    );
+    if is_kernel_operation {
+        validate_current_kernel_identity(retained)?;
+    } else if is_control_operation {
+        if retained.request_identity.is_some()
+            || retained.registration_digest.is_none()
+            || retained.user_broker_epoch.is_none()
+            || retained.caller_request_id.is_some()
+            || retained.caller_idempotency_key.is_some()
+        {
+            return Err(OperationIdentityError::InvalidIdentity(
+                "retained broker-control identity binding is incomplete".to_owned(),
+            ));
+        }
+    } else {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained identity operation selector is not admitted".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_caller_and_registration(
+    retained: &DurableIssuedIdentity,
+) -> Result<(), OperationIdentityError> {
     if let Some(caller) = retained.caller_request_id.as_deref()
         && (caller.trim().is_empty() || caller.chars().any(char::is_control))
     {
@@ -894,7 +1140,74 @@ fn validate_retained_identity(
             "retained caller request id is blank".to_owned(),
         ));
     }
+    if let Some(caller_key) = retained.caller_idempotency_key.as_deref()
+        && (caller_key.trim().is_empty() || caller_key.chars().any(char::is_control))
+    {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained caller idempotency key is blank".to_owned(),
+        ));
+    }
+    match (
+        retained.registration_digest.as_deref(),
+        retained.user_broker_epoch,
+    ) {
+        (Some(digest), Some(epoch)) if epoch > 0 && is_lowercase_sha256(digest) => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(OperationIdentityError::InvalidIdentity(
+            "retained registration binding is incomplete".to_owned(),
+        )),
+    }
+}
+
+fn validate_current_kernel_identity(
+    retained: &DurableIssuedIdentity,
+) -> Result<(), OperationIdentityError> {
+    if retained.operation != REGISTER_OPERATION
+        && (retained.registration_digest.is_none() || retained.user_broker_epoch.is_none())
+    {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "non-registration identity omitted its registration generation".to_owned(),
+        ));
+    }
+    let identity = retained.request_identity.as_ref().ok_or_else(|| {
+        OperationIdentityError::InvalidIdentity(
+            "current Kernel identity row omitted its original RequestIdentity".to_owned(),
+        )
+    })?;
+    identity
+        .validate()
+        .map_err(|error| OperationIdentityError::InvalidIdentity(error.to_string()))?;
+    let issued_at_i64 =
+        i64::try_from(retained.issued_at_ms).map_err(|_| OperationIdentityError::InvalidClock)?;
+    if identity.request.metadata.request_id.as_str() != retained.request_id
+        || identity.idempotency_key != retained.idempotency_key
+        || identity.cancellation_id != retained.cancellation_id
+        || identity.deadline_unix_ms != retained.deadline_unix_ms
+        || identity.request.metadata.state_fence != identity.request.state_fence
+        || identity.request.metadata.product_id.as_str() != BROKER_PRODUCT_ID
+        || identity.request.metadata.source_id.as_str() != BROKER_SOURCE_ID
+        || identity.request.metadata.session_id.is_some()
+        || identity.request.metadata.task_id.is_some()
+        || identity.request.metadata.clock.valid_time_ms != Some(issued_at_i64)
+        || identity.request.metadata.clock.known_time_ms != Some(issued_at_i64)
+    {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained RequestIdentity differs from its durable scalar binding".to_owned(),
+        ));
+    }
+    let is_authorize_launch = retained.operation == AUTHORIZE_LAUNCH_OPERATION;
+    if retained.caller_request_id.is_some() != is_authorize_launch
+        || retained.caller_idempotency_key.is_some() != is_authorize_launch
+    {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained caller binding does not match the operation selector".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn fence_value(fence: &eliot_contracts::StateFence) -> Option<Value> {
+    serde_json::to_value(fence).ok()
 }
 
 /// Validates a fence JSON value through the owning [`RequestIdentity`]
@@ -1257,10 +1570,14 @@ mod tests {
             .expect_err("unbound issuance must fail");
         assert_eq!(error, OperationIdentityError::MissingBinding);
         let epoch_error = issuer
-            .note_authority_epoch(&json!({
-                "lineage_id": "01234567-89ab-cdef-0123-456789abcdef",
-                "sequence": 8,
-            }))
+            .note_registration_binding(
+                BINDING_DIGEST,
+                1,
+                &json!({
+                    "lineage_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "sequence": 8,
+                }),
+            )
             .expect_err("unbound epoch sync must fail");
         assert_eq!(epoch_error, OperationIdentityError::MissingBinding);
     }
@@ -1341,7 +1658,9 @@ mod tests {
             "lineage_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             "sequence": 8,
         });
-        issuer.note_authority_epoch(&next).expect("epoch sync");
+        issuer
+            .note_registration_binding(BINDING_DIGEST, 1, &next)
+            .expect("registration binding sync");
         let after = issuer
             .issue_heartbeat(
                 &json!({"registration_digest": "digest-e", "observed_at": NOW + 1}),
@@ -1372,7 +1691,11 @@ mod tests {
         let mut issuer = issuer();
         assert!(
             issuer
-                .note_authority_epoch(&json!({"lineage_id": "not-a-uuid", "sequence": 0}))
+                .note_registration_binding(
+                    BINDING_DIGEST,
+                    1,
+                    &json!({"lineage_id": "not-a-uuid", "sequence": 0}),
+                )
                 .is_err()
         );
         // The failed sync poisoned nothing: issuance still works.
