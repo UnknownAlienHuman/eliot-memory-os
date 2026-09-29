@@ -130,6 +130,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "canonical_owner_create_conflict",
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
+    "mailbox_item_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -552,6 +553,10 @@ fn build_apply_statements(
     append_experience_statements(&mut sql, &mut bindings, experience)?;
     append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_blackboard_item_statements(&mut sql, &mut bindings, transition)?;
+    // #1820 mailbox admission and delivery/ack/expiry advances commit
+    // atomically beside the blackboard rows under the same head-CAS
+    // contract, with identical-identity converge for idempotent replay.
+    append_mailbox_statements(&mut sql, &mut bindings, transition)?;
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
     append_learning_statements(&mut sql, &mut bindings, learning)?;
@@ -1030,6 +1035,26 @@ fn append_blackboard_item_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "blackboard binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends the named mailbox admission or head advance to this canonical
+/// transition, preserving immutable admissions, stream ordering, and
+/// candidate-only scope.
+fn append_mailbox_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = super::surreal_mailbox::mailbox_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "mailbox binding collided with a canonical binding".to_owned(),
             ));
         }
     }

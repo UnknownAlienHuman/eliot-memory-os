@@ -398,6 +398,9 @@ async fn named_read_payload(
         NamedReadOperation::GetBlackboardItem => {
             blackboard_item_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetMailboxItem => {
+            mailbox_item_payload(db, &adapter.config, query, state_fence).await
+        }
         NamedReadOperation::GetLearningRecordRange => {
             learning_record_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -468,6 +471,67 @@ async fn blackboard_item_payload(
     if record.task_id.to_string() != task_id
         || record.item_id != item_id
         || record.revision != head.revision
+        || record.state_fence != *state_fence
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    to_value(&record)
+}
+
+const READ_MAILBOX_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $mailbox_namespace AND key = $mailbox_key LIMIT 1;";
+
+/// Reads the exact current task/message head from durable recovery-owner rows.
+/// The retained head, including its delivery history, is returned as a typed
+/// Store payload; envelopes and content stay behind their own handles.
+async fn mailbox_item_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let task_id = query
+        .parameters
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let message_id = query
+        .parameters
+        .get("message_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let head_key = super::surreal_mailbox::item_head_key(task_id, message_id)?;
+    let mut bindings = Map::new();
+    bindings.insert("mailbox_namespace".to_owned(), json!(head_key.namespace));
+    bindings.insert("mailbox_key".to_owned(), json!(head_key.key));
+    let mut response = client::query(
+        db,
+        config,
+        "read.mailbox_item",
+        READ_MAILBOX_ITEM_HEAD,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<eliot_store_api::RecoveryRecord>(&mut response, 0)?;
+    let Some(head) = rows.first() else {
+        return Ok(Value::Null);
+    };
+    if head.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    if head.namespace != head_key.namespace
+        || head.key != head_key.key
+        || head.schema != eliot_store_api::MAILBOX_ITEM_SCHEMA_V1
+        || head.revision > i64::MAX as u64
+        || eliot_store_api::sha256_hex(&head.payload) != head.value_digest
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let record: eliot_store_api::MailboxItemRecord = serde_json::from_slice(&head.payload)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    record.validate().map_err(AdapterError::Store)?;
+    if record.task_id.to_string() != task_id
+        || record.message_id != message_id
+        || record.advance_seq != head.revision
         || record.state_fence != *state_fence
     {
         return Err(AdapterError::Store(StoreError::InvalidReceipt));

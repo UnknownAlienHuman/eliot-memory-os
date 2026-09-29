@@ -49,6 +49,7 @@ pub mod epistemic_revision;
 pub mod erasure_admission;
 pub mod experience_store;
 pub mod learning_store;
+mod mailbox;
 mod named_mutation_receipt;
 mod notification_state;
 mod payload_authority;
@@ -89,6 +90,17 @@ pub use blackboard::{
     BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
     BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
     blackboard_item_request, decode_blackboard_item,
+};
+
+pub use mailbox::{
+    ACKNOWLEDGE_MAILBOX_ITEM_MUTATION_NAME, ADMIT_MAILBOX_ITEM_MUTATION_NAME,
+    EXPIRE_MAILBOX_ITEM_MUTATION_NAME, MAILBOX_ITEM_READ_NAME, MAILBOX_ITEM_SCHEMA_V1,
+    MAILBOX_STREAM_HEAD_SCHEMA_V1, MAX_MAILBOX_ATTEMPT_HISTORY, MAX_MAILBOX_PAYLOAD_BYTES,
+    MAX_MAILBOX_REFERENCES, MailboxAckAdvance, MailboxDeliveryAdvance, MailboxExpiryAdvance,
+    MailboxExpiryCause, MailboxItemRecord, MailboxItemRevision, MailboxStreamHead, MailboxStreamId,
+    RECORD_MAILBOX_DELIVERY_MUTATION_NAME, decode_mailbox_ack, decode_mailbox_delivery,
+    decode_mailbox_expiry, decode_mailbox_item, mailbox_ack_request, mailbox_delivery_request,
+    mailbox_expiry_request, mailbox_item_read_request, mailbox_item_request,
 };
 
 pub use canonical_event::{
@@ -3739,6 +3751,8 @@ pub enum NamedReadOperation {
     GetAgentFeedbackRange,
     /// Exact, fenced lookup of one immutable blackboard candidate revision.
     GetBlackboardItem,
+    /// Exact, fenced lookup of one retained mailbox item head (issue #1820).
+    GetMailboxItem,
     /// Canonical learning-record range read (issue #1868, I12.24).
     ///
     /// Durable same-scope learning rows keyed `(record_kind, handle,
@@ -3857,6 +3871,27 @@ pub enum NamedMutationOperation {
     /// ceiling; it does not perform decisions, truth promotion, acceptance,
     /// or write-authority changes.
     ApplyBlackboardItem,
+    /// Canonical directed mailbox admission (issue #1820, I10.18).
+    /// Admits one Kernel-admitted mailbox item with its per-stream
+    /// predecessor ordering CAS under the candidate-only ceiling. Same
+    /// message identity with identical bytes converges idempotently; it
+    /// performs no delivery, acknowledgement, or truth promotion.
+    AdmitMailboxItem,
+    /// Canonical mailbox delivery observation (issue #1820, I10.18).
+    /// Records one delivery-step outcome against the exact expected head
+    /// under the candidate-only ceiling. Delivery proves only that the
+    /// step ran; it is never agreement, use, or passive awareness.
+    RecordMailboxDelivery,
+    /// Canonical mailbox acknowledgement (issue #1820, I10.18).
+    /// Records one recipient acknowledgement of the exact admission
+    /// revision under the candidate-only ceiling. Acknowledgement proves
+    /// only receipt; it is never agreement, use, or completion.
+    AcknowledgeMailboxItem,
+    /// Canonical mailbox expiry (issue #1820, I10.18).
+    /// Records terminal horizon or Session-loss expiry against the exact
+    /// expected head under the candidate-only ceiling. Delivery history
+    /// is retained on the expired head.
+    ExpireMailboxItem,
     /// Canonical learning-record commit (issue #1868, I12.24).
     ///
     /// Durable learning-record persistence only: the prepared transition
@@ -3895,6 +3930,10 @@ impl NamedMutationOperation {
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
             | Self::ApplyBlackboardItem
+            | Self::AdmitMailboxItem
+            | Self::RecordMailboxDelivery
+            | Self::AcknowledgeMailboxItem
+            | Self::ExpireMailboxItem
             | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState | Self::ApplySwarmOwnerRevisions => TransitionClass::TaskControl,

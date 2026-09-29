@@ -24,6 +24,7 @@ mod epoch_identity;
 mod module_catalog;
 mod module_test_capsule;
 mod peer_blackboard;
+mod peer_mailbox;
 
 pub use bridge_contract::*;
 pub use bridge_event_capacity::*;
@@ -34,6 +35,7 @@ pub use epoch_identity::*;
 pub use module_catalog::*;
 pub use module_test_capsule::*;
 pub use peer_blackboard::*;
+pub use peer_mailbox::*;
 
 /// The current wire revision of this foundation surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.contracts";

@@ -48,6 +48,7 @@ pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_capability_evidence;
 pub(crate) mod surreal_experience;
 pub(crate) mod surreal_learning;
+pub(crate) mod surreal_mailbox;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;

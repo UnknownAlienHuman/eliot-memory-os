@@ -172,6 +172,16 @@ pub enum ParameterShape {
     BlackboardItemLookup,
     /// Closed typed blackboard item revision and predecessor CAS for issue #1822.
     BlackboardItemRevision,
+    /// Exact task/message identity selector for issue #1820.
+    MailboxItemLookup,
+    /// Closed typed mailbox admission with stream-predecessor CAS for issue #1820.
+    MailboxItemRevision,
+    /// Closed typed mailbox delivery advance with expected-head CAS for issue #1820.
+    MailboxDeliveryAdvance,
+    /// Closed typed mailbox acknowledgement advance with expected-head CAS for issue #1820.
+    MailboxAckAdvance,
+    /// Closed typed mailbox expiry advance with expected-head CAS for issue #1820.
+    MailboxExpiryAdvance,
     /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
     InstrumentRegistrySnapshot,
 }
@@ -191,6 +201,11 @@ impl ParameterShape {
             Self::SwarmOwnerRevision => "eliot.swarm.owner-revision.v1",
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
+            Self::MailboxItemLookup => "eliot.mailbox.item-lookup.v1",
+            Self::MailboxItemRevision => "eliot.mailbox.item-revision.v1",
+            Self::MailboxDeliveryAdvance => "eliot.mailbox.delivery-advance.v1",
+            Self::MailboxAckAdvance => "eliot.mailbox.ack-advance.v1",
+            Self::MailboxExpiryAdvance => "eliot.mailbox.expiry-advance.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
         }
     }
@@ -1124,6 +1139,38 @@ static APPLY_BLACKBOARD_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterD
     shape: ParameterShape::BlackboardItemRevision,
     required: true,
 }];
+static MAILBOX_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "task_id",
+        shape: ParameterShape::MailboxItemLookup,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "message_id",
+        shape: ParameterShape::MailboxItemLookup,
+        required: true,
+    },
+];
+static ADMIT_MAILBOX_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "revision",
+    shape: ParameterShape::MailboxItemRevision,
+    required: true,
+}];
+static RECORD_MAILBOX_DELIVERY_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "advance",
+    shape: ParameterShape::MailboxDeliveryAdvance,
+    required: true,
+}];
+static ACKNOWLEDGE_MAILBOX_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "advance",
+    shape: ParameterShape::MailboxAckAdvance,
+    required: true,
+}];
+static EXPIRE_MAILBOX_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "advance",
+    shape: ParameterShape::MailboxExpiryAdvance,
+    required: true,
+}];
 
 /// Returns the canonical operation name bound into manifests and digests.
 ///
@@ -1141,6 +1188,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetExperienceBankRange => "GetExperienceBankRange",
         NamedReadOperation::GetAgentFeedbackRange => "GetAgentFeedbackRange",
         NamedReadOperation::GetBlackboardItem => "GetBlackboardItem",
+        NamedReadOperation::GetMailboxItem => "GetMailboxItem",
         NamedReadOperation::GetLearningRecordRange => "GetLearningRecordRange",
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
@@ -1195,6 +1243,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetExperienceBankRange" => Some(NamedReadOperation::GetExperienceBankRange),
         b"GetAgentFeedbackRange" => Some(NamedReadOperation::GetAgentFeedbackRange),
         b"GetBlackboardItem" => Some(NamedReadOperation::GetBlackboardItem),
+        b"GetMailboxItem" => Some(NamedReadOperation::GetMailboxItem),
         b"GetLearningRecordRange" => Some(NamedReadOperation::GetLearningRecordRange),
         b"GetCapabilityEvidenceRecordRange" => {
             Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
@@ -1226,6 +1275,10 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
+        NamedMutationOperation::AdmitMailboxItem => "AdmitMailboxItem",
+        NamedMutationOperation::RecordMailboxDelivery => "RecordMailboxDelivery",
+        NamedMutationOperation::AcknowledgeMailboxItem => "AcknowledgeMailboxItem",
+        NamedMutationOperation::ExpireMailboxItem => "ExpireMailboxItem",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
         NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
     }
@@ -1256,6 +1309,10 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
         b"ApplyBlackboardItem" => Some(NamedMutationOperation::ApplyBlackboardItem),
+        b"AdmitMailboxItem" => Some(NamedMutationOperation::AdmitMailboxItem),
+        b"RecordMailboxDelivery" => Some(NamedMutationOperation::RecordMailboxDelivery),
+        b"AcknowledgeMailboxItem" => Some(NamedMutationOperation::AcknowledgeMailboxItem),
+        b"ExpireMailboxItem" => Some(NamedMutationOperation::ExpireMailboxItem),
         b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
         b"RecordCapabilityEvidenceRecord" => {
             Some(NamedMutationOperation::RecordCapabilityEvidenceRecord)
@@ -1292,6 +1349,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// `scope_id` request field, mirroring `GetEvidencePack`);
 /// `GetBlackboardItem` declares the exact `task_id` and `item_id` selectors
 /// (issue #1822);
+/// `GetMailboxItem` declares the exact `task_id` and `message_id` selectors
+/// (issue #1820);
 /// `GetLearningRecordRange` declares the required decimal `max_records`
 /// bound, the optional closed `record_kind` filter, plus the optional
 /// opaque `cursor` continuation selector (issue #1868; scope arrives
@@ -1329,6 +1388,7 @@ pub const fn declared_read_parameters(
             &GET_EXPERIENCE_RANGE_PARAMETERS
         }
         NamedReadOperation::GetBlackboardItem => &BLACKBOARD_ITEM_LOOKUP_PARAMETERS,
+        NamedReadOperation::GetMailboxItem => &MAILBOX_ITEM_LOOKUP_PARAMETERS,
         NamedReadOperation::GetLearningRecordRange => &GET_LEARNING_RANGE_PARAMETERS,
         NamedReadOperation::GetCapabilityEvidenceRecordRange => {
             &GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS
@@ -1388,6 +1448,10 @@ pub const fn declared_read_parameters(
 /// variant, digest re-proof at the Governor read edge);
 /// `ApplyBlackboardItem` declares the required typed `revision` candidate
 /// and predecessor CAS (issue #1822);
+/// `AdmitMailboxItem` declares the required typed `revision` admission and
+/// stream-predecessor CAS (issue #1820);
+/// `RecordMailboxDelivery`, `AcknowledgeMailboxItem`, and `ExpireMailboxItem`
+/// declare the required typed `advance` with expected-head CAS (issue #1820);
 /// `RecordLearningRecord` declares the seven required commit fields
 /// (`record_kind` over the closed learning-kind set, `handle`,
 /// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
@@ -1412,6 +1476,10 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
+        NamedMutationOperation::AdmitMailboxItem => &ADMIT_MAILBOX_ITEM_PARAMETERS,
+        NamedMutationOperation::RecordMailboxDelivery => &RECORD_MAILBOX_DELIVERY_PARAMETERS,
+        NamedMutationOperation::AcknowledgeMailboxItem => &ACKNOWLEDGE_MAILBOX_ITEM_PARAMETERS,
+        NamedMutationOperation::ExpireMailboxItem => &EXPIRE_MAILBOX_ITEM_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
@@ -1507,7 +1575,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
     let structured = match declaration.shape {
         ParameterShape::OperationId
         | ParameterShape::Subject
-        | ParameterShape::BlackboardItemLookup => false,
+        | ParameterShape::BlackboardItemLookup
+        | ParameterShape::MailboxItemLookup => false,
         ParameterShape::EpistemicRevision
         | ParameterShape::NotificationState
         | ParameterShape::CampaignSourceLookup
@@ -1515,6 +1584,10 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::CampaignViewLookup
         | ParameterShape::SwarmOwnerRevision
         | ParameterShape::BlackboardItemRevision
+        | ParameterShape::MailboxItemRevision
+        | ParameterShape::MailboxDeliveryAdvance
+        | ParameterShape::MailboxAckAdvance
+        | ParameterShape::MailboxExpiryAdvance
         | ParameterShape::InstrumentRegistrySnapshot => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
@@ -1703,6 +1776,44 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             revision.validate()
         }
+        ParameterShape::MailboxItemLookup
+        | ParameterShape::MailboxItemRevision
+        | ParameterShape::MailboxDeliveryAdvance
+        | ParameterShape::MailboxAckAdvance
+        | ParameterShape::MailboxExpiryAdvance => validate_mailbox_shape(declaration, value),
+    }
+}
+
+fn validate_mailbox_shape(
+    declaration: &ParameterDeclaration,
+    value: &Value,
+) -> Result<(), StoreError> {
+    match declaration.shape {
+        ParameterShape::MailboxItemLookup => validate_mailbox_lookup_selector(declaration, value),
+        ParameterShape::MailboxItemRevision => {
+            let revision: crate::MailboxItemRevision = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            revision.validate()
+        }
+        ParameterShape::MailboxDeliveryAdvance => {
+            let advance: crate::MailboxDeliveryAdvance = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            advance.validate()
+        }
+        ParameterShape::MailboxAckAdvance => {
+            let advance: crate::MailboxAckAdvance = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            advance.validate()
+        }
+        ParameterShape::MailboxExpiryAdvance => {
+            let advance: crate::MailboxExpiryAdvance = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            advance.validate()
+        }
+        _ => Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "unexpected shape for mailbox validation",
+        }),
     }
 }
 
@@ -1736,6 +1847,26 @@ fn validate_blackboard_lookup_selector(
         return Err(StoreError::InvalidField {
             field: "operation.parameter",
             reason: "blackboard identity selector must be non-blank text",
+        });
+    }
+    if declaration.name == "task_id" {
+        eliot_contracts::TaskId::new(text).map_err(StoreError::Foundation)?;
+    }
+    Ok(())
+}
+
+fn validate_mailbox_lookup_selector(
+    declaration: &ParameterDeclaration,
+    value: &Value,
+) -> Result<(), StoreError> {
+    let text = value.as_str().ok_or(StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "mailbox identity selector must be a string",
+    })?;
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "mailbox identity selector must be non-blank text",
         });
     }
     if declaration.name == "task_id" {
