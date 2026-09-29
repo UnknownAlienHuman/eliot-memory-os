@@ -65,6 +65,7 @@ work_item_4_removed_set = [
   "Requester",
   "PrivacyClass",
   "DreamBudget (+ DreamBudget::validate)",
+  "DreamerError::InvalidText / ::TooMany / ::MissingLineage / ::InvalidFence (bound-error variants; not `pub` items, they were the error face of the four deleted bound owners above and had zero construction sites)",
 ]
 work_item_4_removal_rule = "A `delete` row was executed only when all three held: (1) its named current owner already carries the behaviour in admitted source, (2) its measured production call-site set is empty (`git grep` over crates/bins finds no reference outside this package, and the package has zero Cargo reverse-dependents), and (3) removing it cannot drop a proof, because the only reader was a fixture assertion about the duplicate itself. The 25 remaining `delete` rows fail at least one of those tests and are recorded, not executed; each names its blocker below."
 
@@ -204,6 +205,7 @@ owner_package = "eliot-dreamer-contracts, eliot-dreamer-candidate-validation"
 owner_evidence = "crates/smart/eliot-dreamer-contracts/src/error.rs:94 pub enum ContractViolation; crates/smart/eliot-dreamer-contracts/src/validation/error.rs:7 pub enum DreamDraftValidationError; the last two variants of the facade enum already `#[from]` the owner error"
 basis = "Error-mapping layer over two owner error vocabularies. It translates two cases (BindingMismatch on the budget field -> BudgetExhausted, ForbiddenCarry -> UnsupportedPromotion) and passes everything else through verbatim, so it owns no error semantics."
 removal_condition = "After the pipeline reports owner errors directly. It is the error type asserted by mod differential_1143."
+partial_removal_2026_09_28 = "Work item 4 removed the four bound-error variants of this enum that the same work item had already made unconstructible: `InvalidText { field, maximum }`, `TooMany { field, maximum }`, `MissingLineage { field }` and `InvalidFence`. They were the facade's own text, collection, lineage and fence bound owners, reachable only through `MAX_TEXT`/`MAX_ITEMS`/`MAX_SOURCES` and the deleted facade intake validation. `git grep -n 'DreamerError::(InvalidText|TooMany|MissingLineage|InvalidFence)' -- '*.rs'` returns zero lines in the whole tree, and the bare-name search returns only the declaration lines, so no construction site, no pattern site and no fixture assertion existed. The six remaining variants and the enum itself stay; their `DELETE-PROPOSED` condition is unchanged."
 
 [[item_disposition]]
 item = "Requester"
