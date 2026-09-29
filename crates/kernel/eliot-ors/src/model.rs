@@ -8799,8 +8799,10 @@ impl NativeWorkerClaimExecutableBindingProjection {
         ] {
             validate_digest(value, field)?;
         }
-        self.authority_epoch.validate()?;
-        self.state_fence.validate()?;
+        self.state_fence.validate().map_err(|_| OrsError::InvalidField {
+            field: "native_worker_claim_executable_binding_projection",
+            reason: "state fence is invalid",
+        })?;
         if self.worker_generation == 0
             || self.adapter_revision == 0
             || self.grant_graph_revision == 0
