@@ -36,7 +36,8 @@
 //! reconciliation supplies a terminal disposition. The durable handoff of
 //! records (ControlWal/redb) and the boot-time reconcile loop belong to a
 //! later wave; [`StorePermitRecord::reconcile`] is the pure classifier that
-//! loop will drive.
+//! loop will drive, and [`StorePermitRecord::persisted_state_after`] is the
+//! pure persisted state it writes for the observed disposition.
 //!
 //! ASSUMPTION: this crate has no `eliot-contracts` edge (Cargo deps are frozen
 //! for this slice), so the typed Authority Epoch and typed
@@ -392,13 +393,55 @@ impl StorePermitRecord {
             }
         }
     }
+
+    /// Returns the lifecycle state the durable owner persists after observing
+    /// `disposition` for this record: the pure state half of the reconcile
+    /// loop whose counter half is [`StoreReserve::apply_restarted_hold`].
+    ///
+    /// A completing release persists as released; terminal dispositions persist
+    /// their own terminal state idempotently; leak-suspect and stale records
+    /// persist their excluded states until the current owner reconciles them.
+    /// A continuing hold persists as issued/held: a release-requested record
+    /// never reconciles to a continuing hold (it completes instead), and a
+    /// stale record observed under current bindings is current again.
+    #[must_use]
+    pub fn persisted_state_after(
+        &self,
+        disposition: StoreReconcileDisposition,
+    ) -> StorePermitState {
+        match disposition {
+            StoreReconcileDisposition::ReleaseCompletesNow
+            | StoreReconcileDisposition::ReleaseCompletedTerminal => StorePermitState::Released,
+            StoreReconcileDisposition::NotIssuedTerminal => StorePermitState::NotIssued,
+            StoreReconcileDisposition::ExcludedLeakSuspect => {
+                StorePermitState::PossiblyLeakedUnknown
+            }
+            StoreReconcileDisposition::StaleOwnerRequiresReconciliation => {
+                StorePermitState::StaleOwnerRequiringReconciliation
+            }
+            StoreReconcileDisposition::HeldCurrent => {
+                debug_assert!(
+                    !matches!(
+                        self.state,
+                        StorePermitState::Released
+                            | StorePermitState::NotIssued
+                            | StorePermitState::PossiblyLeakedUnknown
+                            | StorePermitState::ReleaseRequested
+                    ),
+                    "HeldCurrent follows only a live held or reconciled-stale record"
+                );
+                StorePermitState::IssuedHeld
+            }
+        }
+    }
 }
 
 /// Exactly-once release evidence for one [`StorePermit`].
 ///
 /// Bound to permit identity, dimension, class, operation label/identity,
-/// owner and issuing bridge generation: a replayed or relabelled release
-/// does not match and is refused before any counter moves.
+/// owner, issuing bridge generation, profile revision and exact amount: a
+/// replayed, relabelled or profile-moved release does not match and is
+/// refused before any counter moves.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreReleaseEvidence {
     permit_id: String,
@@ -408,6 +451,8 @@ pub struct StoreReleaseEvidence {
     operation_id: String,
     owner: String,
     owner_generation: Uuid,
+    profile_revision: String,
+    amount: u64,
 }
 
 impl StoreReleaseEvidence {
@@ -453,17 +498,32 @@ impl StoreReleaseEvidence {
         self.owner_generation
     }
 
+    /// Returns the profile revision recorded at issue.
+    #[must_use]
+    pub fn profile_revision(&self) -> &str {
+        &self.profile_revision
+    }
+
+    /// Returns the exact amount in the bottleneck's unit recorded at issue.
+    #[must_use]
+    pub const fn amount(&self) -> u64 {
+        self.amount
+    }
+
     /// Returns `true` only when every binding matches the live permit:
     /// same permit and operation identities, same owner, same issuing
-    /// generation, same dimension and class. Changed content never matches.
+    /// generation, same profile revision, same dimension, class and exact
+    /// amount. Changed content never matches.
     #[must_use]
     pub fn matches_permit(&self, permit: &StorePermit) -> bool {
         self.permit_id == permit.permit_id
             && self.operation_id == permit.operation_id
             && self.owner == permit.owner
             && self.owner_generation == permit.owner_generation
+            && self.profile_revision == permit.profile_revision
             && self.dimension == permit.dimension
             && self.class == permit.class
+            && self.amount == permit.amount
     }
 }
 
@@ -678,6 +738,8 @@ impl StorePermit {
             operation_id: self.operation_id.clone(),
             owner: self.owner.clone(),
             owner_generation: self.owner_generation,
+            profile_revision: self.profile_revision.clone(),
+            amount: self.amount,
         })
     }
 
