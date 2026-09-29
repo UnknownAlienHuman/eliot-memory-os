@@ -3498,16 +3498,13 @@ pub fn analyze_conflict(
     // complete. Every leg below preserves the same positions, groups, risks,
     // owner recommendation, and named gap; only the terminal outcome differs.
     let has_unknown_lineage = groups.iter().any(|group| !group.known);
-    let unrecommendable_probes =
-        recommended.is_empty() && !supplements.supplied_probes.is_empty();
+    let unrecommendable_probes = recommended.is_empty() && !supplements.supplied_probes.is_empty();
     let undecided_without_unknown = conflict_set.acceptability == ArgumentAcceptability::Undecided
         && supplements.unknowns.is_empty();
     let incompleteness = if has_unknown_lineage || unrecommendable_probes {
         Some("incomplete coverage: named open lineage or probe gaps remain")
     } else if undecided_without_unknown {
-        Some(
-            "incomplete coverage: undecided acceptability and no load-bearing unknown is supplied",
-        )
+        Some("incomplete coverage: undecided acceptability and no load-bearing unknown is supplied")
     } else {
         None
     };
@@ -5692,17 +5689,11 @@ mod tests {
         let mut discriminative = test_supplements();
         discriminative.supplied_probes = vec![test_discriminative_probe("probe-66-disc")];
         let bound = test_conflict_naming_probe(Some("probe-66-disc"));
-        let candidate = match analyze_conflict(
-            &item,
-            &draft,
-            &grounded,
-            &bound,
-            &discriminative,
-            &policy,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => panic!("discriminative probe analysis: {err:?}"),
-        };
+        let candidate =
+            match analyze_conflict(&item, &draft, &grounded, &bound, &discriminative, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("discriminative probe analysis: {err:?}"),
+            };
         assert_eq!(candidate.recommended_probes.len(), 1);
         let recommended = candidate
             .recommended_probes
