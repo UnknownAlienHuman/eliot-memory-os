@@ -284,7 +284,10 @@ pub(crate) enum ExecutableBodyRefusal {
         note: &'static str,
     },
     /// The presented identity names a migration root the current owner
-    /// declares non-executable.
+    /// declares non-executable: the root's recorded identity, its exact
+    /// repository path, or a path beneath its directory prefix (see
+    /// [`non_executable_root_for`]). A root that is a single file rather than
+    /// a directory matches only its identity and its exact path.
     NonExecutableRoot {
         /// Repository path of the root.
         path: &'static str,
@@ -1214,15 +1217,19 @@ pub(crate) fn validate_legacy_table_mapping() -> Result<(), LegacyMappingOmissio
 
 /// Finds the declared non-executable root a presented identity names.
 ///
-/// The refusal covers the whole root, not one filename: the recorded identity,
-/// the exact repository path and every path under that root (the `root.path`
-/// directory prefix with its `/` separator) all resolve to the same
-/// [`ExecutableBodyRefusal::NonExecutableRoot`]. A file inside
-/// `crates/eliot-store/migrations/` or `crates/eliot-store/src/surql/`, or the
-/// retired root `migrations/0001_bootstrap.surql.retired` under any other
-/// name, therefore cannot be selected by current configuration, launch,
-/// packaging or restore: `I5.9` admits one executable migration graph, and
-/// this array is that graph's closed non-executable complement.
+/// Three arms reach a root, and all three resolve to the same
+/// [`ExecutableBodyRefusal::NonExecutableRoot`]: the recorded identity, the
+/// exact repository path, and the `root.path` directory prefix with its `/`
+/// separator. The third arm is what refuses a file inside
+/// `crates/eliot-store/migrations/` or `crates/eliot-store/src/surql/`.
+///
+/// The retired root `migrations/0001_bootstrap.surql.retired` is a single
+/// file, so the directory arm is vacuous for it: only its recorded identity
+/// and its exact path reach this variant. Any other spelling of it —
+/// `migrations/0001_bootstrap.surql` in particular — reaches no arm here and
+/// is refused as [`ExecutableBodyRefusal::UnknownIdentity`] instead, because
+/// it is neither a published executable body nor a declared root. The refusal
+/// is the same either way; only the typed reason differs.
 fn non_executable_root_for(identity: &str) -> Option<&'static NonExecutableRoot> {
     NON_EXECUTABLE_MIGRATION_ROOTS.iter().find(|root| {
         root.identity == identity
@@ -1241,9 +1248,10 @@ fn non_executable_root_for(identity: &str) -> Option<&'static NonExecutableRoot>
 /// generation are exactly the published ones. Every other outcome is a typed
 /// [`ExecutableBodyRefusal`]; there is no default-allow path and no way for a
 /// caller to name a different body, directory or DDL text. A declared
-/// non-executable root refuses every identity it covers — its recorded
-/// identity, its exact path and every path beneath it (see
-/// [`non_executable_root_for`]).
+/// non-executable root is refused as
+/// [`ExecutableBodyRefusal::NonExecutableRoot`] for the three spellings
+/// [`non_executable_root_for`] matches; any other identity that names no
+/// published body is refused as [`ExecutableBodyRefusal::UnknownIdentity`].
 pub(crate) fn resolve_executable_body(
     identity: &str,
     statements: &str,
