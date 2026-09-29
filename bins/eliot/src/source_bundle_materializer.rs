@@ -11,13 +11,14 @@ use eliot_installation::{
     AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan,
     GenerationPackagePlanner, InstallationEpoch, InstallationError, InstallationProfile,
     InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
-    PlatformHandle, ProfileSelectionInput, ProfileSelectionResolution,
+    PlatformHandle, ProfileSelectionInput, ProfileSelectionResolution, ProfileSupervision,
     RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
     SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
     SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
     agent_bridge_source_plan_from_observed_kernel,
-    provider_bootstrap_credential_target_for_store_target, source_bundle_publication_operation_id,
+    provider_bootstrap_credential_target_for_store_target, select_profile_roots,
+    source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::{
@@ -112,6 +113,9 @@ pub struct CanarySourceBundleMaterializeInput {
     /// Complete explicit I3.1 selection, including OS-proved anchors, versioned
     /// component identity, retained runtime anchor, and protected write paths.
     pub profile_selection: ProfileSelectionInput,
+    /// The one read-only I3.1 resolution produced by the installer caller and
+    /// retained through source publication, receipts, and runtime descriptors.
+    pub profile_resolution: ProfileSelectionResolution,
     /// Stable transaction identity used by the planner's launch-template
     /// derivation.
     pub transaction_id: PlatformHandle,
@@ -570,11 +574,80 @@ fn validate_materializer_selection(
     input: &CanarySourceBundleMaterializeInput,
     selection: &ProfileSelectionResolution,
 ) -> Result<(), MaterializeError> {
+    validate_absolute(&input.output_bundle, "output_bundle")?;
+    validate_absolute(&input.store_path, "store_path")?;
+    validate_absolute(
+        Path::new(input.profile_selection.profile_anchor_root.as_str()),
+        "profile_anchor_root",
+    )?;
+    validate_absolute(
+        Path::new(input.profile_selection.staging_root.as_str()),
+        "staging_root",
+    )?;
+    validate_package_relative_path(Path::new(input.generation.as_str()))
+        .map_err(|error| MaterializeError::Invalid(format!("generation: {error}")))?;
+    if input.transaction_id.as_str().trim().is_empty()
+        || input.transaction_id.as_str().chars().any(char::is_control)
+    {
+        return Err(MaterializeError::Invalid(
+            "transaction_id must be non-blank and free of controls".to_owned(),
+        ));
+    }
+    input
+        .installation_epoch
+        .validate()
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    selection
+        .roots
+        .validate(input.profile_selection.profile)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     selection
         .roots
         .validate_source_bundle_root(input.profile_selection.source_root.as_str())
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    selection
+        .roots
+        .validate_source_bundle_root(input.profile_selection.staging_root.as_str())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let roles = &selection.governance.roots;
+    let expected_supervision = match input.profile_selection.profile {
+        InstallationProfile::SystemService => ProfileSupervision::ScmDemandStart,
+        InstallationProfile::UserMode => ProfileSupervision::CurrentUserLauncherTaskScheduler,
+        InstallationProfile::PortableDev => ProfileSupervision::RepositoryLocalDisposable,
+    };
+    let no_service_authority_proof_valid = if input.profile_selection.profile.requires_admin() {
+        selection.no_service_authority_proof.is_none()
+    } else {
+        selection
+            .no_service_authority_proof
+            .as_ref()
+            .is_some_and(|proof| {
+                proof.profile == input.profile_selection.profile
+                    && !proof.selects_scm_supervision
+                    && !proof.requires_admin
+                    && !proof.requires_program_data_anchor
+                    && proof.verified_root_roles == 4
+            })
+    };
+    let selected_roots = select_profile_roots(
+        input.profile_selection.profile,
+        input.profile_selection.component.as_str(),
+        input.profile_selection.version.as_str(),
+        input.profile_selection.generation.as_deref(),
+        &input.profile_selection.anchors,
+    )
+    .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     if selection.governance.profile != input.profile_selection.profile
+        || selection.governance.supervision != expected_supervision
+        || !no_service_authority_proof_valid
+        || selected_roots.immutable_binaries != selection.roots.immutable_binaries
+        || selected_roots.durable_data != selection.roots.durable_data
+        || selected_roots.user_config != selection.roots.user_config
+        || selected_roots.user_cache != selection.roots.user_cache
+        || roles.immutable_binaries != selection.roots.immutable_binaries
+        || roles.durable_data != selection.roots.durable_data
+        || roles.user_config != selection.roots.user_config
+        || roles.user_cache != selection.roots.user_cache
         || selection.roots.runtime_state_roots.profile_anchor_root
             != input.profile_selection.profile_anchor_root
         || (input.profile_selection.profile == InstallationProfile::PortableDev
@@ -719,9 +792,7 @@ fn build_typed_bundle(
     input: &CanarySourceBundleMaterializeInput,
     executables: &[ValidatedExecutable],
 ) -> Result<TypedBundle, MaterializeError> {
-    let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)
-        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    build_typed_bundle_with_selection(input, executables, &selection)
+    build_typed_bundle_with_selection(input, executables, &input.profile_resolution)
 }
 
 fn build_typed_bundle_with_selection(
@@ -856,7 +927,11 @@ fn build_typed_bundle_with_selection(
     let store_bridge_arguments = match profile {
         InstallationProfile::PortableDev => make_args([
             "--portable-dev-root".to_owned(),
-            input.profile_selection.profile_anchor_root.as_str().to_owned(),
+            input
+                .profile_selection
+                .profile_anchor_root
+                .as_str()
+                .to_owned(),
             "--config".to_owned(),
             config_path.as_str().to_owned(),
         ])?,
@@ -1711,9 +1786,12 @@ fn materialize_with_executables(
     executables: &[ValidatedExecutable],
     stop_after_durable_intent: bool,
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
-    let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)
-        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    materialize_with_resolved_selection(input, executables, stop_after_durable_intent, &selection)
+    materialize_with_resolved_selection(
+        input,
+        executables,
+        stop_after_durable_intent,
+        &input.profile_resolution,
+    )
 }
 
 #[allow(
@@ -1941,10 +2019,10 @@ fn materialize_with_resolved_selection(
 pub fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
-    let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)?;
-    validate_materializer_selection(input, &selection).map_err(to_installation_error)?;
-    if let Some(existing) = reconcile_existing_publication(input, &selection)
-        .map_err(to_installation_error)?
+    let selection = &input.profile_resolution;
+    validate_materializer_selection(input, selection).map_err(to_installation_error)?;
+    if let Some(existing) =
+        reconcile_existing_publication(input, selection).map_err(to_installation_error)?
     {
         return Ok(existing);
     }
@@ -1971,7 +2049,7 @@ pub fn materialize_canary_source_bundle(
         .into_iter()
         .map(|(path, role)| validate_executable(&path, role).map_err(to_installation_error))
         .collect::<Result<Vec<_>, _>>()?;
-    materialize_with_resolved_selection(input, &executables, false, &selection)
+    materialize_with_resolved_selection(input, &executables, false, selection)
         .map_err(to_installation_error)
 }
 
@@ -1984,8 +2062,8 @@ pub fn materialize_canary_source_bundle(
 mod tests {
     use super::*;
     use eliot_installation::{
-        GenerationPackagePlanInput, InstallationTransactionStore, RedbInstallationTransactionStore,
-        ProfileRootAnchors, validate_installation_transaction_json,
+        GenerationPackagePlanInput, InstallationTransactionStore, ProfileRootAnchors,
+        RedbInstallationTransactionStore, validate_installation_transaction_json,
     };
     use tempfile::TempDir;
 
@@ -2080,6 +2158,24 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
+        let profile_selection = ProfileSelectionInput {
+            profile: InstallationProfile::PortableDev,
+            anchors: ProfileRootAnchors {
+                program_files: None,
+                program_data: None,
+                local_app_data,
+                repository_root: Some(profile_anchor_root.clone()),
+            },
+            profile_anchor_root,
+            installation_key: None,
+            component: "eliot".to_owned(),
+            version: "dev".to_owned(),
+            generation: Some("generation-test".to_owned()),
+            source_root: handle(output_bundle.to_string_lossy().into_owned()),
+            staging_root: handle(staging_root.to_string_lossy().into_owned()),
+        };
+        let profile_resolution =
+            GenerationPackagePlanner::resolve_profile_selection(&profile_selection).unwrap();
         CanarySourceBundleMaterializeInput {
             eliot_host_exe: PathBuf::new(),
             eliot_watchdog_exe: PathBuf::new(),
@@ -2102,22 +2198,8 @@ mod tests {
                 lineage_id: handle("lineage-test"),
                 sequence: 1,
             },
-            profile_selection: ProfileSelectionInput {
-                profile: InstallationProfile::PortableDev,
-                anchors: ProfileRootAnchors {
-                    program_files: None,
-                    program_data: None,
-                    local_app_data,
-                    repository_root: Some(profile_anchor_root.clone()),
-                },
-                profile_anchor_root,
-                installation_key: None,
-                component: "eliot".to_owned(),
-                version: "dev".to_owned(),
-                generation: Some("generation-test".to_owned()),
-                source_root: handle(output_bundle.to_string_lossy().into_owned()),
-                staging_root: handle(staging_root.to_string_lossy().into_owned()),
-            },
+            profile_selection,
+            profile_resolution,
             transaction_id: handle("transaction:test"),
         }
     }
