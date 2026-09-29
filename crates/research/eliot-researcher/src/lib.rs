@@ -30,27 +30,36 @@ use eliot_research_exchange_api::{
 // `NoMatchEvaluationIssuer::issue_for` exists to issue. `NoMatchEvaluation`
 // itself stays public because a consumer reads the record off
 // `AbsencePreconditions`; it can no longer be constructed from outside.
+//
+// `NoMatchEvaluationIssuer`, its named-argument params and
+// `AuthorizedManifest` ARE exported, because they are the three values the
+// evaluator/denominator owner outside this crate needs in order to issue a
+// record at all. They are nameable from here so a positive case is expressible
+// from outside the crate; `issue_for` remains the only construction path for the
+// record itself, so exporting them widens the surface a holder needs and
+// removes no door.
 pub use evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding,
-    CLAIM_REQUIREMENTS, ClaimRequirement, DimensionEvaluation, ManifestSource, MemberNoMatchResult,
-    NoMatchApplicability, NoMatchDimension, NoMatchEvaluation, ObservedOutsideScope,
-    RequirementOutcome, UnsupportedPrecisionItem,
+    AuthorizedManifest, AuthorizedManifestParams, CLAIM_REQUIREMENTS, ClaimRequirement,
+    DimensionEvaluation, ManifestSource, MemberNoMatchResult, NoMatchApplicability,
+    NoMatchDimension, NoMatchEvaluation, NoMatchEvaluationIssuer, NoMatchEvaluationIssuerParams,
+    ObservedOutsideScope, RequirementOutcome, UnsupportedPrecisionItem,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
 // reaching into a module path for a vocabulary it must match on.
 pub use inquiry_governance::{
-    AcquisitionOutcome, BlindedField, CandidateEvidence, ClaimAuditRecord, CounterSearchStatus,
-    CoverageGoal, CoverageReceipt, DenominatorKind, EnumerationState, EvidenceFreeze,
-    EvidenceFreezeParams, EvidenceGrade, EvidenceSetPrecision, GovernorInquiryAdmissionRequest,
-    HypothesisPolicy, IndependenceBlindingPolicy, IndependenceDimension,
-    IndependenceDimensionMeasurement, IndependenceProfile, InquiryError, InquiryGovernance,
-    InquiryHorizon, InquiryLane, InquiryObservation, InquiryOutputContract, InquiryProtocol,
-    InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures, InquiryStopRule,
-    InquiryTerminalRecord, InquiryUncertainty, LaneDisciplineOutcome, MissingSourceClass,
-    PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind,
-    ResearchDebtRestriction, SourcePortfolio, SpecialistDiscoverability, StopRuleKind,
-    StreamEvidence, UnadmittedReference, UnadmittedReferenceKind, VerifierStrength,
+    AbsenceEvidence, AcquisitionOutcome, BlindedField, CandidateEvidence, ClaimAuditRecord,
+    CounterSearchStatus, CoverageGoal, CoverageReceipt, CoverageReceiptParams, DenominatorKind,
+    EnumerationState, EvidenceFreeze, EvidenceFreezeParams, EvidenceGrade, EvidenceSetPrecision,
+    GovernorInquiryAdmissionRequest, HypothesisPolicy, IndependenceBlindingPolicy,
+    IndependenceDimension, IndependenceDimensionMeasurement, IndependenceProfile, InquiryError,
+    InquiryGovernance, InquiryHorizon, InquiryLane, InquiryObservation, InquiryOutputContract,
+    InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
+    InquiryStopRule, InquiryTerminalRecord, InquiryUncertainty, LaneDisciplineOutcome,
+    MissingSourceClass, PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt,
+    ResearchDebtKind, ResearchDebtRestriction, SourcePortfolio, SpecialistDiscoverability,
+    StopRuleKind, StreamEvidence, UnadmittedReference, UnadmittedReferenceKind, VerifierStrength,
 };
 pub use inquiry_lanes::{
     AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,
