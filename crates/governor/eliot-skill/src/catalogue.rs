@@ -473,10 +473,19 @@ impl SkillCatalogueEntry {
         Ok(())
     }
 
-    /// Scoped or current entries with valid structure may be used.
-    /// Stale, suppressed, archived and quarantined entries are blocked.
+    /// Scoped or provisionally admitted entries with valid structure may be
+    /// used. Stale, suppressed, archived and quarantined entries are blocked.
+    /// `Current` additionally requires the bound promotion record: a current
+    /// entry carrying no promotion evidence never passed promotion
+    /// validation, so it is unvalidated and cannot reach Material use (the
+    /// same rule `activation_display` and `HotsetDeliveryReceipt::issue`
+    /// enforce; the use gate agrees so the bridge admission path refuses it
+    /// too).
     #[must_use]
     pub fn is_usable(&self) -> bool {
+        if self.status == SkillStatus::Current && self.promotion_evidence.is_none() {
+            return false;
+        }
         matches!(self.status, SkillStatus::Current | SkillStatus::Provisional)
             && self.validate().is_ok()
     }
@@ -1278,8 +1287,10 @@ impl SkillCatalogue {
     }
 
     /// Fail-closed use gate: unknown, invalid, or non-current/provisional
-    /// entries are blocked. A stale entry stays blocked until its dependency
-    /// drift is reviewed and re-admitted as a new validated revision.
+    /// entries are blocked, as is a current entry carrying no bound promotion
+    /// record (unvalidated: it never passed promotion validation). A stale
+    /// entry stays blocked until its dependency drift is reviewed and
+    /// re-admitted as a new validated revision.
     #[must_use]
     pub fn is_usable(&self, skill_id: &str) -> bool {
         self.entries
@@ -1414,9 +1425,11 @@ impl SkillCatalogue {
     /// marking reuses the existing mark paths with first-drift-wins, and a
     /// mark rotates the catalogue digest so Hotset receipts issued before the
     /// sweep fail closed at `activation_display` instead of displaying a
-    /// drifted body. The pinned dependency set is then compared against the
-    /// currently registered versions through the activation Material-use
-    /// gate, so an unvalidated or stale Skill cannot reach Material use
+    /// drifted body. Every declared leg is then compared against the observed
+    /// world through the full Material-use gate
+    /// (`activation::gate_material_use_against`: status, promotion binding,
+    /// dependency set, host/profile, definition, tool basis), so an
+    /// unvalidated or stale Skill cannot reach Material use
     /// through a stored-status lag; stale entries stay refused through the
     /// existing `is_usable`/display refusal, and bounded use returns only as
     /// provisional. A passing display keeps the full receipt chain
@@ -1449,11 +1462,7 @@ impl SkillCatalogue {
         self.reconcile_staleness(world)?;
         let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
         entry.validate()?;
-        super::activation::gate_material_use(
-            entry.status,
-            &entry.dependencies,
-            world.current_dependencies,
-        )?;
+        super::activation::gate_material_use_against(entry, world)?;
         self.activation_display(skill_id, receipt, ack, world.tools)
     }
 }
