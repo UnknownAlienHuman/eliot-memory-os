@@ -8,8 +8,8 @@
   "cursor": {
     "handle_digest": "5555555555555555555555555555555555555555555555555555555555555555",
     "page_index": 0,
-    "cumulative_members": 2,
-    "cumulative_bytes": 3072
+    "cumulative_members": 0,
+    "cumulative_bytes": 0
   },
   "members": [
     {
@@ -35,6 +35,11 @@
       "reference_digest": null
     }
   ],
+  "coverage": {
+    "state": "in_progress",
+    "cumulative_members": 2,
+    "denominator_members": 3
+  },
   "cumulative_bytes": 3072,
   "cumulative_work": 50,
   "is_last": false,
@@ -42,7 +47,7 @@
   "next_cursor": {
     "handle_digest": "5555555555555555555555555555555555555555555555555555555555555555",
     "page_index": 1,
-    "cumulative_members": 3,
-    "cumulative_bytes": 3136
+    "cumulative_members": 2,
+    "cumulative_bytes": 3072
   }
 }

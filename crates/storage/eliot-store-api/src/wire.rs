@@ -19,14 +19,14 @@ use thiserror::Error;
 use crate::{
     BackupOperationReconciliation, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind, ExactJsonBytes,
-    IsolatedDestination, IsolationEvidence, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest,
-    NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
-    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error, json_shape_name,
-    reconcile_same_operation, verify_canonical_request_hash,
+    IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
+    NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes, dreamer_job::map_durable_error,
+    json_shape_name, reconcile_same_operation, sha256_hex, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -753,6 +753,37 @@ pub struct StoreBackupRequest {
 }
 
 impl StoreBackupRequest {
+    /// Derives the stable admitted identity for destination preparation.
+    ///
+    /// This is the existing #975 operation identity projection centralized
+    /// for the client, wire validator, and adapter port: its digest binds the
+    /// exact closed `PrepareDestination` payload and its idempotency key stays
+    /// stable for the admitted destination coordinates.
+    pub fn prepare_destination_identity(
+        destination: &IsolatedDestination,
+    ) -> Result<OperationIdentity, StoreError> {
+        destination.validate()?;
+        let operation = StoreBackupOperation::PrepareDestination(destination.clone());
+        let payload_bytes = canonical_json_bytes(&operation)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let canonical_request_hash = sha256_hex(&payload_bytes);
+        let identity = OperationIdentity {
+            operation_id: OperationId::new(format!(
+                "store-backup-prepare-destination:{canonical_request_hash}"
+            ))
+            .map_err(StoreError::Foundation)?,
+            idempotency_key: format!(
+                "store-backup-prepare-destination:{}:{}:{}",
+                destination.destination_id,
+                destination.target_schema,
+                destination.evidence.purge_policy_revision,
+            ),
+            canonical_request_hash,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
     /// Returns the stable admitted mutation identity for unknown-outcome
     /// binding (issue #975).
     ///
@@ -778,8 +809,8 @@ impl StoreBackupRequest {
     /// request correlation, not the original operation — the reconciled
     /// operation is `first`, `second` is only the compared identity);
     /// `PrepareDestination` carries no operation identity in its payload, so
-    /// the envelope identity is the only mutation binding and there is
-    /// nothing to conflict with.
+    /// the envelope identity is validated against the canonical operation
+    /// projection derived from the exact destination payload.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.context.validate().map_err(StoreError::Foundation)?;
         self.identity.validate()?;
@@ -805,7 +836,13 @@ impl StoreBackupRequest {
                 }
                 Ok(())
             }
-            StoreBackupOperation::PrepareDestination(_) => Ok(()),
+            StoreBackupOperation::PrepareDestination(destination) => {
+                let expected = Self::prepare_destination_identity(destination)?;
+                if expected != self.identity {
+                    return Err(StoreError::IdentityConflict);
+                }
+                Ok(())
+            }
             StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => {
                 if batch.operation != self.identity {
                     return Err(StoreError::InvalidField {
@@ -948,8 +985,8 @@ impl StoreBackupStatus {
     }
 }
 
-/// Closed backup response catalogue reusing #950 receipt/page/evidence
-/// types verbatim (issue #975).
+/// Closed backup response catalogue reusing #950 receipt/page types and the
+/// destination owner's readback-confirmed preparation receipt (issue #975).
 ///
 /// Unknown, partial, or expired states stay explicit per-outcome outcomes;
 /// they are never reported as success.
@@ -967,7 +1004,7 @@ pub enum StoreBackupResponse {
         receipt: SnapshotEndReceipt,
     },
     Isolation {
-        evidence: IsolationEvidence,
+        receipt: IsolatedDestinationReceipt,
     },
     Restored {
         receipt: RestoreValidationReceipt,
@@ -995,7 +1032,7 @@ impl StoreBackupResponse {
             Self::Handle { handle } => handle.validate(),
             Self::Page { page } => page.validate(),
             Self::EndReceipt { receipt } => receipt.validate(),
-            Self::Isolation { evidence } => evidence.validate(),
+            Self::Isolation { receipt } => receipt.validate(),
             Self::Restored { receipt } | Self::Validation { receipt } => receipt.validate(),
             Self::Status { report } => report.validate(),
             Self::Reconciled { reconciliation } => reconciliation.validate(),

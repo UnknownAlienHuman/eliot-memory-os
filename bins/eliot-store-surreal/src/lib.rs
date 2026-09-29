@@ -34,14 +34,14 @@ use eliot_protocol::{
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    ExactJsonBytes, IsolatedDestination, IsolatedRestorePort, IsolationEvidence, NamedReadRequest,
-    NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
-    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
-    StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth, WriteReceipt,
-    decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
-    verify_canonical_request_hash,
+    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
+    NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
+    WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
+    genesis_manifest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -903,7 +903,8 @@ impl StoreComposition {
         &self,
         context: &RequestMeta,
         destination: IsolatedDestination,
-    ) -> Result<IsolationEvidence, StoreCompositionError> {
+        operation: OperationIdentity,
+    ) -> Result<IsolatedDestinationReceipt, StoreCompositionError> {
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -911,6 +912,7 @@ impl StoreComposition {
         destination
             .validate()
             .map_err(StoreCompositionError::Store)?;
+        operation.validate().map_err(StoreCompositionError::Store)?;
         if context.state_fence != self.state_fence {
             return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
         }
@@ -919,10 +921,14 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome =
-            IsolatedRestorePort::prepare_isolated_destination(&self.store, context, destination)
-                .await
-                .map_err(StoreCompositionError::Store);
+        let outcome = IsolatedRestorePort::prepare_isolated_destination(
+            &self.store,
+            context,
+            destination,
+            operation,
+        )
+        .await
+        .map_err(StoreCompositionError::Store);
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))

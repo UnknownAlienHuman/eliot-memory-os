@@ -8,8 +8,8 @@
   "cursor": {
     "handle_digest": "2222222222222222222222222222222222222222222222222222222222222222",
     "page_index": 1,
-    "cumulative_members": 2,
-    "cumulative_bytes": 384
+    "cumulative_members": 1,
+    "cumulative_bytes": 128
   },
   "members": [
     {
@@ -24,6 +24,11 @@
       "reference_digest": "1111111111111111111111111111111111111111111111111111111111111111"
     }
   ],
+  "coverage": {
+    "state": "complete",
+    "cumulative_members": 2,
+    "denominator_members": 2
+  },
   "cumulative_bytes": 384,
   "cumulative_work": 9,
   "is_last": true,

@@ -572,11 +572,46 @@ pub struct SnapshotPage {
     pub handle: SnapshotHandle,
     pub cursor: SnapshotCursor,
     pub members: Vec<SnapshotMember>,
+    /// Owner-observed member coverage and terminal state for this page.
+    ///
+    /// `denominator_members` comes from the backend's retained canonical
+    /// enumeration, not from the caller-declared begin denominator. The
+    /// cumulative count is repeated here so the response can be checked
+    /// against the admitted cursor without trusting an echoed next cursor.
+    pub coverage: SnapshotPageCoverage,
     pub cumulative_bytes: u64,
     pub cumulative_work: u64,
     pub is_last: bool,
     pub predecessor_digest: String,
     pub next_cursor: Option<SnapshotCursor>,
+}
+
+/// Explicit coverage state for one owner-issued page.
+///
+/// Expired and unknown captures have no successful page payload; their exact
+/// refusal or unknown outcome remains on the typed `StoreFailure` path.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotPageState {
+    /// Additional owner-observed members remain to be served.
+    InProgress,
+    /// The owner-observed set was completely served under a complete capture.
+    Complete,
+    /// The known owner-observed set was served, but the capture is not an
+    /// authoritative complete snapshot.
+    Partial,
+}
+
+/// Owner-observed denominator and cumulative progress for one page.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotPageCoverage {
+    /// Explicit current outcome state.
+    pub state: SnapshotPageState,
+    /// Members served through this page, including this page's members.
+    pub cumulative_members: u64,
+    /// Exact denominator independently observed by the store owner.
+    pub denominator_members: u64,
 }
 
 impl SnapshotPage {
@@ -605,27 +640,95 @@ impl SnapshotPage {
         for member in &self.members {
             member.validate()?;
         }
-        let member_bytes: u64 = self.members.iter().fold(0_u64, |total, member| {
-            total.saturating_add(member.residency.byte_count)
-        });
-        if self.cumulative_bytes < member_bytes {
+        self.validate_coverage_and_cursor()
+    }
+
+    /// Checks cumulative page coverage and the exact next-cursor frontier.
+    fn validate_coverage_and_cursor(&self) -> Result<(), StoreError> {
+        let member_bytes = self.members.iter().try_fold(0_u64, |total, member| {
+            total
+                .checked_add(member.residency.byte_count)
+                .ok_or(StoreError::PayloadTooLarge)
+        })?;
+        let cumulative_bytes = self
+            .cursor
+            .cumulative_bytes
+            .checked_add(member_bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+        if self.cumulative_bytes != cumulative_bytes {
             return Err(StoreError::InvalidField {
                 field: "snapshot.cumulative_bytes",
-                reason: "below the member byte total",
+                reason: "must equal the admitted cursor bytes plus this page",
             });
         }
+        let page_members =
+            u64::try_from(self.members.len()).map_err(|_| StoreError::PayloadTooLarge)?;
+        let cumulative_members = self
+            .cursor
+            .cumulative_members
+            .checked_add(page_members)
+            .ok_or(StoreError::PayloadTooLarge)?;
+        if self.coverage.cumulative_members != cumulative_members
+            || self.coverage.denominator_members < cumulative_members
+        {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.coverage",
+                reason: "owner coverage must match the admitted cursor and contain progress",
+            });
+        }
+        let next_page_index = self
+            .cursor
+            .page_index
+            .checked_add(1)
+            .ok_or(StoreError::PayloadTooLarge)?;
         validate_digest(&self.predecessor_digest, "snapshot.predecessor_digest")?;
-        match (&self.is_last, &self.next_cursor) {
-            (true, Some(_)) => Err(StoreError::InvalidField {
+        match (self.coverage.state, self.is_last, &self.next_cursor) {
+            (SnapshotPageState::InProgress, false, Some(cursor)) => {
+                cursor.validate()?;
+                if cursor.handle_digest != self.handle.snapshot_digest
+                    || cursor.page_index != next_page_index
+                    || cursor.cumulative_members != cumulative_members
+                    || cursor.cumulative_bytes != self.cumulative_bytes
+                    || self.coverage.denominator_members <= cumulative_members
+                {
+                    return Err(StoreError::InvalidField {
+                        field: "snapshot.next_cursor",
+                        reason: "continuation must exactly advance owner coverage",
+                    });
+                }
+                Ok(())
+            }
+            (SnapshotPageState::Complete | SnapshotPageState::Partial, true, None)
+                if self.coverage.denominator_members == cumulative_members =>
+            {
+                Ok(())
+            }
+            (SnapshotPageState::InProgress, true, _) => Err(StoreError::InvalidField {
                 field: "snapshot.next_cursor",
-                reason: "terminal page must not carry a next cursor",
+                reason: "in-progress coverage must have a continuation",
             }),
-            (true, None) => Ok(()),
-            (false, Some(cursor)) => cursor.validate(),
-            (false, None) => Err(StoreError::InvalidField {
+            (SnapshotPageState::Complete | SnapshotPageState::Partial, false, _) => {
+                Err(StoreError::InvalidField {
+                    field: "snapshot.coverage",
+                    reason: "terminal coverage state requires a terminal page",
+                })
+            }
+            (SnapshotPageState::InProgress, false, None) => Err(StoreError::InvalidField {
                 field: "snapshot.next_cursor",
                 reason: "non-terminal page requires a next cursor",
             }),
+            (SnapshotPageState::Complete | SnapshotPageState::Partial, true, Some(_)) => {
+                Err(StoreError::InvalidField {
+                    field: "snapshot.next_cursor",
+                    reason: "terminal page must not carry a next cursor",
+                })
+            }
+            (SnapshotPageState::Complete | SnapshotPageState::Partial, true, None) => {
+                Err(StoreError::InvalidField {
+                    field: "snapshot.coverage",
+                    reason: "terminal coverage must close the owner denominator",
+                })
+            }
         }
     }
 
@@ -652,7 +755,24 @@ impl SnapshotPage {
         {
             return Err(StoreError::IdentityConflict);
         }
-        if self.cursor.cumulative_members > begin.bounds.max_members
+        if self.coverage.denominator_members != begin.denominator.member_count() {
+            return Err(StoreError::IdentityConflict);
+        }
+        for member in &self.members {
+            let expected = begin
+                .denominator
+                .members
+                .iter()
+                .find(|candidate| candidate.member_id == member.member_id)
+                .ok_or(StoreError::IdentityConflict)?;
+            if expected != member {
+                return Err(StoreError::IdentityConflict);
+            }
+        }
+        if self.coverage.denominator_members > begin.bounds.max_members
+            || self.coverage.cumulative_members > begin.bounds.max_members
+            || self.cursor.cumulative_members > begin.bounds.max_members
+            || self.cumulative_work > begin.bounds.max_work
             || self.cumulative_bytes > begin.bounds.max_bytes
         {
             return Err(StoreError::PayloadTooLarge);
@@ -671,6 +791,12 @@ impl SnapshotPage {
     /// The cursor/bounds checks below are unchanged and still apply once the
     /// handle is proven identical.
     pub fn validate_continuation(&self, previous: &SnapshotPage) -> Result<(), StoreError> {
+        if previous.is_last || previous.coverage.state != SnapshotPageState::InProgress {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.page",
+                reason: "a terminal page cannot have a continuation",
+            });
+        }
         if self.handle.consistency_point != previous.handle.consistency_point {
             return Err(StoreError::InvalidField {
                 field: "snapshot.consistency_point",
@@ -688,22 +814,29 @@ impl SnapshotPage {
         {
             return Err(StoreError::IdentityConflict);
         }
-        if self.cursor.page_index != previous.cursor.page_index + 1 {
+        let expected_page_index = previous
+            .cursor
+            .page_index
+            .checked_add(1)
+            .ok_or(StoreError::PayloadTooLarge)?;
+        if self.cursor.page_index != expected_page_index {
             return Err(StoreError::InvalidField {
                 field: "snapshot.page_index",
                 reason: "continuation must advance exactly one page",
             });
         }
-        if self.cumulative_bytes < previous.cumulative_bytes {
+        if self.cursor.cumulative_bytes != previous.cumulative_bytes
+            || self.cursor.cumulative_members != previous.coverage.cumulative_members
+        {
             return Err(StoreError::InvalidField {
-                field: "snapshot.cumulative_bytes",
-                reason: "continuation must not reset cumulative bounds",
+                field: "snapshot.cursor",
+                reason: "continuation must begin at the exact previous page bounds",
             });
         }
-        if self.cursor.cumulative_members < previous.cursor.cumulative_members {
+        if self.coverage.denominator_members != previous.coverage.denominator_members {
             return Err(StoreError::InvalidField {
-                field: "snapshot.cumulative_members",
-                reason: "continuation must not reset cumulative bounds",
+                field: "snapshot.coverage.denominator_members",
+                reason: "continuation must preserve the owner-observed denominator",
             });
         }
         Ok(())
@@ -824,6 +957,31 @@ impl IsolatedDestination {
         }
         self.evidence.validate()?;
         validate_text(&self.target_schema, "restore.target_schema")
+    }
+}
+
+/// Durable owner receipt for an isolated destination preparation.
+///
+/// This is distinct from [`IsolationEvidence`]: the evidence is caller input,
+/// while this receipt carries the admitted operation and the existing
+/// destination owner's readback-confirmed admission digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolatedDestinationReceipt {
+    /// Exact backup operation admitted by the Kernel client.
+    pub operation: OperationIdentity,
+    /// Destination whose durable fence was read back.
+    pub destination_id: String,
+    /// Existing owner-recorded digest of the durable admission document.
+    pub admission_digest: String,
+}
+
+impl IsolatedDestinationReceipt {
+    /// Validates the durable receipt shape without treating it as authority.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.operation.validate()?;
+        validate_text(&self.destination_id, "restore.destination_id")?;
+        validate_digest(&self.admission_digest, "restore.admission_digest")
     }
 }
 
@@ -1214,9 +1372,11 @@ pub trait IsolatedRestorePort: Send + Sync {
         &self,
         ctx: &RequestMeta,
         destination: IsolatedDestination,
-    ) -> Result<IsolationEvidence, StoreError> {
+        operation: OperationIdentity,
+    ) -> Result<IsolatedDestinationReceipt, StoreError> {
         ctx.validate().map_err(StoreError::Foundation)?;
         destination.validate()?;
+        operation.validate()?;
         Err(StoreError::UnknownOperation)
     }
 

@@ -78,11 +78,12 @@ use std::sync::{Mutex, OnceLock};
 use eliot_store_api::{
     BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_RESTORE_SCHEMA_V1,
     BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, IsolatedDestination,
-    IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS, OperationId, OperationIdentity,
-    OrderingHeadExpectation, ReconciliationOutcome, RecoveryRecord, RequestMeta,
-    RestoreValidationReceipt, RevisionHeadExpectation, SnapshotCompleteness, SnapshotMember,
-    SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreError, StoreMutationDisposition,
-    canonical_json_bytes, reconcile_same_operation, sha256_hex,
+    IsolatedDestinationReceipt, IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS,
+    OperationId, OperationIdentity, OrderingHeadExpectation, ReconciliationOutcome, RecoveryRecord,
+    RequestMeta, RestoreValidationReceipt, RevisionHeadExpectation, SnapshotCompleteness,
+    SnapshotMember, SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreBackupRequest,
+    StoreError, StoreMutationDisposition, canonical_json_bytes, reconcile_same_operation,
+    sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -3249,8 +3250,13 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
         &self,
         ctx: &RequestMeta,
         destination: IsolatedDestination,
-    ) -> Result<IsolationEvidence, StoreError> {
+        operation: OperationIdentity,
+    ) -> Result<IsolatedDestinationReceipt, StoreError> {
         ctx.validate().map_err(StoreError::Foundation)?;
+        operation.validate()?;
+        if StoreBackupRequest::prepare_destination_identity(&destination)? != operation {
+            return Err(StoreError::IdentityConflict);
+        }
         let (active_store, active_installation) = active_store_identity(&self.config);
         validate_isolated_destination(&destination, &active_store, &active_installation)
             .map_err(redact_store_error)?;
@@ -3284,7 +3290,11 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
             if existing.document.admission_digest != admission_digest {
                 return Err(StoreError::IdentityConflict);
             }
-            return Ok(destination.evidence.clone());
+            return Ok(IsolatedDestinationReceipt {
+                operation,
+                destination_id: existing.document.destination_id,
+                admission_digest: existing.document.admission_digest,
+            });
         }
         let document = destination_document(&destination, &binding, admission_digest, now)?;
         let row = destination_registry_row(&document, &key, &ctx.state_fence)?;
@@ -3325,7 +3335,11 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
         if confirmed.document.admission_digest != document.admission_digest {
             return Err(StoreError::IdentityConflict);
         }
-        Ok(destination.evidence.clone())
+        Ok(IsolatedDestinationReceipt {
+            operation,
+            destination_id: confirmed.document.destination_id,
+            admission_digest: confirmed.document.admission_digest,
+        })
     }
 
     /// Applies one canonical restore batch into the isolated destination.
