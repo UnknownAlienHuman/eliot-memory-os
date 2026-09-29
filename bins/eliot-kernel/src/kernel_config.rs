@@ -60,6 +60,12 @@ pub struct KernelConfig {
     pub testd_artifact_sha256: Option<String>,
     /// Independent digest of the approved native worker image injected by Host.
     pub native_worker_artifact_sha256: Option<String>,
+    /// Host-injected absolute User Broker executable path, paired with its
+    /// installer-approved artifact digest. Missing keeps the User Broker
+    /// role out of the front-door peer set.
+    pub user_broker_executable_path: Option<PathBuf>,
+    /// Installer-approved digest paired with `user_broker_executable_path`.
+    pub user_broker_artifact_sha256: Option<String>,
     /// Independent digest of the approved WASM-host image injected by Host
     /// (#1780). Missing fails closed once the WASM grant route is required;
     /// no in-memory or test signer is fabricated by the production
@@ -130,6 +136,8 @@ impl KernelConfig {
             doctor_executable_path: None,
             testd_artifact_sha256: None,
             native_worker_artifact_sha256: None,
+            user_broker_executable_path: None,
+            user_broker_artifact_sha256: None,
             wasm_host_artifact_sha256: None,
             wasm_host_executable_path: None,
             eliotd_receipt_binding: None,
@@ -233,6 +241,18 @@ impl KernelConfig {
     #[must_use]
     pub fn with_native_worker_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
         self.native_worker_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the exact Host-approved User Broker executable path and digest.
+    #[must_use]
+    pub fn with_user_broker_artifact_binding(
+        mut self,
+        path: PathBuf,
+        digest: impl Into<String>,
+    ) -> Self {
+        self.user_broker_executable_path = Some(path);
+        self.user_broker_artifact_sha256 = Some(digest.into());
         self
     }
 

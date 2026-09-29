@@ -276,6 +276,22 @@ async fn main() {
         );
     };
     kernel_config = kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
+    let Some(user_broker_executable_path) = options.user_broker_executable_path.clone() else {
+        exit_error(
+            "USER_BROKER_ARTIFACT_CONTRACT_REQUIRED",
+            "Host launch must inject the exact User Broker executable path",
+        );
+    };
+    let Some(user_broker_artifact_sha256) = options.user_broker_artifact_sha256.clone() else {
+        exit_error(
+            "USER_BROKER_ARTIFACT_CONTRACT_REQUIRED",
+            "Host launch must inject the installer-approved User Broker executable digest",
+        );
+    };
+    kernel_config = kernel_config.with_user_broker_artifact_binding(
+        user_broker_executable_path,
+        user_broker_artifact_sha256,
+    );
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
     // I16.2/I16.5 (issue #1841): install the bounded-label OpenMetrics stack

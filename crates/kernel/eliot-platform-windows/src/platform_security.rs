@@ -31,6 +31,10 @@ pub enum NamedPipePeerKind {
     /// identity and is authenticated only through one exact OS-observed service
     /// process binding, the same strength the Host and `eliotd` roles get.
     Watchdog,
+    /// The installer-pinned User Broker running in one OS-observed active
+    /// interactive session. This role proves transport identity only; it
+    /// carries no User Broker operation authority by itself.
+    UserBroker,
 }
 
 impl NamedPipePeerKind {
@@ -42,6 +46,7 @@ impl NamedPipePeerKind {
             Self::Eliotd => "eliotd",
             Self::AgentBridge => "eliot-agent-bridge",
             Self::Watchdog => "eliot-watchdog",
+            Self::UserBroker => "eliot-user-broker",
         }
     }
 }
@@ -68,8 +73,14 @@ impl NamedPipePeerProfile {
             .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
             || (kind == NamedPipePeerKind::AgentBridge && profile_id.is_none())
             || (kind != NamedPipePeerKind::AgentBridge && profile_id.is_some())
-            || (kind == NamedPipePeerKind::AgentBridge && !expectation.is_dynamic_process())
-            || (kind != NamedPipePeerKind::AgentBridge && expectation.is_dynamic_process())
+            || (kind == NamedPipePeerKind::AgentBridge
+                && (!expectation.is_dynamic_process()
+                    || expectation.requires_interactive_group_membership()))
+            || (kind == NamedPipePeerKind::UserBroker
+                && (!expectation.is_dynamic_process()
+                    || !expectation.requires_interactive_group_membership()))
+            || (!matches!(kind, NamedPipePeerKind::AgentBridge | NamedPipePeerKind::UserBroker)
+                && expectation.is_dynamic_process())
         {
             return Err(WindowsAdapterError::InvalidInput);
         }
@@ -115,10 +126,10 @@ pub struct NamedPipePeerSet {
 
 impl NamedPipePeerSet {
     /// Maximum number of local peer roles in one set.
-    pub const MAX_ENTRIES: usize = 4;
+    pub const MAX_ENTRIES: usize = 5;
 
-    /// Seals a bounded set with at most one Host, Eliotd, `AgentBridge`, and
-    /// `Watchdog`.
+    /// Seals a bounded set with at most one Host, Eliotd, `AgentBridge`,
+    /// `Watchdog`, and User Broker.
     pub fn new(mut entries: Vec<NamedPipePeerProfile>) -> Result<Self, WindowsAdapterError> {
         if entries.is_empty() || entries.len() > Self::MAX_ENTRIES {
             return Err(WindowsAdapterError::InvalidInput);
@@ -126,10 +137,20 @@ impl NamedPipePeerSet {
         if entries.iter().any(|entry| {
             let static_process = entry.expectation.approved_process_binding();
             let dynamic_process = entry.expectation.is_dynamic_process();
-            let valid = if entry.kind == NamedPipePeerKind::AgentBridge {
-                dynamic_process
-            } else {
-                !dynamic_process && static_process.is_some()
+            let valid = match entry.kind {
+                NamedPipePeerKind::AgentBridge => {
+                    dynamic_process
+                        && !entry
+                            .expectation
+                            .requires_interactive_group_membership()
+                }
+                NamedPipePeerKind::UserBroker => {
+                    dynamic_process
+                        && entry
+                            .expectation
+                            .requires_interactive_group_membership()
+                }
+                _ => !dynamic_process && static_process.is_some(),
             };
             !valid
         }) {
@@ -165,13 +186,24 @@ impl NamedPipePeerSet {
             .any(|entry| entry.expectation.requires_builtin_administrators())
     }
 
-    /// Returns whether a dynamic bridge entry requires an OS-observed active
-    /// interactive session during live authentication.
+    /// Returns whether a dynamic bridge or User Broker entry requires an
+    /// OS-observed active interactive session during live authentication.
     #[must_use]
     pub fn requires_active_interactive_session(&self) -> bool {
         self.entries
             .iter()
             .any(|entry| entry.expectation.is_dynamic_process())
+    }
+
+    /// Returns whether live authentication must prove enabled INTERACTIVE
+    /// group membership from the peer process primary token.
+    #[must_use]
+    pub fn requires_interactive_group_membership(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            entry
+                .expectation
+                .requires_interactive_group_membership()
+        })
     }
 
     /// Returns the approved SID principals used to build and verify a set DACL.
@@ -488,6 +520,21 @@ pub fn validate_pinned_artifact(
     path: &Path,
     expected_sha256: &str,
 ) -> Result<PathBuf, WindowsAdapterError> {
+    validate_pinned_artifact_with_identity(path, expected_sha256).map(|(path, _)| path)
+}
+
+/// Validates an installer-pinned executable and returns its canonical path
+/// together with the stable identity read from the same no-follow handle used
+/// to measure its bytes.
+///
+/// # Errors
+///
+/// Returns an error when the path or digest is invalid, the artifact is absent
+/// or a reparse point, its identity changes, or its digest mismatches.
+pub fn validate_pinned_artifact_with_identity(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<(PathBuf, FileIdentity), WindowsAdapterError> {
     if !path.is_absolute() || !crate::valid_sha256_hex(expected_sha256) {
         return Err(WindowsAdapterError::InvalidInput);
     }
@@ -525,7 +572,9 @@ pub fn validate_pinned_artifact(
         if crate::sha256_hex(&bytes) != expected_sha256 {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
-        Ok(canonical)
+        let identity = crate::file_identity_for_open_handle(&file)
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        Ok((canonical, identity))
     }
     #[cfg(not(windows))]
     {

@@ -1118,6 +1118,8 @@ impl KernelComposition {
         let doctor_artifact_sha256 = config.doctor_artifact_sha256.clone();
         let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
         let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
+        let user_broker_executable_path = config.user_broker_executable_path.clone();
+        let user_broker_artifact_sha256 = config.user_broker_artifact_sha256.clone();
         let eliotd_receipt_binding = config.eliotd_receipt_binding.clone();
         let audit_spool_binding = config.audit_spool_binding.clone();
         let audit_fallback_profile = config.audit_fallback_profile_or_default();
@@ -1186,6 +1188,7 @@ impl KernelComposition {
             (&doctor_artifact_sha256, "Doctor"),
             (&testd_artifact_sha256, "Testd"),
             (&native_worker_artifact_sha256, "native worker"),
+            (&user_broker_artifact_sha256, "User Broker"),
             (&wasm_host_artifact_sha256, "WASM host"),
         ] {
             if let Some(digest) = digest
@@ -1195,6 +1198,12 @@ impl KernelComposition {
                     "{label} artifact digest must be lowercase SHA-256"
                 )));
             }
+        }
+        if user_broker_executable_path.is_some() != user_broker_artifact_sha256.is_some() {
+            return Err(KernelBuildError::Service(
+                "User Broker executable path and artifact digest must be injected together"
+                    .to_owned(),
+            ));
         }
         if daemon_launch.is_some() && kernel_artifact_sha256.is_none() {
             return Err(KernelBuildError::Service(
@@ -1596,6 +1605,8 @@ impl KernelComposition {
             eliotd_descriptor_artifact_sha256,
             wasm_host_executable_path,
             wasm_host_artifact_sha256,
+            user_broker_executable_path,
+            user_broker_artifact_sha256,
             wasm_join_table: Mutex::new(eliot_kernel_service::WasmJoinTable::default()),
             pre_stage_identity_cache: Mutex::new(
                 eliot_kernel_service::PreStageIdentityCache::default(),
