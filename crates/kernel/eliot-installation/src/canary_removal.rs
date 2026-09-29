@@ -55,10 +55,14 @@ use super::{
 ///
 /// Version 2 makes the absolute reconcile deadline of the bounded reconcile
 /// wait mandatory. Version 3 adds the `UserMode` supervision-authority credential
-/// as a typed resource in the frozen removal graph. Older records require
-/// explicit migration; neither deadlines nor resource classifications are
-/// synthesized as defaults.
-pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
+/// as a typed resource in the frozen removal graph. Version 4 gives the
+/// repository-local `PortableDev` supervision authority its own removal
+/// category. Its original typed receipt is retained by the install
+/// transaction, but canary removal remains unsupported until the installation
+/// effect port provides provider-specific exact deletion and readback. Older
+/// records require explicit migration; neither deadlines nor resource
+/// classifications are synthesized as defaults.
+pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 
 /// Canonical prefix of every derived canary-removal operation identity.
 const CANARY_REMOVAL_OPERATION_PREFIX: &str = "canary-removal/v1:";
@@ -98,16 +102,25 @@ const CANARY_REMOVAL_RECONCILE_TIMEOUT_MS: u64 = 30_000;
 pub enum CanaryRemovalResource {
     /// Exact staged generation tree below the shared packages staging root.
     GenerationPackageRoot,
-    /// The `LocalService` Store credential provisioned for this generation.
+    /// The Store credential provisioned for this generation under its admitted
+    /// profile scope (`LocalService` or the exact current-user SID).
     StoreCredential,
     /// The exact current-user supervision-authority credential provisioned by
     /// the original `UserMode` transaction.
     UserModeAuthorityCredential,
+    /// The repository-local `PortableDev` supervision-authority key provisioned
+    /// by this generation. Its typed write receipt is retained by the install
+    /// transaction; removal remains unsupported while the installation effect
+    /// port lacks provider-specific exact deletion and readback.
+    PortableDevSupervisionAuthority,
     /// One canonical SCM service registration admitted for this generation.
     ServiceRegistration,
     /// One canonical SCM service start admitted for this generation.
     ServiceStart,
     /// The current-user Task Scheduler registration owned by this generation.
+    /// Its typed receipt is retained by the install transaction; removal stays
+    /// unsupported until the installation effect request carries that receipt
+    /// and its port performs exact unregister and readback.
     CurrentUserTaskRegistration,
     /// One installer-owned root created below the installation root.
     InstallationRoot,
@@ -1776,11 +1789,23 @@ fn freeze_effect_graph(
                 false,
                 true,
             ),
+            InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. } => (
+                CanaryRemovalResource::StoreCredential,
+                applied_identity(progress)?,
+                false,
+                true,
+            ),
             InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => (
                 CanaryRemovalResource::UserModeAuthorityCredential,
                 applied_identity(progress)?,
                 false,
                 true,
+            ),
+            InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. } => (
+                CanaryRemovalResource::PortableDevSupervisionAuthority,
+                applied_identity(progress)?,
+                false,
+                false,
             ),
             InstallerEffectPlan::MaterializePhaseB { .. } => (
                 CanaryRemovalResource::PhaseBLiveOverlay,
