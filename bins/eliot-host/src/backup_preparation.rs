@@ -3642,12 +3642,7 @@ impl OwnerEvidence {
             // of this projection; the refusal it raises is the point.
             self.owner_lease_ref()?;
             let binding = HostManifestBinding {
-                manifest_digest: self
-                    .approved
-                    .manifest
-                    .config_digest
-                    .as_str()
-                    .to_owned(),
+                manifest_digest: self.approved.manifest.config_digest.as_str().to_owned(),
                 roots_digest: self.runtime_roots().roots_digest.as_str().to_owned(),
                 registry_revision: self.revision(),
             };

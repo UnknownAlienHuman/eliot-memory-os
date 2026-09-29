@@ -584,7 +584,7 @@ impl RestorePorts<'_> {
     }
 }
 
-impl<'a> RestorePorts<'a> {
+impl RestorePorts<'_> {
     /// Returns this per-execution bundle carrying the owner-issued destination
     /// evidence, built by [`DestinationManifestEvidence::issue_from_owner_manifest`]
     /// (issue #962, AUDIT-7).
