@@ -1784,13 +1784,12 @@ impl KernelComposition {
                     // owner (`admit_doctor_repair_cancellation`), so the
                     // requested cancellation is observed as effected here.
                     // Production-reachable via the driver control arm. Info
-                    // only; this wrapper owns the single terminal.
+                    // only; `dispatch_frame` owns the single designated terminal.
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
             }
-            Err(error) => {
+            Err(_) => {
                 observe_frame("kernel.frame_doctor_execute", "fenced");
-                super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
             }
         }
         result
@@ -2093,13 +2092,12 @@ impl KernelComposition {
                     // owner (`admit_testd_cancellation`), so the requested
                     // cancellation is observed as effected here.
                     // Production-reachable via the driver control arm. Info
-                    // only; this wrapper owns the single terminal.
+                    // only; `dispatch_frame` owns the single designated terminal.
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
             }
-            Err(error) => {
+            Err(_) => {
                 observe_frame("kernel.frame_testd_execute", "fenced");
-                super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
             }
         }
         result
