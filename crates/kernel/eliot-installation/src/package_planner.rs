@@ -116,7 +116,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 fn current_user_store_credential_plan(
     candidate: &CandidateManifest,
-    roots: &InstallationRoots,
+    roots: &RuntimeStateRoots,
     authority_generation: ResourceGeneration,
 ) -> Result<StoreCredentialProvisionPlan, InstallationError> {
     let principal_sid = WindowsInstallerSecretProvider::new()

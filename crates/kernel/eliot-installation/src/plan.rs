@@ -16,7 +16,7 @@ use super::{
     WindowsPathIdentity,
     approved_path, handle, package_plan_error, phase_b_host_state_root_digest,
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest, sha256_handle,
-    sha256_hex, validate_package_relative_text,
+    sha256_hex, same_windows_root, validate_package_relative_text,
 };
 use super::credential_provision::valid_current_user_sid;
 use super::profile_supervision::UserModeTaskRegistrationPlan;
@@ -782,7 +782,7 @@ pub(super) fn validate_current_user_store_credential_effect_bindings(
             InstallationProfile::SystemService => "",
         };
         let expected_state_root = WindowsPathIdentity::parse_root(
-            roots.host_state_root.as_str(),
+            roots.runtime_state_roots.host_state_root.as_str(),
             "runtime_roots.host_state_root",
         )?;
         let planned_state_root = WindowsPathIdentity::parse_root(
@@ -795,7 +795,8 @@ pub(super) fn validate_current_user_store_credential_effect_bindings(
             || provision.provider != super::StoreCredentialProvider::WindowsCredentialManager
             || provision.target != *store_credential_target
             || provision.target != candidate.store_credential_target
-            || provision.host_state_root.as_str() != roots.host_state_root.as_str()
+            || provision.host_state_root.as_str()
+                != roots.runtime_state_roots.host_state_root.as_str()
             || expected_state_root != planned_state_root
             || provision.expected_host_executable != candidate.host_executable_path
             || provision.expected_host_executable_sha256 != launch.host_artifact_digest
