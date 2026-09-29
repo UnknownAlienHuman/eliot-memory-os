@@ -475,6 +475,34 @@ fn validate_descriptor_abi_digest(descriptor: &TypedDescriptor) -> Result<(), Ty
     Ok(())
 }
 
+/// The single linker constructor for typed worlds: a fresh empty linker with
+/// zero ambient imports. No WASI command/preopens/stdio inheritance, no
+/// network/HTTP/DNS, no env/args, no clock/random, no process/thread, no
+/// credential/Store/provider/model/tool access, and no mutation host function
+/// is ever defined on it. A component that imports anything fails closed:
+/// `preflight_component_type` rejects observed imports before instantiation,
+/// and instantiation on this linker fails for unregistered imports.
+fn empty_linker(engine: &wasmtime::Engine) -> wasmtime::component::Linker<StoreState> {
+    wasmtime::component::Linker::new(engine)
+}
+
+/// Validates the guest's descriptor identity before the domain export runs.
+/// A lying descriptor is denied at `TypedStage::Descriptor` here, so its
+/// claims can neither select imports nor reach domain invocation. Linking
+/// never consults the descriptor: every world instantiates on `empty_linker`
+/// with zero ambient imports, and this check only denies.
+fn check_descriptor_identity(
+    world: TypedWorld,
+    descriptor: &TypedDescriptor,
+    limits: &InvocationLimits,
+) -> Result<(), TypedExecutionError> {
+    validate_descriptor(world, descriptor, limits.max_output_bytes)
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+    validate_descriptor_abi_digest(descriptor)
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+    Ok(())
+}
+
 /// Bounded pre-lift and post-lift measurement of one typed value. String and
 /// list ceilings are checked as each leaf is visited, so a request is bounded
 /// before the host lowers it into guest memory and a result is bounded while
@@ -1086,7 +1114,7 @@ fn describe_context_admission(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_admission::ContextAdmission;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = ContextAdmission::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1111,7 +1139,7 @@ fn describe_context_assembly(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_assembly::ContextAssembly;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = ContextAssembly::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1136,7 +1164,7 @@ fn describe_cue_activation(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::cue_activation::CueActivation;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = CueActivation::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1161,7 +1189,7 @@ fn describe_dreamer_handler(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_handler::DreamerHandler;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = DreamerHandler::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1186,7 +1214,7 @@ fn describe_memory_curation_screen(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::memory_curation_screen::MemoryCurationScreen;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = MemoryCurationScreen::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1211,7 +1239,7 @@ fn describe_dreamer_cycle(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_cycle::DreamerCycle;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = DreamerCycle::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1994,7 +2022,7 @@ fn call_admission(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_admission::ContextAdmission;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             ContextAdmission::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2017,6 +2045,10 @@ fn call_admission(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::ContextAdmission, &descriptor, limits)?;
         let called = interface
             .call_admit(&mut *store, request)
             .map_err(|error| {
@@ -2045,7 +2077,7 @@ fn call_assembly(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_assembly::ContextAssembly;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             ContextAssembly::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2068,6 +2100,10 @@ fn call_assembly(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::ContextAssembly, &descriptor, limits)?;
         let called = interface
             .call_assemble(&mut *store, request)
             .map_err(|error| {
@@ -2096,7 +2132,7 @@ fn call_cue_activation(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::cue_activation::CueActivation;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             CueActivation::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2119,6 +2155,10 @@ fn call_cue_activation(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::CueActivation, &descriptor, limits)?;
         let called = interface
             .call_activate(&mut *store, request)
             .map_err(|error| {
@@ -2147,7 +2187,7 @@ fn call_dreamer_handler(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_handler::DreamerHandler;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             DreamerHandler::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2170,6 +2210,10 @@ fn call_dreamer_handler(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::DreamerHandler, &descriptor, limits)?;
         let called = interface
             .call_handle(&mut *store, request)
             .map_err(|error| {
@@ -2198,7 +2242,7 @@ fn call_memory_curation_screen(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::memory_curation_screen::MemoryCurationScreen;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = MemoryCurationScreen::instantiate(&mut *store, component, &linker).map_err(
             |error| {
                 staged(
@@ -2222,6 +2266,10 @@ fn call_memory_curation_screen(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::MemoryCurationScreen, &descriptor, limits)?;
         let called = interface
             .call_screen(&mut *store, request)
             .map_err(|error| {
@@ -2250,7 +2298,7 @@ fn call_dreamer_cycle(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_cycle::DreamerCycle;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             DreamerCycle::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2273,6 +2321,10 @@ fn call_dreamer_cycle(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::DreamerCycle, &descriptor, limits)?;
         let called = interface.call_step(&mut *store, request).map_err(|error| {
             staged(
                 TypedStage::Invoke,
