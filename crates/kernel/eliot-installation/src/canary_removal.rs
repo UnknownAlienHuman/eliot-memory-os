@@ -1178,12 +1178,16 @@ where
             install.stage()
         )));
     }
-    if install.has_activation_projection_intent() {
+    if install.has_pending_activation_projection_intent() {
         return Err(InstallationError::IncompleteObservation(
             "the activation owner still holds this transaction's pending activation intent"
                 .to_owned(),
         ));
     }
+    // A held intent together with the committed activation receipt is retained
+    // historical provenance, not a pending projection: the install history
+    // stays owned by the original transaction and removal proceeds as a new
+    // operation bound to it, never as a rewritten rollback.
     install.require_all_effects_applied()?;
     if !install.pending_external_changes.is_empty() {
         return Err(InstallationError::IncompleteObservation(
@@ -1402,9 +1406,11 @@ fn require_complete_effect_coverage(
 ///   token. The only claim this owner makes is the one it can prove from its own
 ///   record: the authority that would admit those authorities is bound to this
 ///   exact generation of this exact installation, so retiring the generation
-///   retires them with it. A transaction still holding a live activation
-///   projection intent - the canary's own activation session boundary in this
-///   owner - is refused outright.
+///   retires them with it. A transaction still holding a genuinely pending
+///   activation projection intent - the canary's own activation session
+///   boundary in this owner, a held intent without the committed activation
+///   receipt - is refused outright. A held intent together with that receipt
+///   is retained historical provenance, not a pending projection.
 ///
 /// The owner-derived rows are re-derived here and compared identity for
 /// identity against the frozen plan. That is what stops a plan from naming a
@@ -1435,10 +1441,12 @@ fn require_quiesced_owner_effects(
     {
         return Err(InstallationError::IdentityConflict);
     }
-    // The canary's live activation session boundary: a held intent means the
-    // activation owner can still project this generation, so its leases,
-    // sessions and routes are not yet this removal's to retire.
-    if install.has_activation_projection_intent() {
+    // The canary's live activation session boundary: a genuinely pending
+    // intent means the activation owner can still project this generation, so
+    // its leases, sessions and routes are not yet this removal's to retire. A
+    // held intent together with the committed activation receipt is retained
+    // historical provenance and does not block retirement.
+    if install.has_pending_activation_projection_intent() {
         return Err(InstallationError::IncompleteObservation(
             "the activation owner still holds this transaction's pending activation intent"
                 .to_owned(),

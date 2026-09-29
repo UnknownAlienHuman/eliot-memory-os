@@ -764,6 +764,20 @@ impl InstallationTransaction {
         self.activation_projection_intent.is_some()
     }
 
+    /// Reports whether the activation owner still holds a genuinely pending
+    /// projection intent for this transaction.
+    ///
+    /// A held intent past the committed activation boundary is retained
+    /// historical provenance, not a pending projection: `ActiveVerified`,
+    /// `Cleaning` and `Completed` all require the exact committed activation
+    /// receipt, so the activation owner has already projected this generation.
+    /// Only a held intent without that committed receipt means the activation
+    /// owner can still project this generation.
+    #[must_use]
+    pub fn has_pending_activation_projection_intent(&self) -> bool {
+        self.activation_projection_intent.is_some() && self.active_verified_receipt.is_none()
+    }
+
     /// Requires authoritative readback for every immutable installer effect.
     ///
     /// This is the core admission gate for any registry or approval
