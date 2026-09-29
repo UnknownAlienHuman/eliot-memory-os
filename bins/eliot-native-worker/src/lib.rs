@@ -484,39 +484,51 @@ pub fn require_worker_cell_match(
     Ok(())
 }
 
-/// Requires a credential-bearing Ready verdict to predate the presenting
-/// registration's lease expiry.
+/// Requires a Ready verdict to remain inside the presenting registration's
+/// lease at the current drive boundary.
 ///
 /// Credential-lease negative (Implements #22 AC5): the readiness verdict
 /// travels to the drive before any lifecycle submit, so a Ready that still
 /// carries broker-issued credential references while its registration lease
 /// has already expired at declaration time is a refused presentation (typed
 /// exit 78 in the binary, never the missing-material deferral and never a
-/// drive). Lease loss revokes the credential authority; the owner re-issues
-/// it through a new admission, never a local repair in the worker. A
-/// `Blocked` verdict asserts no credential authority and passes; a report
-/// with an empty credential set passes with general lease liveness left to
-/// the claim deadline and admission revalidation. Credentials stay
-/// broker-bound per #23/User Broker: this pin compares the declaration time
-/// against the lease window only and carries no credential material.
+/// drive). The current drive time must also precede lease expiry for every
+/// Ready verdict, so an old declaration cannot be replayed after lease loss.
+/// The owner re-issues authority through a new admission, never a local
+/// repair in the worker. A `Blocked` verdict asserts no credential authority
+/// and passes. Credentials stay broker-bound per #23/User Broker; this pin
+/// compares both declaration and current drive time with the registration
+/// lease window and carries no credential material.
 ///
 /// # Errors
 ///
 /// Returns [`NativeWorkerError::KernelAdmissionRequired`] when a
-/// credential-bearing Ready outlives its registration lease or answers
-/// another registration.
+/// Ready outlives its registration lease at declaration or drive time, or
+/// credential-bearing Ready answers another registration.
 pub fn require_ready_credential_lease_liveness(
     registration: &NativeWorkerRegistration,
     readiness: &ReadinessSubmission,
+    observed_at_unix_ms: u64,
 ) -> Result<(), NativeWorkerError> {
     match readiness.readiness() {
-        NativeWorkerReadiness::Ready(report) => report
-            .validate_credential_lease(registration)
-            .map_err(|error| {
-                NativeWorkerError::KernelAdmissionRequired(format!(
-                    "credential-bearing Ready outlived its registration lease: {error}"
-                ))
-            }),
+        NativeWorkerReadiness::Ready(report) => {
+            report
+                .validate_credential_lease(registration)
+                .map_err(|error| {
+                    NativeWorkerError::KernelAdmissionRequired(format!(
+                        "credential-bearing Ready outlived its registration lease: {error}"
+                    ))
+                })?;
+            if observed_at_unix_ms == 0
+                || report.ready_at_unix_ms > observed_at_unix_ms
+                || observed_at_unix_ms >= registration.lease_expires_at_unix_ms
+            {
+                return Err(NativeWorkerError::KernelAdmissionRequired(
+                    "Ready is not current under its registration lease".to_owned(),
+                ));
+            }
+            Ok(())
+        }
         NativeWorkerReadiness::Blocked(_) => Ok(()),
     }
 }
@@ -569,7 +581,7 @@ where
     require_artifact_manifest_match(admission.claim(), &hello)?;
     require_module_catalog_revision_match(registration, admission.claim())?;
     require_worker_cell_match(registration, admission.claim())?;
-    require_ready_credential_lease_liveness(registration, readiness)?;
+    require_ready_credential_lease_liveness(registration, readiness, dispatch_now_unix_ms()?)?;
     lifecycle.submit_registration(registration)?;
     lifecycle.submit_claim(admission)?;
     lifecycle.submit_reconcile(reconcile)?;
