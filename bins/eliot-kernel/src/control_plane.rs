@@ -118,6 +118,47 @@ fn observe_control_capacity(capacity: usize) {
 }
 
 impl KernelComposition {
+    /// Takes exclusive Kernel ownership of one installation/activation contour.
+    ///
+    /// I14.16 step 7: the replacement Kernel acquires the exclusive owner
+    /// object for the exact contour Host bound to it, and Host refuses to mark
+    /// the candidate active unless this object exists and is not creatable by
+    /// anyone else. The object is created at the candidate `Reconcile` - the
+    /// first point where this process learns its own contour, and still inside
+    /// the zero-authority shadow phase - and is held for the process lifetime.
+    /// A repeated reconcile of a different contour in the same process is
+    /// refused rather than silently keeping the previous owner.
+    #[cfg(windows)]
+    pub(crate) fn acquire_kernel_owner(
+        &self,
+        installation: &PlatformHandle,
+        activation: &PlatformHandle,
+    ) -> Result<(), eliot_platform_windows::KernelOwnerLeaseError> {
+        // A poisoned gate still has to be recovered: refusing here would leave
+        // the contour's owner unrecorded while this process keeps running.
+        let mut owner = self
+            .kernel_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = owner.as_ref() {
+            if !held.is_for(installation, activation) {
+                return Err(eliot_platform_windows::KernelOwnerLeaseError::ExistingObject);
+            }
+            let capability = held.owner_capability();
+            // Proves this process still owns the object right now; a released
+            // or dropped lease fails closed here.
+            let _live = capability
+                .live_guard()
+                .map_err(|_| eliot_platform_windows::KernelOwnerLeaseError::ExistingObject)?;
+            return Ok(());
+        }
+        *owner = Some(eliot_platform_windows::KernelOwnerLease::acquire(
+            installation,
+            activation,
+        )?);
+        Ok(())
+    }
+
     /// Applies one lifecycle command through the sole Kernel transition gateway.
     ///
     /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): exactly one terminal is
@@ -724,12 +765,27 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
         } else {
             match &request.command {
-                KernelControlCommand::Reconcile => self
-                    .service
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .reconcile(request.candidate.clone())
-                    .map_err(|_| TransportError::SessionFenced)?,
+                // I14.16 step 2/7: the candidate takes exclusive ownership of
+                // its own installation/activation contour here, before it
+                // adopts any lineage, so two Kernels can never both own the
+                // same contour and Host has a real object to verify later.
+                KernelControlCommand::Reconcile => {
+                    // The exclusive owner object is a Windows named-object
+                    // primitive; on other targets the contour has no
+                    // cross-process owner object to take and this step is
+                    // unreachable rather than simulated.
+                    #[cfg(windows)]
+                    self.acquire_kernel_owner(
+                        &request.candidate.installation_id,
+                        &request.candidate.activation_id,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    self.service
+                        .lock()
+                        .map_err(|_| TransportError::SessionFenced)?
+                        .reconcile(request.candidate.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                }
                 KernelControlCommand::BootstrapStore(_)
                 | KernelControlCommand::Activate(_)
                 | KernelControlCommand::ReconcileActivation(_)

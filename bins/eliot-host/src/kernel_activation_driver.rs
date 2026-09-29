@@ -1,11 +1,12 @@
 use super::{
     AppendReceipt, EpochTransition, HealthDimension, HostError, HostInstallationEpoch,
     HostKernelCandidateBinding, HostStateJournalService, HostStateRecord, JournalBackend,
-    KernelActivationPermit, KernelActivationReceipt, KernelActivationState, KernelJobBinding,
-    KernelReadyReceipt, KernelRecord, NonceState, OneTimeNonceState, PlatformHandle,
-    PriorKernelDisposition, ResourceGeneration, ServiceProcessRecord, ServiceProcessState,
-    append_reconciled, fresh_kernel_activation_nonce, nonce_after_activation_failure, operation,
-    record_fence, sha256_json,
+    KernelActivationPermit, KernelActivationReceipt, KernelActivationState, KernelHandoffReceipt,
+    KernelJobBinding, KernelReadyReceipt, KernelRecord, NonceState, OneTimeNonceState,
+    PlatformHandle, PriorKernelDisposition, ResourceGeneration, ServiceProcessRecord,
+    ServiceProcessState, append_reconciled, fresh_kernel_activation_nonce,
+    nonce_after_activation_failure, operation, prove_candidate_owner_held, record_fence,
+    sha256_json,
 };
 
 // F-LOG-HOST-3 (#978) Kernel-activation observation helpers.
@@ -44,6 +45,11 @@ pub(super) struct DurableKernelActivationDriver<'a, B: JournalBackend> {
     journal: &'a HostStateJournalService<B>,
     current: KernelRecord,
     issued_permit: Option<KernelActivationPermit>,
+    /// I14.16 step 5: the retained handoff boundary of the retired contour.
+    /// `None` means no prior Kernel existed. A replacement contour cannot
+    /// commit prior disposition without one, so the lock-release proof and
+    /// the durable record cannot be separated.
+    handoff: Option<KernelHandoffReceipt>,
 }
 
 #[cfg(windows)]
@@ -56,6 +62,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             journal,
             current,
             issued_permit: None,
+            handoff: None,
         }
     }
 
@@ -105,6 +112,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             journal,
             current,
             issued_permit: None,
+            handoff: None,
         })
     }
 
@@ -123,16 +131,76 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         Ok(receipt)
     }
 
-    pub(super) fn handoff_prepared(&mut self) -> Result<(), HostError> {
+    /// Records the I14.16 step-5 handoff boundary for the retired contour.
+    ///
+    /// The receipt is compared by content against the prior disposition this
+    /// activation already carries, so a receipt describing a different
+    /// retired contour cannot advance this one, and `None` is accepted only
+    /// when there was genuinely no prior Kernel. The receipt authorizes
+    /// nothing yet: the exclusive owner object is probed in
+    /// [`Self::prior_disposition_committed`], which is the only step that may
+    /// unblock nonce issuance.
+    pub(super) fn handoff_prepared(
+        &mut self,
+        handoff: Option<&KernelHandoffReceipt>,
+    ) -> Result<(), HostError> {
+        let disposition = &self.current.prior_kernel_disposition;
+        match handoff {
+            Some(receipt) => {
+                if !receipt.matches_disposition(disposition) {
+                    return Err(HostError::ProcessContour(
+                        "Kernel handoff receipt does not match this activation's prior contour"
+                            .to_owned(),
+                    ));
+                }
+            }
+            None => {
+                if !matches!(disposition, PriorKernelDisposition::NoPriorKernel) {
+                    return Err(HostError::ProcessContour(
+                        "Kernel handoff requires a receipt for the recorded prior contour"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        let evidence = match handoff {
+            Some(receipt) => Some(receipt.evidence_ref()?),
+            None => None,
+        };
+        self.handoff = handoff.cloned();
         self.transition(
             KernelActivationState::HandoffPrepared,
             "kernel-handoff-prepared",
-            |_| Ok(()),
+            |next| {
+                if let Some(evidence) = evidence {
+                    next.disposition_evidence.push(evidence);
+                }
+                Ok(())
+            },
         )?;
         Ok(())
     }
 
+    /// Commits the retired contour's disposition only after Host has proven,
+    /// on the live operating-system object, that the retired Kernel released
+    /// its exclusive ownership.
+    ///
+    /// Process termination alone is not this proof: `journal_append::
+    /// terminated_prior_kernel` proves the Job is empty and the root is
+    /// reaped, while [`KernelHandoffReceipt::prove_released`] proves no
+    /// process still owns that contour. Nonce issuance is already gated on
+    /// `OldTerminated`, so an unproven release can never reach it.
     pub(super) fn prior_disposition_committed(&mut self) -> Result<(), HostError> {
+        if let Some(handoff) = self.handoff.as_ref() {
+            handoff.prove_released()?;
+        } else if !matches!(
+            self.current.prior_kernel_disposition,
+            PriorKernelDisposition::NoPriorKernel
+        ) {
+            return Err(HostError::ProcessContour(
+                "prior disposition commit requires the recorded Kernel handoff receipt".to_owned(),
+            ));
+        }
         self.transition(
             KernelActivationState::OldTerminated,
             "kernel-prior-disposition",
@@ -214,6 +282,11 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // requires actual owner evidence (permit + receipts), never liveness
         // alone.
         kernel_activation_observe("host.kernel-activation readiness requested");
+        // I14.16 step 7/8: the candidate must hold exclusive ownership of its
+        // own contour before Host publishes it. This runs before the permit,
+        // receipt and nonce checks so a candidate that never took the owner
+        // object is refused here, not after the stable pipe is committed.
+        prove_candidate_owner_held(candidate)?;
         let permit = self.issued_permit.as_ref().ok_or_else(|| {
             HostError::ProcessContour("active Kernel is missing its issued permit".to_owned())
         })?;
