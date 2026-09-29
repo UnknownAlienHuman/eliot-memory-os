@@ -73,11 +73,6 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), AssemblyError
     Ok(())
 }
 
-/// Assemble one exact admitted set using one injected measurement call.
-///
-/// The callback receives the exact canonical A-15 rendered payload bytes and
-/// is invoked once. This prototype accepts only exact UTF-8 byte measurement;
-/// tokenizer and STU observations remain data for a later qualified route.
 /// Builds and self-validates the selection proof for one assembled view.
 ///
 /// Extracted so the membership and identity checks read as one step: the proof
@@ -85,15 +80,28 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), AssemblyError
 /// own `validate` is the only place that claim is checked. See #251 - the two
 /// id sets must come from independent projections, and `validate` also compares
 /// lengths so a duplicated id cannot collapse inside a set.
+///
+/// The admitted identities are therefore read here from the admission owner's
+/// set, and the caller supplies only the rendered ones. Passing one list for
+/// both would make the equality a comparison of a list with a copy of itself,
+/// which no atom the projection dropped, added or duplicated could violate.
+/// `AdmittedContextSet::validate` refuses any record that is not `Include` or
+/// `HandleOnly` and `render` projects every record, so for a valid admitted set
+/// the two sets are equal; only the recorded order of `admitted_ids` differs
+/// from the presentation order of the projection.
 fn selection_proof(
     admitted: &AdmittedContextSet,
-    ids: &[eliot_contracts::ArtifactId],
+    rendered_ids: &[eliot_contracts::ArtifactId],
     output_digest: &str,
 ) -> Result<eliot_context_contracts::SelectionIntegrityProof, AssemblyError> {
     let selection = eliot_context_contracts::SelectionIntegrityProof {
         binding: admitted.binding.clone(),
-        admitted_ids: ids.to_vec(),
-        rendered_ids: ids.to_vec(),
+        admitted_ids: admitted
+            .records
+            .iter()
+            .map(|record| record.candidate.atom_id.clone())
+            .collect(),
+        rendered_ids: rendered_ids.to_vec(),
         omission_evidence: admitted.economy.displaced.clone(),
         output_digest: output_digest.to_owned(),
     };
@@ -101,6 +109,11 @@ fn selection_proof(
     Ok(selection)
 }
 
+/// Assemble one exact admitted set using one injected measurement call.
+///
+/// The callback receives the exact canonical A-15 rendered payload bytes and
+/// is invoked once. This prototype accepts only exact UTF-8 byte measurement;
+/// tokenizer and STU observations remain data for a later qualified route.
 pub fn assemble_active_view<F>(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
@@ -186,14 +199,11 @@ where
         policy,
         policy.max_serialized_bytes,
     )?;
-    let ids = rendered
-        .iter()
-        .map(|atom| atom.atom_id.clone())
-        .collect::<Vec<_>>();
-    let selection = selection_proof(admitted, &ids, &output_digest)?;
+    let rendered_ids: Vec<_> = rendered.iter().map(|atom| atom.atom_id.clone()).collect();
+    let selection = selection_proof(admitted, &rendered_ids, &output_digest)?;
     let view = ActiveUnderstandingView {
         binding: admitted.binding.clone(),
-        admitted_ids: ids,
+        admitted_ids: selection.admitted_ids.clone(),
         rendered,
         selection,
         quality,
