@@ -30,6 +30,17 @@
 //! supplied external resolution receipt, which is retained verbatim and never
 //! reissued or reinterpreted here.
 //!
+//! Two completeness rules are load-bearing. First, the incompleteness reason
+//! is read from the analysis itself, never from the permission to emit partial
+//! output: an incomplete analysis is [`ConflictOutcome::Partial`] when the
+//! policy admits a partial emission and is otherwise the same typed
+//! [`ConflictOutcome::Abstention`], so a stricter emission policy can withhold
+//! a candidate but can never promote an incomplete one to
+//! [`ConflictOutcome::Complete`]. Second, a probe is qualified by exact
+//! identity and typed outcome distinction only: a rationale that mentions an
+//! unknown names nothing, and a recommended probe lists only the positions the
+//! `ConflictSet` itself binds to it, never the whole set by default.
+//!
 //! Every terminal outcome is read from input the analysis already holds; none
 //! is invented, defaulted, or inferred from prose. Cancellation and the frozen
 //! deadline give [`ConflictOutcome::Blocked`] and [`ConflictOutcome::Stale`].
@@ -1210,8 +1221,15 @@ pub struct RecommendedProbe {
     /// Digest of the supplied result schema.
     pub result_digest: String,
     /// Position sources this probe separates, in sorted order.
+    ///
+    /// Populated only from the `ConflictSet`'s own discriminative-probe
+    /// binding, so an unbound probe names none rather than inheriting every
+    /// position in the set.
     pub discriminates_positions: Vec<String>,
     /// Load-bearing unknown this probe resolves, when any.
+    ///
+    /// Set only on exact identity against a supplied unknown, never on a
+    /// rationale that happens to mention one.
     pub resolves_unknown: Option<String>,
     /// Owner bound to the follow-up.
     pub owner: String,
@@ -2788,29 +2806,49 @@ fn branches_discriminate(schema: &PossibleResultSchema) -> bool {
     false
 }
 
-/// Returns the unknown this probe resolves, when its declaration names one.
+/// Returns the unknown this probe resolves, when its objective names one.
+///
+/// Qualification is exact identity, never containment. The objective's own
+/// invalidation condition must carry the unknown's text verbatim, so a
+/// rationale that merely mentions an unknown resolves nothing and a shorter
+/// identity never matches a longer one. Nothing here is prose-smoothed: the
+/// returned unknown is the caller's own declaration, copied back unchanged.
 fn resolves_unknown(probe: &SuppliedProbe, unknowns: &[String]) -> Option<String> {
     for condition in &probe.objective.invalidation_conditions {
         for unknown in unknowns {
-            if contains_marker(&lowered(unknown), &lowered(&condition.assumption_id))
-                || contains_marker(&lowered(&condition.assumption_id), &lowered(unknown))
-            {
+            if condition.assumption_id == *unknown {
                 return Some(unknown.clone());
             }
-        }
-    }
-    let rationale = lowered(&probe.objective.materiality_rationale);
-    for unknown in unknowns {
-        let low_unknown = lowered(unknown);
-        if !low_unknown.trim().is_empty() && contains_marker(&rationale, &low_unknown) {
-            return Some(unknown.clone());
         }
     }
     None
 }
 
+/// Returns the positions the `ConflictSet` itself proves a probe separates.
+///
+/// The only target-to-position binding the canonical probe contracts carry is
+/// the set's own `discriminative_probe` handle: when it names this probe
+/// exactly, the set declares that the probe separates its own positions.
+/// Rival-model and gap-objective result targets carry no position `SourceId`,
+/// so any other probe has no proven mapping here and names none, rather than
+/// inheriting every position in the set.
+fn proven_target_position_coverage(
+    conflict_set: &ConflictSet,
+    probe: &SuppliedProbe,
+    position_sources: &[String],
+) -> Vec<String> {
+    if conflict_set.probe.as_deref() != Some(probe.probe_id.as_str()) {
+        return Vec::new();
+    }
+    let mut covered: Vec<String> = position_sources.to_vec();
+    covered.sort();
+    covered.dedup();
+    covered
+}
+
 /// Builds the recommended probe list from supplied declarations only.
 fn recommend_probes(
+    conflict_set: &ConflictSet,
     supplements: &ConflictSupplements,
     position_sources: &[String],
 ) -> Vec<RecommendedProbe> {
@@ -2824,9 +2862,7 @@ fn recommend_probes(
         if !matrix_separates && resolved.is_none() {
             continue;
         }
-        let mut covered: Vec<String> = position_sources.to_vec();
-        covered.sort();
-        covered.dedup();
+        let covered = proven_target_position_coverage(conflict_set, probe, position_sources);
         out.push(RecommendedProbe {
             probe_id: probe.probe_id.clone(),
             objective_digest: probe.objective.digest.clone(),
@@ -3365,10 +3401,14 @@ fn emit_candidate(
 /// [`ConflictOutcome::Blocked`] or [`ConflictOutcome::Stale`], the canonical
 /// `ConflictSet` lifecycle gives [`ConflictOutcome::Rejected`],
 /// [`ConflictOutcome::Unsupported`], or [`ConflictOutcome::Abstention`] through
-/// [`check_lifecycle_boundary`], and a coverage shortfall gives
-/// [`ConflictOutcome::Partial`] only when the policy admits a partial emission.
-/// Each terminal leg still preserves every position, objection, and lineage
-/// group of the set it was handed; none resolves the conflict.
+/// [`check_lifecycle_boundary`]. A coverage shortfall is decided from the
+/// analysis alone: an incomplete analysis is
+/// [`ConflictOutcome::Partial`] only when the policy admits a partial emission
+/// and is otherwise the same typed [`ConflictOutcome::Abstention`], so a
+/// stricter emission policy can withhold a candidate but never promotes an
+/// incomplete one to [`ConflictOutcome::Complete`]. Each terminal leg still
+/// preserves every position, objection, and lineage group of the set it was
+/// handed, together with the named gap; none resolves the conflict.
 ///
 /// # Errors
 ///
@@ -3450,14 +3490,39 @@ pub fn analyze_conflict(
         .iter()
         .map(|position| position.source_handle.clone())
         .collect();
-    let recommended = recommend_probes(supplements, &position_sources);
+    let recommended = recommend_probes(conflict_set, supplements, &position_sources);
     let owner = recommend_owner(conflict_set, supplements, &groups, &recommended);
+    // The incompleteness reason is read from the analysis itself, never from
+    // the permission to emit partial output: a stricter emission policy can
+    // withhold a partial candidate but can never make missing evidence
+    // complete. Every leg below preserves the same positions, groups, risks,
+    // owner recommendation, and named gap; only the terminal outcome differs.
     let has_unknown_lineage = groups.iter().any(|group| !group.known);
-    let partial_denominator =
-        has_unknown_lineage || recommended.is_empty() && !supplements.supplied_probes.is_empty();
-    if policy.allow_partial && partial_denominator {
+    let unrecommendable_probes =
+        recommended.is_empty() && !supplements.supplied_probes.is_empty();
+    let undecided_without_unknown = conflict_set.acceptability == ArgumentAcceptability::Undecided
+        && supplements.unknowns.is_empty();
+    let incompleteness = if has_unknown_lineage || unrecommendable_probes {
+        Some("incomplete coverage: named open lineage or probe gaps remain")
+    } else if undecided_without_unknown {
+        Some(
+            "incomplete coverage: undecided acceptability and no load-bearing unknown is supplied",
+        )
+    } else {
+        None
+    };
+    if let Some(note) = incompleteness {
+        // With no partial path admitted, an incomplete analysis is withheld
+        // rather than promoted: [`ConflictOutcome::Abstention`] is the existing
+        // typed "no analysis is offered" result and carries the same members
+        // and the same named gap as the partial leg.
+        let outcome = if policy.allow_partial {
+            ConflictOutcome::Partial
+        } else {
+            ConflictOutcome::Abstention
+        };
         return emit_candidate(
-            ConflictOutcome::Partial,
+            outcome,
             conflict_set,
             supplements,
             policy,
@@ -3467,25 +3532,7 @@ pub fn analyze_conflict(
             &risks,
             &recommended,
             &owner,
-            "partial coverage with named open lineage or probe gaps",
-        );
-    }
-    if conflict_set.acceptability == ArgumentAcceptability::Undecided
-        && supplements.unknowns.is_empty()
-        && policy.allow_partial
-    {
-        return emit_candidate(
-            ConflictOutcome::Partial,
-            conflict_set,
-            supplements,
-            policy,
-            &positions,
-            &groups,
-            independent,
-            &risks,
-            &recommended,
-            &owner,
-            "partial coverage with undecided acceptability and no load-bearing unknown",
+            note,
         );
     }
     emit_candidate(
@@ -3653,6 +3700,14 @@ mod tests {
 
     /// Returns a minimal two-position conflict set bound to the test bundle.
     fn test_conflict() -> ConflictSet {
+        test_conflict_naming_probe(None)
+    }
+
+    /// Returns the same conflict set with its own `discriminative_probe`
+    /// handle set. That set-side handle is the only target-to-position binding
+    /// the canonical contracts carry, so a supplied probe claims covered
+    /// positions only when the set itself names it.
+    fn test_conflict_naming_probe(probe_id: Option<&str>) -> ConflictSet {
         let receipt = test_receipt();
         ConflictSet::new(ConflictSetParams {
             conflict_id: "conflict-1".to_owned(),
@@ -3677,7 +3732,7 @@ mod tests {
             ]),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
-            probe: None,
+            probe: probe_id.map(str::to_owned),
             decision_owner: SourceId::new("source-a").expect("valid source"),
             affected_actions: vec!["decide-cache".to_owned()],
             lifecycle: ConflictLifecycle::Open,
@@ -4288,7 +4343,12 @@ mod tests {
                 Ok(candidate) => candidate,
                 Err(err) => panic!("nondiscriminative analysis: {err:?}"),
             };
-        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.outcome,
+            ConflictOutcome::Abstention,
+            "a supplied probe that can never be recommended leaves an open probe gap; \
+             with no partial path admitted the analysis is withheld, not promoted to complete"
+        );
         assert!(candidate.recommended_probes.is_empty());
         assert!(!candidate.invalidation_conditions.is_empty());
     }
@@ -4360,7 +4420,12 @@ mod tests {
         assert!(candidate.recommended_probes.is_empty());
         assert!(!candidate.note.contains("ConciliumPlan"));
         assert_eq!(candidate.resolution_status, None);
-        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.outcome,
+            ConflictOutcome::Abstention,
+            "an unrecommendable supplied probe is an open probe gap; the owner \
+             recommendation survives and the analysis is withheld, not completed"
+        );
     }
 
     // WORK_UNIT_CASE: 673/4
@@ -5215,7 +5280,12 @@ mod tests {
             Ok(candidate) => candidate,
             Err(err) => panic!("unknown lineage analysis: {err:?}"),
         };
-        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.outcome,
+            ConflictOutcome::Abstention,
+            "an unknown lineage group is an open evidence gap; with allow_partial \
+             false the analysis is withheld and never promoted to complete"
+        );
         assert_eq!(
             candidate.independent_root_count, 1,
             "unknown lineage contributes no independent root"
@@ -5621,11 +5691,12 @@ mod tests {
         let policy = test_policy();
         let mut discriminative = test_supplements();
         discriminative.supplied_probes = vec![test_discriminative_probe("probe-66-disc")];
+        let bound = test_conflict_naming_probe(Some("probe-66-disc"));
         let candidate = match analyze_conflict(
             &item,
             &draft,
             &grounded,
-            &conflict,
+            &bound,
             &discriminative,
             &policy,
         ) {
@@ -7581,7 +7652,7 @@ mod tests {
     // WORK_UNIT_CASE: 673/38
     #[test]
     fn case_38_supplied_probe_discriminates_two_live_positions() {
-        let conflict = test_conflict();
+        let conflict = test_conflict_naming_probe(Some("probe-38-disc"));
         let mut supplements = test_supplements();
         supplements.supplied_probes = vec![test_discriminative_probe("probe-38-disc")];
         let candidate = match analyze_conflict(
@@ -7693,7 +7764,7 @@ mod tests {
     // WORK_UNIT_CASE: 673/41
     #[test]
     fn case_41_exact_probe_bounds_preserved_verbatim() {
-        let conflict = test_conflict();
+        let conflict = test_conflict_naming_probe(Some("probe-41-bounds"));
         let mut supplied = test_discriminative_probe("probe-41-bounds");
         supplied.owner_note = String::from("source-b owns the follow-up under evidence authority");
         supplied.verifier = String::from("verifier-41");
@@ -7787,7 +7858,12 @@ mod tests {
             Ok(candidate) => candidate,
             Err(err) => panic!("all-blocked probe analysis: {err:?}"),
         };
-        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.outcome,
+            ConflictOutcome::Abstention,
+            "every supplied probe blocked or over budget is an open probe gap; the \
+             analysis is withheld rather than completed"
+        );
         assert!(candidate.recommended_probes.is_empty());
         assert_eq!(candidate.positions.len(), 2);
         assert_eq!(candidate.resolution_status, None);
