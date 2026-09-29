@@ -434,6 +434,12 @@ fn control_sequence_is_canonical(sequence: u64, rest: &str) -> bool {
     })
 }
 
+fn u64_ceiling_as_usize(max_bytes: u64) -> usize {
+    // If the configured ceiling exceeds the addressable slice size, no
+    // representable byte buffer can exceed it, so usize::MAX is exact.
+    usize::try_from(max_bytes).unwrap_or(usize::MAX)
+}
+
 /// Reads one control spool file under the allocation guard: the length is
 /// checked before and after the read so a concurrently grown file is refused
 /// rather than truncated. Returns [`MaterialError::Missing`] for an absent
@@ -445,7 +451,7 @@ pub fn read_control_bytes(path: &std::path::Path) -> Result<Vec<u8>, MaterialErr
 }
 
 fn read_control_bytes_unlocked(path: &std::path::Path) -> Result<Vec<u8>, MaterialError> {
-    let bytes = read_bounded_regular_file(path, WASM_CONTROL_MAX_FILE_BYTES as usize)?;
+    let bytes = read_bounded_regular_file(path, u64_ceiling_as_usize(WASM_CONTROL_MAX_FILE_BYTES))?;
     if bytes.is_empty() {
         return Err(MaterialError::TooLarge);
     }
@@ -460,7 +466,7 @@ pub fn stage_control_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), M
     }
     let root = path.parent().ok_or(MaterialError::Malformed)?;
     with_installation_root_lock(root, || {
-        write_atomic_locked(path, bytes, WASM_CONTROL_MAX_FILE_BYTES as usize)
+        write_atomic_locked(path, bytes, u64_ceiling_as_usize(WASM_CONTROL_MAX_FILE_BYTES))
             .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))
     })
 }
@@ -473,9 +479,8 @@ pub fn retire_legacy_control(path: &std::path::Path, admitted_digest: &str) -> b
         return false;
     };
     with_installation_root_lock(root, || {
-        let bytes = match read_control_bytes_unlocked(path) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(false),
+        let Ok(bytes) = read_control_bytes_unlocked(path) else {
+            return Ok(false);
         };
         if sha256_hex(&bytes) != admitted_digest {
             return Ok(false);
@@ -1508,7 +1513,7 @@ fn reclaim_claimed_file_unlocked(
         Ok(metadata) if metadata.file_type().is_file() => {
             let Ok(bytes) = read_bounded_regular_file(
                 &aside,
-                crate::artifact_preflight::MAX_ARTIFACT_BYTES as usize,
+                u64_ceiling_as_usize(crate::artifact_preflight::MAX_ARTIFACT_BYTES),
             ) else {
                 return ReclaimOutcome::Other("aside-unreadable".to_owned());
             };
@@ -1550,7 +1555,7 @@ fn reclaim_claimed_file_unlocked(
     }
     let Ok(bytes) = read_bounded_regular_file(
         &aside,
-        crate::artifact_preflight::MAX_ARTIFACT_BYTES as usize,
+        u64_ceiling_as_usize(crate::artifact_preflight::MAX_ARTIFACT_BYTES),
     ) else {
         restore_aside_if_absent(&aside, &fixed);
         return ReclaimOutcome::Other("aside-unreadable".to_owned());
@@ -1605,49 +1610,69 @@ fn reclaim_claimed_delivery_unlocked(
     claim: &DeliveryClaim,
     install_dir: &std::path::Path,
 ) -> ClaimedReclamation {
-    let staged = match read_claimed_dispatch_material_unlocked(install_dir) {
-        Ok(Some(current)) => current,
-        Ok(None) => {
-            return ClaimedReclamation::AlreadyGone {
-                claimed: claim.identity().clone(),
-            };
-        }
-        Err(_) => {
-            return ClaimedReclamation::RetainedForRecovery {
-                claimed: claim.identity().clone(),
-            };
-        }
-    };
-    if staged.0.identity().envelope_digest != claim.identity().envelope_digest
-        || staged.0.identity().claim_id != claim.identity().claim_id
-    {
-        return ClaimedReclamation::ReplacementPreserved {
-            claimed: claim.identity().clone(),
+    let (owner_identity, join, disposition) =
+        match read_claimed_reclamation_state_unlocked(claim, install_dir) {
+            Ok(state) => state,
+            Err(outcome) => return outcome,
         };
+    let effective_claim = match bind_claim_for_reclamation_unlocked(
+        claim,
+        &owner_identity,
+        &join,
+        &disposition,
+        install_dir,
+    ) {
+        Ok(bound) => bound,
+        Err(outcome) => return outcome,
+    };
+    reclaim_claimed_material_unlocked(install_dir, &effective_claim)
+}
+
+fn read_claimed_reclamation_state_unlocked(
+    claim: &DeliveryClaim,
+    install_dir: &std::path::Path,
+) -> Result<(OwnerDeliveryIdentity, OwnerJoinBinding, OwnerDeliveryDisposition), ClaimedReclamation>
+{
+    let Ok(staged) = read_claimed_dispatch_material_unlocked(install_dir) else {
+        return Err(ClaimedReclamation::RetainedForRecovery {
+            claimed: claim.identity().clone(),
+        });
+    };
+    let Some((staged_claim, _material)) = staged else {
+        return Err(ClaimedReclamation::AlreadyGone {
+            claimed: claim.identity().clone(),
+        });
+    };
+    if staged_claim.identity().envelope_digest != claim.identity().envelope_digest
+        || staged_claim.identity().claim_id != claim.identity().claim_id
+    {
+        return Err(ClaimedReclamation::ReplacementPreserved {
+            claimed: claim.identity().clone(),
+        });
     }
     let identity = claim.identity();
-    let disposition_record = match read_owner_disposition_unlocked(install_dir, staged.0.identity())
+    let disposition_record = match read_owner_disposition_unlocked(install_dir, staged_claim.identity())
     {
         Ok(record) => record,
         Err(_) => {
-            return ClaimedReclamation::RetainedForRecovery {
+            return Err(ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
-            };
+            });
         }
     };
     let owner_identity = disposition_record.disposition.identity().clone();
-    if !owner_identity.names(staged.0.identity()) || !owner_identity.names(identity) {
-        return ClaimedReclamation::ReplacementPreserved {
+    if !owner_identity.names(staged_claim.identity()) || !owner_identity.names(identity) {
+        return Err(ClaimedReclamation::ReplacementPreserved {
             claimed: identity.clone(),
-        };
+        });
     }
-    match read_delivery_publication_unlocked(install_dir, staged.0.identity()) {
+    match read_delivery_publication_unlocked(install_dir, staged_claim.identity()) {
         Ok(Some(publication))
             if publication.is_ready() && publication.identity() == &owner_identity => {}
         _ => {
-            return ClaimedReclamation::RetainedForRecovery {
+            return Err(ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
-            };
+            });
         }
     }
     let join = disposition_record.disposition.join().clone();
@@ -1656,19 +1681,29 @@ fn reclaim_claimed_delivery_unlocked(
         .as_ref()
         .is_some_and(|expected| expected != &join)
     {
-        return ClaimedReclamation::RetainedForRecovery {
+        return Err(ClaimedReclamation::RetainedForRecovery {
             claimed: identity.clone(),
-        };
+        });
     }
+    Ok((owner_identity, join, disposition_record.disposition))
+}
+
+fn bind_claim_for_reclamation_unlocked(
+    claim: &DeliveryClaim,
+    owner_identity: &OwnerDeliveryIdentity,
+    join: &OwnerJoinBinding,
+    disposition: &OwnerDeliveryDisposition,
+    install_dir: &std::path::Path,
+) -> Result<DeliveryClaim, ClaimedReclamation> {
+    let identity = claim.identity();
     let mut effective_identity = identity.clone();
     effective_identity.publication_incarnation = Some(owner_identity.publication_incarnation);
     effective_identity.publication_revision = Some(owner_identity.publication_revision);
     let mut effective_claim = claim.clone();
-    effective_claim.identity = effective_identity.clone();
+    effective_claim.identity = effective_identity;
     effective_claim.owner_identity = Some(owner_identity.clone());
     effective_claim.join = Some(join.clone());
-    let disposition = disposition_record.disposition;
-    match &disposition {
+    match disposition {
         OwnerDeliveryDisposition::Acknowledged {
             launch_incarnation,
             claimant_incarnation,
@@ -1688,52 +1723,60 @@ fn reclaim_claimed_delivery_unlocked(
                     .as_ref()
                     .is_some_and(|current| current != claimant_incarnation)
             {
-                return ClaimedReclamation::RetainedForRecovery {
+                return Err(ClaimedReclamation::RetainedForRecovery {
                     claimed: identity.clone(),
-                };
+                });
             }
             effective_claim = match bind_claim_to_owner(
                 &effective_claim,
-                &owner_identity,
-                &join,
+                owner_identity,
+                join,
                 runtime_request_digest,
                 launch_incarnation,
                 claimant_incarnation,
             ) {
                 Ok(bound) => bound,
                 Err(_) => {
-                    return ClaimedReclamation::RetainedForRecovery {
+                    return Err(ClaimedReclamation::RetainedForRecovery {
                         claimed: identity.clone(),
-                    };
+                    });
                 }
             };
             if !disposition.is_claimed_by(&effective_claim)
                 || !read_served_result_unlocked(install_dir, &effective_claim)
                     .is_ok_and(|result| result.is_some_and(|record| record.names(&effective_claim)))
             {
-                return ClaimedReclamation::RetainedForRecovery {
+                return Err(ClaimedReclamation::RetainedForRecovery {
                     claimed: identity.clone(),
-                };
+                });
             }
         }
         OwnerDeliveryDisposition::RetiredNoEffect { .. } => {}
         _ => {
-            return ClaimedReclamation::RetainedForRecovery {
+            return Err(ClaimedReclamation::RetainedForRecovery {
                 claimed: identity.clone(),
-            };
+            });
         }
     }
+    Ok(effective_claim)
+}
+
+fn reclaim_claimed_material_unlocked(
+    install_dir: &std::path::Path,
+    effective_claim: &DeliveryClaim,
+) -> ClaimedReclamation {
+    let effective_identity = effective_claim.identity();
     let artifact = reclaim_claimed_file_unlocked(
         install_dir,
         WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
-        &effective_identity,
+        effective_identity,
         |bytes| {
             Sha256Digest::of_bytes(bytes).as_str() == effective_identity.artifact_digest.as_str()
         },
     );
     if matches!(&artifact, ReclaimOutcome::Preserved) {
         return ClaimedReclamation::ReplacementPreserved {
-            claimed: effective_identity,
+            claimed: effective_identity.clone(),
         };
     }
     if !matches!(
@@ -1741,7 +1784,7 @@ fn reclaim_claimed_delivery_unlocked(
         ReclaimOutcome::Reclaimed | ReclaimOutcome::NotFound
     ) {
         return ClaimedReclamation::Reclaimed(DeliveryReclamation {
-            identity: effective_identity,
+            identity: effective_identity.clone(),
             artifact,
             input: ReclaimOutcome::Other("not-attempted-after-artifact-residual".to_owned()),
             material: ReclaimOutcome::Other("retained-for-recovery".to_owned()),
@@ -1750,17 +1793,17 @@ fn reclaim_claimed_delivery_unlocked(
     let input = reclaim_claimed_file_unlocked(
         install_dir,
         WASM_HOST_GUEST_INPUT_FILE_NAME,
-        &effective_identity,
+        effective_identity,
         |bytes| Sha256Digest::of_bytes(bytes).as_str() == effective_identity.input_digest.as_str(),
     );
     if matches!(&input, ReclaimOutcome::Preserved) {
         return ClaimedReclamation::ReplacementPreserved {
-            claimed: effective_identity,
+            claimed: effective_identity.clone(),
         };
     }
     if !matches!(&input, ReclaimOutcome::Reclaimed | ReclaimOutcome::NotFound) {
         return ClaimedReclamation::Reclaimed(DeliveryReclamation {
-            identity: effective_identity,
+            identity: effective_identity.clone(),
             artifact,
             input,
             material: ReclaimOutcome::Other("retained-for-recovery".to_owned()),
@@ -1769,7 +1812,7 @@ fn reclaim_claimed_delivery_unlocked(
     let material = reclaim_claimed_file_unlocked(
         install_dir,
         WASM_HOST_MATERIAL_FILE_NAME,
-        &effective_identity,
+        effective_identity,
         |bytes| Sha256Digest::of_bytes(bytes) == effective_identity.envelope_digest,
     );
     // A preserved envelope or payload means a replacement owns the fixed
@@ -1777,11 +1820,11 @@ fn reclaim_claimed_delivery_unlocked(
     // the owner slot retains the complete recovery identity.
     if matches!(&material, ReclaimOutcome::Preserved) {
         return ClaimedReclamation::ReplacementPreserved {
-            claimed: effective_identity,
+            claimed: effective_identity.clone(),
         };
     }
     ClaimedReclamation::Reclaimed(DeliveryReclamation {
-        identity: effective_identity,
+        identity: effective_identity.clone(),
         artifact,
         input,
         material,
@@ -1858,12 +1901,12 @@ impl OwnerDeliveryIdentity {
             && self.authority_epoch_json == claim.authority_epoch_json
             && self.envelope_digest == claim.envelope_digest.as_str()
             && self.host_artifact_digest == claim.host_artifact_digest.as_str()
-            && claim.publication_incarnation.map_or(true, |incarnation| {
+            && claim.publication_incarnation.is_none_or(|incarnation| {
                 incarnation == self.publication_incarnation
             })
             && claim
                 .publication_revision
-                .map_or(true, |revision| revision == self.publication_revision)
+                .is_none_or(|revision| revision == self.publication_revision)
     }
 
     /// Rejects a record the owner could not have issued under the mirrored
@@ -2159,24 +2202,20 @@ impl OwnerDeliveryDisposition {
                 match self {
                     Self::TerminalUnacknowledged {
                         result_digest,
-                        result_sequence,
                         ..
                     }
                     | Self::Acknowledged {
                         result_digest,
-                        result_sequence,
                         ..
                     } => {
                         require_owner_digest(result_digest, "delivery-result-digest")?;
                         // Sequence zero is valid and names the first result event.
-                        let _sequence = result_sequence;
                     }
                     _ => {}
                 }
                 if let Self::Acknowledged {
                     receiver_ack_identity,
                     receiver_ack_digest,
-                    receiver_ack_sequence,
                     process_settlement_digest,
                     material_settlement_digest,
                     ..
@@ -2187,7 +2226,6 @@ impl OwnerDeliveryDisposition {
                     require_owner_digest(process_settlement_digest, "process-settlement-digest")?;
                     require_owner_digest(material_settlement_digest, "material-settlement-digest")?;
                     // Sequence zero is valid for the receiver's first ACK.
-                    let _sequence = receiver_ack_sequence;
                 }
             }
             Self::RetiredNoEffect {
@@ -2418,7 +2456,7 @@ fn write_owner_disposition_unlocked(
 /// the exact stored claim so only its result may be considered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeliveryClaimOutcome {
-    /// This process atomically changed the owner reservation to InFlight.
+    /// This process atomically changed the owner reservation to `InFlight`.
     Acquired(DeliveryClaim),
     /// A prior claimant owns this exact delivery but has no terminal result.
     ExistingInFlight(DeliveryClaim),
@@ -2469,6 +2507,12 @@ fn bind_claim_to_owner(
     Ok(bound)
 }
 
+struct DeliveryClaimOwnerBinding {
+    identity: OwnerDeliveryIdentity,
+    join: OwnerJoinBinding,
+    expected_launch: String,
+}
+
 /// Revalidates the fixed staged set and atomically claims only a matching
 /// owner `LaunchReserved` disposition. This bounded local transaction holds
 /// the shared installation-root mutex across reread, full comparison, and
@@ -2476,120 +2520,180 @@ fn bind_claim_to_owner(
 pub fn acquire_delivery_claim(
     install_dir: &std::path::Path,
     staged: &DeliveryClaim,
-    runtime_request_digest: Sha256Digest,
+    runtime_request_digest: &Sha256Digest,
     now_ms: u64,
 ) -> Result<DeliveryClaimOutcome, MaterialError> {
     with_installation_root_lock(install_dir, || {
-        let Some((current, _material)) = read_claimed_dispatch_material_unlocked(install_dir)?
-        else {
-            return Ok(DeliveryClaimOutcome::Conflict);
-        };
-        if current.identity != staged.identity {
-            return Ok(DeliveryClaimOutcome::Conflict);
-        }
-        let Some(publication) = read_delivery_publication_unlocked(install_dir, &staged.identity)?
-        else {
-            return Ok(DeliveryClaimOutcome::Unavailable);
-        };
-        if !publication.is_ready() || !publication.names(&staged.identity) {
-            return Ok(DeliveryClaimOutcome::Conflict);
-        }
-        let mut record = match read_owner_disposition_unlocked(install_dir, &staged.identity) {
-            Ok(record) => record,
-            Err(MaterialError::DigestMismatch) => return Ok(DeliveryClaimOutcome::Conflict),
-            Err(_) => return Ok(DeliveryClaimOutcome::Unavailable),
-        };
-        if record.disposition.identity() != publication.identity()
-            || !record.disposition.identity().names(&staged.identity)
-            || record.disposition.request_commitment() != staged.identity.envelope_digest.as_str()
-        {
-            return Ok(DeliveryClaimOutcome::Conflict);
-        }
-        let identity = record.disposition.identity().clone();
-        let join = record.disposition.join().clone();
-        let expected_launch = launch_incarnation(&identity);
-        match &record.disposition {
-            OwnerDeliveryDisposition::LaunchReserved {
-                launch_incarnation: reserved,
-                ..
-            } => {
-                if reserved != &expected_launch || now_ms >= identity.expires_at {
-                    return Ok(DeliveryClaimOutcome::Conflict);
-                }
-                let Some(claimant) = claimant_incarnation() else {
-                    return Ok(DeliveryClaimOutcome::Unavailable);
-                };
-                record.disposition = OwnerDeliveryDisposition::InFlight {
-                    identity: identity.clone(),
-                    join: join.clone(),
-                    request_commitment: identity.envelope_digest.clone(),
-                    launch_incarnation: expected_launch.clone(),
-                    claimant_incarnation: claimant.clone(),
-                    runtime_request_digest: runtime_request_digest.as_str().to_owned(),
-                };
-                write_owner_disposition_unlocked(install_dir, &staged.identity, &record)
-                    .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
-                Ok(DeliveryClaimOutcome::Acquired(bind_claim_to_owner(
-                    staged,
-                    &identity,
-                    &join,
-                    runtime_request_digest.as_str(),
-                    &expected_launch,
-                    &claimant,
-                )?))
-            }
-            OwnerDeliveryDisposition::InFlight {
-                launch_incarnation: existing_launch,
-                claimant_incarnation: existing_claimant,
-                runtime_request_digest: existing_request,
-                ..
-            } => {
-                if existing_launch != &expected_launch
-                    || existing_request != runtime_request_digest.as_str()
-                {
-                    return Ok(DeliveryClaimOutcome::Conflict);
-                }
-                Ok(DeliveryClaimOutcome::ExistingInFlight(bind_claim_to_owner(
-                    staged,
-                    &identity,
-                    &join,
-                    existing_request,
-                    existing_launch,
-                    existing_claimant,
-                )?))
-            }
-            OwnerDeliveryDisposition::TerminalUnacknowledged {
-                launch_incarnation: existing_launch,
-                claimant_incarnation: existing_claimant,
-                runtime_request_digest: existing_request,
-                ..
-            }
-            | OwnerDeliveryDisposition::Acknowledged {
-                launch_incarnation: existing_launch,
-                claimant_incarnation: existing_claimant,
-                runtime_request_digest: existing_request,
-                ..
-            } => {
-                if existing_launch != &expected_launch
-                    || existing_request != runtime_request_digest.as_str()
-                {
-                    return Ok(DeliveryClaimOutcome::Conflict);
-                }
-                Ok(DeliveryClaimOutcome::RetainedResult(bind_claim_to_owner(
-                    staged,
-                    &identity,
-                    &join,
-                    existing_request,
-                    existing_launch,
-                    existing_claimant,
-                )?))
-            }
-            OwnerDeliveryDisposition::Ready { .. }
-            | OwnerDeliveryDisposition::RetiredNoEffect { .. } => {
-                Ok(DeliveryClaimOutcome::Conflict)
-            }
-        }
+        acquire_delivery_claim_unlocked(install_dir, staged, runtime_request_digest, now_ms)
     })
+}
+
+fn acquire_delivery_claim_unlocked(
+    install_dir: &std::path::Path,
+    staged: &DeliveryClaim,
+    runtime_request_digest: &Sha256Digest,
+    now_ms: u64,
+) -> Result<DeliveryClaimOutcome, MaterialError> {
+    let Some((current, _material)) = read_claimed_dispatch_material_unlocked(install_dir)? else {
+        return Ok(DeliveryClaimOutcome::Conflict);
+    };
+    if current.identity != staged.identity {
+        return Ok(DeliveryClaimOutcome::Conflict);
+    }
+    let Some(publication) = read_delivery_publication_unlocked(install_dir, &staged.identity)?
+    else {
+        return Ok(DeliveryClaimOutcome::Unavailable);
+    };
+    if !publication.is_ready() || !publication.names(&staged.identity) {
+        return Ok(DeliveryClaimOutcome::Conflict);
+    }
+    let record = match read_owner_disposition_unlocked(install_dir, &staged.identity) {
+        Ok(record) => record,
+        Err(MaterialError::DigestMismatch) => return Ok(DeliveryClaimOutcome::Conflict),
+        Err(_) => return Ok(DeliveryClaimOutcome::Unavailable),
+    };
+    if record.disposition.identity() != publication.identity()
+        || !record.disposition.identity().names(&staged.identity)
+        || record.disposition.request_commitment() != staged.identity.envelope_digest.as_str()
+    {
+        return Ok(DeliveryClaimOutcome::Conflict);
+    }
+    let binding = DeliveryClaimOwnerBinding {
+        identity: record.disposition.identity().clone(),
+        join: record.disposition.join().clone(),
+        expected_launch: launch_incarnation(record.disposition.identity()),
+    };
+    resolve_delivery_claim_unlocked(
+        install_dir,
+        staged,
+        runtime_request_digest,
+        now_ms,
+        record,
+        &binding,
+    )
+}
+
+fn resolve_delivery_claim_unlocked(
+    install_dir: &std::path::Path,
+    staged: &DeliveryClaim,
+    runtime_request_digest: &Sha256Digest,
+    now_ms: u64,
+    mut record: OwnerDeliveryDispositionRecord,
+    binding: &DeliveryClaimOwnerBinding,
+) -> Result<DeliveryClaimOutcome, MaterialError> {
+    match record.disposition.clone() {
+        OwnerDeliveryDisposition::LaunchReserved { .. } => claim_reserved_delivery_unlocked(
+            install_dir,
+            staged,
+            runtime_request_digest,
+            now_ms,
+            &mut record,
+            binding,
+        ),
+        OwnerDeliveryDisposition::InFlight {
+            launch_incarnation,
+            claimant_incarnation,
+            runtime_request_digest: existing_request,
+            ..
+        } => replay_delivery_claim(
+            staged,
+            runtime_request_digest,
+            binding,
+            &launch_incarnation,
+            &claimant_incarnation,
+            &existing_request,
+            DeliveryClaimOutcome::ExistingInFlight,
+        ),
+        OwnerDeliveryDisposition::TerminalUnacknowledged {
+            launch_incarnation,
+            claimant_incarnation,
+            runtime_request_digest: existing_request,
+            ..
+        }
+        | OwnerDeliveryDisposition::Acknowledged {
+            launch_incarnation,
+            claimant_incarnation,
+            runtime_request_digest: existing_request,
+            ..
+        } => replay_delivery_claim(
+            staged,
+            runtime_request_digest,
+            binding,
+            &launch_incarnation,
+            &claimant_incarnation,
+            &existing_request,
+            DeliveryClaimOutcome::RetainedResult,
+        ),
+        OwnerDeliveryDisposition::Ready { .. }
+        | OwnerDeliveryDisposition::RetiredNoEffect { .. } => {
+            Ok(DeliveryClaimOutcome::Conflict)
+        }
+    }
+}
+
+fn claim_reserved_delivery_unlocked(
+    install_dir: &std::path::Path,
+    staged: &DeliveryClaim,
+    runtime_request_digest: &Sha256Digest,
+    now_ms: u64,
+    record: &mut OwnerDeliveryDispositionRecord,
+    binding: &DeliveryClaimOwnerBinding,
+) -> Result<DeliveryClaimOutcome, MaterialError> {
+    let OwnerDeliveryDisposition::LaunchReserved {
+        launch_incarnation: reserved,
+        ..
+    } = &record.disposition
+    else {
+        return Ok(DeliveryClaimOutcome::Conflict);
+    };
+    if reserved != &binding.expected_launch || now_ms >= binding.identity.expires_at {
+        return Ok(DeliveryClaimOutcome::Conflict);
+    }
+    let Some(claimant) = claimant_incarnation() else {
+        return Ok(DeliveryClaimOutcome::Unavailable);
+    };
+    record.disposition = OwnerDeliveryDisposition::InFlight {
+        identity: binding.identity.clone(),
+        join: binding.join.clone(),
+        request_commitment: binding.identity.envelope_digest.clone(),
+        launch_incarnation: binding.expected_launch.clone(),
+        claimant_incarnation: claimant.clone(),
+        runtime_request_digest: runtime_request_digest.as_str().to_owned(),
+    };
+    write_owner_disposition_unlocked(install_dir, &staged.identity, record)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    Ok(DeliveryClaimOutcome::Acquired(bind_claim_to_owner(
+        staged,
+        &binding.identity,
+        &binding.join,
+        runtime_request_digest.as_str(),
+        &binding.expected_launch,
+        &claimant,
+    )?))
+}
+
+fn replay_delivery_claim(
+    staged: &DeliveryClaim,
+    runtime_request_digest: &Sha256Digest,
+    binding: &DeliveryClaimOwnerBinding,
+    existing_launch: &str,
+    existing_claimant: &str,
+    existing_request: &str,
+    outcome: fn(DeliveryClaim) -> DeliveryClaimOutcome,
+) -> Result<DeliveryClaimOutcome, MaterialError> {
+    if existing_launch != binding.expected_launch
+        || existing_request != runtime_request_digest.as_str()
+    {
+        return Ok(DeliveryClaimOutcome::Conflict);
+    }
+    Ok(outcome(bind_claim_to_owner(
+        staged,
+        &binding.identity,
+        &binding.join,
+        existing_request,
+        existing_launch,
+        existing_claimant,
+    )?))
 }
 
 /// Reads the owner publication state for the claimed generation's slot.
@@ -2954,7 +3058,6 @@ pub struct ServedResultRecord {
 
 impl ServedResultRecord {
     /// Captures one result snapshot for the exact acquired child claim.
-    #[must_use]
     pub fn from_claim(
         claim: &DeliveryClaim,
         payload: ServedResultPayload,
@@ -3100,7 +3203,7 @@ fn read_served_result_unlocked(
             || record
                 .stream
                 .as_ref()
-                .map_or(true, |stream| stream.terminal_sequence.is_some()))
+                .is_none_or(|stream| stream.terminal_sequence.is_some()))
     {
         // RESULT may reach disk just before a crash that prevents the matching
         // terminal disposition write. Preserve the bytes, but never expose
@@ -3148,6 +3251,18 @@ pub fn write_served_result(
 ) -> std::io::Result<()> {
     let record = ServedResultRecord::from_claim(claim, payload, retained_at_unix_ms)
         .map_err(|_| std::io::Error::other("delivery-claim-unbound"))?;
+    validate_served_result_record(&record)?;
+    let bytes =
+        serde_json::to_vec(&record).map_err(|error| std::io::Error::other(error.to_string()))?;
+    if bytes.len() > SERVED_RESULT_MAX_BYTES {
+        return Err(std::io::Error::other("served-result-too-large"));
+    }
+    with_installation_root_lock_io(install_dir, || {
+        write_served_result_unlocked(install_dir, claim, &record, &bytes)
+    })
+}
+
+fn validate_served_result_record(record: &ServedResultRecord) -> std::io::Result<()> {
     if record.retained_at_unix_ms == 0 || record.frame.is_some() {
         return Err(std::io::Error::other("served-result-shape-unavailable"));
     }
@@ -3169,93 +3284,117 @@ pub fn write_served_result(
     } else if record.result_sequence.is_some() {
         return Err(std::io::Error::other("served-result-sequence"));
     }
-    let bytes =
-        serde_json::to_vec(&record).map_err(|error| std::io::Error::other(error.to_string()))?;
-    if bytes.len() > SERVED_RESULT_MAX_BYTES {
-        return Err(std::io::Error::other("served-result-too-large"));
+    Ok(())
+}
+
+fn write_served_result_unlocked(
+    install_dir: &std::path::Path,
+    claim: &DeliveryClaim,
+    record: &ServedResultRecord,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut disposition = read_owner_disposition_unlocked(install_dir, &claim.identity)
+        .map_err(|_| std::io::Error::other("delivery-disposition-unavailable"))?;
+    if !disposition.disposition.is_claimed_by(claim) {
+        return Err(std::io::Error::other("delivery-claim-conflict"));
     }
-    with_installation_root_lock_io(install_dir, || {
-        let mut disposition = read_owner_disposition_unlocked(install_dir, &claim.identity)
-            .map_err(|_| std::io::Error::other("delivery-disposition-unavailable"))?;
-        if !disposition.disposition.is_claimed_by(claim) {
-            return Err(std::io::Error::other("delivery-claim-conflict"));
+    if verify_served_result_extension_unlocked(install_dir, claim, record, &disposition)? {
+        return Ok(());
+    }
+    if !matches!(
+        &disposition.disposition,
+        OwnerDeliveryDisposition::InFlight { .. }
+    ) {
+        return Err(std::io::Error::other("delivery-not-in-flight"));
+    }
+    let result_path = delivery_slot_dir(install_dir, &claim.identity)
+        .join(WASM_DELIVERY_RESULT_FILE_NAME);
+    write_atomic_locked(&result_path, bytes, SERVED_RESULT_MAX_BYTES)?;
+    seal_terminal_served_result_unlocked(install_dir, claim, record, bytes, &mut disposition)
+}
+
+fn verify_served_result_extension_unlocked(
+    install_dir: &std::path::Path,
+    claim: &DeliveryClaim,
+    record: &ServedResultRecord,
+    disposition: &OwnerDeliveryDispositionRecord,
+) -> std::io::Result<bool> {
+    let result_path = delivery_slot_dir(install_dir, &claim.identity)
+        .join(WASM_DELIVERY_RESULT_FILE_NAME);
+    match read_bounded_regular_file(&result_path, SERVED_RESULT_MAX_BYTES) {
+        Ok(_) => {}
+        Err(MaterialError::Missing) => return Ok(false),
+        Err(_) => return Err(std::io::Error::other("retained-result-unavailable")),
+    }
+    let old = read_served_result_unlocked(install_dir, claim)
+        .map_err(|_| std::io::Error::other("retained-result-unavailable"))?
+        .ok_or_else(|| std::io::Error::other("retained-result-unavailable"))?;
+    if !old.names(claim) {
+        return Err(std::io::Error::other("retained-result-conflict"));
+    }
+    let old_stream = old
+        .stream
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("retained-result-shape-conflict"))?;
+    let new_stream = record
+        .stream
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("retained-result-shape-conflict"))?;
+    if old.frame.is_some()
+        || old_stream.events.len() > new_stream.events.len()
+        || old_stream.events != new_stream.events[..old_stream.events.len()]
+        || (old_stream.events.len() == new_stream.events.len()
+            && old_stream.stream_digest != new_stream.stream_digest)
+    {
+        return Err(std::io::Error::other("retained-result-prefix-conflict"));
+    }
+    if matches!(
+        &disposition.disposition,
+        OwnerDeliveryDisposition::TerminalUnacknowledged { .. }
+            | OwnerDeliveryDisposition::Acknowledged { .. }
+    ) {
+        if old.stream == record.stream && old.frame == record.frame {
+            return Ok(true);
         }
-        let slot = delivery_slot_dir(install_dir, &claim.identity);
-        let result_path = slot.join(WASM_DELIVERY_RESULT_FILE_NAME);
-        let old_exists = match read_bounded_regular_file(&result_path, SERVED_RESULT_MAX_BYTES) {
-            Ok(_) => Some(()),
-            Err(MaterialError::Missing) => None,
-            Err(_) => return Err(std::io::Error::other("retained-result-unavailable")),
-        };
-        if old_exists.is_some() {
-            let old = read_served_result_unlocked(install_dir, claim)
-                .map_err(|_| std::io::Error::other("retained-result-unavailable"))?
-                .ok_or_else(|| std::io::Error::other("retained-result-unavailable"))?;
-            if !old.names(claim) {
-                return Err(std::io::Error::other("retained-result-conflict"));
-            }
-            let old_stream = old
-                .stream
-                .as_ref()
-                .ok_or_else(|| std::io::Error::other("retained-result-shape-conflict"))?;
-            let new_stream = record
-                .stream
-                .as_ref()
-                .ok_or_else(|| std::io::Error::other("retained-result-shape-conflict"))?;
-            if old.frame.is_some()
-                || old_stream.events.len() > new_stream.events.len()
-                || old_stream.events != new_stream.events[..old_stream.events.len()]
-                || (old_stream.events.len() == new_stream.events.len()
-                    && old_stream.stream_digest != new_stream.stream_digest)
-            {
-                return Err(std::io::Error::other("retained-result-prefix-conflict"));
-            }
-            if matches!(
-                &disposition.disposition,
-                OwnerDeliveryDisposition::TerminalUnacknowledged { .. }
-                    | OwnerDeliveryDisposition::Acknowledged { .. }
-            ) {
-                if old.stream == record.stream && old.frame == record.frame {
-                    return Ok(());
-                }
-                return Err(std::io::Error::other("terminal-result-already-sealed"));
-            }
-        }
-        if !matches!(
-            &disposition.disposition,
-            OwnerDeliveryDisposition::InFlight { .. }
-        ) {
+        return Err(std::io::Error::other("terminal-result-already-sealed"));
+    }
+    Ok(false)
+}
+
+fn seal_terminal_served_result_unlocked(
+    install_dir: &std::path::Path,
+    claim: &DeliveryClaim,
+    record: &ServedResultRecord,
+    bytes: &[u8],
+    disposition: &mut OwnerDeliveryDispositionRecord,
+) -> std::io::Result<()> {
+    if let Some(stream) = record.stream.as_ref()
+        && let Some(result_sequence) = stream.terminal_sequence
+    {
+        let OwnerDeliveryDisposition::InFlight {
+            identity,
+            join,
+            request_commitment,
+            launch_incarnation,
+            claimant_incarnation,
+            runtime_request_digest,
+        } = &disposition.disposition
+        else {
             return Err(std::io::Error::other("delivery-not-in-flight"));
-        }
-        write_atomic_locked(&result_path, &bytes, SERVED_RESULT_MAX_BYTES)?;
-        if let Some(stream) = record.stream.as_ref()
-            && let Some(result_sequence) = stream.terminal_sequence
-        {
-            let OwnerDeliveryDisposition::InFlight {
-                identity,
-                join,
-                request_commitment,
-                launch_incarnation,
-                claimant_incarnation,
-                runtime_request_digest,
-            } = &disposition.disposition
-            else {
-                return Err(std::io::Error::other("delivery-not-in-flight"));
-            };
-            disposition.disposition = OwnerDeliveryDisposition::TerminalUnacknowledged {
-                identity: identity.clone(),
-                join: join.clone(),
-                request_commitment: request_commitment.clone(),
-                launch_incarnation: launch_incarnation.clone(),
-                claimant_incarnation: claimant_incarnation.clone(),
-                runtime_request_digest: runtime_request_digest.clone(),
-                result_digest: Sha256Digest::of_bytes(&bytes).as_str().to_owned(),
-                result_sequence,
-            };
-            write_owner_disposition_unlocked(install_dir, &claim.identity, &disposition)?;
-        }
-        Ok(())
-    })
+        };
+        disposition.disposition = OwnerDeliveryDisposition::TerminalUnacknowledged {
+            identity: identity.clone(),
+            join: join.clone(),
+            request_commitment: request_commitment.clone(),
+            launch_incarnation: launch_incarnation.clone(),
+            claimant_incarnation: claimant_incarnation.clone(),
+            runtime_request_digest: runtime_request_digest.clone(),
+            result_digest: Sha256Digest::of_bytes(bytes).as_str().to_owned(),
+            result_sequence,
+        };
+        write_owner_disposition_unlocked(install_dir, &claim.identity, disposition)?;
+    }
+    Ok(())
 }
 
 /// Wire mirror of the owner-published grant record, field-for-field with
