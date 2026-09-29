@@ -6426,14 +6426,13 @@ impl KernelComposition {
         // commits, so a failed save stays pending and is offered again
         // by the next take. The typed outcome is consumed below but never
         // fails the write whose retain it records.
-        let persist_outcome = match pending_journal.as_ref() {
-            Some(snapshot) => Some(persist_pre_stage_corrections(
+        let persist_outcome = pending_journal.as_ref().map(|snapshot| {
+            persist_pre_stage_corrections(
                 &self.work_root,
                 &self.pre_stage_identity_cache,
                 snapshot,
-            )),
-            None => None,
-        };
+            )
+        });
         // Consume the restore/save outcomes before admitting a dependent
         // write (issue #1796, audit 5890973032 defect 2): a failed recovery
         // or a failed save is reported on the commit response, and the write
@@ -9319,13 +9318,11 @@ fn restore_pre_stage_corrections(
         }
         Ok(bytes) => bytes,
     };
-    let snapshot =
-        match serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                return record_journal_restore(cache, JournalRestoreOutcome::RecoveryRequired);
-            }
-        };
+    let Ok(snapshot) =
+        serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes)
+    else {
+        return record_journal_restore(cache, JournalRestoreOutcome::RecoveryRequired);
+    };
     match cache.lock() {
         Ok(mut guard) => {
             if guard.is_empty() {
