@@ -1310,10 +1310,24 @@ impl InstrumentRegistry {
     /// same exact revision, digest, and stage DAG on either side. A route that
     /// is missing here is missing on both sides together, never only in CI.
     ///
+    /// `receipts` are the caller-attested executable supply-chain receipts.
+    /// A receipt is validated against the admitted spec digest at exactly this
+    /// generation, so a drifted or orphan receipt fails closed here and the
+    /// routes refuse to resolve at all. Passing no receipt is admitted as an
+    /// explicit absence — the pre-launch gate then binds the admitted
+    /// executable file and schema without a pinned digest — and
+    /// `require_provenance` is what later refuses a receipted route whose
+    /// stages carry no recorded identity.
+    ///
     /// # Errors
     ///
-    /// Returns [`ProfileError`] when a builtin literal fails validation.
-    pub fn with_verification_route_profiles(generation: u64) -> Result<Self, ProfileError> {
+    /// Returns [`ProfileError`] when a builtin literal fails validation, or
+    /// the admission error when a receipt is orphan, drifted, or of a
+    /// mismatched generation.
+    pub fn with_verification_route_profiles(
+        generation: u64,
+        receipts: Vec<SupplyChainReceipt>,
+    ) -> Result<Self, ProfileError> {
         Self::build(
             builtin_specs()?,
             vec![
@@ -1323,7 +1337,7 @@ impl InstrumentRegistry {
                 bundle_verification_profile()?,
             ],
             generation,
-            Vec::new(),
+            receipts,
         )
     }
 
@@ -2464,5 +2478,38 @@ impl<'a> ProfileCompiler<'a> {
             scope,
             environment,
         )
+    }
+
+    /// Resolves the verification route both local and CI invoke (issue #1914
+    /// W2).
+    ///
+    /// I18.21 requires "CI builds the ELIOT verifier/runner bootstrap and then
+    /// calls the same versioned profiles used locally", and I10.8.10 requires
+    /// "Justfile and CI → thin invokers of the same named profile". Both
+    /// requirements are satisfied by exactly this one call: there is no second
+    /// gate-order source, no CI-only stage list, and no per-entrypoint profile
+    /// choice, because the caller names only the route and supplies only the
+    /// admitted execution bindings. The route name is resolved to its admitted
+    /// revision here, and the caller learns the exact identity from the returned
+    /// [`ResolvedProfile`]; it can never select a revision itself.
+    ///
+    /// A route that is not admitted fails closed with
+    /// [`ProfileError::UnknownProfile`]. A caller that wants a different route
+    /// passes a different name, which is an explicit visible change, never an
+    /// environment sniff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::UnknownProfile`] when the route admits no
+    /// revision, and the [`InstrumentProfileResolver::resolve`] failures when a
+    /// binding is refused.
+    pub fn resolve_route(
+        &self,
+        route: &str,
+        layout: TargetLayout,
+        scope: WorkScope,
+        environment: StageEnvironment,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        self.resolve_admitted(route, layout, scope, environment)
     }
 }

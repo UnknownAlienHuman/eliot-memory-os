@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::InstrumentRunner;
-use crate::profile::{InstrumentProfile, InstrumentRegistry, ProfileCompiler, ProfileError};
+use crate::profile::{
+    InstrumentProfile, InstrumentRegistry, ProfileCompiler, ProfileError, ProfileScopeClasses,
+    StageEnvironment, TargetLayout, WorkScope,
+};
 use crate::profile_run::{
     AggregateStatus, InstrumentRun, ProfileAggregate, RetainedExitOutcome, RetainedToolIdentity,
     StageEvidence, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
@@ -31,7 +34,8 @@ use crate::profile_run::{
 };
 use crate::registry::SupplyChainReceipt;
 use crate::verification_profile::{
-    ParityVerdict, VerificationProfileReceipt, verify_profile_parity,
+    DeclaredEnvironmentDependency, ParityVerdict, VerificationProfileReceipt,
+    build_verification_profile_receipt, verify_profile_parity,
 };
 
 /// Canonical `dev-fast` profile name (I18.6).
@@ -890,9 +894,18 @@ pub fn dev_fast_registry(
     generation: u64,
     receipts: Vec<crate::registry::SupplyChainReceipt>,
 ) -> Result<InstrumentRegistry, DevFastError> {
-    use crate::profile::{builtin_specs, compiler_profile, test_profile};
+    use crate::profile::{
+        builtin_specs, bundle_verification_profile, compiler_profile,
+        package_verification_profile, test_profile,
+    };
     let specs = builtin_specs()?;
-    let profiles = vec![compiler_profile()?, test_profile()?, dev_fast_profile()?];
+    let profiles = vec![
+        compiler_profile()?,
+        test_profile()?,
+        dev_fast_profile()?,
+        package_verification_profile()?,
+        bundle_verification_profile()?,
+    ];
     Ok(InstrumentRegistry::build(
         specs, profiles, generation, receipts,
     )?)
@@ -917,6 +930,82 @@ pub fn dev_fast_caller_plan(
     plan.bind_candidate_identity(candidate.digest())
         .map_err(|error| DevFastError::Admission(error.to_string()))?;
     Ok(plan)
+}
+
+/// Resolves one verification route through the single shared profile compiler
+/// and issues its shared receipt (issue #1914 W2 + W4).
+///
+/// This is the ONE function a local entrypoint and CI both call, so a local run
+/// and a CI run of the same route reach the same resolver, the same admitted
+/// revision, and the same receipt schema. I18.21 requires "CI builds the ELIOT
+/// verifier/runner bootstrap and then calls the same versioned profiles used
+/// locally", and I10.8.4 lists "Justfile wrappers" and "CI" as callers of the
+/// same profile compiler; both are satisfied by this single call, so there is no
+/// second gate-order source and no CI-only stage list.
+///
+/// The registry is built here from
+/// [`InstrumentRegistry::with_verification_route_profiles`] rather than
+/// supplied by the caller, because the registry is what decides which revision
+/// a route name admits. A caller that assembled its own registry could admit a
+/// different revision than the one CI resolves, which is exactly the divergence
+/// this function exists to remove. `receipts` are the caller-attested
+/// executable supply-chain receipts; they are validated against the admitted
+/// spec digest at exactly `generation`, so a drifted or orphan receipt refuses
+/// here and the route never resolves at all.
+///
+/// The run is then receipted through
+/// [`build_verification_profile_receipt`](crate::verification_profile::build_verification_profile_receipt),
+/// which calls `require_provenance` and therefore REFUSES a run whose required
+/// identity or provenance data is absent: a stage with no recorded executable
+/// identity, or an external stage with no admitted supply-chain receipt, fails
+/// closed here instead of producing a receipt that defaults to an identity.
+/// There is no path from this function to a receipt whose identity is missing.
+///
+/// The exact admitted revision, the profile digest, the stage DAG digest, and
+/// the resolution digest are all read back from the same
+/// [`ProfileCompiler::resolve_route`] result, so local and CI cannot report
+/// different revisions for one route. A route the registry never admitted fails
+/// closed; a caller never falls back to a neighbouring profile or a default.
+///
+/// # Errors
+///
+/// Returns [`DevFastError::Admission`] carrying the registry or
+/// [`ProfileCompiler::resolve_route`] failure when a receipt is refused, the
+/// route admits no revision, or a binding is refused, and
+/// [`DevFastError::ReceiptMismatch`] when
+/// [`build_verification_profile_receipt`](crate::verification_profile::build_verification_profile_receipt)
+/// refuses the run for a missing identity, a missing provenance receipt, a
+/// profile-identity divergence, or an undeclared stage.
+pub fn resolve_verification_route(
+    generation: u64,
+    receipts: Vec<SupplyChainReceipt>,
+    route: &str,
+    layout: TargetLayout,
+    scope: WorkScope,
+    environment: StageEnvironment,
+    aggregate: &ProfileAggregate,
+    classes: &ProfileScopeClasses,
+    environment_dependencies: &[DeclaredEnvironmentDependency],
+) -> Result<VerificationProfileReceipt, DevFastError> {
+    let registry = InstrumentRegistry::with_verification_route_profiles(generation, receipts)
+        .map_err(|error| DevFastError::Admission(format!("verification registry refused: {error}")))?;
+    let compiler = ProfileCompiler::new(&registry);
+    let resolved = compiler
+        .resolve_route(route, layout, scope, environment)
+        .map_err(|error| DevFastError::Admission(format!("profile route refused: {error}")))?;
+    let admitted = compiler
+        .compile_exact(&resolved.name, resolved.revision)
+        .map_err(|error| {
+            DevFastError::Admission(format!("resolved route did not compile: {error}"))
+        })?;
+    build_verification_profile_receipt(
+        &admitted,
+        classes,
+        aggregate,
+        &environment,
+        environment_dependencies,
+    )
+    .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))
 }
 
 /// Normalized outcome of one retained `dev-fast` stage capture.
