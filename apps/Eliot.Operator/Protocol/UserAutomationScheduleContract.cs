@@ -1285,32 +1285,11 @@ public static class UserAutomationOutcomeClassifier
         // answer is described, and a nested projection never compensates for a
         // foreign parent result.
         if (recovery.ValueKind != JsonValueKind.Null
-            || !HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_TRANSITION_VALUE_MEMBERS)
-            || !TryGetObject(value, "transition", out var transition)
-            || !HasCurrentTransitionShape(transition)
-            || !HasCurrentInspectionProjection(value)
-            || !TryGetObject(transition, "identity", out var identity)
-            || !MatchesOperationIdentity(
-                identity,
-                context,
-                CanonicalRequestHashMember))
+            || !HasUserAutomationTransitionProperties(value, context, answer))
         {
             return UnverifiedOwnerAnswer(
                 action,
-                "the known owner transition does not carry the exact operation identity of this request");
-        }
-
-        // The State Fence context is read through the same closed helper the
-        // typed refusal path uses, so both result paths accept one fence shape
-        // and neither infers a lineage, generation or revision from names.
-        if (!TryGetObject(transition, "state_fence", out var stateFence)
-            || !IsClosedStateFence(stateFence)
-            || !TryGetObject(answer, "state_fence", out var envelopeFence)
-            || !SameSerializedFence(stateFence, envelopeFence))
-        {
-            return UnverifiedOwnerAnswer(
-                action,
-                "the known owner transition does not carry a closed State Fence for this request");
+                "the known owner transition does not bind the expected operation identity, current transition wire version, and matching nested/envelope State Fence");
         }
 
         var projection = FindScheduleProjection(answer);
