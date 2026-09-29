@@ -9655,8 +9655,11 @@ where
                         | InstallerEffectPlan::StagePackage { .. },
                         None,
                     )
-                    | (InstallerEffectPlan::RegisterService { .. }, Some(_))
-                    | (InstallerEffectPlan::RegisterCurrentUserTask { .. }, Some(_)) => {}
+                    | (
+                        InstallerEffectPlan::RegisterService { .. }
+                        | InstallerEffectPlan::RegisterCurrentUserTask { .. },
+                        Some(_),
+                    ) => {}
                 }
                 if matches!(
                     transaction.installer_effects[index],
@@ -10944,8 +10947,8 @@ where
     }
 
     /// Drives the durable prefix up to, but not through, the profile's Host
-    /// bootstrap handoff. SystemService stops before its first ordered SCM
-    /// start. UserMode stops before Phase B after its current-user credentials
+    /// bootstrap handoff. `SystemService` stops before its first ordered SCM
+    /// start. `UserMode` stops before Phase B after its current-user credentials
     /// are applied. The caller projects the exact pending activation before
     /// either profile can start an approved runtime.
     pub fn drive_until_host_bootstrap(
