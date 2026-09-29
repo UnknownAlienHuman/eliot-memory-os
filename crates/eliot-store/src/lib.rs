@@ -44,7 +44,7 @@ pub use control_reserve::{
     STORE_CONNECTION_BOTTLENECK, STORE_PENDING_WRITE_BOTTLENECK, STORE_TRANSACTION_BOTTLENECK,
     StoreDimension, StorePermit, StorePermitOperation, StorePermitRecord, StorePermitRequest,
     StorePermitState, StoreReconcileDisposition, StoreReleaseEvidence, StoreReserve,
-    StoreReserveError,
+    StoreReserveError, StoreScopeReserves,
 };
 pub use control_wal::{
     ControlWal, WalDeadLetter, WalFailedWrite, WalPendingWrite, WalProjectHead, WalWriteState,

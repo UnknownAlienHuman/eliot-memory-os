@@ -47,6 +47,25 @@
 //! enforce. The wiring wave that adds the contracts edge tightens these to
 //! the typed spellings without changing the partition discipline.
 //!
+//! [`StoreReserve::publish_claimed_rows`] publishes the three `CLAIMED`
+//! [`eliot_runtime_contracts::BottleneckCapacityProfile`] rows for the Kernel
+//! profile composition join: one row per Store bottleneck in frozen contract
+//! order, each naming the frozen-map owner verbatim, the exact unit, the
+//! physical total and both disjoint partitions, and validated with the
+//! existing row check before return. Completeness is compared against the
+//! independent frozen map (exactly the three Store dimensions under one
+//! shared Store owner), never against the rows themselves.
+//!
+//! [`StoreScopeReserves`] holds one independent [`StoreReserve`] per
+//! Store/Ordering Scope or provider path: saturating one scope's normal
+//! partition shares no counter with any other scope's protected partition.
+//!
+//! ASSUMPTION: `owner_generation_ref`, `proof_profile_ref` and scope labels
+//! are composition- or caller-supplied current evidence echoed or keyed by
+//! this owner; this module opens no clock and reads no profile. The wiring
+//! wave that adds the contracts edge tightens the epoch-adjacent spellings
+//! without changing the partition discipline.
+//!
 //! This module has no production caller yet (STITCH): it publishes the owner
 //! evidence the Kernel profile composition will join. Wiring needs one line
 //! in `crates/eliot-store/src/lib.rs` (`pub mod control_reserve;` plus the
@@ -56,12 +75,16 @@
 //! caller-supplied and echoed into the permit/record; this module opens no
 //! clock and reads no profile.
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eliot_runtime_contracts::{
-    CapacityBottleneck, CapacityClass, CapacityUnit, ControlOperationClass, NormalWorkClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, CapacityBottleneck, CapacityClass,
+    CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass, NormalWorkClass,
+    frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -136,6 +159,13 @@ pub enum StoreReserveError {
         /// Why the re-hold is impossible.
         detail: String,
     },
+    /// The existing contract rejected an assembled Store reserve row.
+    #[error("runtime contract rejected Store reserve row: {0}")]
+    Contract(String),
+    /// The scope registry is unavailable; no scope reserve was created or
+    /// returned and no partition counter moved.
+    #[error("Store scope registry is unavailable; no scope reserve was created or returned")]
+    ScopeRegistryUnavailable,
 }
 
 /// Which Store dimension a permit holds.
@@ -1251,5 +1281,291 @@ impl StoreReserve {
             }
         }
         Ok(disposition)
+    }
+
+    /// Publishes the three `CLAIMED` owner-evidence rows for the Kernel
+    /// profile composition join (issue #1679, W3 Store wave).
+    ///
+    /// One row per Store bottleneck in frozen contract order (connection,
+    /// transaction, pending-write memory). Each row names the owner verbatim
+    /// from the existing [`frozen_bottleneck_owner_map`] binding for its
+    /// exact dimension (never a second owner string), the composition-supplied
+    /// bridge-generation reference, the exact bottleneck unit, the physical
+    /// total (the disjoint normal plus protected partition enforced here),
+    /// both disjoint partitions, [`CapacityEnforcement::PhysicalPartition`]
+    /// (normal acquisition paths never address the protected counters and
+    /// vice versa; there is no shared pool to borrow from) and no emergency
+    /// partition. The evidence reference is owner-derived current evidence:
+    /// the live available amount of each partition at publication time.
+    /// The invalidation set names the two owner-known invalidation
+    /// conditions: a bridge-generation move and a partition-config change.
+    /// Every row passes the existing
+    /// [`BottleneckCapacityProfile::validate`] before it is returned, so an
+    /// inconsistent row fails closed here instead of reaching the composer.
+    ///
+    /// Completeness is checked against the independent frozen map, not
+    /// against these rows: publication fails closed unless the frozen map
+    /// binds exactly the three Store bottlenecks to the same owner this
+    /// reserve publishes under. A fourth Store-owned dimension, or a moved
+    /// Store owner, is a contradiction, never a silently under-claimed
+    /// profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] for a blank or malformed
+    /// `owner_generation_ref` or `proof_profile_ref`, when the frozen map no
+    /// longer binds a Store bottleneck to one shared Store owner, or when a
+    /// partition sum overflows; returns [`StoreReserveError::Contract`] when
+    /// an assembled row fails the existing contract validation.
+    pub fn publish_claimed_rows(
+        &self,
+        owner_generation_ref: &str,
+        proof_profile_ref: &str,
+    ) -> Result<[BottleneckCapacityProfile; 3], StoreReserveError> {
+        validate_label(owner_generation_ref, "store_reserve.owner_generation_ref")?;
+        validate_label(proof_profile_ref, "store_reserve.proof_profile_ref")?;
+        let owner = frozen_store_owner()?;
+        let rows = [
+            Self::claimed_row(
+                StoreDimension::ConnectionSlots,
+                owner,
+                owner_generation_ref,
+                proof_profile_ref,
+                self.inner.connection_normal_capacity,
+                self.inner.connection_protected_capacity,
+                self.available_normal_connections(),
+                self.available_protected_connections(),
+            )?,
+            Self::claimed_row(
+                StoreDimension::TransactionSlots,
+                owner,
+                owner_generation_ref,
+                proof_profile_ref,
+                self.inner.transaction_normal_capacity,
+                self.inner.transaction_protected_capacity,
+                self.available_normal_transactions(),
+                self.available_protected_transactions(),
+            )?,
+            Self::claimed_row(
+                StoreDimension::PendingWriteMemory,
+                owner,
+                owner_generation_ref,
+                proof_profile_ref,
+                self.inner.pending_normal_capacity_bytes,
+                self.inner.pending_protected_capacity_bytes,
+                self.available_normal_pending_bytes(),
+                self.available_protected_pending_bytes(),
+            )?,
+        ];
+        Ok(rows)
+    }
+
+    /// Builds the single `CLAIMED` row for one Store dimension and validates
+    /// it with the existing contract check.
+    fn claimed_row(
+        dimension: StoreDimension,
+        owner: &'static str,
+        owner_generation_ref: &str,
+        proof_profile_ref: &str,
+        normal_capacity: u64,
+        protected_capacity: u64,
+        normal_available: u64,
+        protected_available: u64,
+    ) -> Result<BottleneckCapacityProfile, StoreReserveError> {
+        let bottleneck = dimension.bottleneck();
+        let unit = bottleneck.unit();
+        let normal_quantity =
+            NonZeroU64::new(normal_capacity).ok_or(StoreReserveError::InvalidField {
+                field: "store_reserve.normal_limit",
+                reason: "the normal partition of a claimed row is positive",
+            })?;
+        let protected_quantity =
+            NonZeroU64::new(protected_capacity).ok_or(StoreReserveError::InvalidField {
+                field: "store_reserve.protected_limit",
+                reason: "the protected partition of a claimed row is positive",
+            })?;
+        let physical_total = normal_capacity
+            .checked_add(protected_capacity)
+            .and_then(NonZeroU64::new)
+            .ok_or(StoreReserveError::InvalidField {
+                field: "store_reserve.physical_total_limit",
+                reason: "CAPACITY_SUM_OVERFLOW: the disjoint partition sum is positive and representable",
+            })?;
+        let row = BottleneckCapacityProfile {
+            bottleneck,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: owner.to_owned(),
+            owner_generation_ref: owner_generation_ref.to_owned(),
+            unit,
+            physical_total_limit: Some(CapacityLimit {
+                unit,
+                quantity: physical_total,
+            }),
+            normal_work_applicable: true,
+            normal_limit: Some(CapacityLimit {
+                unit,
+                quantity: normal_quantity,
+            }),
+            protected_limit: Some(CapacityLimit {
+                unit,
+                quantity: protected_quantity,
+            }),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::PhysicalPartition),
+            proof_profile_ref: proof_profile_ref.to_owned(),
+            evidence_refs: vec![format!(
+                "store-reserve/{}/bridge-gen-{owner_generation_ref}/normal-avail-{normal_available}/protected-avail-{protected_available}",
+                bottleneck.as_contract_str(),
+            )],
+            invalidation_set: vec![
+                "store-reserve/bridge-generation-change".to_owned(),
+                "store-reserve/partition-config-change".to_owned(),
+            ],
+        };
+        row.validate()
+            .map_err(|error| StoreReserveError::Contract(error.to_string()))?;
+        Ok(row)
+    }
+}
+
+/// Resolves the single shared Store owner from the frozen owner map and
+/// checks row completeness against that independent set.
+///
+/// Returns the owner the frozen map binds the connection dimension to, after
+/// proving that the transaction and pending-write dimensions bind the same
+/// owner and that no fourth frozen dimension binds it. The three
+/// [`STORE_CONNECTION_BOTTLENECK`], [`STORE_TRANSACTION_BOTTLENECK`] and
+/// [`STORE_PENDING_WRITE_BOTTLENECK`] constants are the claim; the frozen map
+/// is the independent denominator they are compared against.
+fn frozen_store_owner() -> Result<&'static str, StoreReserveError> {
+    fn contradiction(detail: &'static str) -> StoreReserveError {
+        StoreReserveError::InvalidField {
+            field: "store_reserve.frozen_owner_map",
+            reason: detail,
+        }
+    }
+    let owner_map = frozen_bottleneck_owner_map();
+    let owner = owner_map
+        .iter()
+        .find(|bound| bound.bottleneck == STORE_CONNECTION_BOTTLENECK)
+        .map(|bound| bound.owner)
+        .ok_or_else(|| contradiction("the frozen map binds no Store connection dimension"))?;
+    for bottleneck in [STORE_TRANSACTION_BOTTLENECK, STORE_PENDING_WRITE_BOTTLENECK] {
+        let bound_owner = owner_map
+            .iter()
+            .find(|bound| bound.bottleneck == bottleneck)
+            .map(|bound| bound.owner)
+            .ok_or_else(|| contradiction("the frozen map binds no Store dimension"))?;
+        if bound_owner != owner {
+            return Err(contradiction(
+                "the Store dimensions bind different frozen owners",
+            ));
+        }
+    }
+    let owned_count = owner_map
+        .iter()
+        .filter(|bound| bound.owner == owner)
+        .count();
+    if owned_count != 3 {
+        return Err(contradiction(
+            "the frozen map binds a different number of dimensions to the Store owner",
+        ));
+    }
+    Ok(owner)
+}
+
+/// One independent [`StoreReserve`] per Store/Ordering Scope or provider
+/// path (issue #1679, A6).
+///
+/// Saturating one scope's normal partition cannot consume another scope's
+/// protected control path because scopes share no counter: every scope label
+/// resolves to its own [`StoreReserve`] with its own disjoint
+/// normal/protected partitions over the same composition-configured sizes.
+/// Distinct [`StoreScopeReserves`] instances (for example one per provider
+/// path) share nothing either. A scope label names one Store/Ordering Scope
+/// or provider path; labels are composition-supplied and validated with the
+/// same bounded non-blank rule the owner enforces everywhere, and no label
+/// carries a priority or class that could relabel work across partitions.
+#[derive(Debug)]
+pub struct StoreScopeReserves {
+    normal_connection_slots: u64,
+    protected_connection_slots: u64,
+    normal_transaction_slots: u64,
+    protected_transaction_slots: u64,
+    normal_pending_write_bytes: NonZeroU64,
+    protected_pending_write_bytes: NonZeroU64,
+    scopes: Mutex<HashMap<String, StoreReserve>>,
+}
+
+impl StoreScopeReserves {
+    /// Creates the per-scope holder with one partition size set shared by
+    /// every scope admitted through it.
+    ///
+    /// Sizes are validated once through the existing
+    /// [`StoreReserve::partitioned`] constructor; the probe reserve is
+    /// discarded and no capacity is held here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] when any slot partition
+    /// size is zero.
+    pub fn new(
+        normal_connection_slots: u64,
+        protected_connection_slots: u64,
+        normal_transaction_slots: u64,
+        protected_transaction_slots: u64,
+        normal_pending_write_bytes: NonZeroU64,
+        protected_pending_write_bytes: NonZeroU64,
+    ) -> Result<Self, StoreReserveError> {
+        let _probe = StoreReserve::partitioned(
+            normal_connection_slots,
+            protected_connection_slots,
+            normal_transaction_slots,
+            protected_transaction_slots,
+            normal_pending_write_bytes,
+            protected_pending_write_bytes,
+        )?;
+        Ok(Self {
+            normal_connection_slots,
+            protected_connection_slots,
+            normal_transaction_slots,
+            protected_transaction_slots,
+            normal_pending_write_bytes,
+            protected_pending_write_bytes,
+            scopes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Returns the reserve for one scope, creating its independent partitions
+    /// on first use.
+    ///
+    /// The returned reserve shares no counter with any other scope's
+    /// reserve: saturating this scope leaves every other scope's normal and
+    /// protected partitions untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::InvalidField`] for a blank or malformed
+    /// scope label, or [`StoreReserveError::ScopeRegistryUnavailable`] when
+    /// the scope registry cannot be locked.
+    pub fn reserve_for_scope(&self, scope: &str) -> Result<StoreReserve, StoreReserveError> {
+        validate_label(scope, "store_scope.scope")?;
+        let mut scopes = self
+            .scopes
+            .lock()
+            .map_err(|_| StoreReserveError::ScopeRegistryUnavailable)?;
+        if let Some(reserve) = scopes.get(scope) {
+            return Ok(reserve.clone());
+        }
+        let reserve = StoreReserve::partitioned(
+            self.normal_connection_slots,
+            self.protected_connection_slots,
+            self.normal_transaction_slots,
+            self.protected_transaction_slots,
+            self.normal_pending_write_bytes,
+            self.protected_pending_write_bytes,
+        )?;
+        scopes.insert(scope.to_owned(), reserve.clone());
+        Ok(reserve)
     }
 }
