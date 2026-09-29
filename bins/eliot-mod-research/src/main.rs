@@ -413,10 +413,7 @@ fn report_admitted_inquiry(
             // the one a release consumer has to see before it promotes anything.
             let gate = match inquiry.release_gate() {
                 Ok(()) => eliot_mod_research::RELEASE_GATE_ADMITTED.to_owned(),
-                Err(error) => format!(
-                    "{}:{error}",
-                    eliot_mod_research::RELEASE_GATE_BLOCKED
-                ),
+                Err(error) => format!("{}:{error}", eliot_mod_research::RELEASE_GATE_BLOCKED),
             };
             let _ = writeln!(
                 io::stderr(),

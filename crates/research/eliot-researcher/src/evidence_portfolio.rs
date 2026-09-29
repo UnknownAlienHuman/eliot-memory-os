@@ -5985,7 +5985,9 @@ impl ClaimVerdict {
         self.requirements
             .iter()
             .find(|requirement| requirement.name == name)
-            .map_or(RequirementOutcome::Unknown, |requirement| requirement.outcome)
+            .map_or(RequirementOutcome::Unknown, |requirement| {
+                requirement.outcome
+            })
     }
 
     /// Whether both I21.8 requirement obligations were established.
@@ -5998,9 +6000,9 @@ impl ClaimVerdict {
     #[must_use]
     pub fn requirements_complete(&self) -> bool {
         self.requirements.len() == CLAIM_REQUIREMENTS.len()
-            && CLAIM_REQUIREMENTS.iter().all(|name| {
-                self.requirement_outcome(name) == RequirementOutcome::Satisfied
-            })
+            && CLAIM_REQUIREMENTS
+                .iter()
+                .all(|name| self.requirement_outcome(name) == RequirementOutcome::Satisfied)
     }
 
     /// Whether this verdict may be released as fully supported.
