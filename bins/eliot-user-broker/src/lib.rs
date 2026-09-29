@@ -59,8 +59,8 @@ mod protected_launch_config;
 use bridge_contract::{user_broker_contract, validate_user_broker_contract};
 use kernel_authority_port::KernelAuthorityPort;
 pub use notify_fallback_ensure::{
-    LiveNotifyFallbackEffects, NotifyFallbackEffects, NotifyFallbackEnsure,
-    NotifyFallbackRegistration, ensure_notify_fallback_registered,
+    LiveNotifyFallbackEffects, NotifyFallbackDeclaration, NotifyFallbackEffects,
+    NotifyFallbackEnsure, NotifyFallbackRegistration, ensure_notify_fallback_registered,
 };
 pub use notify_launch_callin::{
     BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyAcknowledge, NotifyDeliver,
