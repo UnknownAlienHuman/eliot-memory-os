@@ -103,9 +103,9 @@ pub use transport_profile::{
 use understanding_bootstrap::validate_task_inputs_match_surface;
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootDelta, BootstrapContext, BootstrapError, BootstrapSession,
-    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition, ScopeLevel,
-    SelectedTask, TaskCandidate, TaskSelectionDisposition, TaskSelectionView,
-    UnderstandingBootstrap, get_understanding_bootstrap,
+    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition,
+    RoutePayloadMeasurement, ScopeLevel, SelectedTask, TaskCandidate, TaskSelectionDisposition,
+    TaskSelectionView, UnderstandingBootstrap, get_understanding_bootstrap, measure_route_payload,
 };
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
@@ -3944,6 +3944,33 @@ impl BootstrapSnapshot {
     }
 }
 
+/// Attaches the route-profiled payload measurement to one sealed bootstrap.
+///
+/// Renders the composed default output exactly as the wire frame would and
+/// binds the exact UTF-8 byte observation to the owner-selected route profile
+/// ([`measure_route_payload`]), naming the inline expansion handles behind
+/// which omitted material stays reachable. Runs on every sealed delivery, so
+/// each bootstrap the agent receives carries its own live-path measurement.
+/// Measurement never blocks delivery: if rendering fails, the bootstrap keeps
+/// `payload_measurement: None` and the frame bound below still refuses any
+/// oversize emission instead of truncating it.
+fn attach_route_payload_measurement(bootstrap: &mut UnderstandingBootstrap) {
+    let Ok(rendered) = serde_json::to_string(&*bootstrap) else {
+        return;
+    };
+    let mut omitted_behind_handles = Vec::with_capacity(2);
+    omitted_behind_handles.push(bootstrap.next_safe_expansion.clone());
+    if let Some(delta) = &bootstrap.boot_delta {
+        omitted_behind_handles.push(delta.expansion_handle.clone());
+    }
+    let route_profile_ref = bootstrap.route_profile_ref.clone();
+    bootstrap.payload_measurement = Some(measure_route_payload(
+        &route_profile_ref,
+        &rendered,
+        omitted_behind_handles,
+    ));
+}
+
 impl BridgeRunner {
     pub fn new(
         profile: Profile,
@@ -4449,7 +4476,7 @@ impl BridgeRunner {
     /// the live attach fence.
     pub fn note_owner_snapshot(
         &mut self,
-        context: BootstrapContext,
+        mut context: BootstrapContext,
         tasks: BootstrapTaskInputs,
     ) -> Result<(), BootstrapError> {
         if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
@@ -4458,6 +4485,16 @@ impl BridgeRunner {
                 detail: "material readiness cannot be projected while the retained context carries only an opaque fence reference".to_owned(),
             });
         }
+        // The host-supplied path never carries frozen rendering identities:
+        // a client can name them in request JSON (bypassing the constructor),
+        // so they are cleared here before validation and retention. Only the
+        // compiled-surface intake re-applies the exact owner values below.
+        context.serializer_id.clear();
+        context.serializer_version.clear();
+        context.serializer_options_digest.clear();
+        context.tokenizer_id.clear();
+        context.tokenizer_version.clear();
+        context.tokenizer_hash.clear();
         get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
@@ -4571,7 +4608,20 @@ impl BridgeRunner {
             next_safe_expansion,
             boot_delta,
         )?;
-        self.note_owner_snapshot(context, tasks)
+        self.note_owner_snapshot(context, tasks)?;
+        // The generic note path clears frozen rendering identities (host
+        // clients can name them in request JSON); re-apply the exact values
+        // the compiled owner surface carried, already validated by
+        // `from_compiled_surface` above.
+        if let Some(snapshot) = self.bootstrap_snapshot.as_mut() {
+            snapshot.context.serializer_id = surface.serializer_id.clone();
+            snapshot.context.serializer_version = surface.serializer_version.clone();
+            snapshot.context.serializer_options_digest = surface.serializer_options_digest.clone();
+            snapshot.context.tokenizer_id = surface.tokenizer_id.clone();
+            snapshot.context.tokenizer_version = surface.tokenizer_version.clone();
+            snapshot.context.tokenizer_hash = surface.tokenizer_hash.clone();
+        }
+        Ok(())
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
     ///
@@ -4616,9 +4666,10 @@ impl BridgeRunner {
                 detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
             });
         };
-        let bootstrap =
+        let mut bootstrap =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
         BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
+        attach_route_payload_measurement(&mut bootstrap);
         Ok(bootstrap)
     }
     /// Previews the one-time bootstrap without marking it delivered. A
@@ -4634,7 +4685,12 @@ impl BridgeRunner {
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
         let mut session = self.bootstrap_session;
-        session.take_auto_boot(&snapshot.context, tasks, requested_assessment)
+        session
+            .take_auto_boot(&snapshot.context, tasks, requested_assessment)
+            .map(|mut bootstrap| {
+                attach_route_payload_measurement(&mut bootstrap);
+                bootstrap
+            })
     }
     /// Takes the once-per-session auto-boot for the first successful response.
     ///
@@ -4658,6 +4714,10 @@ impl BridgeRunner {
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
         self.bootstrap_session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
+            .map(|mut bootstrap| {
+                attach_route_payload_measurement(&mut bootstrap);
+                bootstrap
+            })
     }
     /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
     ///
