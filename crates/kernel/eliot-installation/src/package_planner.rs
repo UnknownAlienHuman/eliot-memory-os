@@ -4,7 +4,10 @@ use std::path::Path;
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     FileIdentity, PackageManifest, PackageSourceObservation, PackageStagingError,
-    TrustedSourceBundle, validate_package_relative_path,
+    TrustedSourceBundle, UserModeSupervisionAuthorityCredentialRequest,
+    UserModeSupervisionAuthorityCredentialTargetObservation,
+    WindowsInstallerSecretProvider, WindowsUserModeSupervisionAuthorityCredentialProvider,
+    validate_package_relative_path,
 };
 
 use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
@@ -20,6 +23,7 @@ use crate::{
     ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
     SupervisionAuthorityProvisionPlan, NoServiceProfileAuthorityProof,
+    UserModeSupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate, prove_no_service_profile_authority_dependency,
     provider_bootstrap_credential_target_for_store_target, select_profile_roots,
@@ -2085,6 +2089,74 @@ impl GenerationPackagePlanner {
             candidate_manifest_digest: candidate_manifest_digest.clone(),
             package_manifest_digest,
         });
+        if input.profile == InstallationProfile::UserMode {
+            let effect_id = PlatformHandle::new(format!(
+                "effect:user-mode-supervision-authority:{}",
+                input.generation
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.user_mode_authority_effect_id".to_owned(),
+                reason: error.to_string(),
+            })?;
+            let owner_sid = WindowsInstallerSecretProvider::new()
+                .principal_sid()
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "generation.user_mode_authority_owner_sid".to_owned(),
+                    reason: error.to_string(),
+                })?;
+            let request = UserModeSupervisionAuthorityCredentialRequest {
+                transaction_id: input.transaction_id.as_str().to_owned(),
+                effect_id: effect_id.as_str().to_owned(),
+                installation_id: input.installation_epoch.installation.as_str().to_owned(),
+                candidate_generation: input.generation.as_str().to_owned(),
+                authority_generation,
+                supervision_lease_scope_id: supervision_lease_scope_id.as_str().to_owned(),
+                signer_id: "eliot-kernel".to_owned(),
+                key_id: format!("eliot-supervision-key:v1:{}", input.generation),
+                owner_sid: owner_sid.as_str().to_owned(),
+            };
+            let target = match WindowsUserModeSupervisionAuthorityCredentialProvider::new()
+                .inspect_target(&request)
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "generation.user_mode_authority_target".to_owned(),
+                    reason: error.to_string(),
+                })? {
+                UserModeSupervisionAuthorityCredentialTargetObservation::Absent {
+                    owner_sid: observed_sid,
+                    target,
+                } if observed_sid == owner_sid => target,
+                UserModeSupervisionAuthorityCredentialTargetObservation::Absent { .. }
+                | UserModeSupervisionAuthorityCredentialTargetObservation::Present { .. } => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            };
+            effects.push(InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+                effect_id: effect_id.clone(),
+                provision: Box::new(UserModeSupervisionAuthorityProvisionPlan {
+                    transaction_id: input.transaction_id.clone(),
+                    effect_id,
+                    installation_id: input.installation_epoch.installation.clone(),
+                    candidate_generation: input.generation.clone(),
+                    authority_generation,
+                    supervision_lease_scope_id: supervision_lease_scope_id.clone(),
+                    signer_id: PlatformHandle::new(request.signer_id).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "generation.user_mode_authority_signer_id".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?,
+                    key_id: PlatformHandle::new(request.key_id).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "generation.user_mode_authority_key_id".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?,
+                    target,
+                    owner_sid,
+                    profile_roots: roots.clone(),
+                }),
+            });
+        }
         if input.profile == InstallationProfile::SystemService {
             for (role, name, executable_path) in [
                 (
@@ -2305,6 +2377,9 @@ impl GenerationPackagePlanner {
                     InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
                         provision.target.clone()
                     }
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+                        provision, ..
+                    } => provision.target.clone(),
                     InstallerEffectPlan::MaterializePhaseB {
                         static_template, ..
                     } => static_template.authority_id.clone(),

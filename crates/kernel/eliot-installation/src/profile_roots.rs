@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
-use super::{InstallationError, WindowsPathIdentity, text};
+use super::{InstallationError, WindowsPathIdentity, joined_windows_path, text};
 
 /// Breaking revision of the persisted four-root installation binding.
 ///
@@ -168,11 +168,12 @@ impl InstallationRoots {
 
     /// Binds the I3.1 durable root to the proved runtime topology.
     ///
-    /// `system_service` names the runtime profile root itself as durable
-    /// state; `user_mode` refines that contour into per-role children, so each
-    /// of its durable, configuration and cache roots must sit strictly below
-    /// it. `portable_dev` is explicitly disposable, so profile agreement and
-    /// root separation above are its complete join.
+    /// `system_service` and `user_mode` retain the I3.1 durable-data root as
+    /// their top-level state contour and refine it into per-installation
+    /// runtime directories. UserMode's data, config, and cache roles are
+    /// checked against the exact sibling layout derived from its retained
+    /// LocalAppData anchor. `portable_dev` is explicitly disposable, so
+    /// profile agreement and root separation above are its complete join.
     fn validate_durable_runtime_join(
         &self,
         profile: InstallationProfile,
@@ -185,26 +186,53 @@ impl InstallationRoots {
         let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
         match profile {
             InstallationProfile::SystemService => {
-                if durable != profile_root {
+                let expected_durable = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(
+                        self.runtime_state_roots.profile_anchor_root.as_str(),
+                        "Eliot",
+                    ),
+                    "durable_data",
+                )?;
+                if durable != expected_durable
+                    || durable == profile_root
+                    || !durable.contains(&profile_root)
+                {
                     return Err(InstallationError::ProfileViolation(
-                        "durable installation root must equal the runtime profile root".to_owned(),
+                        "runtime installation root must sit strictly below the I3.1 durable-data root"
+                            .to_owned(),
                     ));
                 }
             }
             InstallationProfile::UserMode => {
+                let user_root = joined_windows_path(
+                    self.runtime_state_roots.profile_anchor_root.as_str(),
+                    "Eliot",
+                );
+                let expected_data = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(&user_root, "data"),
+                    "durable_data",
+                )?;
+                let expected_config = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(&user_root, "config"),
+                    "user_config",
+                )?;
+                let expected_cache = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(&user_root, "cache"),
+                    "user_cache",
+                )?;
                 let user_config =
                     WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
                 let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
-                for (field, root) in [
-                    ("durable_data", &durable),
-                    ("user_config", &user_config),
-                    ("user_cache", &user_cache),
-                ] {
-                    if !profile_root.contains(root) || profile_root == *root {
-                        return Err(InstallationError::ProfileViolation(format!(
-                            "{field} must sit strictly below the runtime profile root"
-                        )));
-                    }
+                if durable != expected_data
+                    || user_config != expected_config
+                    || user_cache != expected_cache
+                    || durable == profile_root
+                    || !durable.contains(&profile_root)
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "UserMode data, config, cache, and runtime roots must preserve the I3.1 sibling layout"
+                            .to_owned(),
+                    ));
                 }
             }
             InstallationProfile::PortableDev => {}
