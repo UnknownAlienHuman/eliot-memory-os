@@ -868,6 +868,10 @@ impl UserAutomationHostExecutionResponse {
         self.validate_operation_response(request)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each typed request and response variant is checked in one exhaustive boundary"
+    )]
     fn validate_operation_response(
         &self,
         request: &UserAutomationHostExecutionRequest,
@@ -1034,10 +1038,12 @@ impl UserAutomationHostExecutionResponse {
 fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMetadata {
     match &request.operation {
         UserAutomationHostExecutionOperation::AdmitOccurrence { request } => &request.context,
-        UserAutomationHostExecutionOperation::CancelPendingWakes { request } => &request.context,
+        UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+        | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+            &request.context
+        }
         UserAutomationHostExecutionOperation::ReadPendingWake { request } => &request.context,
         UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => &request.context,
-        UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => &request.context,
     }
 }
 
@@ -1571,24 +1577,21 @@ impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExe
         // The claim expiry is checked by the durable observer after waiting
         // for this transport, immediately before the first possible write.
         observer.dispatch_started(&request)?;
-        let outcome = match transport.send_frame(&frame, self.limits).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                observer
-                    .delivery_outcome(
-                        &request,
-                        eliot_ors::HostRequestDeliveryReceipt::UnknownOutcome,
+        let Ok(outcome) = transport.send_frame(&frame, self.limits).await else {
+            observer
+                .delivery_outcome(
+                    &request,
+                    eliot_ors::HostRequestDeliveryReceipt::UnknownOutcome,
+                )
+                .map_err(|_| {
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "the uncertain send outcome could not be durably observed".to_owned(),
                     )
-                    .map_err(|_| {
-                        UserAutomationRuntimeError::UnknownOutcome(
-                            "the uncertain send outcome could not be durably observed".to_owned(),
-                        )
-                    })?;
-                return Err(UserAutomationRuntimeError::UnknownOutcome(
-                    "UserAutomation cancellation send crossed an unclassified transport error"
-                        .to_owned(),
-                ));
-            }
+                })?;
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "UserAutomation cancellation send crossed an unclassified transport error"
+                    .to_owned(),
+            ));
         };
         let delivery_receipt = match outcome {
             DeliveryOutcome::Delivered => eliot_ors::HostRequestDeliveryReceipt::Delivered,

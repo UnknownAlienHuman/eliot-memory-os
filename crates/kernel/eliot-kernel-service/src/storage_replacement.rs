@@ -1220,6 +1220,8 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::HostRequestLegacyCorrelationUnresolved => {
             invalid_field("host_request_legacy_correlation")
         }
+        OrsError::HostRequestAttemptLimitExceeded => invalid_field("host_request_attempt_limit"),
+        OrsError::HostRequestAttemptExpired => invalid_field("host_request_attempt_expired"),
         OrsError::CampaignLearningStateViewConflict { .. } => {
             invalid_field("campaign_learning_state_view")
         }

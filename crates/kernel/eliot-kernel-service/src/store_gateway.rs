@@ -64,12 +64,11 @@ use crate::store_write_reservation::{
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationExecutionError,
-    UserAutomationExecutionOutcome, UserAutomationExecutionRequest, UserAutomationRemovalResult,
-    UserAutomationWakeCancellation, UserAutomationWakeCancellationTarget,
-    UserAutomationWakeEnumerationReceipt, UserAutomationWakePublication,
-    UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
-    retirement_wake_enumeration_request,
+    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
+    UserAutomationRemovalResult, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
+    read_retirement_wake_targets, retirement_wake_enumeration_request,
 };
 use crate::user_automation_execution_client::{
     UserAutomationHostExecutionObserver, UserAutomationHostExecutionOperation,
@@ -107,7 +106,7 @@ const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 /// record; it grants no authority and carries no decision of its own.
 static USER_AUTOMATION_SEND_CLAIM_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// ORS-backed observer for one exact UserAutomation cancellation claim.
+/// ORS-backed observer for one exact `UserAutomation` cancellation claim.
 ///
 /// The expected typed cancellation, staged row, and acquired claim are
 /// immutable snapshots. Every callback revalidates the actual authenticated
@@ -1937,6 +1936,10 @@ impl KernelStoreGateway {
     /// active ORS claim; its result and owner receipt are terminalized in one
     /// ORS transaction. A missing, legacy, or inaccessible Host batch leaves
     /// the obligation reconciling and never authorizes a resend.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exact owner readback, claim evidence, and terminal result are checked together"
+    )]
     async fn reconcile_cancellation_owner_readback<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -1962,23 +1965,22 @@ impl KernelStoreGateway {
         let Ok(operation_id) = user_automation_obligation_operation_id(obligation) else {
             return retained;
         };
-        let record = match ors.load_host_request(&operation_id, &obligation.request_digest) {
-            Ok(Some(record)) => record,
-            _ => return retained,
+        let Ok(Some(record)) = ors.load_host_request(&operation_id, &obligation.request_digest)
+        else {
+            return retained;
         };
         let Some(attempt) = record.attempt.clone() else {
             return retained;
         };
-        let expected_payload_digest =
-            match runtime_obligation_payload_digest(&obligation.subject_ids) {
-                Ok(digest) => digest,
-                Err(_) => return retained,
-            };
-        let expected_fence_digest =
-            match user_automation_obligation_fence_digest(sealed, obligation) {
-                Ok(digest) => digest,
-                Err(_) => return retained,
-            };
+        let Ok(expected_payload_digest) =
+            runtime_obligation_payload_digest(&obligation.subject_ids)
+        else {
+            return retained;
+        };
+        let Ok(expected_fence_digest) = user_automation_obligation_fence_digest(sealed, obligation)
+        else {
+            return retained;
+        };
         let exact_request = UserAutomationWakeCancellation {
             context: sealed.context.clone(),
             authenticated_principal: sealed.authenticated_principal.clone(),
@@ -2031,11 +2033,11 @@ impl KernelStoreGateway {
         {
             return retained;
         }
-        let authenticated_readback =
-            match runtime.read_cancellation_batch(exact_request.clone()).await {
-                Ok(readback) => readback,
-                Err(_) => return retained,
-            };
+        let Ok(authenticated_readback) =
+            runtime.read_cancellation_batch(exact_request.clone()).await
+        else {
+            return retained;
+        };
         if authenticated_readback
             .readback
             .validate_for(&exact_request)
@@ -2057,20 +2059,18 @@ impl KernelStoreGateway {
             state_fence: exact_request.state_fence.clone(),
             wake_ids: authenticated_readback.readback.cancelled_wake_ids.clone(),
         };
-        let result_response = match serde_json::to_value(&response) {
-            Ok(response) => response,
-            Err(_) => return retained,
+        let Ok(result_response) = serde_json::to_value(&response) else {
+            return retained;
         };
         let result_digest = match canonical_json_bytes(&result_response) {
             Ok(bytes) => sha256_hex(&bytes),
             Err(_) => return retained,
         };
-        let owner_receipt_commitment_sha256 = match authenticated_readback
+        let Ok(owner_receipt_commitment_sha256) = authenticated_readback
             .readback
             .owner_receipt_commitment_sha256()
-        {
-            Ok(digest) => digest,
-            Err(_) => return retained,
+        else {
+            return retained;
         };
         let evidence = HostRequestOwnerReadbackEvidence {
             operation_id: record.operation_id.clone(),
@@ -2162,6 +2162,10 @@ impl KernelStoreGateway {
     /// The body is what an exact replay of the same parent operation serves
     /// instead of issuing the effect a second time, so a lost response is
     /// resumed from the record rather than re-derived from a fresh owner call.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the retained answer and original send claim are validated as one operation"
+    )]
     fn retain_user_automation_obligation_answer(
         &self,
         obligation: &UserAutomationRuntimeObligation,
@@ -2484,6 +2488,10 @@ impl KernelStoreGateway {
     /// fields name the claiming Kernel generation, its authority session, and
     /// this claim's unique launch identity, which is what makes two competing
     /// claims distinguishable instead of interchangeable.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exclusive attempt and bounded no-send retry use one durable claim transition"
+    )]
     fn user_automation_send_claim_attempt(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -2527,7 +2535,7 @@ impl KernelStoreGateway {
             Some(previous)
                 if previous.phase == HostRequestAttemptPhase::DefinitelyNotSent
                     && record.state == HostRequestState::Routed
-                    && record.attempt_history.len() < 1 =>
+                    && record.attempt_history.is_empty() =>
             {
                 previous.generation.checked_add(1).ok_or_else(|| {
                     unretained_obligation_reason(
@@ -2538,7 +2546,7 @@ impl KernelStoreGateway {
             }
             Some(previous)
                 if previous.phase == HostRequestAttemptPhase::DefinitelyNotSent
-                    && record.attempt_history.len() >= 1 =>
+                    && !record.attempt_history.is_empty() =>
             {
                 return Err(unretained_obligation_reason(
                     obligation,
@@ -2710,6 +2718,10 @@ impl KernelStoreGateway {
     /// cancellation identities are derived from the obligation rather than
     /// copied from a transport, so two attempts of one parent operation always
     /// present the same durable request identity.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact obligation identity and custody fields are built together"
+    )]
     fn user_automation_obligation_outbox_record(
         sealed: &UserAutomationServiceRequest,
         obligation: &UserAutomationRuntimeObligation,
@@ -3842,6 +3854,10 @@ impl KernelStoreGateway {
     /// revision. A retained answer is validated against the current exact
     /// request, including State Fence; a replay under a different fence remains
     /// reconciling instead of being silently rebound to the new era.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "enumeration receipt validation and retention share one exact owner operation"
+    )]
     async fn read_or_retain_retirement_enumeration_receipt<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -4119,6 +4135,10 @@ impl KernelStoreGateway {
         .map_err(|error| unretained_cancellation_reason(&revision.revision, error.to_string()))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the observer binds the complete cancellation claim before dispatch"
+    )]
     fn user_automation_cancellation_custody_observer<'a>(
         &'a self,
         sealed: &UserAutomationServiceRequest,
@@ -4254,6 +4274,10 @@ impl KernelStoreGateway {
     /// await window leaves a non-reissuable reconciling record under the
     /// ORIGINAL owner operation identity rather than ordinary `Retained` work
     /// that a later attempt would blindly reissue.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "retirement dispatch and exact reconciliation remain in one causal contour"
+    )]
     async fn issue_retirement_cancellation<R>(
         &self,
         handoff: OwnerWakeHandoffKind,
@@ -4460,6 +4484,10 @@ impl KernelStoreGateway {
     /// is the only classification the caller needs: a lost owner answer means the
     /// effect may already be applied, while every other refusal happened before
     /// the cancellation left this boundary.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exact retirement operation, target set, receipt, runtime, and observer are all required"
+    )]
     async fn cancel_retirement_wakes<R>(
         &self,
         handoff: OwnerWakeHandoffKind,
