@@ -996,8 +996,7 @@ impl ToolExposureReceiptV2 {
             route_fingerprint: self.route_fingerprint.clone(),
             registered: self.registered,
             advertised_to_route: self.advertised_to_route,
-            eligible_under_scope_policy_and_grant: self
-                .eligible_under_scope_policy_and_grant,
+            eligible_under_scope_policy_and_grant: self.eligible_under_scope_policy_and_grant,
             selected_by_planner_or_model: self.selected_by_planner_or_model,
             called: Some(true),
             transport_completed: Some(true),
@@ -1007,9 +1006,7 @@ impl ToolExposureReceiptV2 {
             expanded_or_retried: Some(true),
             observably_used_in_decision_action_or_verifier: self
                 .observably_used_in_decision_action_or_verifier,
-            terminal_task_or_product_outcome_ref: self
-                .terminal_task_or_product_outcome_ref
-                .clone(),
+            terminal_task_or_product_outcome_ref: self.terminal_task_or_product_outcome_ref.clone(),
         };
         expanded.validate()?;
         Ok(expanded)
