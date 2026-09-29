@@ -26,7 +26,11 @@
 //! are computed here with [`crate::sha256_hex`] over the exact bytes the
 //! trusted readback caller supplies, and every record is keyed by its own
 //! exact hint or operation identity: a lease/session/operation bound to
-//! one operation is never reused for another.
+//! one operation is never reused for another. Confirmation evidence must
+//! be independent of the hint it confirms: a readback that observes no
+//! repository transition, or git status/heads that echo a content-domain
+//! digest, is refused rather than confirmed, so the ledger can never
+//! verify the caller's string against itself.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -125,9 +129,11 @@ impl ContentRead {
 }
 
 /// Readback evidence bound to the same hinted path as the two direct
-/// content reads. The host-request admission observer reuses the admitted
-/// connection, descriptor, and envelope digests; the Kernel checks shapes
-/// and digest agreement, never repository semantics.
+/// content reads. The evidence must independently observe repository state:
+/// a readback that records the same HEAD on both sides with no revision
+/// transition and no diff handle observes nothing and is refused with
+/// [`ChangeMonitorError::InvalidGitEvidence`], so a hint can never be
+/// confirmed against a restatement of the caller's own string.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitReadback {
     pub repository: String,
@@ -142,10 +148,13 @@ pub(crate) struct GitReadback {
 
 /// Trusted confirmation evidence for one pending hint: the admitted
 /// baseline, two independent content reads that must agree, and the bound
-/// readback evidence. The host-request admission observer reuses the
-/// admitted envelope and descriptor digests for both reads; the Kernel
-/// confirms stability and materiality against the exact operation's
-/// evidence.
+/// readback evidence. Independence is enforced, not assumed: a git status
+/// proof or head that merely copies a content-domain digest (the baseline
+/// or either content read) is refused with
+/// [`ChangeMonitorError::InvalidGitEvidence`], because comparing the
+/// caller's string with itself proves nothing about the hinted artifact.
+/// The Kernel never invents source bytes to fill the gap; refused evidence
+/// leaves the hint pending and governed acceptance blocked (fail-closed).
 ///
 /// Caller (I10.21 W2): `super::observe_change_monitor_host_hint`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -321,6 +330,21 @@ fn validate_git(git: &GitReadback) -> Result<(), ChangeMonitorError> {
     {
         return Err(ChangeMonitorError::InvalidGitEvidence);
     }
+    // I10.21 W2: a readback that records the same HEAD on both sides with
+    // no revision transition and no diff handle observes no repository
+    // state at all — it restates the caller's string. Such evidence can
+    // neither prove nor disprove a transition, so the Kernel refuses it
+    // instead of confirming a hint against itself. Confirmation requires
+    // an observed transition: a head movement, a revision change, or a
+    // diff handle. A refused hint stays pending and keeps governed
+    // acceptance blocked (fail-closed); the Kernel never invents source
+    // bytes to fill the gap.
+    if git.head_before == git.head_after
+        && git.before_revision == git.after_revision
+        && git.diff_handle.is_none()
+    {
+        return Err(ChangeMonitorError::InvalidGitEvidence);
+    }
     Ok(())
 }
 
@@ -335,7 +359,32 @@ fn validate_verification(verification: &HintVerification) -> Result<(), ChangeMo
             return Err(ChangeMonitorError::InvalidGitEvidence);
         }
     }
-    validate_git(&verification.git)
+    validate_git(&verification.git)?;
+    // I10.21 W2: confirmation must compare the admitted baseline against
+    // INDEPENDENT evidence, never against the caller's string restated in
+    // another field. A git status proof or head that copies a
+    // content-domain digest (the baseline or either content read) proves
+    // only the caller's own string equality — the exact self-verification
+    // the evidence rule forbids — so the Kernel refuses it. Genuine
+    // evidence never trips this: a status checksum over repository output
+    // and a repository commit identity cannot equal a content checksum
+    // except by restatement (collision aside).
+    for candidate in [
+        verification.before_digest.as_deref(),
+        Some(verification.first_read.digest()),
+        Some(verification.reread.digest()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if verification.git.status_sha256 == candidate
+            || verification.git.head_before == candidate
+            || verification.git.head_after == candidate
+        {
+            return Err(ChangeMonitorError::InvalidGitEvidence);
+        }
+    }
+    Ok(())
 }
 
 /// Stable lane-relative artifact path for host-request admission hints.
@@ -410,7 +459,12 @@ pub(crate) fn material_transition_ids(
 
 /// Confirms one pending hint with trusted content and readback evidence
 /// (I10.21 W2, second half). The two content reads must agree or the
-/// readback proves nothing; a Material transition (after digest differs
+/// readback proves nothing; self-verifying evidence — a git readback that
+/// observes no transition, or git status/heads that echo a content-domain
+/// digest — is refused with [`ChangeMonitorError::InvalidGitEvidence`] or
+/// [`ChangeMonitorError::UnstableReadback`] before any verdict, so the
+/// `VerifiedImmaterial` early return is reachable only on genuinely
+/// independent evidence. A Material transition (after digest differs
 /// from the admitted baseline) emits an unknown-origin Material change
 /// (I10.21 A2), reconciled immediately only when a recorded governed
 /// change already proves the exact same resource transition.
