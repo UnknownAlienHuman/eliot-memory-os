@@ -52,6 +52,13 @@ const MAX_TYPED_MEMORIES: usize = 1;
 const MAX_TYPED_TABLES: usize = 1;
 /// Approximate per-item lift cost used to convert a list into a byte bound.
 const TYPED_ITEM_LIFT_BYTES: u64 = 8;
+/// Log/stderr detail ceiling. [`TypedExecutionError::fmt`] feeds the bounded
+/// stderr/log line, so every rendered detail is cut to this size on a char
+/// boundary: digests, measured sizes, and bounded identity codes pass through,
+/// while a foreign detail (neutral-crate kit/capsule text, a future world
+/// name) can never carry a raw payload, path, secret, or backtrace into the
+/// log. All host-owned codes are far shorter and never truncated.
+const MAX_LOG_DETAIL_BYTES: usize = 256;
 
 /// Caller-selected execution mode. Governed is the default; experimental
 /// and legacy must be explicitly selected and never auto-probed.
@@ -291,22 +298,60 @@ pub enum TypedExecutionError {
     },
 }
 
+/// Cuts `value` to [`MAX_LOG_DETAIL_BYTES`] on a char boundary. Returns the
+/// whole value when it already fits; no allocation, no escaping change.
+/// Called by [`TypedExecutionError::fmt`] (typed_execution.rs::fmt) and by
+/// [`map_contract_error`] (typed_execution.rs::map_contract_error).
+fn truncate_detail(value: &str) -> &str {
+    if value.len() <= MAX_LOG_DETAIL_BYTES {
+        return value;
+    }
+    let mut end = MAX_LOG_DETAIL_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 impl fmt::Display for TypedExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every rendered detail passes through `truncate_detail`: the stderr
+        // and log lines built from this string stay bounded and redacted even
+        // when a detail arrived from outside the typed lane.
         match self {
             Self::GovernedAdmissionRequired => formatter.write_str("KERNEL_ADMISSION_REQUIRED"),
-            Self::AdmissionMismatch(reason) => write!(formatter, "ADMISSION_MISMATCH:{reason}"),
-            Self::WorldUnknown(world) => write!(formatter, "WORLD_UNKNOWN:{world}"),
-            Self::WorldSelection { reason } => write!(formatter, "WORLD_SELECTION:{reason}"),
-            Self::ExportTypeMismatch(name) => write!(formatter, "EXPORT_TYPE_MISMATCH:{name}"),
+            Self::AdmissionMismatch(reason) => {
+                write!(formatter, "ADMISSION_MISMATCH:{}", truncate_detail(reason))
+            }
+            Self::WorldUnknown(world) => {
+                write!(formatter, "WORLD_UNKNOWN:{}", truncate_detail(world))
+            }
+            Self::WorldSelection { reason } => {
+                write!(formatter, "WORLD_SELECTION:{}", truncate_detail(reason))
+            }
+            Self::ExportTypeMismatch(name) => {
+                write!(
+                    formatter,
+                    "EXPORT_TYPE_MISMATCH:{}",
+                    truncate_detail(name)
+                )
+            }
             Self::MissingExport(name) | Self::ForbiddenImport(name) => {
-                write!(formatter, "{CAPABILITY_INTRODUCTION_REQUIRED}:{name}")
+                write!(
+                    formatter,
+                    "{CAPABILITY_INTRODUCTION_REQUIRED}:{}",
+                    truncate_detail(name)
+                )
             }
             Self::LegacyMismatch => formatter.write_str("LEGACY_MISMATCH"),
             Self::Artifact(error) => write!(formatter, "{error}"),
-            Self::LimitDenied(reason) => write!(formatter, "LIMIT_DENIED:{reason}"),
-            Self::Engine(reason) => write!(formatter, "ENGINE:{reason}"),
-            Self::OutputViolation(reason) => write!(formatter, "OUTPUT_VIOLATION:{reason}"),
+            Self::LimitDenied(reason) => {
+                write!(formatter, "LIMIT_DENIED:{}", truncate_detail(reason))
+            }
+            Self::Engine(reason) => write!(formatter, "ENGINE:{}", truncate_detail(reason)),
+            Self::OutputViolation(reason) => {
+                write!(formatter, "OUTPUT_VIOLATION:{}", truncate_detail(reason))
+            }
             Self::Staged { stage, cause } => write!(formatter, "STAGE:{stage}:{cause}"),
         }
     }
@@ -841,6 +886,65 @@ fn semantic_digest(receipt: &TypedReceipt) -> Sha256Digest {
     Sha256Digest::of_bytes(&canonical)
 }
 
+/// Typed-lane receipt ceiling. The CLI refuses any stdout/stderr line above
+/// its own budget; this tighter lane ceiling bounds what the typed lane can
+/// hand it. A legit receipt stays far below it: digests are fixed hex,
+/// measurements are scalars, and every identity string was validated bounded
+/// before the receipt was built.
+const MAX_TYPED_RECEIPT_BYTES: usize = 16_384;
+
+/// Rejects a receipt whose rendered value strings or identity vectors exceed
+/// the typed-lane ceiling before it can reach stdout. The receipt carries
+/// digests, measured sizes, and bounded identity codes only — never a raw
+/// payload, path, secret, or backtrace — so this gate bounds the envelope,
+/// not content that must be redacted. Failure is the typed
+/// `OUTPUT_VIOLATION:receipt-bound` denial. Called by
+/// [`execute_describe_experimental`] (typed_execution.rs::execute_describe_experimental)
+/// and [`execute_domain_experimental`] (typed_execution.rs::execute_domain_experimental).
+fn check_receipt_bounds(receipt: &TypedReceipt) -> Result<(), TypedExecutionError> {
+    if receipt.actual_imports.len() > 8 || receipt.actual_exports.len() > 8 {
+        return Err(TypedExecutionError::OutputViolation(
+            "receipt-bound".to_owned(),
+        ));
+    }
+    // Fixed overhead covers the six hex digests plus the scalar measurements.
+    // String and vector contents are measured below; saturation keeps a
+    // hostile length from wrapping the counter.
+    let mut bytes: u64 = 512;
+    for value in [
+        receipt.proof.as_str(),
+        receipt.world.as_str(),
+        receipt.package_id.as_str(),
+        receipt.engine_version.as_str(),
+        receipt.stage.as_str(),
+        receipt.terminal.as_str(),
+    ] {
+        bytes = bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+    }
+    for identity in [
+        receipt.operation_id.as_ref(),
+        receipt.task_id.as_ref(),
+        receipt.fence_epoch.as_ref(),
+        receipt.policy_id.as_ref(),
+    ] {
+        if let Some(value) = identity {
+            bytes = bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+        }
+    }
+    for values in [&receipt.actual_imports, &receipt.actual_exports] {
+        for value in values {
+            bytes = bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+        }
+    }
+    let ceiling = u64::try_from(MAX_TYPED_RECEIPT_BYTES).unwrap_or(u64::MAX);
+    if bytes > ceiling {
+        return Err(TypedExecutionError::OutputViolation(
+            "receipt-bound".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Annotates a fail-closed cause with the stage the single call had actually
 /// reached. Nested annotation keeps the innermost stage.
 fn staged(stage: TypedStage, cause: TypedExecutionError) -> TypedExecutionError {
@@ -1042,6 +1146,7 @@ pub fn execute_describe_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
+    check_receipt_bounds(&receipt).map_err(|error| staged(TypedStage::Output, error))?;
     Ok((receipt, descriptor))
 }
 
@@ -2051,6 +2156,7 @@ pub fn execute_domain_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
+    check_receipt_bounds(&receipt).map_err(|error| staged(TypedStage::Output, error))?;
     Ok((receipt, result))
 }
 
@@ -2106,9 +2212,11 @@ fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
         TypedContractError::EngineUnknown => {
             TypedExecutionError::Engine("capsule-engine-unknown".to_owned())
         }
-        TypedContractError::InvalidKit(detail) => TypedExecutionError::AdmissionMismatch(detail),
+        TypedContractError::InvalidKit(detail) => {
+            TypedExecutionError::AdmissionMismatch(truncate_detail(&detail).to_owned())
+        }
         TypedContractError::InvalidCapsule(detail) => {
-            TypedExecutionError::AdmissionMismatch(detail)
+            TypedExecutionError::AdmissionMismatch(truncate_detail(&detail).to_owned())
         }
         TypedContractError::Serialization(_) => {
             TypedExecutionError::AdmissionMismatch("kit-digest".to_owned())
