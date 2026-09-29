@@ -124,6 +124,9 @@ impl AuthorityCeiling {
         }
     }
 
+    /// Test-only ceiling probe: production never mints a profile, so the only
+    /// callers are the unit tests below.
+    #[cfg(test)]
     fn allows_material(self) -> bool {
         matches!(self, Self::Material | Self::Critical)
     }
@@ -667,7 +670,11 @@ impl StartupCoordinator {
     /// dynamic Watchdog-coverage half is
     /// [`KernelComposition::admit_material_authority_for_fence`](super::KernelComposition::admit_material_authority_for_fence).
     /// This remains the startup-prerequisite and profile-ceiling check,
-    /// covered by the unit tests below.
+    /// covered by the unit tests below. Test-only: production
+    /// Material/Critical effects never mint a profile (see above), and the
+    /// removed `KernelComposition::admit_material_authority` was its last
+    /// production caller (#1935 AUD1).
+    #[cfg(test)]
     pub(crate) fn admit_material_authority(
         &self,
         profile: GovernanceProfile,
