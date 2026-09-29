@@ -4063,8 +4063,7 @@ impl SurrealStoreAdapter {
             retention: first.retention_domain.clone(),
         };
         let mut dispositions = Vec::with_capacity(recorded.len());
-        let mut dispositions_by_member: BTreeMap<String, MemberDisposition> =
-            BTreeMap::with_capacity(recorded.len());
+        let mut dispositions_by_member: BTreeMap<String, MemberDisposition> = BTreeMap::new();
         let mut evidence = Vec::with_capacity(recorded.len());
         for row in &recorded {
             // Only a claim that names a closed class, a record address *and* the
