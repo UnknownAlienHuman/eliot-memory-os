@@ -121,11 +121,7 @@ pub fn restore_reactive_runtime(
     let live_session = view.binding().session_id().as_str().to_owned();
     let live_scope = view.binding().task_binding().work_scope_id().to_owned();
     let live_task = view.binding().task_binding().task_id().as_str().to_owned();
-    let live_task_revision = view
-        .binding()
-        .task_binding()
-        .task_revision()
-        .to_owned();
+    let live_task_revision = view.binding().task_binding().task_revision().to_owned();
     let live_fence = live_state_fence(view.binding())?;
     // Live-binding self addresses: the bridge requests only its own session's
     // canonical attention/mailbox URIs, its own scope state, and its own task
