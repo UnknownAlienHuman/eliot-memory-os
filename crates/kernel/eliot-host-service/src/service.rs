@@ -638,7 +638,7 @@ where
                     )
                     .map_err(|_error| HostServiceError::InvalidField {
                         field: "dependency.foreign_occupant_directive",
-                        reason: "observed occupant evidence did not yield a complete directive",
+                        reason: "observed occupant evidence was not complete enough to classify",
                     })?;
                 return Err(HostServiceError::ForeignOccupant(directive));
             }

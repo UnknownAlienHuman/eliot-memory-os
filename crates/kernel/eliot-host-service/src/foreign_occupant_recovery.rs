@@ -403,7 +403,10 @@ impl ForeignOccupantRecoveryDirective {
                 ) => blocked.push(operation),
                 CollisionOperationDisposition::Refused(
                     CollisionRefusal::ReadOnlyAlternativeUnavailable { .. },
-                ) => {}
+                ) => {
+                    // A read-only class that is not a meaningful alternative for
+                    // the admitted operation belongs in neither set.
+                }
             }
         }
 
@@ -436,9 +439,9 @@ impl ForeignOccupantRecoveryDirective {
                 CollisionOperationDisposition::Permitted(operation)
             }
             CollisionOperationClass::ReadOnly(_) => {
-                CollisionOperationDisposition::Refused(CollisionRefusal::ReadOnlyAlternativeUnavailable {
-                    requested,
-                })
+                CollisionOperationDisposition::Refused(
+                    CollisionRefusal::ReadOnlyAlternativeUnavailable { requested },
+                )
             }
             CollisionOperationClass::Destructive(operation) => {
                 CollisionOperationDisposition::Refused(CollisionRefusal::OwnershipEvidenceMissing {
