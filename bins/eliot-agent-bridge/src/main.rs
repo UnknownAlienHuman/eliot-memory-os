@@ -13,7 +13,7 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
+    CoverageGap, DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
     RecoveryProjectionPage, ResourceHandle, SessionId,
 };
 use eliot_contracts::{
@@ -167,6 +167,14 @@ enum Request {
     },
     ForwardEvent {
         event: EventEnvelope,
+    },
+    /// Forwards one bounded, explicitly identified coverage gap to the Kernel.
+    ///
+    /// The typed gap identity and interval are validated by the existing
+    /// bridge forwarder; this request grants no event cursor or application
+    /// authority.
+    ForwardGap {
+        gap: CoverageGap,
     },
     /// Admits one caller-supplied reactive-context injection for the live
     /// session (I7.19 admit step over the live stdio intake).
@@ -877,6 +885,11 @@ fn main() {
                 provider_failure |= provider_failed;
                 response
             }
+            Ok(Request::ForwardGap { gap }) => {
+                let (response, provider_failed) = handle_forward_gap(&mut runner, &gap);
+                provider_failure |= provider_failed;
+                response
+            }
             Ok(Request::ReactiveAdmit {
                 cue,
                 firing,
@@ -1404,25 +1417,20 @@ fn forward_stage(error: &BridgeError) -> &'static str {
 /// Shapes one forward-dispatch failure with staged typed recovery.
 ///
 /// Keeps the exact [`bridge_error`] code mapping and fail-closed behavior;
-/// only the detail is sharpened to name the failing stage, the unadmitted
-/// event-delivery capability with its durable owner reference (the Kernel
-/// observation route, #77 req 4), and the pending-identity preservation.
-/// No ledger is built and no readiness is claimed: pending entries stay
-/// pending under their original identity, and no reconcile-then-retry loop
-/// is advertised because retry cannot succeed until the owner route admits
-/// this bridge.
+/// only the detail is sharpened to name the failing stage and preserve the
+/// original event or gap identity. A refusal does not report acceptance, and
+/// a successful transport result elsewhere never claims Governor
+/// normalization or application.
 fn forward_dispatch_error(error: &BridgeError) -> (Response, bool) {
     let provider_failed = is_provider_failure(error);
     let response = match bridge_error(error) {
         Response::Error { code, detail } => Response::Error {
             code,
             detail: format!(
-                "forward {} stage: {detail}; event delivery unavailable: no admitted Kernel \
-                observation/ORS event route (front door admits activation and host-request \
-                envelopes only); owner: Kernel observation route (#77 req 4 allocates the \
-                event-delivery/reconciliation child there); pending entries stay pending \
-                under their original stream, event, and sequence identity; retry cannot \
-                succeed until that route is admitted",
+                "forward {} stage: {detail}; the Kernel observation route refused this request \
+                or returned no admissible result; preserve the original event or gap identity \
+                and follow the typed owner recovery response before retrying; this bridge result \
+                does not claim Governor normalization or application",
                 forward_stage(error),
             ),
         },
@@ -1433,18 +1441,17 @@ fn forward_dispatch_error(error: &BridgeError) -> (Response, bool) {
 
 /// Shapes one reactive-receipt failure with staged typed recovery.
 ///
-/// The forward itself already succeeded at this point: only the per-item
-/// Delivery/Injection Receipt drain failed, so the code stays
-/// `REACTIVE_RECEIPT_REJECTED` while the detail names the receipt stage,
-/// the durable owner (the Kernel observation route, which this bridge holds
-/// unadmitted), and the reconcile path. No ledger is built and no readiness
-/// is claimed.
+/// The forwarding call returned before the per-item Delivery/Injection
+/// Receipt drain failed. This separate bridge-owned ledger failure neither
+/// changes nor upgrades the forwarding disposition; pending items retain
+/// their live-session identity for snapshot and reconciliation.
 fn forward_receipt_error(error: &BridgeError) -> Response {
     Response::Error {
         code: "REACTIVE_RECEIPT_REJECTED",
         detail: format!(
-            "reactive receipt stage: {error}; durable owner: Kernel observation route (not admitted); \
-            delivered items keep their live-session identity — reconcile explicitly, then retry the forward"
+            "reactive receipt stage: {error}; the forwarding result is unchanged and does not \
+            claim normalization or application; pending reactive items keep their live-session \
+            identity — export and reconcile the reactive ledger, then retry receipt delivery"
         ),
     }
 }
@@ -1504,6 +1511,22 @@ fn handle_forward_event(runner: &mut BridgeRunner, event: &EventEnvelope) -> (Re
                 Err(error) => (forward_receipt_error(&error), false),
             }
         }
+        Err(error) => forward_dispatch_error(&error),
+    }
+}
+
+/// Forwards one explicit coverage gap through the existing admitted Kernel
+/// observation route. Success reflects Kernel acceptance of the gap identity
+/// only; it does not claim Governor normalization or application.
+fn handle_forward_gap(runner: &mut BridgeRunner, gap: &CoverageGap) -> (Response, bool) {
+    match runner.forward_gap(gap) {
+        Ok(()) => (
+            Response::Forwarded {
+                bootstrap: None,
+                reactive_receipts: Vec::new(),
+            },
+            false,
+        ),
         Err(error) => forward_dispatch_error(&error),
     }
 }
@@ -2136,7 +2159,7 @@ fn status_response(
             activation_port: "not-attached",
             host_request_port: "no-session: attach and activate before host-request dispatch",
             kernel_binding_failure: None,
-            observation_forwarding_port: "unavailable: Kernel observation route not admitted",
+            observation_forwarding_port: "unavailable: attach and activate before forwarding coverage gaps",
             recovery: "attach and activate before host requests; attached Status and reconnect probe the live Kernel binding; a replacement connection requires a new admission".to_owned(),
             reactive: None,
             bootstrap: None,
@@ -2149,16 +2172,27 @@ fn status_response(
                     reason: "Kernel status client is unavailable".to_owned(),
                 }),
             };
-            let (host_request_port, kernel_binding_failure, recovery) = match probe {
+            let (
+                host_request_port,
+                kernel_binding_failure,
+                recovery,
+                observation_forwarding_port,
+            ) = match probe {
                 Ok(()) => (
                     "kernel-binding-current: live Kernel Health probe succeeded; session-bound dispatch joins the admitted Kernel session",
                     None,
                     "live Kernel binding confirmed; reconnect with the current connection, session, generation, epoch, and fence nonce; stale targets fail closed; a replacement connection requires a new admission".to_owned(),
+                    if view.reconciliation_required() {
+                        "reconciliation-required: ordinary event and gap forwarding remains gated until recovery completes"
+                    } else {
+                        "admitted: live Kernel binding and composed event/gap forwarder are ready; acceptance does not claim Governor normalization or application"
+                    },
                 ),
                 Err(error) => (
                     "kernel-binding-unknown: live Kernel Health probe failed; local attach facts are not currentness proof",
                     Some(error),
                     "Kernel binding is unknown; re-attach and activate to establish a new admission before relying on these local attach facts".to_owned(),
+                    "degraded: live Kernel binding could not be confirmed; forwarding availability is unknown",
                 ),
             };
             Response::Status {
@@ -2173,7 +2207,7 @@ fn status_response(
                 activation_port: "attached",
                 host_request_port,
                 kernel_binding_failure,
-                observation_forwarding_port: "unavailable: Kernel observation route not admitted",
+                observation_forwarding_port,
                 recovery,
                 reactive: Some(reactive_status_view(runner)),
                 bootstrap: None,
@@ -4555,6 +4589,7 @@ mod tests {
                         Request::DryRunCancel { .. } => "dry_run_cancel",
                         Request::ForwardHook { .. } => "forward_hook",
                         Request::ForwardEvent { .. } => "forward_event",
+                        Request::ForwardGap { .. } => "forward_gap",
                         Request::ReactiveAdmit { .. } => "reactive_admit",
                         Request::ReactiveRecordUse { .. } => "reactive_record_use",
                         Request::ReactiveRecordUseByHandle { .. } => {
