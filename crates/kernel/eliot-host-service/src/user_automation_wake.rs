@@ -529,7 +529,7 @@ fn horizon_wake_operation_identity(
 /// - `earliest_start`, `deadline`, and `expiry` name that same owner-normalized
 ///   occurrence. The accepted revision's normalized contract supplies exactly
 ///   one instant per occurrence, so this boundary derives no other time: a
-///   catch-up or deadline policy is not part of the contract being published
+///   `catch-up` or `deadline` policy is not part of the contract being published
 ///   and inventing one here would put a time in the journal that the revision
 ///   never normalized;
 /// - `required_capabilities` names the existing UserAutomation kernel
