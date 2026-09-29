@@ -83,3 +83,36 @@ pub fn classify_bridge_route_resume(
         ContinuityKind::Rehydrated
     }
 }
+
+/// Classifies a reconnect against the Governor-retained route definition (W4).
+///
+/// The `prior` fingerprint is the launch admission retained at attach; the
+/// live side is re-derived from the route definition the registry retains
+/// under the same `route_id` — the `derive_admission`
+/// (`route_registry.rs:1268`) pattern of comparing against the earlier
+/// retained receipt (`:1249-1252`) instead of recomputing over one
+/// constructor-fixed field pair. A revised retained definition — a
+/// local/managed adapter move, a service/interactive identity move, or a
+/// distinct account-mode move — diverges the fingerprints, so the resume
+/// classifies as an explicit
+/// [`ContinuityKind::Rehydrated`](eliot_protocol::ContinuityKind) new
+/// attempt — I10.5's "it becomes a `Rehydrated` attempt" — never silent
+/// continuity under the previous session identity. A retained definition
+/// identical to launch keeps native resume, which stays only the
+/// single-compatible-fingerprint optimization. When the registry retains no
+/// definition for the route, the live declaration itself is fingerprinted,
+/// preserving the launch-equality comparison without inventing retained
+/// content.
+#[must_use]
+pub fn classify_bridge_route_reconnect(
+    registry: &CapabilityRouteRegistry,
+    prior: &RouteBehaviorFingerprint,
+    route: &RuntimeRoute,
+    installation: &RouteInstallationIdentity,
+) -> ContinuityKind {
+    let next = match registry.route(&route.route_id) {
+        Some(retained) => RouteBehaviorFingerprint::of(retained, installation),
+        None => RouteBehaviorFingerprint::of(route, installation),
+    };
+    classify_bridge_route_resume(prior, &next)
+}
