@@ -51,7 +51,7 @@
 //!
 //! # There is no live-DB-file backup path (issue #1141, W4)
 //!
-//! I05-10 states the export "is independent of SurrealQL" and I05-13 states the
+//! I05-10 states the export "is independent of `SurrealQL`" and I05-13 states the
 //! ORS fence "is a logical Kernel export, not a copy of a live redb file".
 //! `crates/storage/AGENTS.md` carries the same rule: "Live DB file copying is
 //! not a supported backup contract."
@@ -392,20 +392,19 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
 /// The heads are looked up in maps built once, so the membership test is
 /// "does the owner declare this position" and not a search of a caller-chosen
 /// list.
-fn prove_coherent_boundary(
-    snapshot: &CoherentSourceExport,
-    request: &EcxfExportRequest,
-) -> Result<(), BackupError> {
-    if !snapshot.completeness.is_complete() {
-        return Err(BackupError::InconsistentBoundary);
-    }
-    // The owner-declared identities travel into `manifest.json`, so a blank or
-    // malformed one is refused at the boundary rather than by the interchange
-    // crate's own `text`/`digest` helpers further down. This is a shape
-    // requirement, not an authenticity proof: the authenticity obligation is
-    // the importer's, which checks the recorded values against what it holds.
+/// The owner-declared identities that travel into `manifest.json`, checked for
+/// shape at the export boundary rather than by the interchange crate's own
+/// `text`/`digest` helpers further down.
+///
+/// This is a shape requirement, not an authenticity proof: the authenticity
+/// obligation is the importer's, which checks the recorded values against what
+/// it holds.
+fn require_exported_identity_shape(snapshot: &CoherentSourceExport) -> Result<(), BackupError> {
     text(&snapshot.source_adapter, "ecxf.source_adapter")?;
-    text(&snapshot.source_adapter_version, "ecxf.source_adapter_version")?;
+    text(
+        &snapshot.source_adapter_version,
+        "ecxf.source_adapter_version",
+    )?;
     text(&snapshot.schema_generation, "ecxf.schema_generation")?;
     text(&snapshot.store_generation, "ecxf.store_generation")?;
     text(&snapshot.export_receipt, "ecxf.export_receipt")?;
@@ -417,6 +416,17 @@ fn prove_coherent_boundary(
         &snapshot.normative_pair_identity_receipt_digest,
         "ecxf.normative_pair_identity_receipt_digest",
     )?;
+    Ok(())
+}
+
+fn prove_coherent_boundary(
+    snapshot: &CoherentSourceExport,
+    request: &EcxfExportRequest,
+) -> Result<(), BackupError> {
+    if !snapshot.completeness.is_complete() {
+        return Err(BackupError::InconsistentBoundary);
+    }
+    require_exported_identity_shape(snapshot)?;
     if snapshot.scope_id.as_ref() != Some(&request.scope_id) {
         return Err(BackupError::FenceMismatch {
             subject: "export scope".to_owned(),
