@@ -60,11 +60,12 @@ use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoverySt
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecordedRevocationDisposition,
-    ScopeId, SecurityContext, TransitionClass, WriteReceipt, generated_operation_manifests,
-    operation_manifest_set_digest, parse_revocation_history_payload,
+    EffectClass, EventProjectionRelationIntents, InfluenceDependencyClosure, InfluenceState,
+    NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
+    ReadConsistency, RecordedRevocationDisposition, RevocationReason, ScopeId, SecurityContext,
+    TransitionClass, WriteReceipt, generated_operation_manifests, operation_manifest_set_digest,
+    parse_revocation_history_payload,
 };
 
 use crate::{
@@ -260,10 +261,199 @@ pub fn canonical_receipt_identity(
     Ok(envelope.identity.clone())
 }
 
+/// Extends one built revocation envelope with the coordinates the durable
+/// closure supplies and the seven-parameter record cannot carry.
+///
+/// The owner-approved `RecordAuthorityRevocation` parameter set is closed at
+/// seven fields, so the bounds, completeness, receipt, and reconciliation
+/// coordinates the record must bind travel through the two surfaces the
+/// canonical envelope already hash-binds and the store already compares for
+/// this exact operation: the typed
+/// [`InfluenceDependencyClosure`](eliot_store_api::InfluenceDependencyClosure)
+/// in `security`, and the `admission_contract_set_digest` over the same
+/// payload. Both are inside the envelope's canonical request view, so a replay
+/// of this operation that presents a different closure conflicts at the store
+/// instead of recording a second record under one identity.
+///
+/// Every coordinate is read from the ORIGINAL durable closure after that
+/// closure's own `validate()` accepted it. Nothing is recomputed from
+/// process-local state, defaulted, or invented:
+///
+/// * the typed closure repeats, field for field, what
+///   [`RecordedRevocation`](eliot_store_api::RecordedRevocation) serves on the
+///   read side — origin, affected set, terminal influence state, reason,
+///   durable revision, and the exact State Fence — so the recording and
+///   reading halves of this issue name the same closure the same way;
+/// * the digest additionally covers the closure's own canonical request
+///   digest, the Kernel-issued snapshot, authority epoch, transition receipt
+///   identity and committed disposition, the store-issued canonical
+///   reconciliation link (or its explicit absence while the second phase is
+///   still pending), the declaration's proof ceiling and its preserved
+///   alternate paths, and the bounded engine's traversal limits.
+///
+/// The traversal bounds are the crate's one admitted limit set
+/// ([`RevocationBounds::default_bounds`]), validated here through the type's
+/// own `validate()`. The durable closure receipt carries no per-closure bound
+/// field, so this binds the standing limit set the closure's complete-verdict
+/// gate runs under rather than a value supplied per closure.
+///
+/// Grouping them into one serializable shape keeps the shared canonical codec
+/// hashing field names rather than a positional tuple, and makes the bound set
+/// reviewable as a whole: the stable operation and idempotency identities, the
+/// closure's own canonical request digest, the origin and affected set, the
+/// snapshot/epoch/fence, the transition receipt and its committed disposition,
+/// the canonical reconciliation link, the proof ceilings with the preserved
+/// alternate paths, and the traversal bounds.
+#[derive(serde::Serialize)]
+struct DurableRevocationCoordinates<'a> {
+    operation_id: &'a str,
+    idempotency_key: &'a str,
+    closure_request_digest: &'a str,
+    origin_ref: &'a str,
+    closure_id: &'a str,
+    closure_revision: &'a str,
+    affected_digest: &'a str,
+    affected_count: &'a str,
+    invalidation_reason: &'a str,
+    fence_digest: &'a str,
+    snapshot_id: &'a str,
+    authority_epoch: &'a eliot_contracts::EpochId,
+    authority_receipt_id: &'a str,
+    authority_receipt_state: GrantClosureState,
+    canonical_receipt: Option<&'a ReceiptIdentity>,
+    proof_ceiling: eliot_receipts::ProofCeiling,
+    declaration_proof_ceiling: eliot_receipts::ProofCeiling,
+    preserved: &'a [eliot_receipts::GrantClosureAlternatePath],
+    bounds: &'a RevocationBounds,
+}
+
+/// Proves every owner-approved field the revocation record carries is the
+/// durable closure's own recorded value.
+///
+/// The record is bound to THIS closure, not merely to a closure that happens to
+/// name the same operation: each recorded field is compared against the
+/// closure it claims to bind, and the expected affected set is the durable
+/// declaration read back here rather than a second copy of a caller list. The
+/// ORIGINAL closure is validated through its own `validate()`; nothing is
+/// recomputed from process-local state.
+fn require_recorded_fields_bind_closure(
+    envelope: &CanonicalWriteEnvelope,
+    closure: &GrantClosureReceipt,
+) -> Result<(), CompositionError> {
+    closure
+        .validate()
+        .map_err(|error| owner_refused(format!("durable grant closure is invalid: {error}")))?;
+    if closure.state != GrantClosureState::Revoked
+        || closure.authority_receipt.state != GrantClosureState::Revoked
+    {
+        return Err(owner_refused(
+            "canonical revocation reconciliation requires a committed revoked closure".to_owned(),
+        ));
+    }
+    let command = envelope
+        .semantic_commands
+        .first()
+        .ok_or_else(|| owner_refused("revocation envelope carries no named command".to_owned()))?;
+    let recorded = |name: &str| -> Result<String, CompositionError> {
+        command
+            .parameters
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                owner_refused(format!(
+                    "revocation record carries no {name} binding parameter"
+                ))
+            })
+    };
+    let durable_affected = closure.declaration.affected_grants();
+    if recorded("origin_ref")? != closure.declaration.authority_root_ref
+        || recorded("closure_id")? != closure.operation_id
+        || recorded("closure_revision")? != closure.declaration.grant_graph_revision.to_string()
+        || recorded("affected_digest")? != canonical_digest(&durable_affected)?
+        || recorded("affected_count")? != durable_affected.len().to_string()
+        || recorded("fence_digest")? != canonical_digest(&closure.authority.state_fence)?
+    {
+        return Err(identity_refused(
+            "recorded revocation fields do not bind the durable closure they claim".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn bind_durable_closure_coordinates(
+    envelope: &mut CanonicalWriteEnvelope,
+    closure: &GrantClosureReceipt,
+) -> Result<(), CompositionError> {
+    require_recorded_fields_bind_closure(envelope, closure)?;
+    let bounds = RevocationBounds::default_bounds();
+    bounds.validate().map_err(|error| {
+        owner_refused(format!("revocation traversal bounds are invalid: {error}"))
+    })?;
+    // The typed closure repeats, field for field, what the recorded history row
+    // serves on the read side, so the recording and reading halves name the
+    // same closure the same way: origin, affected set, terminal influence
+    // state, reason, durable revision, and the exact State Fence.
+    let influence_closure = InfluenceDependencyClosure {
+        closure_id: closure.operation_id.clone(),
+        root_ref: closure.declaration.target_grant_id.clone(),
+        dependent_refs: closure.declaration.affected_grants(),
+        invalidation_reason: Some(RevocationReason::SourceRevoked),
+        current_influence: InfluenceState::Revoked,
+        state_fence: closure.authority.state_fence.clone(),
+        revision: closure.declaration.grant_graph_revision,
+    };
+    influence_closure.validate().map_err(|error| {
+        owner_refused(format!(
+            "durable revocation influence closure is invalid: {error}"
+        ))
+    })?;
+    if influence_closure.state_fence != envelope.request.state_fence {
+        return Err(identity_refused(
+            "durable closure fence disagrees with the recorded revocation request".to_owned(),
+        ));
+    }
+    let affected = closure.declaration.affected_grants();
+    let affected_digest = canonical_digest(&affected)?;
+    let fence_digest = canonical_digest(&closure.authority.state_fence)?;
+    let closure_revision = closure.declaration.grant_graph_revision.to_string();
+    let affected_count = affected.len().to_string();
+    envelope.admission_contract_set_digest = canonical_digest(&DurableRevocationCoordinates {
+        operation_id: envelope.operation_id.as_str(),
+        idempotency_key: envelope.idempotency_key.as_str(),
+        closure_request_digest: &closure.idempotency_digest,
+        origin_ref: &closure.declaration.authority_root_ref,
+        closure_id: &closure.operation_id,
+        closure_revision: &closure_revision,
+        affected_digest: &affected_digest,
+        affected_count: &affected_count,
+        invalidation_reason: AUTHORITY_REVOCATION_KERNEL_FIRST_REASON,
+        fence_digest: &fence_digest,
+        snapshot_id: &closure.authority_receipt.snapshot_id,
+        authority_epoch: &closure.authority_receipt.authority_epoch,
+        authority_receipt_id: &closure.authority_receipt.receipt_id,
+        authority_receipt_state: closure.authority_receipt.state,
+        canonical_receipt: closure.canonical_receipt.as_ref(),
+        proof_ceiling: closure.proof_ceiling,
+        declaration_proof_ceiling: closure.declaration.proof_ceiling,
+        preserved: &closure.declaration.preserved,
+        bounds: &bounds,
+    })?;
+    envelope.security.influence_closure = Some(influence_closure);
+    // The envelope was already valid once; the durable binding added fields to
+    // two hash-bound surfaces, so it is re-validated rather than trusted.
+    envelope.validate()?;
+    Ok(())
+}
+
 /// Builds the canonical second-phase revocation envelope from one already
 /// committed Kernel closure. Every value used for the affected-set digest,
 /// revision, root, and fence is read from the durable closure; no closure
-/// member, digest, or receipt is synthesized from process-local state.
+/// member, digest, or receipt is synthesized from process-local state. The
+/// durable closure additionally supplies the bounds, completeness, receipt,
+/// and reconciliation coordinates through
+/// [`bind_durable_closure_coordinates`], so the record carries every
+/// coordinate the replayability requirement names.
 pub fn authority_revocation_envelope_from_closure(
     identity: &RequestIdentity,
     canonical_operation_id: &OperationId,
@@ -287,7 +477,7 @@ pub fn authority_revocation_envelope_from_closure(
     let affected = closure.declaration.affected_grants();
     let affected_digest = canonical_digest(&affected)?;
     let fence_digest = canonical_digest(&closure.authority.state_fence)?;
-    authority_revocation_envelope(
+    let mut envelope = authority_revocation_envelope(
         identity,
         canonical_operation_id,
         &closure.declaration.authority_root_ref,
@@ -297,7 +487,9 @@ pub fn authority_revocation_envelope_from_closure(
         affected.len() as u64,
         AUTHORITY_REVOCATION_KERNEL_FIRST_REASON,
         &fence_digest,
-    )
+    )?;
+    bind_durable_closure_coordinates(&mut envelope, closure)?;
+    Ok(envelope)
 }
 
 /// Builds the typed `GetAuthorityRevocationHistory` named read for one
