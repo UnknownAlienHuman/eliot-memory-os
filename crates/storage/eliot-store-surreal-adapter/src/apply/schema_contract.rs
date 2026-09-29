@@ -122,9 +122,7 @@ pub(super) fn schema_meta_record_for_v1_to_v2(
 /// [`schema::MIGRATION_STATE_APPLIED`] over exactly these fields, so an
 /// `APPLYING` row read back afterwards means the DDL never committed and the
 /// recorded identity is the exact plan that was in flight.
-pub(super) fn migration_intent_record(
-    applied: &SchemaMetaRecord,
-) -> SchemaMetaRecord {
+pub(super) fn migration_intent_record(applied: &SchemaMetaRecord) -> SchemaMetaRecord {
     SchemaMetaRecord {
         generation: applied.generation.clone(),
         migrations: applied.migrations.clone(),
@@ -261,15 +259,13 @@ fn validate_schema_meta_record_in_state(
     Ok(())
 }
 
-/// Validates a durable migration intent against the exact plan that presented
-/// it, and reports whether the recorded plan is this one.
+/// Validates a durable migration intent against the exact plan presenting it.
 ///
 /// The identity is compared, not restated: a row whose recorded migration id,
-/// DDL bytes digest, target generation, bridge range or predecessor
-/// generation is any other plan's is refused rather than adopted, so a stale
-/// or foreign intent can never be completed by this migration. The successor
-/// record is the row read back from the provider, not a record rebuilt from
-/// the plan that asked for it.
+/// DDL bytes digest, target generation, bridge range or predecessor is any
+/// other plan's is refused rather than adopted, so a stale or foreign intent
+/// can never be completed by this migration. The row compared is the one read
+/// back from the provider, never a record rebuilt from the plan that asked.
 pub(super) fn validate_migration_intent_record(
     record: &SchemaMetaRecord,
     migration: &CompiledMigration,

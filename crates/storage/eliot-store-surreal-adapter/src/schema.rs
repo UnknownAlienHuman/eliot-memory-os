@@ -623,16 +623,16 @@ pub(crate) const TX_GUARD_SCHEMA_PREDECESSOR: &str = "LET $pre = (SELECT * FROM 
 
 pub(crate) const TX_UPDATE_SCHEMA_META_CAS: &str = "LET $schema_cas = (UPDATE type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record WHERE generation = $expected_generation AND migration_id = $expected_migration_id AND migration_checksum_sha256 = $expected_migration_checksum_sha256 AND compatible_bridge_range = $expected_bridge_range AND migration_state = $expected_migration_state AND array::len(migrations) = $expected_migrations_len AND migrations[0].migration_id = $expected_migration_0_id AND migrations[0].migration_checksum_sha256 = $expected_migration_0_checksum AND migrations[0].generation = $expected_migration_0_generation AND updated_at = $expected_updated_at RETURN AFTER); IF array::len($schema_cas ?? []) != 1 { THROW 'schema_predecessor_mismatch'; };";
 
-/// Durable state written over an applied `schema_meta` row by the operation
-/// that is about to run provider DDL, in its own committed transaction.
+/// Durable state written over the `schema_meta` row by the operation that is
+/// about to run provider DDL, in its own committed transaction.
 ///
-/// The intent keeps the predecessor generation and the applied migration
-/// history untouched and writes only the plan identity and the state, so the
-/// row proves after a crash exactly which plan was in flight. Because the DDL
-/// and the `APPLIED` metadata write share one transaction (see
+/// The intent row carries the target generation, the target migration
+/// identity, the complete migration history and the same `updated_at` stamp
+/// the migration would commit, differing from the applied record only in the
+/// state, so after a crash the row names exactly which plan was in flight.
+/// Because the DDL and the `APPLIED` metadata write share one transaction (see
 /// [`forward_migration_sql`]), an `APPLYING` row is proof that the DDL did
-/// not commit, and the recorded identity is the exact operation a retry must
-/// reconcile. The compare-and-set is the same predecessor guard the forward
+/// not commit. The compare-and-set is the same predecessor guard the forward
 /// transaction uses, so the intent is owned by that one row and one state
 /// fence, and re-recording it for the same plan is an exact replay.
 pub(crate) const TX_MARK_SCHEMA_MIGRATION_INTENT: &str = "LET $schema_intent = (UPDATE type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_intent_record WHERE generation = $expected_generation AND migration_id = $expected_migration_id AND migration_checksum_sha256 = $expected_migration_checksum_sha256 AND compatible_bridge_range = $expected_bridge_range AND migration_state = $expected_migration_state AND array::len(migrations) = $expected_migrations_len AND migrations[0].migration_id = $expected_migration_0_id AND migrations[0].migration_checksum_sha256 = $expected_migration_0_checksum AND migrations[0].generation = $expected_migration_0_generation AND updated_at = $expected_updated_at RETURN AFTER); IF array::len($schema_intent ?? []) != 1 { THROW 'schema_predecessor_mismatch'; };";
