@@ -24,7 +24,9 @@
 //! the request, so pressure evidence is never manufactured.
 //!
 //! This module has no production caller yet (STITCH): it publishes the owner
-//! evidence the Kernel profile composition will join. There is no emergency
+//! evidence the Kernel profile composition joins via
+//! [`OrsReserve::publish_owner_rows`] and the kernel-core
+//! `join_ors_owner_evidence` composition step. There is no emergency
 //! partition here; recording reserve loss stays with the front-door
 //! last-resort slot until a later wave wires ORS-side loss reporting.
 //! DISCLOSED LIMIT: `profile_revision` on the responses is caller-supplied
@@ -39,12 +41,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eliot_contracts::{ArtifactId, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
-    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
-    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
-    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
-    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
+    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
+    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
+    NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -120,6 +123,33 @@ impl OrsDimension {
             Self::DurableQueueBytes => ORS_DURABLE_BYTES_BOTTLENECK,
         }
     }
+}
+
+/// Composition-resolved reference strings the ORS owner binds into its
+/// published capacity rows but cannot observe itself.
+///
+/// The owner supplies every quantity in the row from the live reserve: the
+/// frozen bottleneck and unit, the disjoint normal/protected partition limits
+/// and their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+/// mechanism those partitions are held under. The composition supplies the
+/// references that identify the observation: its own owner-generation
+/// reference for the ORS owner, the independent proof-profile reference, and
+/// the current evidence and invalidation references. Both halves are required:
+/// [`OrsReserve::publish_owner_rows`] fails closed through the existing
+/// [`BottleneckCapacityProfile::validate`] when any reference is missing or
+/// non-canonical, so the composition must resolve canonical (strictly
+/// ascending, duplicate-free) reference sets rather than have them defaulted
+/// or sorted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrsOwnerEvidenceContext {
+    /// Owner generation/revision reference for the Kernel ORS owner.
+    pub owner_generation_ref: String,
+    /// Independent proof-profile reference produced for the ORS dimensions.
+    pub proof_profile_ref: String,
+    /// Current owner evidence references supporting the published rows.
+    pub evidence_refs: Vec<String>,
+    /// Exact invalidation set of the published rows.
+    pub invalidation_set: Vec<String>,
 }
 
 /// Typed operation identity carried by every [`OrsPermit`].
@@ -692,6 +722,123 @@ impl OrsReserve {
             RecoveryCommitStatus::None,
         )
     }
+
+    /// Publishes the two owner-produced capacity rows for the frozen ORS
+    /// dimensions: transaction slots and durable queue bytes.
+    ///
+    /// Every quantity is read from this reserve: the frozen bottleneck and
+    /// unit, the configured disjoint normal/protected partition limits and
+    /// their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+    /// mechanism those partitions are held under. The published limits are the
+    /// configured partition capacities, not the currently available remainder:
+    /// availability moves as permits are acquired and released, while the
+    /// guarantee the profile records is the partition itself. No emergency
+    /// partition is claimed here because the ORS owner holds none; the
+    /// preallocated last-resort slot stays with the Kernel front-door owner.
+    /// The composition-resolved references come from `ctx` unchanged.
+    ///
+    /// Each row is checked by the existing
+    /// [`BottleneckCapacityProfile::validate`] before it is returned, so a
+    /// missing owner, generation, physical total, protected partition,
+    /// enforcement, proof, evidence or invalidation reference fails here
+    /// rather than publishing a row the Kernel composition would have to
+    /// lower to `UNKNOWN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsReserveError::Contract`] when the frozen owner map binds
+    /// no owner to an ORS dimension, when the configured partition capacities
+    /// cannot form a positive physical total, or when either assembled row
+    /// fails the existing contract validation.
+    pub fn publish_owner_rows(
+        &self,
+        ctx: &OrsOwnerEvidenceContext,
+    ) -> Result<[BottleneckCapacityProfile; 2], OrsReserveError> {
+        let transaction = owner_capacity_row(
+            ORS_TRANSACTION_BOTTLENECK,
+            self.inner.transaction_normal_capacity,
+            self.inner.transaction_protected_capacity,
+            ctx,
+        )?;
+        let durable = owner_capacity_row(
+            ORS_DURABLE_BYTES_BOTTLENECK,
+            self.inner.durable_normal_capacity_bytes,
+            self.inner.durable_protected_capacity_bytes,
+            ctx,
+        )?;
+        Ok([transaction, durable])
+    }
+}
+
+/// Builds one claimed owner row for an ORS dimension from the reserve's
+/// configured partition capacities and the composition-resolved references.
+///
+/// The owner reference is read from the frozen owner map, never restated here;
+/// the unit is the bottleneck's own declared unit. The physical total is
+/// exactly the sum of the two disjoint partitions, so the existing partition
+/// accounting check always bounds them. A zero partition capacity or a missing
+/// frozen owner fails closed: the reserve constructor already refuses zero
+/// partitions, and a dimension without a frozen owner has no claim to publish.
+fn owner_capacity_row(
+    bottleneck: CapacityBottleneck,
+    normal_capacity: u64,
+    protected_capacity: u64,
+    ctx: &OrsOwnerEvidenceContext,
+) -> Result<BottleneckCapacityProfile, OrsReserveError> {
+    let owner = frozen_bottleneck_owner_map()
+        .into_iter()
+        .find(|bound| bound.bottleneck == bottleneck)
+        .map(|bound| bound.owner)
+        .ok_or_else(|| {
+            OrsReserveError::Contract(format!(
+                "frozen owner map binds no owner to {bottleneck:?}; no ORS row to publish"
+            ))
+        })?;
+    let unit = bottleneck.unit();
+    let limit = |field: &'static str, amount: u64| {
+        NonZeroU64::new(amount)
+            .map(|quantity| CapacityLimit { unit, quantity })
+            .ok_or(OrsReserveError::InvalidField {
+                field,
+                reason: "partition capacity must be greater than zero",
+            })
+    };
+    let normal_limit = limit("ors_reserve.normal_limit", normal_capacity)?;
+    let protected_limit = limit("ors_reserve.protected_limit", protected_capacity)?;
+    let physical_total = normal_capacity
+        .checked_add(protected_capacity)
+        .ok_or(OrsReserveError::InvalidField {
+            field: "ors_reserve.physical_total_limit",
+            reason: "disjoint partition capacities overflow the physical total",
+        })?;
+    let physical_total_limit = NonZeroU64::new(physical_total).ok_or(
+        OrsReserveError::InvalidField {
+            field: "ors_reserve.physical_total_limit",
+            reason: "physical total must be greater than zero",
+        },
+    )?;
+    let row = BottleneckCapacityProfile {
+        bottleneck,
+        coverage_state: BottleneckCoverageState::Claimed,
+        owner_ref: owner.to_owned(),
+        owner_generation_ref: ctx.owner_generation_ref.clone(),
+        unit,
+        physical_total_limit: Some(CapacityLimit {
+            unit,
+            quantity: physical_total_limit,
+        }),
+        normal_work_applicable: true,
+        normal_limit: Some(normal_limit),
+        protected_limit: Some(protected_limit),
+        emergency_limit: None,
+        enforcement: Some(CapacityEnforcement::PhysicalPartition),
+        proof_profile_ref: ctx.proof_profile_ref.clone(),
+        evidence_refs: ctx.evidence_refs.clone(),
+        invalidation_set: ctx.invalidation_set.clone(),
+    };
+    row.validate()
+        .map_err(|error| OrsReserveError::Contract(error.to_string()))?;
+    Ok(row)
 }
 
 /// Exact parts of one ORS rejection directive shared by every constructor.
