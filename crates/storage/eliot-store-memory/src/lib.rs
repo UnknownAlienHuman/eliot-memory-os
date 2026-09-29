@@ -993,7 +993,16 @@ fn dispatch_apply_automation_state(
         return Err(StoreError::TransitionClassExceeded);
     }
     let operation_key = transition.identity.operation_id.to_string();
-    let mut dispatch = AutomationDispatch::new(state, transition);
+    // The dispatch OWNS its provenance: the fence, scope, task and source
+    // operation are copied off the transition here, once, and the dispatch
+    // borrows only the locked state from here on.
+    let mut dispatch = AutomationDispatch::new(
+        state,
+        transition.state_fence.clone(),
+        transition.scope_id.to_string(),
+        transition.task_id.clone(),
+        transition.identity.operation_id.to_string(),
+    );
     let mut automation_index = 0_usize;
     for command in &transition.named_operations {
         let decoded = match command.operation {
@@ -1036,6 +1045,16 @@ fn dispatch_apply_automation_state(
 /// so a leg body is only the mutation it applies and cannot stamp a row with
 /// provenance that differs from its neighbour's. `source_operation_id` is the
 /// first-writer identity the immutable failure row records.
+///
+/// The provenance is OWNED, not borrowed: the only reference this type carries
+/// is the locked state. A dispatch that borrowed its transition would have two
+/// lifetimes to reconcile at construction — the mutable borrow it hands back
+/// and the transition it reads — and the compiler would have to pick which one
+/// the returned value lives as long as. Owning the provenance removes the
+/// question instead of answering it, and it is the honest shape: the row bytes
+/// are written into state that outlives this dispatch, so the provenance they
+/// carry must outlive it too rather than being a view of something the caller
+/// may still be holding.
 struct AutomationDispatch<'a> {
     state: &'a mut MemoryState,
     state_fence: StateFence,
@@ -1044,15 +1063,25 @@ struct AutomationDispatch<'a> {
     source_operation_id: String,
 }
 
-impl AutomationDispatch<'_> {
+impl<'a> AutomationDispatch<'a> {
     /// Binds the locked state to the one transition this dispatch writes under.
-    fn new(state: &mut MemoryState, transition: &PreparedTransition) -> Self {
+    ///
+    /// The four provenance values are taken by value, so `transition` is
+    /// read here and never referenced again; the returned dispatch's single
+    /// lifetime is the borrow of `state`.
+    fn new(
+        state: &'a mut MemoryState,
+        state_fence: StateFence,
+        scope_id: String,
+        task_id: Option<String>,
+        source_operation_id: String,
+    ) -> Self {
         Self {
             state,
-            state_fence: transition.state_fence.clone(),
-            scope_id: transition.scope_id.to_string(),
-            task_id: transition.task_id.clone(),
-            source_operation_id: transition.identity.operation_id.to_string(),
+            state_fence,
+            scope_id,
+            task_id,
+            source_operation_id,
         }
     }
 
