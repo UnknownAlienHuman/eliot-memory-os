@@ -20,16 +20,35 @@ use eliot_receipts::{
 use super::host_request_route::LocalReadAdmission;
 
 /// Route fingerprint for tool calls admitted through the local-read boundary.
-fn route_fingerprint(envelope: &eliot_protocol::HostRequestEnvelope) -> String {
+///
+/// The fingerprint joins the authenticated envelope session, authority epoch,
+/// and resource generation with the admitted campaign task identity when the
+/// accepted method carries one. A campaign packet re-requested under a new
+/// task revision is new work, not a material repeat, while the same packet
+/// under the same task revision keeps its repeat identity. The task identity
+/// comes from the accepted [`LocalReadAdmission`] — never caller tool text —
+/// so the repeat join stays admission-derived exactly like the call class.
+fn route_fingerprint(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    admission: &LocalReadAdmission,
+) -> String {
     let session = envelope
         .identity
         .session_id
         .as_deref()
         .unwrap_or("unknown-session");
-    format!(
+    let base = format!(
         "{}:{:?}:{:?}",
         session, envelope.state_fence.authority_epoch, envelope.state_fence.resource_generation
-    )
+    );
+    match admission {
+        LocalReadAdmission::CampaignPacket {
+            task_id,
+            task_revision,
+            ..
+        } => format!("{base}:packet:{task_id}:{task_revision}"),
+        LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => base,
+    }
 }
 
 /// Derives the tool call class from the accepted Kernel admission.
@@ -75,8 +94,10 @@ fn inputs_digest(tool: &serde_json::Value) -> Result<String, serde_json::Error> 
 ///
 /// The cost/effect class derives from `admission` — the accepted method —
 /// never from the caller-supplied name string. The versioned tool definition
-/// identity still names the invoked tool; classification does not. The
-/// inputs digest covers the effective call inputs with the caller-declared
+/// identity still names the invoked tool; classification does not. The route
+/// fingerprint likewise joins the admitted campaign task identity for packet
+/// methods, so a new task revision is new work rather than a material repeat.
+/// The inputs digest covers the effective call inputs with the caller-declared
 /// `intent` block stripped, so a reworded `expected_delta` keeps the repeat
 /// identity and meets the evidence-bound comparison instead of hashing as
 /// fresh inputs.
@@ -92,7 +113,7 @@ pub(crate) fn build_tool_call_request(
     let digest = inputs_digest(tool).ok()?;
     Some(ToolCallRequest {
         tool_definition: name,
-        route_fingerprint: route_fingerprint(envelope),
+        route_fingerprint: route_fingerprint(envelope, admission),
         call_class: class,
         inputs_digest: digest,
         intent: Some(intent),
