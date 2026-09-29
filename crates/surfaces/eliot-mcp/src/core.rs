@@ -2356,14 +2356,15 @@ pub fn tools_list_result() -> Result<Value, WireRejection> {
     tools_list_result_for_permitted_surface(&surface)
 }
 
-/// Builds a task-relative `tools/list` result from a #1745 permitted subset.
+/// Projects a #1745 permitted subset onto the advertised `tools/list` shape.
 ///
 /// This entry is the single funnel for every advertised listing: discovery
-/// arrives with the owner-joined descriptors and an empty withheld set,
-/// while task-bound publication arrives already derived from a decision
-/// compiled over owner-supplied task conditions. Both project through the
-/// same envelopes, identity `_meta`, dialect record, and budget binding,
-/// so withheld methods stay absent without a second projection.
+/// arrives already derived from the owner-joined published surface through
+/// #1745's admitted subset over a no-task decision, while task-bound
+/// publication arrives already derived from a decision compiled over
+/// owner-supplied task conditions. Both project through the same envelopes,
+/// identity `_meta`, dialect record, and budget binding, so withheld methods
+/// stay absent without a second projection.
 pub fn tools_list_result_for_permitted_surface(
     surface: &PermittedTaskSurface,
 ) -> Result<Value, WireRejection> {
