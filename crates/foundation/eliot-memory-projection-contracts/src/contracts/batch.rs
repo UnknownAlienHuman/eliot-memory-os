@@ -217,13 +217,18 @@ impl MemoryProjectionBatch {
         // is unclaimed completeness, not evidence of it, so it is refused here
         // rather than discovered later by whichever consumer happens to look.
         //
-        // This is deliberately stricter than the r6 freeze note at
+        // This was deliberately stricter than the r7 freeze note at
         // `cognitive-rev12-contract-schema-freeze.toml` ("Known{total} must
-        // cover projected plus omitted volume"), which states a lower bound
-        // and never mentions the frontier. That note under-specifies the rule;
-        // it does not grant the remainder. The freeze is a published wave
-        // revision under a recorded digest, so reconciling the wording is the
-        // owner's revision decision and is escalated, not edited here.
+        // cover projected plus omitted volume"), which stated a lower bound
+        // and never mentioned the frontier, so that note alone was not proof of
+        // completeness. It did not grant the remainder either. That divergence
+        // is now reconciled rather than left standing: freeze revision r8
+        // states this exact disjoint three-way accounting in the
+        // `ProjectionCoverage` denominator_note, and the freeze's own
+        // [readback] rule required a new candidate rather than an in-place
+        // byte edit, so the r7 digest is superseded and every verdict bound to
+        // it is invalidated. The rule below and the frozen note are one rule
+        // again, at the same revision boundary.
         for omission in &self.coverage.omissions {
             if !seen.insert(omission.handle.as_str().to_owned()) {
                 return Err(MemoryProjectionError::Duplicate {
