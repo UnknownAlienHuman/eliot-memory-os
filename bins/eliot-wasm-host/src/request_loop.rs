@@ -67,12 +67,13 @@
 //! - **Execution evidence** is the projected result event sequence; the
 //!   uncertain `Unknown` event and the later containment/reconciliation
 //!   event are separate retained observations, never one rewritten record.
-//!   Each names the command that produced it — the #2785 handover token
-//!   carried as `command_sequence` — so a consumer orders events by the
-//!   command, not by when the loop happened to observe it, and a control
-//!   event admitted from an owner delivery names that exact delivery and the
-//!   acknowledgement the child staged for it (#2786), never an order or an
-//!   identity inferred from arrival.
+//!   Each names the command that produced it — the process-local handover
+//!   correlation token carried as `command_sequence` — so within one
+//!   recorded stream a consumer can tell which handover each event came
+//!   from, using the retained `sequence`/`observation_predecessors` order for
+//!   the order itself, and a control event admitted from an owner delivery
+//!   names that exact delivery and the acknowledgement the child staged for
+//!   it (#2786), never an order or an identity inferred from arrival.
 //! - **Cleanup evidence** is this loop's own termination record: whether
 //!   the tracked worker was asked to stop, whether its Shutdown reply
 //!   arrived, and whether the thread was actually joined. A clean stop is
@@ -178,18 +179,19 @@ pub const WASM_HOST_RESULT_WIRE_ID: &str = "eliot.wasm.host-result";
 /// version 1. Consumers must reject every other version. (Prior emissions
 /// carried the request constant by defect.)
 ///
-/// Version 3 adds the two exact coordination identities this family was
-/// missing: the observed worker command's own command sequence
-/// ([`WasmHostResultFrame::command_sequence`], issue #2787 S3.5, coordinate
-/// with #2785) and the owner's exact control delivery identity plus the
-/// acknowledgement phase the child actually staged for it
+/// Version 3 adds the two exact coordination facts this family was
+/// missing: the process-local handover correlation token of the observed
+/// worker command ([`WasmHostResultFrame::command_sequence`], issue #2787
+/// S3.5, coordinate with #2785) and the owner's exact control delivery
+/// identity plus the acknowledgement the child actually staged for it
 /// ([`WasmHostResultFrame::delivery_ack`], issue #2787 S6.2, #2786's exact
 /// delivery identity/acknowledgement). Before this version both fields did
-/// not exist, so an event's position in the stream was the arrival order of
-/// the loop's own counter and a control event named no delivery it answered.
-/// An external consumer of version 2 must be migrated: the producer no
-/// longer emits it, and every other version is rejected by
-/// [`validate_frame`].
+/// not exist, so an event named no handover it came from and a control event
+/// named no delivery it answered. The token is a process counter, not an
+/// owner-issued identity: it is valid inside the recorded stream that carries
+/// it and is never compared across processes. An external consumer of
+/// version 2 must be migrated: the producer no longer emits it, and every
+/// other version is rejected by [`validate_frame`].
 pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 3;
 /// Closed observation phase: the frame observes guest execution.
 pub const RESULT_PHASE_EXECUTE: &str = "execute";
@@ -262,6 +264,13 @@ const OUTPUT_DEADLINE: Duration = Duration::from_secs(5);
 /// was handed over rather than only its kind, and so a stale token from
 /// another operation in this process can never settle this one. It is
 /// bookkeeping, not an operation authority.
+///
+/// It is a process `static` starting at 1, so a value it mints is comparable
+/// only with another value minted by this process without a restart. It is
+/// not owner-issued, not durable, and not a command identity any owner ever
+/// issued. The order of one operation's observations is not this counter: it
+/// is `sequence` with its complete `observation_predecessors` prefix in the
+/// retained record (#2787 S3.5), which is written to disk and replayed.
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Fixed field name for the loop's own Execute command, used by the
@@ -830,13 +839,17 @@ pub struct ControlDeliveryAcknowledgement {
 /// - a publication failure surfaces through the loop error and the retained
 ///   observation, never as an ad hoc fallback object.
 ///
-/// Every event additionally names the coordination identity of the command
-/// that produced it ([`command_sequence`](Self::command_sequence), the #2785
-/// handover token) and, for a control event admitted from an owner delivery,
-/// the exact delivery it answers and the acknowledgement the child staged
-/// for it ([`delivery_ack`](Self::delivery_ack), #2786). A consumer orders
-/// events by the command that produced them, never by arrival, and joins a
-/// control event to the exact owner spool slot it belongs to.
+/// Every event additionally names the process-local handover correlation
+/// token of the command that produced it
+/// ([`command_sequence`](Self::command_sequence)) and, for a control event
+/// admitted from an owner delivery, the exact delivery it answers and the
+/// acknowledgement the child staged for it
+/// ([`delivery_ack`](Self::delivery_ack), #2786). The token distinguishes
+/// which handover each event came from within one recorded stream; the order
+/// itself is `sequence` with its complete `observation_predecessors` prefix,
+/// which is durable. The token is not an owner-issued identity and is never
+/// compared across processes, while `delivery_ack` joins a control event to
+/// the exact owner spool slot it belongs to.
 ///
 /// Consumers must reject mixed versions, duplicate terminal events, sequence
 /// gaps, contradictory command sequences, and contradictory identities. That
@@ -875,18 +888,32 @@ pub struct WasmHostResultFrame {
     /// this event. The first event has no predecessors; each follow-up names
     /// every retained event before it, bounded by `sequence`.
     pub observation_predecessors: Vec<u64>,
-    /// The observed worker command's OWN command sequence (#2787 S3.5,
-    /// coordinated with #2785) — the `COMMAND_SEQUENCE` correlation token
-    /// this loop stamped on the accepted command handover.
+    /// The handover correlation token of the worker command whose reply this
+    /// event observes (#2787 S3.5) — the `COMMAND_SEQUENCE` value this loop
+    /// stamped on that one accepted command.
     ///
-    /// This is the ordering evidence the issue requires and `sequence` is
-    /// not: `sequence` is the loop's own arrival counter over retained
-    /// observations, while this token is assigned by the single command
-    /// handover that produced the observed reply. The two are independent —
-    /// a control follow-up can be requested only after the slot that carried
-    /// the previous token was retired — so a consumer can order events by the
-    /// command that produced them rather than by when they happened to be
-    /// observed, and two events of one operation can never share a token.
+    /// What it is: the process-local number of that single command handover,
+    /// read from the accepted command slot while the slot still holds that
+    /// command. The bound-1 worker slot means two observations of one
+    /// operation can never name the same token, so within a recorded stream
+    /// it distinguishes which handover each event came from.
+    ///
+    /// What it is not, and what no code here enforces: it is not
+    /// owner-issued, not durable, and not comparable across processes or
+    /// across a restart of this one, because it is a process counter rather
+    /// than an identity. It therefore does not order events by a command
+    /// identity the owner issued, and it must not be compared with a token
+    /// from another process or another run. The retained order of one
+    /// operation's observations is `sequence` together with the complete
+    /// `observation_predecessors` prefix, both of which live in the durable
+    /// retained record. This token adds one more within-stream fact — which
+    /// handover produced the event — and is checked only for that internal
+    /// consistency (`validate_command_coordination` for its presence
+    /// pairing, [`validate_result_stream`] for strict increase within the
+    /// stream). A control event's owner-issued delivery identity travels
+    /// separately in [`delivery_ack`](Self::delivery_ack); where the owner
+    /// did issue a sequence for a command, that is the field that carries it,
+    /// not this one.
     ///
     /// `None` for a frame that refuses before any worker command ran: there
     /// was no handover, so there is no command sequence to report and none is
@@ -1191,15 +1218,17 @@ fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), 
 /// a command must carry the token and an event that observed none must not.
 /// A frame claiming the handover of a command it also says never ran is a
 /// contradiction. No value is refused beyond that pairing: the token is the
-/// producer's own [`COMMAND_SEQUENCE`] handover number, and judging its
-/// magnitude would be a policy this contract does not own.
+/// producer's own process-local [`COMMAND_SEQUENCE`] handover number, so
+/// there is nothing about it to judge — it is not owner-issued, and judging
+/// its magnitude or comparing it to another producer's would be a policy this
+/// contract does not own.
 fn validate_command_coordination(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
     match (
         frame.worker_command.is_some(),
         frame.command_sequence.is_some(),
     ) {
         // Observed command with no token: the producer must report the
-        // handover it stamped, never leave the ordering evidence absent.
+        // handover it stamped, never leave that correlation absent.
         (true, false) | (false, true) => Err(invalid("command-sequence")),
         (true, true) | (false, false) => Ok(()),
     }
@@ -1463,13 +1492,16 @@ pub fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), Loop
         if event.sequence != expected {
             return Err(invalid("sequence-gap"));
         }
-        // Command order (#2787 S3.5): each observation's handover token must
-        // be strictly greater than its predecessor's. The bound-1 command
-        // slot means two observations can never share one handover, and the
-        // loop can only request a follow-up after the previous slot was
-        // retired, so a repeat or a step backwards is a contradiction a
-        // consumer must reject rather than reorder. The check is against the
-        // ORIGINAL recorded values, not against arrival position.
+        // Handover order within this one stream (#2787 S3.5): each
+        // observation's handover token must be strictly greater than its
+        // predecessor's. The bound-1 command slot means two observations can
+        // never share one handover, and the loop can only request a
+        // follow-up after the previous slot was retired, so a repeat or a
+        // step backwards is a contradiction a consumer must reject rather
+        // than reorder. This compares the ORIGINAL recorded values, and
+        // because the token is a process-local counter, it holds only over
+        // this stream — the recorded `sequence` is what orders events, and
+        // the owner-issued identity of a control command is `delivery_ack`.
         if let Some(token) = event.command_sequence
             && previous_command.is_some_and(|previous| token <= previous)
         {
@@ -3099,14 +3131,14 @@ fn command_name(command: WorkerCommand) -> &'static str {
     }
 }
 
-/// The exact coordination identity of one command the worker accepted
+/// The coordination facts of one command the worker accepted
 /// (#2787 S3.5/S6.2).
 ///
 /// `CommandDelivery::Accepted` already holds the #2785 handover token, and
 /// the channel reader holds #2786's exact owner delivery identity for the
 /// command it enqueued from one. This pairs the two so a result event reports
-/// the command that PRODUCED it, instead of inferring its position from when
-/// the loop happened to observe it.
+/// the handover it came from, instead of leaving that implicit, alongside the
+/// owner delivery it answers.
 ///
 /// It is read while the accepted slot still holds that command and is never
 /// reconstructed afterwards: an event whose handover token is not held here
@@ -3783,13 +3815,16 @@ impl BoundedRequestLoop {
     /// The #2785 handover correlation token of the accepted command, or `None`
     /// when no command is outstanding.
     ///
-    /// This is the ordering evidence a result event carries as
+    /// This is the correlation a result event carries as
     /// [`WasmHostResultFrame::command_sequence`]: it is stamped by
     /// [`Self::send`] on the one command handover the worker received, so two
-    /// observations of one operation can never name the same token, and a
-    /// consumer orders events by the command that produced them rather than
-    /// by arrival. It is read while the accepted slot still holds that
-    /// command, and never guessed afterwards.
+    /// observations of one operation can never name the same token and a
+    /// consumer can tell which handover produced which event inside the
+    /// recorded stream. It is that process counter, nothing more — it
+    /// orders nothing by itself, it is not owner-issued, and it is never
+    /// compared outside the stream that recorded it. It is read while the
+    /// accepted slot still holds that command, and never guessed
+    /// afterwards.
     fn accepted_command_sequence(&self) -> Option<u64> {
         match self.delivery {
             Some(CommandDelivery::Accepted { token, .. }) => Some(token),
@@ -3808,11 +3843,11 @@ impl BoundedRequestLoop {
     /// either way the original operation identity is retained for the
     /// owner-side reconciliation record rather than reissued.
     ///
-    /// `identity` is the coordination identity of the command whose reply
-    /// this is (#2787 S3.5/S6.2). The caller reads it from the accepted
-    /// command slot BEFORE that slot is retired here, so the event carries
-    /// the handover token of the command that produced it and the exact
-    /// owner delivery it answers — never an order inferred from arrival, and
+    /// `identity` is the coordination facts of the command whose reply this
+    /// is (#2787 S3.5/S6.2). The caller reads it from the accepted command
+    /// slot BEFORE that slot is retired here, so the event carries the
+    /// handover correlation of the command that produced it and the exact
+    /// owner delivery it answers — never a value inferred from arrival, and
     /// never a delivery identity the command did not come from.
     fn on_outcome(
         &mut self,
@@ -3863,9 +3898,9 @@ impl BoundedRequestLoop {
             .flatten()
             .map(|previous| previous.sequence)
             .collect();
-        // The event's own coordination identity, read from the accepted
-        // command that produced it (#2787 S3.5/S6.2). It is applied before
-        // the budget check so an identity ever larger than the frame budget
+        // The event's own coordination facts, read from the accepted command
+        // that produced it (#2787 S3.5/S6.2). It is applied before the
+        // budget check so an identity ever larger than the frame budget
         // is caught by the same omission rule as any other field, and before
         // the event joins the retained sequence so the durable record carries
         // it too.
@@ -4058,7 +4093,7 @@ impl BoundedRequestLoop {
             .flatten()
             .map(|previous| previous.sequence)
             .collect();
-        // The lost command's own coordination identity (#2787 S3.5/S6.2),
+        // The lost command's own coordination facts (#2787 S3.5/S6.2),
         // read from the accepted slot that still holds it: the loss is
         // attributed to the exact command whose reply never arrived, not to
         // the operation as a whole. A `Shutdown` loss projects the demand
@@ -5124,7 +5159,7 @@ fn consume_worker_outcome(
     // before the accepted slot is retired, because only an owner-sourced
     // command may be completed against one (issue #2896 A2/A3).
     let owner = state.accepted_owner_delivery();
-    // The command's coordination identity (#2787 S3.5/S6.2), read from the
+    // The command's coordination facts (#2787 S3.5/S6.2), read from the
     // accepted slot while it still holds that command and before the slot is
     // retired below. An owner-sourced command names the exact delivery the
     // channel reader holds for it, with the acknowledgement phase the reader
@@ -5325,7 +5360,7 @@ fn observe_residual_outcome(
         state.record_residual(denied("uncorrelated-outcome"));
         return;
     }
-    // The command's coordination identity (#2787 S3.5/S6.2), read from the
+    // The command's coordination facts (#2787 S3.5/S6.2), read from the
     // accepted slot while it still holds that command. The phase is whatever
     // the channel reader itself recorded; this supervisor completes no owner
     // delivery — it owns no command sender, so it stages no `completed` ack —
