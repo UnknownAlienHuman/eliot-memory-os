@@ -2003,6 +2003,12 @@ fn validate_recovery_window_identity_and_reply_shape(
     Ok(None)
 }
 
+fn reconciliation_receipt_ref(key: &str) -> Result<ReconciliationReceiptRef, ProviderFailure> {
+    ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}")).map_err(|_| {
+        event_shape_failure("reconciliation refused: owner key does not form a receipt reference")
+    })
+}
+
 /// Decodes the owner's reconciliation answer into a port outcome, refusing any
 /// answer that does not belong to the presenting attach. The continuation
 /// checks live in [`check_expected_continuation`]: a required stream scope must
@@ -2067,12 +2073,7 @@ fn decode_reconciliation_outcome(
     let handoffs_reconciled = decode_handoffs_reconciled(reconciliation)?;
     check_expected_continuation(reconciliation, &stream_facts, expected)?;
     check_recovery_page_ordinals(reconciliation, expected, window_status)?;
-    let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
-        .map_err(|_| {
-            event_shape_failure(
-                "reconciliation refused: owner key does not form a receipt reference",
-            )
-        })?;
+    let receipt_ref = reconciliation_receipt_ref(&key)?;
     let presenting_connection = ConnectionId::new(identity.connection_echo).map_err(|_| {
         event_shape_failure("reconciliation refused: connection echo is not a valid identity")
     })?;
