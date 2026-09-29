@@ -568,8 +568,12 @@ fn check_ceiling(
 /// Reads nothing: the caller supplies the exact immutable buffer. The same
 /// buffer is hashed (preflight) and compiled; the path is never reread.
 /// Zero ambient imports, full resource limits, and output checks apply to
-/// descriptor/initialization execution exactly like a domain call. The
-/// admitted typed domain operation is executed by
+/// descriptor/initialization execution exactly like a domain call:
+/// instantiation and the descriptor run inside the same guarded envelope, so
+/// fuel exhaustion or the epoch deadline there is reported at the
+/// `Instantiate`/`Descriptor` stage actually reached. The descriptor identity
+/// (including the frozen WIT digest) is validated before the receipt is
+/// produced. The admitted typed domain operation is executed by
 /// [`execute_domain_experimental`], which reuses this same preflight,
 /// envelope and limits.
 pub fn execute_describe_experimental(
@@ -602,6 +606,8 @@ pub fn execute_describe_experimental(
     let (output_digest, output_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
             .map_err(|error| staged(TypedStage::Output, error))?;
+    validate_descriptor_abi_digest(&descriptor)
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let input_digest = Sha256Digest::of_bytes(&[]);
@@ -1002,7 +1008,9 @@ impl wasmtime::ResourceLimiter for StoreState {
 
 /// Runs one descriptor closure with fuel, memory/table/instance limits,
 /// and epoch interruption driven by both a tick pump and the wall
-/// deadline. No clock, randomness, or ambient capability reaches the guest.
+/// deadline. The wall deadline forces epoch ticks independent of remaining
+/// fuel, so the epoch deadline fires even when fuel is plentiful. No clock,
+/// randomness, or ambient capability reaches the guest.
 fn run_guarded<T>(
     engine: &wasmtime::Engine,
     limits: &InvocationLimits,
@@ -1087,12 +1095,22 @@ fn describe_context_admission(
     use crate::typed_bindings::context_admission::ContextAdmission;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
-        let instance = ContextAdmission::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
+        let instance =
+            ContextAdmission::instantiate(&mut *store, component, &linker).map_err(|error| {
+                staged(
+                    TypedStage::Instantiate,
+                    map_instantiate_error(&error, store.data().limit_hit),
+                )
+            })?;
         let raw = instance
             .eliot_current_admission()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
+            .map_err(|error| {
+                staged(
+                    TypedStage::Descriptor,
+                    map_call_error("describe", &error, store.data().limit_hit),
+                )
+            })?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -1112,12 +1130,22 @@ fn describe_context_assembly(
     use crate::typed_bindings::context_assembly::ContextAssembly;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
-        let instance = ContextAssembly::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
+        let instance =
+            ContextAssembly::instantiate(&mut *store, component, &linker).map_err(|error| {
+                staged(
+                    TypedStage::Instantiate,
+                    map_instantiate_error(&error, store.data().limit_hit),
+                )
+            })?;
         let raw = instance
             .eliot_current_assembly()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
+            .map_err(|error| {
+                staged(
+                    TypedStage::Descriptor,
+                    map_call_error("describe", &error, store.data().limit_hit),
+                )
+            })?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -1137,12 +1165,22 @@ fn describe_cue_activation(
     use crate::typed_bindings::cue_activation::CueActivation;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
-        let instance = CueActivation::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
+        let instance =
+            CueActivation::instantiate(&mut *store, component, &linker).map_err(|error| {
+                staged(
+                    TypedStage::Instantiate,
+                    map_instantiate_error(&error, store.data().limit_hit),
+                )
+            })?;
         let raw = instance
             .eliot_current_activation()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
+            .map_err(|error| {
+                staged(
+                    TypedStage::Descriptor,
+                    map_call_error("describe", &error, store.data().limit_hit),
+                )
+            })?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -1162,12 +1200,22 @@ fn describe_dreamer_handler(
     use crate::typed_bindings::dreamer_handler::DreamerHandler;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
-        let instance = DreamerHandler::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
+        let instance =
+            DreamerHandler::instantiate(&mut *store, component, &linker).map_err(|error| {
+                staged(
+                    TypedStage::Instantiate,
+                    map_instantiate_error(&error, store.data().limit_hit),
+                )
+            })?;
         let raw = instance
             .eliot_current_handler()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
+            .map_err(|error| {
+                staged(
+                    TypedStage::Descriptor,
+                    map_call_error("describe", &error, store.data().limit_hit),
+                )
+            })?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -1187,12 +1235,23 @@ fn describe_memory_curation_screen(
     use crate::typed_bindings::memory_curation_screen::MemoryCurationScreen;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
-        let instance = MemoryCurationScreen::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
+        let instance = MemoryCurationScreen::instantiate(&mut *store, component, &linker).map_err(
+            |error| {
+                staged(
+                    TypedStage::Instantiate,
+                    map_instantiate_error(&error, store.data().limit_hit),
+                )
+            },
+        )?;
         let raw = instance
             .eliot_current_screen()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
+            .map_err(|error| {
+                staged(
+                    TypedStage::Descriptor,
+                    map_call_error("describe", &error, store.data().limit_hit),
+                )
+            })?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -1212,12 +1271,22 @@ fn describe_dreamer_cycle(
     use crate::typed_bindings::dreamer_cycle::DreamerCycle;
     run_guarded(engine, limits, |store| {
         let linker = wasmtime::component::Linker::new(engine);
-        let instance = DreamerCycle::instantiate(&mut *store, component, &linker)
-            .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
+        let instance =
+            DreamerCycle::instantiate(&mut *store, component, &linker).map_err(|error| {
+                staged(
+                    TypedStage::Instantiate,
+                    map_instantiate_error(&error, store.data().limit_hit),
+                )
+            })?;
         let raw = instance
             .eliot_current_cycle()
             .call_describe(&mut *store)
-            .map_err(|error| map_call_error("describe", &error, store.data().limit_hit))?;
+            .map_err(|error| {
+                staged(
+                    TypedStage::Descriptor,
+                    map_call_error("describe", &error, store.data().limit_hit),
+                )
+            })?;
         Ok(TypedDescriptor {
             world_name: raw.world_name,
             package_id: raw.package_id,
@@ -1402,7 +1471,9 @@ impl TypedDomainResult {
 /// is instantiated on the existing empty linker inside the existing guarded
 /// envelope, the registered descriptor is called and its identity validated,
 /// and the domain export is then called EXACTLY ONCE with the generated
-/// request type of the selected world.
+/// request type of the selected world. That single invocation is terminal:
+/// a staged failure or otherwise unknown outcome is returned as-is and never
+/// retried on another world or second invocation.
 pub fn execute_domain_experimental(
     world: TypedWorld,
     artifact: &[u8],
