@@ -4,7 +4,7 @@ mod request_input;
 
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
-    CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
+    CurrentAssessment, DeliveryPoint, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
     ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile,
     TransportAdmissionError, TransportProfile, UnderstandingBootstrap, UseOutcome,
     kernel_ports_with_declaration, loopback_http_route, parse_args, reactive_runtime_composition,
@@ -865,6 +865,7 @@ fn main() {
                 record_invocation_delivery(&mut runner, &mut response);
                 drain_reactive_pending_into_invocation(
                     &mut runner,
+                    &mut host_request_client,
                     request.correlation_id.as_str(),
                     &mut response,
                 );
@@ -876,12 +877,14 @@ fn main() {
             Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
             Ok(Request::ForwardHook { event }) => {
-                let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
+                let (response, provider_failed) =
+                    handle_forward_hook_durable(&mut runner, &mut host_request_client, &event);
                 provider_failure |= provider_failed;
                 response
             }
             Ok(Request::ForwardEvent { event }) => {
-                let (response, provider_failed) = handle_forward_event(&mut runner, &event);
+                let (response, provider_failed) =
+                    handle_forward_event(&mut runner, &mut host_request_client, &event);
                 provider_failure |= provider_failed;
                 response
             }
@@ -898,6 +901,7 @@ fn main() {
                 invalidations,
             }) => handle_reactive_admit(
                 &mut runner,
+                &mut host_request_client,
                 cue,
                 firing,
                 relations,
@@ -905,16 +909,26 @@ fn main() {
                 &invalidations,
             ),
             Ok(Request::ReactiveRecordUse { item_id, update }) => {
-                handle_reactive_record_use(&mut runner, &item_id, update)
+                handle_reactive_record_use(&mut runner, &mut host_request_client, &item_id, update)
             }
             Ok(Request::ReactiveRecordUseByHandle {
                 memory_handle,
                 update,
-            }) => handle_reactive_record_use_by_handle(&mut runner, &memory_handle, update),
+            }) => handle_reactive_record_use_by_handle(
+                &mut runner,
+                &mut host_request_client,
+                &memory_handle,
+                update,
+            ),
             Ok(Request::ReactiveRecordDisposition {
                 item_id,
                 disposition,
-            }) => handle_reactive_record_disposition(&mut runner, &item_id, disposition),
+            }) => handle_reactive_record_disposition(
+                &mut runner,
+                &mut host_request_client,
+                &item_id,
+                disposition,
+            ),
             Ok(Request::ReactiveSnapshot) => handle_reactive_snapshot(&runner),
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
                 Ok(_) => match runner.recovery_projection_page(None) {
@@ -1473,6 +1487,33 @@ fn forward_receipt_error(error: &BridgeError) -> Response {
 /// cursor, and sequence. The host's own untyped identifier therefore never
 /// names a delivery point on its own: a wire with no typed normalization is
 /// refused before any pending injection moves.
+fn handle_forward_hook_durable(
+    runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
+    event: &HostEventEnvelope,
+) -> (Response, bool) {
+    match runner.forward_hook(event) {
+        Ok(()) => match commit_pending_reactive_delivery(
+            runner,
+            port,
+            DeliveryPoint::HostHook {
+                hook_id: event.event_id.as_str().to_owned(),
+            },
+        ) {
+            Ok(receipts) => (
+                Response::Forwarded {
+                    bootstrap: None,
+                    reactive_receipts: receipts,
+                },
+                false,
+            ),
+            Err(error) => (forward_receipt_error(&error), false),
+        },
+        Err(error) => forward_dispatch_error(&error),
+    }
+}
+
+#[cfg(test)]
 fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> (Response, bool) {
     match runner.forward_hook(event) {
         Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
@@ -1496,11 +1537,21 @@ fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> 
 /// drains the live session's pending injections inside the next bridge
 /// response named by that event. Same wiring contract as
 /// [`handle_forward_hook`]: no planning, no assessment, no minting.
-fn handle_forward_event(runner: &mut BridgeRunner, event: &EventEnvelope) -> (Response, bool) {
+fn handle_forward_event(
+    runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
+    event: &EventEnvelope,
+) -> (Response, bool) {
     match runner.forward_event(event) {
         Ok(_) => {
             let response_id = format!("forward-event:{}", event.event_id);
-            match runner.deliver_reactive_pending_via_response(&response_id) {
+            match commit_pending_reactive_delivery(
+                runner,
+                port,
+                DeliveryPoint::NextBridgeResponse {
+                    response_id: response_id.clone(),
+                },
+            ) {
                 Ok(receipts) => (
                     Response::Forwarded {
                         bootstrap: None,
@@ -1544,6 +1595,7 @@ fn handle_forward_gap(runner: &mut BridgeRunner, gap: &CoverageGap) -> (Response
 /// receipt-stage failure never rewrites an already-admitted invocation.
 fn drain_reactive_pending_into_invocation(
     runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
     correlation_id: &str,
     response: &mut Response,
 ) {
@@ -1552,13 +1604,38 @@ fn drain_reactive_pending_into_invocation(
     } = response
     {
         debug_assert!(reactive_receipts.is_empty());
-        match runner.deliver_reactive_pending_via_response(correlation_id) {
+        match commit_pending_reactive_delivery(
+            runner,
+            port,
+            DeliveryPoint::NextBridgeResponse {
+                response_id: correlation_id.to_owned(),
+            },
+        ) {
             Ok(receipts) => {
                 *reactive_receipts = receipts;
             }
             Err(error) => emit_error("REACTIVE_RECEIPT_REJECTED", &error.to_string()),
         }
     }
+}
+
+fn commit_pending_reactive_delivery(
+    runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
+    delivery: DeliveryPoint,
+) -> Result<Vec<InjectionReceipt>, BridgeError> {
+    reactive_runtime_composition::mutate_reactive_ledger(
+        runner,
+        port,
+        |candidate, session_id| {
+            candidate
+                .pending_item_ids(session_id)
+                .into_iter()
+                .map(|item_id| candidate.deliver(&item_id, delivery.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))
+        },
+    )
 }
 
 /// Admits one live reactive-context injection through the stdio intake.
@@ -1571,6 +1648,7 @@ fn drain_reactive_pending_into_invocation(
 /// session binding is never read from caller text.
 fn handle_reactive_admit(
     runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
     cue: NormalizedCue,
     firing: FiringEvidence,
     relations: Vec<String>,
@@ -1578,10 +1656,19 @@ fn handle_reactive_admit(
     invalidations: &[String],
 ) -> Response {
     let mut invalidations_applied = 0;
-    for source in invalidations {
-        invalidations_applied += runner.invalidate_reactive_source(source);
-    }
-    match runner.admit_reactive_injection(cue, Some(firing), relations, admission) {
+    let result = reactive_runtime_composition::mutate_reactive_ledger(
+        runner,
+        port,
+        |candidate, session_id| {
+            for source in invalidations {
+                invalidations_applied += candidate.invalidate_source(source);
+            }
+            candidate
+                .admit(session_id, cue, Some(firing), relations, admission)
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))
+        },
+    );
+    match result {
         Ok(item_id) => Response::ReactiveAdmitted {
             item_id,
             invalidations_applied,
@@ -1598,12 +1685,29 @@ fn handle_reactive_admit(
 /// like the ledger gate.
 fn handle_reactive_record_use(
     runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
     item_id: &str,
     update: UseOutcome,
 ) -> Response {
-    match runner.record_reactive_use(item_id, update) {
-        Ok(()) => Response::ReactiveRecorded {
-            item_id: item_id.to_owned(),
+    let item_id = item_id.to_owned();
+    let result = reactive_runtime_composition::mutate_reactive_ledger(
+        runner,
+        port,
+        move |candidate, live_session| {
+            if candidate.item_session(&item_id) != Some(live_session) {
+                return Err(BridgeError::ProviderContract(
+                    "reactive item does not belong to the live attach session".to_owned(),
+                ));
+            }
+            candidate
+                .record_use(&item_id, update)
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))
+                .map(|()| item_id.clone())
+        },
+    );
+    match result {
+        Ok(item_id) => Response::ReactiveRecorded {
+            item_id,
             bootstrap: None,
         },
         Err(error) => bridge_error(&error),
@@ -1615,10 +1719,31 @@ fn handle_reactive_record_use(
 /// ledger session or nothing is recorded.
 fn handle_reactive_record_use_by_handle(
     runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
     memory_handle: &str,
     update: UseOutcome,
 ) -> Response {
-    match runner.record_reactive_use_by_handle(memory_handle, update) {
+    let handle = memory_handle.to_owned();
+    let result = reactive_runtime_composition::mutate_reactive_ledger(
+        runner,
+        port,
+        move |candidate, live_session| {
+            let resolved = eliot_agent_bridge::parse_memory_handle(&handle)
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+            if resolved.session_id != live_session
+                || candidate.item_session(&resolved.item_id) != Some(resolved.session_id.as_str())
+            {
+                return Err(BridgeError::ProviderContract(
+                    "memory handle does not match a live delivered ledger item".to_owned(),
+                ));
+            }
+            candidate
+                .record_use(&resolved.item_id, update)
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+            Ok(resolved.item_id)
+        },
+    );
+    match result {
         Ok(item_id) => Response::ReactiveRecorded {
             item_id,
             bootstrap: None,
@@ -1631,12 +1756,29 @@ fn handle_reactive_record_use_by_handle(
 /// open or self-superseding records fail closed with critical stickiness kept.
 fn handle_reactive_record_disposition(
     runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
     item_id: &str,
     disposition: ItemDisposition,
 ) -> Response {
-    match runner.record_reactive_disposition(item_id, disposition) {
-        Ok(()) => Response::ReactiveRecorded {
-            item_id: item_id.to_owned(),
+    let item_id = item_id.to_owned();
+    let result = reactive_runtime_composition::mutate_reactive_ledger(
+        runner,
+        port,
+        move |candidate, live_session| {
+            if candidate.item_session(&item_id) != Some(live_session) {
+                return Err(BridgeError::ProviderContract(
+                    "reactive item does not belong to the live attach session".to_owned(),
+                ));
+            }
+            candidate
+                .record_disposition(&item_id, disposition)
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))
+                .map(|()| item_id.clone())
+        },
+    );
+    match result {
+        Ok(item_id) => Response::ReactiveRecorded {
+            item_id,
             bootstrap: None,
         },
         Err(error) => bridge_error(&error),
