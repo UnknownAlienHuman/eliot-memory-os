@@ -40,13 +40,14 @@ use eliot_platform_windows::{
     WindowsPlatform,
 };
 use eliot_process::{
-    DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation, KernelDispatchKey,
-    OriginChallenge, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
-    OriginControlPresentation, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
+    ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
+    KernelDispatchKey, OperationId, OriginChallenge, OriginChallengeRequest,
+    OriginControlGrant, OriginControlOperation, OriginControlPresentation, PermitIssuance,
+    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
+    ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
     ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
-    ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SuspendedLaunchEvidence,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SessionId,
+    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_store_api::{
@@ -95,6 +96,524 @@ pub struct ProcessExecutionAuthorityConfig {
 
 struct OrsProcessReplayStore {
     store: Arc<RedbRecoveryStore>,
+}
+
+/// The authenticated process operation whose source effect is being observed.
+///
+/// This is formed from the admitted request and server-derived owner before a
+/// process can start. A source adapter must use it to select the governed
+/// attempt and tracked-resource baseline; executable, cwd, and exit status are
+/// deliberately absent as source-mutation evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessEffectBinding {
+    operation_id: OperationId,
+    session_id: SessionId,
+    action_lease_ref: ActionLeaseRef,
+    state_fence: FencingToken,
+    owner: ProcessOwnerBinding,
+}
+
+impl GovernedProcessEffectBinding {
+    fn from_admission(
+        owner: &ProcessOwnerBinding,
+        admission: &ProcessExecutionAdmissionRequest,
+    ) -> Result<Self, ProcessExecutionError> {
+        admission.validate()?;
+        let intent = admission.intent();
+        if admission.recipient_module_id() != owner.module_id()
+            || !admission
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(owner.authority_epoch())
+            || admission.state_fence().generation() != owner.generation()
+            || admission.state_fence().generation() != intent.generation()
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
+        Ok(Self {
+            operation_id: intent.operation_id().clone(),
+            session_id: intent.session_id().clone(),
+            action_lease_ref: admission.action_lease_ref().clone(),
+            state_fence: admission.state_fence().clone(),
+            owner: owner.clone(),
+        })
+    }
+
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(crate) fn action_lease_ref(&self) -> &ActionLeaseRef {
+        &self.action_lease_ref
+    }
+
+    pub(crate) fn state_fence(&self) -> &FencingToken {
+        &self.state_fence
+    }
+
+    pub(crate) fn owner(&self) -> &ProcessOwnerBinding {
+        &self.owner
+    }
+
+    fn matches_request(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: &ProcessRequest,
+    ) -> bool {
+        self.owner == *owner
+            && self.operation_id == *request.operation_id()
+            && self.session_id == *request.session_id()
+            && self.state_fence == *request.fence()
+            && self.state_fence.generation() == request.generation()
+    }
+
+    fn matches_process_binding(&self, binding: &ProcessExecutionBinding) -> bool {
+        binding.operation_id() == &self.operation_id
+            && binding.session_id() == &self.session_id
+            && binding.state_fence() == &self.state_fence
+            && binding
+                .authority_epoch()
+                .is_same_authority(self.owner.authority_epoch())
+    }
+}
+
+/// One exact tracked-resource state independently read before process start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessSourceRevision {
+    resource_ref: String,
+    revision: String,
+    path: Option<String>,
+    symbol: Option<String>,
+    content_digest: String,
+    structural_digest: Option<String>,
+}
+
+impl GovernedProcessSourceRevision {
+    pub(crate) fn new(
+        resource_ref: impl Into<String>,
+        revision: impl Into<String>,
+        path: Option<String>,
+        symbol: Option<String>,
+        content_digest: impl Into<String>,
+        structural_digest: Option<String>,
+    ) -> Result<Self, GovernedProcessEffectPortError> {
+        let value = Self {
+            resource_ref: resource_ref.into(),
+            revision: revision.into(),
+            path,
+            symbol,
+            content_digest: content_digest.into(),
+            structural_digest,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), GovernedProcessEffectPortError> {
+        if !nonblank(&self.resource_ref)
+            || !nonblank(&self.revision)
+            || !lower_sha256(&self.content_digest)
+            || self.path.as_deref().is_some_and(|value| !nonblank(value))
+            || self.symbol.as_deref().is_some_and(|value| !nonblank(value))
+            || self
+                .structural_digest
+                .as_deref()
+                .is_some_and(|value| !lower_sha256(value))
+        {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resource_ref(&self) -> &str {
+        &self.resource_ref
+    }
+
+    pub(crate) fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub(crate) fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    pub(crate) fn symbol(&self) -> Option<&str> {
+        self.symbol.as_deref()
+    }
+
+    pub(crate) fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    pub(crate) fn structural_digest(&self) -> Option<&str> {
+        self.structural_digest.as_deref()
+    }
+}
+
+/// Complete tracked-source baseline captured before the admitted process effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessEffectBaseline {
+    binding: GovernedProcessEffectBinding,
+    attempt_receipt_ref: String,
+    source_snapshot_ref: String,
+    tracked_sources: Vec<GovernedProcessSourceRevision>,
+}
+
+impl GovernedProcessEffectBaseline {
+    pub(crate) fn new(
+        binding: GovernedProcessEffectBinding,
+        attempt_receipt_ref: impl Into<String>,
+        source_snapshot_ref: impl Into<String>,
+        tracked_sources: Vec<GovernedProcessSourceRevision>,
+    ) -> Result<Self, GovernedProcessEffectPortError> {
+        let value = Self {
+            binding,
+            attempt_receipt_ref: attempt_receipt_ref.into(),
+            source_snapshot_ref: source_snapshot_ref.into(),
+            tracked_sources,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), GovernedProcessEffectPortError> {
+        if !nonblank(&self.attempt_receipt_ref) || !nonblank(&self.source_snapshot_ref) {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+        validate_source_set(&self.tracked_sources)
+    }
+
+    pub(crate) fn binding(&self) -> &GovernedProcessEffectBinding {
+        &self.binding
+    }
+
+    pub(crate) fn attempt_receipt_ref(&self) -> &str {
+        &self.attempt_receipt_ref
+    }
+
+    pub(crate) fn source_snapshot_ref(&self) -> &str {
+        &self.source_snapshot_ref
+    }
+
+    pub(crate) fn tracked_sources(&self) -> &[GovernedProcessSourceRevision] {
+        &self.tracked_sources
+    }
+}
+
+/// Exact invalidation evidence attached to one changed tracked source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessFenceInvalidation {
+    dependency: String,
+    state_fence: FencingToken,
+    reason_ref: String,
+}
+
+impl GovernedProcessFenceInvalidation {
+    pub(crate) fn new(
+        dependency: impl Into<String>,
+        state_fence: FencingToken,
+        reason_ref: impl Into<String>,
+    ) -> Result<Self, GovernedProcessEffectPortError> {
+        let value = Self {
+            dependency: dependency.into(),
+            state_fence,
+            reason_ref: reason_ref.into(),
+        };
+        if !nonblank(&value.dependency) || !nonblank(&value.reason_ref) {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn dependency(&self) -> &str {
+        &self.dependency
+    }
+
+    pub(crate) fn state_fence(&self) -> &FencingToken {
+        &self.state_fence
+    }
+
+    pub(crate) fn reason_ref(&self) -> &str {
+        &self.reason_ref
+    }
+}
+
+/// One independently read material source transition and its real diff handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessSourceChange {
+    change_id: String,
+    before: Option<GovernedProcessSourceRevision>,
+    after: Option<GovernedProcessSourceRevision>,
+    diff_handle: String,
+    invalidations: Vec<GovernedProcessFenceInvalidation>,
+}
+
+impl GovernedProcessSourceChange {
+    pub(crate) fn new(
+        change_id: impl Into<String>,
+        before: Option<GovernedProcessSourceRevision>,
+        after: Option<GovernedProcessSourceRevision>,
+        diff_handle: impl Into<String>,
+        invalidations: Vec<GovernedProcessFenceInvalidation>,
+    ) -> Result<Self, GovernedProcessEffectPortError> {
+        let value = Self {
+            change_id: change_id.into(),
+            before,
+            after,
+            diff_handle: diff_handle.into(),
+            invalidations,
+        };
+        if !nonblank(&value.change_id)
+            || !nonblank(&value.diff_handle)
+            || value.before.is_none() && value.after.is_none()
+            || value.invalidations.is_empty()
+        {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+        if let Some(before) = &value.before {
+            before.validate()?;
+        }
+        if let Some(after) = &value.after {
+            after.validate()?;
+        }
+        if let (Some(before), Some(after)) = (&value.before, &value.after)
+            && (before.resource_ref != after.resource_ref || before.revision == after.revision)
+        {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn change_id(&self) -> &str {
+        &self.change_id
+    }
+
+    pub(crate) fn before(&self) -> Option<&GovernedProcessSourceRevision> {
+        self.before.as_ref()
+    }
+
+    pub(crate) fn after(&self) -> Option<&GovernedProcessSourceRevision> {
+        self.after.as_ref()
+    }
+
+    pub(crate) fn diff_handle(&self) -> &str {
+        &self.diff_handle
+    }
+
+    pub(crate) fn invalidations(&self) -> &[GovernedProcessFenceInvalidation] {
+        &self.invalidations
+    }
+}
+
+/// Validated post-effect readback for one admitted process operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessChangeReceipt {
+    binding: GovernedProcessEffectBinding,
+    attempt_receipt_ref: String,
+    source_snapshot_ref: String,
+    post_effect_readback_ref: String,
+    post_effect_sources: Vec<GovernedProcessSourceRevision>,
+    changes: Vec<GovernedProcessSourceChange>,
+}
+
+impl GovernedProcessChangeReceipt {
+    pub(crate) fn new(
+        baseline: &GovernedProcessEffectBaseline,
+        post_effect_readback_ref: impl Into<String>,
+        post_effect_sources: Vec<GovernedProcessSourceRevision>,
+        changes: Vec<GovernedProcessSourceChange>,
+    ) -> Result<Self, GovernedProcessEffectPortError> {
+        let value = Self {
+            binding: baseline.binding.clone(),
+            attempt_receipt_ref: baseline.attempt_receipt_ref.clone(),
+            source_snapshot_ref: baseline.source_snapshot_ref.clone(),
+            post_effect_readback_ref: post_effect_readback_ref.into(),
+            post_effect_sources,
+            changes,
+        };
+        value.validate_for(baseline)?;
+        Ok(value)
+    }
+
+    fn validate_for(
+        &self,
+        baseline: &GovernedProcessEffectBaseline,
+    ) -> Result<(), GovernedProcessEffectPortError> {
+        baseline.validate()?;
+        if self.binding != baseline.binding
+            || self.attempt_receipt_ref != baseline.attempt_receipt_ref
+            || self.source_snapshot_ref != baseline.source_snapshot_ref
+            || !nonblank(&self.post_effect_readback_ref)
+        {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+        validate_source_set(&self.post_effect_sources)?;
+
+        let before = source_map(&baseline.tracked_sources);
+        let after = source_map(&self.post_effect_sources);
+        let resource_refs = before
+            .keys()
+            .chain(after.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut observed_changes = BTreeMap::new();
+        for resource_ref in resource_refs {
+            let prior = before.get(resource_ref).copied();
+            let current = after.get(resource_ref).copied();
+            if prior != current {
+                if let (Some(prior), Some(current)) = (prior, current)
+                    && prior.revision == current.revision
+                {
+                    return Err(GovernedProcessEffectPortError::InvalidReceipt);
+                }
+                observed_changes.insert(resource_ref, (prior, current));
+            }
+        }
+        if observed_changes.len() != self.changes.len() {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+
+        let mut seen_change_ids = std::collections::BTreeSet::new();
+        let mut seen_resources = std::collections::BTreeSet::new();
+        for change in &self.changes {
+            let resource = change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .ok_or(GovernedProcessEffectPortError::InvalidReceipt)?;
+            let Some((expected_before, expected_after)) =
+                observed_changes.get(resource.resource_ref.as_str())
+            else {
+                return Err(GovernedProcessEffectPortError::InvalidReceipt);
+            };
+            if !seen_change_ids.insert(change.change_id.as_str())
+                || !seen_resources.insert(resource.resource_ref.as_str())
+                || *expected_before != change.before.as_ref()
+                || *expected_after != change.after.as_ref()
+            {
+                return Err(GovernedProcessEffectPortError::InvalidReceipt);
+            }
+            let dependency = format!("resource:{}", resource.resource_ref);
+            if !change.invalidations.iter().any(|invalidation| {
+                invalidation.dependency == dependency
+                    && invalidation.state_fence == self.binding.state_fence
+                    && invalidation.reason_ref == self.attempt_receipt_ref
+            }) {
+                return Err(GovernedProcessEffectPortError::InvalidReceipt);
+            }
+            let mut invalidation_dependencies = std::collections::BTreeSet::new();
+            if change.invalidations.iter().any(|invalidation| {
+                !nonblank(&invalidation.dependency)
+                    || invalidation.state_fence != self.binding.state_fence
+                    || invalidation.reason_ref != self.attempt_receipt_ref
+                    || !invalidation_dependencies.insert(invalidation.dependency.as_str())
+            }) {
+                return Err(GovernedProcessEffectPortError::InvalidReceipt);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn binding(&self) -> &GovernedProcessEffectBinding {
+        &self.binding
+    }
+
+    pub(crate) fn attempt_receipt_ref(&self) -> &str {
+        &self.attempt_receipt_ref
+    }
+
+    pub(crate) fn operation_ref(&self) -> &str {
+        self.binding.operation_id.as_str()
+    }
+
+    pub(crate) fn source_snapshot_ref(&self) -> &str {
+        &self.source_snapshot_ref
+    }
+
+    pub(crate) fn post_effect_readback_ref(&self) -> &str {
+        &self.post_effect_readback_ref
+    }
+
+    pub(crate) fn post_effect_sources(&self) -> &[GovernedProcessSourceRevision] {
+        &self.post_effect_sources
+    }
+
+    pub(crate) fn changes(&self) -> &[GovernedProcessSourceChange] {
+        &self.changes
+    }
+}
+
+/// Stable categories for a missing or malformed independent source observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GovernedProcessEffectPortError {
+    SourceSnapshotUnavailable,
+    PostEffectReadbackUnavailable,
+    ChangeMonitorUnavailable,
+    InvalidReceipt,
+}
+
+/// Required Governor-owned readback and ChangeMonitor ingress for process tools.
+///
+/// Implementations capture the complete tracked-source baseline before launch,
+/// independently read the terminal source state, attach actual diff and fence
+/// invalidation handles, and ingest only the validated receipt supplied back by
+/// Kernel. Returning an empty `changes` list is valid only after complete
+/// before/after readback; process success is never source evidence.
+pub(crate) trait GovernedProcessEffectPort: Send + Sync {
+    fn capture_before(
+        &self,
+        binding: &GovernedProcessEffectBinding,
+    ) -> Result<GovernedProcessEffectBaseline, GovernedProcessEffectPortError>;
+
+    fn read_after(
+        &self,
+        baseline: &GovernedProcessEffectBaseline,
+        terminal_evidence: &ProcessEvidence,
+    ) -> Result<GovernedProcessChangeReceipt, GovernedProcessEffectPortError>;
+
+    fn ingest(
+        &self,
+        receipt: &GovernedProcessChangeReceipt,
+    ) -> Result<(), GovernedProcessEffectPortError>;
+}
+
+fn nonblank(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_source_set(
+    sources: &[GovernedProcessSourceRevision],
+) -> Result<(), GovernedProcessEffectPortError> {
+    let mut resources = std::collections::BTreeSet::new();
+    for source in sources {
+        source.validate()?;
+        if !resources.insert(source.resource_ref.as_str()) {
+            return Err(GovernedProcessEffectPortError::InvalidReceipt);
+        }
+    }
+    Ok(())
+}
+
+fn source_map<'a>(
+    sources: &'a [GovernedProcessSourceRevision],
+) -> BTreeMap<&'a str, &'a GovernedProcessSourceRevision> {
+    sources
+        .iter()
+        .map(|source| (source.resource_ref.as_str(), source))
+        .collect()
 }
 
 struct OrsProcessEvidenceSink {
