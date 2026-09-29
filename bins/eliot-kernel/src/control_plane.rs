@@ -789,13 +789,15 @@ impl KernelComposition {
             // one activation. Both move through the owner transition; the
             // census keeps classifying recorded rows and never rewrites them.
             let now_ms = crate::unix_ms();
-            let mut outcome = RuntimeLeaseTickOutcome::default();
-            outcome.expired = self.expire_past_due_runtime_leases(&fence, now_ms)?;
-            outcome.superseded = self.supersede_stale_runtime_leases(
-                &fence,
-                request.candidate.activation_id.as_str(),
-                receipt.operation_id.as_str(),
-            )?;
+            let outcome = RuntimeLeaseTickOutcome {
+                expired: self.expire_past_due_runtime_leases(&fence, now_ms)?,
+                superseded: self.supersede_stale_runtime_leases(
+                    &fence,
+                    request.candidate.activation_id.as_str(),
+                    receipt.operation_id.as_str(),
+                )?,
+                ..Default::default()
+            };
             observe_runtime_lease_tick(&outcome);
         }
         #[cfg(windows)]
