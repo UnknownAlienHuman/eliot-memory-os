@@ -1090,15 +1090,23 @@ fn admit_traversed_transition(
         let same_transition = known.record().transition_id == evidence.record().transition_id;
         let same_operation = known.record().operation_id == evidence.record().operation_id;
         let same_digest = known.canonical_request_digest() == evidence.canonical_request_digest();
-        (same_transition && !(same_operation && same_digest)) || (same_operation && !same_digest)
+        if same_digest {
+            // Identical content under one transition id is the same crossing
+            // seen twice, and a shared transition id carrying a different
+            // operation is a different crossing reusing the id.
+            same_transition && !same_operation
+        } else {
+            // A different canonical request digest under a shared transition id
+            // or a shared operation id is the conflict this refuses. Nothing
+            // else is, and nothing else here can be.
+            same_transition || same_operation
+        }
     });
     if conflicting {
         return Err(AuthorityError::IdentityConflict);
     }
     let transition_id = evidence.record().transition_id.clone();
-    if !traversed.contains_key(&transition_id) {
-        traversed.insert(transition_id, evidence);
-    }
+    traversed.entry(transition_id).or_insert(evidence);
     Ok(())
 }
 
