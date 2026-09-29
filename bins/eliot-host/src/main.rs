@@ -1206,6 +1206,13 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         // The dedicated execution pipe blocks until this drain answers, so it
         // must run from the service loop rather than from the pipe server.
         process_user_automation_owner_requests(&host);
+        // One bounded sweep of the backup dispatch handoff. The backup owner
+        // registered on the runtime-control pipe hands each admitted operation
+        // to this live composition and waits for the answer, so, exactly like
+        // the UserAutomation owner queue above, the owner operation runs from
+        // the service loop, which is the only thread holding the durable Host
+        // journal, the owner lease and the installation registry.
+        process_backup_dispatch_requests(&host);
         if durable_fence {
             // A degraded branch has fenced the shared authority in the durable
             // state store. Keep the healthy sibling alive, but do not continue
@@ -1495,6 +1502,31 @@ fn process_user_automation_owner_requests(host: &HostComposition) {
             "eliot-host: UserAutomation owner queue drain failed: {error}"
         );
     }
+}
+
+/// Drains the backup dispatch handoff the registered Host backup owner submits
+/// admitted operations through (#962).
+///
+/// The registered owner runs on the runtime-control pipe server thread and is
+/// not the holder of the durable Host journal, so it hands each admitted
+/// operation here and blocks for the answer. This is the only production place
+/// that runs a dispatched backup owner operation, and it runs it on the one
+/// serialized owner loop, against the live composition's own retained state.
+///
+/// A bounded, non-blocking sweep of an already-admitted handoff: it starts no
+/// work, opens no pipe, admits nothing, and never blocks supervision. It
+/// reports how many admitted operations it actually answered, so a sweep that
+/// drained nothing says zero rather than claiming work.
+#[cfg(windows)]
+fn process_backup_dispatch_requests(host: &HostComposition) {
+    let answered = host.process_backup_dispatch_requests(&host.backup_dispatch_queue());
+    if answered == 0 {
+        return;
+    }
+    let _ = writeln!(
+        io::stderr().lock(),
+        "eliot-host: backup owner dispatch answered {answered} admitted operation(s)"
+    );
 }
 
 /// I1.5 trigger class of one authenticated runtime-control request.
