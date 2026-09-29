@@ -1306,7 +1306,7 @@ pub fn import_ecxf_package(
     // formatting difference. It is checked here, before any payload member is
     // decoded, because identity is the first question about a package and
     // nothing below it can repair a wrong answer.
-    if manifest.installation_id != expected_installation_id {
+    if manifest.installation_id.as_str() != expected_installation_id {
         return Err(EcxfError::InconsistentBoundary);
     }
     let integrity: IntegrityManifest = serde_json::from_slice(integrity_bytes)
