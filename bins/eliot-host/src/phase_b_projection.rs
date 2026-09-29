@@ -8,12 +8,11 @@ use super::{
     HostInstallationEpoch, HostPhaseBMaterialization, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt, InstallationProfile,
     LOCAL_SERVICE_SID, OpaqueLabel, OperationIdentity, OrsEpochIdentity, PhaseBLiveBinding,
-    PlatformHandle,
-    ProcessAuthorityHandoffDescriptor, ProvisionedSupervisionAuthority, RuntimeLaunchDescriptor,
-    SecretReference, Sha256, StateFence, StateFenceSnapshot, StoreCredentialProvider,
-    StoreCredentialScope, host_owner_epoch_digest, installation_phase_b_credential_receipt_digest,
-    installation_phase_b_host_state_root_digest, installation_phase_b_watchdog_selector_digest,
-    observe_named_pipe_peer_process,
+    PlatformHandle, ProcessAuthorityHandoffDescriptor, ProvisionedSupervisionAuthority,
+    RuntimeLaunchDescriptor, SecretReference, Sha256, StateFence, StateFenceSnapshot,
+    StoreCredentialProvider, StoreCredentialScope, host_owner_epoch_digest,
+    installation_phase_b_credential_receipt_digest, installation_phase_b_host_state_root_digest,
+    installation_phase_b_watchdog_selector_digest, observe_named_pipe_peer_process,
 };
 
 #[cfg(windows)]
@@ -147,11 +146,10 @@ pub(super) fn validate_phase_b_credential_receipt(
             );
             let root = eliot_platform_windows::UserOwnedRootLease::open_existing(host_state_root)
                 .map_err(|_| {
-                    HostError::RecoveryRequired(
-                        "Phase-B UserMode Host state root is not owned by the current user"
-                            .to_owned(),
-                    )
-                })?;
+                HostError::RecoveryRequired(
+                    "Phase-B UserMode Host state root is not owned by the current user".to_owned(),
+                )
+            })?;
             root.verify_stable_identity().map_err(|_| {
                 HostError::RecoveryRequired(
                     "Phase-B UserMode Host state root identity changed".to_owned(),

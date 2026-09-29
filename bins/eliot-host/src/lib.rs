@@ -1773,7 +1773,7 @@ use phase_b_projection::{
     phase_b_build_authority_descriptor, phase_b_build_authority_descriptor_for_rebind,
     phase_b_credential_receipt_digest, phase_b_manifest_digest, phase_b_prepared_public_receipt,
     phase_b_public_receipt, phase_b_public_receipt_from_binding, phase_b_root_binding_digest,
-    phase_b_watchdog_selector_digest, validate_phase_b_credential_receipt,
+    phase_b_watchdog_selector_digest,
 };
 
 #[cfg(windows)]
@@ -7024,7 +7024,11 @@ impl HostComposition {
                     "Phase-B handoff requires the exact pending activation".to_owned(),
                 )
             })?;
-            validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)?;
+            self.validate_phase_b_credential_receipt_for_profile(
+                credential_receipt,
+                &pending.manifest,
+                intent,
+            )?;
             let manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
             let expected_static_template = phase_b_static_template_for_candidate(&pending.manifest)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -7170,7 +7174,11 @@ impl HostComposition {
                     "FinalizePhaseB requires the exact pending activation".to_owned(),
                 )
             })?;
-            validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)?;
+            self.validate_phase_b_credential_receipt_for_profile(
+                credential_receipt,
+                &pending.manifest,
+                intent,
+            )?;
             let prepared = pending.phase_b_prepared_receipt.as_ref().ok_or_else(|| {
                 HostError::RecoveryRequired(
                     "FinalizePhaseB has no durable prepared receipt".to_owned(),
@@ -7291,7 +7299,12 @@ impl HostComposition {
             && let Some(receipt) = pending.phase_b_prepared_receipt.as_ref()
             && pending.phase_b_receipt.is_none()
             && intent.validate().is_ok()
-            && validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)
+            && self
+                .validate_phase_b_credential_receipt_for_profile(
+                    credential_receipt,
+                    &pending.manifest,
+                    intent,
+                )
                 .is_ok()
             && receipt.validate().is_ok()
             && receipt.transaction_id == intent.transaction_id
@@ -7378,7 +7391,11 @@ impl HostComposition {
             let manifest_digest = phase_b_manifest_digest(&manifest)?;
             let expected_static_template = phase_b_static_template_for_candidate(&manifest)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            validate_phase_b_credential_receipt(credential_receipt, &manifest, intent)?;
+            self.validate_phase_b_credential_receipt_for_profile(
+                credential_receipt,
+                &manifest,
+                intent,
+            )?;
             let live_process_identity = if committed_binding.is_none()
                 && pending_receipt.is_none()
                 && pending_intent.is_none()

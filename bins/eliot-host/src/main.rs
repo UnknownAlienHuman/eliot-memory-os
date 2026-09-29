@@ -642,6 +642,9 @@ fn run_profile_supervisor(
         ));
     }
     let mut host = HostComposition::open_for_profile(launch_options.clone(), profile)?;
+    if host.registry().pending_activation().is_some() {
+        return run_pending_user_mode_bootstrap(&mut host);
+    }
     let active = host.registry().active().ok_or_else(|| {
         HostError::ProcessContour(format!(
             "{profile:?} supervisor has no active approved generation"
@@ -758,6 +761,39 @@ fn run_profile_supervisor(
     }
     if let Some(error) = loop_failure {
         return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_pending_user_mode_bootstrap(host: &mut HostComposition) -> Result<(), HostError> {
+    use std::sync::atomic::Ordering;
+
+    // The installer retains the dedicated current-user Job until this Host
+    // finishes its one pending Phase-B handoff. The Host owner serves the
+    // credential and Phase-B requests; the installer never issues their
+    // owner-epoch or process-identity receipts itself.
+    let control = host.credential_control()?;
+    let phase_b_queue = control.phase_b_queue();
+    let credential_thread = spawn_credential_control(control)?;
+    let mut completed = false;
+    while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+        process_phase_b_requests(host, &phase_b_queue);
+        if host.registry().pending_activation().is_none() {
+            completed = host.registry().active().is_some();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    STOP_REQUESTED.store(true, Ordering::Release);
+    let _ = credential_thread.join();
+    if host.running() {
+        host.stop()?;
+    }
+    if !completed {
+        return Err(HostError::RecoveryRequired(
+            "current-user pending Host ended without an active Phase-B terminal".to_owned(),
+        ));
     }
     Ok(())
 }
