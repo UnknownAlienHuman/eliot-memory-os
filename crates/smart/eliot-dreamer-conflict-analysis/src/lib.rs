@@ -96,6 +96,39 @@
 //! whole of the owner-unavailable path — there is no fetch, no retry, no
 //! fallback owner, and no acquisition surface here.
 //!
+//! # What makes a record owner-bound rather than merely well formed
+//!
+//! Shape is never authority here. Each of the following is checked against the
+//! record that carries it, and a well-formed string satisfies none of them on
+//! its own:
+//!
+//! - a source member's retained bytes must reproduce the digest the owner
+//!   RECORDED for them ([`SourceMemberRecord::validate`]). The recorded value is
+//!   the original and is never recomputed and substituted for the check.
+//! - a [`SourceRecordCommitment`] is a pointer, not evidence. It becomes a
+//!   binding only because [`check_owner_comparison_members`] requires a
+//!   retained member recording exactly its digest and
+//!   [`OwnerComparison::validate`] requires an admitted profile whose
+//!   definition bytes reproduce its profile digest.
+//! - a profile's definition bytes must reproduce its owner-recorded digest, and
+//!   its descriptors must be exactly the canonical eight in canonical order.
+//! - every observed value names its source, the member digest it was read from,
+//!   and the descriptor it answers, so a value cannot be re-attached to another
+//!   position or answer a dimension it was not read under.
+//! - a causal record is joined to ITS OWN source's retained material, never to
+//!   the union of every member in the analysis, and its mechanism claim must be
+//!   read at that member's retained revision.
+//! - an intervention receipt must be the receipt of a retained evidence
+//!   envelope. A 64-character digest matching no envelope is a string, not an
+//!   execution receipt.
+//! - every envelope's own fence must match the current item fence by exact
+//!   tuple, because the envelope contract proves a fence is well formed, not
+//!   that it is the current one.
+//!
+//! A claim whose position has no admitted source member is refused at
+//! admission rather than assessed against nothing. Nothing here raises a
+//! ceiling: an unverifiable input keeps the unverified/unknown result.
+//!
 //! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
@@ -1022,6 +1055,13 @@ pub struct ControlBinding {
 }
 
 /// Owner-issued intervention execution and its receipt.
+///
+/// The receipt is the proof that the execution happened, so it is read as the
+/// receipt of a retained evidence envelope rather than as a digest string:
+/// [`CausalEvidenceRecord::validate`] refuses a record whose receipt matches no
+/// retained envelope. Without that join an intervention would be supportable on
+/// any well-formed 64-character digest, which is precisely the "two hashes look
+/// right" substitution the owner contract exists to prevent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterventionBinding {
     /// Execution identity of the intervention.
@@ -1219,6 +1259,7 @@ impl CausalEvidenceRecord {
             MAX_ENVELOPES_PER_RECORD,
         )?;
         let mut evidence_ids: Vec<String> = Vec::with_capacity(self.evidence.len());
+        let mut receipt_digests: Vec<String> = Vec::with_capacity(self.evidence.len());
         for record in &self.evidence {
             record.validate()?;
             if evidence_ids.contains(&record.evidence_id) {
@@ -1227,6 +1268,7 @@ impl CausalEvidenceRecord {
                 });
             }
             evidence_ids.push(record.evidence_id.clone());
+            receipt_digests.push(record.receipt_digest.clone());
         }
         if !evidence_ids.contains(&self.falsifier.evidence_id) {
             return Err(ConflictAnalysisError::Binding {
@@ -1238,6 +1280,20 @@ impl CausalEvidenceRecord {
             return Err(ConflictAnalysisError::Binding {
                 field: "causal_evidence.control.evidence_id".to_owned(),
                 detail: "evaluator result is not traced to retained evidence".to_owned(),
+            });
+        }
+        // An intervention execution is proven by the receipt that owner
+        // issued, so the receipt is read as that receipt rather than as a
+        // well-formed digest. A digest matching no retained envelope is the
+        // same unbound string the other two legs refuse: without this join an
+        // intervention state would be reachable on any 64 hex characters.
+        if let Some(intervention) = &self.intervention
+            && !receipt_digests.contains(&intervention.receipt_digest)
+        {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.intervention.receipt_digest".to_owned(),
+                detail: "intervention receipt is not the receipt of a retained evidence envelope"
+                    .to_owned(),
             });
         }
         self.rivals.validate(&evidence_ids)
@@ -1403,7 +1459,19 @@ pub struct OwnerRecords {
     pub causal_evidence: Vec<CausalEvidenceRecord>,
 }
 
-/// Owner-issued commitment binding one source handle to the record it names.
+/// Commitment binding one source handle to the record and profile it names.
+///
+/// This is a POINTER, not the owner evidence. Its own constructor checks only
+/// that the handle and the two digests are well formed, and private fields do
+/// not make a string constructor into an owner boundary: a well-formed
+/// commitment establishes nothing by itself. What carries the authority is the
+/// pair of records it points at — the [`SourceMemberRecord`] whose retained
+/// bytes must reproduce the digest this commitment names, and the
+/// [`OwnerComparisonProfile`] whose definition bytes must reproduce the profile
+/// digest. [`check_owner_comparison_members`] and
+/// [`OwnerComparison::validate`] are what turn a pointer into a binding; a
+/// commitment naming a digest no retained member records is refused as stale
+/// or conflicting rather than read as current evidence.
 ///
 /// The commitment carries the handle it is issued for, so it cannot be detached
 /// from its source and re-attached to another. Normalizing a comparison pair
@@ -1417,11 +1485,18 @@ pub struct SourceRecordCommitment {
 }
 
 impl SourceRecordCommitment {
-    /// Declares the owner-issued commitment for one source handle.
+    /// Declares the commitment for one source handle.
     ///
-    /// `profile` names the owner-issued comparison profile the record was
-    /// admitted under; a commitment without both digests is refused rather
-    /// than admitted as unverified.
+    /// This constructor checks SHAPE ONLY: a handle, a record digest, a profile
+    /// handle, and a profile digest. It performs no I/O, reads no retained
+    /// bytes, and admits no owner; a value that passes here is a pointer, and
+    /// it becomes a binding only when [`check_owner_comparison_members`] finds a
+    /// [`SourceMemberRecord`] recording that exact digest and
+    /// [`OwnerComparison::validate`] finds an [`OwnerComparisonProfile`] whose
+    /// definition bytes reproduce `profile_digest`. `profile` names the
+    /// owner-issued comparison profile the record was admitted under; a
+    /// commitment without both digests is refused rather than admitted as
+    /// unverified.
     pub fn new(
         source: &str,
         record_digest: &str,
@@ -1809,11 +1884,17 @@ impl CanonicalComparisonPair {
 /// Typed relation between two positions over the canonical dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CompatibilityRelation {
-    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
+    /// Every canonical dimension carries an equal admitted value from both
+    /// sources under one owner-issued profile. DERIVED by
+    /// [`derive_owner_relation`], never submitted: a legacy declaration
+    /// cannot reach it and no owner-issued record means it is not emitted.
     EqualConditions,
-    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
+    /// The admitted values differ on at least one canonical dimension under one
+    /// owner-issued profile, with every dimension resolved. DERIVED the same
+    /// way, so a legacy declaration cannot reach it either.
     TypedDifference,
-    /// Legacy declarations lack owner-bound evidence; relation is unknown.
+    /// No relation is proven: a legacy declaration has no owner-bound records,
+    /// or an admitted comparison leaves a canonical dimension unresolved.
     Ambiguous,
 }
 
@@ -1966,9 +2047,27 @@ pub struct CausalClaimRecord {
 
 /// Caller-supplied supplements bound to one `ConflictSet` analysis.
 ///
-/// `comparisons` and `causal_claims` retain legacy v1 declaration shapes and
-/// are digested as such. This type has no byte deserializer that could silently
-/// fill defaults while upgrading old serialized values into a stronger schema.
+/// This type carries BOTH kinds of input, kept apart rather than merged, and
+/// the two are never interchangeable:
+///
+/// - `comparisons` and `causal_claims` are RETAINED UNVERIFIED DECLARATIONS.
+///   They are preserved and digested as legacy version 1 and stay at
+///   [`SupplementVersion::LegacyV1Unverified`]: their values and prose are
+///   declarations, never evidence, and they cannot qualify equality, difference,
+///   prediction, intervention, or attribution.
+/// - `owner_records` is the OWNER-BOUND INPUT: source members carrying retained
+///   bytes and their owner-recorded digest, one owner-issued comparison profile
+///   with the observed value for each source on each canonical dimension, and
+///   causal evidence joined to its own source's material and receipts. It is
+///   the only input from which [`CompatibilityRelation`] and
+///   [`CausalClaimState`] are derived, and it reaches
+///   [`SupplementVersion::OwnerRecordV2`].
+///
+/// A declaration is never promoted by the presence of an owner record for a
+/// different source, and an owner record is never inferred from a declaration.
+///
+/// This type has no byte deserializer that could silently fill defaults while
+/// upgrading old serialized values into a stronger schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictSupplements {
     /// Expected A-05 receipt the item and draft receipts bind against.
@@ -3079,11 +3178,6 @@ fn validate_causal_evidence(
     records: &OwnerRecords,
 ) -> Result<(), ConflictAnalysisError> {
     let handles = position_source_handles(conflict_set);
-    let retained: Vec<String> = records
-        .source_members
-        .iter()
-        .map(|member| member.record_digest.clone())
-        .collect();
     let mut seen: Vec<String> = Vec::with_capacity(records.causal_evidence.len());
     for record in &records.causal_evidence {
         record.validate()?;
@@ -3106,20 +3200,34 @@ fn validate_causal_evidence(
             item,
             "causal_evidence",
         )?;
-        check_mechanism_revision(record, records)?;
-        check_evidence_joins(record, item, &retained)?;
+        // The claim's material belongs to the claim's own position, so its
+        // member is resolved here ONCE and both the revision check and the
+        // material join below read that one record. A claim naming a position
+        // with no admitted source member has nothing to read its mechanism
+        // claim from: that is a refusal, not a check that may be skipped, and
+        // skipping it is what let a claim reach an evidence-qualified state
+        // with no retained material of its own behind it.
+        let Some(member) = find_source_member(&records.source_members, &record.source_handle)
+        else {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.source_member".to_owned(),
+                detail: format!(
+                    "no owner source member is admitted for position {}",
+                    redact(&record.source_handle)
+                ),
+            });
+        };
+        check_mechanism_revision(record, member)?;
+        check_evidence_joins(record, item, member)?;
     }
     Ok(())
 }
 
-/// Confirms one mechanism claim was read at the retained source revision.
+/// Confirms one mechanism claim was read at its own source's retained revision.
 fn check_mechanism_revision(
     record: &CausalEvidenceRecord,
-    records: &OwnerRecords,
+    member: &SourceMemberRecord,
 ) -> Result<(), ConflictAnalysisError> {
-    let Some(member) = find_source_member(&records.source_members, &record.source_handle) else {
-        return Ok(());
-    };
     if member.source_revision == record.mechanism.source_revision {
         return Ok(());
     }
@@ -3129,18 +3237,38 @@ fn check_mechanism_revision(
     })
 }
 
-/// Joins every retained envelope to the material it claims and keeps the A-05
+/// Joins every retained envelope to its own source's material and keeps the A-05
 /// receipt out of the causal evidence set.
+///
+/// The join is against the ONE member the claim's own position retained, never
+/// against the union of every member in the analysis. An envelope backed by a
+/// different position's bytes is not evidence about this position, so reading
+/// it as though it were would let one source's retained material qualify
+/// another source's claim.
+///
+/// The envelope's own fence is compared to the current item fence by exact
+/// tuple. The envelope contract validates that a fence is well formed, not
+/// that it is the CURRENT one, so a stale or mixed-fence envelope is otherwise
+/// well-formed evidence: without this comparison it would qualify a claim
+/// under a lease or epoch the analysis does not hold.
 fn check_evidence_joins(
     record: &CausalEvidenceRecord,
     item: &ValidatedCurationItem,
-    retained: &[String],
+    member: &SourceMemberRecord,
 ) -> Result<(), ConflictAnalysisError> {
     for evidence in &record.evidence {
-        if !retained.contains(&evidence.material_digest) {
+        if evidence.material_digest != member.record_digest {
             return Err(ConflictAnalysisError::Binding {
                 field: "causal_evidence.material_digest".to_owned(),
-                detail: "evidence is not joined to any retained source material".to_owned(),
+                detail: "evidence is not joined to the retained material of its own source"
+                    .to_owned(),
+            });
+        }
+        if !fences_match_exact(&evidence.envelope.state_fence, &item.state_fence) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.envelope.state_fence".to_owned(),
+                detail: "evidence was captured under a different fence than the current one"
+                    .to_owned(),
             });
         }
         if evidence.receipt_digest == item.receipt.bundle_digest {
@@ -4080,6 +4208,12 @@ fn blocking_causal_leg(record: &CausalEvidenceRecord) -> Option<String> {
 /// attribution on its own, and correlation and chronology never promote
 /// either. Anything short of the declared state's own requirements stays
 /// [`CausalClaimState::Unknown`].
+///
+/// Reaching [`CausalClaimState::Intervention`] additionally depends on admission
+/// having proved the execution's receipt: [`CausalEvidenceRecord::validate`]
+/// refuses a record whose `intervention.receipt_digest` is not the receipt of
+/// one of its own retained envelopes. So the `Some(_)` arm below is reached
+/// only for an owner-issued execution, never for a well-formed digest.
 fn derive_causal_state(record: &CausalEvidenceRecord) -> CausalClaimState {
     if blocking_causal_leg(record).is_some() {
         return CausalClaimState::Unknown;
