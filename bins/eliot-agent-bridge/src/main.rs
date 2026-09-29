@@ -5,10 +5,10 @@ mod request_input;
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
-    ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile,
-    TransportAdmissionError, TransportProfile, UnderstandingBootstrap, UseOutcome,
-    kernel_ports_with_declaration, loopback_http_route, parse_args, reactive_runtime_composition,
-    validate_credential, validate_host, validate_origin,
+    ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue,
+    OwnerDryRunPreview, Profile, TransportAdmissionError, TransportProfile, UnderstandingBootstrap,
+    UseOutcome, kernel_ports_with_declaration, loopback_http_route, parse_args,
+    reactive_runtime_composition, validate_credential, validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -146,11 +146,13 @@ enum Request {
     /// Dry-run preview of one invocation (I7.17).
     ///
     /// Validates the inert request exactly like [`Request::Invoke`] and then
-    /// answers with a typed static preview instead of dispatching: the
-    /// gateway, the trusted port, the runner, and the admitted transport are
-    /// never touched, so no envelope is built, no replay entry is recorded,
-    /// and no external effect can occur. Read-only tools receive a validated
-    /// preview; effectful tools receive `DRY_RUN_UNSUPPORTED`.
+    /// answers with a typed preview instead of dispatching: read-only tools
+    /// ride the canonical owner path
+    /// ([`dry_run_invocation_via_owner`], kernel preview entry
+    /// `agent_host_request_preview`) while effectful tools without a safe
+    /// simulator keep the local static `DRY_RUN_UNSUPPORTED` answer. No
+    /// envelope is staged, no replay entry is recorded, no receipt is issued,
+    /// and no external effect can occur on any path.
     DryRunInvoke {
         request: HostInvocationRequest,
     },
@@ -593,6 +595,14 @@ struct StopPendingIdentity {
 
 /// Stable identity of the bridge-local static dry-run preview contract.
 const DRY_RUN_PREVIEW_SOURCE: &str = "bridge-static-preview.v1";
+/// Source identity the kernel preview entry emits on every preview answer.
+///
+/// Owned by `bins/eliot-kernel/src/host_request_route.rs`
+/// (`HOST_REQUEST_PREVIEW_SOURCE`); the literal is repeated here because that
+/// constant is `pub(crate)` to the kernel binary. The bridge only reports
+/// this source after [`KernelHostRequestClient::preview_invocation`] joins an
+/// owner answer carrying exactly this identity.
+const DRY_RUN_OWNER_PREVIEW_SOURCE: &str = "kernel-owner-preview.v1";
 /// Disposition of a dry run over a read-only tool with real inert validation.
 const DRY_RUN_PREVIEW_DISPOSITION: &str = "DRY_RUN_PREVIEW";
 /// Honest disposition where the bridge owns no safe simulator (I7.17).
@@ -932,7 +942,9 @@ fn main() {
             Ok(Request::Cancel { request }) => {
                 handle_cancellation(host_gateway, &mut host_request_client, &request)
             }
-            Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
+            Ok(Request::DryRunInvoke { request }) => {
+                dry_run_invocation_via_owner(&runner, &mut host_request_client, &request)
+            }
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
             Ok(Request::ForwardHook { event }) => {
                 let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
@@ -1803,11 +1815,12 @@ fn dry_run_binding(runner: &BridgeRunner) -> DryRunBinding {
 /// Classifies one invocation tool for dry-run preview (I7.17).
 ///
 /// Read-only projections (`eliot.state`, `eliot.packet`, `eliot.query`) carry
-/// no external effects, so the bridge answers them with a validated static
-/// preview naming the entry they would have ridden. Every other tool is
-/// effectful and the bridge owns no safe simulator for it, so the honest
-/// answer is `DRY_RUN_UNSUPPORTED`. Returns the effect class, the route
-/// label, and the disposition in that order.
+/// no external effects, so the canonical dry-run path asks the kernel
+/// preview entry to validate them over immutable owner inputs and answers
+/// with the exact owner preview. Every other tool is effectful and has no
+/// safe simulator, so the honest answer stays the local static
+/// `DRY_RUN_UNSUPPORTED`. Returns the effect class, the route label, and the
+/// disposition in that order.
 fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'static str) {
     match tool {
         ToolRequest::State(_) => (
@@ -1873,6 +1886,93 @@ fn dry_run_invocation(runner: &BridgeRunner, request: &HostInvocationRequest) ->
             source: DRY_RUN_PREVIEW_SOURCE,
             inert_validation: "passed",
             statement: statement.to_owned(),
+        },
+        binding: dry_run_binding(runner),
+    }
+}
+
+/// Answers one read-only invocation dry run through the kernel/operation
+/// owner (I7.17).
+///
+/// Canonical dry-run request path: after the same bridge-local inert
+/// validation as a real invoke (malformed input fails closed with the
+/// identical `HOST_REQUEST_INVALID` shape), tools the bridge classifies as
+/// read-only ride a fresh lookup-only preview envelope to the kernel preview
+/// entry, which runs the existing invoke-read validator over immutable owner
+/// inputs and answers the exact preview plus its source/currentness ceiling.
+/// The preview envelope stages nothing and the entry receipts nothing, so
+/// the target state plus the external-effect ledger stay exactly unchanged;
+/// `simulated` stays false because owner validation ran, never a simulation
+/// and never an effect. Tools without a safe simulator never reach the owner:
+/// they keep the local static `DRY_RUN_UNSUPPORTED` answer of
+/// [`dry_run_invocation`]. Any owner or transport failure on the owner leg
+/// keeps that same static preview, whose statement already says only
+/// bridge-local validation passed.
+fn dry_run_invocation_via_owner(
+    runner: &BridgeRunner,
+    client: &mut KernelHostRequestClient,
+    request: &HostInvocationRequest,
+) -> Response {
+    if let Err(error) = request.validate() {
+        return host_gateway_error(&HostGatewayError::from(error));
+    }
+    let (effect_class, route, disposition) = dry_run_invoke_plan(&request.tool);
+    if disposition != DRY_RUN_PREVIEW_DISPOSITION {
+        return dry_run_invocation(runner, request);
+    }
+    let owner = match client.preview_invocation(request) {
+        Ok(owner) => owner,
+        Err(_) => return dry_run_invocation(runner, request),
+    };
+    let OwnerDryRunPreview { lane, previewed } = owner;
+    let Some(lane) = lane.as_deref().filter(|_| previewed) else {
+        // The owner independently confirmed no serving read lane for this
+        // tool: answer the honest unsupported shape with the best static
+        // preview. No validation/simulation ran against the target operation.
+        return Response::DryRun {
+            correlation_id: request.correlation_id.as_str().to_owned(),
+            operation: "invoke",
+            disposition: DRY_RUN_UNSUPPORTED_DISPOSITION,
+            preview: DryRunPreview {
+                canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
+                operation_handle: None,
+                effect_class,
+                route: DRY_RUN_ROUTE_WITHHELD,
+                deadline_preference_ms: request.deadline_preference_ms,
+                simulated: false,
+            },
+            evidence: DryRunEvidence {
+                source: DRY_RUN_OWNER_PREVIEW_SOURCE,
+                inert_validation: "passed",
+                statement:
+                    "DRY_RUN_UNSUPPORTED: the kernel owner confirmed this tool has no serving \
+                    read lane; no validation/simulation ran against the target operation; no \
+                    effects were issued and nothing was staged"
+                        .to_owned(),
+            },
+            binding: dry_run_binding(runner),
+        };
+    };
+    Response::DryRun {
+        correlation_id: request.correlation_id.as_str().to_owned(),
+        operation: "invoke",
+        disposition,
+        preview: DryRunPreview {
+            canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
+            operation_handle: None,
+            effect_class,
+            route,
+            deadline_preference_ms: request.deadline_preference_ms,
+            simulated: false,
+        },
+        evidence: DryRunEvidence {
+            source: DRY_RUN_OWNER_PREVIEW_SOURCE,
+            inert_validation: "passed",
+            statement: format!(
+                "kernel owner validated the exact tool bytes into serving lane `{lane}`; \
+                owner-confirmed connection and fence match the live binding at preview \
+                time; no simulation ran, no effects were issued, and nothing was staged"
+            ),
         },
         binding: dry_run_binding(runner),
     }
