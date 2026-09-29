@@ -1494,7 +1494,7 @@ async fn run_loop(
     // request must remain a select branch so shutdown and other cadence work
     // keep running while the authenticated response is pending.
     let mut solo_poll_flight = SoloPollFlight::Idle;
-    let mut solo_poll_last_refusal: Option<String> = None;
+    let mut solo_poll_last_diagnostic: Option<String> = None;
     // #2100: O1 owner-feed trigger state. The runtime retains one trigger
     // across passes so an unchanged provider performs no IO, while a
     // revision advance or a recovery re-presentation republishes through the
@@ -1583,7 +1583,7 @@ async fn run_loop(
                     &mut supervision_progress,
                     &mut deferred_supervision_activity,
                     &mut solo_poll_flight,
-                    &mut solo_poll_last_refusal,
+                    &mut solo_poll_last_diagnostic,
                 )
                 .await?;
                 // #1862: the campaign-packet flight keeps its own queue, claim,
@@ -1697,7 +1697,7 @@ async fn run_loop(
                 settle_solo_poll_completion(
                     solo_poll_completion,
                     &mut solo_poll_flight,
-                    &mut solo_poll_last_refusal,
+                    &mut solo_poll_last_diagnostic,
                 );
             }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
@@ -2637,7 +2637,7 @@ async fn drain_flights_on_shutdown(
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     deferred_activity: &mut DeferredSupervisionActivity,
     solo_poll_flight: &mut SoloPollFlight,
-    solo_poll_last_refusal: &mut Option<String>,
+    solo_poll_last_diagnostic: &mut Option<String>,
 ) -> Result<RunLoopExit, String> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -2765,7 +2765,7 @@ async fn drain_flights_on_shutdown(
                 settle_solo_poll_completion(
                     solo_poll_completion,
                     solo_poll_flight,
-                    solo_poll_last_refusal,
+                    solo_poll_last_diagnostic,
                 );
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -3907,7 +3907,7 @@ async fn next_solo_poll_completion(flight: &mut SoloPollFlight) -> SoloPollCompl
 fn settle_solo_poll_completion(
     completion: SoloPollCompletion,
     flight: &mut SoloPollFlight,
-    last_refusal: &mut Option<String>,
+    last_diagnostic: &mut Option<String>,
 ) {
     *flight = SoloPollFlight::Idle;
     let result = match completion {
@@ -3924,17 +3924,119 @@ fn settle_solo_poll_completion(
                 operation_id = %eliotd::diagnostics::sanitize_identity(&operation_id),
                 dispatch_id = %eliotd::diagnostics::sanitize_identity(&dispatch_id),
             );
-            *last_refusal = None;
+            *last_diagnostic = None;
         }
-        Ok(_) => *last_refusal = None,
+        Ok(eliotd::solo_agent_driver::SoloPollOutcome::OwnerBindingPending {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            reason,
+            observed_at_unix_ms,
+        }) => {
+            let diagnostic_key = format!(
+                "owner-binding-pending:{:?}",
+                (&claim_id, &attempt_id, &operation_id, &task_id, reason)
+            );
+            if last_diagnostic.as_deref() != Some(diagnostic_key.as_str()) {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.solo_owner_binding_pending",
+                    claim_id = %eliotd::diagnostics::sanitize_identity(&claim_id),
+                    attempt_id = %eliotd::diagnostics::sanitize_identity(&attempt_id),
+                    operation_id = %eliotd::diagnostics::sanitize_identity(&operation_id),
+                    task_id = %eliotd::diagnostics::sanitize_identity(&task_id),
+                    reason = ?reason,
+                    observed_at_unix_ms,
+                    queue_retained = true,
+                );
+            }
+            *last_diagnostic = Some(diagnostic_key);
+        }
+        Ok(eliotd::solo_agent_driver::SoloPollOutcome::ProviderRevisionsUnavailable {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        }) => {
+            let diagnostic_key = format!(
+                "provider-revisions-unavailable:{:?}",
+                (&claim_id, &attempt_id, &operation_id, &task_id)
+            );
+            if last_diagnostic.as_deref() != Some(diagnostic_key.as_str()) {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.solo_provider_revisions_unavailable",
+                    claim_id = %eliotd::diagnostics::sanitize_identity(&claim_id),
+                    attempt_id = %eliotd::diagnostics::sanitize_identity(&attempt_id),
+                    operation_id = %eliotd::diagnostics::sanitize_identity(&operation_id),
+                    task_id = %eliotd::diagnostics::sanitize_identity(&task_id),
+                    observed_at_unix_ms,
+                    queue_retained = true,
+                );
+            }
+            *last_diagnostic = Some(diagnostic_key);
+        }
+        Ok(eliotd::solo_agent_driver::SoloPollOutcome::OwnerBindingRevoked {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        }) => {
+            let diagnostic_key = format!(
+                "owner-binding-revoked:{:?}",
+                (&claim_id, &attempt_id, &operation_id, &task_id)
+            );
+            if last_diagnostic.as_deref() != Some(diagnostic_key.as_str()) {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.solo_owner_binding_revoked",
+                    claim_id = %eliotd::diagnostics::sanitize_identity(&claim_id),
+                    attempt_id = %eliotd::diagnostics::sanitize_identity(&attempt_id),
+                    operation_id = %eliotd::diagnostics::sanitize_identity(&operation_id),
+                    task_id = %eliotd::diagnostics::sanitize_identity(&task_id),
+                    observed_at_unix_ms,
+                    queue_retained = true,
+                );
+            }
+            *last_diagnostic = Some(diagnostic_key);
+        }
+        Ok(eliotd::solo_agent_driver::SoloPollOutcome::OwnerBindingUnknownOutcome {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        }) => {
+            let diagnostic_key = format!(
+                "owner-binding-unknown-outcome:{:?}",
+                (&claim_id, &attempt_id, &operation_id, &task_id)
+            );
+            if last_diagnostic.as_deref() != Some(diagnostic_key.as_str()) {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.solo_owner_binding_unknown_outcome",
+                    claim_id = %eliotd::diagnostics::sanitize_identity(&claim_id),
+                    attempt_id = %eliotd::diagnostics::sanitize_identity(&attempt_id),
+                    operation_id = %eliotd::diagnostics::sanitize_identity(&operation_id),
+                    task_id = %eliotd::diagnostics::sanitize_identity(&task_id),
+                    observed_at_unix_ms,
+                    queue_retained = true,
+                );
+            }
+            *last_diagnostic = Some(diagnostic_key);
+        }
+        Ok(_) => *last_diagnostic = None,
         Err(error) => {
-            if last_refusal.as_deref() != Some(error.as_str()) {
+            if last_diagnostic.as_deref() != Some(error.as_str()) {
                 tracing::warn!(
                     target: "eliotd::diagnostics",
                     event = "eliotd.solo_poll_refused",
                     detail = %error,
                 );
-                *last_refusal = Some(error);
+                *last_diagnostic = Some(error);
             }
         }
     }
