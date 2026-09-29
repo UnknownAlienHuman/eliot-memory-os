@@ -1743,8 +1743,59 @@ impl DaemonComposition {
             ));
         }
         let outcome = self.map_activation_outcome(ticket, now, successor_observation.as_ref());
+        let outcome = match outcome {
+            Ok(result)
+                if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() =>
+            {
+                self.attach_cold_start_question(ticket, now, result)
+            }
+            other => other,
+        };
         emit_activation_admission_diagnostics(ticket, &outcome);
         outcome
+    }
+
+    /// Runs the reachable, non-ready attach discovery leg for an explicit
+    /// workspace selector. The Host observer supplies filesystem/VCS facts;
+    /// the scanner may return only its smallest privacy-boundary question
+    /// until an installation-backed disclosure owner is supplied.
+    fn attach_cold_start_question(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+        result: AgentActivationResolutionResult,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        let mut observed = crate::task_binding_admission::observe_cold_start_discovery(
+            ticket,
+            &ticket.state_fence,
+            now.max(1),
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let scan = eliot_workscope::run_bootstrap_discovery(
+            None,
+            None,
+            &mut observed.lease,
+            &observed.key,
+            &observed.discovery,
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        match scan {
+            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
+                code,
+                discriminative_question,
+            } => result
+                .with_cold_start_question(
+                    eliot_protocol::AgentActivationColdStartQuestion::new(
+                        code,
+                        discriminative_question,
+                    )
+                    .map_err(|error| DaemonError::Lifecycle(error.to_string()))?,
+                )
+                .map_err(|error| DaemonError::Lifecycle(error.to_string())),
+            eliot_workscope::BootstrapScanOutcome::Completed { .. } => Err(DaemonError::Lifecycle(
+                "cold-start scan completion requires installation owner readback".to_owned(),
+            )),
+        }
     }
 
     /// Resolves this Governor's typed activation outcome for one already

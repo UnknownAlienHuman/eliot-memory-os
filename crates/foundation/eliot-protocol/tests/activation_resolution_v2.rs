@@ -36,6 +36,7 @@ fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-v2-1".to_owned(),
+        workspace_selector: None,
         cancellation_id: "activation-cancellation-v2-1".to_owned(),
         state_fence: StateFence::new(test_epoch(7), ResourceGeneration::new(11)?),
         kernel_deadline_unix_ms: 10_000,

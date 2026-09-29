@@ -761,6 +761,7 @@ impl KernelComposition {
             activation_request_sha256: request.request_sha256.clone(),
             peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
             connection_id: connection_id.to_owned(),
+            workspace_selector: request.workspace_selector.clone(),
             cancellation_id: request.request_identity.cancellation_id.clone(),
             state_fence: receipt.state_fence.clone(),
             kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
@@ -1837,6 +1838,7 @@ impl KernelComposition {
             task_revision: binding.task_revision.clone(),
             plan_id: binding.plan_id.clone(),
             plan_revision: binding.plan_revision.clone(),
+            cold_start_question: result.cold_start_question.clone(),
         };
         let response = AgentBridgeActivationResponse {
             wire_id: eliot_protocol::AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
@@ -2304,8 +2306,7 @@ impl KernelComposition {
         );
         let result = match (result, cleanup, pending_poisoned) {
             (Ok(reply), Ok(()), false) => Ok(reply),
-            (Err(error), _, _) => Err(error),
-            (Ok(_), Err(error), _) => Err(error),
+            (Err(error), _, _) | (Ok(_), Err(error), _) => Err(error),
             (Ok(_), Ok(()), true) => Err(TransportError::SessionFenced),
         };
         match &result {

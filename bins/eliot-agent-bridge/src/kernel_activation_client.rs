@@ -316,6 +316,7 @@ pub(super) fn build_neutral_activation_request(
         operation: eliot_protocol::AGENT_BRIDGE_ACTIVATION_OPERATION.to_owned(),
         demand_id: demand_id.to_owned(),
         connection_id: receipt.connection_id.clone(),
+        workspace_selector: core_request.workspace_selector().map(str::to_owned),
         attach_kind,
         pre_attach_blind_interval: blind,
         request_identity,
@@ -524,21 +525,23 @@ impl KernelTransportOwner {
                     b.state_fence.nonce,
                 )
                 .map_err(|_| provider_failure())?;
-                Ok(ActivationPortOutcome::Authenticated(
-                    ActivationPortResult::authenticated(
-                        principal_id,
-                        session_id,
-                        generation,
-                        fence,
-                        task_id,
-                        work_unit_id,
-                        b.work_scope_id,
-                        b.task_revision,
-                        b.plan_id,
-                        b.plan_revision,
-                    )
-                    .map_err(|_| provider_failure())?,
-                ))
+                let result = ActivationPortResult::authenticated(
+                    principal_id,
+                    session_id,
+                    generation,
+                    fence,
+                    task_id,
+                    work_unit_id,
+                    b.work_scope_id,
+                    b.task_revision,
+                    b.plan_id,
+                    b.plan_revision,
+                )
+                .map_err(|_| provider_failure())?;
+                let result = result
+                    .with_cold_start_question(b.cold_start_question)
+                    .map_err(|_| provider_failure())?;
+                Ok(ActivationPortOutcome::Authenticated(result))
             }
         }
     }

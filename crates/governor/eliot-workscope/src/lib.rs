@@ -3729,10 +3729,10 @@ mod tests {
     fn bootstrap_discovery(privacy_boundary: Option<PrivacyBoundary>) -> BootstrapDiscoveryInputs {
         BootstrapDiscoveryInputs {
             scan_ref: "scan:one".into(),
-            candidate_privacy: PrivacyClass::Internal,
+            candidate_privacy: Some(PrivacyClass::Internal),
             privacy_boundary,
             observed: bootstrap_observed(),
-            policy: bootstrap_policy(),
+            policy: Some(bootstrap_policy()),
             evidence: bootstrap_evidence(),
             proposed_kind: ScopeKind::GitRepo,
             identity_fingerprint: "fingerprint:one".into(),
@@ -3864,8 +3864,8 @@ mod tests {
             handles: Vec::new(),
         };
         let outcome = match run_bootstrap_discovery(
-            &mut store,
-            &bootstrap_binding(),
+            Some(&mut store),
+            Some(&bootstrap_binding()),
             &mut lease,
             &bootstrap_key(),
             &bootstrap_discovery(Some(bootstrap_boundary())),
@@ -3917,8 +3917,8 @@ mod tests {
             handles: Vec::new(),
         };
         let outcome = match run_bootstrap_discovery(
-            &mut store,
-            &bootstrap_binding(),
+            Some(&mut store),
+            Some(&bootstrap_binding()),
             &mut lease,
             &bootstrap_key(),
             &bootstrap_discovery(None),
