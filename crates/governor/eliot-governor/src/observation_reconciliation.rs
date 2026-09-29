@@ -1187,6 +1187,17 @@ pub enum NegativeMemoryGateOutcome {
     /// A complete bounded enumeration found no applicable rule and the effect
     /// proceeded.
     ProceededWithoutWarning,
+    /// The gate could not decide, and the effect was refused rather than
+    /// judged.
+    ///
+    /// This variant exists because its absence was a live defect: with no way
+    /// to say "undecided", an undecidable gate had to be recorded as
+    /// `ProceededWithoutWarning`, which asserts two things that are both
+    /// false - that a complete enumeration ran, and that the effect proceeded.
+    /// Neither is true of an `Unavailable` decision, which is the gate refusing
+    /// to certify either a match or an absence. An absence of evidence is not
+    /// evidence of absence, and an undecided gate is not a pass.
+    Undecided,
 }
 
 impl NegativeMemoryGateOutcome {
@@ -1198,6 +1209,7 @@ impl NegativeMemoryGateOutcome {
             Self::ProbeRequired => "probe_required",
             Self::ProceededWithWarning => "proceeded_with_warning",
             Self::ProceededWithoutWarning => "proceeded_without_warning",
+            Self::Undecided => "undecided",
         }
     }
 }
@@ -1249,7 +1261,10 @@ impl NegativeMemoryGateObservation {
     pub fn observation_identity(&self) -> String {
         format!(
             "{}:{}:{}:{}",
-            self.action_operation_id, self.record_id, self.rule_revision, self.outcome.as_str()
+            self.action_operation_id,
+            self.record_id,
+            self.rule_revision,
+            self.outcome.as_str()
         )
     }
 
@@ -1275,8 +1290,8 @@ fn negative_memory_gate_submission(
 ) -> Result<ObservationSubmission, CompositionError> {
     let fence = identity.request.metadata.state_fence.clone();
     let generation = fence.resource_generation.value().to_string();
-    let work_scope = WorkScopeId::new(GOVERNOR_SCOPE_ID)
-        .map_err(|error| owner_refused(error.to_string()))?;
+    let work_scope =
+        WorkScopeId::new(GOVERNOR_SCOPE_ID).map_err(|error| owner_refused(error.to_string()))?;
     let record = ObservationRecordEnvelope {
         record_id: format!("negative-memory-gate:{}", outcome.dedup_key()),
         kind: ObservationRecordKind::Telemetry,
@@ -2050,7 +2065,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         &self,
         identity: &eliot_protocol::RequestIdentity,
         base_operation_id: &OperationId,
-        outcome: &NegativeMemoryGateOutcome,
+        outcome: &NegativeMemoryGateObservation,
     ) -> Result<WriteReceipt, CompositionError> {
         self.validate_capture_identity_fence(identity)?;
         let observation_operation = OperationId::new(format!(

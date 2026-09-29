@@ -38,23 +38,27 @@
 
 use std::collections::BTreeMap;
 
+use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_context_contracts::QualityScorecard;
 use eliot_dreamer_failure::{
     FailureAction, FailureApplicability, FailureCoverage, FailureDimension, FailureEnvironment,
     NegativeMemoryHorizonDomain, NegativeMemoryHorizonDomainKind, NegativeMemoryMatchBound,
-    NegativeMemoryMatchResult, NegativeMemoryResource, NegativeMemorySubject, match_negative_memory,
+    NegativeMemoryMatchResult, NegativeMemoryResource, NegativeMemorySubject,
+    match_negative_memory,
 };
 use eliot_governor::{
-    GovernorComposition, KernelGenerationPort, NegativeMemoryGateDecision, NegativeMemoryGateInput,
-    NegativeMemoryProbeProposal, NegativeMemoryProceedWarning, NegativeMemoryRuleProjection,
-    admit_negative_memory_probe, apply_negative_memory_coverage, evaluate_negative_memory_gate,
+    CompositionError, GovernorComposition, KernelGenerationPort, NamedReadProbeExecutor,
+    NegativeMemoryGateDecision, NegativeMemoryGateInput, NegativeMemoryProbeProposal,
+    NegativeMemoryRuleProjection, admit_negative_memory_probe, apply_negative_memory_coverage,
+    evaluate_negative_memory_gate, execute_negative_memory_probe,
     negative_memory_gate_refusal_message, plan_negative_memory_rule_read,
     project_negative_memory_rules, resolve_negative_memory_rule_read,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    CanonicalWriteEnvelope, EffectClass, NamedReadRequest, NamedReadResponse, OperationId, ScopeId,
-    StateFence, WriteReceipt,
+    EffectClass, LearningRecordKind, MAX_LEARNING_PAGE_RECORDS, NamedReadOperation,
+    NamedReadRequest, NamedReadResponse, OperationId, ReadConsistency, ScopeId, StateFence,
+    WriteReceipt,
 };
 use thiserror::Error;
 
@@ -195,10 +199,15 @@ pub async fn resolve_rule_set(
 ) -> Result<eliot_governor::ResolvedNegativeMemoryRuleSet, NegativeMemoryActionError> {
     let scope_id = ScopeId::new(action.scope_id.as_str())
         .map_err(|error| NegativeMemoryActionError::Plan(error.to_string()))?;
-    let request: NamedReadRequest = plan_negative_memory_rule_read(scope_id, action.state_fence.clone())
-        .map_err(|error| NegativeMemoryActionError::Plan(error.to_string()))?;
+    let request: NamedReadRequest =
+        plan_negative_memory_rule_read(scope_id, action.state_fence.clone())
+            .map_err(|error| NegativeMemoryActionError::Plan(error.to_string()))?;
+    // The transport takes the request by value; the resolver then needs it to
+    // prove the response answers THIS read, so the send gets a clone and the
+    // original stays for the comparison. This is the same order
+    // `skill_evidence_read` uses.
     let response: NamedReadResponse = kernel
-        .store_named_async(request)
+        .store_named_async(request.clone())
         .await
         .map_err(|error| NegativeMemoryActionError::Resolve(error.to_string()))?;
     resolve_negative_memory_rule_read(&request, &response)
@@ -321,13 +330,9 @@ pub fn project_action_response(
 ) -> Result<NegativeMemoryRuleProjection, NegativeMemoryActionError> {
     let subject = action_subject(action)?;
     let horizon = observed_horizon(action)?;
-    let matched: NegativeMemoryMatchResult = match_negative_memory(
-        &subject,
-        &horizon,
-        resolved.read(),
-        &gate_bound(),
-    )
-    .map_err(|error| NegativeMemoryActionError::Subject(error.to_string()))?;
+    let matched: NegativeMemoryMatchResult =
+        match_negative_memory(&subject, &horizon, resolved.read(), &gate_bound())
+            .map_err(|error| NegativeMemoryActionError::Subject(error.to_string()))?;
     let mut records = BTreeMap::new();
     let mut policies = BTreeMap::new();
     for record in resolved.records() {
@@ -368,6 +373,59 @@ pub fn probe_for(
     let proposal = admit_negative_memory_probe(decision, resolved)
         .map_err(|error| NegativeMemoryActionError::Refused(error.to_string()))?;
     Ok(Some(proposal))
+}
+
+/// Binds the read-only probe executor to the retained Kernel named-read route.
+///
+/// This is the production transport: one closed `NamedReadRequest` answered by
+/// the store at the requested exact fence, or a typed error. It is the same
+/// `store_named_async` route `skill_evidence_read` uses, so the probe adds no
+/// second read path - and a transport that answered with a substitute response
+/// instead of refusing would not satisfy the executor's contract.
+fn kernel_probe_executor(kernel: &DaemonKernelClient) -> NamedReadProbeExecutor<'_> {
+    NamedReadProbeExecutor::new(
+        plan_probe_read,
+        Box::new(move |request| {
+            Box::pin(async move {
+                kernel
+                    .store_named_async(request)
+                    .await
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))
+            })
+        }),
+    )
+}
+
+/// Plans the probe's one bounded read over the scope the rule set came from.
+///
+/// The scope is the PROPOSAL's own, not a fixed one: a probe read against any
+/// other scope would answer about a different rule set than the one the
+/// admission was built from. The operation, consistency and record kind are the
+/// same closed learning-record range the rule-set read uses, so the probe adds
+/// no second read path, and the request is validated before it is sent.
+fn plan_probe_read(
+    proposal: &NegativeMemoryProbeProposal,
+) -> Result<NamedReadRequest, CompositionError> {
+    let mut parameters = BTreeMap::new();
+    parameters.insert(
+        "record_kind".to_owned(),
+        serde_json::Value::String(LearningRecordKind::ActivationReceipt.as_str().to_owned()),
+    );
+    parameters.insert(
+        "max_records".to_owned(),
+        serde_json::Value::String(MAX_LEARNING_PAGE_RECORDS.to_string()),
+    );
+    let request = NamedReadRequest {
+        operation: NamedReadOperation::GetLearningRecordRange,
+        scope_id: Some(proposal.scope_id().clone()),
+        consistency: ReadConsistency::ExactFence,
+        state_fence: proposal.admitted_state_fence().clone(),
+        parameters,
+    };
+    request
+        .validate()
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    Ok(request)
 }
 
 /// Appends one matched gate outcome to the existing observation path.
@@ -417,7 +475,9 @@ fn matched_outcome(
             rule_revision,
             ..
         } => (record_id.clone(), *rule_revision, String::new()),
-        NegativeMemoryGateDecision::Proceed { warning: Some(warning) } => (
+        NegativeMemoryGateDecision::Proceed {
+            warning: Some(warning),
+        } => (
             warning.record_id.clone(),
             warning.rule_revision,
             String::new(),
@@ -446,7 +506,9 @@ fn matched_outcome(
 }
 
 /// Re-derives the observation outcome class from the decision itself.
-const fn observation_outcome(decision: &NegativeMemoryGateDecision) -> eliot_governor::NegativeMemoryGateOutcome {
+const fn observation_outcome(
+    decision: &NegativeMemoryGateDecision,
+) -> eliot_governor::NegativeMemoryGateOutcome {
     match decision {
         NegativeMemoryGateDecision::Block { .. } => {
             eliot_governor::NegativeMemoryGateOutcome::Blocked
@@ -461,7 +523,7 @@ const fn observation_outcome(decision: &NegativeMemoryGateDecision) -> eliot_gov
             eliot_governor::NegativeMemoryGateOutcome::ProceededWithoutWarning
         }
         NegativeMemoryGateDecision::Unavailable { .. } => {
-            eliot_governor::NegativeMemoryGateOutcome::ProceededWithoutWarning
+            eliot_governor::NegativeMemoryGateOutcome::Undecided
         }
     }
 }
@@ -500,6 +562,10 @@ pub async fn commit_gated_action<P: KernelGenerationPort + ?Sized>(
         resolved: &resolved,
         revalidated_rule_set_revision: Some(resolved.rule_set_revision()),
         state_fence: &action.state_fence,
+        // The first evaluation has not run any probe, so a `RequireCheck` is
+        // correctly refused here. The admission arrives in `executed_input`
+        // below, and only that second evaluation can resolve the demand.
+        probe_admission: None,
     };
     let decision = evaluate_negative_memory_gate(&input);
     let projection = project_action_response(action, &resolved, scorecard)?;
@@ -517,8 +583,26 @@ pub async fn commit_gated_action<P: KernelGenerationPort + ?Sized>(
         .await;
         return Err(NegativeMemoryActionError::Refused(refusal));
     }
+    // A `RequireCheck` demands the named discriminating check actually run, so
+    // the proposal is executed over the retained read-only Kernel route and the
+    // resulting admission - not the proposal - is what the gate is re-evaluated
+    // with. An absent or refused probe leaves `probe_admission` as `None`,
+    // which keeps the decision a refusal; the executed check is the only thing
+    // that can turn a demand into a pass.
+    let probe_admission = match probe.as_ref() {
+        Some(proposal) => Some(
+            execute_negative_memory_probe(proposal, &kernel_probe_executor(kernel))
+                .await
+                .map_err(|error| NegativeMemoryActionError::Refused(error.to_string()))?,
+        ),
+        None => None,
+    };
+    let executed_input = NegativeMemoryGateInput {
+        probe_admission: probe_admission.as_ref(),
+        ..input.clone()
+    };
     let committed = governor
-        .commit_canonical_gated_by_negative_memory(identity, envelope, &input)
+        .commit_canonical_gated_by_negative_memory(identity, envelope, &executed_input)
         .await
         .map_err(|error| NegativeMemoryActionError::Refused(error.to_string()))?;
     append_matched_outcome(

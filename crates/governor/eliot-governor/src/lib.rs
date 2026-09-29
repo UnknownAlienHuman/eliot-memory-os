@@ -84,13 +84,14 @@ pub use negative_memory_gate::{
     negative_memory_gate_refusal_message, refusal_as_composition_error,
 };
 pub use negative_memory_probe::{
-    NegativeMemoryProbeAdmission, NegativeMemoryProbeBudget, NegativeMemoryProbeEffectCeiling,
-    NegativeMemoryProbeExecution, NegativeMemoryProbeProposal, NegativeMemoryProbeRefusal,
-    admit_negative_memory_probe, execute_negative_memory_probe,
+    NamedReadProbeExecutor, NegativeMemoryProbeAdmission, NegativeMemoryProbeBudget,
+    NegativeMemoryProbeEffectCeiling, NegativeMemoryProbeExecution, NegativeMemoryProbeExecutor,
+    NegativeMemoryProbeProposal, NegativeMemoryProbeRefusal, admit_negative_memory_probe,
+    execute_negative_memory_probe,
 };
 pub use negative_memory_read::{
-    NegativeMemoryReadRefusal, ResolvedNegativeMemoryRuleSet,
-    plan_negative_memory_rule_read, resolve_negative_memory_rule_read,
+    NegativeMemoryReadRefusal, ResolvedNegativeMemoryRuleSet, plan_negative_memory_rule_read,
+    resolve_negative_memory_rule_read,
 };
 mod controlboard_projection;
 mod learning_admission;

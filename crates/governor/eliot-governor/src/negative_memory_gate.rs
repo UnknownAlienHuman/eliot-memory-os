@@ -133,6 +133,7 @@ use eliot_dreamer_failure::{
 use eliot_store_api::StateFence;
 
 use crate::composition::CompositionError;
+use crate::negative_memory_probe::NegativeMemoryProbeAdmission;
 use crate::negative_memory_read::ResolvedNegativeMemoryRuleSet;
 
 /// A near-match or advisory warning that accompanies a proceed.
@@ -318,6 +319,19 @@ pub struct NegativeMemoryGateInput<'a> {
     /// request being admitted, not between two values the caller supplied
     /// together.
     pub state_fence: &'a StateFence,
+    /// The probe admission that resolves this action's
+    /// [`NegativeMemoryGateDecision::RequireCheck`], when one has been produced.
+    ///
+    /// A `RequireCheck` decision names the discriminating check that must run
+    /// and the verifier that must produce it, and by itself it refuses the
+    /// action. This is the second, producer-issued half: the admission returned
+    /// by
+    /// [`execute_negative_memory_probe`](crate::negative_memory_probe::execute_negative_memory_probe),
+    /// which re-reads the scope at the admitted fence and admits the result
+    /// only when the store's own verifier binding is the record's. It is
+    /// `None` when no probe has been executed, and a `None` here leaves the
+    /// action refused - it never turns a check into a pass.
+    pub probe_admission: Option<&'a NegativeMemoryProbeAdmission>,
 }
 
 fn refused(refusal: NegativeMemoryGateRefusal) -> NegativeMemoryGateDecision {
@@ -540,18 +554,44 @@ fn decide_exact(
             policy_id: policy.policy_id.clone(),
             rule_set_revision,
         },
-        NegativeMemoryDisposition::RequireCheck => NegativeMemoryGateDecision::RequireCheck {
-            record_id: record.record_id.clone(),
-            rule_revision: record.rule_revision,
-            policy_id: policy.policy_id.clone(),
-            check_id: record.discriminating_check.check_id.clone(),
-            required_verifier: record.discriminating_check.required_verifier.clone(),
-            discriminates_dimension_names: record
-                .discriminating_check
-                .discriminates_dimension_names
-                .clone(),
-            rule_set_revision,
-        },
+        NegativeMemoryDisposition::RequireCheck => {
+            let check = &record.discriminating_check;
+            // A `RequireCheck` is a demand, not a verdict: the action is
+            // refused until the named check has actually run. The only thing
+            // that resolves it is a probe admission for THIS check, run
+            // against THIS record and revision, produced by the verifier THIS
+            // record names, and served at the fence this request is admitted
+            // at. So an absent admission, an admission for a different check,
+            // an admission for a different rule revision, an admission whose
+            // verifier is not the record's, and an admission served at another
+            // fence all leave the action refused. Nothing here can turn an
+            // unexecuted check into a pass.
+            if let Some(admission) = input.probe_admission
+                && admission.check_id == check.check_id
+                && admission.verifier == check.required_verifier
+                && admission.record_id == record.record_id
+                && admission.rule_revision == record.rule_revision
+                && admission.served_state_fence == *input.state_fence
+            {
+                return NegativeMemoryGateDecision::Proceed {
+                    warning: Some(NegativeMemoryProceedWarning {
+                        record_id: record.record_id.clone(),
+                        rule_revision: record.rule_revision,
+                        differing_field_names: Vec::new(),
+                        enumeration_incomplete: false,
+                    }),
+                };
+            }
+            NegativeMemoryGateDecision::RequireCheck {
+                record_id: record.record_id.clone(),
+                rule_revision: record.rule_revision,
+                policy_id: policy.policy_id.clone(),
+                check_id: check.check_id.clone(),
+                required_verifier: check.required_verifier.clone(),
+                discriminates_dimension_names: check.discriminates_dimension_names.clone(),
+                rule_set_revision,
+            }
+        }
         // An advisory policy on an exact match is a warning, never a block: the
         // policy owner explicitly declined blocking power.
         NegativeMemoryDisposition::Advisory => NegativeMemoryGateDecision::Proceed {
@@ -571,10 +611,10 @@ fn decide_exact(
 /// digest; this looks up the record itself in the snapshot it just compared, so
 /// the disposition is decided against the record's own recorded discriminating
 /// check rather than against anything the caller supplied alongside the match.
-fn find_matched_record(
-    resolved: &ResolvedNegativeMemoryRuleSet,
+fn find_matched_record<'a>(
+    resolved: &'a ResolvedNegativeMemoryRuleSet,
     matched: &eliot_dreamer_failure::ExactMatch,
-) -> Option<&NegativeMemoryFingerprint> {
+) -> Option<&'a NegativeMemoryFingerprint> {
     for page in &resolved.read().delivered_pages {
         for rule in &page.rules {
             if rule.record_id == matched.record_id

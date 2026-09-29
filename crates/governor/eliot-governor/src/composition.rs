@@ -22,6 +22,9 @@ use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
 use crate::negative_memory_gate::{
     self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
 };
+use crate::negative_memory_probe::{
+    NegativeMemoryProbeExecutor, admit_negative_memory_probe, execute_negative_memory_probe,
+};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
@@ -6561,6 +6564,66 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<NegativeMemoryGatedCommit, CompositionError> {
         bind_gate_to_request(gate, &envelope)?;
         let decision = evaluate_negative_memory_gate(gate);
+        if let Some(refusal) = negative_memory_gate::refusal_as_composition_error(&decision) {
+            return Err(refusal);
+        }
+        let receipt = self.commit_canonical(identity, envelope).await?;
+        Ok(NegativeMemoryGatedCommit { receipt, decision })
+    }
+
+    /// Commits a canonical write after running the discriminating check a
+    /// [`NegativeMemoryGateDecision::RequireCheck`] demands.
+    ///
+    /// This is the production caller for the read-only probe executor, and it
+    /// exists because a `RequireCheck` is a DEMAND rather than a verdict: the
+    /// plain gated commit refuses such an action and stays refusing it, which
+    /// is correct but leaves the demanded check unrun. Here the gate is
+    /// evaluated once to learn which check the matched rule declares, the
+    /// proposal is built only from that decision and this envelope's own
+    /// owner-observed rule set, the probe is executed through the retained
+    /// read-only route, and the gate is evaluated a SECOND time with the
+    /// resulting admission. The second evaluation is the same pure function
+    /// with one more input, so the probe result cannot grant anything the
+    /// first evaluation would have refused for any other reason.
+    ///
+    /// A probe that fails to execute, that is served at another fence, or whose
+    /// verifier is not the record's own leaves the second decision a
+    /// `RequireCheck` refusal. There is no path here where an unexecuted check
+    /// becomes a pass, and the write is refused in that case exactly as the
+    /// plain gated commit refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] when the gate refuses after the probe, when
+    /// the probe cannot be proposed for the returned decision, or when the
+    /// underlying canonical commit fails. A probe refusal is reported as the
+    /// gate's own typed refusal rather than flattened, so the caller learns
+    /// that the action was held for an unexecuted check.
+    pub async fn commit_canonical_gated_by_executed_check(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+        gate: &NegativeMemoryGateInput<'_>,
+        probe: &dyn NegativeMemoryProbeExecutor,
+    ) -> Result<NegativeMemoryGatedCommit, CompositionError> {
+        bind_gate_to_request(gate, &envelope)?;
+        let first = evaluate_negative_memory_gate(gate);
+        let admission = if matches!(first, NegativeMemoryGateDecision::RequireCheck { .. }) {
+            let proposal = admit_negative_memory_probe(&first, gate.resolved)
+                .map_err(|refusal| CompositionError::Recovery(format!("{refusal}")))?;
+            Some(
+                execute_negative_memory_probe(&proposal, probe)
+                    .await
+                    .map_err(|refusal| CompositionError::Recovery(format!("{refusal}")))?,
+            )
+        } else {
+            None
+        };
+        let resolved_input = NegativeMemoryGateInput {
+            probe_admission: admission.as_ref(),
+            ..gate.clone()
+        };
+        let decision = evaluate_negative_memory_gate(&resolved_input);
         if let Some(refusal) = negative_memory_gate::refusal_as_composition_error(&decision) {
             return Err(refusal);
         }

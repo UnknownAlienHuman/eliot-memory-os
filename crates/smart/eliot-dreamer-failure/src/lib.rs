@@ -26,8 +26,8 @@ pub use assessment::{
     OutcomeAssessment, TriggerAssessment,
 };
 pub use eliot_dreamer_contracts::{
-    FailureAction, FailureApplicability, FailureCoverage, FailureDimension,
-    FailureDimensionSource, FailureDimensionValue, FailureDisposition, FailureEnvironment,
+    FailureAction, FailureApplicability, FailureCoverage, FailureDimension, FailureDimensionSource,
+    FailureDimensionValue, FailureDisposition, FailureEnvironment,
 };
 pub use negative_memory::{
     LegacyFailureFingerprintRecord, NEGATIVE_MEMORY_MAX_BYTES, NEGATIVE_MEMORY_MAX_TEXT,

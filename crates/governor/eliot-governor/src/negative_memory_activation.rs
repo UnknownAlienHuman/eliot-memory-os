@@ -125,7 +125,9 @@ pub fn negative_memory_policy_admission_ref(policy: &NegativeMemoryActionPolicy)
     let bytes = canonical_json_bytes(policy).unwrap_or_default();
     format!(
         "negative-memory-admission:{}:{}:{}",
-        policy.policy_id, policy.policy_revision, sha256_hex(&bytes)
+        policy.policy_id,
+        policy.policy_revision,
+        sha256_hex(&bytes)
     )
 }
 

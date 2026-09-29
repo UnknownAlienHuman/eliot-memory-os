@@ -80,7 +80,9 @@ use eliot_store_api::{
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::negative_memory_activation::{ACTIVATION_HANDLE_PREFIX, NegativeMemoryActivationDocument};
+use crate::negative_memory_activation::{
+    ACTIVATION_HANDLE_PREFIX, NegativeMemoryActivationDocument,
+};
 
 /// Maximum pages one resolver call may consider when a page was truncated.
 ///
@@ -258,10 +260,7 @@ pub fn resolve_negative_memory_rule_read(
     let read = assemble_read(&scope_id, rule_set_revision, &records, truncated)?;
     Ok(ResolvedNegativeMemoryRuleSet {
         read,
-        policies: records
-            .iter()
-            .map(|entry| entry.policy.clone())
-            .collect(),
+        policies: records.iter().map(|entry| entry.policy.clone()).collect(),
         records: records.iter().map(|entry| entry.record.clone()).collect(),
         store_observed_fence: response.state_fence.clone(),
         scope_id,
@@ -398,8 +397,13 @@ fn decode_row(row: &Value) -> Result<DecodedRule, NegativeMemoryReadRefusal> {
             "presented row digest does not cover the served record bytes".to_owned(),
         ));
     }
-    let document: NegativeMemoryActivationDocument = serde_json::from_str(&record_json)
-        .map_err(|error| refused(&handle, format!("activation document does not decode: {error}")))?;
+    let document: NegativeMemoryActivationDocument =
+        serde_json::from_str(&record_json).map_err(|error| {
+            refused(
+                &handle,
+                format!("activation document does not decode: {error}"),
+            )
+        })?;
     if document.handle() != handle {
         return Err(refused(
             &handle,
@@ -448,7 +452,11 @@ fn assemble_read(
             FailureCoverage::Partial,
         )
     } else {
-        (DeclaredPageTotal::Known { page_total: 1 }, Vec::new(), FailureCoverage::Complete)
+        (
+            DeclaredPageTotal::Known { page_total: 1 },
+            Vec::new(),
+            FailureCoverage::Complete,
+        )
     };
     let read = NegativeMemoryCandidateRead {
         read_handle,
@@ -467,7 +475,7 @@ fn assemble_read(
         return Err(NegativeMemoryReadRefusal::Payload("delivered page count"));
     }
     read.validate()
-        .map_err(|error| NegativeMemoryReadRefusal::Payload("read"))?;
+        .map_err(|_| NegativeMemoryReadRefusal::Payload("read"))?;
     Ok(read)
 }
 
@@ -475,7 +483,9 @@ fn assemble_read(
 ///
 /// The digest is order-invariant: the store's row order is a keyset artefact,
 /// not a property of the rule set, so two reads of the same rows agree.
-fn rule_set_digest(rules: &[NegativeMemoryFingerprint]) -> Result<String, NegativeMemoryReadRefusal> {
+fn rule_set_digest(
+    rules: &[NegativeMemoryFingerprint],
+) -> Result<String, NegativeMemoryReadRefusal> {
     let mut identities: Vec<(&str, u64, &str)> = rules
         .iter()
         .map(|rule| {
@@ -488,6 +498,6 @@ fn rule_set_digest(rules: &[NegativeMemoryFingerprint]) -> Result<String, Negati
         .collect();
     identities.sort_unstable();
     let bytes = canonical_json_bytes(&identities)
-        .map_err(|error| NegativeMemoryReadRefusal::Payload("rule_set_digest"))?;
+        .map_err(|_| NegativeMemoryReadRefusal::Payload("rule_set_digest"))?;
     Ok(sha256_hex(&bytes))
 }

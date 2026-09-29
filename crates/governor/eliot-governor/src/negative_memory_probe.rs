@@ -47,6 +47,7 @@
 #![forbid(unsafe_code)]
 
 use std::future::Future;
+use std::pin::Pin;
 
 use eliot_contracts::{OperationId, StateFence};
 use eliot_dreamer_failure::{
@@ -114,7 +115,10 @@ impl std::fmt::Display for NegativeMemoryProbeRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotARequiredCheck { decision } => {
-                write!(formatter, "gate decision {decision} names no required check")
+                write!(
+                    formatter,
+                    "gate decision {decision} names no required check"
+                )
             }
             Self::RuleSetIncomplete => {
                 write!(
@@ -207,11 +211,11 @@ impl NegativeMemoryProbeBudget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NegativeMemoryProbeForbiddenEffectGuard {
     /// The recorded effect class the probe must not perform.
-    pub forbidden_effect_class: EffectClass,
+    pub effect_class: EffectClass,
     /// The recorded effect identity the probe must not perform.
-    pub forbidden_effect_id: String,
+    pub effect_id: String,
     /// The recorded operation identity the probe must not reuse.
-    pub forbidden_operation_id: String,
+    pub operation_id: String,
 }
 
 /// One admitted, typed, read-only discriminating-check proposal.
@@ -382,9 +386,9 @@ impl NegativeMemoryProbeProposal {
                 self.operation_id.as_str()
             )));
         }
-        if self.forbidden_effect.forbidden_operation_id != self.protected_operation_id
-            || self.forbidden_effect.forbidden_effect_id != self.protected_effect_id
-            || self.forbidden_effect.forbidden_effect_class != self.protected_effect_class
+        if self.forbidden_effect.operation_id != self.protected_operation_id
+            || self.forbidden_effect.effect_id != self.protected_effect_id
+            || self.forbidden_effect.effect_class != self.protected_effect_class
         {
             return Err(NegativeMemoryProbeRefusal::ProposalInvalid(
                 "forbidden-effect guard does not bind the protected action".to_owned(),
@@ -482,9 +486,9 @@ fn build_proposal(
         ceiling: NegativeMemoryProbeEffectCeiling::ReadOnly,
         budget: NegativeMemoryProbeBudget::bounded(),
         forbidden_effect: NegativeMemoryProbeForbiddenEffectGuard {
-            forbidden_effect_class: record.failed_action.effect_class,
-            forbidden_effect_id: record.failed_action.effect_id.clone(),
-            forbidden_operation_id: record.failed_action.operation_id.clone(),
+            effect_class: record.failed_action.effect_class,
+            effect_id: record.failed_action.effect_id.clone(),
+            operation_id: record.failed_action.operation_id.clone(),
         },
     };
     proposal.validate()?;
@@ -547,12 +551,15 @@ pub trait NegativeMemoryProbeExecutor {
     fn execute<'e>(
         &'e self,
         proposal: &'e NegativeMemoryProbeProposal,
-    ) -> Box<dyn Future<Output = Result<NegativeMemoryProbeExecution, CompositionError>> + Send + 'e>;
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<NegativeMemoryProbeExecution, CompositionError>> + Send + 'e,
+        >,
+    >;
 }
 
 /// The production probe executor: one bounded, exact-fence, read-only named
-/// read over the same scope the rule set came from.
-///
+/// read over the same scope the rule set came from.///
 /// The executor performs no effect of any kind. It re-reads the activation
 /// receipts for the proposal's scope at the proposal's own admitted fence
 /// through the retained authenticated Kernel route, and reports the verifier
@@ -561,14 +568,27 @@ pub trait NegativeMemoryProbeExecutor {
 /// answers another operation is refused, and the retained outcome is `Unknown`
 /// rather than `Passed`: an unrelated or unresolved read is never a passing
 /// discriminating check.
+/// The bounded read transport a probe runs over.
+///
+/// Named so the executor's type says what it holds rather than spelling the
+/// boxed future out twice: the production binding is the daemon's retained
+/// `store_named_async` route, and any other binding must satisfy the same
+/// contract - one closed named read, served at the requested exact fence, or a
+/// typed error. A transport that returns a substitute response rather than
+/// refusing does not satisfy this.
+pub type NegativeMemoryProbeTransport<'a> = Box<
+    dyn Fn(
+            NamedReadRequest,
+        )
+            -> Pin<Box<dyn Future<Output = Result<NamedReadResponse, CompositionError>> + Send + 'a>>
+        + Send
+        + Sync
+        + 'a,
+>;
+
 pub struct NamedReadProbeExecutor<'a> {
     plan: fn(&NegativeMemoryProbeProposal) -> Result<NamedReadRequest, CompositionError>,
-    send: Box<
-        dyn Fn(NamedReadRequest) -> Box<dyn Future<Output = Result<NamedReadResponse, CompositionError>> + Send>
-            + Send
-            + Sync
-            + 'a,
-    >,
+    send: NegativeMemoryProbeTransport<'a>,
 }
 
 impl<'a> NamedReadProbeExecutor<'a> {
@@ -577,15 +597,7 @@ impl<'a> NamedReadProbeExecutor<'a> {
     #[must_use]
     pub fn new(
         plan: fn(&NegativeMemoryProbeProposal) -> Result<NamedReadRequest, CompositionError>,
-        send: Box<
-            dyn Fn(
-                    NamedReadRequest,
-                ) -> Box<
-                    dyn Future<Output = Result<NamedReadResponse, CompositionError>> + Send,
-                > + Send
-                + Sync
-                + 'a,
-        >,
+        send: NegativeMemoryProbeTransport<'a>,
     ) -> Self {
         Self { plan, send }
     }
@@ -595,8 +607,11 @@ impl NegativeMemoryProbeExecutor for NamedReadProbeExecutor<'_> {
     fn execute<'e>(
         &'e self,
         proposal: &'e NegativeMemoryProbeProposal,
-    ) -> Box<dyn Future<Output = Result<NegativeMemoryProbeExecution, CompositionError>> + Send + 'e>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<NegativeMemoryProbeExecution, CompositionError>> + Send + 'e,
+        >,
+    > {
         let planned = (self.plan)(proposal);
         let send = &self.send;
         Box::pin(async move {
@@ -724,8 +739,8 @@ fn admit_execution(
 }
 
 /// The exact preimage one probe admission digest is taken over.
-fn probe_admission_preimage<'p>(
-    proposal: &'p NegativeMemoryProbeProposal,
+fn probe_admission_preimage(
+    proposal: &NegativeMemoryProbeProposal,
     execution: &NegativeMemoryProbeExecution,
     discriminated: &[String],
 ) -> Vec<(&'static str, String)> {
@@ -734,12 +749,18 @@ fn probe_admission_preimage<'p>(
         ("discriminated", discriminated.join(",")),
         ("operation_id", proposal.operation_id.as_str().to_owned()),
         ("outcome", format!("{:?}", execution.outcome)),
-        ("protected_input_digest", proposal.protected_input_digest.clone()),
+        (
+            "protected_input_digest",
+            proposal.protected_input_digest.clone(),
+        ),
         ("record_digest", proposal.record_digest.clone()),
         ("record_id", proposal.record_id.clone()),
         ("response_digest", execution.response_digest().to_owned()),
         ("rule_revision", proposal.rule_revision.to_string()),
-        ("served_fence", format!("{:?}", execution.served_state_fence)),
+        (
+            "served_fence",
+            format!("{:?}", execution.served_state_fence),
+        ),
         ("verifier", proposal.required_verifier.clone()),
         ("verifier_digest", proposal.verifier_digest.clone()),
         ("verifier_revision", proposal.verifier_revision.clone()),
