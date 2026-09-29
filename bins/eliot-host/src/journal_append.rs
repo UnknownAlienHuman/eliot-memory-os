@@ -9,9 +9,9 @@ use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, EliotActivationRecord,
     EpochTransition, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
     HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend,
-    JournalError, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
-    KernelRecord, LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource,
-    ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
+    JournalError, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord, KernelRecord,
+    LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource, ReadinessEvidence,
+    ReconcileOutcome, WakeDisposition, record_checksum,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
