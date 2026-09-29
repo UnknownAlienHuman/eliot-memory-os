@@ -8012,6 +8012,75 @@ pub(crate) fn retained_source_revision_keys(
         .collect()
 }
 
+/// Re-checks the CURRENT disclosure permission for one retained result
+/// immediately before its bytes are re-sent (issue #1809 item 6).
+///
+/// Replay preserves the ORIGINAL execution and result identity, so this is
+/// not a second admission: the durable row is returned unchanged, nothing
+/// re-executes, and nothing is written. What replay may NOT do is assume the
+/// permission that admitted the first delivery still holds, because the
+/// recipient, the authority, and the operating contour can all have moved
+/// while the bytes sat in ORS. Three joins are proved here, each against the
+/// source that owns it rather than against the presenting request:
+///
+/// 1. **The row is one ORS itself closed as a result.** Only
+///    [`HostRequestState::ResultReceived`] and [`HostRequestState::Terminal`]
+///    may be re-sent. A row still in `Admitted`/`Routed`/`Submitted`/
+///    `PossiblyEffected`/`Unknown`/`Reconciling` has an unresolved
+///    reconciliation obligation and no settled result, so re-sending it
+///    would resolve an unknown external delivery into a success by
+///    assumption. Such a row keeps that obligation: this function only
+///    refuses, and its caller performs no write, so the obligation stays
+///    with its owner.
+/// 2. **The retained delivery evidence still describes this row's own
+///    recorded result.** The existing ORS validator is re-run over the
+///    ORIGINALLY recorded values. Nothing is recomputed, so evidence
+///    recorded for another operation or another result can never be read
+///    back as proof about this one.
+/// 3. **The live authenticated recipient is still the authority the row was
+///    produced under.** The Session's authority epoch comes from the
+///    authenticated transport, never from the presenting envelope's body, and
+///    is compared against the value the durable row itself recorded. The
+///    comparison is on the authority LINEAGE, which is the identity dimension:
+///    a rotation to a new sequence within one lineage is the same authority
+///    continuing, while a different lineage is a different authority that
+///    never produced this result and cannot be shown to still permit
+///    receiving it. A changed resource generation is deliberately NOT a
+///    refusal here: a module re-registration at a new generation is this same
+///    operation observed later, and I14.21 requires exactly such a retry to
+///    reconcile to the already-committed result. Contour currency is the
+///    source-revision join's job, not this one.
+///
+/// Pure: it reads the row and the retained Session and performs no store IO
+/// and no dispatch, so a refusal here cannot overwrite the original result
+/// or erase an earlier delivery observation.
+pub(crate) fn check_retained_disclosure_permission(
+    record: &HostRequestRecord,
+    session: &Session,
+) -> Result<(), TransportError> {
+    if !matches!(
+        record.state,
+        HostRequestState::ResultReceived | HostRequestState::Terminal
+    ) {
+        // A row ORS has not closed as a result is not a replayable answer.
+        // Stated here as this function's own precondition rather than
+        // inherited from the loader, so the disclosure boundary never
+        // depends on a check made somewhere else.
+        return Err(TransportError::SessionFenced);
+    }
+    // Existing validator, originally recorded values, no recomputation.
+    record
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if !session
+        .authority_epoch
+        .is_same_authority(&record.authority_epoch)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
 /// Decodes the exact typed admission receipt from a rehydrate payload.
 ///
 /// The receipt is re-validated against the presenting envelope by
