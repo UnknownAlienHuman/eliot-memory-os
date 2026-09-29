@@ -448,22 +448,22 @@ pub struct CurrentUserTaskUnknownProgress {
     pub cleanup_error: String,
 }
 
-/// Exact one-shot Task Scheduler RunEx intent, committed before the call.
+/// Exact one-shot Task Scheduler `RunEx` intent, committed before the call.
 ///
 /// A retained intent without a run receipt is unresolved after restart and
-/// never authorizes a second RunEx call.
+/// never authorizes a second `RunEx` call.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentUserTaskRunIntent {
     /// Canonical digest of the registration request bound to the task.
     pub request_digest: PlatformHandle,
-    /// Exact Task Scheduler identity passed to RunEx.
+    /// Exact Task Scheduler identity passed to `RunEx`.
     pub task_name: String,
     /// Current-user SID bound to the registered task.
     pub sid: String,
     /// Interactive session used by the one-shot run request.
     pub session_id: u32,
-    /// Exact registered task XML digest checked before RunEx.
+    /// Exact registered task XML digest checked before `RunEx`.
     pub task_xml_sha256: PlatformHandle,
 }
 
@@ -697,10 +697,10 @@ pub struct InstallationEffectProgress {
     /// Request and provider evidence retained when current-user task
     /// registration requires reconciliation.
     pub current_user_task_unknown: Option<CurrentUserTaskUnknownProgress>,
-    /// Exact pre-call RunEx intent. Presence forbids automatic rerun after
+    /// Exact pre-call `RunEx` intent. Presence forbids automatic rerun after
     /// restart unless its matching launch receipt was already committed.
     pub current_user_task_run_intent: Option<CurrentUserTaskRunIntent>,
-    /// Task Scheduler launch acceptance for the registered UserMode task.
+    /// Task Scheduler launch acceptance for the registered `UserMode` task.
     /// This is not Host readiness; runtime readiness remains independently
     /// observed by the Host process handshake.
     pub current_user_task_run_receipt: Option<CurrentUserTaskRunReceipt>,
@@ -1870,7 +1870,7 @@ impl InstallationTransaction {
     ///
     /// Returns [`InstallationError::IncompleteObservation`] when Phase-B or
     /// the preceding effects are unsettled, and a profile or identity error
-    /// when the transaction is not the retained UserMode installation.
+    /// when the transaction is not the retained `UserMode` installation.
     pub fn require_user_mode_task_registration_ready(
         &self,
     ) -> Result<(), InstallationError> {
@@ -1951,10 +1951,10 @@ impl InstallationTransaction {
         Ok(())
     }
 
-    /// Returns the exact persisted RunEx intent for the planned UserMode task.
+    /// Returns the exact persisted `RunEx` intent for the planned `UserMode` task.
     ///
     /// Callers must validate the transaction before using this read-only
-    /// projection. The retained session identifies the RunEx attempt and may
+    /// projection. The retained session identifies the `RunEx` attempt and may
     /// differ from the session in the original registration receipt.
     #[must_use]
     pub fn current_user_task_run_intent(&self) -> Option<&CurrentUserTaskRunIntent> {
@@ -1968,7 +1968,7 @@ impl InstallationTransaction {
             })
     }
 
-    /// Returns the exact persisted RunEx receipt for the planned UserMode task.
+    /// Returns the exact persisted `RunEx` receipt for the planned `UserMode` task.
     #[must_use]
     pub fn current_user_task_run_receipt(&self) -> Option<&CurrentUserTaskRunReceipt> {
         self.installer_effects
@@ -2020,10 +2020,10 @@ impl InstallationTransaction {
         self.validate()
     }
 
-    /// Records the exact one-shot Task Scheduler RunEx intent before the call.
+    /// Records the exact one-shot Task Scheduler `RunEx` intent before the call.
     ///
     /// A transaction which already contains this intent but no matching run
-    /// receipt must be reconciled by Host readiness and cannot issue RunEx a
+    /// receipt must be reconciled by Host readiness and cannot issue `RunEx` a
     /// second time.
     pub(crate) fn record_current_user_task_run_intent(
         &mut self,
@@ -2092,7 +2092,7 @@ impl InstallationTransaction {
     }
 
     /// Persists the exact Task Scheduler acceptance receipt for the retained
-    /// one-shot RunEx intent.
+    /// one-shot `RunEx` intent.
     pub(crate) fn record_current_user_task_run_receipt(
         &mut self,
         receipt: CurrentUserTaskRunReceipt,
@@ -3701,18 +3701,15 @@ impl InstallationTransaction {
             }
             if let Some(credential) = &progress.store_credential {
                 credential.validate()?;
-                let provision = match effect {
-                    InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
-                    | InstallerEffectPlan::ProvisionCurrentUserStoreCredential {
-                        provision, ..
-                    } => provision,
-                    _ => {
-                        return Err(InstallationError::InvalidField {
-                            field: "effect_progress.store_credential".to_owned(),
-                            reason: "credential progress belongs only to its provision effect"
-                                .to_owned(),
-                        });
-                    }
+                let (InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
+                | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { provision, .. }) =
+                    effect
+                else {
+                    return Err(InstallationError::InvalidField {
+                        field: "effect_progress.store_credential".to_owned(),
+                        reason: "credential progress belongs only to its provision effect"
+                            .to_owned(),
+                    });
                 };
                 match credential.lifecycle {
                     StoreCredentialLifecycle::Active

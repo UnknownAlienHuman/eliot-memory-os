@@ -131,7 +131,7 @@ pub(crate) fn retry_registry_open_on_already_open<T>(
     }
 }
 
-/// Opens (or creates) the registry writer file with bounded AlreadyOpen
+/// Opens (or creates) the registry writer file with bounded `AlreadyOpen`
 /// retry. This is the `open_at` (`Database::create`) primitive.
 pub(crate) fn open_registry_writer_create_with_retry(
     path: &Path,
@@ -145,7 +145,7 @@ pub(crate) fn open_registry_writer_create_with_retry(
     .map_err(|error| super::InstallationError::Platform(error.to_string()))
 }
 
-/// Opens the existing registry writer file with bounded AlreadyOpen retry.
+/// Opens the existing registry writer file with bounded `AlreadyOpen` retry.
 /// This is the `open_existing_at` (`Database::open`) primitive.
 pub(crate) fn open_registry_writer_with_retry(
     path: &Path,
@@ -159,7 +159,7 @@ pub(crate) fn open_registry_writer_with_retry(
     .map_err(|error| super::InstallationError::Platform(error.to_string()))
 }
 
-/// Opens the registry read-only file with bounded AlreadyOpen retry. This is
+/// Opens the registry read-only file with bounded `AlreadyOpen` retry. This is
 /// the `inspect_existing`/`inspect_existing_at` (`ReadOnlyDatabase::open`)
 /// primitive.
 pub(crate) fn open_registry_reader_with_retry(

@@ -31,11 +31,11 @@ pub use contract_models::{
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "profile", content = "provision", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PhaseBSupervisionAuthorityProvisionPlan {
-    /// Service-SID sealed key provisioned by the elevated SystemService installer.
+    /// Service-SID sealed key provisioned by the elevated `SystemService` installer.
     SystemService(Box<SupervisionAuthorityProvisionPlan>),
-    /// Current-user Credential Manager key provisioned for UserMode.
+    /// Current-user Credential Manager key provisioned for `UserMode`.
     UserMode(Box<UserModeSupervisionAuthorityProvisionPlan>),
-    /// Disposable repository-local key provisioned for PortableDev.
+    /// Disposable repository-local key provisioned for `PortableDev`.
     PortableDev(Box<PortableDevSupervisionAuthorityKeyRequest>),
 }
 
@@ -189,7 +189,7 @@ pub enum InstallerEffectPlan {
         /// Secret-free immutable provision plan.
         provision: StoreCredentialProvisionPlan,
     },
-    /// Provision a Store credential in the exact UserMode or PortableDev current-user token.
+    /// Provision a Store credential in the exact `UserMode` or `PortableDev` current-user token.
     ProvisionCurrentUserStoreCredential {
         /// Stable effect identity.
         effect_id: PlatformHandle,
@@ -205,20 +205,20 @@ pub enum InstallerEffectPlan {
         /// Secret-free immutable current-user provision plan.
         provision: Box<UserModeSupervisionAuthorityProvisionPlan>,
     },
-    /// Provision one disposable repository-local PortableDev supervision authority key.
+    /// Provision one disposable repository-local `PortableDev` supervision authority key.
     ProvisionPortableDevSupervisionAuthority {
         /// Stable effect identity.
         effect_id: PlatformHandle,
         /// Exact create-only authority-key request bound to the repository object identity.
         provision: Box<PortableDevSupervisionAuthorityKeyRequest>,
     },
-    /// Register the exact current-user Task Scheduler action for one UserMode
+    /// Register the exact current-user Task Scheduler action for one `UserMode`
     /// candidate. The typed registration template contains no Phase-B digest;
     /// Host must materialize the live descriptor before this effect executes.
     RegisterCurrentUserTask {
         /// Stable effect identity.
         effect_id: PlatformHandle,
-        /// Immutable UserMode task registration template.
+        /// Immutable `UserMode` task registration template.
         registration: Box<UserModeTaskRegistrationPlan>,
     },
     /// Publish the Host-owned Phase-B overlay and hand the exact pending
@@ -534,6 +534,7 @@ pub(super) fn validate_effect_profile(
             ))
         }
         InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+        | InstallerEffectPlan::RegisterCurrentUserTask { .. }
             if profile == InstallationProfile::UserMode =>
         {
             Ok(())
@@ -554,11 +555,6 @@ pub(super) fn validate_effect_profile(
                 "repository-local supervision authority provisioning requires PortableDev profile"
                     .to_owned(),
             ))
-        }
-        InstallerEffectPlan::RegisterCurrentUserTask { .. }
-            if profile == InstallationProfile::UserMode =>
-        {
-            Ok(())
         }
         InstallerEffectPlan::RegisterCurrentUserTask { .. } => {
             Err(InstallationError::ProfileViolation(
@@ -856,12 +852,9 @@ fn portable_dev_authority_relative_path(candidate: &CandidateManifest) -> String
         .as_bytes(),
     );
     format!(
-        "{}.sealed",
-        format!(
-            "{}supervision-authority-{}",
-            eliot_runtime_contracts::PORTABLE_DEV_SUPERVISION_KEY_PREFIX,
-            &digest[..32]
-        )
+        "{}supervision-authority-{}.sealed",
+        eliot_runtime_contracts::PORTABLE_DEV_SUPERVISION_KEY_PREFIX,
+        &digest[..32]
     )
 }
 
