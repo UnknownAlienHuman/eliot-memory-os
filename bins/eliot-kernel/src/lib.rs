@@ -117,10 +117,10 @@ pub use backup_restore::{
 pub use backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, MAX_DESTINATION_LABEL_LEN, OrsRestoreBinding, OrsRestoreJournal,
-    PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL, RESTORE_JOURNAL_PAYLOAD_AREA,
-    RestorePorts, backup_to_kernel, check_kernel_effect_fence, kernel_to_backup, ors_to_backup,
-    require_production_admitted,
+    OrsRestoreJournalOwner, PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE,
+    RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL,
+    RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
+    kernel_to_backup, ors_to_backup, require_production_admitted,
 };
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
@@ -850,9 +850,26 @@ impl KernelComposition {
     /// the per-execution journal is built from that owner handle plus the
     /// Kernel's own live effect fence.
     ///
-    /// The owner-channel transport that reaches this entry is #962's frame
-    /// arm; until it lands, nothing dispatches here, and no placeholder call
-    /// stands in for it.
+    /// `identity` must be built by [`OrsRestoreBinding::from_composition`],
+    /// which reads the installation identity from the live composition cell
+    /// (`crate::dispatch_contour`); there is no other way to construct one, so
+    /// a caller cannot name an installation here.
+    ///
+    /// ## Chain status: still no production caller
+    ///
+    /// This entry has no caller in this repository, and that is recorded here
+    /// rather than papered over. The Kernel's only front-door backup dispatch
+    /// (`KernelComposition::dispatch_backup_frame`) routes `backup.create`,
+    /// `backup.verify` and `backup.restore-test`; `backup.verify` is read-only,
+    /// and `backup.restore-test` is a rehearsal that answers `plan_gap` naming
+    /// the missing owner evidence, so neither performs a restore. The other two
+    /// workspace consumers of this package are a native worker and an
+    /// instrument harness, not a restore owner. Calling this from any of them
+    /// would be a caller invented for the sake of one, and calling it from the
+    /// rehearsal path would run restore effects off a rehearsal and would still
+    /// refuse for want of owner-issued `DestinationManifestEvidence`, whose
+    /// producer (AUDIT-7) is also open. No placeholder call stands in for the
+    /// missing transport; #963/#2569 own the front-door connection.
     pub fn backup_restore_with_ors_journal(
         &self,
         bundle: &eliot_backup::BackupBundle,
