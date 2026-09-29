@@ -1026,6 +1026,7 @@ fn capture_plans_persist_full_recoverable_evidence_without_authority() {
         eliot_contracts::ResourceGeneration::genesis(),
     );
     let mut transition = eliot_store_api::PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-evidence-write").expect("operation"),
             idempotency_key: "idem-evidence-write".to_owned(),
@@ -1116,6 +1117,7 @@ fn non_capture_transitions_persist_no_evidence() {
         eliot_contracts::ResourceGeneration::genesis(),
     );
     let mut transition = eliot_store_api::PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-audit-write").expect("operation"),
             idempotency_key: "idem-audit-write".to_owned(),

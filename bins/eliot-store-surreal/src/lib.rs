@@ -255,7 +255,16 @@ pub fn store_bootstrap_descriptor(
 /// through the typed `StoreFailure` mapping and the plan is never widened,
 /// translated, or given extra commands. A staged transition therefore
 /// survives daemon replacement only when the replacement store bridge
-/// explicitly supports its recorded contract digest and operation manifest.
+/// explicitly supports its recorded protocol revision and operation manifest.
+/// Both halves are decided by CONTENT against this build's own live values: the
+/// recorded [`eliot_store_api::CONTRACT_VERSION`] through
+/// [`PreparedTransition::validate`], and the recorded `operation_manifest_digest`
+/// through `validate_against_catalogue` against the generated manifests.
+///
+/// `admission_contract_set_digest` is not claimed here either: it is carried and
+/// hash-bound, but the bridge holds no live contract-set value to compare it
+/// against, because I05-15 records that no generated authoritative catalogue
+/// exists yet. This boundary refuses to invent one.
 fn admit_prepared_for_execution(
     context: &RequestMeta,
     transition: &PreparedTransition,
@@ -2017,6 +2026,7 @@ mod tests {
         let entries = generated_operation_manifests().expect("catalogue");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-1927-bridge-1").expect("operation id"),
                 idempotency_key: "idem-1927-bridge-1".to_owned(),
@@ -3101,6 +3111,7 @@ mod tests {
             ScopeId, SecurityContext, TransitionClass,
         };
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-bridge").expect("operation id"),
                 idempotency_key: "idem-bridge".to_owned(),
@@ -3177,6 +3188,7 @@ mod tests {
             ScopeId, SecurityContext, TransitionClass,
         };
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-erasure-bridge").expect("operation id"),
                 idempotency_key: "idem-erasure-bridge".to_owned(),

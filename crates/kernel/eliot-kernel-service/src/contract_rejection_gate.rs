@@ -966,6 +966,7 @@ mod tests {
 
     fn transition(op: &str, idem: &str, hash: &str) -> PreparedTransition {
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new(op).expect("op"),
                 idempotency_key: idem.to_owned(),

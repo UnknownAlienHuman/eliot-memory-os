@@ -125,6 +125,7 @@ fn context_for(tag: &str) -> RequestMeta {
 fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
     let operation_id = format!("op-994-kr-{tag}");
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id.clone()).expect("994-kr operation id"),
             idempotency_key: format!("idem-994-kr-{tag}"),

@@ -168,6 +168,7 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
         .map_err(|error| format!("ordering: {error}"))?;
 
     let mut empty_revision = eliot_store_api::PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: eliot_store_api::OperationIdentity {
             operation_id,
             idempotency_key: "retry-1".to_owned(),

@@ -96,6 +96,7 @@ fn context_with(tag: &str) -> RequestMeta {
 
 fn transition_with(tag: &str) -> PreparedTransition {
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-991-{tag}")).unwrap(),
             idempotency_key: format!("idem-991-{tag}"),

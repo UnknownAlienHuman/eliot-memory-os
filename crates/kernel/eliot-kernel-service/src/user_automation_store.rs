@@ -1709,6 +1709,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         );
         let automation_id = automation_scope(&request.intent.operation);
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: request.identity.clone(),
             state_fence: request.context.state_fence.clone(),
             scope_id: ScopeId::new(USER_AUTOMATION_SCOPE)?,

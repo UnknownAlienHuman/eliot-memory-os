@@ -1714,6 +1714,7 @@ mod authority_binding_tests {
             let epoch =
                 EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
             let mut transition = eliot_store_api::PreparedTransition {
+                contract_version: eliot_store_api::CONTRACT_VERSION,
                 identity: OperationIdentity {
                     operation_id: eliot_store_api::OperationId::new("op-evidence-bind")
                         .expect("operation"),
@@ -1832,6 +1833,7 @@ mod allocation_classification_tests {
         use serde_json::json;
         use std::collections::BTreeMap;
         let mut transition = eliot_store_api::PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation).expect("operation"),
                 idempotency_key: format!("idem-{operation}"),

@@ -349,6 +349,7 @@ fn transition_for_with(
         "992 fixture class and ceiling agree through the production mapping"
     );
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id).unwrap(),
             idempotency_key,

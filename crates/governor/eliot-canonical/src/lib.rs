@@ -621,6 +621,7 @@ impl CanonicalWriteEnvelope {
     pub fn prepare(&self) -> Result<PreparedTransition, CanonicalError> {
         self.validate()?;
         let mut transition = PreparedTransition {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: OperationIdentity {
                 operation_id: self.operation_id.clone(),
                 idempotency_key: self.idempotency_key.clone(),

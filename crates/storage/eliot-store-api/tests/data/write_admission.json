@@ -23,6 +23,11 @@
     }
   },
   "transition": {
+    "contract_version": {
+      "major": 1,
+      "minor": 0,
+      "patch": 0
+    },
     "identity": {
       "operation_id": "op-admit-1",
       "idempotency_key": "idem-admit-1",
@@ -82,8 +87,8 @@
     "operation_id": "op-admit-1",
     "idempotency_key": "idem-admit-1",
     "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "prepared_transition_digest": "3d9dd652702e2df81373b4c180299229a519da0b2a491550ccb1bf7171c1e0ea",
-    "reservation_token_digest": "3d6eb8c4fac7952e74d71565a158c633c426384cbe0ef5a692d6d945d33707f3",
+    "prepared_transition_digest": "c3c132e299b0636ed6be1db44bbd43b587abce7a66034daf884dd049396aca55",
+    "reservation_token_digest": "2d9c31a9ecd0b851d5a968b4a158548535cda9178a90c3ab6cc6a0303976dedd",
     "scopes": [
       {
         "scope": "scope-admit-1",

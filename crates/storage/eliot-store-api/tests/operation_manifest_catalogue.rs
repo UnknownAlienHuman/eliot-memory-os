@@ -390,6 +390,7 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
     let mut parameters = BTreeMap::new();
     parameters.insert("subject".to_owned(), json!("observation-1"));
     let mut plan = eliot_store_api::PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("operation-1").unwrap(),
             idempotency_key: "retry-1".to_owned(),

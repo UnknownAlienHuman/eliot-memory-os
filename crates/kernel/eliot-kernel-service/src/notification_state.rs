@@ -644,6 +644,7 @@ fn build_notification_transition(
         }
     })?;
     let mut transition = PreparedTransition {
+        contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: request.operation.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: scope,
