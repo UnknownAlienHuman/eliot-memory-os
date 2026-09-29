@@ -1479,6 +1479,9 @@ pub enum ReadyItemSkipReason {
     /// The item's own `wall_time_ms` budget exceeds the class deadline
     /// ceiling. This is not a temporary condition, so no service is promised
     /// for it by this selector; the item is reported as infeasible instead.
+    /// It is also stepped over without consuming the class's bounded scan
+    /// window, so it cannot block the eligible items queued behind it; its
+    /// disposition belongs to admission.
     ClassDeadlineCeiling,
     /// One more item's `output_bytes` budget would cross the class byte cap.
     ClassByteCapReached,
@@ -1592,10 +1595,14 @@ pub struct WorkClassSelectionReport {
     pub item_ceiling: Option<u64>,
     pub concurrency_ceiling: Option<u64>,
     pub byte_ceiling: Option<u64>,
-    /// Admitted items actually examined. The scan is bounded by the item
-    /// ceiling (or by the whole class on the profile-free path) and walks the
-    /// items in ascending canonical enqueue ordinal, so a truncated window can
-    /// only leave later items unserved, never displace an older one.
+    /// Admitted items actually examined, in ascending canonical enqueue order.
+    /// The scan walks the per-class admitted list at most once, and the item
+    /// ceiling bounds the items a capacity dimension currently closes, so a
+    /// truncated window can only leave later items unserved, never displace an
+    /// older one. An item over the class deadline ceiling is examined and
+    /// reported but does not consume that window, because it is permanently
+    /// rather than temporarily ineligible; this count can therefore exceed
+    /// `item_ceiling` when a class holds over-ceiling items.
     pub scanned_ready_items: usize,
     /// Canonical enqueue ordinal of the oldest admitted item, if any, under the
     /// frozen age rule named in [`FAIR_PULL_ALGORITHM`]. This is the age of the
