@@ -787,6 +787,90 @@ fn live_descriptor_for<'a>(
     })
 }
 
+/// Compiles the no-task discovery decision from the live owner catalogue.
+///
+/// Discovery carries no owner-supplied task conditions, so no task-relative
+/// narrowing applies: every descriptor of the owner-joined published surface
+/// ([`published_mcp_tool_surface`]) is considered exactly once, in catalogue
+/// order, and advertised [`SurfaceDisposition::Visible`] with a recorded
+/// no-task reason. Owner-shaped identity fields carry explicit no-task
+/// markers rather than invented task, role, grant, or capability facts. A
+/// catalogued method without a live registered owner fails closed instead of
+/// being advertised without semantics; withholding still applies downstream
+/// in [`derive_permitted_surface`] when a live descriptor no longer matches
+/// its owner binding.
+///
+/// # Errors
+///
+/// Returns an error when the published catalogue is unavailable, a catalogued
+/// method has no live registered owner, or the compiled decision fails
+/// [`ToolSurfaceDecision::validate`].
+pub fn compile_discovery_surface_decision(
+    registry: &SemanticRegistry,
+) -> Result<ToolSurfaceDecision, SurfaceDecisionError> {
+    let catalogue =
+        published_mcp_tool_surface().map_err(|_| SurfaceDecisionError::DescriptorsUnavailable)?;
+    let mut considered = Vec::with_capacity(catalogue.len());
+    let mut visible = Vec::with_capacity(catalogue.len());
+    let mut reasons = Vec::with_capacity(catalogue.len());
+    let mut definition_revisions = BTreeSet::new();
+    let mut profile_revisions = Vec::with_capacity(catalogue.len());
+    for descriptor in &catalogue {
+        let profile = registry
+            .resolve(&descriptor.name, &descriptor.definition_version)
+            .map_err(|_| SurfaceDecisionError::UnknownMethod {
+                method: descriptor.name.clone(),
+            })?;
+        considered.push(ConsideredSurfaceMethod {
+            method: profile.method.clone(),
+            profile_version: profile.profile_version.clone(),
+            operation_class: profile.operation_class,
+            effect_class: profile.effect_class,
+            capability_evidence: Vec::new(),
+        });
+        visible.push(descriptor.name.clone());
+        reasons.push(SurfaceMethodReason {
+            method: descriptor.name.clone(),
+            disposition: SurfaceDisposition::Visible,
+            reason: "no-task discovery advertisement; no task-relative narrowing applies"
+                .to_owned(),
+        });
+        definition_revisions.insert(descriptor.definition_version.clone());
+        profile_revisions.push(format!("{}@{}", descriptor.name, profile.profile_version));
+    }
+    let decision = ToolSurfaceDecision {
+        schema_version: TOOL_SURFACE_CONTRACT_VERSION,
+        task_ref: "no-task-discovery".to_owned(),
+        role: "no-role-discovery".to_owned(),
+        scope_ref: "no-scope-discovery".to_owned(),
+        route_fingerprint: "no-route-discovery".to_owned(),
+        state_fence: "no-state-fence-discovery".to_owned(),
+        governance_profile: "no-governance-profile-discovery".to_owned(),
+        grant_revision: "no-grant-discovery".to_owned(),
+        considered,
+        visible,
+        lazy_visible: Vec::new(),
+        hidden: Vec::new(),
+        forbidden: Vec::new(),
+        reasons,
+        effect_limits: admitted_effect_names(EffectClass::ExternalEffect),
+        privacy_boundary: "no-task discovery advertisement".to_owned(),
+        expected_delta: "advertised catalogue only; no work delta".to_owned(),
+        cheaper_alternative: "no-task discovery advertisement".to_owned(),
+        expansion: SurfaceExpansion {
+            lazy_methods: Vec::new(),
+            recheck_policy: "no lazy methods on the discovery surface".to_owned(),
+        },
+        invalidation: SurfaceInvalidation {
+            definition_revisions: definition_revisions.into_iter().collect(),
+            profile_revisions,
+            policy_refs: Vec::new(),
+        },
+    };
+    decision.validate()?;
+    Ok(decision)
+}
+
 /// One compiled task-relative surface: decision plus derived subsets.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskRelativeSurface {
