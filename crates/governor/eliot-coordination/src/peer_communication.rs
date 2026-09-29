@@ -4473,7 +4473,11 @@ impl CoordinationOwner {
     pub fn peer_review_batches(&self) -> Vec<PeerReviewBatch> {
         let mut artifacts: BTreeSet<&str> = BTreeSet::new();
         artifacts.extend(self.peer_review_expectations.keys().map(String::as_str));
-        artifacts.extend(self.peer_reviews.values().map(|review| review.artifact_id.as_str()));
+        artifacts.extend(
+            self.peer_reviews
+                .values()
+                .map(|review| review.artifact_id.as_str()),
+        );
         artifacts.extend(self.peer_artifact_heads.keys().map(String::as_str));
         artifacts
             .into_iter()

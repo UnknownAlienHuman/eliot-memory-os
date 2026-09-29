@@ -44,7 +44,9 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_coordination::{AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding};
+use eliot_coordination::{
+    AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding,
+};
 use eliot_observation::ObservationJournal;
 use eliot_store_api::ScopeRevisionView;
 use eliot_task::TaskLifecycleOwner;
@@ -115,7 +117,7 @@ pub struct ControlBoardReviewBatch {
     /// owner recorded no expectation.
     pub outstanding: Option<u64>,
     /// Every retained obligation for this artifact, in `review_id` order.
-    pub obligations: Vec<PeerReviewBatchObligation>,
+    pub obligations: Vec<ControlBoardReviewBatchObligation>,
 }
 
 /// One retained anchored-review obligation as the owner holds it.
