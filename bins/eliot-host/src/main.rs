@@ -754,6 +754,7 @@ fn run_profile_supervisor(
             idle_drain.note_observable_use(&mut host, trigger, &evidence);
         }
         process_user_automation_owner_requests(&host);
+        process_backup_dispatch_requests(&host);
         if !durable_fence {
             let drain_tick = idle_drain.evaluate(&mut host, std::time::Instant::now());
             report_activation_diagnostics(&host, &idle_drain.last_census);
