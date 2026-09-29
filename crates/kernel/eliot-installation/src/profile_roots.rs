@@ -1,10 +1,299 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use eliot_platform_windows::profile_supervision::{
+    ProfileRootPaths, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::runtime_root_contract::{InstallationProfile, RuntimeStateRoots};
 use super::{
-    InstallationError, ProfileGovernedRoots, WindowsPathIdentity, joined_windows_path, text,
+    InstallationError, ProfileGovernedRoots, RuntimeLaunchDescriptor, WindowsPathIdentity,
+    joined_windows_path, phase_b_scm_selector, sha256_handle, text,
 };
+
+/// Builds the platform root request from the exact profile roots retained by a
+/// validated runtime launch descriptor.
+///
+/// During Phase-A the platform receipt carries the fixed pending SCM selector
+/// returned by the transaction's selector boundary; raw pending markers never
+/// enter the platform request.
+pub fn profile_root_request_for_launch(
+    launch: &RuntimeLaunchDescriptor,
+) -> Result<ProfileRootRequest, InstallationError> {
+    launch.validate()?;
+    let selection_digest = phase_b_scm_selector(&launch.authority_descriptor_digest)?;
+    profile_root_request_for_binding(
+        launch,
+        selection_digest.as_str(),
+        launch.authority_generation.value(),
+    )
+}
+
+/// Builds the same root request using the exact committed Phase-B live
+/// authority binding selected by the registry. This is used after restart,
+/// when the immutable launch descriptor still contains its Phase-A selector.
+pub fn profile_root_request_for_live_launch(
+    launch: &RuntimeLaunchDescriptor,
+    live_authority_descriptor_digest: &super::PlatformHandle,
+    authority_generation: u64,
+) -> Result<ProfileRootRequest, InstallationError> {
+    launch.validate()?;
+    sha256_handle(
+        live_authority_descriptor_digest,
+        "profile_root_request.live_authority_descriptor_digest",
+    )?;
+    if live_authority_descriptor_digest.as_str() == super::PHASE_B_PENDING_SCM_DIGEST
+        || authority_generation == 0
+    {
+        return Err(InstallationError::IncompleteObservation(
+            "live profile root selection requires a committed Phase-B authority digest and generation"
+                .to_owned(),
+        ));
+    }
+    profile_root_request_for_binding(
+        launch,
+        live_authority_descriptor_digest.as_str(),
+        authority_generation,
+    )
+}
+
+fn profile_root_request_for_binding(
+    launch: &RuntimeLaunchDescriptor,
+    authority_descriptor_sha256: &str,
+    authority_generation: u64,
+) -> Result<ProfileRootRequest, InstallationError> {
+    let profile = match launch.profile {
+        InstallationProfile::UserMode => ProfileSelection::UserMode,
+        InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+        InstallationProfile::SystemService => {
+            return Err(InstallationError::ProfileViolation(
+                "profile root selection receipts are limited to UserMode and PortableDev"
+                    .to_owned(),
+            ));
+        }
+    };
+    let roots = &launch.profile_governed_roots;
+    let runtime = &launch.runtime_state_roots;
+    let runtime_state_roots = vec![
+        (
+            "runtime_state_roots.profile_anchor_root".to_owned(),
+            PathBuf::from(runtime.profile_anchor_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.installation_root".to_owned(),
+            PathBuf::from(runtime.installation_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.host_state_root".to_owned(),
+            PathBuf::from(runtime.host_state_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.kernel_ors_root".to_owned(),
+            PathBuf::from(runtime.kernel_ors_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.kernel_work_root".to_owned(),
+            PathBuf::from(runtime.kernel_work_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.store_data_root".to_owned(),
+            PathBuf::from(runtime.store_data_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.store_work_root".to_owned(),
+            PathBuf::from(runtime.store_work_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.store_temp_root".to_owned(),
+            PathBuf::from(runtime.store_temp_root.as_str()),
+        ),
+        (
+            "runtime_state_roots.watchdog_state_root".to_owned(),
+            PathBuf::from(runtime.watchdog_state_root.as_str()),
+        ),
+    ];
+    Ok(ProfileRootRequest {
+        profile,
+        installation_id: launch.installation_epoch.installation.as_str().to_owned(),
+        installation_key: launch
+            .profile_installation_key
+            .as_ref()
+            .map(|value| value.as_str().to_owned()),
+        component: launch.profile_component.as_str().to_owned(),
+        version: launch.profile_version.as_str().to_owned(),
+        generation: launch.generation.as_str().to_owned(),
+        authority_descriptor_path: PathBuf::from(launch.authority_descriptor_path.as_str()),
+        authority_descriptor_sha256: authority_descriptor_sha256.to_owned(),
+        authority_generation,
+        roots: ProfileRootPaths {
+            immutable_binaries: PathBuf::from(&roots.immutable_binaries),
+            durable_data: PathBuf::from(&roots.durable_data),
+            user_config: PathBuf::from(&roots.user_config),
+            user_cache: PathBuf::from(&roots.user_cache),
+            runtime_state_roots,
+        },
+        repository_root: launch
+            .portable_root
+            .as_ref()
+            .map(|value| PathBuf::from(value.as_str())),
+    })
+}
+
+/// Compares the retained root identity across the Phase-B pending-selector
+/// transition. The current receipt must still carry every original root
+/// object and owner binding; only a fixed pending SCM selector may transition
+/// to a live descriptor SHA-256.
+pub fn profile_selection_receipts_match_retained_roots(
+    original: &ProfileSelectionReceipt,
+    current: &ProfileSelectionReceipt,
+) -> Result<bool, InstallationError> {
+    validate_profile_selection_receipt_shape(original, "original")?;
+    validate_profile_selection_receipt_shape(current, "current")?;
+    let same_static_binding = original.profile == current.profile
+        && original.installation_id == current.installation_id
+        && original.installation_key == current.installation_key
+        && original.component == current.component
+        && original.version == current.version
+        && original.generation == current.generation
+        && eliot_platform_windows::windows_paths_equal(
+            &original.authority_descriptor_path,
+            &current.authority_descriptor_path,
+        )
+        && original.authority_generation == current.authority_generation
+        && original.owner_sid == current.owner_sid;
+    if !same_static_binding {
+        return Ok(false);
+    }
+    let digest_matches = original.authority_descriptor_sha256
+        == current.authority_descriptor_sha256
+        || (original.authority_descriptor_sha256 == super::PHASE_B_PENDING_SCM_DIGEST
+            && current.authority_descriptor_sha256 != super::PHASE_B_PENDING_SCM_DIGEST);
+    if !digest_matches {
+        return Ok(false);
+    }
+    for observation in &original.roots {
+        let Some(current_observation) = current
+            .roots
+            .iter()
+            .find(|candidate| candidate.role == observation.role)
+        else {
+            return Ok(false);
+        };
+        if observation.identity != current_observation.identity
+            || !eliot_platform_windows::windows_paths_equal(
+                &observation.canonical_path,
+                &current_observation.canonical_path,
+            )
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_profile_selection_receipt_shape(
+    receipt: &ProfileSelectionReceipt,
+    label: &str,
+) -> Result<(), InstallationError> {
+    if !matches!(
+        receipt.profile,
+        ProfileSelection::UserMode | ProfileSelection::PortableDev
+    ) {
+        return Err(InstallationError::ProfileViolation(
+            "retained profile selection must be UserMode or PortableDev".to_owned(),
+        ));
+    }
+    for (value, field) in [
+        (&receipt.installation_id, "installation_id"),
+        (&receipt.component, "component"),
+        (&receipt.version, "version"),
+        (&receipt.generation, "generation"),
+        (&receipt.owner_sid, "owner_sid"),
+    ] {
+        text(value, &format!("profile_selection_receipt.{label}.{field}"))?;
+    }
+    if !receipt.owner_sid.starts_with("S-")
+        || receipt.session_id == 0
+        || receipt.authority_generation == 0
+    {
+        return Err(InstallationError::InvalidField {
+            field: format!("profile_selection_receipt.{label}"),
+            reason: "owner, session, generation, and descriptor path must be live values".to_owned(),
+        });
+    }
+    WindowsPathIdentity::parse_root(
+        &receipt.authority_descriptor_path.to_string_lossy(),
+        &format!("profile_selection_receipt.{label}.authority_descriptor_path"),
+    )?;
+    let digest = super::PlatformHandle::new(&receipt.authority_descriptor_sha256).map_err(
+        |error| InstallationError::InvalidField {
+            field: format!("profile_selection_receipt.{label}.authority_descriptor_sha256"),
+            reason: error.to_string(),
+        },
+    )?;
+    sha256_handle(
+        &digest,
+        &format!("profile_selection_receipt.{label}.authority_descriptor_sha256"),
+    )?;
+
+    const ROOT_ROLES: [&str; 13] = [
+        "immutable_binaries",
+        "durable_data",
+        "user_config",
+        "user_cache",
+        "runtime_state_roots.profile_anchor_root",
+        "runtime_state_roots.installation_root",
+        "runtime_state_roots.host_state_root",
+        "runtime_state_roots.kernel_ors_root",
+        "runtime_state_roots.kernel_work_root",
+        "runtime_state_roots.store_data_root",
+        "runtime_state_roots.store_work_root",
+        "runtime_state_roots.store_temp_root",
+        "runtime_state_roots.watchdog_state_root",
+    ];
+    if receipt.roots.len() != ROOT_ROLES.len() {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "profile-selection receipt {label} does not contain all 13 retained root roles"
+        )));
+    }
+    let mut roles = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    for observation in &receipt.roots {
+        if !ROOT_ROLES.contains(&observation.role.as_str())
+            || !roles.insert(observation.role.as_str())
+            || observation.identity.volume_serial_number == 0
+            || observation.identity.file_index == 0
+            || !identities.insert((
+                observation.identity.volume_serial_number,
+                observation.identity.file_index,
+            ))
+        {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "profile-selection receipt {label} contains an invalid or duplicate root observation"
+            )));
+        }
+        WindowsPathIdentity::parse_root(
+            &observation.canonical_path.to_string_lossy(),
+            &format!("profile_selection_receipt.{label}.{}", observation.role),
+        )?;
+    }
+    if roles.len() != ROOT_ROLES.len() {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "profile-selection receipt {label} omits a retained root role"
+        )));
+    }
+    if receipt.authority_descriptor_sha256 == super::PHASE_B_PENDING_SCM_DIGEST
+        && receipt.profile != ProfileSelection::UserMode
+    {
+        return Err(InstallationError::ProfileViolation(
+            "the pending Phase-B selector is only valid for the UserMode authority transition"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 /// Breaking revision of the persisted four-root installation binding.
 ///
@@ -143,6 +432,140 @@ impl InstallationRoots {
         Ok(())
     }
 
+    /// Validates one retained live profile selection against this exact
+    /// descriptor-bound four-root and runtime-root set.
+    ///
+    /// The observations carry the original file-object identities. This
+    /// method checks their role and path bindings without deriving or
+    /// substituting identities from paths.
+    pub(crate) fn validate_profile_selection_receipt(
+        &self,
+        launch: &RuntimeLaunchDescriptor,
+        receipt: &ProfileSelectionReceipt,
+    ) -> Result<(), InstallationError> {
+        self.validate(launch.profile)?;
+        validate_profile_selection_receipt_shape(receipt, "binding")?;
+        let expected_profile = match launch.profile {
+            InstallationProfile::UserMode => ProfileSelection::UserMode,
+            InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+            InstallationProfile::SystemService => {
+                return Err(InstallationError::ProfileViolation(
+                    "profile-selection receipts are limited to UserMode and PortableDev"
+                        .to_owned(),
+                ));
+            }
+        };
+        let expected_installation_key = launch
+            .profile_installation_key
+            .as_ref()
+            .map(super::PlatformHandle::as_str);
+        let authority_descriptor_digest =
+            super::phase_b_scm_selector(&launch.authority_descriptor_digest)?;
+        if receipt.profile != expected_profile
+            || receipt.installation_id != launch.installation_epoch.installation.as_str()
+            || receipt.installation_key.as_deref() != expected_installation_key
+            || receipt.component != launch.profile_component.as_str()
+            || receipt.version != launch.profile_version.as_str()
+            || receipt.generation != launch.generation.as_str()
+            || !eliot_platform_windows::windows_paths_equal(
+                &receipt.authority_descriptor_path,
+                Path::new(launch.authority_descriptor_path.as_str()),
+            )
+            || receipt.authority_descriptor_sha256 != authority_descriptor_digest.as_str()
+            || receipt.authority_generation != launch.authority_generation.value()
+            || !receipt.owner_sid.starts_with("S-")
+            || receipt.session_id == 0
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        sha256_handle(
+            &authority_descriptor_digest,
+            "profile_selection_receipt.authority_descriptor_sha256",
+        )?;
+
+        let runtime = &launch.runtime_state_roots;
+        let expected_roots = [
+            ("immutable_binaries", self.immutable_binaries.as_str()),
+            ("durable_data", self.durable_data.as_str()),
+            ("user_config", self.user_config.as_str()),
+            ("user_cache", self.user_cache.as_str()),
+            (
+                "runtime_state_roots.profile_anchor_root",
+                runtime.profile_anchor_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.installation_root",
+                runtime.installation_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.host_state_root",
+                runtime.host_state_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.kernel_ors_root",
+                runtime.kernel_ors_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.kernel_work_root",
+                runtime.kernel_work_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.store_data_root",
+                runtime.store_data_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.store_work_root",
+                runtime.store_work_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.store_temp_root",
+                runtime.store_temp_root.as_str(),
+            ),
+            (
+                "runtime_state_roots.watchdog_state_root",
+                runtime.watchdog_state_root.as_str(),
+            ),
+        ];
+        if receipt.roots.len() != expected_roots.len() {
+            return Err(InstallationError::IncompleteObservation(
+                "profile-selection receipt does not contain the complete four-root and runtime-root set"
+                    .to_owned(),
+            ));
+        }
+        let mut observed_roles = BTreeSet::new();
+        for observation in &receipt.roots {
+            let Some((_, expected_path)) = expected_roots
+                .iter()
+                .find(|(role, _)| *role == observation.role)
+            else {
+                return Err(InstallationError::ProfileViolation(format!(
+                    "profile-selection receipt contains unknown root role {}",
+                    observation.role
+                )));
+            };
+            if !observed_roles.insert(observation.role.as_str())
+                || observation.identity.volume_serial_number == 0
+                || observation.identity.file_index == 0
+                || !eliot_platform_windows::windows_paths_equal(
+                    &observation.canonical_path,
+                    Path::new(expected_path),
+                )
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            WindowsPathIdentity::parse_root(
+                &observation.canonical_path.to_string_lossy(),
+                &format!("profile_selection_receipt.{}", observation.role),
+            )?;
+        }
+        if observed_roles.len() != expected_roots.len() {
+            return Err(InstallationError::IncompleteObservation(
+                "profile-selection receipt omits a descriptor-bound root role".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Admits an additional mutable output against this selected profile's
     /// immutable binaries binding.
     ///
@@ -206,6 +629,14 @@ impl InstallationRoots {
             "runtime_state_roots.profile_root",
         )?;
         let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
+        let installation = WindowsPathIdentity::parse_root(
+            self.runtime_state_roots.installation_root.as_str(),
+            "runtime_state_roots.installation_root",
+        )?;
+        let user_config = WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
+        let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
+        let installation_is_below_durable =
+            installation != durable && durable.contains(&installation);
         match profile {
             InstallationProfile::SystemService => {
                 let expected_durable = WindowsPathIdentity::parse_root(
@@ -216,11 +647,11 @@ impl InstallationRoots {
                     "durable_data",
                 )?;
                 if durable != expected_durable
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable != profile_root
+                    || !installation_is_below_durable
                 {
                     return Err(InstallationError::ProfileViolation(
-                        "runtime installation root must sit strictly below the I3.1 durable-data root"
+                        "SystemService durable data must equal its I3.1 root and contain the runtime installation root strictly"
                             .to_owned(),
                     ));
                 }
@@ -242,22 +673,61 @@ impl InstallationRoots {
                     &joined_windows_path(&user_root, "cache"),
                     "user_cache",
                 )?;
-                let user_config =
-                    WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
-                let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
                 if durable != expected_data
+                    || durable != profile_root
                     || user_config != expected_config
                     || user_cache != expected_cache
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || !installation_is_below_durable
                 {
                     return Err(InstallationError::ProfileViolation(
-                        "UserMode data, config, cache, and runtime roots must preserve the I3.1 sibling layout"
+                        "UserMode durable data must equal its I3.1 root, preserve the config/cache siblings, and contain the runtime installation root strictly"
                             .to_owned(),
                     ));
                 }
             }
-            InstallationProfile::PortableDev => {}
+            InstallationProfile::PortableDev => {
+                let anchor = WindowsPathIdentity::parse_root(
+                    self.runtime_state_roots.profile_anchor_root.as_str(),
+                    "runtime_state_roots.profile_anchor_root",
+                )?;
+                let expected_data = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(
+                        &joined_windows_path(
+                            self.runtime_state_roots.profile_anchor_root.as_str(),
+                            ".eliot-dev",
+                        ),
+                        "state",
+                    ),
+                    "durable_data",
+                )?;
+                let expected_config = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(
+                        self.runtime_state_roots.profile_anchor_root.as_str(),
+                        ".eliot-dev\\config",
+                    ),
+                    "user_config",
+                )?;
+                let expected_cache = WindowsPathIdentity::parse_root(
+                    &joined_windows_path(
+                        self.runtime_state_roots.profile_anchor_root.as_str(),
+                        ".eliot-dev\\cache",
+                    ),
+                    "user_cache",
+                )?;
+                if durable != expected_data
+                    || durable != profile_root
+                    || installation != durable
+                    || user_config != expected_config
+                    || user_cache != expected_cache
+                    || !anchor.contains(&durable)
+                    || anchor == durable
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "PortableDev must retain its repository anchor, state installation root, and exact config/cache siblings"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         Ok(())
     }

@@ -288,6 +288,145 @@ impl super::RedbInstallationRegistry {
         read_existing_registry(&database).map(Some)
     }
 
+    /// Inspects an existing UserMode or PortableDev registry through a
+    /// retained current-user no-follow Host-root lease. This read never
+    /// creates a registry file or database.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the read must retain the caller-provided current-user root lease"
+    )]
+    pub fn inspect_existing_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+    ) -> Result<Option<super::ApprovedGenerationRegistry>, super::InstallationError> {
+        if profile == super::InstallationProfile::SystemService {
+            return Err(super::InstallationError::ProfileViolation(
+                "SystemService registry reads require the protected Host-root lease".to_owned(),
+            ));
+        }
+        let path = super::installation_registry_path_user_owned(&host_root, profile)?;
+        host_root
+            .verify_stable_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => {
+                return Err(super::InstallationError::Platform(
+                    "UserMode registry path is not an existing regular file".to_owned(),
+                ));
+            }
+        }
+        let file = UserOwnedPathLease::open_existing(&host_root, &path)
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(super::InstallationError::Platform(
+                "UserMode registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        file.verify_path_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        let database = open_registry_reader_with_retry(file.path())?;
+        file.verify_path_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        host_root
+            .verify_stable_identity()
+            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        read_existing_registry(&database).map(Some)
+    }
+
+    /// Reads one generation's retained UserMode or PortableDev root receipt
+    /// without creating any registry path. Missing registry or receipt bytes
+    /// are explicit migration/recovery outcomes, never path-derived success.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the inspection retains the caller-provided current-user root lease"
+    )]
+    pub fn inspect_profile_selection_receipt_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+        generation: &PlatformHandle,
+    ) -> Result<eliot_platform_windows::profile_supervision::ProfileSelectionReceipt, super::InstallationError>
+    {
+        let registry = Self::inspect_existing_user_owned_at(host_root, profile)?.ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user installation registry is absent; retained profile identity cannot be rehydrated"
+                    .to_owned(),
+            }
+        })?;
+        registry
+            .profile_selection_receipt_for_generation(generation)
+            .cloned()
+    }
+
+    /// Reads the committed Phase-B activation fence for one exact generation
+    /// through the same bounded UserOwned registry snapshot used by Store and
+    /// Watchdog restart validation.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the inspection retains the caller-provided current-user root lease"
+    )]
+    pub fn inspect_committed_activation_fence_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+        generation: &PlatformHandle,
+    ) -> Result<super::ActivationCommitFence, super::InstallationError> {
+        let registry = Self::inspect_existing_user_owned_at(host_root, profile)?.ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user installation registry is absent; committed activation fence cannot be rehydrated"
+                    .to_owned(),
+            }
+        })?;
+        let fence = registry
+            .last_committed_activation_fence()
+            .ok_or_else(|| super::InstallationError::MigrationRequired {
+                reason: "current-user registry has no committed activation fence".to_owned(),
+            })?;
+        if &fence.generation != generation {
+            return Err(super::InstallationError::IdentityConflict);
+        }
+        fence.validate()?;
+        Ok(fence.clone())
+    }
+
+    /// Reads the retained root selection and exact committed Phase-B fence for
+    /// one generation from one validated UserOwned registry snapshot.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the inspection retains the caller-provided current-user root lease"
+    )]
+    pub fn inspect_profile_selection_and_activation_fence_user_owned_at(
+        host_root: UserOwnedRootLease,
+        profile: super::InstallationProfile,
+        generation: &PlatformHandle,
+    ) -> Result<
+        (
+            eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+            super::ActivationCommitFence,
+        ),
+        super::InstallationError,
+    > {
+        let registry = Self::inspect_existing_user_owned_at(host_root, profile)?.ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
+                reason: "current-user installation registry is absent; retained generation bindings cannot be rehydrated"
+                    .to_owned(),
+            }
+        })?;
+        let selection = registry
+            .profile_selection_receipt_for_generation(generation)?
+            .clone();
+        let fence = registry
+            .last_committed_activation_fence()
+            .ok_or_else(|| super::InstallationError::MigrationRequired {
+                reason: "current-user registry has no committed activation fence".to_owned(),
+            })?;
+        if &fence.generation != generation {
+            return Err(super::InstallationError::IdentityConflict);
+        }
+        fence.validate()?;
+        Ok((selection, fence.clone()))
+    }
+
     /// Loads the registry, returning an empty value on first use.
     pub fn load(&self) -> Result<super::ApprovedGenerationRegistry, super::InstallationError> {
         let read = self
@@ -640,6 +779,33 @@ enum PublicationJournalStoreFault {
 }
 
 impl RedbInstallationTransactionStore {
+    /// Captures the original current-user root identities in one exact
+    /// transaction store after all root/ACL and StagePackage prefix effects
+    /// have been durably applied. The existing transaction file is opened by
+    /// its exact caller-selected path; no file or parent is created.
+    pub fn record_profile_selection_receipt_at_exact_path(
+        path: impl AsRef<Path>,
+        transaction_id: &PlatformHandle,
+        receipt: eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let mut store = Self::open_existing_exact_path(path)?;
+        let mut transaction = store
+            .load(transaction_id)?
+            .ok_or_else(|| InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            })?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.record_profile_selection_receipt(receipt)?;
+        if transaction.revision != expected.revision {
+            <Self as transaction_store_private::Sealed>::compare_and_save(
+                &mut store,
+                expected,
+                &transaction,
+            )?;
+        }
+        Ok(transaction)
+    }
+
     /// Persist and read back a source-bundle publication intent in the exact
     /// caller-selected store before any native directory move occurs.
     pub fn begin_source_bundle_publication_at_exact_path(

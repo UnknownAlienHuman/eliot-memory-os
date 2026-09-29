@@ -1432,7 +1432,7 @@ pub(super) fn installation_registry_path(
     Ok(canonical_root.join(INSTALLATION_REGISTRY_FILE_NAME))
 }
 
-fn installation_registry_path_user_owned(
+pub(super) fn installation_registry_path_user_owned(
     host_root: &UserOwnedRootLease,
     profile: crate::InstallationProfile,
 ) -> Result<PathBuf, InstallationError> {
