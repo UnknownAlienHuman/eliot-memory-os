@@ -56,6 +56,7 @@
     "one_hop_consumers": [
       "bins/eliot",
       "bins/eliotd",
+      "crates/eliot-engine",
       "crates/governor/eliot-workscope",
       "crates/surfaces/eliot-cli",
       "workspace/tools/eliot-runtime-compiler"
@@ -102,20 +103,20 @@
     "test_stu": 0,
     "nonzero": true
   },
-  "bound_contract_digest": "47eb212c8826781c25944520ae47dffa1faae3684ef8872a18965a1c8dee3f7d",
+  "bound_contract_digest": "1c6d05759e5132da2d7617c10c92d37a5e347da0617521c32d6bcb43090fd0a8",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -128,15 +129,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 3,
-        "sha256": "00861fbbb6f94bea1c4c4a681384f50f5a0fdea54c348fb6fe2854212fb0a72e"
+        "sha256": "b315ac765013d8f7057d069844632ca95364b81330d9159008f3dec70bcd5166"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "2978676bddf4f5396f1eb7bfb4e250f8c6adca5dda936d0026f4efe40157f348",
+  "artifact_digest": "278fe2cdd7b60518276447148a298d3ae09a0ff3db9e32727ae27145b7fe2b08",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "2978676bddf4f539"
+    "value": "278fe2cdd7b60518"
   }
 }

@@ -24,8 +24,8 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 95398,
-    "test_stu": 34219,
+    "source_stu": 108838,
+    "test_stu": 36845,
     "selected_file_count": 9,
     "inline_cfg_test_modules": 3,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
@@ -34,9 +34,9 @@
     "selected_source": [
       {
         "path": "crates/surfaces/eliot-agent-bridge-core/src/lib.rs",
-        "bytes": 177501,
-        "sha256": "b1acf228fbc9cd584632eb09ca7f19db8a5fdad8ac82ed458d1936ae0d0222b5",
-        "stu": 59167,
+        "bytes": 214256,
+        "sha256": "7991759abb577f3c68e29b9d93ae36e25b4955e4ff6d1b8bcdd361960946b88e",
+        "stu": 71419,
         "inline_cfg_test": true
       },
       {
@@ -55,9 +55,9 @@
       },
       {
         "path": "crates/surfaces/eliot-agent-bridge-core/src/skill_transport.rs",
-        "bytes": 57785,
-        "sha256": "0d4780ac4b7a1b1ecef653a7f89e14c55aca888b5cfc62543d1298ed3548bffa",
-        "stu": 19262,
+        "bytes": 61348,
+        "sha256": "0ce2b2a15e70c22f2c7f5b331dd5ece4f3b93106d4db25eec7d0c60486904ba9",
+        "stu": 20450,
         "inline_cfg_test": true
       },
       {
@@ -71,8 +71,8 @@
     "selected_tests": [
       {
         "path": "crates/surfaces/eliot-agent-bridge-core/tests/bridge_contract.rs",
-        "bytes": 60516,
-        "sha256": "afc91245c8e026536c73f640b1204e6d404e095784cea4fc074fdda91b62f004",
+        "bytes": 64054,
+        "sha256": "9888f9e4cce4abe9c771ce21c9e702f5cc8f347962a04442dbf3e2a537faf5e3",
         "test_attributes": 33,
         "inline_cfg_test": false,
         "classes": [
@@ -100,8 +100,8 @@
       },
       {
         "path": "crates/surfaces/eliot-agent-bridge-core/tests/terminal_reconciliation_inputs.rs",
-        "bytes": 15378,
-        "sha256": "a715f9473e869ea5359aba8a3fe63fc95380404e58a8025f8daecdd3d3a22848",
+        "bytes": 19719,
+        "sha256": "cdce38be97787453e1eaa5d337495a0351630b097e4e37af815e09161e1d024c",
         "test_attributes": 2,
         "inline_cfg_test": false,
         "classes": [
@@ -109,7 +109,7 @@
         ]
       }
     ],
-    "source_selection_digest": "f8bf7c087c3e475a6f50d8bfb898dbb7534a9608e84a9bacee9904dde4bd8cc8"
+    "source_selection_digest": "45cce79be2a437498dce438366e6aa989fba686c736c7b14c36b7371b8f239a4"
   },
   "one_hop_providers": [
     "eliot-agent-api",
@@ -163,20 +163,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "a048b00e43be43a79430ee37e22bde0beeb35e3f6f7849cb01ea11b7620548a5",
+  "bound_contract_digest": "0540e54d75603e447d81e31958267818015699630d7be5ce339cb8d90c4a6682",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -189,15 +189,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 9,
-        "sha256": "f8bf7c087c3e475a6f50d8bfb898dbb7534a9608e84a9bacee9904dde4bd8cc8"
+        "sha256": "45cce79be2a437498dce438366e6aa989fba686c736c7b14c36b7371b8f239a4"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "a103cb06fa5ce04b63f54e6a4d3a2c9bf51fcb62c50e1f8f7a677e9798c0993b",
+  "artifact_digest": "2934c8b07fa8c08cf84aa77dbfe101dafae1cd8962a31074b9369c24870a3730",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "a103cb06fa5ce04b"
+    "value": "2934c8b07fa8c08c"
   }
 }

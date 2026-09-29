@@ -19,7 +19,7 @@
     "package": "eliot-sim-core",
     "root_path": "crates/eliot-sim-core",
     "manifest_path": "crates/eliot-sim-core/Cargo.toml",
-    "module_manifest": null,
+    "module_manifest": "crates/eliot-sim-core/module.toml",
     "description": "Pure deterministic simulation boundary: commands, events, state, seeded scheduler, fault injection, seed artifacts, mandatory scenarios"
   },
   "source_token_estimate": {
@@ -177,20 +177,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "4162d8504a868ba13fb75cbc4d61ec045ae3b5308a98ae4f051148bebb24d008",
+  "bound_contract_digest": "d1ad43120c2004178b3c31c64815b537a4190fe5d4265e964d750a4b0e75972a",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -198,9 +198,12 @@
       },
       "package_manifest": {
         "path": "crates/eliot-sim-core/Cargo.toml",
-        "sha256": "18fa271492a9750732dc883a67b6e6b6aa28126bd1a964b86d31e96ad1c9f664"
+        "sha256": "f96deeaf3eacc8cd8ab48075ac9de578d0b62f84ee4db88d532c21a3f6cb7ee5"
       },
-      "module_manifest": null,
+      "module_manifest": {
+        "path": "crates/eliot-sim-core/module.toml",
+        "sha256": "da62107a29209575da0bb111e628103d7bc8a21c740650b6ac30d90df084fcf9"
+      },
       "selected_source": {
         "path_count": 15,
         "sha256": "fa933136514a3d10b14465c7faebb73e5aef4e2a298602bdfc1d1e62b2f0cab0"
@@ -209,9 +212,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "c43766f47ff1b1732a3dae9bb372194b480b2e8730269386f7e0916512445061",
+  "artifact_digest": "37782d4289084dd72213a3ea0287a273dad96764593c6dda8e7480dbb0638863",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "c43766f47ff1b173"
+    "value": "37782d4289084dd7"
   }
 }

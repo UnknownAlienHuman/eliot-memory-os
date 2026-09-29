@@ -76,20 +76,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "6fb85a93b9c078e3dbe45283c1ca500440bd0443d235792a109a2bef9fbd143b",
+  "bound_contract_digest": "73c6379f30d0b30e2a553a437c334d99e605af1335546ed23a3847467f6f5d92",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -101,7 +101,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-development-diagnosis/module.toml",
-        "sha256": "a0d1e28c3a368854ef9bf9a43756b34792ab4f68ab0757fd1c6ea71debb1340a"
+        "sha256": "2ef9e87e7196bffc341ffc90017ff8e27d32a73b6ab3c56eadb200ac24fd79fe"
       },
       "selected_source": {
         "path_count": 1,
@@ -111,9 +111,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "33d40364943f7ab2e71ac511b15a6fd32efe8a9f578f8762164aed94e6b8d5fe",
+  "artifact_digest": "6737803bee79466a53ca974959e453b5747881503addb76a837426dd772e57c5",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "33d40364943f7ab2"
+    "value": "6737803bee79466a"
   }
 }

@@ -24,7 +24,7 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 14765,
+    "source_stu": 14798,
     "test_stu": 8751,
     "selected_file_count": 2,
     "inline_cfg_test_modules": 0,
@@ -34,9 +34,9 @@
     "selected_source": [
       {
         "path": "crates/smart/eliot-memory-quality/src/lib.rs",
-        "bytes": 44294,
-        "sha256": "7bfe23bef1f1164d75566a0da4f1ecd2f9eb18f01d0e8600257763d508feb8df",
-        "stu": 14765,
+        "bytes": 44394,
+        "sha256": "ae7d947d8818c3701a9b5a1167551f16929f8eb739d5428eab70802a1656f010",
+        "stu": 14798,
         "inline_cfg_test": false
       }
     ],
@@ -50,7 +50,7 @@
         "classes": []
       }
     ],
-    "source_selection_digest": "25fd2be9e7f97389b500bf84fb7250dd1ed8d738704ed793aa962421d8aa7f8a"
+    "source_selection_digest": "72b68adae754fc1c63f2769adb7cacd92d45f997e7f62cc605bde68c0b103db2"
   },
   "one_hop_providers": [
     "eliot-context-contracts",
@@ -93,20 +93,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "68129308b0d4d922cad1fa236dd46c97efce34eefce666cb1ec4fd26ed36002e",
+  "bound_contract_digest": "b2d9553eb29856e092dfb89861ead55a64410a61908ad79d4b8fbb6774fac722",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -118,19 +118,19 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-memory-quality/module.toml",
-        "sha256": "819e1f3930800ab2b9af9871c21a2372856d15c225200d2a3ddbd2c54dda438f"
+        "sha256": "fae29dad092b3fcc8ccfefb767c1ee1a43a45c7796ab22d2562374149c4d397c"
       },
       "selected_source": {
         "path_count": 2,
-        "sha256": "25fd2be9e7f97389b500bf84fb7250dd1ed8d738704ed793aa962421d8aa7f8a"
+        "sha256": "72b68adae754fc1c63f2769adb7cacd92d45f997e7f62cc605bde68c0b103db2"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "d90058b3f15084505f9bbc65da521c0e4c088ebc5ae5a09d4e36a9ba19c15fe0",
+  "artifact_digest": "af97677920ed6ecaa1e961ea2d083184a5022eebac27bda539a79aabd593fea7",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "d90058b3f1508450"
+    "value": "af97677920ed6eca"
   }
 }

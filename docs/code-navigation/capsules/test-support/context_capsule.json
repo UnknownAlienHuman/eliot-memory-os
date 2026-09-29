@@ -19,7 +19,7 @@
     "package": "eliot-test-support",
     "root_path": "crates/foundation/eliot-test-support",
     "manifest_path": "crates/foundation/eliot-test-support/Cargo.toml",
-    "module_manifest": null,
+    "module_manifest": "crates/foundation/eliot-test-support/module.toml",
     "description": "ELIOT bounded test-only clocks, fixtures, failpoints and fake resources"
   },
   "source_token_estimate": {
@@ -77,20 +77,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "66e04199fbce86a3d8b456f55413e62723c7c9d8bbff9b24e03e52a5984b71bd",
+  "bound_contract_digest": "7deefe00930c88281344cf2bee38cf2cbbc563429dd15381bab3da354448256e",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -98,9 +98,12 @@
       },
       "package_manifest": {
         "path": "crates/foundation/eliot-test-support/Cargo.toml",
-        "sha256": "9784f68f8826bde4b73cd579c755753c166fb8560d190ef241ed6c6b9a53b593"
+        "sha256": "a32e3b4ffb732cbe5e8030b2fc40f3a91b57e62a2c9dffec49d2a2d830881ada"
       },
-      "module_manifest": null,
+      "module_manifest": {
+        "path": "crates/foundation/eliot-test-support/module.toml",
+        "sha256": "c7f9cc6f3fd2918007f9bd9b3a1e0cc6c50140e0a5e45c8dab45bcc9d5d5e210"
+      },
       "selected_source": {
         "path_count": 1,
         "sha256": "c1acdb71b027653141708cda735a938de8de9d05e815d46bea5a52855edc9c08"
@@ -109,9 +112,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "c73bf6e3218eecb9650d0a174bcd42e9c8fd1a2d747b3bd895b8dadd8f269d06",
+  "artifact_digest": "759e64df8cbf1ba29a2a9482ffdca6bf907bc222cf30ad771d4abad7f9dd1e72",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "c73bf6e3218eecb9"
+    "value": "759e64df8cbf1ba2"
   }
 }

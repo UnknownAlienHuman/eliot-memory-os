@@ -31,9 +31,9 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 800173,
-    "test_stu": 80133,
-    "selected_file_count": 71,
+    "source_stu": 981766,
+    "test_stu": 82278,
+    "selected_file_count": 79,
     "inline_cfg_test_modules": 29,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
   },
@@ -41,23 +41,23 @@
     "selected_source": [
       {
         "path": "bins/eliotd/src/activation_projection.rs",
-        "bytes": 62307,
-        "sha256": "019ab8af169d9a4195b555d5ad50b14d245dcb4bf7a1e696e8b9db1da2a014c2",
-        "stu": 20769,
+        "bytes": 63243,
+        "sha256": "cd3fbaf3da8fdb70afb98157fb29a583fbf256614f4682dda0160680784eb0aa",
+        "stu": 21081,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/agent_fabric.rs",
-        "bytes": 125648,
-        "sha256": "6ef91b73a7956d9fd1a6bd87ddf21154e919161eab446713eb9a44ed7232773e",
-        "stu": 41883,
+        "bytes": 153190,
+        "sha256": "879a9ada54eec0fe6484dc3e4b0848eea4a5a6a7f71db6b4650c98da49150968",
+        "stu": 51064,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/campaign_context_owner.rs",
-        "bytes": 12251,
-        "sha256": "3bfecfb7548da5c2878726dd34c2402cef3be6c0899ed5d51a278d2ce2c8a11e",
-        "stu": 4084,
+        "bytes": 14338,
+        "sha256": "5963186a611c3920352bed59a4046ffa43c2898d96ce535ed106199a5993c8eb",
+        "stu": 4780,
         "inline_cfg_test": false
       },
       {
@@ -76,23 +76,23 @@
       },
       {
         "path": "bins/eliotd/src/campaign_packet.rs",
-        "bytes": 61059,
-        "sha256": "1f6281cf15923e5dc71f9c70821094f70ad433298416193055ecd0af6af2429e",
-        "stu": 20353,
+        "bytes": 67176,
+        "sha256": "738850b9e1399fcd0f2dfadcc1304ae758d9fa4a56992c5d42627e7823e6e4aa",
+        "stu": 22392,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/campaign_task_controller.rs",
-        "bytes": 16643,
-        "sha256": "3230b32cf9efc83b725a8db2f1ebda7179cafeeac65250f6b8df0e57a821384b",
-        "stu": 5548,
+        "bytes": 24785,
+        "sha256": "441c655db284641b4390409a6695f5a8bd2b3bf82514ac4c15fdcdf661aafe93",
+        "stu": 8262,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/canonical_config_precedence.rs",
-        "bytes": 40692,
-        "sha256": "df7b6e4d0b5a12272867d086c436a53918cf1a66fc94c91bf6ec9447f1de3cce",
-        "stu": 13564,
+        "bytes": 44304,
+        "sha256": "d16795fa0b1c25107de01d323da25c8d85bfdd9ebc82cf9be50f7cd0c1f32c42",
+        "stu": 14768,
         "inline_cfg_test": true
       },
       {
@@ -104,44 +104,44 @@
       },
       {
         "path": "bins/eliotd/src/capability_evidence_wiring.rs",
-        "bytes": 20286,
-        "sha256": "cc177dd3d88d2da2bcffc66b7d6a2cb0b5d87c0f5580a1139a85ca7deac10da8",
-        "stu": 6762,
+        "bytes": 68872,
+        "sha256": "84794a966cf749343c12720f0c15b8a001e3c336cf29170799531ce765f29459",
+        "stu": 22958,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/capability_outcome.rs",
-        "bytes": 26656,
-        "sha256": "75e255cdba39c0554f5ca1827c96bd0ae762b2e97fb93fd2952396f6a6e7a813",
-        "stu": 8886,
+        "bytes": 33981,
+        "sha256": "e96867b089afd4539c530faeffd8851b4f3605ff31b48d0df8dade56b4fcdefb",
+        "stu": 11327,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/controlboard_adapters.rs",
-        "bytes": 105397,
-        "sha256": "9e731a7d875527e52f0d6d73df73c0413c15612783a3722b4466476ee5181b90",
-        "stu": 35133,
+        "bytes": 108132,
+        "sha256": "2af3fca57df3ee345a2c73323ee2c3a74cd2cd0c6ef9382c23dbb94a0f871b7a",
+        "stu": 36044,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/daemon_config.rs",
-        "bytes": 10326,
-        "sha256": "5ccb21d29a5cf0e1ed3f61e4c7a5b7ae6e177ffcbad3912819cfe7a1eb9ff20a",
-        "stu": 3442,
+        "bytes": 16126,
+        "sha256": "6d8daddb250da867891de803e80a29b7b2021d9788ba53fc50b4c4c8aecf6716",
+        "stu": 5376,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/daemon_kernel_client.rs",
-        "bytes": 131896,
-        "sha256": "b8cf967ea2b77b09f9458bb6669489f2eeb639d738a926dc7734181773bbce18",
-        "stu": 43966,
+        "bytes": 144387,
+        "sha256": "f810aca82af3b775eb9018abaa188a43a6187da45e3dad7a7726681435419316",
+        "stu": 48129,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/daemon_kernel_client/handshake.rs",
-        "bytes": 9783,
-        "sha256": "8e9773d31e1dbf8d2816ef5e49dece5e26ca937e1c93beee13e990d01ff1ee6e",
-        "stu": 3261,
+        "bytes": 12645,
+        "sha256": "b745a636214a74f508a75abc9a06d21f8b4ab43cd7bcfb4c0ca1820b8650304d",
+        "stu": 4215,
         "inline_cfg_test": false
       },
       {
@@ -153,16 +153,16 @@
       },
       {
         "path": "bins/eliotd/src/daemon_runtime.rs",
-        "bytes": 240882,
-        "sha256": "092aa5db9eba9bffed0d27594c8fd63d50136fdcdfb57897e5197db970ea4ab0",
-        "stu": 80294,
+        "bytes": 235442,
+        "sha256": "903a5ab91ab1726669f9b965447883fccb2b300401cd1b743586822d9e1845b2",
+        "stu": 78481,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/diagnostics.rs",
-        "bytes": 50800,
-        "sha256": "83715fe1c1c6afda09cca67f76dbe75ec6e499333a1597856d8a9baca6c8d04c",
-        "stu": 16934,
+        "bytes": 61309,
+        "sha256": "a552036000e8896ce82efa4f12061dfd4c85eb6ed5f0aa89292e133cb0947c7c",
+        "stu": 20437,
         "inline_cfg_test": false
       },
       {
@@ -181,10 +181,17 @@
       },
       {
         "path": "bins/eliotd/src/dreamer_model_adapter.rs",
-        "bytes": 96383,
-        "sha256": "3778ca24e3ac37728dca519370546afb43ed38654d70d68dcf109521eaab2e49",
-        "stu": 32128,
+        "bytes": 136017,
+        "sha256": "e78c85bc94f8bf90869e0eeb1016d1e87e016d74e91dba42b4d0ec3747fd3884",
+        "stu": 45339,
         "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliotd/src/execution_metrics.rs",
+        "bytes": 25772,
+        "sha256": "d5c14e90ffd5af65dafa605ed85405070b40c0788be3d89eafe92247965d755c",
+        "stu": 8591,
+        "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/experience_runtime.rs",
@@ -194,10 +201,17 @@
         "inline_cfg_test": false
       },
       {
+        "path": "bins/eliotd/src/external_attach_reconciliation.rs",
+        "bytes": 54304,
+        "sha256": "0aaee2785c52e029ada410b2f5feaaf2be6f6fc4c678a08b1d7bfd559d832abc",
+        "stu": 18102,
+        "inline_cfg_test": false
+      },
+      {
         "path": "bins/eliotd/src/finish_attempt.rs",
-        "bytes": 7524,
-        "sha256": "ba30ae21178ab36d91fae1036690b956b135b620a2e022413459231fdc4f2dea",
-        "stu": 2508,
+        "bytes": 12503,
+        "sha256": "ce13cc16ac0853ce69649f958df9d55b34248f985aa7382590f9347eb91668aa",
+        "stu": 4168,
         "inline_cfg_test": false
       },
       {
@@ -209,10 +223,17 @@
       },
       {
         "path": "bins/eliotd/src/freshness_admission.rs",
-        "bytes": 36529,
-        "sha256": "73b57d22384b5531989fc7d9258fe0b10279e0cad64d4c1d09dc06dd5256c7c1",
-        "stu": 12177,
+        "bytes": 42868,
+        "sha256": "ec8606a1bb7b782274b8322aa24a7f3bf989ec31076a1e902c872a5589bc7aca",
+        "stu": 14290,
         "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliotd/src/governor_authority_feed.rs",
+        "bytes": 7157,
+        "sha256": "6cdebd7a1e7e0f0e35b5a60dd6cb5d617fd772de2a741b4577504dd916a0add4",
+        "stu": 2386,
+        "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/governor_local_read.rs",
@@ -230,9 +251,9 @@
       },
       {
         "path": "bins/eliotd/src/improvement_candidate_route.rs",
-        "bytes": 9010,
-        "sha256": "9cbfe14f5b5799b29d970dbabaa30ad2b8d7d154690cc3cb4bd22d289bf2ad9d",
-        "stu": 3004,
+        "bytes": 10821,
+        "sha256": "7d9f2dfc89807a390e9a2eaefa41dea150a5e69c201f0b5fd0bd01a39fee58c2",
+        "stu": 3607,
         "inline_cfg_test": false
       },
       {
@@ -243,24 +264,31 @@
         "inline_cfg_test": false
       },
       {
+        "path": "bins/eliotd/src/improvement_intake_dispatch.rs",
+        "bytes": 53896,
+        "sha256": "fbebbc7927e915e677e2f422cb77df7f758c513d8c9c1e6e0f270253d0a07cf7",
+        "stu": 17966,
+        "inline_cfg_test": false
+      },
+      {
         "path": "bins/eliotd/src/kernel_authority_client.rs",
-        "bytes": 37801,
-        "sha256": "9acff39eecc9da1434f4ed5d6250b19528f9e6a93c8380cd3ec1f62e6e3b64c4",
-        "stu": 12601,
+        "bytes": 38065,
+        "sha256": "19b6f3b2ca5f1ebbfeacf7b3cf038dfb27acb3102ecf59677b550d3b0b4ba070",
+        "stu": 12689,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/kernel_context_read_client.rs",
-        "bytes": 95853,
-        "sha256": "009584fc8d8d9e0ebbd1ec2236f07be54cc84f62cec91a64595c4ed3ec7a36e1",
-        "stu": 31951,
+        "bytes": 96694,
+        "sha256": "59d011c5ccdefeb46ec8383e384b9e8ea04fe2b43d1e5c05afa0ab855603fe9d",
+        "stu": 32232,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/kernel_recovery_client.rs",
-        "bytes": 13322,
-        "sha256": "367074141581145ba7470fedca3747544dd960c4496ada858c643362297f1d01",
-        "stu": 4441,
+        "bytes": 14474,
+        "sha256": "26cc821a1db6d9e20de7e66ebeba685eec7c86ee203f646560ff36602d516dcb",
+        "stu": 4825,
         "inline_cfg_test": false
       },
       {
@@ -272,51 +300,58 @@
       },
       {
         "path": "bins/eliotd/src/lib.rs",
-        "bytes": 133220,
-        "sha256": "81818db070cd0529f804e833abfeccda9edb838d0c3753bac62be156cfceac45",
-        "stu": 44407,
+        "bytes": 182155,
+        "sha256": "2a38d7b2a8d17365e540da93a2e08004cf6d02050dcf855647ade19f00912d21",
+        "stu": 60719,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/main.rs",
-        "bytes": 1177,
-        "sha256": "6dc76c7b6ea4a07626626fee1cb8008536f8ff538d71a5ff79c947f0296c1f7f",
-        "stu": 393,
+        "bytes": 1829,
+        "sha256": "08777a57e17b9f9efee402bfe2bd4f7aa2463fa5bebb3fb6669fd9b9c7338a58",
+        "stu": 610,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/maintenance_family_catalog.rs",
-        "bytes": 62273,
-        "sha256": "915ba1edae730510c6aca0527b5b392975d80f365ba91e1eb8ec5733922b02f4",
-        "stu": 20758,
+        "bytes": 68344,
+        "sha256": "fdea8205a9732212484d09e78f9926a577daf5d5faaaac382b00d439ce6fd60a",
+        "stu": 22782,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/maintenance_trigger_evaluator.rs",
-        "bytes": 15437,
-        "sha256": "ca9fa843026e5076c9561f398158941cc66314edbbcaf3a4b0c37e279e0c16dd",
-        "stu": 5146,
+        "bytes": 18241,
+        "sha256": "902eacd076c8e95de18098a897cd7984e990d41c1366f07924fdae2b756a32c5",
+        "stu": 6081,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/notification_board_attach.rs",
-        "bytes": 8823,
-        "sha256": "34a5fc7789fb9b23d5f9b20a0eb3efb4f41e173dcf48f4f76fb04d30827b3abb",
-        "stu": 2941,
+        "bytes": 17702,
+        "sha256": "5f800bda2bb35d7d02339d96201349829cd0584e06138f81819b0c88c2d6a4ed",
+        "stu": 5901,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/notification_state_emit.rs",
-        "bytes": 38956,
-        "sha256": "2266927e762008d7cc42e2e5073f563491b6948d294fe77fa1bd3cb1a23ae9f6",
-        "stu": 12986,
+        "bytes": 44588,
+        "sha256": "3e4b95d7fdde6e3c90469ecbcce387e2c1a390420f6ec7fe428e4a44cae82d91",
+        "stu": 14863,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/observability.rs",
+        "bytes": 3711,
+        "sha256": "7f6198eaed8ea53ece460f7cd62c4e5e5fde89dd82423d03abf0e6f3eac3566b",
+        "stu": 1237,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/observation_adapters.rs",
-        "bytes": 34292,
-        "sha256": "b1065ff77135288d263dcb6a4662d101c3ed0ff573276ad6d366f09f5f98a44f",
-        "stu": 11431,
+        "bytes": 34620,
+        "sha256": "2e9accc2263fe6a597dd16839c5d1ab21244c35388cbdf0560a8b45c1d1ea42a",
+        "stu": 11540,
         "inline_cfg_test": true
       },
       {
@@ -328,16 +363,30 @@
       },
       {
         "path": "bins/eliotd/src/process_origin.rs",
-        "bytes": 31305,
-        "sha256": "532b3f793ff9f422371e80024b3e93f3ed7390877b92c9d0e61229be2356107f",
-        "stu": 10435,
+        "bytes": 32496,
+        "sha256": "af6d5492ee48340a6e6737f818d6bdef77b29709ab1339e0d37030abe11c7c6b",
+        "stu": 10832,
         "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliotd/src/provider_transport_policy.rs",
+        "bytes": 34490,
+        "sha256": "90a13ae451f3460b4fce48d4ba7f0bfcc7b1fbc71e6313347cc36b90d4a79700",
+        "stu": 11497,
+        "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/reactive_feed.rs",
         "bytes": 6768,
         "sha256": "3aa8a1c51cc3f2e2f24c34399519f44b107ace64e769d809bef6903f9d7fe391",
         "stu": 2256,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/route_execution_identity.rs",
+        "bytes": 12525,
+        "sha256": "4f70cb6b1a7ecd86c61e3cb1325f2576bb573e90bf1a463edc30d0850bf6a85e",
+        "stu": 4175,
         "inline_cfg_test": false
       },
       {
@@ -349,9 +398,9 @@
       },
       {
         "path": "bins/eliotd/src/skill_acceptance_read.rs",
-        "bytes": 22402,
-        "sha256": "3e240f71ba891c31e929c51b8f9be8d9eb84d2fbac819c626c36900fdfdc1b81",
-        "stu": 7468,
+        "bytes": 23664,
+        "sha256": "15c7a0af4b22913eb0a139a3d8fd6de4795530d686d63de6ed8563770aca2681",
+        "stu": 7888,
         "inline_cfg_test": true
       },
       {
@@ -363,16 +412,23 @@
       },
       {
         "path": "bins/eliotd/src/skill_dispatch.rs",
-        "bytes": 24934,
-        "sha256": "32b6be56b27adeafe46f9e76c31b7c4fa2f00c745dc300d5ff960bca72c74831",
-        "stu": 8312,
+        "bytes": 60413,
+        "sha256": "dd00ff2a560e8149401dae6973de013c9c7f407234e5969ab3ab5d3fd5c775d6",
+        "stu": 20138,
         "inline_cfg_test": true
       },
       {
+        "path": "bins/eliotd/src/skill_evidence_read.rs",
+        "bytes": 17672,
+        "sha256": "c624fb12d548fd65369dbf03399602756ecd20a956c51eb70b8973e9ed7f592a",
+        "stu": 5891,
+        "inline_cfg_test": false
+      },
+      {
         "path": "bins/eliotd/src/skill_lifecycle_adapters.rs",
-        "bytes": 135913,
-        "sha256": "8baf8b8a37000c6ba7f2b69347313f91d68e66e6b9303187c2f7a36483af4ea8",
-        "stu": 45305,
+        "bytes": 136571,
+        "sha256": "a9d9a9fd09b2d12ff97ba7e209a01e0d76779445c9b0021782ddd3314ddc77f3",
+        "stu": 45524,
         "inline_cfg_test": true
       },
       {
@@ -384,9 +440,9 @@
       },
       {
         "path": "bins/eliotd/src/staffing_policy.rs",
-        "bytes": 30078,
-        "sha256": "0f44debc89b3664893cb4a4b5f8d344b9bfe4f443feb2db1eb31c944c45fdd36",
-        "stu": 10026,
+        "bytes": 49705,
+        "sha256": "ec5c5cf7b617804b75d20981eb6d914eefb88f4e76e2897ee231f1c1fa4f46aa",
+        "stu": 16569,
         "inline_cfg_test": false
       },
       {
@@ -398,9 +454,9 @@
       },
       {
         "path": "bins/eliotd/src/startup_evidence_producer.rs",
-        "bytes": 53294,
-        "sha256": "1d1eb0335f461b51bfeda9259ac6eaf987d7e69489eebd9773e0a91117d0ef69",
-        "stu": 17765,
+        "bytes": 54268,
+        "sha256": "a9e0d3f3701b2a1c03a1474ad705c3d6a46872f91d06a9f2167f2a40016ca211",
+        "stu": 18090,
         "inline_cfg_test": true
       },
       {
@@ -426,16 +482,16 @@
       },
       {
         "path": "bins/eliotd/src/swarm_composition.rs",
-        "bytes": 72211,
-        "sha256": "677040fbeb263dbd409ebe1f947d9846e61ee0c5da50414af575533dff859574",
-        "stu": 24071,
+        "bytes": 77876,
+        "sha256": "ce80b399d614226d576e3adee927cc5329e26e38fef982b0d125effc112af7f3",
+        "stu": 25959,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/task_binding_admission.rs",
-        "bytes": 45925,
-        "sha256": "f381ecdf284abbbfac5fff144bf57f6a6c9706e2db4f2ebd3b4f4436b6a2685a",
-        "stu": 15309,
+        "bytes": 53763,
+        "sha256": "c338f6dd9a8413f80b44ecf94d07ad03c984695e03bcbd333dfdbacc51b03602",
+        "stu": 17921,
         "inline_cfg_test": true
       },
       {
@@ -447,9 +503,9 @@
       },
       {
         "path": "bins/eliotd/src/testd_terminal_completion.rs",
-        "bytes": 37392,
-        "sha256": "0439ce64fcf3713f05202176f5d8c7bb592044782c50bfd7af1b5585a8f4f55f",
-        "stu": 12464,
+        "bytes": 38325,
+        "sha256": "443a970018a01eda1d2dfe78cfac35897ba5fa45066ae74eac5cb72f1f81758c",
+        "stu": 12775,
         "inline_cfg_test": false
       },
       {
@@ -483,8 +539,8 @@
       },
       {
         "path": "bins/eliotd/tests/agent_fabric_wiring.rs",
-        "bytes": 67378,
-        "sha256": "c4dd2af557dba078a73a3cd6798dc5d350730c689e6e76851aff5f7e84eca158",
+        "bytes": 70940,
+        "sha256": "d241a37830a9188d2ebf3fb6050dbccbf25153f6ff95e8f3454309c9ecf19357",
         "test_attributes": 31,
         "inline_cfg_test": false,
         "classes": [
@@ -494,8 +550,8 @@
       },
       {
         "path": "bins/eliotd/tests/daemon_diagnostics.rs",
-        "bytes": 42679,
-        "sha256": "965d8b0c294df93b086ab4e867fe306315c67568bfa04e77e4ce2a8c1c496f5b",
+        "bytes": 45282,
+        "sha256": "221125dfb87ad1da5f1bea58bdb05a1bfcd8b715688dd941997084332516b887",
         "test_attributes": 21,
         "inline_cfg_test": false,
         "classes": [
@@ -524,8 +580,8 @@
       },
       {
         "path": "bins/eliotd/tests/local_read_e2e.rs",
-        "bytes": 19379,
-        "sha256": "0fcb32b802fd6fc60ccb54ce4da3b3f334030dbf4f8e7ccd65f23163f22eec08",
+        "bytes": 19544,
+        "sha256": "47b79fb126c30688abbd7797731401b9266b45448d59c2c36cac0613b909537c",
         "test_attributes": 2,
         "inline_cfg_test": false,
         "classes": [
@@ -542,8 +598,8 @@
       },
       {
         "path": "bins/eliotd/tests/swarm_composition.rs",
-        "bytes": 22387,
-        "sha256": "327070af5c1a220edb6ba904185fc013199f322347208b736f1a06daa60f0507",
+        "bytes": 22492,
+        "sha256": "4ae75124d12e0309eb97d37c74f5b350eef415f0ed755616a32efbb81badca53",
         "test_attributes": 5,
         "inline_cfg_test": false,
         "classes": [
@@ -568,7 +624,7 @@
         "classes": []
       }
     ],
-    "source_selection_digest": "5a76115fb9ed94c84092f5819ca7889bfe34f5b3f91c387cdfd2fabefaa8b2e9"
+    "source_selection_digest": "5e6ea4691e37e5bf977c6f076fea4448f832dd7e03932a3de9f934e39ff0462b"
   },
   "one_hop_providers": [
     "eliot-agent-api",
@@ -601,6 +657,7 @@
     "eliot-governor",
     "eliot-improvement",
     "eliot-instrument-api",
+    "eliot-integration-coverage",
     "eliot-ipc",
     "eliot-kernel-core",
     "eliot-kernel-service",
@@ -609,6 +666,7 @@
     "eliot-maintenance",
     "eliot-memory-quality",
     "eliot-observability",
+    "eliot-observability-runtime",
     "eliot-observation",
     "eliot-observation-contracts",
     "eliot-platform",
@@ -669,20 +727,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "2d723edbff05119c56081d595a1b57c4601ae1a5a24a8232a74d2b2ac9f04b37",
+  "bound_contract_digest": "8be4deac3744c2614555a2dedd4487320558b8a86d307f065f04a8855a15894b",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -690,20 +748,20 @@
       },
       "package_manifest": {
         "path": "bins/eliotd/Cargo.toml",
-        "sha256": "955e74e5d5c038ad9fbbe09e0df4788d2b870251cfe86a676b63c50fa78b6cab"
+        "sha256": "cae3983df692fb5b9b527363c385ceae667aeb550bec8fa9e4b6a973a4c3c175"
       },
       "module_manifest": null,
       "selected_source": {
-        "path_count": 71,
-        "sha256": "5a76115fb9ed94c84092f5819ca7889bfe34f5b3f91c387cdfd2fabefaa8b2e9"
+        "path_count": 79,
+        "sha256": "5e6ea4691e37e5bf977c6f076fea4448f832dd7e03932a3de9f934e39ff0462b"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "26a3f9e3f8e7ce70245366c3a1d2154e513c863c5173999c694135ac555c926e",
+  "artifact_digest": "09b68108de0bc57c9c004ec67acb2799825d2cbbad57add6e4da89e6a6a464bb",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "26a3f9e3f8e7ce70"
+    "value": "09b68108de0bc57c"
   }
 }

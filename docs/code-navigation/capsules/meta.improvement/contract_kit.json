@@ -1,0 +1,289 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "meta.improvement",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "meta.improvement",
+    "source_package": "eliot-improvement",
+    "source_manifest": "crates/meta/eliot-improvement/Cargo.toml",
+    "source_root_path": "crates/meta/eliot-improvement",
+    "module_manifest": "crates/meta/eliot-improvement/module.toml",
+    "workspace_member": true,
+    "bins_reachable": true,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Declare, bound, deduplicate and close improvement candidates and prepare the advisory promotion input that Governor maintenance admission consumes."
+    },
+    "causal_property": {
+      "state": "DECLARED",
+      "origin": "module.toml|causal_property",
+      "value": "advisory improvement candidate declaration, intake bounds and closure, plus the advisory promotion-input preparation the Governor admission owner consumes"
+    },
+    "invariants": {
+      "state": "DECLARED",
+      "origin": "module.toml|invariants",
+      "value": [
+        "advisory_only is always true and direct_promotion is always false",
+        "no API in this package can make a candidate active, admitted or promoted",
+        "self-verification is impossible: the package supplies no evaluator outcome that admits its own candidate",
+        "closure never performs promotion",
+        "one aggregate learning score never becomes a promotion gate"
+      ]
+    },
+    "non_goals": {
+      "state": "DECLARED",
+      "origin": "module.toml|non_goals",
+      "value": [
+        "promotion execution",
+        "active generation activation or cutover",
+        "authority or permit issuance",
+        "source, config or policy mutation",
+        "task Finish",
+        "second scheduler or maintenance owner"
+      ]
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "supervision-meta",
+        "title": "Supervision and meta repair",
+        "responsibility": "Watchdog observation, Doctor repair, runtime status, improvement, independent supervision, and bounded recovery.",
+        "documentation_handles": [
+          "I14.25",
+          "I8.3"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "DECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": "meta.improvement"
+    },
+    "source_maintenance_owner": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": null
+    },
+    "state_class": {
+      "state": "DECLARED",
+      "origin": "module.toml|state_class",
+      "value": "stateless"
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return an explicit rejected, narrowed, inconclusive or open-learning-debt outcome with exact missing evidence; never infer promotion readiness from one score and never fabricate a result."
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|inputs",
+      "value": [
+        "instrumental signal or outcome",
+        "owner-decision evidence and trace",
+        "campaign outcome and economics evidence",
+        "AttemptLearningDelta refs",
+        "HarnessActivationReceipt refs"
+      ]
+    },
+    "outputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|outputs",
+      "value": [
+        "ImprovementCandidate",
+        "CampaignLearningClosure candidate",
+        "PromotionInput candidate",
+        "intake and bounds outcome",
+        "open learning debt"
+      ]
+    },
+    "providers": {
+      "state": "DECLARED",
+      "origin": "module.toml|providers",
+      "value": [
+        "Dreamer/Watchdog/Concilium suggestion",
+        "replay, holdout, transfer, retention, evaluator-validity and Product Pulse evidence"
+      ]
+    },
+    "depends_on": {
+      "state": "DECLARED",
+      "origin": "module.toml|depends_on",
+      "value": [
+        "eliot-learning-contracts"
+      ]
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": "R7"
+      },
+      "runtime_bundle": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": "eliotd"
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "DECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "DECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": "merge back when no independent consumer, proof, dependency or replacement seam remains"
+    },
+    "split_trigger": {
+      "state": "DECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": null
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "DECLARED",
+      "origin": "module.toml|discriminator",
+      "value": "the package prepares a candidate and an advisory promotion input only; every authority-bearing value (proof ceiling, effect class, permits, promotion receipts) is fixed in the Governor admission owner and read by no API here"
+    },
+    "old_failure_or_missing_capability": {
+      "state": "DECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": "an unbound improvement package could treat source presence or a passing experiment as production self-modification, policy change, capability support, authority expansion or task Finish"
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "unimplemented!",
+        "todo!"
+      ]
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [],
+    "contract_refs_source": "crates/meta/eliot-improvement/Cargo.toml",
+    "donor_records": [
+      {
+        "path": "ELIOT_ARCHITECTURE I2.23 CrateExtractionDecision",
+        "disposition": "authoritative crate topology and disposition decision shape"
+      },
+      {
+        "path": "ELIOT_IMPLEMENTATION I12.24 ImprovementCandidate and CampaignLearningClosure",
+        "disposition": "authoritative candidate and closure contract"
+      },
+      {
+        "path": "crates/smart/cognitive-donor-map.toml",
+        "disposition": "RETAIN_AND_HARDEN_IN_PLACE donor row for crates/meta/eliot-improvement; this package-level decision is the same reading in I2.23 decision form and does not open a second one"
+      }
+    ]
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/meta/eliot-improvement/Cargo.toml",
+        "sha256": "e12432ef3226951528872e9e9f23601b9b2bf0b20ff228861a7e929467db06ec"
+      },
+      "module_manifest": {
+        "path": "crates/meta/eliot-improvement/module.toml",
+        "sha256": "40703cfc618ec83c35e64c960038c8cd7b5752a6a4f51884b15de3b0f7ee4b5f"
+      },
+      "selected_source": {
+        "path_count": 17,
+        "sha256": "eb03e246811ab69daa07afe41716fefd916a6cfdc6768c5aae0239bb7fd8924f"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "0339e26cb20e5028ed8fa47adeb87dc0db337418330506cbe21aac82cfc9cee8",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "0339e26cb20e5028"
+  }
+}

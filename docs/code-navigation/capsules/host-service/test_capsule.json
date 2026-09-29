@@ -60,8 +60,8 @@
       },
       {
         "path": "crates/kernel/eliot-host-service/tests/user_automation_execution.rs",
-        "bytes": 10296,
-        "sha256": "cbde66468625624da3737c2d5aed3de84f5fa0ec11f508ecd6bc47df2566441c",
+        "bytes": 10331,
+        "sha256": "4bf854eea94490450e7f9c89f2cb76b66f88268fc3ec6922b104e73cfc6dfef6",
         "test_attributes": 1,
         "inline_cfg_test": false,
         "classes": [
@@ -121,23 +121,23 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 57,
-    "test_stu": 21324,
+    "test_stu": 21336,
     "nonzero": true
   },
-  "bound_contract_digest": "aad80450e740e2a42ae8c6791428e55eb7bff2d829ef7e12c538e88935685a70",
+  "bound_contract_digest": "e53aa1bcd306461dceeca5608222f3cb191496d728d54c6508163cfc28eb75c9",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -150,15 +150,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 9,
-        "sha256": "fa08fc0700a27a3cdee118a0f22c5041d85c36e65d013cc9589007faba9f4c22"
+        "sha256": "dd15bf4cee26d52da148e247808498a9396a021f0935fc709c1874383477a832"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "93c26c5740c69c37a9e44a0feaea6ec95f8757ba6e9871256d6e25005543b092",
+  "artifact_digest": "7d5cdaf303d126f6052d4075f8de6d4bcef0207cc01a86a6b8f60642c0d3f342",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "93c26c5740c69c37"
+    "value": "7d5cdaf303d126f6"
   }
 }

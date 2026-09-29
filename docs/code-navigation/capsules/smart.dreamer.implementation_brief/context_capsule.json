@@ -156,20 +156,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "0da3e1c7a05599d77bdbb07897fd8b3ec6cf9448b5487b48530e1f21ecfe8a87",
+  "bound_contract_digest": "5956cfaba6c93445812bf7deb1a153175c7cd8d7d925a43f9b0c8a0db9f2d0a3",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -181,7 +181,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-implementation-brief/module.toml",
-        "sha256": "577b7cb529bfecab086690310fa7bc946f91d612a9c1e2fb1f8822219f33b723"
+        "sha256": "e9a9d46424e89de8b8a3981fedc10509bd90857398413941d4ce4a567252d50d"
       },
       "selected_source": {
         "path_count": 11,
@@ -191,9 +191,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "eb7e2d79e01f866789b13b78c4dd69d48791c52ba87a6f7890574c6102228f85",
+  "artifact_digest": "8a72248c34f056a71ccb9d30e407d319ba44026b2e4f6037d36d500c163387cb",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "eb7e2d79e01f8667"
+    "value": "8a72248c34f056a7"
   }
 }

@@ -70,8 +70,8 @@
       },
       {
         "path": "bins/eliotd/tests/agent_fabric_wiring.rs",
-        "bytes": 67378,
-        "sha256": "c4dd2af557dba078a73a3cd6798dc5d350730c689e6e76851aff5f7e84eca158",
+        "bytes": 70940,
+        "sha256": "d241a37830a9188d2ebf3fb6050dbccbf25153f6ff95e8f3454309c9ecf19357",
         "test_attributes": 31,
         "inline_cfg_test": false,
         "classes": [
@@ -81,8 +81,8 @@
       },
       {
         "path": "bins/eliotd/tests/daemon_diagnostics.rs",
-        "bytes": 42679,
-        "sha256": "965d8b0c294df93b086ab4e867fe306315c67568bfa04e77e4ce2a8c1c496f5b",
+        "bytes": 45282,
+        "sha256": "221125dfb87ad1da5f1bea58bdb05a1bfcd8b715688dd941997084332516b887",
         "test_attributes": 21,
         "inline_cfg_test": false,
         "classes": [
@@ -111,8 +111,8 @@
       },
       {
         "path": "bins/eliotd/tests/local_read_e2e.rs",
-        "bytes": 19379,
-        "sha256": "0fcb32b802fd6fc60ccb54ce4da3b3f334030dbf4f8e7ccd65f23163f22eec08",
+        "bytes": 19544,
+        "sha256": "47b79fb126c30688abbd7797731401b9266b45448d59c2c36cac0613b909537c",
         "test_attributes": 2,
         "inline_cfg_test": false,
         "classes": [
@@ -129,8 +129,8 @@
       },
       {
         "path": "bins/eliotd/tests/swarm_composition.rs",
-        "bytes": 22387,
-        "sha256": "327070af5c1a220edb6ba904185fc013199f322347208b736f1a06daa60f0507",
+        "bytes": 22492,
+        "sha256": "4ae75124d12e0309eb97d37c74f5b350eef415f0ed755616a32efbb81badca53",
         "test_attributes": 5,
         "inline_cfg_test": false,
         "classes": [
@@ -155,7 +155,7 @@
         "classes": []
       }
     ],
-    "test_attribute_count": 362
+    "test_attribute_count": 361
   },
   "parser_or_golden_corpus": [],
   "fake_port_contract_tests": [
@@ -212,24 +212,24 @@
   },
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
-    "test_attribute_count": 362,
-    "test_stu": 80133,
+    "test_attribute_count": 361,
+    "test_stu": 82278,
     "nonzero": true
   },
-  "bound_contract_digest": "2d723edbff05119c56081d595a1b57c4601ae1a5a24a8232a74d2b2ac9f04b37",
+  "bound_contract_digest": "8be4deac3744c2614555a2dedd4487320558b8a86d307f065f04a8855a15894b",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -237,20 +237,20 @@
       },
       "package_manifest": {
         "path": "bins/eliotd/Cargo.toml",
-        "sha256": "955e74e5d5c038ad9fbbe09e0df4788d2b870251cfe86a676b63c50fa78b6cab"
+        "sha256": "cae3983df692fb5b9b527363c385ceae667aeb550bec8fa9e4b6a973a4c3c175"
       },
       "module_manifest": null,
       "selected_source": {
-        "path_count": 71,
-        "sha256": "5a76115fb9ed94c84092f5819ca7889bfe34f5b3f91c387cdfd2fabefaa8b2e9"
+        "path_count": 79,
+        "sha256": "5e6ea4691e37e5bf977c6f076fea4448f832dd7e03932a3de9f934e39ff0462b"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "d33acd9a1d7af43bf98e9a055ca5c38b17a4cec8f4df6cab2c7dd00748ca2853",
+  "artifact_digest": "a94bb2fec01565d79e166d1ed0c1e416781d78f9e903d7e0313f25b241adf253",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "d33acd9a1d7af43b"
+    "value": "a94bb2fec01565d7"
   }
 }

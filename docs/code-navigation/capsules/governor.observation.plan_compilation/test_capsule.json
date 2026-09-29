@@ -114,20 +114,20 @@
     "test_stu": 4153,
     "nonzero": true
   },
-  "bound_contract_digest": "3ad227d266d6438132671cfcdf64b9f48224ee2adb378d65a1354c1ac5aa1507",
+  "bound_contract_digest": "e5d609f9148763876ca0ddba21868221ab530595a73785d0f95676d446f01fa2",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -146,9 +146,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "31aca0d0081d332eefb739d4a0204bc7e9c465fb65825c5ae84c9d88ca567aa3",
+  "artifact_digest": "bd471e33d4b8c7167371862589c451da7cf999d9154d69a5e80547b0f9945742",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "31aca0d0081d332e"
+    "value": "bd471e33d4b8c716"
   }
 }

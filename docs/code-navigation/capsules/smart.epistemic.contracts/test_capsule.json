@@ -153,20 +153,20 @@
     "test_stu": 4722,
     "nonzero": true
   },
-  "bound_contract_digest": "3427a2c2f8a7613157827503c770fd12e9b56129e6b701819435277e674ffe7b",
+  "bound_contract_digest": "9747e399209b67a21a7690f3f608a675dc576a6665a54d76277bb8918024df0c",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -178,19 +178,19 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-epistemic-contracts/module.toml",
-        "sha256": "b1f6a6a4fcb2378cbbafe06d01b5029f9ccf97d91ff7b4505b86b4e7045d0a66"
+        "sha256": "cbe0f4b473c6cd08ddcf9c61850a3034ea61f2c02725b44dfbfa1fdf8835f0dc"
       },
       "selected_source": {
         "path_count": 24,
-        "sha256": "004f197687b84bffc2bb8e193dde8625fd799712e2c40d5507457a1e140df31e"
+        "sha256": "7303be1bff5711287d45d658d8f1fb7c35bec83910295d1a34819b3b7cab35a4"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "06b33ab1e9194aea832e12c51c0a9561904a31fbff9934572c7dbc53dd0cd7d0",
+  "artifact_digest": "ea34cb6df2a7f4e7fe293ef1dc8de42bd502eeaea3a0500dbcb488b172258eed",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "06b33ab1e9194aea"
+    "value": "ea34cb6df2a7f4e7"
   }
 }
