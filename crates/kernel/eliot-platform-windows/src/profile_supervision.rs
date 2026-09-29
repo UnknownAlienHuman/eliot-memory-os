@@ -3,7 +3,7 @@
 //! This module consumes provider-neutral projections of the descriptor-owned
 //! profile selection. It does not depend on `eliot-installation`; callers must
 //! validate the complete descriptor and then pass its exact root roles here.
-//! UserMode is current-user and least-privilege only. PortableDev is retained
+//! `UserMode` is current-user and least-privilege only. `PortableDev` is retained
 //! under the repository root and remains process/Job supervised by Host.
 
 use std::path::{Path, PathBuf};
@@ -36,11 +36,11 @@ pub struct ProfileRootPaths {
     pub user_config: PathBuf,
     /// User cache (kept separate from configuration).
     pub user_cache: PathBuf,
-    /// Digest-bound RuntimeStateRoots paths, each retaining its role name.
+    /// Digest-bound `RuntimeStateRoots` paths, each retaining its role name.
     pub runtime_state_roots: Vec<(String, PathBuf)>,
 }
 
-/// Provider-neutral request made only after the RuntimeLaunchDescriptor has
+/// Provider-neutral request made only after the `RuntimeLaunchDescriptor` has
 /// passed its digest, profile, and exact four-root equality checks.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,7 +65,7 @@ pub struct ProfileRootRequest {
     pub authority_generation: u64,
     /// The four profile-governed roots plus every runtime state root.
     pub roots: ProfileRootPaths,
-    /// Canonical repository root for PortableDev; absent for UserMode.
+    /// Canonical repository root for `PortableDev`; absent for `UserMode`.
     pub repository_root: Option<PathBuf>,
 }
 
@@ -114,7 +114,7 @@ pub struct ProfileSelectionReceipt {
     pub roots: Vec<ProfileRootObservation>,
 }
 
-/// Fixed Host action installed by the UserMode current-user launcher.
+/// Fixed Host action installed by the `UserMode` current-user launcher.
 ///
 /// `bootstrap_arguments` must be the already-admitted, nonce-free
 /// `HostLaunchOptions` argv tail; the adapter adds its private supervisor mode
@@ -156,7 +156,7 @@ pub struct CurrentUserTaskReceipt {
     pub executable_sha256: String,
     /// Exact working directory read back from the task action.
     pub working_directory: PathBuf,
-    /// Exact argument vector, including the UserMode switch pair and bootstrap.
+    /// Exact argument vector, including the `UserMode` switch pair and bootstrap.
     pub arguments: Vec<String>,
     /// Digest of the exact Task Scheduler XML read back after registration.
     pub task_xml_sha256: String,
@@ -171,11 +171,11 @@ pub struct CurrentUserTaskReceipt {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentUserTaskRunReceipt {
-    /// Task identity whose XML was checked immediately before RunEx.
+    /// Task identity whose XML was checked immediately before `RunEx`.
     pub task_name: String,
-    /// Exact current-user SID used by RunEx.
+    /// Exact current-user SID used by `RunEx`.
     pub sid: String,
-    /// Interactive session used by RunEx.
+    /// Interactive session used by `RunEx`.
     pub session_id: u32,
     /// Task Scheduler engine PID for the accepted run, not the Host action PID.
     pub engine_process_id: u32,
@@ -213,7 +213,7 @@ pub enum CurrentUserTaskObservation {
     },
 }
 
-/// Task Scheduler command-line mode used only by the UserMode task action.
+/// Task Scheduler command-line mode used only by the `UserMode` task action.
 pub const USER_MODE_SUPERVISOR_SWITCH: &str = "--eliot-profile-supervisor";
 
 /// Registration failure after task creation. If exact cleanup cannot be
@@ -280,7 +280,7 @@ impl From<WindowsAdapterError> for CurrentUserTaskRegistrationError {
 }
 
 /// Registers a fixed, least-privilege current-user logon task for a validated
-/// UserMode profile. All I3.1 roots remain retained and are rechecked across
+/// `UserMode` profile. All I3.1 roots remain retained and are rechecked across
 /// Task Scheduler registration/readback.
 ///
 /// # Errors
@@ -298,39 +298,7 @@ pub fn register_current_user_task(
     let retained_roots = open_profile_root_leases(&request.roots)?;
     let selection = retained_roots.selection.clone();
     validate_user_mode_bootstrap(request, &selection)?;
-    let executable =
-        crate::validate_pinned_artifact(&request.executable, &request.executable_sha256)?;
-    let immutable_root = &request.roots.roots.immutable_binaries;
-    if !executable
-        .parent()
-        .is_some_and(|parent| crate::windows_paths_equal(parent, immutable_root))
-        || !executable
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("eliot-host.exe"))
-    {
-        return Err(WindowsAdapterError::IdentityMismatch.into());
-    }
-    if !crate::windows_paths_equal(&request.working_directory, immutable_root) {
-        return Err(WindowsAdapterError::IdentityMismatch.into());
-    }
-    let root_lease = UserOwnedRootLease::open_existing(immutable_root)
-        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
-    root_lease
-        .validate_child_parent(&executable)
-        .and_then(|()| root_lease.verify_stable_identity())
-        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
-    let descriptor = crate::validate_pinned_artifact(
-        &request.roots.authority_descriptor_path,
-        &request.roots.authority_descriptor_sha256,
-    )?;
-    if !crate::windows_paths_equal(&descriptor, &request.roots.authority_descriptor_path)
-        || !descriptor
-            .parent()
-            .is_some_and(|parent| crate::windows_paths_equal(parent, immutable_root))
-    {
-        return Err(WindowsAdapterError::IdentityMismatch.into());
-    }
+    let (executable, root_lease) = retain_user_mode_host_image(request)?;
 
     let task_name = task_name_for_selection(&selection)?;
     let arguments = task_arguments(&request.bootstrap_arguments)?;
@@ -377,7 +345,7 @@ pub fn register_current_user_task(
         request.clone(),
         selection.clone(),
         executable.clone(),
-        platform_receipt,
+        &platform_receipt,
     );
     if retained_roots.verify_stable_identity().is_err() {
         return Err(cleanup_after_registration(
@@ -403,11 +371,52 @@ pub fn register_current_user_task(
     Ok(task_receipt)
 }
 
+/// Validates and retains the exact approved Host image, its immutable-binaries
+/// parent lease, and the digest-bound authority descriptor below that same root.
+fn retain_user_mode_host_image(
+    request: &CurrentUserTaskRequest,
+) -> Result<(PathBuf, UserOwnedRootLease), WindowsAdapterError> {
+    let executable =
+        crate::validate_pinned_artifact(&request.executable, &request.executable_sha256)?;
+    let immutable_root = &request.roots.roots.immutable_binaries;
+    if !executable
+        .parent()
+        .is_some_and(|parent| crate::windows_paths_equal(parent, immutable_root))
+        || !executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("eliot-host.exe"))
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    if !crate::windows_paths_equal(&request.working_directory, immutable_root) {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let root_lease = UserOwnedRootLease::open_existing(immutable_root)
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    root_lease
+        .validate_child_parent(&executable)
+        .and_then(|()| root_lease.verify_stable_identity())
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    let descriptor = crate::validate_pinned_artifact(
+        &request.roots.authority_descriptor_path,
+        &request.roots.authority_descriptor_sha256,
+    )?;
+    if !crate::windows_paths_equal(&descriptor, &request.roots.authority_descriptor_path)
+        || !descriptor
+            .parent()
+            .is_some_and(|parent| crate::windows_paths_equal(parent, immutable_root))
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok((executable, root_lease))
+}
+
 fn current_user_task_receipt(
     request: CurrentUserTaskRequest,
     selection: ProfileSelectionReceipt,
     executable: PathBuf,
-    platform: crate::platform_security::UserModeProfileTaskReceipt,
+    platform: &crate::platform_security::UserModeProfileTaskReceipt,
 ) -> CurrentUserTaskReceipt {
     CurrentUserTaskReceipt {
         selection,
@@ -483,7 +492,7 @@ pub fn remove_current_user_task(
     retained_roots.verify_stable_identity()
 }
 
-/// Inspects the exact task requested by a committed UserMode installation
+/// Inspects the exact task requested by a committed `UserMode` installation
 /// effect. A supplied receipt additionally binds the observed XML digest to a
 /// previously persisted postcondition.
 ///
@@ -520,8 +529,8 @@ pub fn inspect_current_user_task(
     }
     let task_name = task_name_for_selection(&selection)?;
     let spec = platform_task_spec(request, &selection, executable.clone())?;
-    if let Some(receipt) = expected_receipt {
-        if receipt.request != *request
+    if let Some(receipt) = expected_receipt
+        && (receipt.request != *request
             || !same_selection_except_session(&receipt.selection, &selection)
             || receipt.task_name != task_name
             || receipt.executable != executable
@@ -529,10 +538,9 @@ pub fn inspect_current_user_task(
             || receipt.working_directory != request.working_directory
             || receipt.arguments != request.bootstrap_arguments
             || receipt.sid != selection.owner_sid
-            || receipt.session_id == 0
-        {
-            return Err(WindowsAdapterError::IdentityMismatch);
-        }
+            || receipt.session_id == 0)
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
     }
     let observed = crate::platform_security::inspect_user_mode_profile_task(&spec)?;
     retained_roots.verify_stable_identity()?;
@@ -635,7 +643,7 @@ fn same_selection_except_session(
         && registered.roots == current.roots
 }
 
-/// Revalidates the descriptor-bound UserMode or PortableDev roots against the
+/// Revalidates the descriptor-bound `UserMode` or `PortableDev` roots against the
 /// current OS identity and returns every role's file-object identity.
 ///
 /// # Errors
@@ -736,7 +744,16 @@ fn retain_profile_roots(
             if request.repository_root.is_some() {
                 return Err(WindowsAdapterError::InvalidInput);
             }
-            validate_user_mode_layout(request, local_app_data.as_deref().unwrap())?;
+            validate_user_mode_layout(
+                request,
+                // `local_app_data` is `Some` exactly for `ProfileSelection::UserMode`,
+                // which is the arm that reaches this point. The `ok_or` keeps the
+                // invariant explicit without panicking on a platform anchor that
+                // could never be absent here.
+                local_app_data
+                    .as_deref()
+                    .ok_or(WindowsAdapterError::Unavailable)?,
+            )?;
             None
         }
         ProfileSelection::PortableDev => {
@@ -752,19 +769,7 @@ fn retain_profile_roots(
         }
     };
 
-    let mut root_requests = vec![
-        (
-            "immutable_binaries".to_owned(),
-            request.roots.immutable_binaries.clone(),
-        ),
-        (
-            "durable_data".to_owned(),
-            request.roots.durable_data.clone(),
-        ),
-        ("user_config".to_owned(), request.roots.user_config.clone()),
-        ("user_cache".to_owned(), request.roots.user_cache.clone()),
-    ];
-    root_requests.extend(request.roots.runtime_state_roots.iter().cloned());
+    let root_requests = profile_role_requests(request);
 
     let repository_path = repository.as_ref().map(|lease| lease.path().to_path_buf());
     let repository_identity = repository.as_ref().map(UserOwnedRootLease::identity);
@@ -800,11 +805,71 @@ fn retain_profile_roots(
         owner_sid = Some(sid.to_owned());
         session_id = Some(anchor.session_id());
     }
+    let (mut role_observations, mut role_leases, owner_sid) = retain_role_roots(
+        request.profile,
+        root_requests,
+        local_app_data.as_deref(),
+        local_app_data_lease.as_ref(),
+        repository_path.as_deref(),
+        repository_identity,
+        owner_sid,
+    )?;
+    observations.append(&mut role_observations);
+    leases.append(&mut role_leases);
+    finish_profile_selection(
+        request,
+        observations,
+        leases,
+        local_app_data_lease,
+        owner_sid,
+        session_id,
+    )
+}
+
+/// Projects the four fixed profile root roles plus every runtime state root,
+/// preserving the descriptor's role names as the observation keys.
+fn profile_role_requests(request: &ProfileRootRequest) -> Vec<(String, PathBuf)> {
+    let mut root_requests = vec![
+        (
+            "immutable_binaries".to_owned(),
+            request.roots.immutable_binaries.clone(),
+        ),
+        (
+            "durable_data".to_owned(),
+            request.roots.durable_data.clone(),
+        ),
+        ("user_config".to_owned(), request.roots.user_config.clone()),
+        ("user_cache".to_owned(), request.roots.user_cache.clone()),
+    ];
+    root_requests.extend(request.roots.runtime_state_roots.iter().cloned());
+    root_requests
+}
+
+/// Opens and retains every non-anchor profile role root, observing the exact
+/// current-user owner SID that binds them all together.
+fn retain_role_roots(
+    profile: ProfileSelection,
+    root_requests: Vec<(String, PathBuf)>,
+    local_app_data: Option<&Path>,
+    local_app_data_lease: Option<&crate::platform_security::CurrentUserLocalAppDataRootLease>,
+    repository_path: Option<&Path>,
+    repository_identity: Option<FileIdentity>,
+    mut owner_sid: Option<String>,
+) -> Result<
+    (
+        Vec<ProfileRootObservation>,
+        Vec<UserOwnedRootLease>,
+        Option<String>,
+    ),
+    WindowsAdapterError,
+> {
+    let mut observations = Vec::with_capacity(root_requests.len());
+    let mut leases = Vec::new();
     for (role, path) in root_requests {
         if role == "runtime_state_roots.profile_anchor_root" {
-            let expected_anchor = match request.profile {
-                ProfileSelection::UserMode => local_app_data.as_deref(),
-                ProfileSelection::PortableDev => repository_path.as_deref(),
+            let expected_anchor = match profile {
+                ProfileSelection::UserMode => local_app_data,
+                ProfileSelection::PortableDev => repository_path,
             }
             .ok_or(WindowsAdapterError::IdentityMismatch)?;
             if !crate::windows_paths_equal(&path, expected_anchor) {
@@ -812,18 +877,21 @@ fn retain_profile_roots(
             }
             observations.push(ProfileRootObservation {
                 role,
-                canonical_path: local_app_data_lease.as_ref().map_or_else(
+                canonical_path: local_app_data_lease.map_or_else(
                     || expected_anchor.to_path_buf(),
                     |lease| lease.path().to_path_buf(),
                 ),
                 identity: repository_identity
-                    .or_else(|| local_app_data_lease.as_ref().map(|lease| lease.identity()))
+                    .or_else(|| {
+                        local_app_data_lease
+                            .map(crate::platform_security::CurrentUserLocalAppDataRootLease::identity)
+                    })
                     .ok_or(WindowsAdapterError::IdentityMismatch)?,
             });
             continue;
         }
         let lease = open_user_root(&path)?;
-        if let Some(repository) = repository_path.as_deref()
+        if let Some(repository) = repository_path
             && !is_contained_by(repository, lease.path())
         {
             return Err(WindowsAdapterError::IdentityMismatch);
@@ -844,7 +912,19 @@ fn retain_profile_roots(
         });
         leases.push(lease);
     }
+    Ok((observations, leases, owner_sid))
+}
 
+/// Proves the complete postcondition of a retained profile root set and builds
+/// the selection receipt bound to the current process identity.
+fn finish_profile_selection(
+    request: &ProfileRootRequest,
+    observations: Vec<ProfileRootObservation>,
+    leases: Vec<UserOwnedRootLease>,
+    local_app_data_lease: Option<crate::platform_security::CurrentUserLocalAppDataRootLease>,
+    mut owner_sid: Option<String>,
+    session_id: Option<u32>,
+) -> Result<RetainedProfileRoots, WindowsAdapterError> {
     if observations.len() != 13 || !validate_role_paths(&observations) {
         return Err(WindowsAdapterError::IdentityMismatch);
     }
@@ -864,7 +944,7 @@ fn retain_profile_roots(
     if session_id.is_some_and(|session| session != current.expected_session_id()) {
         return Err(WindowsAdapterError::IdentityMismatch);
     }
-    session_id = Some(current.expected_session_id());
+    let session_id = current.expected_session_id();
     if let Some(anchor) = &local_app_data_lease {
         anchor
             .verify_stable_identity()
@@ -882,7 +962,7 @@ fn retain_profile_roots(
         authority_descriptor_sha256: request.authority_descriptor_sha256.clone(),
         authority_generation: request.authority_generation,
         owner_sid,
-        session_id: session_id.ok_or(WindowsAdapterError::IdentityMismatch)?,
+        session_id,
         roots: observations,
     };
     Ok(RetainedProfileRoots {
@@ -939,6 +1019,7 @@ fn task_name_for_selection(
 }
 
 fn root_binding_digest(selection: &ProfileSelectionReceipt) -> String {
+    use std::fmt::Write as _;
     let mut binding = format!(
         "{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\n",
         selection.profile,
@@ -950,7 +1031,6 @@ fn root_binding_digest(selection: &ProfileSelectionReceipt) -> String {
         selection.authority_descriptor_path.display(),
         selection.authority_descriptor_sha256,
     );
-    use std::fmt::Write as _;
     let _ = writeln!(binding, "{}", selection.authority_generation);
     for root in &selection.roots {
         let _ = writeln!(
