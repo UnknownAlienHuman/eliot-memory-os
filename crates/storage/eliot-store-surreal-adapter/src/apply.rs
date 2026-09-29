@@ -99,8 +99,9 @@ use schema_contract::SchemaMigrationIdentity;
 #[cfg(test)]
 use schema_contract::schema_meta_record;
 use schema_contract::{
-    FenceRecord, MigrationPreflight, SchemaMetaRecord, schema_meta_record_for_v1_to_v2,
-    v1_identity, validate_fence_record, validate_schema_meta_record,
+    FenceRecord, MigrationPreflight, SchemaMetaRecord, applied_record_from_intent,
+    migration_intent_record, schema_meta_record_for_v1_to_v2, v1_identity, validate_fence_record,
+    validate_migration_intent_record, validate_schema_meta_record,
 };
 
 /// Fail-closed admission of one presented migration against the current
@@ -149,12 +150,18 @@ fn build_forward_sql() -> String {
     schema::forward_migration_sql()
 }
 
-fn build_forward_bindings(
+/// Binds the fence and the exact predecessor identity the schema-meta
+/// compare-and-set refuses to overwrite.
+///
+/// `TX_GUARD_SCHEMA_PREDECESSOR` and `TX_UPDATE_SCHEMA_META_CAS` compare
+/// every one of these values, so this is the predecessor proof both the intent
+/// write and the DDL transaction use; the intent write is not able to claim a
+/// row that has moved.
+fn bind_fence_and_predecessor(
+    m: &mut Map<String, Value>,
     existing: &SchemaMetaRecord,
     fence: &FenceRecord,
-    new_record: &SchemaMetaRecord,
-) -> Map<String, Value> {
-    let mut m = Map::new();
+) {
     m.insert("expected_state_fence".to_owned(), json!(fence.state_fence));
     m.insert(
         "expected_commit_sequence".to_owned(),
@@ -204,8 +211,63 @@ fn build_forward_bindings(
         json!(schema::table::SCHEMA_META),
     );
     m.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
+}
+
+fn build_forward_bindings(
+    existing: &SchemaMetaRecord,
+    fence: &FenceRecord,
+    new_record: &SchemaMetaRecord,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    bind_fence_and_predecessor(&mut m, existing, fence);
     m.insert("schema_meta_record".to_owned(), json!(new_record));
     m
+}
+
+/// Commits the durable migration intent in its own transaction before any
+/// provider DDL work (issue #1221, W7/A8).
+///
+/// The write is an owned compare-and-set over the exact predecessor identity
+/// and state fence this operation holds, so it cannot be claimed by a
+/// different writer, and it performs no DDL. Its own outcome is read back from
+/// the provider: a transport failure returns `UnknownMigrationOutcome` with
+/// the plan's identity, which the preflight then reconciles from the durable
+/// record rather than assuming either outcome.
+async fn record_migration_intent(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    predecessor: &SchemaMetaRecord,
+    fence: &FenceRecord,
+    intent: &SchemaMetaRecord,
+    migration: &CompiledMigration,
+) -> Result<(), AdapterError> {
+    let mut m = Map::new();
+    bind_fence_and_predecessor(&mut m, predecessor, fence);
+    m.insert("schema_meta_intent_record".to_owned(), json!(intent));
+    let mut response = client::query(
+        db,
+        config,
+        "migration.intent",
+        &schema::migration_intent_sql(),
+        m,
+    )
+    .await?;
+    let errors = response.take_errors();
+    if errors.iter().any(|e| is_guard_conflict(e)) {
+        return Err(AdapterError::Config(
+            "migration intent predecessor moved".to_owned(),
+        ));
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::UnknownMigrationOutcome {
+            migration_id: migration.migration_id.clone(),
+        });
+    }
+    let observed = read_schema_meta(db, config).await?;
+    match observed {
+        Some(observed) if observed == *intent => Ok(()),
+        _ => Err(AdapterError::PartialOutcome),
+    }
 }
 
 fn migration_preflight(
@@ -223,8 +285,16 @@ fn migration_preflight(
             "empty database admits exactly the v2 initial plan".to_owned(),
         ));
     };
+    if record.migration_state == schema::MIGRATION_STATE_APPLYING {
+        // A durable intent names the plan that was in flight. It is not
+        // authority to adopt: the recorded identity is compared against this
+        // plan, and only an intent whose predecessor is the one the published
+        // graph requires for these exact bytes may be completed.
+        validate_migration_intent_record(&record, migration)?;
+        return Ok(MigrationPreflight::IntentRecorded);
+    }
     validate_schema_meta_record(&record)?;
-    if record.migration_state != "APPLIED" {
+    if record.migration_state != schema::MIGRATION_STATE_APPLIED {
         return Err(AdapterError::PartialOutcome);
     }
     if record.compatible_bridge_range != crate::ADAPTER_NAME {
@@ -353,8 +423,15 @@ pub(crate) async fn probe_generation(
     .await?;
     let record = take_schema_meta(&mut response, 0)?;
     if let Some(record) = &record {
+        if record.migration_state == schema::MIGRATION_STATE_APPLYING {
+            // A committed intent is not a generation. Readiness stays
+            // MIGRATION_REQUIRED until the admitted migration operation that
+            // recorded it commits or reconciles; nothing may read the store as
+            // ready while one is in flight.
+            return Ok(None);
+        }
         validate_schema_meta_record(record)?;
-        if record.migration_state != "APPLIED" {
+        if record.migration_state != schema::MIGRATION_STATE_APPLIED {
             return Ok(None);
         }
     }
@@ -496,9 +573,23 @@ async fn handle_forward_migration(
     {
         return Err(AdapterError::PartialOutcome);
     }
-    let record = schema_meta_record_for_v1_to_v2(&existing, migration, updated_at);
+    // The intent is committed before the DDL transaction is dispatched, so a
+    // transport failure on the DDL leaves a durable record naming the exact
+    // plan that was in flight. The DDL itself is unchanged: the DDL and the
+    // applied metadata still commit in one transaction. A preflight
+    // `IntentRecorded` row is this operation's own unfinished attempt, so the
+    // applied record is derived from the row read back, not from the plan.
+    let (intent, applied) = if existing.migration_state == schema::MIGRATION_STATE_APPLYING {
+        let applied = applied_record_from_intent(&existing);
+        (existing, applied)
+    } else {
+        let applied = schema_meta_record_for_v1_to_v2(&existing, migration, updated_at);
+        let intent = migration_intent_record(&applied);
+        record_migration_intent(db, config, &existing, &fence, &intent, migration).await?;
+        (intent, applied)
+    };
     let sql = build_forward_sql();
-    let bindings = build_forward_bindings(&existing, &fence, &record);
+    let bindings = build_forward_bindings(&intent, &fence, &applied);
     let mut response = client::query(db, config, "migration.apply", &sql, bindings).await?;
     let errors = response.take_errors();
     if errors.iter().any(|e| is_guard_conflict(e)) {
@@ -601,7 +692,7 @@ async fn apply_migration_direct(
         MigrationPreflight::Empty => {
             handle_empty_migration(db, &adapter.config, migration, state_fence, &updated_at).await
         }
-        MigrationPreflight::V1ToV2 => {
+        MigrationPreflight::V1ToV2 | MigrationPreflight::IntentRecorded => {
             let fence = read_fence(db, &adapter.config).await?;
             let Some(fence) = fence else {
                 return Err(AdapterError::PartialOutcome);

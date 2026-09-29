@@ -155,6 +155,16 @@ pub(crate) const SCHEMA_META_KEY: &str = "current";
 
 pub(crate) const GENERATION_V1: &str = "1.0.0";
 pub(crate) const GENERATION_V2: &str = "2.0.0";
+
+/// Durable `migration_state` of a committed schema metadata row. Only this
+/// value means "this generation is applied and usable"; every other value
+/// blocks writer readiness.
+pub(crate) const MIGRATION_STATE_APPLIED: &str = "APPLIED";
+/// Durable `migration_state` of the row a migration operation owns between
+/// recording its intent and committing its DDL. The DDL and the `APPLIED`
+/// write share one transaction, so this value is durable proof that the DDL
+/// did not commit, and it names the exact plan that was in flight.
+pub(crate) const MIGRATION_STATE_APPLYING: &str = "APPLYING";
 pub(crate) const MIGRATION_ID_V1: &str = "eliot.store.surreal.schema.v1";
 pub(crate) const MIGRATION_ID_V2: &str = "eliot.store.surreal.schema.v2";
 pub(crate) const MIGRATION_ID_V1_TO_V2: &str = "eliot.store.surreal.schema.v1_to_v2";
@@ -612,6 +622,27 @@ pub(crate) const TX_GUARD_FENCE: &str = "LET $fence_guard = (SELECT * FROM ONLY 
 pub(crate) const TX_GUARD_SCHEMA_PREDECESSOR: &str = "LET $pre = (SELECT * FROM ONLY schema_meta:current); IF $pre.generation != $expected_generation OR $pre.migration_id != $expected_migration_id OR $pre.migration_checksum_sha256 != $expected_migration_checksum_sha256 OR $pre.compatible_bridge_range != $expected_bridge_range OR $pre.migration_state != $expected_migration_state OR array::len($pre.migrations) != $expected_migrations_len OR $pre.migrations[0].migration_id != $expected_migration_0_id OR $pre.migrations[0].migration_checksum_sha256 != $expected_migration_0_checksum OR $pre.migrations[0].generation != $expected_migration_0_generation OR $pre.updated_at != $expected_updated_at { THROW 'schema_predecessor_mismatch'; };";
 
 pub(crate) const TX_UPDATE_SCHEMA_META_CAS: &str = "LET $schema_cas = (UPDATE type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record WHERE generation = $expected_generation AND migration_id = $expected_migration_id AND migration_checksum_sha256 = $expected_migration_checksum_sha256 AND compatible_bridge_range = $expected_bridge_range AND migration_state = $expected_migration_state AND array::len(migrations) = $expected_migrations_len AND migrations[0].migration_id = $expected_migration_0_id AND migrations[0].migration_checksum_sha256 = $expected_migration_0_checksum AND migrations[0].generation = $expected_migration_0_generation AND updated_at = $expected_updated_at RETURN AFTER); IF array::len($schema_cas ?? []) != 1 { THROW 'schema_predecessor_mismatch'; };";
+
+/// Durable state written over the `schema_meta` row by the operation that is
+/// about to run provider DDL, in its own committed transaction.
+///
+/// The intent row carries the target generation, the target migration
+/// identity, the complete migration history and the same `updated_at` stamp
+/// the migration would commit, differing from the applied record only in the
+/// state, so after a crash the row names exactly which plan was in flight.
+/// Because the DDL and the `APPLIED` metadata write share one transaction (see
+/// [`forward_migration_sql`]), an `APPLYING` row is proof that the DDL did
+/// not commit. The compare-and-set is the same predecessor guard the forward
+/// transaction uses, so the intent is owned by that one row and one state
+/// fence, and re-recording it for the same plan is an exact replay.
+pub(crate) const TX_MARK_SCHEMA_MIGRATION_INTENT: &str = "LET $schema_intent = (UPDATE type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_intent_record WHERE generation = $expected_generation AND migration_id = $expected_migration_id AND migration_checksum_sha256 = $expected_migration_checksum_sha256 AND compatible_bridge_range = $expected_bridge_range AND migration_state = $expected_migration_state AND array::len(migrations) = $expected_migrations_len AND migrations[0].migration_id = $expected_migration_0_id AND migrations[0].migration_checksum_sha256 = $expected_migration_0_checksum AND migrations[0].generation = $expected_migration_0_generation AND updated_at = $expected_updated_at RETURN AFTER); IF array::len($schema_intent ?? []) != 1 { THROW 'schema_predecessor_mismatch'; };";
+
+/// The intent transaction: fence guard, then the owned intent write, then the
+/// commit. It performs no DDL, so it neither creates nor removes a table and
+/// cannot be mistaken for a schema generation.
+pub(crate) fn migration_intent_sql() -> String {
+    format!("{TX_BEGIN} {TX_GUARD_FENCE} {TX_MARK_SCHEMA_MIGRATION_INTENT} {TX_COMMIT}")
+}
 
 pub(crate) fn forward_migration_sql() -> String {
     format!(
