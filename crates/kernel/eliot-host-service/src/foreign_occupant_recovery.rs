@@ -18,6 +18,15 @@
 //! conversion between them, and [`ForeignOccupantRecoveryDirective::admit`] is
 //! the single conversion from a requested operation to a collision answer, so
 //! a read-only observation has no path to a destructive request.
+//!
+//! There is exactly one directive family here. Two observation seams can
+//! classify a foreign occupant — a service-identity read
+//! ([`ForeignOccupantRecoveryDirective::for_observed_occupant`]) and a planned
+//! loopback-endpoint listener read
+//! ([`ForeignOccupantRecoveryDirective::for_observed_endpoint_occupant`]) — and
+//! both reach the same struct through the same private `assemble` fold, so
+//! neither seam can drift into a second answer, a second conversion point, or a
+//! second representation of the operation space.
 
 use eliot_contracts::StateFence;
 use eliot_platform::{PlatformHandle, ServiceObservation};
@@ -360,7 +369,12 @@ impl PlannedEndpointOccupant {
                 "collision observation timestamp is zero",
             ));
         }
-        if self.observed_owner_process_id == self.retained_owned_process_id {
+        // Only a contradiction between two *present* identities is a defect.
+        // `None == None` means neither identity was read, which is not a
+        // collision and not this check's business.
+        if self.observed_owner_process_id.is_some()
+            && self.observed_owner_process_id == self.retained_owned_process_id
+        {
             return Err(ForeignOccupantRecoveryError::InvalidDirective(
                 "the observed occupant is the retained owned child",
             ));

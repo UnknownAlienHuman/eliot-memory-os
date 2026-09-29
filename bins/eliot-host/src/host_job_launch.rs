@@ -479,6 +479,7 @@ fn store_endpoint_collision_directive(
         ))
     })
 }
+
 /// Builds the exact Kernel child argv by injecting the Host-approved
 /// digest-bound Doctor executable path into the sealed launch descriptor's
 /// stored `kernel_arguments`.
