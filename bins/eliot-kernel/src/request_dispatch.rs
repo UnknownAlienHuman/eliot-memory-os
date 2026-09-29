@@ -1905,9 +1905,12 @@ enum PriorVerification {
 ///    digest comparison and before the row is used for anything observable.
 /// 2. the named predecessor must belong to the SAME authenticated principal, so a
 ///    caller cannot read another principal's operation at all.
-/// 3. the presented request hash must equal the stored one AND the presented archive
-///    must be the stored archive. The stored request hash covers the predecessor's
-///    own PRINCIPAL, `WorkScope`, operation id and archive provenance, so guessing the
+/// 3. the presented request hash must equal the stored one AND the owner must
+///    re-prove the stored operation for the decoded bytes
+///    ([`owner_reproves_predecessor_operation`]). The stored request hash covers the
+///    predecessor's
+///    own PRINCIPAL, `WorkScope`, operation id and archive provenance, and the owner
+///    re-proof covers the archive's whole decided content, so guessing the
 ///    namespace key alone — which is on the wire as `operation_namespace` — yields
 ///    nothing. It provably does NOT cover the predecessor's session, because
 ///    `session_id` is ambient; that is deliberate and is justified in
