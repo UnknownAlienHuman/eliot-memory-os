@@ -1525,9 +1525,11 @@ pub fn admit_canonical_write(
     // A task-free capture remains cold and unrelated non-task writes need
     // no task selection. Task-relative effects return the typed error.
     let (selection, candidate_count) = match selection_response_for_receipt(receipt) {
-        Ok(TaskSelectionResponse::Absent(_)
-        | TaskSelectionResponse::Exploratory { .. }
-        | TaskSelectionResponse::Stale { .. }) => (None, 0_usize),
+        Ok(
+            TaskSelectionResponse::Absent(_)
+            | TaskSelectionResponse::Exploratory { .. }
+            | TaskSelectionResponse::Stale { .. },
+        ) => (None, 0_usize),
         Ok(TaskSelectionResponse::Ambiguous(candidate_handles)) => (None, candidate_handles.len()),
         Ok(TaskSelectionResponse::Current(evidence)) => (Some(evidence), 1_usize),
         Err(_) if !task_relative => (None, 0_usize),
