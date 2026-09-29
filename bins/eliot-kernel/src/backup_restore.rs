@@ -32,10 +32,13 @@
 //!                              fence gate, observed evidence);
 //! purge .................... purge owner (`apply_purge_ledger`: every ledger
 //!                              entry is applied through the ORS purge-ledger
-//!                              owner, which issues the revision, and the
-//!                              entries with the revisions they consumed are
-//!                              staged as this phase's evidence, purge-first
-//!                              before any import);
+//!                              owner, which issues the revision; the
+//!                              owner-issued revision is cross-checked against
+//!                              the revision the archive declares before the
+//!                              phase stages anything, and the entries with the
+//!                              revisions they consumed are staged as this
+//!                              phase's evidence, purge-first before any
+//!                              import);
 //! canonical/receipt/
 //! projection/rebuild/verify . canonical owner (`import_*`, chain + count
 //!                              verification over observed destination state);
@@ -316,6 +319,11 @@ pub const OWNER_STAGED_FILE_ALLOWANCE: usize = 16;
 const STAGED_OUTPUT_MEMBERS_FIELD: &str = "restore.staged_output_members";
 /// `BackupError::LimitExceeded` field name for the byte ceiling.
 const STAGED_OUTPUT_BYTES_FIELD: &str = "restore.staged_output_bytes";
+/// Exact subject of the purge-ledger revision refusal, the same subject
+/// `elipt_backup::BackupBundle::validate_class_requirements` already refuses
+/// this manifest field with, so one disagreement has one name here and in the
+/// seam contract.
+const PURGE_LEDGER_REVISION_SUBJECT: &str = "purge ledger revision";
 
 /// Checked accumulation for the derived staged-output denominators. Overflow
 /// refuses the archive through the named ceiling rather than wrapping a byte
@@ -818,12 +826,28 @@ impl KernelBackupRestore {
     /// `bundle.manifest.purge_ledger_revision` — the ARCHIVE's own declared
     /// revision, not the value the owner returned during the purge phase — and
     /// `eliot_backup` REQUIRES that published field to equal the archive's
-    /// declared revision. The owner-issued revisions and that published field
-    /// are therefore NOT cross-checked against each other anywhere: they are
-    /// two independent numbers, one routed through the owner into the staged
-    /// phase evidence digest, one copied from the archive manifest. This
-    /// comment does not assert they are equal, and no code here compares them;
-    /// adding that comparison is a separate change, not this one.
+    /// declared revision. Publishing the owner's value instead is therefore not
+    /// available, so the two readings of that one quantity are CROSS-CHECKED
+    /// instead: [`check_purge_revision_closure`] runs inside the purge phase,
+    /// after the owner issued its revisions and before the phase stages the
+    /// evidence document carrying them, and refuses with the seam's
+    /// [`BackupError::FenceMismatch`] naming `purge ledger revision` when they
+    /// disagree, when the owner issued no revision for a carried entry, or when
+    /// the owner issued the zero that means "nothing was ever applied". A
+    /// published purge revision is therefore never a number copied out of the
+    /// archive under check and left unverified: the archive's declaration and
+    /// the owner's answer must agree before any import, and neither value is
+    /// computed here.
+    ///
+    /// What the cross-check does NOT cover, stated rather than implied: an
+    /// archive that carries no purge entry has no owner-issued revision, so no
+    /// comparison is performed for it and none is claimed — the empty-ledger
+    /// path applies nothing and reports no revision, and the published field
+    /// remains the archive's own declared value. A resumed transaction that
+    /// reconciles the purge phase from its journaled receipt does not re-apply
+    /// the ledger either, so the check is a property of the phase execution
+    /// that applied the entries, and that phase's receipt is what the purge
+    /// obligation evidence binds.
     pub fn restore_with_ors_journal(
         &self,
         ors: &std::sync::Arc<RedbRecoveryStore>,
@@ -1542,12 +1566,22 @@ struct KernelRestoreTarget<'a> {
     ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     /// Revisions the purge phase actually consumed from the ORS purge-ledger
     /// owner, in ledger order. Observable on the SUCCESS path only:
-    /// [`KernelRestoreTarget::apply_purge_ledger`] projects them into the
-    /// staged phase evidence, and that staging is what the phase receipt
-    /// digests. If a later step of the same phase fails, the target is dropped
-    /// with this field — no reader observes it on that path, and this comment
-    /// does not claim one does.
+    /// [`KernelRestoreTarget::apply_purge_ledger`] first cross-checks them
+    /// against the archive's declared revision through
+    /// [`check_purge_revision_closure`], then projects them into the staged
+    /// phase evidence, and that staging is what the phase receipt digests. If a
+    /// later step of the same phase fails, the target is dropped with this
+    /// field — no reader observes it on that path, and this comment does not
+    /// claim one does.
     applied_purge_revisions: Vec<AppliedPurgeRevision>,
+    /// The ARCHIVE's own declared purge-ledger revision,
+    /// `bundle.manifest.purge_ledger_revision`, copied once when this target
+    /// was built so the purge phase can cross-check it against what the owner
+    /// issued without reaching back into the bundle.
+    ///
+    /// Stored, never recomputed: nothing here increments, derives or counts to
+    /// produce it.
+    declared_purge_ledger_revision: u64,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
     /// Bounded output budget derived from the archive before any write.
@@ -1582,6 +1616,7 @@ impl<'a> KernelRestoreTarget<'a> {
             rehearsal: ports.rehearsal,
             ors: ors.map(std::sync::Arc::clone),
             applied_purge_revisions: Vec::new(),
+            declared_purge_ledger_revision: bundle.manifest.purge_ledger_revision,
             calls: Vec::new(),
             final_evidence: None,
             budget: StagedOutputBudget::derive(bundle)?,
@@ -1665,6 +1700,16 @@ impl<'a> KernelRestoreTarget<'a> {
     /// rehearsal, unchanged and byte-for-byte: there is nothing that could
     /// have been written, so the empty-ledger path applies no entry, reports
     /// no revision, and is not a skip of an application.
+    ///
+    /// ## Ordering against the revision cross-check
+    ///
+    /// The revisions returned here are cross-checked against the archive's
+    /// declared revision by [`check_purge_revision_closure`], which
+    /// [`KernelRestoreTarget::apply_purge_ledger`] calls on the result of THIS
+    /// function and only after this function returned. A rehearsal carrying a
+    /// purge entry therefore still refuses at the guard above, before any owner
+    /// call, and never reaches the cross-check: adding it does not move the live
+    /// owner one step closer to a rehearsal.
     fn apply_purge_entries(
         &self,
         entries: &[PurgeLedgerEntry],
@@ -2616,6 +2661,13 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
         PurgeOwnerClient::bind(entries).validate_entries()?;
         let applied = self.apply_purge_entries(entries)?;
+        // The archive's declared revision and the revisions the owner issued
+        // for THESE entries are two readings of one quantity, so they are
+        // compared here — after the owner answered, and BEFORE this phase
+        // stages the evidence document that carries the answer. A disagreement
+        // therefore never becomes a staged phase receipt, and it is never
+        // published as the restore's `provenance.purge_ledger_revision`.
+        check_purge_revision_closure(self.declared_purge_ledger_revision, entries, &applied)?;
         self.applied_purge_revisions = applied;
         // The staged document is this phase's evidence, so the owner-issued
         // revisions ride the SAME effect evidence every other phase already
@@ -2879,6 +2931,111 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
     if records > MAX_JOURNAL_PAGE_ENTRIES {
         return Err(KernelRestoreError::CapabilityMissing {
             capability: "restore_journal_history_budget",
+        });
+    }
+    Ok(())
+}
+
+/// Cross-checks the archive's declared purge-ledger revision against the
+/// revisions the ORS purge-ledger owner actually issued for the entries this
+/// phase applied (issue #960, A14: "current purge/residency/reference closure
+/// preserved").
+///
+/// The restore evidence publishes
+/// `provenance.purge_ledger_revision`, and `eliot_backup` REQUIRES that
+/// published field to equal `bundle.manifest.purge_ledger_revision` — the
+/// ARCHIVE's own declared revision
+/// ([`RestoreEvidence::validate_against_plan`]).
+/// That field is therefore copied from the manifest, and until this check the
+/// owner's answer for the same quantity was never compared against it: two
+/// independent numbers, one copied out of the archive under check and one
+/// issued by the owner that applied the ledger. `A13.7` requires a restore to
+/// verify privacy purge closure against the CURRENT owner, and
+/// `I5.13:44` requires the manifest to bind the purge-ledger revision, so the
+/// two must be cross-checked rather than one of them published unchecked.
+///
+/// The compared values are only ever the two legitimate ones: the archive's
+/// declared `manifest.purge_ledger_revision`, and the revision the owner
+/// returned from [`RedbRecoveryStore::apply_purge_ledger_entry`]. Nothing here
+/// computes, increments, counts or derives a revision: there is no `+ 1`, no
+/// `wrapping_add`, no counter and no use of an entry count as a revision. The
+/// only selection performed is choosing which owner-issued value represents
+/// the ledger position reached by the whole archive ledger (the highest one),
+/// because entries are handed to the owner in ledger order.
+///
+/// The archive side is whatever its producer declared for that manifest field —
+/// `elipt_backup` leaves the value to the producer and only refuses the
+/// incoherent pairs — and it is never re-derived here. An archive whose
+/// declared revision is not a revision the applying owner issues is therefore
+/// refused at this check rather than published as a closure: this module does
+/// not reconcile two producers' conventions and never rewrites either number
+/// to make them agree.
+///
+/// The comparison is fail-closed in every direction:
+///
+/// * a count disagreement — the owner did not issue one revision for every
+///   carried entry — refuses, so a phase that applied less than the archive
+///   declares cannot pass as closure;
+/// * an owner-issued revision of zero refuses, because the owner's own record
+///   contract states an applied purge always consumes a NON-ZERO ledger
+///   revision (`PurgeLedgerRecord::validate`); a zero is the owner's "nothing
+///   was ever applied" answer, not an issued revision, and treating it as one
+///   would be absence of proof read as proof;
+/// * an issued revision that disagrees with the archive's declared revision
+///   refuses. This is the same shape as the archive-side binding
+///   `elipt_backup::BackupBundle::validate_class_requirements` already
+///   enforces for this field, and as the owner-side answer comparison in
+///   `eliot-host`'s `project_owner_bound`, and it is deliberately strict in
+///   BOTH directions: a declared revision the owner's ledger never reached is
+///   as much a closure failure as an applied revision the archive never
+///   declared.
+///
+/// The refusal is the seam's existing typed
+/// [`BackupError::FenceMismatch`] naming `purge ledger revision` — the same
+/// variant and subject `elipt_backup` already uses when this field's binding
+/// does not hold, so no new error variant and no second refusal style is
+/// introduced here. It crosses the layer boundary through the existing
+/// `BackupError` → `KernelRestoreError::TargetFailed` mapping
+/// ([`backup_to_kernel`](super::backup_restore_ports::backup_to_kernel)), so
+/// the cause stays typed and is never stringified.
+///
+/// ## An archive with no purge entry
+///
+/// When the archive carries no purge entry there is no owner-issued revision
+/// to compare and none is invented, so this function returns without
+/// comparing. That is NOT a cross-checked agreement and is not reported as
+/// one: the empty ledger applied nothing, so there is no purge closure this
+/// phase established, and the published revision remains the archive's own
+/// declared value with nothing of the owner's behind it (see
+/// [`KernelRestoreTarget::apply_purge_ledger`], whose empty-ledger posture is
+/// "applies no entry, reports no revision, and is not a skip of an
+/// application"). A closure this phase never established cannot be claimed as
+/// owner-corroborated, and the obligation the finalize evidence publishes
+/// binds the phase receipt of the phase that actually ran.
+fn check_purge_revision_closure(
+    declared: u64,
+    entries: &[PurgeLedgerEntry],
+    applied: &[AppliedPurgeRevision],
+) -> Result<(), BackupError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    // One owner-issued revision per carried entry, and no owner-issued
+    // revision may be the owner's own "nothing was applied" zero.
+    if applied.len() != entries.len() || applied.iter().any(|record| record.revision == 0) {
+        return Err(BackupError::FenceMismatch {
+            subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
+        });
+    }
+    // The highest revision the owner issued is the ledger position this
+    // restore's whole ledger reached: a SELECTION among values the owner
+    // returned, never a value computed here. `None` — the owner issued no
+    // revision at all — is compared as itself, so it refuses rather than
+    // standing in for agreement.
+    let owner_issued = applied.iter().map(|record| record.revision).max();
+    if owner_issued != Some(declared) {
+        return Err(BackupError::FenceMismatch {
+            subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
         });
     }
     Ok(())
