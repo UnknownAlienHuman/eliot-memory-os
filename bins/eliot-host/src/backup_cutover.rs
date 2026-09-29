@@ -1179,15 +1179,28 @@ pub enum CutoverError {
 // lib.rs: `HostComposition::backup_dispatch_cutover`,
 // `HostComposition::backup_dispatch_cutover_disposition` and
 // `HostComposition::backup_dispatch_cutover_retire` each arm one guard, armed
-// on entry and disarmed on every success return, so an `Err` reaching any arm
-// emits exactly one terminal record for that operation and a success emits
-// none. The three frozen codes are
+// on entry, so an `Err` reaching any arm emits exactly one terminal record for
+// that operation. The three frozen codes are
 // `host-backup-cutover-failed` / `host-backup-cutover-disposition-failed` /
 // `host-backup-cutover-retire-failed`, so the three operations stay
 // distinguishable from each other and each stays distinct from a separate
 // process shutdown failure (`host-stop-failed`, `host-open-failed`). Nothing
 // here is deduplicated away: there is no global dedup cache, so a second
 // failed operation still reports its own terminal.
+//
+// An operation can fail BY DISPOSITION rather than by `Err`, and a
+// `Result`-driven guard alone would miss exactly that case: this module's
+// owners answer a refusal with `Ok(CutoverOutcome { disposition: Failed, .. })`
+// once the durable intent reached its terminal `CutoverIntentState::Failed`
+// state, and `reconcile_cutover_outcome` is the projection that produces that
+// word from the owners themselves. The three guards therefore settle through
+// [`cutover_disposition_reports_failure`] beside
+// [`cutover_disposition_token`] - the one owner that classifies every
+// disposition - and stay armed exactly for the owner's own failure word, so
+// the owed terminal record is emitted and the typed `CutoverOutcome` still
+// leaves the boundary unchanged. `Unknown` is not one of those words:
+// preserved uncertainty under the original operation identity is not a failure
+// (I14.21), and it must never be reported as one.
 //
 // Production call sites (#983). There are TWO distinct live cutover contours
 // and each is observed on its own token; they are not the same observation and
@@ -1318,6 +1331,35 @@ fn cutover_disposition_token(disposition: CutoverDisposition) -> &'static str {
         CutoverDisposition::RetirementPending => "retirement_pending",
         CutoverDisposition::Failed => "failed",
         CutoverDisposition::Unknown => "unknown",
+    }
+}
+
+/// Whether one owner [`CutoverDisposition`] reports this cutover operation
+/// itself as terminally failed, so the caller boundary that owns this
+/// operation's single terminal record still owes that record even though the
+/// operation returned `Ok`.
+///
+/// Exhaustive and closed on purpose. A cutover that fails BY DISPOSITION
+/// rather than by `Err` is a real, owner-observed failure of the operation,
+/// not an absent or incomplete channel: the durable intent for this exact
+/// operation reached the terminal `Failed` state, and that is the only thing
+/// this predicate reports. `Unknown` is deliberately NOT one of them — it is
+/// the preserved uncertainty of a lost response or a torn owner pair
+/// (I14.21), and reading it as a failure would manufacture a terminal the
+/// owners never proved. Every other variant is progress or a settlement, so
+/// each is named rather than defaulted, and a disposition added later cannot
+/// compile without being classified here.
+#[must_use]
+pub fn cutover_disposition_reports_failure(disposition: CutoverDisposition) -> bool {
+    match disposition {
+        CutoverDisposition::Failed => true,
+        CutoverDisposition::Requested
+        | CutoverDisposition::Validated
+        | CutoverDisposition::Prepared
+        | CutoverDisposition::Committed
+        | CutoverDisposition::Reconciled
+        | CutoverDisposition::RetirementPending
+        | CutoverDisposition::Unknown => false,
     }
 }
 
