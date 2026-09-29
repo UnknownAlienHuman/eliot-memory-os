@@ -913,10 +913,16 @@ def string_switch_offsets(text: str) -> tuple[str, list[tuple[int, int]], list[i
     non-Cue owner. Unclosed or undecodable syntax raises instead of proving zero.
     """
     spans: list[tuple[int, int]] = []
-    code, _ = _strip_core(text, literal_spans=spans)
+    code, unclosed = _strip_core(text, literal_spans=spans)
     data = text.encode("utf-8")
     if any(end < 0 or end > len(data) for _, end in spans):
         raise ValueError("unclosed string in switch scan")
+    # The stripper reports an unterminated block comment as `unclosed` without
+    # recording a span, so a span-end check alone reports a false zero there.
+    # The whole rest of the file is inside the comment, which hides any site it
+    # contains; unknown lexical input must be incomplete, never clean.
+    if unclosed:
+        raise ValueError("unclosed lexical input in switch scan")
     if not re.search(r"\bmatch\b", code):
         return code, spans, []
     offsets: list[int] = []
