@@ -1386,11 +1386,12 @@ impl DeliveryClaim {
 
 /// Claimed reclamation result (#2786 steps 5/6): execution outcome, result
 /// publication, owner acknowledgement, and physical reclamation stay
-/// separate. Only an identity-matching staged set is reclaimed; a
-/// replacement, an already-gone set, or an unreadable set is left untouched
-/// with its exact identity preserved. Durable owner-side retirement awaits
-/// the kernel publisher half; this child-side transition presents the exact
-/// claimed identity against the same staged owner state.
+/// separate. Only identity-matching fixed material or its claim-specific
+/// `.reclaiming` aside is eligible. A successor fixed set is left untouched;
+/// unknown or incomplete custody leaves the aside for recovery with its exact
+/// identity preserved. Durable owner-side retirement awaits the kernel
+/// publisher half; this child-side transition presents the exact claimed
+/// identity against the same staged owner state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaimedReclamation {
     /// The claimed generation was reclaimed with per-file outcomes.
@@ -1493,13 +1494,63 @@ fn consume_staged_unlocked(path: &std::path::Path) -> ReclaimOutcome {
     }
 }
 
+/// Reads the exact immutable owner-slot copy for one staged name. This is
+/// required before deleting a `.reclaiming` aside: a digest match alone does
+/// not prove that a retained owner still has the claimed material.
+fn read_retained_owner_file_unlocked(
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+    file_name: &str,
+) -> Result<Vec<u8>, MaterialError> {
+    let expected_digest = match file_name {
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME => claim.artifact_digest.as_str(),
+        WASM_HOST_GUEST_INPUT_FILE_NAME => claim.input_digest.as_str(),
+        WASM_HOST_MATERIAL_FILE_NAME => claim.envelope_digest.as_str(),
+        _ => return Err(MaterialError::Malformed),
+    };
+    let path = delivery_slot_dir(install_dir, claim).join(file_name);
+    let bytes = read_bounded_regular_file(
+        &path,
+        u64_ceiling_as_usize(crate::artifact_preflight::MAX_ARTIFACT_BYTES),
+    )?;
+    if Sha256Digest::of_bytes(&bytes).as_str() != expected_digest {
+        return Err(MaterialError::DigestMismatch);
+    }
+    Ok(bytes)
+}
+
+/// Verifies that all three exact-generation owner copies remain available.
+/// A `.reclaiming` aside is not disposable when its immutable owner slot is
+/// incomplete, unreadable, or has drifted.
+fn read_retained_owner_material_unlocked(
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+) -> Result<[Vec<u8>; 3], MaterialError> {
+    let artifact = read_retained_owner_file_unlocked(
+        install_dir,
+        claim,
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+    )?;
+    let input = read_retained_owner_file_unlocked(
+        install_dir,
+        claim,
+        WASM_HOST_GUEST_INPUT_FILE_NAME,
+    )?;
+    let material = read_retained_owner_file_unlocked(
+        install_dir,
+        claim,
+        WASM_HOST_MATERIAL_FILE_NAME,
+    )?;
+    Ok([artifact, input, material])
+}
+
 /// Reclaims one fixed staging name by claim while the shared installation-
 /// root lock is held: renames the fixed name aside under the claimed-
 /// identity name, re-verifies the aside bytes against the claim, and deletes
-/// only the verified aside. A fixed name that went missing answers
-/// `NotFound`; aside bytes that fail verification are restored when no
-/// successor owns the name and answer `Preserved`. Deletion targets the
-/// claimed aside path only, never a generic current pathname.
+/// only the verified aside when the exact owner-slot copy is retained. A
+/// fixed name that went missing answers `NotFound`; invalid or unowned aside
+/// bytes remain as recovery evidence. Deletion targets the claimed aside path
+/// only, never a generic current pathname.
 #[must_use]
 fn reclaim_claimed_file_unlocked(
     install_dir: &std::path::Path,
@@ -1520,13 +1571,17 @@ fn reclaim_claimed_file_unlocked(
             if !verify(&bytes) {
                 return ReclaimOutcome::Preserved;
             }
-            match std::fs::symlink_metadata(&fixed) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return consume_staged_unlocked(&aside);
-                }
-                Ok(_) => return ReclaimOutcome::Preserved,
-                Err(error) => return ReclaimOutcome::Other(error.kind().to_string()),
+            let Ok(owner_copy) = read_retained_owner_file_unlocked(install_dir, claim, file_name)
+            else {
+                return ReclaimOutcome::Other("aside-owner-copy-unavailable".to_owned());
+            };
+            if bytes != owner_copy {
+                return ReclaimOutcome::Preserved;
             }
+            // The aside name is already bound to this exact claim. Once its
+            // bytes match the retained owner copy, a successor at the fixed
+            // locator cannot own or strand this claim-specific file.
+            return consume_staged_unlocked(&aside);
         }
         Ok(_) => return ReclaimOutcome::Preserved,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1561,6 +1616,14 @@ fn reclaim_claimed_file_unlocked(
         return ReclaimOutcome::Other("aside-unreadable".to_owned());
     };
     if !verify(&bytes) {
+        restore_aside_if_absent(&aside, &fixed);
+        return ReclaimOutcome::Preserved;
+    }
+    let Ok(owner_copy) = read_retained_owner_file_unlocked(install_dir, claim, file_name) else {
+        restore_aside_if_absent(&aside, &fixed);
+        return ReclaimOutcome::Other("aside-owner-copy-unavailable".to_owned());
+    };
+    if bytes != owner_copy {
         restore_aside_if_absent(&aside, &fixed);
         return ReclaimOutcome::Preserved;
     }
@@ -1603,7 +1666,7 @@ fn reclaim_claimed_delivery_unlocked(
     install_dir: &std::path::Path,
 ) -> ClaimedReclamation {
     let (owner_identity, join, disposition) =
-        match read_claimed_reclamation_state_unlocked(claim, install_dir) {
+        match read_claimed_reclamation_owner_state_unlocked(claim, install_dir) {
             Ok(state) => state,
             Err(outcome) => return outcome,
         };
@@ -1617,10 +1680,35 @@ fn reclaim_claimed_delivery_unlocked(
         Ok(bound) => bound,
         Err(outcome) => return outcome,
     };
+
+    if let Some(outcome) =
+        reconcile_claimed_asides_after_successor_unlocked(install_dir, &effective_claim)
+    {
+        return outcome;
+    }
+
+    let staged = match read_claimed_dispatch_material_unlocked(install_dir) {
+        Ok(staged) => staged,
+        Err(_) => {
+            return ClaimedReclamation::RetainedForRecovery {
+                claimed: claim.identity().clone(),
+            };
+        }
+    };
+    let Some((staged_claim, _material)) = staged else {
+        return ClaimedReclamation::AlreadyGone {
+            claimed: claim.identity().clone(),
+        };
+    };
+    if !owner_identity.names(staged_claim.identity()) {
+        return ClaimedReclamation::ReplacementPreserved {
+            claimed: claim.identity().clone(),
+        };
+    }
     reclaim_claimed_material_unlocked(install_dir, &effective_claim)
 }
 
-fn read_claimed_reclamation_state_unlocked(
+fn read_claimed_reclamation_owner_state_unlocked(
     claim: &DeliveryClaim,
     install_dir: &std::path::Path,
 ) -> Result<
@@ -1631,40 +1719,22 @@ fn read_claimed_reclamation_state_unlocked(
     ),
     ClaimedReclamation,
 > {
-    let Ok(staged) = read_claimed_dispatch_material_unlocked(install_dir) else {
-        return Err(ClaimedReclamation::RetainedForRecovery {
-            claimed: claim.identity().clone(),
-        });
-    };
-    let Some((staged_claim, _material)) = staged else {
-        return Err(ClaimedReclamation::AlreadyGone {
-            claimed: claim.identity().clone(),
-        });
-    };
-    if staged_claim.identity().envelope_digest != claim.identity().envelope_digest
-        || staged_claim.identity().claim_id != claim.identity().claim_id
-    {
-        return Err(ClaimedReclamation::ReplacementPreserved {
-            claimed: claim.identity().clone(),
-        });
-    }
     let identity = claim.identity();
-    let disposition_record =
-        match read_owner_disposition_unlocked(install_dir, staged_claim.identity()) {
-            Ok(record) => record,
-            Err(_) => {
-                return Err(ClaimedReclamation::RetainedForRecovery {
-                    claimed: identity.clone(),
-                });
-            }
-        };
+    let disposition_record = match read_owner_disposition_unlocked(install_dir, identity) {
+        Ok(record) => record,
+        Err(_) => {
+            return Err(ClaimedReclamation::RetainedForRecovery {
+                claimed: identity.clone(),
+            });
+        }
+    };
     let owner_identity = disposition_record.disposition.identity().clone();
-    if !owner_identity.names(staged_claim.identity()) || !owner_identity.names(identity) {
+    if !owner_identity.names(identity) {
         return Err(ClaimedReclamation::ReplacementPreserved {
             claimed: identity.clone(),
         });
     }
-    match read_delivery_publication_unlocked(install_dir, staged_claim.identity()) {
+    match read_delivery_publication_unlocked(install_dir, identity) {
         Ok(Some(publication))
             if publication.is_ready() && publication.identity() == &owner_identity => {}
         _ => {
@@ -1684,6 +1754,154 @@ fn read_claimed_reclamation_state_unlocked(
         });
     }
     Ok((owner_identity, join, disposition_record.disposition))
+}
+
+/// Recovers only the three deterministic aside names for one exact claim.
+/// This path is used after a complete successor occupies the shared locators,
+/// so it never renames or removes a current fixed name. Owner identity,
+/// publication, custody disposition, retained result, and the full immutable
+/// owner copy are verified while the caller holds the shared installation-root
+/// lock. Any uncertainty keeps the aside and reports a recovery obligation;
+/// filename age and digest equality alone never retire it.
+fn reconcile_claimed_asides_after_successor_unlocked(
+    install_dir: &std::path::Path,
+    claim: &DeliveryClaim,
+) -> Option<ClaimedReclamation> {
+    let identity = claim.identity();
+    let paths = claimed_reclaim_aside_paths(install_dir, identity);
+    let Some(present) = claimed_reclaim_aside_presence_unlocked(&paths) else {
+        return Some(ClaimedReclamation::RetainedForRecovery {
+            claimed: identity.clone(),
+        });
+    };
+    if !present.iter().any(|found| *found) {
+        return None;
+    }
+
+    // The identity-specific aside is safe to retire only once a complete
+    // different delivery occupies the fixed names.
+    // If the claimed generation is still current, the ordinary guarded path
+    // below handles its remaining fixed names and these asides together.
+    match read_claimed_dispatch_material_unlocked(install_dir) {
+        Ok(Some((current, _))) if claim_is_same_owner_delivery(claim, &current) => return None,
+        Ok(Some(_)) => {}
+        // Without a complete current envelope, payload names may be partial
+        // publication state. Keep the aside until discovery can establish the
+        // successor set instead of treating an empty read as absence proof.
+        Ok(None) => {
+            return Some(ClaimedReclamation::RetainedForRecovery {
+                claimed: identity.clone(),
+            });
+        }
+        Err(_) => {
+            return Some(ClaimedReclamation::RetainedForRecovery {
+                claimed: identity.clone(),
+            });
+        }
+    }
+
+    let aside_bytes = match read_verified_claimed_asides_unlocked(
+        install_dir,
+        identity,
+        &paths,
+        &present,
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Some(ClaimedReclamation::RetainedForRecovery {
+                claimed: identity.clone(),
+            });
+        }
+    };
+    Some(delete_claimed_asides_unlocked(identity, &paths, &aside_bytes))
+}
+
+fn claimed_reclaim_aside_paths(
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+) -> [std::path::PathBuf; 3] {
+    [
+        reclaim_aside_path(install_dir, WASM_HOST_GUEST_ARTIFACT_FILE_NAME, claim),
+        reclaim_aside_path(install_dir, WASM_HOST_GUEST_INPUT_FILE_NAME, claim),
+        reclaim_aside_path(install_dir, WASM_HOST_MATERIAL_FILE_NAME, claim),
+    ]
+}
+
+fn claimed_reclaim_aside_presence_unlocked(
+    paths: &[std::path::PathBuf; 3],
+) -> Option<[bool; 3]> {
+    let mut present = [false; 3];
+    for (slot, aside) in present.iter_mut().zip(paths) {
+        match std::fs::symlink_metadata(aside) {
+            Ok(metadata) if metadata.file_type().is_file() => *slot = true,
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(present)
+}
+
+fn read_verified_claimed_asides_unlocked(
+    install_dir: &std::path::Path,
+    claim: &StagedDeliveryIdentity,
+    paths: &[std::path::PathBuf; 3],
+    present: &[bool; 3],
+) -> Result<[Option<Vec<u8>>; 3], MaterialError> {
+    let owner_copy = read_retained_owner_material_unlocked(install_dir, claim)?;
+    let mut aside_bytes: [Option<Vec<u8>>; 3] = std::array::from_fn(|_| None);
+    for (index, ((aside, is_present), retained)) in paths
+        .iter()
+        .zip(present)
+        .zip(owner_copy.iter())
+        .enumerate()
+    {
+        if !*is_present {
+            continue;
+        }
+        let bytes = read_bounded_regular_file(
+            aside,
+            u64_ceiling_as_usize(crate::artifact_preflight::MAX_ARTIFACT_BYTES),
+        )?;
+        if bytes.as_slice() != retained.as_slice() {
+            return Err(MaterialError::DigestMismatch);
+        }
+        aside_bytes[index] = Some(bytes);
+    }
+    Ok(aside_bytes)
+}
+
+fn delete_claimed_asides_unlocked(
+    claim: &StagedDeliveryIdentity,
+    paths: &[std::path::PathBuf; 3],
+    verified_asides: &[Option<Vec<u8>>; 3],
+) -> ClaimedReclamation {
+    let mut outcomes = [
+        ReclaimOutcome::NotFound,
+        ReclaimOutcome::NotFound,
+        ReclaimOutcome::NotFound,
+    ];
+    for (outcome, (aside, bytes)) in outcomes
+        .iter_mut()
+        .zip(paths.iter().zip(verified_asides))
+    {
+        if bytes.is_some() {
+            *outcome = consume_staged_unlocked(aside);
+        }
+    }
+    ClaimedReclamation::Reclaimed(DeliveryReclamation {
+        identity: claim.clone(),
+        artifact: outcomes[0].clone(),
+        input: outcomes[1].clone(),
+        material: outcomes[2].clone(),
+    })
+}
+
+fn claim_is_same_owner_delivery(claim: &DeliveryClaim, staged: &DeliveryClaim) -> bool {
+    claim
+        .owner_identity
+        .as_ref()
+        .is_some_and(|owner_identity| owner_identity.names(staged.identity()))
 }
 
 fn bind_claim_for_reclamation_unlocked(
