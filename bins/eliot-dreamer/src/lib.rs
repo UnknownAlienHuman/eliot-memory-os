@@ -39,6 +39,9 @@ pub use curation_pulse::{
     CURATION_PULSE_SCHEMA_VERSION, CurationMemberFinding, CurationProductPulse,
     CurationPulseDisposition,
 };
+pub use curation_screen_stage::{
+    CurationProtection, CurationProtectionSet, ProtectionClass, ProtectionDecision,
+};
 pub use error::DreamerError;
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
@@ -539,13 +542,18 @@ fn run_admitted_pipeline(
                 ));
             }
         };
+        // The A-20 screen path also assesses each screened record's protection
+        // state, derived from the admitted job against this exact binding, so
+        // the receipt can carry a per-member protection finding instead of only
+        // an A-31 routing disposition.
+        let protection = curation_screen_stage::protection_for_admitted(job, &binding);
         // Carrier check before any generic model/grounding work: without a
         // Governor-injected execution carrier there is nothing downstream to
         // run, so refuse here with the precise reason.
         let carrier = curation_carrier.ok_or(DreamerError::InvalidAdmission(
             dispatch_stage::CURATION_CARRIER_REFUSAL,
         ))?;
-        return dispatch_stage::dispatch_curation(binding, carrier);
+        return dispatch_stage::dispatch_curation(binding, protection, carrier);
     }
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
@@ -565,6 +573,7 @@ fn run_admitted_pipeline(
         admission,
         job,
         screen_binding,
+        None,
         None,
         job.job_class,
         Some(&validated),
@@ -788,11 +797,37 @@ pub struct Interpretation {
     pub epistemic_status: String,
 }
 
+/// One curation candidate, projected from the routed A-31 record.
+///
+/// Field set follows I9.6 "Curation candidate": identity, kind, source
+/// handles, the four evidence fields (`support`, `counterevidence`,
+/// `scope_and_applicability`, `preservation_report`), the proposed
+/// transformation, uncertainty, and rollback. `support` deliberately carries
+/// provenance digests and evidence references rather than any use or
+/// popularity measure, because A14.4 forbids low use from reducing factual
+/// support and frequent retrieval from strengthening a record.
+/// `counterevidence` and `preservation_report` restate the A-20 owner
+/// protection assessment for every screened target this candidate would
+/// transform, so a protected record stays distinguishable from an ordinary one
+/// for a consumer reading only the candidate list.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CurationCandidate {
     pub candidate_id: String,
     pub kind: String,
     pub source_handles: Vec<String>,
+    /// I9.6 `support`: the evidence the record rests on (owner digests and
+    /// evidence references), never a usage or popularity measure.
+    pub support: String,
+    /// I9.6 `counterevidence`: the owner protection findings and any routing
+    /// rejection hint that counts against this candidate.
+    pub counterevidence: String,
+    /// I9.6 `scope_and_applicability`: the exact task, scope, request, attempt,
+    /// and handles this candidate is proposed under.
+    pub scope_and_applicability: String,
+    /// I9.6 `preservation_report`: what was preserved, the owner protection
+    /// findings, and the candidate-only, no-mutation fact.
+    pub preservation_report: String,
     pub proposed_transformation: String,
     pub uncertainty: String,
     pub rollback: String,
@@ -1139,6 +1174,19 @@ fn build_result(input: &DreamJobInput) -> DreamResult {
                 candidate_id: format!("{}-candidate-{}", input.job_id, index + 1),
                 kind: "review_required".into(),
                 source_handles: vec![handle.clone()],
+                support: format!(
+                    "handle-only fixture: {handle} was admitted as a source handle; no owner screen digest, request digest, or result digest exists for a fixture candidate."
+                ),
+                counterevidence: format!(
+                    "the owner declared no conflict for {handle}, so its protection state is unknown rather than cleared; this fixture runs no real admitted route."
+                ),
+                scope_and_applicability: format!(
+                    "applies to scope {} for job {}; proposed mutable target: {handle}; no state_fence is bound by this fixture.",
+                    input.scope_id, input.job_id
+                ),
+                preservation_report: format!(
+                    "no source mutation was performed: fixture candidate over {handle} is review_required; no owner protection finding was derived because no real screen ran."
+                ),
                 proposed_transformation: "Inspect provenance and propose a reversible derived projection; do not alter the source.".into(),
                 uncertainty: "No semantic promotion is possible from a handle-only bounded bundle.".into(),
                 rollback: "Discard the candidate and reopen the source handle.".into(),

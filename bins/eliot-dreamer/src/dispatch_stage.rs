@@ -64,9 +64,9 @@ use eliot_dreamer_contracts::{
     ValidationPolicy,
 };
 use eliot_dreamer_curation::{
-    CurationCandidateSet, CurationRoutingError, MAX_BATCH_ITEMS, NativeCurationPortSet,
-    OwnerRevisionPin, RoutingDisposition, RoutingPolicy, ValidatedCurationBatch,
-    route_validated_curation,
+    CurationCandidateSet, CurationMemberOutcome, CurationRoutingError, MAX_BATCH_ITEMS,
+    NativeCurationPortSet, OwnerRevisionPin, RoutingDisposition, RoutingPolicy,
+    ValidatedCurationBatch, route_validated_curation,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, LocalOrientationFrame, OrientationError, OrientationPolicy,
@@ -79,6 +79,7 @@ use crate::admitted_material::{
 };
 use crate::controller::verify_admitted_binding;
 use crate::curation_pulse::compose_curation_pulse;
+use crate::curation_screen_stage::{CurationProtection, CurationProtectionSet, ProtectionClass};
 use crate::{
     CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
     KernelJobAdmission, SourceCoverage,
@@ -94,6 +95,13 @@ const CURATION_PORTS_REFUSAL: &str =
 /// binding the fan-in must be checked against.
 const CURATION_SCREEN_REFUSAL: &str =
     "admitted curation dispatch requires Governor-resolved screen binding";
+/// Fail-closed reason when the Curation arm is entered without the A-20 owner
+/// protection assessment derived from that same screen binding. The receipt
+/// must carry a protection finding for every routed member, so a route that
+/// cannot name one refuses instead of emitting candidates whose protection
+/// state is simply absent.
+const CURATION_PROTECTION_REFUSAL: &str =
+    "admitted curation dispatch requires the owner screen protection assessment";
 /// Fail-closed reason when the Curation arm is entered without the
 /// Governor-injected execution carrier: the validated batch and the ten live
 /// handler ports arrive together from the Governor, so without them there is
@@ -198,8 +206,9 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// [`DreamResult::Orientation`] complete/partial/blocked result (blocked
 /// until the Governor supply channel lands); Curation checks the carrier first
 /// (a missing carrier refuses before any screen or registry work, so no
-/// generic stage burns on a job that cannot route), then the screen binding,
-/// then the real A-31 fan-in; `ResearchSynthesis` and `Maintenance` prove
+/// generic stage burns on a job that cannot route), then the screen binding
+/// together with the protection assessment derived from that binding, then the
+/// real A-31 fan-in; `ResearchSynthesis` and `Maintenance` prove
 /// the structured receipt binding first and then name their missing
 /// Governor-resolved inputs; the five classes `submit` never admits refuse
 /// with `UnsupportedJobClass`.
@@ -207,6 +216,7 @@ pub(crate) fn dispatch_admitted(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     screen: Option<ScreenBinding>,
+    curation_protection: Option<CurationProtectionSet>,
     curation_carrier: Option<CurationExecutionCarrier<'_>>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
@@ -228,7 +238,10 @@ pub(crate) fn dispatch_admitted(
             let Some(binding) = screen else {
                 return Err(DreamerError::InvalidAdmission(CURATION_SCREEN_REFUSAL));
             };
-            dispatch_curation(binding, carrier)
+            let Some(protection) = curation_protection else {
+                return Err(DreamerError::InvalidAdmission(CURATION_PROTECTION_REFUSAL));
+            };
+            dispatch_curation(binding, protection, carrier)
         }
         // Native owner: the production Orientation composer (typed
         // complete/partial/blocked result via the versioned carrier), gated
@@ -681,8 +694,9 @@ fn curation_routing_policy() -> RoutingPolicy {
 
 /// Dispatches one admitted Curation job through the A-31 sole fan-in.
 ///
-/// Takes the A-20 screen binding from the screen stage and the
-/// Governor-injected execution carrier (both already checked present by
+/// Takes the A-20 screen binding from the screen stage, the owner protection
+/// assessment derived from that same binding, and the
+/// Governor-injected execution carrier (all already checked present by
 /// [`dispatch_admitted`]). Then, genuinely and in order: resolves the
 /// owner-published closed registry, validates its closure and stable digest,
 /// validates the bounded all-or-nothing routing policy, validates the screen
@@ -691,8 +705,8 @@ fn curation_routing_policy() -> RoutingPolicy {
 /// routes the injected batch through the real
 /// [`route_validated_curation`](eliot_dreamer_curation::route_validated_curation),
 /// then composes the narrow Curation Product Pulse from the owner screen
-/// binding, the admitted batch, and the routed set, and maps the candidate set
-/// plus that pulse onto [`DreamResult::Curation`].
+/// binding, the protection assessment, the admitted batch, and the routed set,
+/// and maps the candidate set plus that pulse onto [`DreamResult::Curation`].
 /// Never returns `UnsupportedJobClass`.
 #[allow(
     clippy::needless_pass_by_value,
@@ -700,6 +714,7 @@ fn curation_routing_policy() -> RoutingPolicy {
 )]
 pub(crate) fn dispatch_curation(
     screen: ScreenBinding,
+    protection: CurationProtectionSet,
     carrier: CurationExecutionCarrier<'_>,
 ) -> Result<DreamResult, DreamerError> {
     let registry = canonical_registry().map_err(|error| dispatch_denied(&error))?;
@@ -713,6 +728,14 @@ pub(crate) fn dispatch_curation(
     if screen.state != ScreenState::Eligible {
         return Err(DreamerError::InvalidAdmission("screen ineligible"));
     }
+    // The assessment must cover exactly the members this binding admitted, so a
+    // parallel or stale protection record can never narrate a different
+    // operation than the one being routed.
+    if protection.screened_targets != screen.screened_targets
+        || protection.members.len() != protection.screened_targets.len()
+    {
+        return Err(DreamerError::InvalidAdmission(CURATION_PROTECTION_REFUSAL));
+    }
     if carrier.ports.ports.is_empty() {
         return Err(curation_port_boundary_refusal(
             &registry,
@@ -722,8 +745,163 @@ pub(crate) fn dispatch_curation(
     }
     let set = route_validated_curation(&carrier.batch, &screen, &registry, &policy, &carrier.ports)
         .map_err(|error| curation_denied(&error))?;
-    let pulse = compose_curation_pulse(&screen, &carrier.batch, &set)?;
+    let pulse = compose_curation_pulse(&screen, &protection, &carrier.batch, &set)?;
     map_curation_set(&set, pulse)
+}
+
+/// Renders one owner protection assessment as the receipt phrase that names
+/// what the admission actually declared.
+///
+/// `Protected` cites the admitted declaration verbatim; `Unknown` says plainly
+/// that no evidence was admitted, because a missing finding must never be
+/// spelled as clearance.
+fn protection_phrase(assessment: &CurationProtection) -> String {
+    match assessment.class {
+        Some(class) => format!(
+            "owner declared {class} protection on {member} (declared reference: {reference})",
+            class = protection_class_name(class),
+            member = assessment.member_id,
+            reference = assessment.owner_reference.as_deref().unwrap_or("absent"),
+        ),
+        None => format!(
+            "no owner protection evidence was admitted for {member}; its protection state is unknown, not cleared",
+            member = assessment.member_id,
+        ),
+    }
+}
+
+/// Closed wire name of one derived protection class.
+fn protection_class_name(class: ProtectionClass) -> &'static str {
+    match class {
+        ProtectionClass::UnresolvedConflict => "UNRESOLVED_CONFLICT",
+    }
+}
+
+/// Renders the member's protection findings, or states that none apply.
+fn protection_summary(protection: &[CurationProtection]) -> String {
+    if protection.is_empty() {
+        return "this member transforms no screened target, so no owner protection finding applies"
+            .to_owned();
+    }
+    protection
+        .iter()
+        .map(protection_phrase)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// I9.6 `support`: the evidence this routing record actually rests on.
+///
+/// Every value is a record the run produced — the two A-20 screen digests, the
+/// dispatched request and sealed result digests, and the A-31 item's own
+/// evidence references. It is deliberately NOT a usage count or a popularity
+/// measure: A14.4 forbids frequent retrieval from strengthening a record, so
+/// nothing popularity-shaped may enter this field.
+fn candidate_support(
+    pulse: &crate::CurationProductPulse,
+    member: &CurationMemberOutcome,
+    result_digest: &str,
+) -> String {
+    let evidence_refs = if member.evidence_refs.is_empty() {
+        "none supplied by the routed item".to_owned()
+    } else {
+        member.evidence_refs.join(", ")
+    };
+    format!(
+        "A-20 screen result {screen_result} and screen item {screen_item} admitted this member; \
+         A-31 dispatched request digest {request} to handler {handler} after {calls} call(s) and \
+         received result digest {result}; routed item evidence references: {evidence_refs}",
+        screen_result = pulse.screen_result_digest,
+        screen_item = pulse.screen_item_digest,
+        request = member.request_digest.as_deref().unwrap_or("absent"),
+        handler = member.handler_id,
+        calls = member.calls,
+        result = result_digest,
+        evidence_refs = evidence_refs,
+    )
+}
+
+/// I9.6 `counterevidence`: what counts against this candidate, stated from the
+/// owner record rather than softened away.
+///
+/// A protected target and an unassessed one both appear here, which is what
+/// keeps a protected exact-negative record distinguishable from an ordinary
+/// one in the emitted receipt.
+fn candidate_counterevidence(
+    finding: &crate::CurationMemberFinding,
+    protection: &[CurationProtection],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = protection_summary(protection);
+    if let Some(hint) = &finding.rejection_hint {
+        // `write!` on a String is infallible, so the result is deliberately
+        // discarded rather than surfaced as a fallible branch.
+        let _ = write!(
+            text,
+            "; A-31 routing rejection hint for this member: {hint}"
+        );
+    }
+    if finding.calls != 1 {
+        let _ = write!(
+            text,
+            "; this member recorded {} handler call(s), so it carries no live handler result",
+            finding.calls
+        );
+    }
+    text
+}
+
+/// I9.6 `scope_and_applicability`: the exact operation the candidate is
+/// proposed under, plus the handles it would touch.
+///
+/// Applicability is bound to the receipt's `state_fence` by reference rather
+/// than restated, so the candidate can never claim a fence the pulse did not
+/// run under.
+fn candidate_scope(pulse: &crate::CurationProductPulse, member: &CurationMemberOutcome) -> String {
+    let targets = if member.targets.is_empty() {
+        "no mutable target".to_owned()
+    } else {
+        member.targets.join(", ")
+    };
+    let evidence_refs = if member.evidence_refs.is_empty() {
+        "none".to_owned()
+    } else {
+        member.evidence_refs.join(", ")
+    };
+    format!(
+        "applies to task {task} in scope {scope} under request {request} at dispatch attempt {attempt}, \
+         bounded by the receipt state_fence; proposed mutable targets: {targets}; immutable evidence references: {evidence_refs}",
+        task = pulse.task_id,
+        scope = pulse.scope_id,
+        request = pulse.request_id,
+        attempt = pulse.attempt,
+        targets = targets,
+        evidence_refs = evidence_refs,
+    )
+}
+
+/// I9.6 `preservation_report`: what this record preserved and what it did not
+/// touch.
+///
+/// Candidate-only and honest: no source mutation was performed, and the owner
+/// protection assessment for every target this member would transform is
+/// restated here so a consumer reading only the candidate list still sees it.
+/// A14.4 holds because a contested member is preserved and reported — never
+/// dropped, and never silently merged away.
+fn candidate_preservation(
+    member: &CurationMemberOutcome,
+    protection: &[CurationProtection],
+) -> String {
+    format!(
+        "no source mutation was performed: candidate {member_id} ({kind}) is a routing record sealed by handler {handler} \
+         under routing disposition {disposition}; owner protection findings: {protection_summary}",
+        member_id = member.member_id,
+        kind = member.kind.as_str(),
+        handler = member.handler_id,
+        disposition = member.disposition.as_str(),
+        protection_summary = protection_summary(protection),
+    )
 }
 
 /// Maps one routed A-31 candidate set onto the crate curation result.
@@ -744,6 +922,17 @@ pub(crate) fn dispatch_curation(
 /// empty success. The composed Curation Product Pulse travels alongside the
 /// candidate list, so the receipt always names the route, identities,
 /// disposition, omissions, and proof ceiling the candidates came from.
+///
+/// The I9.6 candidate fields `support`, `counterevidence`,
+/// `scope_and_applicability`, and `preservation_report` are filled from the
+/// records this run produced, never from a fixed sentence: the pulse's own
+/// finding for the member supplies the A-20 protection assessment, the A-31
+/// member supplies its digests, evidence references, disposition, and routing
+/// note, and the pulse supplies the screen digests and the operation identity
+/// the candidate is applicable under. A member whose target carried an owner
+/// protection declaration therefore states that declaration in
+/// `counterevidence` and `preservation_report` instead of reading as an
+/// ordinary candidate.
 fn map_curation_set(
     set: &CurationCandidateSet,
     pulse: crate::CurationProductPulse,
@@ -754,10 +943,25 @@ fn map_curation_set(
             continue;
         }
         let result_digest = member.result_digest.as_deref().unwrap_or("absent");
+        // The member's protection findings come from the pulse finding for
+        // that exact member, so the candidate and the receipt state one
+        // assessment rather than two derivations of it.
+        let finding = pulse
+            .findings
+            .iter()
+            .find(|finding| finding.member_id == member.member_id)
+            .ok_or(DreamerError::InvalidAdmission(
+                crate::curation_pulse::PROTECTION_FINDING_REFUSAL,
+            ))?;
+        let protection = finding.protection.as_slice();
         candidates.push(CurationCandidate {
             candidate_id: member.member_id.clone(),
             kind: member.kind.as_str().to_owned(),
             source_handles: member.targets.clone(),
+            support: candidate_support(&pulse, member, result_digest),
+            counterevidence: candidate_counterevidence(finding, protection),
+            scope_and_applicability: candidate_scope(&pulse, member),
+            preservation_report: candidate_preservation(member, protection),
             proposed_transformation: format!(
                 "routing record: handler {handler_id} sealed a live candidate under result digest {result_digest}; owner note: {note}; content stays Governor-sealed, this record maps the routing outcome only",
                 handler_id = member.handler_id, note = member.note,
