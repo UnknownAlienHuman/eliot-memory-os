@@ -3217,6 +3217,7 @@ dependencies = [
 name = "eliot-store-surreal"
 version = "0.1.0"
 dependencies = [
+ "eliot-backup",
  "eliot-blob",
  "eliot-contracts",
  "eliot-installation",
