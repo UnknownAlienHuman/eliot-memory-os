@@ -4,10 +4,9 @@ use eliot_contracts::{
     RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_learning_activation_assessment::{
-    ActivationAssessmentError, ActivationSection, ActivationStatus, AdherenceSection,
-    AdherenceStatus, AssessmentInput, AssessmentPolicy, AssessmentResultOrIncomplete,
-    DeliverySection, DeliveryStatus, MAX_INPUT_BYTES, MAX_METRICS, MAX_OUTPUT_BYTES, MAX_STAGES,
-    MissingAssessmentField, RetrievalSection, RetrievalStatus,
+    ActivationAssessmentError, AdherenceStatus, AssessmentInput, AssessmentPolicy,
+    AssessmentResultOrIncomplete, MAX_INPUT_BYTES, MAX_METRICS, MAX_OUTPUT_BYTES, MAX_STAGES,
+    MissingAssessmentField, ObservedAdherence, ObservedDelivery, ObservedRetrieval, ObservedUse,
 };
 use eliot_learning_contracts::{
     AgentAttemptId, AssessmentDimension, CampaignActiveOverlayPolicy,
@@ -579,31 +578,50 @@ fn policy_with_stages(stages: Vec<LifecycleStage>) -> AssessmentPolicy {
 }
 
 // The fixtures in this file supply no retrieval, delivery, observable-activation
-// or adherence evidence for an attempt. These are the honest "no evidence
-// observed" sections the receipt contract requires; every status guard is inert
-// for them, so the stage, dimension and causal-ceiling expectations asserted
-// below are unchanged by their presence.
-static FIXTURE_RETRIEVAL: RetrievalSection = RetrievalSection {
-    status: RetrievalStatus::Unknown,
-    expansion_or_tool_query_refs: Vec::new(),
+// or adherence evidence for an attempt. These four observations are the honest
+// "no evidence observed" facts the assessment derives its five receipt sections
+// from; every status guard is inert for them, so the stage, dimension and
+// causal-ceiling expectations asserted below are unchanged by their presence.
+// Eligibility is not asserted here: `overlay_eligibility` runs over the sealed
+// overlay's own fields, so the requesting campaign and the observation instant
+// must still be eligible for the derived retrieval reason to stay absent.
+// These are `const`, not `static`: `AssessmentInput` takes each observation by
+// value, and a value cannot be moved out of a static item.
+const FIXTURE_OBSERVED_RETRIEVAL: ObservedRetrieval<'static> = ObservedRetrieval {
+    requesting_campaign_id: "campaign-620",
+    binding_compatible: true,
+    // Strictly before the fixture overlay's `expires_at_ms` of 2_000, so the
+    // sealed overlay stays eligible at the observation instant.
+    now_ms: 1,
+    cross_task: None,
+    // Never retrieved: the derived retrieval status is
+    // `ELIGIBLE_NOT_RETRIEVED`, which keeps retrieval and delivery orthogonal.
+    retrieved: false,
+    expansion_or_tool_query_refs: &[],
 };
-static FIXTURE_DELIVERY: DeliverySection = DeliverySection {
-    status: DeliveryStatus::Missing,
+const FIXTURE_OBSERVED_DELIVERY: ObservedDelivery<'static> = ObservedDelivery {
+    // No delivery was attempted, so the derived delivery status is
+    // `NOT_DELIVERED` and no packet facts are recorded.
+    attempted: false,
     packet_position: None,
     serialized_digest: None,
     bytes: None,
     actual_tokens: None,
-};
-static FIXTURE_ACTIVATION: ActivationSection = ActivationSection {
-    status: ActivationStatus::NotObserved,
     acknowledgement_ref: None,
-    observation_limit_reason: None,
-    first_qualifying_observable_use_ref: None,
 };
-static FIXTURE_ADHERENCE: AdherenceSection = AdherenceSection {
-    status: AdherenceStatus::Unknown,
-    early_mid_final_checkpoint_refs: Vec::new(),
-    prescribed_or_avoided_action_and_required_verifier_refs: Vec::new(),
+const FIXTURE_OBSERVED_USE: ObservedUse<'static> = ObservedUse {
+    observed_any: false,
+    first_qualifying_use_ref: None,
+    // Observability was available and nothing qualifying was observed, which is
+    // `NOT_OBSERVED`. No use reference is fabricated.
+    observable: true,
+};
+const FIXTURE_OBSERVED_ADHERENCE: ObservedAdherence<'static> = ObservedAdherence {
+    // `UNKNOWN` is not a compliance claim; it is the absent signal.
+    checkpoint_status: AdherenceStatus::Unknown,
+    checkpoint_refs: &[],
+    action_and_verifier_refs: &[],
+    observed_violation: None,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -654,11 +672,10 @@ fn make_input<'a>(
         memory_refs: &[],
         procedure_refs: &[],
         preserved_success_ref: None,
-        eligibility_and_retrieval_reason: None,
-        retrieval: &FIXTURE_RETRIEVAL,
-        delivery: &FIXTURE_DELIVERY,
-        activation: &FIXTURE_ACTIVATION,
-        adherence: &FIXTURE_ADHERENCE,
+        retrieval: FIXTURE_OBSERVED_RETRIEVAL,
+        delivery: FIXTURE_OBSERVED_DELIVERY,
+        observable_use: FIXTURE_OBSERVED_USE,
+        adherence: FIXTURE_OBSERVED_ADHERENCE,
         conflicts_suppression_or_compaction_loss: &[],
         downstream_refs: &[],
         receipt_completeness_and_missing_fields: &[],
@@ -3648,11 +3665,10 @@ fn case_39_evidence_next_step_owner_link_without_promotion()
             memory_refs: &[],
             procedure_refs: &[],
             preserved_success_ref: None,
-            eligibility_and_retrieval_reason: None,
-            retrieval: &FIXTURE_RETRIEVAL,
-            delivery: &FIXTURE_DELIVERY,
-            activation: &FIXTURE_ACTIVATION,
-            adherence: &FIXTURE_ADHERENCE,
+            retrieval: FIXTURE_OBSERVED_RETRIEVAL,
+            delivery: FIXTURE_OBSERVED_DELIVERY,
+            observable_use: FIXTURE_OBSERVED_USE,
+            adherence: FIXTURE_OBSERVED_ADHERENCE,
             conflicts_suppression_or_compaction_loss: &[],
             downstream_refs: &[],
             receipt_completeness_and_missing_fields: &[],
