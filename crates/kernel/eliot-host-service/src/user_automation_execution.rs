@@ -197,19 +197,23 @@ where
             // request.
             UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
                 let publication = self.wake.publish_wake_horizon(request).await?;
-                Ok(UserAutomationHostExecutionResponse::WakeHorizonPublication {
-                    request_sha256,
-                    state_fence,
-                    publication: Box::new(publication),
-                })
+                Ok(
+                    UserAutomationHostExecutionResponse::WakeHorizonPublication {
+                        request_sha256,
+                        state_fence,
+                        publication: Box::new(publication),
+                    },
+                )
             }
             UserAutomationHostExecutionOperation::ReadWakeHorizonPublication { request } => {
                 let publication = self.wake.read_wake_horizon_publication(request).await?;
-                Ok(UserAutomationHostExecutionResponse::WakeHorizonPublication {
-                    request_sha256,
-                    state_fence,
-                    publication: Box::new(publication),
-                })
+                Ok(
+                    UserAutomationHostExecutionResponse::WakeHorizonPublication {
+                        request_sha256,
+                        state_fence,
+                        publication: Box::new(publication),
+                    },
+                )
             }
         }
     }

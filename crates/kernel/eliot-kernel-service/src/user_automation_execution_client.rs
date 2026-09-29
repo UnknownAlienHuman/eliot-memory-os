@@ -1833,9 +1833,9 @@ where
             request,
         )?;
         match self.execute(carrier).await? {
-            UserAutomationHostExecutionResponse::WakeHorizonPublication {
-                publication, ..
-            } => Ok(*publication),
+            UserAutomationHostExecutionResponse::WakeHorizonPublication { publication, .. } => {
+                Ok(*publication)
+            }
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::Cancelled { .. }
             | UserAutomationHostExecutionResponse::WakeRead { .. }
@@ -1863,9 +1863,9 @@ where
             request,
         )?;
         match self.execute(carrier).await? {
-            UserAutomationHostExecutionResponse::WakeHorizonPublication {
-                publication, ..
-            } => Ok(*publication),
+            UserAutomationHostExecutionResponse::WakeHorizonPublication { publication, .. } => {
+                Ok(*publication)
+            }
             UserAutomationHostExecutionResponse::Admitted { .. }
             | UserAutomationHostExecutionResponse::Cancelled { .. }
             | UserAutomationHostExecutionResponse::WakeRead { .. }
