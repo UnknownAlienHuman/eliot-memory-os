@@ -47,7 +47,7 @@ use eliot_native_worker_core::{
     NativeRenewalId, NativeWorkerClaim, NativeWorkerExecutableBinding,
     NativeWorkerExecutableExpectation, NativeWorkerRegistration, PROTOCOL_VERSION, ProviderFailure,
     WorkerCore, WorkerError, WorkerEventEnvelope, WorkerEventPayload, WorkerFrame, WorkerFrameBody,
-    WorkerHello, WorkerLifecycle, WorkerRequest,
+    WorkerHello, WorkerLifecycle, WorkerRequest, compile_native_worker_execute_call_v1,
 };
 use eliot_process::SessionId as ProcessSessionId;
 use eliot_process::{
@@ -740,7 +740,7 @@ fn valid_join(
         adapter_id: "adapter-test".to_owned(),
         adapter_revision: 3,
         config_digest: registration.worker_config_digest.clone(),
-        facet_manifest_ref: "facet-manifest-7".to_owned(),
+        facet_manifest_ref: load(eliot_contracts::native_worker_resource_facet_ref_v1()),
         capability_cell: load(eliot_contracts::CapabilityCellId::new("cell-test-1")),
         grant_graph_revision: 5,
         module_catalog_revision: 7,
@@ -1361,14 +1361,20 @@ fn stdio_frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
 }
 
 fn stdio_execute_frame() -> WorkerFrame {
+    let request = WorkerRequest {
+        attempt_id: load(AttemptId::new("attempt-1")),
+        capability: "inspect".to_owned(),
+        payload: BTreeMap::new(),
+        proposed_effect: None,
+    };
+    let cell = load(eliot_contracts::CapabilityCellId::new("cell-test-1"));
+    let facet_ref = load(eliot_contracts::native_worker_resource_facet_ref_v1());
+    let call = load(compile_native_worker_execute_call_v1(
+        &facet_ref, &cell, &request,
+    ));
     stdio_frame(
         "stdio-exec-1",
-        WorkerFrameBody::Execute(WorkerRequest {
-            attempt_id: load(AttemptId::new("attempt-stdio-exec-1")),
-            capability: "inspect".to_owned(),
-            payload: BTreeMap::new(),
-            proposed_effect: None,
-        }),
+        WorkerFrameBody::Execute(call),
     )
 }
 
