@@ -1555,6 +1555,8 @@ fn host_lifecycle_frozen_event(boundary: &'static HostLifecycleBoundary) -> &'st
 }
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
+#[cfg(windows)]
+pub use host_job_launch::ProfileSupervisorJob;
 pub use eliot_host_control_endpoint::{
     AcceptedOwnerMethod, BackupDispatchRefusal, HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner,
     HostBackupOwnerRegistration, HostRuntimeControl, HostRuntimeControlQueue,
@@ -1673,7 +1675,7 @@ use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
     HostOwnerLeaseReleaseError, ProtectedRootLease, ServiceAccount, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStopOutcome, TerminatedJobChild,
-    WindowsPlatform, fresh_kernel_activation_nonce,
+    UserOwnedRootLease, WindowsPlatform, fresh_kernel_activation_nonce,
 };
 #[cfg(windows)]
 use eliot_process::DispatchAuthorityId;
@@ -1763,8 +1765,8 @@ pub enum HostError {
 
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, UserOwnedRootLease,
-    WindowsAdapterError, observe_named_pipe_peer_process,
+    JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, WindowsAdapterError,
+    observe_named_pipe_peer_process,
 };
 
 // I16.10 (issue #1837): the last entry carries the installer-owned Watchdog
@@ -1773,7 +1775,7 @@ use eliot_platform_windows::{
 // `ELIOT_RUNTIME_STATE_ROOTS_DIGEST` as the receipt and ORS roots, so the
 // Kernel cannot receive a digest that does not cover the anchor sink.
 #[cfg(windows)]
-const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 8] = [
+const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 11] = [
     "ELIOT_KERNEL_CONTROL_PIPE",
     "ELIOT_HOST_PROCESS_ID",
     "ELIOT_HOST_PROCESS_START",
@@ -1782,6 +1784,9 @@ const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 8] = [
     "ELIOT_KERNEL_ORS_ROOT",
     "ELIOT_KERNEL_WATCHDOG_STATE_ROOT",
     "ELIOT_RUNTIME_STATE_ROOTS_DIGEST",
+    "ELIOT_INSTALLATION_PROFILE",
+    "ELIOT_PROFILE_ROOT_REQUEST",
+    "ELIOT_PROFILE_ROOT_SELECTION",
 ];
 
 #[cfg(windows)]
@@ -1792,7 +1797,7 @@ use phase_b_projection::{
     phase_b_build_authority_descriptor, phase_b_build_authority_descriptor_for_rebind,
     phase_b_credential_receipt_digest, phase_b_manifest_digest, phase_b_prepared_public_receipt,
     phase_b_public_receipt, phase_b_public_receipt_from_binding, phase_b_root_binding_digest,
-    phase_b_watchdog_selector_digest, validate_phase_b_credential_receipt,
+    phase_b_watchdog_selector_digest,
 };
 
 #[cfg(windows)]
@@ -4384,6 +4389,21 @@ impl HostJobBranches {
         // binding is rebuilt from the same installer-owned root rather than
         // left to a same-directory default.
         let watchdog_anchor_root = Self::watchdog_anchor_root(launch)?;
+        let profile_root_binding = if matches!(
+            launch.profile,
+            eliot_installation::InstallationProfile::UserMode
+                | eliot_installation::InstallationProfile::PortableDev
+        ) {
+            let request = host_job_launch::profile_root_request(launch)?;
+            let leases =
+                eliot_platform_windows::profile_supervision::open_profile_root_leases(&request)
+                    .map_err(|error| {
+                        HostError::ProcessContour(format!("reopen Kernel profile roots: {error}"))
+                    })?;
+            Some((request, leases))
+        } else {
+            None
+        };
         // T6-D2 front-door anchor (issue #461): the stored 22-value contour
         // gains the sealed digest-bound Doctor path so the relaunched Kernel
         // receives the exact 24-value launch options. Missing anchors fail
@@ -4414,6 +4434,10 @@ impl HostJobBranches {
                 watchdog_anchor_root,
                 &launch.runtime_state_roots.roots_digest,
             )),
+            Some(launch.profile),
+            profile_root_binding
+                .as_ref()
+                .map(|(request, leases)| (request, leases.selection())),
         )?;
         Ok(child)
     }
@@ -4521,6 +4545,8 @@ impl HostJobBranches {
             host,
             &launch.store_bridge_arguments,
             &store_working_directory,
+            None,
+            None,
             None,
             None,
         )?;
@@ -5317,6 +5343,16 @@ pub struct HostComposition {
     /// cached `registry` projection below is revision-keyed and rebuildable
     /// from these short-lived opens; it never creates authority or freshness.
     registry_host_root: PathBuf,
+    /// Exact current-user selection receipt loaded from the registry and
+    /// retained across epoch and registry reopen operations.
+    #[cfg(all(windows, not(test)))]
+    profile_selection_receipt:
+        Option<eliot_platform_windows::profile_supervision::ProfileSelectionReceipt>,
+    /// Retains the descriptor-bound UserMode/PortableDev I3.1 root handles
+    /// across the production Host composition. Unit tests use isolated registry
+    /// fixtures and omit this production-only lease set.
+    #[cfg(all(windows, not(test)))]
+    profile_root_leases: Option<eliot_platform_windows::profile_supervision::ProfileRootLeaseSet>,
     #[cfg(test)]
     test_registry_file: Option<PathBuf>,
     registry: ApprovedGenerationRegistry,
@@ -5536,19 +5572,65 @@ fn installation_registry_lock_contended(error: &InstallationError) -> bool {
 pub(crate) fn open_installation_registry_with_transient_retry(
     host_state_root: &Path,
 ) -> Result<Option<RedbInstallationRegistry>, HostError> {
+    open_installation_registry_with_transient_retry_for_profile(
+        host_state_root,
+        InstallationProfile::SystemService,
+        None,
+    )
+}
+
+/// Opens an existing registry under the lease contour selected by an explicit
+/// profile value. User profiles never fall through to the ProgramData-backed
+/// protected-root adapter.
+pub(crate) fn open_installation_registry_with_transient_retry_for_profile(
+    host_state_root: &Path,
+    profile: InstallationProfile,
+    profile_selection: Option<
+        &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    >,
+) -> Result<Option<RedbInstallationRegistry>, HostError> {
     let mut attempt = 0_u32;
     loop {
-        let root_lease = ProtectedRootLease::open_existing(host_state_root)
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        let canonical = root_lease
-            .canonical_path()
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        if canonical.as_path() != host_state_root {
-            return Err(HostError::ProcessContour(
-                "SCM Host state root is not the exact retained installation root".to_owned(),
-            ));
-        }
-        match RedbInstallationRegistry::open_existing_at(root_lease) {
+        let opened = match profile {
+            InstallationProfile::SystemService => {
+                let root_lease = ProtectedRootLease::open_existing(host_state_root)
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                let canonical = root_lease
+                    .canonical_path()
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                if !windows_paths_equal(&canonical, host_state_root) {
+                    return Err(HostError::ProcessContour(
+                        "SystemService Host root is not the exact retained installation root"
+                            .to_owned(),
+                    ));
+                }
+                RedbInstallationRegistry::open_existing_at(root_lease)
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let Some(profile_selection) = profile_selection else {
+                    return Err(HostError::ProcessContour(
+                        "current-user registry reopen requires the retained profile selection receipt"
+                            .to_owned(),
+                    ));
+                };
+                let root_lease = UserOwnedRootLease::open_existing(host_state_root)
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                let canonical = root_lease
+                    .canonical_path()
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                if !windows_paths_equal(&canonical, host_state_root) {
+                    return Err(HostError::ProcessContour(
+                        "current-user Host root is not the exact retained profile root".to_owned(),
+                    ));
+                }
+                RedbInstallationRegistry::open_existing_user_owned_at(
+                    root_lease,
+                    profile,
+                    profile_selection,
+                )
+            }
+        };
+        match opened {
             Ok(store) => return Ok(store),
             Err(error)
                 if installation_registry_lock_contended(&error)
@@ -5579,10 +5661,25 @@ pub(crate) fn open_installation_registry_with_transient_retry(
 pub(crate) fn open_registry_store_at(
     host_state_root: &Path,
 ) -> Result<RedbInstallationRegistry, HostError> {
-    open_installation_registry_with_transient_retry(host_state_root)?.ok_or_else(|| {
-        HostError::ProcessContour(
-            "SCM Host state root has no approved-generation registry".to_owned(),
-        )
+    open_registry_store_at_profile(host_state_root, InstallationProfile::SystemService, None)
+}
+
+pub(crate) fn open_registry_store_at_profile(
+    host_state_root: &Path,
+    profile: InstallationProfile,
+    profile_selection: Option<
+        &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    >,
+) -> Result<RedbInstallationRegistry, HostError> {
+    open_installation_registry_with_transient_retry_for_profile(
+        host_state_root,
+        profile,
+        profile_selection,
+    )?
+    .ok_or_else(|| {
+        HostError::ProcessContour(format!(
+            "{profile:?} Host root has no approved-generation registry"
+        ))
     })
 }
 
@@ -5895,7 +5992,31 @@ impl HostComposition {
             return RedbInstallationRegistry::open_test_support(path)
                 .map_err(HostError::Installation);
         }
-        open_registry_store_at(&self.registry_host_root)
+        let profile = self
+            .registry
+            .pending_activation()
+            .map(|pending| pending.manifest.runtime_launch.profile)
+            .or_else(|| {
+                self.registry
+                    .active()
+                    .map(|active| active.manifest.runtime_launch.profile)
+            })
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Host registry has no profile-bound active or pending manifest".to_owned(),
+                )
+            })?;
+        #[cfg(all(windows, not(test)))]
+        if let Some(leases) = self.profile_root_leases.as_ref() {
+            leases
+                .verify_stable_identity()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        }
+        #[cfg(all(windows, not(test)))]
+        let profile_selection = self.profile_selection_receipt.as_ref();
+        #[cfg(any(test, not(windows)))]
+        let profile_selection = None;
+        open_registry_store_at_profile(&self.registry_host_root, profile, profile_selection)
     }
 
     /// Prepares one isolated backup destination through registry-committed
@@ -6893,6 +7014,21 @@ impl HostComposition {
         reason = "Host reopen keeps the epoch, registry, and Phase-B crash-recovery ordering in one boundary"
     )]
     pub fn open(launch_options: HostLaunchOptions) -> Result<Self, HostError> {
+        Self::open_for_profile(launch_options, InstallationProfile::SystemService)
+    }
+
+    /// Opens Host only through the explicitly selected profile lease family.
+    /// The selector constrains the root adapter; the loaded manifest and its
+    /// complete descriptor-bound root set must independently agree before any
+    /// journal or child-process effect.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Host reopen keeps the profile, epoch, registry, and Phase-B crash-recovery ordering in one boundary"
+    )]
+    pub fn open_for_profile(
+        launch_options: HostLaunchOptions,
+        selected_profile: InstallationProfile,
+    ) -> Result<Self, HostError> {
         // F-LOG-HOST-1: request/admitted distinction; single terminal via
         // guard. Missing evidence suppresses `admitted`, never a new branch.
         host_lifecycle_observe_requested(BOUNDARY_OPEN_REQUESTED);
@@ -6907,29 +7043,72 @@ impl HostComposition {
         let installation = launch_options.installation().clone();
         let owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
         let host_state_root = launch_options.host_state_root().to_path_buf();
-        let root_lease = ProtectedRootLease::open_existing(&host_state_root)
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        let canonical_root = root_lease
-            .canonical_path()
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        if canonical_root != host_state_root {
-            return Err(HostError::ProcessContour(
-                "SCM Host state root is not the exact retained installation root".to_owned(),
-            ));
+        match selected_profile {
+            InstallationProfile::SystemService => {
+                let root_lease = ProtectedRootLease::open_existing(&host_state_root)
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                let canonical_root = root_lease
+                    .canonical_path()
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                if !windows_paths_equal(&canonical_root, &host_state_root) {
+                    return Err(HostError::ProcessContour(
+                        "SystemService Host root is not the exact retained installation root"
+                            .to_owned(),
+                    ));
+                }
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let root_lease = UserOwnedRootLease::open_existing(&host_state_root)
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                let canonical_root = root_lease
+                    .canonical_path()
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                if !windows_paths_equal(&canonical_root, &host_state_root) {
+                    return Err(HostError::ProcessContour(
+                        "current-user Host root is not the exact retained profile root".to_owned(),
+                    ));
+                }
+            }
         }
         // s37/#1339, A13.9: the installer staging writer is released before
         // the SCM start + convergence wait, so `DatabaseAlreadyOpen` here is
         // a short release race, not a held owner. Retry it with bounded
         // backoff; every other open failure still fails closed immediately.
-        // `root_lease` stays in this scope for the canonical-path proof;
-        // each attempt opens a fresh short-lived lease inside the helper.
-        // The handle below is short-lived (open-load-drop); Host retains only
-        // `host_state_root` and re-opens per CAS/readback.
-        let mut registry = {
-            let store = open_registry_store_at(&host_state_root)?;
-            let loaded = store.load()?;
-            drop(store);
-            loaded
+        // The current-user bootstrap read is deliberately read-only: it loads
+        // the original registry receipt before any writer reopen can require
+        // that receipt as its root-identity authority.
+        let mut registry = match selected_profile {
+            InstallationProfile::SystemService => {
+                let store = open_registry_store_at_profile(
+                    &host_state_root,
+                    selected_profile,
+                    None,
+                )?;
+                let loaded = store.load()?;
+                drop(store);
+                loaded
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let root_lease = UserOwnedRootLease::open_existing(&host_state_root)
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                let canonical_root = root_lease
+                    .canonical_path()
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                if !windows_paths_equal(&canonical_root, &host_state_root) {
+                    return Err(HostError::ProcessContour(
+                        "current-user Host root is not the exact retained profile root".to_owned(),
+                    ));
+                }
+                RedbInstallationRegistry::inspect_existing_user_owned_at(
+                    root_lease,
+                    selected_profile,
+                )?
+                .ok_or_else(|| {
+                    HostError::ProcessContour(format!(
+                        "{selected_profile:?} Host root has no approved-generation registry"
+                    ))
+                })?
+            }
         };
         let pending_for_reopen = registry.pending_activation().cloned();
         Self::validate_launch_options_for_registry(
@@ -6937,17 +7116,65 @@ impl HostComposition {
             &registry,
             pending_for_reopen.as_ref(),
         )?;
+        let startup_manifest = pending_for_reopen
+            .as_ref()
+            .map(|pending| &pending.manifest)
+            .or_else(|| registry.active().map(|generation| &generation.manifest))
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Host launch authority has no approved generation".to_owned(),
+                )
+            })?;
+        startup_manifest
+            .runtime_launch
+            .validate()
+            .map_err(HostError::Installation)?;
+        if startup_manifest.runtime_launch.profile != selected_profile {
+            return Err(HostError::ProcessContour(format!(
+                "selected {selected_profile:?} lease mode does not match the approved {:?} profile",
+                startup_manifest.runtime_launch.profile
+            )));
+        }
+        #[cfg(windows)]
+        let profile_root_leases = match selected_profile {
+            InstallationProfile::SystemService => None,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let request =
+                    host_job_launch::profile_root_request(&startup_manifest.runtime_launch)?;
+                Some(
+                    eliot_platform_windows::profile_supervision::open_profile_root_leases(&request)
+                        .map_err(|error| {
+                            HostError::ProcessContour(format!(
+                                "selected profile roots could not be retained: {error}"
+                            ))
+                        })?,
+                )
+            }
+        };
+        #[cfg(windows)]
+        let original_profile_selection = if let Some(leases) = profile_root_leases.as_ref() {
+            let original = registry
+                .profile_selection_receipt_for_generation(&startup_manifest.generation)
+                .map_err(HostError::Installation)?
+                .clone();
+            if !eliot_installation::profile_selection_receipts_match_retained_roots(
+                &original,
+                leases.selection(),
+            )
+            .map_err(HostError::Installation)?
+            {
+                return Err(HostError::RecoveryRequired(
+                    "profile root identities changed since installation".to_owned(),
+                ));
+            }
+            Some(original)
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let original_profile_selection = None;
         #[cfg(windows)]
         {
-            let startup_manifest = pending_for_reopen
-                .as_ref()
-                .map(|pending| &pending.manifest)
-                .or_else(|| registry.active().map(|generation| &generation.manifest))
-                .ok_or_else(|| {
-                    HostError::ProcessContour(
-                        "SCM launch authority has no approved generation".to_owned(),
-                    )
-                })?;
             verify_current_host_artifact(startup_manifest)?;
         }
         if let Some(pending) = pending_for_reopen.as_ref()
@@ -6964,6 +7191,7 @@ impl HostComposition {
                 &host_state_root,
                 &mut registry,
                 &host_capability,
+                original_profile_selection.as_ref(),
                 pending,
                 reason,
             )?;
@@ -6993,6 +7221,12 @@ impl HostComposition {
                 Vec::new()
             }
         };
+        #[cfg(windows)]
+        if let Some(leases) = profile_root_leases.as_ref() {
+            leases
+                .verify_stable_identity()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        }
         let journal_path = host_state_root.join(HOST_JOURNAL_FILE_NAME);
         let (
             journal,
@@ -7004,10 +7238,18 @@ impl HostComposition {
         ) = open_production_epoch(
             &journal_path,
             installation,
+            selected_profile,
+            original_profile_selection.as_ref(),
             pending_for_reopen.as_ref(),
             registry.active_phase_b_rebind(),
             &durable_store_recovery_fences,
         )?;
+        #[cfg(windows)]
+        if let Some(leases) = profile_root_leases.as_ref() {
+            leases
+                .verify_stable_identity()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        }
         #[cfg(windows)]
         let jobs = if store_recovery_startup_fence.is_fenced() {
             HostJobBranches::new_fenced(&host)
@@ -7015,11 +7257,17 @@ impl HostComposition {
             HostJobBranches::new(&host)
         }
         .map_err(|error| HostError::Platform(error.to_string()))?;
+        #[cfg(all(windows, test))]
+        let _ = &profile_root_leases;
         let mut composition = Self {
             store_rebind_boundary: HostStoreRebindProductionBoundary,
             runtime_control_boundary: HostRuntimeControlProductionBoundary,
             journal,
             registry_host_root: host_state_root,
+            #[cfg(all(windows, not(test)))]
+            profile_selection_receipt: original_profile_selection,
+            #[cfg(all(windows, not(test)))]
+            profile_root_leases,
             #[cfg(test)]
             test_registry_file: None,
             registry,
@@ -7226,12 +7474,12 @@ impl HostComposition {
     }
 
     /// Creates the credential control only from this live Host composition's
-    /// owner lease.  Callers receive an opaque authenticated server handle;
-    /// the raw `LocalService` Credential Manager provider is not public.
+    /// owner lease and selected launch. Callers receive an opaque authenticated
+    /// server handle; the raw Credential Manager provider is not public.
     ///
     /// # Errors
     ///
-    /// Returns an error if the live Host owner capability or protected state
+    /// Returns an error if the live Host owner capability or selected state
     /// root cannot be admitted.
     #[cfg(windows)]
     pub fn credential_control(&self) -> Result<HostCredentialControl, HostError> {
@@ -7239,14 +7487,43 @@ impl HostComposition {
         // values/env/payloads. Single terminal via guard.
         host_lifecycle_observe_scm(BOUNDARY_CREDENTIAL_CONTROL_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_CREDENTIAL_CONTROL_TERMINAL);
-        let capability = self
-            .owner_lease
-            .credential_mutation_capability()
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        let control = HostCredentialControl::new(
+        let (launch, expected_transaction_id, expected_plan_digest) =
+            if let Some(pending) = self.registry.pending_activation() {
+                (
+                    pending.manifest.runtime_launch.clone(),
+                    pending.transaction_id.clone(),
+                    pending.plan_digest.clone(),
+                )
+            } else if let Some(active) = self.registry.active() {
+                (
+                    active.manifest.runtime_launch.clone(),
+                    active.approval.transaction_id().clone(),
+                    active.approval.installer_plan_digest().clone(),
+                )
+            } else {
+                return Err(HostError::RecoveryRequired(
+                    "credential control has no selected approved generation".to_owned(),
+                ));
+            };
+        let capability = match launch.profile {
+            InstallationProfile::SystemService => Some(
+                self.owner_lease
+                    .credential_mutation_capability()
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+            ),
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => None,
+        };
+        let selected_roots = self
+            .profile_root_leases
+            .as_ref()
+            .map(|roots| roots.selection().clone());
+        let control = HostCredentialControl::new_for_profile(
             self.host.clone(),
-            self.launch_options.host_state_root().to_path_buf(),
+            launch,
+            selected_roots,
             capability,
+            expected_transaction_id,
+            expected_plan_digest,
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         )
         .map_err(HostError::Platform)?;
@@ -7294,7 +7571,11 @@ impl HostComposition {
                     "Phase-B handoff requires the exact pending activation".to_owned(),
                 )
             })?;
-            validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)?;
+            self.validate_phase_b_credential_receipt_for_profile(
+                credential_receipt,
+                &pending.manifest,
+                intent,
+            )?;
             let manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
             let expected_static_template = phase_b_static_template_for_candidate(&pending.manifest)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -7440,7 +7721,11 @@ impl HostComposition {
                     "FinalizePhaseB requires the exact pending activation".to_owned(),
                 )
             })?;
-            validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)?;
+            self.validate_phase_b_credential_receipt_for_profile(
+                credential_receipt,
+                &pending.manifest,
+                intent,
+            )?;
             let prepared = pending.phase_b_prepared_receipt.as_ref().ok_or_else(|| {
                 HostError::RecoveryRequired(
                     "FinalizePhaseB has no durable prepared receipt".to_owned(),
@@ -7561,7 +7846,12 @@ impl HostComposition {
             && let Some(receipt) = pending.phase_b_prepared_receipt.as_ref()
             && pending.phase_b_receipt.is_none()
             && intent.validate().is_ok()
-            && validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)
+            && self
+                .validate_phase_b_credential_receipt_for_profile(
+                    credential_receipt,
+                    &pending.manifest,
+                    intent,
+                )
                 .is_ok()
             && receipt.validate().is_ok()
             && receipt.transaction_id == intent.transaction_id
@@ -7648,7 +7938,11 @@ impl HostComposition {
             let manifest_digest = phase_b_manifest_digest(&manifest)?;
             let expected_static_template = phase_b_static_template_for_candidate(&manifest)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            validate_phase_b_credential_receipt(credential_receipt, &manifest, intent)?;
+            self.validate_phase_b_credential_receipt_for_profile(
+                credential_receipt,
+                &manifest,
+                intent,
+            )?;
             let live_process_identity = if committed_binding.is_none()
                 && pending_receipt.is_none()
                 && pending_intent.is_none()
@@ -9620,10 +9914,15 @@ impl HostComposition {
         // value is identical.
         let host_capability = self.owner_lease.activation_capability();
         let registry_root = self.registry_host_root.clone();
+        #[cfg(not(test))]
+        let profile_selection = self.profile_selection_receipt.as_ref();
+        #[cfg(test)]
+        let profile_selection = None;
         persist_pending_recovery(
             &registry_root,
             &mut self.registry,
             &host_capability,
+            profile_selection,
             pending,
             reason,
         )

@@ -11,14 +11,21 @@
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
+#[cfg(windows)]
+use eliot_installation::InstallationProfile;
 use eliot_kernel::AuthorityDescriptorContour;
 #[cfg(windows)]
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{EliotdLaunchDescriptor, HostStoreBootstrapRequirement};
 #[cfg(windows)]
+use eliot_platform_windows::profile_supervision::{
+    ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
+    open_profile_root_leases,
+};
+#[cfg(windows)]
 use eliot_platform_windows::{
-    NamedPipePeerProcessBinding, ProtectedRuntimePathLease, UserOwnedPathLease, UserOwnedRootLease,
-    observe_named_pipe_peer_process,
+    FileIdentity, NamedPipePeerProcessBinding, ProtectedRuntimePathLease, UserOwnedPathLease,
+    UserOwnedRootLease, observe_named_pipe_peer_process, windows_paths_equal,
 };
 
 #[cfg(windows)]
@@ -40,12 +47,15 @@ pub(crate) struct KernelStartupBinding {
     generation_config_digest: String,
     pub(crate) installation_id: String,
     pub(crate) approved_generation: String,
+    installation_profile: String,
+    profile_root_request: Option<ProfileRootRequest>,
+    profile_root_selection: Option<ProfileSelectionReceipt>,
 }
 
 #[cfg(windows)]
 impl KernelStartupBinding {
     pub(crate) fn from_environment() -> Result<Self, String> {
-        Self::parse(
+        let mut binding = Self::parse(
             std::env::var("ELIOT_KERNEL_CONTROL_PIPE").ok(),
             std::env::var("ELIOT_HOST_PROCESS_ID").ok(),
             std::env::var("ELIOT_HOST_PROCESS_START").ok(),
@@ -57,7 +67,44 @@ impl KernelStartupBinding {
             std::env::var("ELIOT_GENERATION_CONFIG_DIGEST").ok(),
             std::env::var("ELIOT_HOST_INSTALLATION").ok(),
             std::env::var("ELIOT_APPROVED_GENERATION").ok(),
-        )
+        )?;
+        binding.installation_profile =
+            std::env::var("ELIOT_INSTALLATION_PROFILE").map_err(|_| {
+                "Host launch context did not inject the installation profile".to_owned()
+            })?;
+        match binding.installation_profile.as_str() {
+            "system_service" => {
+                if std::env::var_os("ELIOT_PROFILE_ROOT_REQUEST").is_some()
+                    || std::env::var_os("ELIOT_PROFILE_ROOT_SELECTION").is_some()
+                {
+                    return Err(
+                        "SystemService launch received current-user root authority".to_owned()
+                    );
+                }
+            }
+            "user_mode" | "portable_dev" => {
+                let request = std::env::var("ELIOT_PROFILE_ROOT_REQUEST").map_err(|_| {
+                    "Host launch context omitted the profile root request".to_owned()
+                })?;
+                let selection = std::env::var("ELIOT_PROFILE_ROOT_SELECTION").map_err(|_| {
+                    "Host launch context omitted the retained profile selection".to_owned()
+                })?;
+                binding.profile_root_request =
+                    Some(serde_json::from_str(&request).map_err(|error| {
+                        format!("Host launch profile root request is invalid: {error}")
+                    })?);
+                binding.profile_root_selection =
+                    Some(serde_json::from_str(&selection).map_err(|error| {
+                        format!("Host launch profile root selection is invalid: {error}")
+                    })?);
+            }
+            _ => {
+                return Err(
+                    "Host launch context injected an unknown installation profile".to_owned(),
+                );
+            }
+        }
+        Ok(binding)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -161,6 +208,9 @@ impl KernelStartupBinding {
             generation_config_digest,
             installation_id,
             approved_generation,
+            installation_profile: String::new(),
+            profile_root_request: None,
+            profile_root_selection: None,
         })
     }
 
@@ -182,6 +232,189 @@ impl KernelStartupBinding {
             && self.host_process_start == start_time_100ns
             && self.host_process_image == image_path
     }
+
+    pub(crate) fn supervision_profile_binding(
+        &self,
+        retained_roots: Option<&ProfileRootLeaseSet>,
+    ) -> Result<(InstallationProfile, Option<(PathBuf, FileIdentity)>), String> {
+        match self.installation_profile.as_str() {
+            "system_service" => {
+                if self.profile_root_request.is_some()
+                    || self.profile_root_selection.is_some()
+                    || retained_roots.is_some()
+                {
+                    return Err(
+                        "SystemService launch received current-user profile roots".to_owned()
+                    );
+                }
+                Ok((InstallationProfile::SystemService, None))
+            }
+            "user_mode" => {
+                let request = self.profile_root_request.as_ref().ok_or_else(|| {
+                    "UserMode launch omitted its retained profile root request".to_owned()
+                })?;
+                let selection = self.profile_root_selection.as_ref().ok_or_else(|| {
+                    "UserMode launch omitted its retained profile selection".to_owned()
+                })?;
+                let retained = retained_roots.ok_or_else(|| {
+                    "UserMode launch omitted its retained profile root leases".to_owned()
+                })?;
+                if request.profile != ProfileSelection::UserMode
+                    || selection.profile != ProfileSelection::UserMode
+                    || retained.selection() != selection
+                {
+                    return Err("UserMode retained profile root identity changed".to_owned());
+                }
+                if request.repository_root.is_some() {
+                    return Err("UserMode launch received a PortableDev repository root".to_owned());
+                }
+                Ok((InstallationProfile::UserMode, None))
+            }
+            "portable_dev" => {
+                let request = self.profile_root_request.as_ref().ok_or_else(|| {
+                    "PortableDev launch omitted its retained profile root request".to_owned()
+                })?;
+                let repository_root = request.repository_root.clone().ok_or_else(|| {
+                    "PortableDev launch omitted the descriptor repository root".to_owned()
+                })?;
+                let selection = self.profile_root_selection.as_ref().ok_or_else(|| {
+                    "PortableDev launch omitted the retained profile selection".to_owned()
+                })?;
+                let retained = retained_roots.ok_or_else(|| {
+                    "PortableDev launch omitted its retained profile root leases".to_owned()
+                })?;
+                if request.profile != ProfileSelection::PortableDev
+                    || selection.profile != ProfileSelection::PortableDev
+                    || retained.selection() != selection
+                {
+                    return Err("PortableDev retained profile selection changed".to_owned());
+                }
+                let retained_selection = retained.selection();
+                let mut profile_anchors = retained_selection.roots.iter().filter(|observation| {
+                    observation.role == "runtime_state_roots.profile_anchor_root"
+                });
+                let profile_anchor = profile_anchors.next().ok_or_else(|| {
+                    "PortableDev retained profile selection omitted its repository identity"
+                        .to_owned()
+                })?;
+                if profile_anchors.next().is_some() {
+                    return Err(
+                        "PortableDev retained profile selection duplicated its repository identity"
+                            .to_owned(),
+                    );
+                }
+                if !repository_root.is_absolute()
+                    || !windows_paths_equal(&repository_root, &profile_anchor.canonical_path)
+                    || repository_root.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::CurDir | std::path::Component::ParentDir
+                        )
+                    })
+                {
+                    return Err(
+                        "PortableDev descriptor repository root is not canonical".to_owned()
+                    );
+                }
+                Ok((
+                    InstallationProfile::PortableDev,
+                    Some((repository_root, profile_anchor.identity)),
+                ))
+            }
+            _ => Err("Kernel launch profile is unsupported".to_owned()),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn retain_profile_root_binding(
+    options: &KernelLaunchOptions,
+    binding: &KernelStartupBinding,
+) -> Result<Option<ProfileRootLeaseSet>, String> {
+    let expected_profile = match binding.installation_profile.as_str() {
+        "system_service" => {
+            if binding.profile_root_request.is_some() || binding.profile_root_selection.is_some() {
+                return Err("SystemService launch received current-user root authority".to_owned());
+            }
+            return Ok(None);
+        }
+        "user_mode" => ProfileSelection::UserMode,
+        "portable_dev" => ProfileSelection::PortableDev,
+        _ => return Err("Kernel launch profile is unsupported".to_owned()),
+    };
+    let request = binding
+        .profile_root_request
+        .as_ref()
+        .ok_or_else(|| "Kernel launch omitted the profile root request".to_owned())?;
+    let expected_selection = binding
+        .profile_root_selection
+        .as_ref()
+        .ok_or_else(|| "Kernel launch omitted the retained profile selection".to_owned())?;
+    if request.profile != expected_profile
+        || expected_selection.profile != expected_profile
+        || request.installation_id != binding.installation_id
+        || request.generation != binding.approved_generation
+        || request.authority_descriptor_sha256 != options.authority_sha256
+        || request.authority_generation == 0
+        || !windows_paths_equal(
+            &request.authority_descriptor_path,
+            &options.authority_descriptor,
+        )
+    {
+        return Err("profile root request diverges from the admitted Kernel generation".to_owned());
+    }
+
+    let retained = open_profile_root_leases(request)
+        .map_err(|error| format!("reopen profile root identities: {error}"))?;
+    if retained.selection() != expected_selection {
+        return Err("retained profile root identities changed after Host selection".to_owned());
+    }
+    let runtime_root = |role: &str| -> Result<&Path, String> {
+        let mut matches = request
+            .roots
+            .runtime_state_roots
+            .iter()
+            .filter(|(observed_role, _)| observed_role == role);
+        let path = matches
+            .next()
+            .map(|(_, path)| path.as_path())
+            .ok_or_else(|| format!("profile root request omitted runtime role {role}"))?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "profile root request duplicated runtime role {role}"
+            ));
+        }
+        Ok(path)
+    };
+    for (role, injected) in [
+        ("runtime_state_roots.host_state_root", &binding.receipt_root),
+        (
+            "runtime_state_roots.kernel_ors_root",
+            &binding.kernel_ors_root,
+        ),
+        ("runtime_state_roots.kernel_work_root", &options.work_root),
+        (
+            "runtime_state_roots.watchdog_state_root",
+            &binding.watchdog_state_root,
+        ),
+    ] {
+        if !windows_paths_equal(runtime_root(role)?, injected) {
+            return Err(format!(
+                "injected Kernel path does not match retained role {role}"
+            ));
+        }
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable_parent = executable
+        .parent()
+        .ok_or_else(|| "Kernel executable has no immutable root parent".to_owned())?;
+    if !windows_paths_equal(executable_parent, &request.roots.immutable_binaries) {
+        return Err("Kernel executable is outside its retained immutable binaries root".to_owned());
+    }
+    retained.verify_stable_identity().map_err(|error| {
+        format!("profile root identity changed before Kernel admission: {error}")
+    })?;
+    Ok(Some(retained))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

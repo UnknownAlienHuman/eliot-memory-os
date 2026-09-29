@@ -21,7 +21,11 @@ use super::{
     HostStoreBootstrapRequirement, PathBuf,
 };
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
+#[cfg(windows)]
+use eliot_installation::InstallationProfile;
 use eliot_observability_runtime::RuntimeProfile;
+#[cfg(windows)]
+use eliot_platform_windows::FileIdentity;
 
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +86,14 @@ pub struct KernelConfig {
     /// signer is fabricated by the production composition.
     #[cfg(windows)]
     pub supervision_lease_authority: Option<SupervisionLeaseAuthorityConfig>,
+    /// Exact profile selected by the protected Host launch descriptor. A
+    /// supervision key reference is admitted only when its variant matches.
+    #[cfg(windows)]
+    pub(super) supervision_installation_profile: Option<InstallationProfile>,
+    /// Descriptor-retained repository root used only for `PortableDev` keys.
+    /// It is never inferred from the current directory or environment.
+    #[cfg(windows)]
+    pub(super) portable_dev_repository_root: Option<(PathBuf, FileIdentity)>,
     /// Host-owned Watchdog-failure-domain directory receiving the periodic
     /// audit digest anchors (issue #1837; I16.10). `None` keeps the default
     /// sink below the Kernel work root; the sink is always exactly one
@@ -136,6 +148,10 @@ impl KernelConfig {
             agent_bridge_admission: None,
             #[cfg(windows)]
             supervision_lease_authority: None,
+            #[cfg(windows)]
+            supervision_installation_profile: None,
+            #[cfg(windows)]
+            portable_dev_repository_root: None,
             audit_anchor_binding: None,
             metrics_listen: None,
             audit_spool_binding: None,
@@ -278,6 +294,21 @@ impl KernelConfig {
         authority: SupervisionLeaseAuthorityConfig,
     ) -> Self {
         self.supervision_lease_authority = Some(authority);
+        self
+    }
+
+    /// Injects the exact profile and optional repository root retained from
+    /// the Host-approved launch descriptor. `PortableDev` requires the root;
+    /// other profiles reject one during authority composition.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn with_supervision_installation_profile(
+        mut self,
+        profile: InstallationProfile,
+        portable_dev_repository_root: Option<(PathBuf, FileIdentity)>,
+    ) -> Self {
+        self.supervision_installation_profile = Some(profile);
+        self.portable_dev_repository_root = portable_dev_repository_root;
         self
     }
 

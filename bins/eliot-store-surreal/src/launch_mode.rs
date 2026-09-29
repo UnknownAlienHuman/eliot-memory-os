@@ -30,11 +30,16 @@ use eliot_protocol::{
 #[cfg(windows)]
 use eliot_store_surreal::{
     SERVICE_NAME, StoreComposition, StoreLaunchConfig, load_config, load_portable_dev_config,
+    load_user_mode_config,
 };
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum LaunchMode {
     Protected {
+        config_path: PathBuf,
+    },
+    UserMode {
+        root: PathBuf,
         config_path: PathBuf,
     },
     PortableDev {
@@ -67,14 +72,37 @@ pub(super) enum LaunchMode {
     },
 }
 
+pub(super) struct PreparedLaunch {
+    pub config: StoreLaunchConfig,
+    pub user_mode_root_lease: Option<eliot_platform_windows::UserOwnedRootLease>,
+}
+
 #[cfg(windows)]
 #[allow(clippy::print_stdout)]
-pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunchConfig>, String> {
+pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<PreparedLaunch>, String> {
     match mode {
         LaunchMode::EmitBootstrapDescriptor { .. } => {
             Err("descriptor emission must be handled before Store composition launch".to_owned())
         }
-        LaunchMode::Protected { config_path } => load_config(Some(&config_path)).map(Some),
+        LaunchMode::Protected { config_path } => {
+            let config = load_config(Some(&config_path))?;
+            if config.runtime_launch.profile
+                != eliot_installation::InstallationProfile::SystemService
+            {
+                return Err("protected --config launch requires SystemService profile".to_owned());
+            }
+            Ok(Some(PreparedLaunch {
+                config,
+                user_mode_root_lease: None,
+            }))
+        }
+        LaunchMode::UserMode { root, config_path } => {
+            let (root_lease, config) = resolve_user_mode_config(&root, config_path)?;
+            Ok(Some(PreparedLaunch {
+                config,
+                user_mode_root_lease: Some(root_lease),
+            }))
+        }
         LaunchMode::PortableDev {
             root,
             config_path,
@@ -90,8 +118,11 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
                 // maintenance verdict refuses the mode with the exact report:
                 // maintenance authority never migrates an unqualified
                 // generation.
-                super::require_writer_admission(&config)?;
                 let composition = StoreComposition::new(&config)?;
+                let _root_use = composition
+                    .retain_roots_for_use()
+                    .map_err(|error| format!("revalidate Store roots: {error}"))?;
+                super::require_writer_admission(&config)?;
                 composition.connect().await?;
                 // Bind the recorded decision to the connected provider's live
                 // identity before allowing the migration to mutate its schema.
@@ -116,7 +147,10 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
                 );
                 return Ok(None);
             }
-            Ok(Some(config))
+            Ok(Some(PreparedLaunch {
+                config,
+                user_mode_root_lease: None,
+            }))
         }
         LaunchMode::ExportEcxf {
             root,
@@ -136,8 +170,11 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
             // after it connects. Without the identity binding the recorded
             // `source_adapter_version` of an archive would describe a binary
             // nobody verified.
-            super::require_writer_admission(&config)?;
             let composition = StoreComposition::new(&config)?;
+            let _root_use = composition
+                .retain_roots_for_use()
+                .map_err(|error| format!("revalidate Store roots: {error}"))?;
+            super::require_writer_admission(&config)?;
             composition.connect().await?;
             super::require_writer_admission(&config)?;
             super::bind_observed_identity(&composition, &config)?;
@@ -184,6 +221,34 @@ fn resolve_portable_dev_config(
         root.path().join(config_path)
     };
     let config = load_portable_dev_config(&root, &config_path)?;
+    if config.runtime_launch.profile != eliot_installation::InstallationProfile::PortableDev {
+        return Err("portable-dev launch config does not select PortableDev profile".to_owned());
+    }
+    Ok((root, config))
+}
+
+/// Resolves an explicit `UserMode` immutable-binaries root lease and loads its
+/// materialized Store config through a no-follow file lease. The loaded
+/// descriptor must bind the same root in its I3.1 profile selection.
+#[cfg(windows)]
+fn resolve_user_mode_config(
+    root: &std::path::Path,
+    config_path: PathBuf,
+) -> Result<
+    (
+        eliot_platform_windows::UserOwnedRootLease,
+        StoreLaunchConfig,
+    ),
+    String,
+> {
+    let root = eliot_platform_windows::UserOwnedRootLease::open_existing(root)
+        .map_err(|error| format!("open UserMode immutable-binaries root: {error}"))?;
+    let config_path = if config_path.is_absolute() {
+        config_path
+    } else {
+        root.path().join(config_path)
+    };
+    let config = load_user_mode_config(&root, &config_path)?;
     Ok((root, config))
 }
 
@@ -224,6 +289,7 @@ fn read_portable_dev_clock(config: &StoreLaunchConfig) -> Result<ClockObservatio
 /// Supported launch forms are deliberately closed:
 ///
 /// - `eliot-store-surreal --config <protected .json or .toml path>`
+/// - `eliot-store-surreal --user-mode-root <absolute existing immutable-binaries root> --config <path>`
 /// - `eliot-store-surreal --emit-bootstrap-descriptor <config path> <descriptor path>`
 /// - `eliot-store-surreal --portable-dev-root <absolute existing root> --config <path>`
 /// - `eliot-store-surreal --portable-dev-root <absolute existing root> --config <path> --initialize-schema-only`
@@ -258,6 +324,28 @@ where
             }),
             _ => Err("--config requires exactly one path".to_owned()),
         },
+        Some(value) if value == "--user-mode-root" => {
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--user-mode-root requires one root path".to_owned())?;
+            if !root.is_absolute() {
+                return Err("--user-mode-root requires an absolute root path".to_owned());
+            }
+            if args.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
+                return Err(
+                    "UserMode launch requires --config immediately after the root".to_owned(),
+                );
+            }
+            let config_path = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--config requires exactly one path".to_owned())?;
+            if args.next().is_some() {
+                return Err("UserMode launch accepts exactly one config path".to_owned());
+            }
+            Ok(LaunchMode::UserMode { root, config_path })
+        }
         Some(value) if value == "--portable-dev-root" => {
             let root = args
                 .next()

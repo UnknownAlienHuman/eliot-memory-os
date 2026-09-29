@@ -17,8 +17,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::super::{
-    InstallationError, PlatformHandle, ResourceGeneration, SUPERVISION_AUTHORITY_HOST_SERVICE,
-    SUPERVISION_AUTHORITY_SERVICE_SID_TYPE, approved_path, handle, handles,
+    InstallationError, InstallationProfile, InstallationRoots, PlatformHandle, ResourceGeneration,
+    SUPERVISION_AUTHORITY_HOST_SERVICE, SUPERVISION_AUTHORITY_SERVICE_SID_TYPE, approved_path,
+    handle, handles,
 };
 
 /// A planned immutable change to an OS registration, file or plugin surface.
@@ -169,5 +170,97 @@ impl SupervisionAuthorityProvisionPlan {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
+    }
+}
+
+/// Immutable `UserMode` supervision authority plan. Unlike the service-SID
+/// plan above, the signing key is scoped to one current-user Credential
+/// Manager target derived from this transaction/effect and the exact profile
+/// roots; no SCM identity, `ProgramData` path, or installer-root HMAC key is
+/// admitted by this contract.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeSupervisionAuthorityProvisionPlan {
+    /// Installation transaction that owns this planned key write.
+    pub transaction_id: PlatformHandle,
+    /// Exact planned effect identity included in the current-user key target.
+    pub effect_id: PlatformHandle,
+    /// Installation identity pinned into the supervision trust anchor.
+    pub installation_id: PlatformHandle,
+    /// Exact candidate generation that owns the key.
+    pub candidate_generation: PlatformHandle,
+    /// Authority lifecycle generation.
+    pub authority_generation: ResourceGeneration,
+    /// Stable lease identity selected in the immutable candidate descriptor.
+    pub supervision_lease_scope_id: PlatformHandle,
+    /// Exact Kernel signer identity.
+    pub signer_id: PlatformHandle,
+    /// Generation-specific external key identity.
+    pub key_id: PlatformHandle,
+    /// Exact current-user Credential Manager target resolved from the
+    /// transaction, effect and owner SID before the immutable plan is sealed.
+    pub target: PlatformHandle,
+    /// Current-user SID observed while the plan was admitted.
+    pub owner_sid: PlatformHandle,
+    /// Complete I3.1 `UserMode` path binding, including all digest-bound runtime
+    /// roots. The effect executor reopens these roots and retains their
+    /// current-user no-follow identities before key access.
+    pub profile_roots: InstallationRoots,
+}
+
+impl UserModeSupervisionAuthorityProvisionPlan {
+    pub(super) fn validate(&self) -> Result<(), InstallationError> {
+        for (value, field) in [
+            (&self.transaction_id, "user_mode_supervision.transaction_id"),
+            (&self.effect_id, "user_mode_supervision.effect_id"),
+            (
+                &self.installation_id,
+                "user_mode_supervision.installation_id",
+            ),
+            (
+                &self.candidate_generation,
+                "user_mode_supervision.candidate_generation",
+            ),
+            (
+                &self.supervision_lease_scope_id,
+                "user_mode_supervision.supervision_lease_scope_id",
+            ),
+            (&self.signer_id, "user_mode_supervision.signer_id"),
+            (&self.key_id, "user_mode_supervision.key_id"),
+            (&self.target, "user_mode_supervision.target"),
+            (&self.owner_sid, "user_mode_supervision.owner_sid"),
+        ] {
+            handle(value, field)?;
+        }
+        if self.authority_generation.value() == 0 {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.signer_id.as_str() != "eliot-kernel"
+            || self.key_id.as_str()
+                != format!("eliot-supervision-key:v1:{}", self.candidate_generation)
+            || !self.owner_sid.as_str().starts_with("S-")
+            || self.owner_sid.as_str().chars().any(char::is_control)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let suffix = self
+            .target
+            .as_str()
+            .strip_prefix("eliot/supervision-authority/user-mode/v1/")
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "user_mode_supervision.target".to_owned(),
+                reason: "must use the UserMode supervision authority target".to_owned(),
+            })?;
+        if suffix.len() != 64
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(InstallationError::InvalidField {
+                field: "user_mode_supervision.target".to_owned(),
+                reason: "must contain the exact lowercase target digest".to_owned(),
+            });
+        }
+        self.profile_roots.validate(InstallationProfile::UserMode)
     }
 }

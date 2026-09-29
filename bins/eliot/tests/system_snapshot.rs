@@ -10,11 +10,12 @@ use std::{
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_installation::{
     CandidateManifest, GenerationPackagePlanInput, GenerationPackagePlanner,
-    INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch, InstallationProfile,
-    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
-    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
-    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
-    SupervisionAuthorityBinding, UserOwnedRootLease, parse_installation_transaction_id,
+    INSTALLATION_ROOT_BINDING_VERSION, INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch,
+    InstallationProfile, InstallationRoots, InstallationTransaction, InstallerAclPrincipal,
+    InstallerEffectPlan, ManagedEnvironmentAction, ManagedEnvironmentChangeRequest,
+    PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange, ResourceGeneration,
+    RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, SupervisionAuthorityBinding,
+    UserOwnedRootLease, parse_installation_transaction_id,
 };
 #[cfg(windows)]
 use eliot_platform_windows::{
@@ -701,9 +702,37 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         lineage_id: fixture_handle("lineage:cli-positive"),
         sequence: 1,
     };
-    let generation = fixture_handle("generation:cli-positive");
+    let generation = fixture_handle("generation-cli-positive");
     let mut runtime_launch = RuntimeLaunchDescriptor {
         profile: InstallationProfile::PortableDev,
+        profile_component: fixture_handle("eliot"),
+        profile_version: fixture_handle("test-version"),
+        profile_installation_key: None,
+        profile_governed_roots: InstallationRoots {
+            binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: root
+                .join("target")
+                .join("eliot-dev")
+                .join(generation.as_str())
+                .to_string_lossy()
+                .into_owned(),
+            durable_data: root
+                .join(".eliot-dev")
+                .join("state")
+                .to_string_lossy()
+                .into_owned(),
+            user_config: root
+                .join(".eliot-dev")
+                .join("config")
+                .to_string_lossy()
+                .into_owned(),
+            user_cache: root
+                .join(".eliot-dev")
+                .join("cache")
+                .to_string_lossy()
+                .into_owned(),
+            runtime_state_roots: runtime_state_roots.clone(),
+        },
         portable_root: Some(portable_root.clone()),
         installation_epoch: installation_epoch.clone(),
         generation: generation.clone(),

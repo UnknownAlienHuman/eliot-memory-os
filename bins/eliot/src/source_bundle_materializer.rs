@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -11,11 +11,11 @@ use eliot_installation::{
     AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan,
     GenerationPackagePlanner, InstallationEpoch, InstallationError, InstallationProfile,
     InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
-    PlatformHandle, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
-    RuntimeStateRoots, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
-    SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
-    SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
-    agent_bridge_source_plan_from_observed_kernel,
+    PlatformHandle, ProfileSelectionInput, ProfileSelectionResolution,
+    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
+    SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION, SourceBundlePublicationJournal,
+    SourceBundlePublicationJournalState, SourceBundlePublicationRole, StateFence,
+    SupervisionAuthorityBinding, agent_bridge_source_plan_from_observed_kernel,
     provider_bootstrap_credential_target_for_store_target, source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
@@ -108,12 +108,9 @@ pub struct CanarySourceBundleMaterializeInput {
     pub generation: PlatformHandle,
     /// Installation lineage used by the typed launch contracts.
     pub installation_epoch: InstallationEpoch,
-    /// Explicit installation profile.
-    pub profile: InstallationProfile,
-    /// OS-validated profile anchor supplied by the caller.
-    pub profile_anchor_root: PlatformHandle,
-    /// Lowercase installation key for profiled roots.
-    pub installation_key: Option<PlatformHandle>,
+    /// Complete explicit I3.1 selection, including OS-proved anchors, versioned
+    /// component identity, retained runtime anchor, and protected write paths.
+    pub profile_selection: ProfileSelectionInput,
     /// Stable transaction identity used by the planner's launch-template
     /// derivation.
     pub transaction_id: PlatformHandle,
@@ -174,6 +171,8 @@ pub struct CanarySourceBundleReceipt {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
+    /// Exact I3.1 root binding retained by publication and Generate.
+    pub profile_governed_roots: eliot_installation::InstallationRoots,
     /// Full fourteen-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Exact role inventory, identities and byte facts.
@@ -182,17 +181,25 @@ pub struct CanarySourceBundleReceipt {
     pub source_identity: FileIdentity,
     /// Exact directory create-new publication receipt.
     pub directory_publication: DirectoryPublicationReceipt,
+    /// Canonical path of the profile anchor selected before source writes.
+    pub selected_profile_anchor_path: String,
+    /// Object identity of the retained profile anchor handle selected before
+    /// source writes.
+    pub selected_profile_anchor_identity: FileIdentity,
 }
 
 /// The non-wire proof handed directly to the generation planner.  It carries
-/// only the exact published root identity, ordered fourteen-role byte facts and
-/// full evidence digest; the planner independently reopens and observes the
-/// path before accepting these facts.
+/// the exact published root identity, the selected profile-anchor object,
+/// ordered fourteen-role byte facts, and full evidence digest; the planner
+/// independently reopens and observes the source path before accepting these
+/// facts.
 #[derive(Clone, Debug)]
 pub(crate) struct SourceBundlePublicationBinding {
     pub source_identity: FileIdentity,
     pub files: Vec<PackageArtifactDigest>,
     pub evidence_digest: PlatformHandle,
+    pub profile_governed_roots: eliot_installation::InstallationRoots,
+    pub retained_profile_anchor: eliot_installation::RetainedProfileAnchor,
 }
 
 impl CanarySourceBundleReceipt {
@@ -202,6 +209,17 @@ impl CanarySourceBundleReceipt {
         if self.files.len() != REQUIRED_ROLES.len()
             || self.source_identity != self.directory_publication.source_identity
             || self.source_identity != self.directory_publication.destination_identity
+            || self.selected_profile_anchor_identity.volume_serial_number == 0
+            || self.selected_profile_anchor_identity.file_index == 0
+            || !eliot_platform_windows::windows_paths_equal(
+                Path::new(&self.selected_profile_anchor_path),
+                Path::new(
+                    self.profile_governed_roots
+                        .runtime_state_roots
+                        .profile_anchor_root
+                        .as_str(),
+                ),
+            )
         {
             return Err(MaterializeError::Invalid(
                 "published source receipt is not an exact fourteen-role directory publication"
@@ -228,10 +246,21 @@ impl CanarySourceBundleReceipt {
             PlatformHandle::new(self.evidence_digest.clone()).map_err(|error| {
                 MaterializeError::Contract(format!("source evidence digest: {error}"))
             })?;
+        let canonical_path = PlatformHandle::new(self.selected_profile_anchor_path.clone())
+            .map_err(|error| {
+                MaterializeError::Contract(format!(
+                    "selected profile anchor path: {error}"
+                ))
+            })?;
         Ok(SourceBundlePublicationBinding {
             source_identity: self.source_identity,
             files,
             evidence_digest,
+            profile_governed_roots: self.profile_governed_roots.clone(),
+            retained_profile_anchor: eliot_installation::RetainedProfileAnchor {
+                canonical_path,
+                identity: self.selected_profile_anchor_identity,
+            },
         })
     }
 }
@@ -260,6 +289,8 @@ pub struct CanarySourceBundleReconciliation {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
+    /// Exact I3.1 root binding retained by the durable publication journal.
+    pub profile_governed_roots: eliot_installation::InstallationRoots,
     /// Full fourteen-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Complete role facts measured before the atomic commit.
@@ -270,6 +301,11 @@ pub struct CanarySourceBundleReconciliation {
     pub reason: CanarySourceBundleReconciliationReason,
     /// Non-authoritative bounded diagnostic for operator triage.
     pub diagnostic: String,
+    /// Canonical path of the profile anchor selected before source writes.
+    pub selected_profile_anchor_path: String,
+    /// Object identity of the retained profile anchor handle selected before
+    /// source writes.
+    pub selected_profile_anchor_identity: FileIdentity,
 }
 
 /// Result of attempting one immutable source-bundle materialization.
@@ -327,6 +363,104 @@ impl From<MaterializeError> for InstallationError {
     }
 }
 
+/// Evidence retained from the profile-anchor object chosen before source
+/// materialization. The caller keeps `handle` alive until the complete
+/// staging/reconcile/publish operation returns.
+#[derive(Clone, Debug)]
+struct SelectedProfileAnchor<'a> {
+    canonical_path: PathBuf,
+    identity: FileIdentity,
+    handle: &'a File,
+}
+
+impl<'a> SelectedProfileAnchor<'a> {
+    fn retain(
+        input: &CanarySourceBundleMaterializeInput,
+        selection: &ProfileSelectionResolution,
+        handle: &'a File,
+        expected_identity: FileIdentity,
+    ) -> Result<Self, MaterializeError> {
+        if expected_identity.volume_serial_number == 0 || expected_identity.file_index == 0 {
+            return Err(MaterializeError::Invalid(
+                "selected profile anchor identity is zero".to_owned(),
+            ));
+        }
+        let handle_identity = eliot_platform_windows::file_identity_for_open_handle(handle)
+            .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+        if handle_identity != expected_identity {
+            return Err(MaterializeError::Invalid(
+                "retained profile anchor handle differs from the selected identity".to_owned(),
+            ));
+        }
+
+        let input_path = canonical_windows_path(Path::new(
+            input.profile_selection.profile_anchor_root.as_str(),
+        ))
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+        let resolved_path = canonical_windows_path(Path::new(
+            selection
+                .roots
+                .runtime_state_roots
+                .profile_anchor_root
+                .as_str(),
+        ))
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+        if !eliot_platform_windows::windows_paths_equal(&input_path, &resolved_path) {
+            return Err(MaterializeError::Invalid(
+                "resolved profile anchor path differs from the selected input".to_owned(),
+            ));
+        }
+        let (path_identity, _path_handle) = open_no_follow_directory(&input_path)
+            .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+        if path_identity != expected_identity {
+            return Err(MaterializeError::Invalid(
+                "selected profile anchor path names a different directory object".to_owned(),
+            ));
+        }
+
+        let anchor = Self {
+            canonical_path: input_path,
+            identity: expected_identity,
+            handle,
+        };
+        anchor.revalidate()?;
+        Ok(anchor)
+    }
+
+    /// Rechecks the original open object and its selected canonical path at a
+    /// source mutation boundary. The no-follow path probe rejects a replaced
+    /// root while the retained handle proves which object was originally
+    /// selected.
+    fn revalidate(&self) -> Result<(), MaterializeError> {
+        let handle_identity = eliot_platform_windows::file_identity_for_open_handle(self.handle)
+            .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+        if handle_identity != self.identity {
+            return Err(MaterializeError::Invalid(
+                "retained profile anchor object identity changed".to_owned(),
+            ));
+        }
+        let current_path = canonical_windows_path(&self.canonical_path)
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+        if !eliot_platform_windows::windows_paths_equal(&self.canonical_path, &current_path) {
+            return Err(MaterializeError::Invalid(
+                "selected profile anchor path changed during materialization".to_owned(),
+            ));
+        }
+        let (path_identity, _path_handle) = open_no_follow_directory(&self.canonical_path)
+            .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+        if path_identity != self.identity {
+            return Err(MaterializeError::Invalid(
+                "selected profile anchor path now names another directory object".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn path_string(&self) -> String {
+        self.canonical_path.to_string_lossy().into_owned()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ValidatedExecutable {
     name: &'static str,
@@ -350,6 +484,7 @@ struct TypedBundle {
     expected: Vec<PackageArtifactDigest>,
     manifest: PackageManifest,
     evidence_digest: PlatformHandle,
+    profile_governed_roots: eliot_installation::InstallationRoots,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -506,33 +641,6 @@ fn validate_role_inventory(roles: &[(&str, bool)]) -> Result<(), MaterializeErro
     Ok(())
 }
 
-fn derive_runtime_roots(
-    profile: InstallationProfile,
-    profile_anchor_root: &PlatformHandle,
-    installation_key: Option<&PlatformHandle>,
-) -> Result<RuntimeStateRoots, MaterializeError> {
-    match profile {
-        InstallationProfile::PortableDev => {
-            if installation_key.is_some() {
-                return Err(MaterializeError::Invalid(
-                    "portable_dev must not provide installation_key".to_owned(),
-                ));
-            }
-            RuntimeStateRoots::derive_portable(profile_anchor_root.clone())
-                .map_err(|error| MaterializeError::Contract(error.to_string()))
-        }
-        InstallationProfile::SystemService | InstallationProfile::UserMode => {
-            let key = installation_key.ok_or_else(|| {
-                MaterializeError::Invalid(
-                    "profiled installation requires installation_key".to_owned(),
-                )
-            })?;
-            RuntimeStateRoots::derive_profiled(profile, profile_anchor_root.clone(), key.as_str())
-                .map_err(|error| MaterializeError::Contract(error.to_string()))
-        }
-    }
-}
-
 fn make_digest(value: String, field: &str) -> Result<PlatformHandle, MaterializeError> {
     PlatformHandle::new(value)
         .map_err(|error| MaterializeError::Contract(format!("{field}: {error}")))
@@ -586,6 +694,61 @@ fn validate_store_config_bytes(
         ));
     }
     Ok(config)
+}
+
+fn validate_materializer_selection(
+    input: &CanarySourceBundleMaterializeInput,
+    selection: &ProfileSelectionResolution,
+) -> Result<(), MaterializeError> {
+    let profile = input.profile_selection.profile;
+    selection
+        .roots
+        .validate(profile)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    selection
+        .roots
+        .validate_source_bundle_root(input.profile_selection.source_root.as_str())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    validate_absolute(&input.output_bundle, "output_bundle")?;
+    validate_absolute(&input.store_path, "store_path")?;
+    validate_absolute(Path::new(input.staging_root.as_str()), "staging_root")?;
+    selection
+        .roots
+        .admits_write_target(input.output_bundle.to_string_lossy().as_ref())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    selection
+        .roots
+        .admits_write_target(input.store_path.to_string_lossy().as_ref())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    selection
+        .roots
+        .admits_write_target(input.staging_root.as_str())
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let governance_roots = &selection.governance.roots;
+    if selection.governance.profile != profile
+        || governance_roots.immutable_binaries != selection.roots.immutable_binaries
+        || governance_roots.durable_data != selection.roots.durable_data
+        || governance_roots.user_config != selection.roots.user_config
+        || governance_roots.user_cache != selection.roots.user_cache
+        || selection.roots.runtime_state_roots.profile_anchor_root
+            != input.profile_selection.profile_anchor_root
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(input.staging_root.as_str()),
+            Path::new(input.profile_selection.staging_root.as_str()),
+        )
+        || (input.profile_selection.profile == InstallationProfile::PortableDev
+            && input.profile_selection.generation.as_deref() != Some(input.generation.as_str()))
+        || !eliot_platform_windows::windows_paths_equal(
+            &input.output_bundle,
+            Path::new(input.profile_selection.source_root.as_str()),
+        )
+    {
+        return Err(MaterializeError::Invalid(
+            "resolved profile binding, generation, or publication path differs from the materializer selection"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn governor_bytes(
@@ -710,17 +873,30 @@ pub(crate) fn bridge_source_plan_for_receipt(
     clippy::too_many_lines,
     reason = "the typed bundle seam keeps all launch and evidence bindings auditable"
 )]
+#[cfg(test)]
 fn build_typed_bundle(
     input: &CanarySourceBundleMaterializeInput,
     executables: &[ValidatedExecutable],
 ) -> Result<TypedBundle, MaterializeError> {
-    let roots = derive_runtime_roots(
-        input.profile,
-        &input.profile_anchor_root,
-        input.installation_key.as_ref(),
-    )?;
-    let generation_root = Path::new(input.staging_root.as_str()).join(input.generation.as_str());
-    let role_path = |role: &str| handle_path(&generation_root.join(role), "staging destination");
+    let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    build_typed_bundle_with_selection(input, executables, &selection)
+}
+
+fn build_typed_bundle_with_selection(
+    input: &CanarySourceBundleMaterializeInput,
+    executables: &[ValidatedExecutable],
+    selection: &ProfileSelectionResolution,
+) -> Result<TypedBundle, MaterializeError> {
+    let roots = selection.roots.runtime_state_roots.clone();
+    let profile = selection.governance.profile;
+    let immutable_generation_root = Path::new(&selection.roots.immutable_binaries);
+    let role_path = |role: &str| {
+        handle_path(
+            &immutable_generation_root.join(role),
+            "profile-governed immutable destination",
+        )
+    };
     let host_path = role_path("eliot-host.exe")?;
     let watchdog_path = role_path("eliot-watchdog.exe")?;
     let store_bridge_path = role_path("eliot-store-surreal.exe")?;
@@ -836,10 +1012,14 @@ fn build_typed_bundle(
         "--eliotd-descriptor-sha256".to_owned(),
         "0".repeat(64),
     ])?;
-    let store_bridge_arguments = match input.profile {
+    let store_bridge_arguments = match profile {
         InstallationProfile::PortableDev => make_args([
             "--portable-dev-root".to_owned(),
-            input.profile_anchor_root.as_str().to_owned(),
+            input
+                .profile_selection
+                .profile_anchor_root
+                .as_str()
+                .to_owned(),
             "--config".to_owned(),
             config_path.as_str().to_owned(),
         ])?,
@@ -915,9 +1095,15 @@ fn build_typed_bundle(
     ))
     .map_err(|error| MaterializeError::Contract(format!("supervision scope id: {error}")))?;
     let runtime_launch = RuntimeLaunchDescriptor {
-        profile: input.profile,
-        portable_root: (input.profile == InstallationProfile::PortableDev)
-            .then(|| input.profile_anchor_root.clone()),
+        profile,
+        profile_component: PlatformHandle::new(input.profile_selection.component.clone())
+            .map_err(|error| MaterializeError::Contract(error.to_string()))?,
+        profile_version: PlatformHandle::new(input.profile_selection.version.clone())
+            .map_err(|error| MaterializeError::Contract(error.to_string()))?,
+        profile_installation_key: input.profile_selection.installation_key.clone(),
+        profile_governed_roots: selection.roots.clone(),
+        portable_root: (profile == InstallationProfile::PortableDev)
+            .then(|| input.profile_selection.profile_anchor_root.clone()),
         installation_epoch: input.installation_epoch.clone(),
         generation: input.generation.clone(),
         authority_generation,
@@ -1078,6 +1264,7 @@ fn build_typed_bundle(
         expected,
         manifest,
         evidence_digest,
+        profile_governed_roots: selection.roots.clone(),
     })
 }
 
@@ -1290,6 +1477,7 @@ fn typed_bundle_from_journal(
 
 fn reconcile_journal_destination(
     journal: &SourceBundlePublicationJournal,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> Result<Option<CanarySourceBundleReceipt>, MaterializeError> {
     let (manifest, expected, precommit_files) = typed_bundle_from_journal(journal)?;
     let destination = &journal.output_bundle;
@@ -1366,13 +1554,17 @@ fn reconcile_journal_destination(
             "published bundle directory receipt differs from the durable journal".to_owned(),
         ));
     }
+    selected_profile_anchor.revalidate()?;
     Ok(Some(CanarySourceBundleReceipt {
         bundle_path: destination.to_string_lossy().into_owned(),
         generation: journal.generation.as_str().to_owned(),
+        profile_governed_roots: journal.profile_governed_roots.clone(),
         evidence_digest: journal.evidence_digest.as_str().to_owned(),
         files,
         source_identity: journal.source_identity,
         directory_publication,
+        selected_profile_anchor_path: selected_profile_anchor.path_string(),
+        selected_profile_anchor_identity: selected_profile_anchor.identity,
     }))
 }
 
@@ -1380,10 +1572,12 @@ fn journal_unknown_outcome(
     journal: &SourceBundlePublicationJournal,
     precommit_files: Vec<MaterializedRolePrecommitReceipt>,
     diagnostic: String,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> CanarySourceBundleMaterializeOutcome {
     CanarySourceBundleMaterializeOutcome::CommittedUnknown(CanarySourceBundleReconciliation {
         bundle_path: journal.output_bundle.to_string_lossy().into_owned(),
         generation: journal.generation.as_str().to_owned(),
+        profile_governed_roots: journal.profile_governed_roots.clone(),
         evidence_digest: journal.evidence_digest.as_str().to_owned(),
         precommit_files,
         directory_publication: DirectoryPublicationOutcome::CommittedUnknown(
@@ -1400,6 +1594,8 @@ fn journal_unknown_outcome(
         ),
         reason: CanarySourceBundleReconciliationReason::DirectoryPublicationUnknown,
         diagnostic,
+        selected_profile_anchor_path: selected_profile_anchor.path_string(),
+        selected_profile_anchor_identity: selected_profile_anchor.identity,
     })
 }
 
@@ -1408,7 +1604,9 @@ fn persist_unknown_publication(
     journal: &SourceBundlePublicationJournal,
     precommit_files: Vec<MaterializedRolePrecommitReceipt>,
     diagnostic: impl AsRef<str>,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+    selected_profile_anchor.revalidate()?;
     let diagnostic = diagnostic.as_ref().chars().take(1024).collect::<String>();
     let unknown = SourceBundlePublicationJournal {
         state: SourceBundlePublicationJournalState::CommittedUnknown,
@@ -1431,17 +1629,19 @@ fn persist_unknown_publication(
         &recorded,
         precommit_files,
         diagnostic,
+        selected_profile_anchor,
     ))
 }
 
 fn load_verified_published_receipt(
     store: &RedbInstallationTransactionStore,
     operation_id: &PlatformHandle,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> Result<CanarySourceBundleReceipt, MaterializeError> {
     let journal = store
         .load_verified_published_source_bundle_publication(operation_id)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    reconcile_journal_destination(&journal)?.ok_or_else(|| {
+    reconcile_journal_destination(&journal, selected_profile_anchor)?.ok_or_else(|| {
         MaterializeError::Invalid(
             "durable Published journal has no exact verified destination".to_owned(),
         )
@@ -1486,7 +1686,9 @@ fn resume_intent_publication(
     store: &RedbInstallationTransactionStore,
     journal: &SourceBundlePublicationJournal,
     precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+    selected_profile_anchor.revalidate()?;
     let publication = match OwnedDirectoryPublication::resume(
         &journal.output_bundle,
         &journal.temporary_path,
@@ -1501,6 +1703,7 @@ fn resume_intent_publication(
                 journal,
                 precommit_files,
                 format!("recorded temporary publication cannot be resumed: {error}"),
+                selected_profile_anchor,
             );
         }
     };
@@ -1517,8 +1720,10 @@ fn resume_intent_publication(
             journal,
             precommit_files,
             format!("recorded temporary publication readback rejected: {error}"),
+            selected_profile_anchor,
         );
     }
+    selected_profile_anchor.revalidate()?;
     let directory_publication = match publication.publish(journal.source_identity) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -1527,11 +1732,13 @@ fn resume_intent_publication(
                 journal,
                 precommit_files,
                 format!("recorded temporary publication move was not authorized: {error}"),
+                selected_profile_anchor,
             );
         }
     };
     match directory_publication {
         DirectoryPublicationOutcome::Published(receipt) => {
+            selected_profile_anchor.revalidate()?;
             let published = SourceBundlePublicationJournal {
                 state: SourceBundlePublicationJournalState::Published,
                 destination_identity: Some(receipt.destination_identity),
@@ -1549,10 +1756,15 @@ fn resume_intent_publication(
                         format!(
                             "published destination failed durable authority verification: {error}"
                         ),
+                        selected_profile_anchor,
                     );
                 }
             };
-            let receipt = load_verified_published_receipt(store, &recorded.operation_id)?;
+            let receipt = load_verified_published_receipt(
+                store,
+                &recorded.operation_id,
+                selected_profile_anchor,
+            )?;
             Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
         }
         DirectoryPublicationOutcome::CommittedUnknown(receipt) => persist_unknown_publication(
@@ -1563,15 +1775,20 @@ fn resume_intent_publication(
                 "recorded temporary publication committed with unknown outcome: {:?}",
                 receipt.reason
             ),
+            selected_profile_anchor,
         ),
     }
 }
 
 fn reconcile_existing_publication(
     input: &CanarySourceBundleMaterializeInput,
+    selection: &ProfileSelectionResolution,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> Result<Option<CanarySourceBundleMaterializeOutcome>, MaterializeError> {
+    validate_materializer_selection(input, selection)?;
     validate_absolute(&input.output_bundle, "output_bundle")?;
     validate_absolute(&input.store_path, "store_path")?;
+    selected_profile_anchor.revalidate()?;
     let operation_id = source_bundle_publication_operation_id(
         &input.transaction_id,
         &input.output_bundle,
@@ -1598,6 +1815,12 @@ fn reconcile_existing_publication(
     };
     if journal.transaction_id != input.transaction_id
         || journal.generation != input.generation
+        || journal.profile_governed_roots != selection.roots
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(journal.selected_profile_anchor_path.as_str()),
+            &selected_profile_anchor.canonical_path,
+        )
+        || journal.selected_profile_anchor_identity != selected_profile_anchor.identity
         || !eliot_platform_windows::windows_paths_equal(
             &journal.output_bundle,
             &input.output_bundle,
@@ -1610,10 +1833,10 @@ fn reconcile_existing_publication(
     let precommit_files = precommit_from_journal(&journal.precommit_files);
     if journal.state == SourceBundlePublicationJournalState::Published {
         return Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
-            load_verified_published_receipt(&store, &operation_id)?,
+            load_verified_published_receipt(&store, &operation_id, selected_profile_anchor)?,
         )));
     }
-    match reconcile_journal_destination(&journal) {
+    match reconcile_journal_destination(&journal, selected_profile_anchor) {
         Ok(Some(receipt)) => {
             let updated = SourceBundlePublicationJournal {
                 state: SourceBundlePublicationJournalState::Published,
@@ -1622,6 +1845,7 @@ fn reconcile_existing_publication(
                 diagnostic: None,
                 ..journal.clone()
             };
+            selected_profile_anchor.revalidate()?;
             let recorded = match store.record_source_bundle_publication(&updated) {
                 Ok(recorded) => recorded,
                 Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
@@ -1632,6 +1856,7 @@ fn reconcile_existing_publication(
                         format!(
                             "reconciled destination failed durable authority verification: {error}"
                         ),
+                        selected_profile_anchor,
                     )?));
                 }
                 Err(error) => {
@@ -1641,20 +1866,26 @@ fn reconcile_existing_publication(
                         format!(
                             "unknown destination failed durable authority verification: {error}"
                         ),
+                        selected_profile_anchor,
                     )));
                 }
             };
             Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
-                load_verified_published_receipt(&store, &recorded.operation_id)?,
+                load_verified_published_receipt(
+                    &store,
+                    &recorded.operation_id,
+                    selected_profile_anchor,
+                )?,
             )))
         }
         Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => Ok(Some(
-            resume_intent_publication(&store, &journal, precommit_files)?,
+            resume_intent_publication(&store, &journal, precommit_files, selected_profile_anchor)?,
         )),
         Ok(None) => Ok(Some(journal_unknown_outcome(
             &journal,
             precommit_files,
             "durable publication journal exists but its destination is absent".to_owned(),
+            selected_profile_anchor,
         ))),
         Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
             Ok(Some(persist_unknown_publication(
@@ -1662,12 +1893,14 @@ fn reconcile_existing_publication(
                 &journal,
                 precommit_files,
                 format!("durable publication reconciliation rejected: {error}"),
+                selected_profile_anchor,
             )?))
         }
         Err(error) => Ok(Some(journal_unknown_outcome(
             &journal,
             precommit_files,
             format!("durable publication reconciliation rejected: {error}"),
+            selected_profile_anchor,
         ))),
     }
 }
@@ -1676,18 +1909,54 @@ fn reconcile_existing_publication(
     clippy::too_many_lines,
     reason = "publication keeps validation, immutable writes, readback and receipt binding together"
 )]
+#[cfg(test)]
 fn materialize_with_executables(
     input: &CanarySourceBundleMaterializeInput,
     executables: &[ValidatedExecutable],
     stop_after_durable_intent: bool,
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+    let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let (anchor_identity, anchor_handle) = open_no_follow_directory(Path::new(
+        input.profile_selection.profile_anchor_root.as_str(),
+    ))
+    .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    let selected_profile_anchor = SelectedProfileAnchor::retain(
+        input,
+        &selection,
+        &anchor_handle,
+        anchor_identity,
+    )?;
+    materialize_with_resolved_selection(
+        input,
+        executables,
+        stop_after_durable_intent,
+        &selection,
+        &selected_profile_anchor,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "publication keeps validation, immutable writes, readback and receipt binding together"
+)]
+fn materialize_with_resolved_selection(
+    input: &CanarySourceBundleMaterializeInput,
+    executables: &[ValidatedExecutable],
+    stop_after_durable_intent: bool,
+    selection: &ProfileSelectionResolution,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
+) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
     validate_role_inventory(&REQUIRED_ROLES)?;
     validate_absolute(&input.output_bundle, "output_bundle")?;
     validate_absolute(
-        Path::new(input.profile_anchor_root.as_str()),
+        Path::new(input.profile_selection.profile_anchor_root.as_str()),
         "profile_anchor_root",
     )?;
-    validate_absolute(Path::new(input.staging_root.as_str()), "staging_root")?;
+    validate_absolute(
+        Path::new(input.profile_selection.staging_root.as_str()),
+        "staging_root",
+    )?;
     validate_absolute(&input.store_path, "store_path")?;
     validate_package_relative_path(Path::new(input.generation.as_str()))
         .map_err(|error| MaterializeError::Invalid(format!("generation: {error}")))?;
@@ -1708,14 +1977,19 @@ fn materialize_with_executables(
         ));
     }
 
-    let typed = build_typed_bundle(input, executables)?;
+    validate_materializer_selection(input, selection)?;
+    selected_profile_anchor.revalidate()?;
+    let typed = build_typed_bundle_with_selection(input, executables, selection)?;
+    selected_profile_anchor.revalidate()?;
     let publication = OwnedDirectoryPublication::create(&input.output_bundle)
         .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    selected_profile_anchor.revalidate()?;
     let temp = publication.temporary_path().to_path_buf();
     let mut source_identities = BTreeMap::<String, FileIdentity>::new();
     for (role, executable) in REQUIRED_ROLES {
         let bytes = role_bytes(role, executables, &typed.json_roles)?;
         let destination = temp.join(role);
+        selected_profile_anchor.revalidate()?;
         write_create_new(&destination, bytes)?;
         let identity =
             eliot_platform_windows::file_identity_for_path(&destination).map_err(|error| {
@@ -1744,6 +2018,7 @@ fn materialize_with_executables(
             }
         }
     }
+    selected_profile_anchor.revalidate()?;
     sync_directory(&temp).map_err(|error| MaterializeError::RecoveryRequired {
         operation: input.transaction_id.as_str().to_owned(),
         stage: InstallationRecoveryStage::ParentSync,
@@ -1840,6 +2115,14 @@ fn materialize_with_executables(
         temporary_name: publication.temporary_name().to_owned(),
         parent_identity: publication.parent_identity(),
         generation: input.generation.clone(),
+        profile_governed_roots: typed.profile_governed_roots.clone(),
+        selected_profile_anchor_path: PlatformHandle::new(
+            selected_profile_anchor.path_string(),
+        )
+        .map_err(|error| {
+            MaterializeError::Contract(format!("selected profile anchor path: {error}"))
+        })?,
+        selected_profile_anchor_identity: selected_profile_anchor.identity,
         manifest_digest: PlatformHandle::new(typed.manifest.canonical_digest())
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
         evidence_digest: typed.evidence_digest.clone(),
@@ -1858,6 +2141,7 @@ fn materialize_with_executables(
     // complete journal-bound tree. The move is then performed by a second
     // exact identity-bound resume, never by an unjournaled creator handle.
     drop(publication);
+    selected_profile_anchor.revalidate()?;
     let existing_journal =
         RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
             &input.store_path,
@@ -1873,25 +2157,67 @@ fn materialize_with_executables(
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     match existing_journal.state {
         SourceBundlePublicationJournalState::Intent => {
-            resume_intent_publication(&store, &existing_journal, precommit_files)
+            resume_intent_publication(
+                &store,
+                &existing_journal,
+                precommit_files,
+                selected_profile_anchor,
+            )
         }
         SourceBundlePublicationJournalState::Published => {
-            let receipt = load_verified_published_receipt(&store, &existing_journal.operation_id)?;
+            let receipt = load_verified_published_receipt(
+                &store,
+                &existing_journal.operation_id,
+                selected_profile_anchor,
+            )?;
             Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
         }
         SourceBundlePublicationJournalState::CommittedUnknown => Ok(journal_unknown_outcome(
             &existing_journal,
             precommit_files,
             "durable publication journal requires exact destination reconciliation".to_owned(),
+            selected_profile_anchor,
         )),
     }
 }
 
 /// Materialize one exact fourteen-role Phase-A source bundle.
-pub fn materialize_canary_source_bundle(
+#[cfg(all(test, windows))]
+fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
-    if let Some(existing) = reconcile_existing_publication(input).map_err(to_installation_error)? {
+    let (anchor_identity, anchor_handle) = open_no_follow_directory(Path::new(
+        input.profile_selection.profile_anchor_root.as_str(),
+    ))
+    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    materialize_canary_source_bundle_with_retained_profile_anchor(
+        input,
+        &anchor_handle,
+        anchor_identity,
+    )
+}
+
+/// Materialize one exact fourteen-role Phase-A source bundle while preserving
+/// the selected profile-anchor object from the caller's pre-write selection
+/// through reconciliation, staging, durable intent, and publication.
+pub fn materialize_canary_source_bundle_with_retained_profile_anchor(
+    input: &CanarySourceBundleMaterializeInput,
+    selected_profile_anchor_handle: &File,
+    selected_profile_anchor_identity: FileIdentity,
+) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
+    let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)?;
+    validate_materializer_selection(input, &selection).map_err(to_installation_error)?;
+    let selected_profile_anchor = SelectedProfileAnchor::retain(
+        input,
+        &selection,
+        selected_profile_anchor_handle,
+        selected_profile_anchor_identity,
+    )
+    .map_err(to_installation_error)?;
+    if let Some(existing) =
+        reconcile_existing_publication(input, &selection, &selected_profile_anchor)
+            .map_err(to_installation_error)?
+    {
         return Ok(existing);
     }
     let executable_inputs = [
@@ -1917,7 +2243,14 @@ pub fn materialize_canary_source_bundle(
         .into_iter()
         .map(|(path, role)| validate_executable(&path, role).map_err(to_installation_error))
         .collect::<Result<Vec<_>, _>>()?;
-    materialize_with_executables(input, &executables, false).map_err(to_installation_error)
+    materialize_with_resolved_selection(
+        input,
+        &executables,
+        false,
+        &selection,
+        &selected_profile_anchor,
+    )
+    .map_err(to_installation_error)
 }
 
 #[cfg(test)]
@@ -1929,8 +2262,8 @@ pub fn materialize_canary_source_bundle(
 mod tests {
     use super::*;
     use eliot_installation::{
-        GenerationPackagePlanInput, InstallationTransactionStore, RedbInstallationTransactionStore,
-        validate_installation_transaction_json,
+        GenerationPackagePlanInput, InstallationTransactionStore, ProfileRootAnchors,
+        RedbInstallationTransactionStore, validate_installation_transaction_json,
     };
     use tempfile::TempDir;
 
@@ -2016,6 +2349,15 @@ mod tests {
         // this disposable fixture with the existing installer helper instead
         // of weakening that ACL contract for tests.
         UserOwnedRootLease::open_existing(anchor.path()).unwrap();
+        let output_bundle = source_parent.path().join("bundle");
+        let staging_root = staging.path().join("staging");
+        let profile_anchor_root = handle(anchor.path().to_string_lossy().into_owned());
+        let local_app_data = handle(
+            eliot_platform_windows::current_user_local_app_data_root()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
         CanarySourceBundleMaterializeInput {
             eliot_host_exe: PathBuf::new(),
             eliot_watchdog_exe: PathBuf::new(),
@@ -2030,7 +2372,7 @@ mod tests {
             eliot_notify_exe: PathBuf::new(),
             agent_bridge_exe: None,
             agent_bridge_account: None,
-            output_bundle: source_parent.path().join("bundle"),
+            output_bundle: output_bundle.clone(),
             store_path: source_parent.path().join("transaction.redb"),
             generation: handle("generation-test"),
             installation_epoch: InstallationEpoch {
@@ -2038,17 +2380,23 @@ mod tests {
                 lineage_id: handle("lineage-test"),
                 sequence: 1,
             },
-            profile: InstallationProfile::PortableDev,
-            profile_anchor_root: handle(anchor.path().to_string_lossy().into_owned()),
-            installation_key: None,
+            profile_selection: ProfileSelectionInput {
+                profile: InstallationProfile::PortableDev,
+                anchors: ProfileRootAnchors {
+                    program_files: None,
+                    program_data: None,
+                    local_app_data,
+                    repository_root: Some(profile_anchor_root.clone()),
+                },
+                profile_anchor_root,
+                installation_key: None,
+                component: "eliot".to_owned(),
+                version: "dev".to_owned(),
+                generation: Some("generation-test".to_owned()),
+                source_root: handle(output_bundle.to_string_lossy().into_owned()),
+                staging_root: handle(staging_root.to_string_lossy().into_owned()),
+            },
             transaction_id: handle("transaction:test"),
-            staging_root: handle(
-                staging
-                    .path()
-                    .join("staging")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
         }
     }
 
@@ -2146,12 +2494,12 @@ mod tests {
         GenerationPackagePlanInput {
             transaction_id: input.transaction_id.clone(),
             installation_epoch: input.installation_epoch.clone(),
-            profile: input.profile,
-            profile_anchor_root: input.profile_anchor_root.clone(),
+            profile: input.profile_selection.profile,
+            profile_anchor_root: input.profile_selection.profile_anchor_root.clone(),
             installation_key: None,
             generation: input.generation.clone(),
             source_root: handle(output_bundle.to_string_lossy().into_owned()),
-            staging_root: input.staging_root.clone(),
+            staging_root: input.profile_selection.staging_root.clone(),
             minimum_store_available_bytes: 1,
             recovery_command: handle("eliot recover --transaction-id transaction:test"),
             agent_bridge_source: None,
@@ -2206,20 +2554,22 @@ mod tests {
         );
         let output_bundle = PathBuf::from(&receipt.bundle_path);
         let binding = receipt.planner_binding().unwrap();
-        let transaction = GenerationPackagePlanner::plan_with_source_publication_binding(
+        let transaction = GenerationPackagePlanner::plan_with_published_profile_binding(
             GenerationPackagePlanInput {
                 transaction_id: input.transaction_id.clone(),
                 installation_epoch: input.installation_epoch.clone(),
-                profile: input.profile,
-                profile_anchor_root: input.profile_anchor_root.clone(),
+                profile: input.profile_selection.profile,
+                profile_anchor_root: input.profile_selection.profile_anchor_root.clone(),
                 installation_key: None,
                 generation: input.generation.clone(),
                 source_root: handle(output_bundle.to_string_lossy().into_owned()),
-                staging_root: input.staging_root.clone(),
+                staging_root: input.profile_selection.staging_root.clone(),
                 minimum_store_available_bytes: 1,
                 recovery_command: handle("eliot recover --transaction-id transaction:test"),
                 agent_bridge_source: None,
             },
+            &input.profile_selection,
+            binding.profile_governed_roots,
             binding.source_identity,
             binding.files,
             binding.evidence_digest,
@@ -2561,6 +2911,7 @@ mod tests {
             output.clone(),
             store.clone(),
             binding,
+            input.profile_selection.clone(),
             crate::write_transaction_artifact,
         )
         .unwrap();
@@ -2618,6 +2969,7 @@ mod tests {
             output.clone(),
             store.clone(),
             binding,
+            input.profile_selection.clone(),
             |path, _transaction| {
                 fs::write(path, b"{\"partial\":")?;
                 Err(std::io::Error::other("injected output failure"))

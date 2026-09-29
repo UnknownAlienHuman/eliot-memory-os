@@ -228,6 +228,104 @@ fn phase_b_observe_bound(observation: &PhaseBObservation) {
 }
 
 impl HostComposition {
+    /// Validates a Phase-B credential receipt against the Host's retained
+    /// profile selection before any operation can publish or reconcile its
+    /// live descriptors. Current-user profiles recheck every admitted root
+    /// and bind the receipt principal to the original selected owner SID.
+    #[cfg(windows)]
+    pub(super) fn validate_phase_b_credential_receipt_for_profile(
+        &self,
+        receipt: &CredentialAccessReceipt,
+        manifest: &CandidateManifest,
+        intent: &HostPhaseBMaterializationIntent,
+    ) -> Result<(), HostError> {
+        let selected_owner_sid = match manifest.runtime_launch.profile {
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                #[cfg(not(test))]
+                {
+                    let retained = self.profile_root_leases.as_ref().ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Phase-B current-user profile roots are not retained by Host"
+                                .to_owned(),
+                        )
+                    })?;
+                    retained.verify_stable_identity().map_err(|_| {
+                        HostError::RecoveryRequired(
+                            "Phase-B current-user profile root identity changed".to_owned(),
+                        )
+                    })?;
+                    let selection = retained.selection();
+                    let launch = &manifest.runtime_launch;
+                    let expected_descriptor_digest =
+                        phase_b_scm_selector(&launch.authority_descriptor_digest)
+                            .map_err(HostError::Installation)?;
+                    let expected_profile = match launch.profile {
+                        InstallationProfile::UserMode => eliot_platform_windows::profile_supervision::ProfileSelection::UserMode,
+                        InstallationProfile::PortableDev => eliot_platform_windows::profile_supervision::ProfileSelection::PortableDev,
+                        InstallationProfile::SystemService => unreachable!(),
+                    };
+                    if selection.profile != expected_profile
+                        || selection.installation_id
+                            != launch.installation_epoch.installation.as_str()
+                        || selection.installation_key.as_deref()
+                            != launch
+                                .profile_installation_key
+                                .as_ref()
+                                .map(|key| key.as_str())
+                        || selection.component != launch.profile_component.as_str()
+                        || selection.version != launch.profile_version.as_str()
+                        || selection.generation != launch.generation.as_str()
+                        || !eliot_platform_windows::windows_paths_equal(
+                            &selection.authority_descriptor_path,
+                            Path::new(launch.authority_descriptor_path.as_str()),
+                        )
+                        || selection.authority_descriptor_sha256
+                            != expected_descriptor_digest.as_str()
+                        || selection.authority_generation != launch.authority_generation.value()
+                        || selection.owner_sid == LOCAL_SERVICE_SID
+                    {
+                        return Err(HostError::RecoveryRequired(
+                            "Phase-B current-user profile selection does not match the candidate"
+                                .to_owned(),
+                        ));
+                    }
+                    let request = super::host_job_launch::profile_root_request(launch)?;
+                    let observed_selection =
+                        eliot_platform_windows::profile_supervision::validate_profile_roots(
+                            &request,
+                        )
+                        .map_err(|_| {
+                            HostError::RecoveryRequired(
+                                "Phase-B current-user profile roots no longer match their admission"
+                                    .to_owned(),
+                            )
+                        })?;
+                    if &observed_selection != selection {
+                        return Err(HostError::RecoveryRequired(
+                            "Phase-B current-user profile root identities changed".to_owned(),
+                        ));
+                    }
+                    Some(selection.owner_sid.as_str())
+                }
+                #[cfg(test)]
+                {
+                    // Test compositions do not retain the production root
+                    // selection; the projection validator therefore fails
+                    // closed for current-user profiles.
+                    None
+                }
+            }
+            InstallationProfile::SystemService => None,
+        };
+
+        super::phase_b_projection::validate_phase_b_credential_receipt(
+            receipt,
+            manifest,
+            intent,
+            selected_owner_sid,
+        )
+    }
+
     /// Materializes the Host-owned Phase-B authority, Store bootstrap, and
     /// dynamic launch descriptors for one already-approved generation.
     ///
@@ -323,8 +421,17 @@ impl HostComposition {
                 "supervision authority is foreign to the approved Phase-A launch".to_owned(),
             ));
         }
-        let portable_root = if launch_template.profile == InstallationProfile::PortableDev {
-            Some(
+        let user_owned_launch_root = match launch_template.profile {
+            InstallationProfile::UserMode => Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    launch_template
+                        .profile_governed_roots
+                        .immutable_binaries
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            ),
+            InstallationProfile::PortableDev => Some(
                 UserOwnedRootLease::open_existing(Path::new(
                     launch_template
                         .portable_root
@@ -337,22 +444,21 @@ impl HostComposition {
                         .as_str(),
                 ))
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            InstallationProfile::SystemService => None,
         };
         let profile = launch_template.profile;
         let authority_path = approved_phase_b_destination_locator(
             Path::new(launch_template.authority_descriptor_path.as_str()),
             &launch_template.authority_descriptor_path,
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
         )?;
         let observed_previous_binding = phase_b_observe_previous_binding(
             manifest,
             &self.host,
             &self.activation_generation.current,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &authority_path,
         )?;
         let durable_manifest_digest = phase_b_manifest_digest(manifest)?;
@@ -375,8 +481,11 @@ impl HostComposition {
         };
         let allow_expired_exact_replay = match std::fs::symlink_metadata(&authority_path) {
             Ok(_) => {
-                let lease =
-                    phase_b_open_existing(profile, portable_root.as_ref(), &authority_path)?;
+                let lease = phase_b_open_existing(
+                    profile,
+                    user_owned_launch_root.as_ref(),
+                    &authority_path,
+                )?;
                 lease.verify().map_err(HostError::RecoveryRequired)?;
                 phase_b_lease_bytes(&lease)? == input.authority_descriptor_bytes
             }
@@ -418,7 +527,7 @@ impl HostComposition {
         )?;
         let config_template_bytes = phase_b_template_bytes(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             &manifest.config_digest,
             "Store config",
@@ -453,7 +562,7 @@ impl HostComposition {
         )?;
         let eliotd_template_bytes = phase_b_template_bytes(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_descriptor_path,
             &launch_template.eliotd_descriptor_digest,
             "eliotd descriptor",
@@ -488,7 +597,7 @@ impl HostComposition {
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let previous_eliotd_digest = phase_b_previous_eliotd_digest(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_descriptor_path,
             &eliotd_live_bytes,
             &launch_template.eliotd_descriptor_digest,
@@ -565,7 +674,7 @@ impl HostComposition {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let previous_config_digest = phase_b_previous_config_digest(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             &config_live_bytes,
             &manifest.config_digest,
@@ -646,7 +755,7 @@ impl HostComposition {
             Path::new(launch_template.store_bootstrap_descriptor_path.as_str()),
             &launch_template.store_bootstrap_descriptor_path,
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
         )?;
         let previous_config_value = previous_binding
             .as_ref()
@@ -677,7 +786,7 @@ impl HostComposition {
         );
         let previous_bootstrap_digest = phase_b_previous_bootstrap_digest(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &bootstrap_path,
             &bootstrap_bytes,
             previous_config_value.as_ref().unwrap_or(&config),
@@ -908,7 +1017,7 @@ impl HostComposition {
         let (authority_readback_digest, authority_identity) =
             phase_b_materialize_file_with_rollback(
                 profile,
-                portable_root.as_ref(),
+                user_owned_launch_root.as_ref(),
                 &authority_path,
                 &input.authority_descriptor_bytes,
                 &previous_authority_digests,
@@ -921,7 +1030,7 @@ impl HostComposition {
         }
         let (eliotd_readback_digest, eliotd_identity) = phase_b_materialize_file_with_rollback(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_descriptor_path,
             &eliotd_live_bytes,
             &eliotd_allowed_digests,
@@ -934,7 +1043,7 @@ impl HostComposition {
         }
         let (config_readback_digest, config_identity) = phase_b_materialize_file_with_rollback(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             &config_live_bytes,
             &config_allowed_digests,
@@ -950,7 +1059,7 @@ impl HostComposition {
         let (bootstrap_readback_digest, bootstrap_identity) =
             phase_b_materialize_file_with_rollback(
                 profile,
-                portable_root.as_ref(),
+                user_owned_launch_root.as_ref(),
                 &bootstrap_path,
                 &bootstrap_bytes,
                 &bootstrap_allowed_digests,
@@ -998,7 +1107,7 @@ impl HostComposition {
             }
             publish_agent_bridge_pair(
                 profile,
-                portable_root.as_ref(),
+                user_owned_launch_root.as_ref(),
                 agent_bridge,
                 &bridge_allowed_profile_digests,
                 &bridge_allowed_declaration_digests,
@@ -1381,8 +1490,18 @@ impl HostComposition {
             ));
         }
         let profile = manifest.runtime_launch.profile;
-        let portable_root = if profile == InstallationProfile::PortableDev {
-            Some(
+        let user_owned_launch_root = match profile {
+            InstallationProfile::UserMode => Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    manifest
+                        .runtime_launch
+                        .profile_governed_roots
+                        .immutable_binaries
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            ),
+            InstallationProfile::PortableDev => Some(
                 UserOwnedRootLease::open_existing(Path::new(
                     manifest
                         .runtime_launch
@@ -1396,15 +1515,14 @@ impl HostComposition {
                         .as_str(),
                 ))
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            InstallationProfile::SystemService => None,
         };
         let readback = |path: &Path,
                         expected: &PlatformHandle,
                         label: &str|
          -> Result<FileIdentity, HostError> {
-            let lease = phase_b_open_existing(profile, portable_root.as_ref(), path)?;
+            let lease = phase_b_open_existing(profile, user_owned_launch_root.as_ref(), path)?;
             lease.verify().map_err(HostError::RecoveryRequired)?;
             let bytes = phase_b_lease_bytes(&lease)?;
             let actual = phase_b_bytes_digest(&bytes)?;
@@ -1646,8 +1764,19 @@ impl HostComposition {
             ));
         }
         let profile = pending.manifest.runtime_launch.profile;
-        let portable_root = if profile == InstallationProfile::PortableDev {
-            Some(
+        let user_owned_launch_root = match profile {
+            InstallationProfile::UserMode => Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    pending
+                        .manifest
+                        .runtime_launch
+                        .profile_governed_roots
+                        .immutable_binaries
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            ),
+            InstallationProfile::PortableDev => Some(
                 UserOwnedRootLease::open_existing(Path::new(
                     pending
                         .manifest
@@ -1662,9 +1791,8 @@ impl HostComposition {
                         .as_str(),
                 ))
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            InstallationProfile::SystemService => None,
         };
         let authority_path = approved_locator(
             Path::new(
@@ -1709,21 +1837,21 @@ impl HostComposition {
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &authority_path,
             "authority descriptor",
             None,
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             "Store config",
             Some(&pending.manifest.config_digest),
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &bootstrap_path,
             "Store bootstrap descriptor",
             Some(
@@ -1735,13 +1863,13 @@ impl HostComposition {
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_path,
             "eliotd descriptor",
             Some(&pending.manifest.runtime_launch.eliotd_descriptor_digest),
         )?;
         if let Some(binding) = prepared.agent_bridge.as_ref() {
-            rollback_agent_bridge_pair(profile, portable_root.as_ref(), binding)?;
+            rollback_agent_bridge_pair(profile, user_owned_launch_root.as_ref(), binding)?;
             rollback_agent_bridge_stage(&binding.stage_prepared)?;
         } else if let Some(stage) = pending.phase_b_agent_bridge_stage_prepared.as_ref() {
             rollback_agent_bridge_stage(stage)?;

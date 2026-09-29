@@ -168,6 +168,12 @@ async fn main() {
         Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
     };
     #[cfg(windows)]
+    let _profile_root_leases =
+        match startup_binding::retain_profile_root_binding(&options, &startup_binding) {
+            Ok(leases) => leases,
+            Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
+        };
+    #[cfg(windows)]
     observe_entrypoint(EntrypointStage::HostStartupBinding);
     // Issue #1836 (W1): install the shared observability runtime from the
     // roots the Host injected, before the store bootstrap, the launch
@@ -197,6 +203,14 @@ async fn main() {
     observe_entrypoint(EntrypointStage::EliotdLaunch);
     let mut kernel_config =
         KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();
+    #[cfg(windows)]
+    {
+        let (profile, portable_dev_repository_root) = startup_binding
+            .supervision_profile_binding(_profile_root_leases.as_ref())
+            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
+        kernel_config = kernel_config
+            .with_supervision_installation_profile(profile, portable_dev_repository_root);
+    }
     #[cfg(windows)]
     let pipe_name = startup_binding.control_pipe.clone();
     #[cfg(not(windows))]
@@ -293,6 +307,12 @@ async fn main() {
             observe_entrypoint_with_detail(EntrypointStage::Composition, observability.describe());
         }
         Err(error) => observe_terminal_error(&error.to_string()),
+    }
+    #[cfg(windows)]
+    if let Some(leases) = &_profile_root_leases {
+        leases
+            .verify_stable_identity()
+            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error.to_string()));
     }
     let kernel = Arc::new(
         match KernelComposition::new_with_authority_descriptor(

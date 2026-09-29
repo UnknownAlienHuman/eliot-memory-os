@@ -116,12 +116,11 @@ fn observability_config(config: &eliot_store_surreal::StoreLaunchConfig) -> Obse
 /// Installs the shared observability runtime from the loaded launch config.
 ///
 /// The Store bridge has no initialized telemetry sink before the launch config
-/// is loaded, so the install happens at the first point where the installation
-/// roots are known — immediately after `prepare_launch` and before the
-/// provider is composed, connected, or the pipe is served. A loaded
-/// configuration is mandatory (this binary cannot reach any live work without
-/// one), so a refused observability configuration is reported through the same
-/// fail-closed launch error path the rest of the launch uses.
+/// is loaded, so installation happens after composition has revalidated the
+/// selected profile receipt and while a fresh no-follow root guard is held.
+/// A loaded configuration is mandatory (this binary cannot reach any live
+/// work without one), so a refused observability configuration is reported
+/// through the same fail-closed launch error path the rest of the launch uses.
 fn install_observability(config: &eliot_store_surreal::StoreLaunchConfig) -> Result<(), String> {
     eliot_observability_runtime::install(&observability_config(config))
         .map(|_| ())
@@ -780,19 +779,14 @@ async fn run() -> Result<(), String> {
         &BridgeIdentity::new(),
         prepared.is_ok(),
     );
-    let Some(config) = prepared? else {
+    let Some(prepared_launch) = prepared? else {
         return Ok(());
     };
-    // Issue #1836 (W1): the installation roots are known now, so the shared
-    // observability runtime is installed before the provider is composed,
-    // connected, or the authenticated pipe is served.
-    install_observability(&config)?;
-    // I5.9 compatibility gate (issue #1932). The verdict is reported and
-    // recorded at every stage, and a maintenance verdict does not abort
-    // startup: the installation comes up as a running, queryable non-writer
-    // whose canonical mutations are refused on the mutation path itself.
-    let mut compatibility = enforce_store_compatibility(&config);
-    let composed = StoreComposition::new(&config);
+    let config = prepared_launch.config;
+    let composed = match prepared_launch.user_mode_root_lease {
+        Some(root) => StoreComposition::new_with_user_mode_launch_root(&config, Some(root)),
+        None => StoreComposition::new(&config),
+    };
     report_stage_outcome(
         BridgeBoundary::Startup,
         "startup",
@@ -800,6 +794,30 @@ async fn run() -> Result<(), String> {
         composed.is_ok(),
     );
     let composition = composed?;
+    run_composed(&config, &composition).await
+}
+
+#[cfg(windows)]
+#[allow(clippy::print_stderr)]
+async fn run_composed(
+    config: &eliot_store_surreal::StoreLaunchConfig,
+    composition: &StoreComposition,
+) -> Result<(), String> {
+    // Issue #1836 (W1): the installation roots are known now, so the shared
+    // observability runtime is installed before the provider is started or the
+    // authenticated pipe is served. Hold a fresh lease set across spool/log
+    // setup and the compatibility read/report because those paths access the
+    // selected roots outside StoreComposition's provider methods.
+    let mut compatibility = {
+        let _root_use = composition.retain_roots_for_use().map_err(|error| {
+            format!("revalidate Store roots before startup side effects: {error}")
+        })?;
+        install_observability(config)?;
+        // I5.9 compatibility gate (issue #1932). A maintenance verdict keeps
+        // the installation queryable as a non-writer; canonical mutations are
+        // refused on the mutation path itself.
+        enforce_store_compatibility(config)
+    };
     let connected = composition.connect().await;
     report_stage_outcome(
         BridgeBoundary::Startup,
@@ -815,13 +833,20 @@ async fn run() -> Result<(), String> {
     // provider-startup window keeps the installation non-writer here, never at
     // the first canonical write. `combine` is fail-closed, so an admitted
     // earlier stage can never re-admit a maintenance verdict.
-    compatibility = compatibility.combine(enforce_store_compatibility(&config));
-    // Observed-identity binding (issue #1932, backend handoff §3): the
-    // adapter proved the live version and spawn-validated digest over its
-    // ownership-verified channel during connect. Bind the record echo to
-    // that observation before serving: a rotated binary or drifted record is
-    // visible maintenance here, never an accepted write.
-    compatibility = compatibility.combine(bind_observed_identity(&composition, &config)?);
+    // The direct compatibility/evidence reads are installation-file accesses
+    // too, so revalidate and hold the profile roots across both checks after
+    // provider startup. A rotated binary or drifted record cannot be accepted
+    // for writes with a detached root path.
+    {
+        let _root_use = composition
+            .retain_roots_for_use()
+            .map_err(|error| format!("revalidate Store roots after provider startup: {error}"))?;
+        compatibility = compatibility.combine(enforce_store_compatibility(config));
+        // Observed-identity binding (issue #1932, backend handoff §3): the
+        // adapter proved the live version and spawn-validated digest over its
+        // ownership-verified channel during connect.
+        compatibility = compatibility.combine(bind_observed_identity(composition, config)?);
+    }
     if !compatibility.is_writer_admitted() {
         // Visible non-writer readiness: the store is up and answers
         // health/readiness, and every canonical mutation is refused. The
@@ -857,7 +882,7 @@ async fn run() -> Result<(), String> {
         gated.is_ok(),
     );
     gated?;
-    serve_handshake_loop(&composition, &config).await
+    serve_handshake_loop(composition, config).await
 }
 
 #[cfg(not(windows))]
