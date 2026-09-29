@@ -78,7 +78,7 @@
 //! bypasses the delegated port can reach the effect step with a fabricated
 //! source root and staging parent. Narrowing that port means making it
 //! crate-private, which the declared 958 suite calls directly, and the
-//! authenticated-caller control itself is owned by #954
+//! authenticated-caller control itself has no Host-side port
 //! ([`BackupCallerAuth::authenticate`] fails closed against it). The module
 //! holds no registry writer, no archive import, no store-recovery rewrite and
 //! no cutover arm, so the closed [`PreparationClass`] set plus those absences
@@ -349,7 +349,7 @@ impl PreparationError {
 // `OwnerEvidence::approved_binding` (mapping adapter covered by the inner bind
 // and outer delegate records), `BackupCallerAuth::{check_shapes, authenticate}`
 // (the former surfaces through `authenticate_for_owner`; the latter is the
-// pending-#954 always-refuse stub with no production path),
+// always-refuse stub with no production path),
 // `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
 // /`projection_to_preparation`/`intent_json`/`result_json`/`destination_from_result`
@@ -764,6 +764,15 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), PreparationError
 /// publish unverified disposition claims under a forensic label. I5.13 keeps the
 /// `HostStateAuditFence` optional, so refusing it is a complete answer rather
 /// than a gap, and no note-size bound is needed because no note is ever carried.
+///
+/// This is the strongest of the two refusals A1's optional audit fence admits.
+/// The note's own typed non-authoritative ceiling is enforced where a note is
+/// admissible at all
+/// (`crate::backup_config_projection::AuditFenceNote::validate`, refusing
+/// `ProjectionError::ActiveAuthorityInAuditFence`); refusing every note here is
+/// stronger still, because no owner corroborates the note's lineage in the
+/// first place, so a lease/grant/current-state assertion is unreachable rather
+/// than merely bounded.
 fn reject_audit_note(note: Option<&String>) -> Result<(), PreparationError> {
     if note.is_some() {
         return Err(PreparationError::OwnerEvidenceUnavailable {
@@ -1870,10 +1879,12 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
 /// profile token or the preparation is refused. A presented owner lease
 /// reference, purge-ledger revision or forensic audit note is **refused**,
 /// because no owner reachable from Host issues or corroborates any of them —
-/// lease issuance and purge-ledger authority belong to #954 and to the
-/// purge-ledger owner respectively. The presented `authority_generation` is
-/// read nowhere on this path: this lane grants it nothing, and the admission
-/// carries the owner-issued one instead.
+/// lease-reference issuance and purge-ledger authority belong to a Host lease
+/// issuer and to the ORS purge-ledger owner respectively, and #954 (merged,
+/// `5e71386a`) supplies neither: its `BackupAdmissionRef` is a per-operation
+/// admission reference, not a standing owner lease. The presented
+/// `authority_generation` is read nowhere on this path: this lane grants it
+/// nothing, and the admission carries the owner-issued one instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PresentedPreparationRequest {
     /// Operation identity (bounded text, unique per preparation).
@@ -1959,8 +1970,8 @@ pub struct PresentedPreparationRequest {
 /// owner-bound preparation lifecycle. [`OwnerEvidence`] has all-private fields
 /// and only [`OwnerEvidence::inspect`] can build one, so this port cannot be
 /// entered without a real protected root and a committed registry behind it.
-/// The caller-role half of authentication stays with #954
-/// ([`BackupCallerAuth::authenticate`], a real fail-closed refusal), while the
+/// The caller-role half of authentication has no Host-side port and stays a
+/// real fail-closed refusal ([`BackupCallerAuth::authenticate`]), while the
 /// source-identity half is proved by
 /// [`BackupCallerAuth::authenticate_for_owner`] at the composition port. Every
 /// owner or presented-evidence failure maps to a typed [`PreparationError`]
@@ -2150,6 +2161,15 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
         },
         ProjectionError::OwnerEvidenceUnavailable { field, obligation } => {
             PreparationError::OwnerEvidenceUnavailable { field, obligation }
+        }
+        ProjectionError::ActiveAuthorityInAuditFence { field } => {
+            PreparationError::InvalidRequest {
+                field,
+                reason: "forensic audit note asserts restored active authority; a \
+                         HostStateAuditFence is forensic only and never a lease, grant, or \
+                         current-state assertion"
+                    .to_owned(),
+            }
         }
     }
 }
@@ -2494,9 +2514,14 @@ pub fn verify_staging_parent_lease(
 ///
 /// Shape carries the owner-issued caller lease digest and the caller fence
 /// digest so refusals and (later) admissions bind them into the audit trail.
-/// Caller authentication itself is pending #954 role-bound control: until
-/// the #954 owner port lands, [`BackupCallerAuth::authenticate`] fails
-/// closed and no destination effect is reachable through delegation.
+/// Caller authentication itself has no Host-side verification to run against:
+/// [`BackupCallerAuth::authenticate`] fails closed, and no destination effect
+/// is reachable through it. #954 is not the open item — it merged
+/// (`5e71386a`, PR #2572) and defines the role/operation contract in
+/// `crates/foundation/eliot-protocol/src/backup.rs`, but that contract carries
+/// no caller credential or token this contour can verify a lease or fence
+/// digest against, and its own doc states that a payload value never grants a
+/// role.
 ///
 /// The live source-identity proof is
 /// [`BackupCallerAuth::authenticate_for_owner`], which
@@ -2522,23 +2547,32 @@ impl BackupCallerAuth {
 
     /// Authenticates the caller against owner-issued control evidence.
     ///
-    /// Fail-closed pending the #954 caller-control port: there is currently
-    /// no owner-issued caller token to verify against, so every caller is
-    /// refused here before any destination effect. This is a real refusal, not
-    /// a placeholder for a passing check: no destination can be prepared
-    /// through the authenticated-caller path until #954 supplies the
-    /// verification, and no code path relaxes it. The #954 implementation
-    /// fills this method without changing its signature or callers.
+    /// Fail-closed because there is no owner-issued caller token to verify
+    /// against: no installation record, approved generation, commit fence,
+    /// owner lease or host-state record reachable from this contour carries a
+    /// caller credential, so every caller is refused here before any
+    /// destination effect. This is a real refusal, not a placeholder for a
+    /// passing check: no destination can be prepared through the
+    /// authenticated-caller path until such an owner exists, and no code path
+    /// relaxes it. The implementation that fills it must not change this
+    /// method's signature or callers.
+    ///
+    /// #954 is NOT the missing owner. It merged (`5e71386a`, PR #2572) and
+    /// supplies the role/operation *contract* in
+    /// `crates/foundation/eliot-protocol/src/backup.rs`; what it does not
+    /// supply is a credential this contour can verify, and its own doc states
+    /// that validators always compare a presented value against a separately
+    /// passed role argument because a payload value never grants a role.
     ///
     /// The owner-issued source-identity proof that does exist today is
     /// [`BackupCallerAuth::authenticate_for_owner`]; this method covers the
-    /// caller-role/credential half that #954 owns.
+    /// caller-role/credential half, which no owner issues.
     pub fn authenticate(&self) -> Result<(), PreparationError> {
         Err(PreparationError::InvalidRequest {
             field: "caller_auth",
-            reason:
-                "authenticated caller control pending #954; unauthenticated preparation refused"
-                    .to_owned(),
+            reason: "no owner-issued caller credential exists on this contour; unauthenticated \
+                     preparation refused"
+                .to_owned(),
         })
     }
 
@@ -2549,8 +2583,9 @@ impl BackupCallerAuth {
     /// the launch installation and the presented source to equal it. The
     /// lease/fence digests stay shape-checked audit-trail evidence: no owner
     /// digest scheme binds them yet, so they grant nothing here.
-    /// Caller-channel (control-plane principal) authentication awaits the
-    /// #954 role-bound port and is reported as backlog, not assumed.
+    /// Caller-channel (control-plane principal) authentication has no owner on
+    /// this contour and is reported as backlog, not assumed; see
+    /// [`BackupCallerAuth::authenticate`].
     pub fn authenticate_for_owner(
         &self,
         lease: &HostOwnerLease,
