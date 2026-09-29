@@ -3111,11 +3111,12 @@ impl RecoveryWindowFacts {
 ///
 /// A keyed continuation names the declared window, one stream scope, the
 /// predecessor sequence the next page must advance past, and explicit
-/// event/gap budgets. A resume selector deliberately omits the volatile
-/// window key so the existing authenticated owner scope can find the same
-/// persisted window after process restart. Every form carries the expected
-/// live authority (generation plus presenting connection), so each call
-/// rechecks the #2729 rights against the current attach.
+/// event/gap budgets. A fresh-process resume omits the window key so the
+/// authenticated owner scope can find its persisted window; a cached-core
+/// resume pins the previously admitted key across reconnect. Every form
+/// carries the expected live authority (generation plus presenting
+/// connection), so each call rechecks the #2729 rights against the current
+/// attach.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryReadRequest {
     window_key: Option<String>,
@@ -3344,6 +3345,21 @@ impl RecoveryReadRequest {
             expected_generation,
             expected_connection,
         })
+    }
+
+    /// Constructs a resume read pinned to the previously admitted window.
+    /// The key narrows the owner lookup but does not replace current attach
+    /// authorization or carry a continuation proof.
+    #[allow(clippy::result_large_err)]
+    pub fn checked_resume_for_window(
+        window_key: String,
+        expected_generation: u64,
+        expected_connection: String,
+    ) -> Result<Self, BridgeError> {
+        validate_text(&window_key, "recovery_read.window_key")?;
+        let mut request = Self::checked_resume(expected_generation, expected_connection)?;
+        request.window_key = Some(window_key);
+        Ok(request)
     }
 
     pub fn window_key(&self) -> Option<&str> {
@@ -3676,6 +3692,7 @@ struct RecoveryWindow {
     window_key: String,
     expires_at_ms: u64,
     live_generation: u64,
+    presenting_connection: ConnectionId,
     import_revision: u64,
     stream_order: Vec<String>,
     streams: BTreeMap<String, RecoveryStreamProgress>,
@@ -3820,6 +3837,14 @@ impl RecoveryWindow {
         }
         let generation = binding.activation_generation.get();
         let connection = binding.connection_id.as_str().to_owned();
+        if self.live_generation != generation || self.presenting_connection != binding.connection_id
+        {
+            return RecoveryReadRequest::checked_resume_for_window(
+                self.window_key.clone(),
+                generation,
+                connection,
+            );
+        }
         if let Some(next) = self.stream_order.iter().find(|stream_id| {
             self.streams
                 .get(*stream_id)
@@ -4123,19 +4148,12 @@ impl AgentBridgeCore {
             let connection = active.binding.connection_id.as_str().to_owned();
             let request = match active.recovery.as_ref() {
                 Some(window) => window.next_request(&active.binding)?,
-                None if active.reconciliation_required => {
-                    if active.blind_interval.is_none() {
-                        return Err(BridgeError::InvalidTransition(
-                            "an unreconciled attach requires its declared blind interval",
-                        ));
-                    }
-                    RecoveryReadRequest::checked_resume(generation, connection)?
-                }
-                None => {
+                None if active.reconciliation_required && active.blind_interval.is_none() => {
                     return Err(BridgeError::InvalidTransition(
-                        "no declared recovery window; reconcile_external opens the walk",
+                        "an unreconciled attach requires its declared blind interval",
                     ));
                 }
+                None => RecoveryReadRequest::checked_resume(generation, connection)?,
             };
             (active.binding.clone(), request)
         };
@@ -4363,8 +4381,27 @@ impl AgentBridgeCore {
         if facts.live_generation != binding.activation_generation {
             return Err(BridgeError::StaleAuthority);
         }
-        let (new_window, window) =
-            Self::stage_recovery_window(recovery, facts, allow_refresh_candidate)?;
+        if facts.window_status != RecoveryWindowStatus::Active
+            && (!facts.stream_facts.is_empty()
+                || !facts.unscoped_gaps.is_empty()
+                || facts.stream_list_proof.is_some()
+                || facts.stream_list_continuation.is_some()
+                || facts.unscoped_gaps_proof.is_some()
+                || facts.unscoped_gaps_continuation.is_some()
+                || facts.stream_list_complete
+                || facts.unscoped_gaps_complete)
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.terminal_status",
+                reason: "moved or expired windows carry identity only, with no page facts or proofs",
+            });
+        }
+        let (new_window, window) = Self::stage_recovery_window(
+            recovery,
+            facts,
+            allow_refresh_candidate,
+            response_selector,
+        )?;
         Self::validate_recovery_request_proof(
             window,
             new_window,
@@ -4375,7 +4412,10 @@ impl AgentBridgeCore {
         let previous_incomplete_reason = window.incomplete_reason;
         let facts_changed =
             Self::apply_recovery_window_facts(window, new_window, response_selector, facts)?;
-        let mut changed = new_window || facts_changed;
+        let presentation_changed = facts.window_status == RecoveryWindowStatus::Active
+            && (window.live_generation != facts.live_generation.get()
+                || window.presenting_connection != facts.presenting_connection);
+        let mut changed = new_window || facts_changed || presentation_changed;
         Self::validate_recovery_gap_total(
             window,
             facts.window_status == RecoveryWindowStatus::Active,
@@ -4383,6 +4423,10 @@ impl AgentBridgeCore {
         let incomplete_reason = match facts.window_status {
             RecoveryWindowStatus::Active => {
                 Self::validate_recovery_window_totals(window)?;
+                window.live_generation = facts.live_generation.get();
+                window
+                    .presenting_connection
+                    .clone_from(&facts.presenting_connection);
                 None
             }
             RecoveryWindowStatus::Moved => Some(RECOVERY_PARTIAL_WINDOW_MOVED),
@@ -4441,32 +4485,45 @@ impl AgentBridgeCore {
         recovery: &'a mut Option<RecoveryWindow>,
         facts: &RecoveryWindowFacts,
         allow_refresh_candidate: bool,
+        response_selector: RecoveryResponseSelector,
     ) -> Result<(bool, &'a mut RecoveryWindow), BridgeError> {
-        let same_generation = recovery
-            .as_ref()
-            .is_some_and(|window| window.live_generation == facts.live_generation.get());
-        let refresh_candidate = same_generation
-            && recovery
-                .as_ref()
-                .is_some_and(|window| window.window_key != facts.window_key);
-        if refresh_candidate && !allow_refresh_candidate {
+        let existing = recovery.as_ref();
+        let same_key = existing.is_some_and(|window| window.window_key == facts.window_key);
+        if same_key
+            && existing.is_some_and(|window| {
+                window.expires_at_ms != facts.expires_at_ms
+                    || window.stream_list_total != facts.stream_list_total
+                    || window.unscoped_gap_total != facts.unscoped_gap_total
+            })
+        {
             return Err(BridgeError::StaleAuthority);
         }
-        if same_generation && !refresh_candidate {
-            let window = recovery.as_ref().ok_or(BridgeError::NotAttached)?;
-            if window.expires_at_ms != facts.expires_at_ms
-                || window.stream_list_total != facts.stream_list_total
-                || window.unscoped_gap_total != facts.unscoped_gap_total
+        let new_window = match existing {
+            None => true,
+            Some(_) if same_key => false,
+            Some(_)
+                if response_selector == RecoveryResponseSelector::Open
+                    && allow_refresh_candidate =>
             {
-                return Err(BridgeError::StaleAuthority);
+                true
             }
+            Some(_) => return Err(BridgeError::StaleAuthority),
+        };
+        let keyed = matches!(
+            response_selector,
+            RecoveryResponseSelector::Streams
+                | RecoveryResponseSelector::Stream
+                | RecoveryResponseSelector::UnscopedGaps
+        );
+        if new_window && keyed {
+            return Err(BridgeError::StaleAuthority);
         }
-        let new_window = !same_generation || refresh_candidate;
         if new_window {
             *recovery = Some(RecoveryWindow {
                 window_key: facts.window_key.clone(),
                 expires_at_ms: facts.expires_at_ms,
                 live_generation: facts.live_generation.get(),
+                presenting_connection: facts.presenting_connection.clone(),
                 import_revision: 0,
                 stream_order: Vec::new(),
                 streams: BTreeMap::new(),
@@ -4476,9 +4533,9 @@ impl AgentBridgeCore {
                 stream_list_proof: facts.stream_list_proof.clone(),
                 unscoped_gaps_proof: facts.unscoped_gaps_proof.clone(),
                 unproven_scope_present: false,
-                stream_list_complete: true,
+                stream_list_complete: false,
                 stream_list_continuation: None,
-                unscoped_gaps_complete: true,
+                unscoped_gaps_complete: false,
                 unscoped_gaps_continuation: None,
                 incomplete_reason: None,
             });
@@ -4501,6 +4558,11 @@ impl AgentBridgeCore {
             RecoveryResponseSelector::Open | RecoveryResponseSelector::Resume
         );
         let resume_existing = response_selector == RecoveryResponseSelector::Resume && !new_window;
+        if facts.window_status != RecoveryWindowStatus::Active {
+            let changed = !window.unproven_scope_present && facts.unproven_scope_present;
+            window.unproven_scope_present |= facts.unproven_scope_present;
+            return Ok(changed);
+        }
         let mut changed = !window.unproven_scope_present && facts.unproven_scope_present;
         window.unproven_scope_present |= facts.unproven_scope_present;
         if resume_existing {

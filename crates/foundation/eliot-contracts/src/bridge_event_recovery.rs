@@ -38,6 +38,10 @@ pub const BRIDGE_RECOVERY_SELECTOR_VERSION: u64 = 2;
 /// Resume remains revision 2 and does not carry a continuation proof.
 pub const BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION: u64 = 2;
 
+/// Wire revision for a resume selector pinned to one previously issued window.
+/// This is a pure row selector: it carries no continuation proof or authority.
+pub const BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION: u64 = 1;
+
 /// Key separator that may not appear inside a selector text field, because
 /// every persisted owner key is built as `<namespace>::<suffix>`.
 const SELECTOR_KEY_SEPARATOR: &str = "::";
@@ -75,6 +79,17 @@ pub enum BridgeRecoverySelector {
     Resume {
         /// Exactly [`BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION`].
         version: u64,
+    },
+    /// Resume or recover the terminal disposition for this exact previously
+    /// issued window. The key narrows owner lookup only; ORS must still
+    /// revalidate the authenticated caller's lineage, principal, and scope.
+    /// This selector deliberately carries no stale continuation proof; it
+    /// constrains lookup to this exact row while authorization is rechecked.
+    ResumeWindow {
+        /// Exactly [`BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION`].
+        version: u64,
+        /// Exact previously issued recovery window to resolve.
+        window_key: String,
     },
     /// One page of the outer stream enumeration, starting after the
     /// owner-issued `after_stream` position.
@@ -161,11 +176,13 @@ impl BridgeRecoverySelector {
 
     /// The owner-issued window this selector is bound to, when the selector
     /// already carries one. An owner-scoped [`Self::Resume`] intentionally
-    /// has no caller-supplied window key.
+    /// has no caller-supplied window key; [`Self::ResumeWindow`] is pinned to
+    /// its exact key without carrying continuation authority.
     pub fn window_key(&self) -> Option<&str> {
         match self {
             Self::Resume { .. } => None,
-            Self::Streams { window_key, .. }
+            Self::ResumeWindow { window_key, .. }
+            | Self::Streams { window_key, .. }
             | Self::Stream { window_key, .. }
             | Self::UnscopedGaps { window_key, .. } => Some(window_key.as_str()),
         }
@@ -189,13 +206,13 @@ impl BridgeRecoverySelector {
     /// continuation selector used as an ORS MAC preimage.
     ///
     /// The keyed variants are validated first, then their required proof
-    /// field is blanked before serialization. `Resume` has no cursor proof
-    /// and cannot be used as a keyed continuation preimage.
+    /// field is blanked before serialization. Neither resume selector carries
+    /// a cursor proof, so neither can be used as a keyed continuation preimage.
     pub fn continuation_bytes(&self) -> Result<Vec<u8>, ContractError> {
         self.validate()?;
         let mut unsigned = self.clone();
         match &mut unsigned {
-            Self::Resume { .. } => {
+            Self::Resume { .. } | Self::ResumeWindow { .. } => {
                 return Err(ContractError::Blank {
                     field: "bridge_recovery_selector.continuation_proof",
                 });
@@ -230,6 +247,9 @@ impl BridgeRecoverySelector {
         self.validate_version()?;
         match self {
             Self::Resume { .. } => {}
+            Self::ResumeWindow { window_key, .. } => {
+                validate_digest(window_key, "bridge_recovery_selector.window_key")?;
+            }
             Self::Streams {
                 window_key,
                 continuation_proof,
@@ -282,14 +302,11 @@ impl BridgeRecoverySelector {
                         field: "bridge_recovery_selector.owner_revision",
                     });
                 }
-                if *after_sequence > *upper_sequence
-                    || *retention_floor > *upper_sequence
-                    || (*upper_sequence > 0 && after_sequence.saturating_add(1) < *retention_floor)
-                {
-                    return Err(ContractError::Blank {
-                        field: "bridge_recovery_selector.after_sequence",
-                    });
-                }
+                validate_stream_retention_window(
+                    *after_sequence,
+                    *upper_sequence,
+                    *retention_floor,
+                )?;
                 if *event_limit == 0 || *event_limit > BRIDGE_RECOVERY_SELECTOR_EVENT_LIMIT {
                     return Err(ContractError::Blank {
                         field: "bridge_recovery_selector.event_limit",
@@ -332,16 +349,14 @@ impl BridgeRecoverySelector {
     }
 
     fn validate_version(&self) -> Result<(), ContractError> {
-        let version = match self {
-            Self::Resume { version }
-            | Self::Streams { version, .. }
+        let (version, expected_version) = match self {
+            Self::Resume { version } => (*version, BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION),
+            Self::ResumeWindow { version, .. } => {
+                (*version, BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION)
+            }
+            Self::Streams { version, .. }
             | Self::Stream { version, .. }
-            | Self::UnscopedGaps { version, .. } => *version,
-        };
-        let expected_version = if matches!(self, Self::Resume { .. }) {
-            BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION
-        } else {
-            BRIDGE_RECOVERY_SELECTOR_VERSION
+            | Self::UnscopedGaps { version, .. } => (*version, BRIDGE_RECOVERY_SELECTOR_VERSION),
         };
         if version != expected_version {
             return Err(ContractError::Blank {
@@ -507,6 +522,22 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), ContractError> 
         || value.chars().any(char::is_control)
     {
         return Err(ContractError::Blank { field });
+    }
+    Ok(())
+}
+
+fn validate_stream_retention_window(
+    after_sequence: u64,
+    upper_sequence: u64,
+    retention_floor: u64,
+) -> Result<(), ContractError> {
+    if after_sequence > upper_sequence
+        || retention_floor > upper_sequence
+        || (upper_sequence > 0 && after_sequence.saturating_add(1) < retention_floor)
+    {
+        return Err(ContractError::Blank {
+            field: "bridge_recovery_selector.after_sequence",
+        });
     }
     Ok(())
 }

@@ -338,6 +338,21 @@ const MAX_BRIDGE_RECOVERY_WINDOWS: usize = 64;
 const MAX_BRIDGE_RECOVERY_CUTS: usize = 4096;
 const MAX_BRIDGE_RECOVERY_REPLY_BYTES: usize = 256 * 1024;
 const BRIDGE_RECOVERY_WINDOW_TTL_MS: u64 = 5 * 60 * 1000;
+const BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY: &str = "bridge_recovery_expiry_evidence_v1";
+const MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE: usize = MAX_BRIDGE_RECOVERY_WINDOWS;
+/// ASSUMPTION for #2732: exact expiry is retained for one additional existing
+/// window TTL; after that finite horizon, Resume reports unavailable evidence.
+/// With a monotonic effective clock, every still-retained natural expiry at
+/// time `t` expired in `(t - TTL, t]`, so its source window was still live at
+/// `t - TTL`; at most the existing 64 live windows can supply those rows.
+/// Explicit early retirement also retains a bounded Moved row, so it can push
+/// the combined set over that natural-expiry bound; overflow aborts Open
+/// atomically without deleting the source row. The byte cap is derived from 64 rows, three
+/// 1,024-byte owner components conservatively escaped at six JSON bytes per
+/// input byte, two digests, bounded integer fields, and per-row JSON overhead.
+const MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE_BYTES: usize = MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE
+    * (3 * 6 * 1_024 + 2 * 64 + 16 * 20 + 1_024)
+    + MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE;
 const BRIDGE_OWNER_LIST_INDEX_SCHEMA_KEY: &str = "bridge_owner_list_index_schema";
 const BRIDGE_OWNER_LIST_INDEX_SCHEMA_V2: &str = "v2";
 const BRIDGE_OWNER_LIST_SEQUENCE_KEY: &str = "bridge_owner_list_sequence";
@@ -1728,7 +1743,7 @@ fn bridge_owner_component(value: &str, field: &'static str) -> Result<(), OrsErr
 /// denominator. Neither is ever inferred from a returned length, so a
 /// truncated page can be reported as a fraction of a declared whole instead
 /// of looking complete because it happened to be shorter than a limit.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventRecoveryWindowRow {
     version: u16,
@@ -1748,6 +1763,14 @@ struct BridgeEventRecoveryWindowRow {
     live_generation: u64,
     #[serde(default)]
     presenting_connection: String,
+    /// The authenticated presenter currently allowed to continue the window.
+    /// Versions 1 and 2 have no separate presentation; their issuer fields
+    /// are also their current presentation. Version 3 can rebind these fields
+    /// without changing the immutable window key or cuts.
+    #[serde(default)]
+    current_live_generation: Option<u64>,
+    #[serde(default)]
+    current_presenting_connection: Option<String>,
     owner_cutoff: u64,
     stream_list_total: u64,
     unscoped_gap_total: u64,
@@ -1759,7 +1782,7 @@ struct BridgeEventRecoveryWindowRow {
 
 impl BridgeEventRecoveryWindowRow {
     fn validate(&self) -> Result<(), OrsError> {
-        if !matches!(self.version, 1 | 2) {
+        if !matches!(self.version, 1..=3) {
             return Err(OrsError::InvalidField {
                 field: "recovery_window.version",
                 reason: "recovery window row carries a supported version",
@@ -1776,13 +1799,45 @@ impl BridgeEventRecoveryWindowRow {
             1 if self.source_revision == 0
                 && self.window_sequence == 0
                 && self.live_generation == 0
-                && self.presenting_connection.is_empty() => {}
+                && self.presenting_connection.is_empty()
+                && self.current_live_generation.is_none()
+                && self.current_presenting_connection.is_none() => {}
             2 if self.source_revision > 0
                 && self.window_sequence > 0
                 && self.live_generation > 0
-                && !self.presenting_connection.is_empty() =>
+                && !self.presenting_connection.is_empty()
+                && self.current_live_generation.is_none()
+                && self.current_presenting_connection.is_none() =>
             {
                 bridge_owner_component(&self.presenting_connection, "owner_connection")?;
+                if self.window_key != Self::key_for(self) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_window",
+                        reason:
+                            "window key does not commit its immutable owner and source identity"
+                                .to_owned(),
+                    });
+                }
+            }
+            3 if self.source_revision > 0
+                && self.window_sequence > 0
+                && self.live_generation > 0
+                && !self.presenting_connection.is_empty()
+                && self
+                    .current_live_generation
+                    .is_some_and(|generation| generation > 0)
+                && self.current_presenting_connection.is_some() =>
+            {
+                bridge_owner_component(&self.presenting_connection, "owner_connection")?;
+                bridge_owner_component(
+                    self.current_presenting_connection.as_deref().ok_or(
+                        OrsError::InvalidField {
+                            field: "recovery_window.current_presenting_connection",
+                            reason: "v3 windows retain their current presenter",
+                        },
+                    )?,
+                    "owner_connection",
+                )?;
                 if self.window_key != Self::key_for(self) {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "bridge_event_recovery_window",
@@ -1848,10 +1903,147 @@ impl BridgeEventRecoveryWindowRow {
         );
         crate::model::sha256_hex(material.as_bytes())
     }
+
+    fn current_live_generation(&self) -> Option<u64> {
+        match self.version {
+            2 => Some(self.live_generation),
+            3 => self.current_live_generation,
+            _ => None,
+        }
+    }
+
+    fn current_presenting_connection(&self) -> Option<&str> {
+        match self.version {
+            2 => Some(&self.presenting_connection),
+            3 => self.current_presenting_connection.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn current_presentation_matches(&self, generation: u64, connection: &str) -> bool {
+        self.current_live_generation() == Some(generation)
+            && self.current_presenting_connection() == Some(connection)
+    }
 }
 
 impl persistence_codec::PersistedValue for BridgeEventRecoveryWindowRow {
     const RECORD_TYPE: &'static str = "bridge_event_recovery_window";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Bounded owner-scoped evidence for one expired or explicitly moved window
+/// after cleanup. The continuation secret is deliberately absent; the stored
+/// disposition and immutable row preserve the original no-facts status shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventRecoveryExpiryEvidence {
+    version: u16,
+    window: BridgeEventRecoveryWindowRow,
+    evidence_until_ms: u64,
+    #[serde(default = "bridge_recovery_expiry_disposition")]
+    disposition: BridgeRecoveryWindowDisposition,
+}
+
+fn bridge_recovery_expiry_disposition() -> BridgeRecoveryWindowDisposition {
+    BridgeRecoveryWindowDisposition::Expired
+}
+
+impl BridgeEventRecoveryExpiryEvidence {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.version != 1
+            || self.window.continuation_secret.is_some()
+            || self.disposition == BridgeRecoveryWindowDisposition::Active
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence version or secret-retention rule is invalid".to_owned(),
+            });
+        }
+        self.window.validate()?;
+        if self.window.owner_scope_digest
+            != RedbRecoveryStore::bridge_owner_scope_digest(
+                &self.window.authority_lineage,
+                &self.window.principal,
+            )?
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence scope digest does not bind its full owner identity"
+                    .to_owned(),
+            });
+        }
+        let expected_until = self
+            .window
+            .expires_at_ms
+            .checked_add(BRIDGE_RECOVERY_WINDOW_TTL_MS)
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence retention horizon overflows its timestamp".to_owned(),
+            })?;
+        if self
+            .window
+            .stream_list_continuation
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 20 || cursor.parse::<u64>().is_err())
+            || self.evidence_until_ms != expected_until
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence cursor or retention horizon is invalid".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One bounded metadata value holds terminal evidence for at most one TTL.
+/// Natural expirations alone fit the 64-row active-window cap over that
+/// horizon; explicit early refreshes can add pressure, so overflow fails the
+/// write rather than evicting evidence or deleting its source row. Rows are
+/// sorted by window key so duplicates are detected rather than guessed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventRecoveryExpiryEvidenceSet {
+    version: u16,
+    rows: Vec<BridgeEventRecoveryExpiryEvidence>,
+}
+
+impl BridgeEventRecoveryExpiryEvidenceSet {
+    fn empty() -> Self {
+        Self {
+            version: 1,
+            rows: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.version != 1 || self.rows.len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence_set",
+                reason: "expiry evidence set version or row bound is invalid".to_owned(),
+            });
+        }
+        let mut previous_key: Option<&str> = None;
+        for row in &self.rows {
+            row.validate()?;
+            let key = row.window.window_key.as_str();
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence_set",
+                    reason: "expiry evidence keys are duplicate or unsorted".to_owned(),
+                });
+            }
+            previous_key = Some(key);
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventRecoveryExpiryEvidenceSet {
+    const RECORD_TYPE: &'static str = "bridge_recovery_expiry_evidence_set";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -1974,6 +2166,9 @@ impl persistence_codec::PersistedValue for BridgeEventRecoveryRevisionRow {
 enum BridgeRecoveryScopeSelector {
     Open,
     Resume,
+    ResumeWindow {
+        window_key: String,
+    },
     Streams {
         window_key: String,
         after_stream: u64,
@@ -10540,6 +10735,181 @@ impl RedbRecoveryStore {
         Ok(matches)
     }
 
+    fn bridge_recovery_expiry_evidence_set_in(
+        write: &redb::WriteTransaction,
+    ) -> Result<BridgeEventRecoveryExpiryEvidenceSet, OrsError> {
+        let encoded = {
+            let meta = write.open_table(META).map_err(storage)?;
+            let Some(value) = meta
+                .get(BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY)
+                .map_err(storage)?
+            else {
+                return Ok(BridgeEventRecoveryExpiryEvidenceSet::empty());
+            };
+            if value.value().len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE_BYTES {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence_set",
+                    reason: "expiry evidence metadata exceeds its encoded byte bound".to_owned(),
+                });
+            }
+            value.value().to_owned()
+        };
+        decode(&encoded)
+    }
+
+    fn save_bridge_recovery_expiry_evidence_set_in(
+        write: &redb::WriteTransaction,
+        set: &BridgeEventRecoveryExpiryEvidenceSet,
+    ) -> Result<(), OrsError> {
+        set.validate()?;
+        let encoded = encode(set)?;
+        if encoded.len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE_BYTES {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let mut meta = write.open_table(META).map_err(storage)?;
+        if set.rows.is_empty() {
+            meta.remove(BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY)
+                .map_err(storage)?;
+            return Ok(());
+        }
+        meta.insert(BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY, encoded.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    fn retain_bridge_recovery_expiry_evidence_in(
+        write: &redb::WriteTransaction,
+        terminal_windows: &[BridgeEventRecoveryWindowRow],
+        disposition: BridgeRecoveryWindowDisposition,
+        now_ms: u64,
+    ) -> Result<(), OrsError> {
+        if disposition == BridgeRecoveryWindowDisposition::Active {
+            return Err(OrsError::InvalidField {
+                field: "recovery_window.disposition",
+                reason: "terminal evidence records only moved or expired windows",
+            });
+        }
+        let mut set = Self::bridge_recovery_expiry_evidence_set_in(write)?;
+        set.rows.retain(|entry| entry.evidence_until_ms > now_ms);
+        for window in terminal_windows {
+            if disposition == BridgeRecoveryWindowDisposition::Expired
+                && window.expires_at_ms > now_ms
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "cleanup selected a window before its natural expiry".to_owned(),
+                });
+            }
+            // The original row was validated by the cleanup scan. Preserve its
+            // exact public expiry shape and immutable identity, but never keep
+            // the selector-signing secret in post-expiry evidence.
+            let mut window = window.clone();
+            window.continuation_secret = None;
+            let evidence_until_ms = window
+                .expires_at_ms
+                .checked_add(BRIDGE_RECOVERY_WINDOW_TTL_MS)
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "expiry evidence retention horizon overflows its timestamp".to_owned(),
+                })?;
+            if evidence_until_ms <= now_ms {
+                continue;
+            }
+            let evidence = BridgeEventRecoveryExpiryEvidence {
+                version: 1,
+                evidence_until_ms,
+                window,
+                disposition,
+            };
+            evidence.validate()?;
+            match set.rows.binary_search_by(|existing| {
+                existing.window.window_key.cmp(&evidence.window.window_key)
+            }) {
+                Ok(index) if set.rows[index] == evidence => {}
+                Ok(_) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_recovery_expiry_evidence_set",
+                        reason: "one window key resolves to conflicting expiry evidence".to_owned(),
+                    });
+                }
+                Err(index) => set.rows.insert(index, evidence),
+            }
+        }
+        if set.rows.len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Self::save_bridge_recovery_expiry_evidence_set_in(write, &set)
+    }
+
+    fn bridge_recovery_expiry_evidence_for_owner_in(
+        write: &redb::WriteTransaction,
+        lineage: &str,
+        principal: &str,
+        window_key: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Option<BridgeEventRecoveryExpiryEvidence>, OrsError> {
+        let scope = Self::bridge_owner_scope_digest(lineage, principal)?;
+        let set = Self::bridge_recovery_expiry_evidence_set_in(write)?;
+        let mut matches = Vec::new();
+        for evidence in set.rows {
+            let window = &evidence.window;
+            if evidence.disposition == BridgeRecoveryWindowDisposition::Expired
+                && evidence.evidence_until_ms > now_ms
+                && window.expires_at_ms > now_ms
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "expiry evidence was recorded before the window naturally expired"
+                        .to_owned(),
+                });
+            }
+            if window_key.is_some_and(|key| window.window_key != key) {
+                continue;
+            }
+            if window.owner_scope_digest != scope {
+                continue;
+            }
+            if window.authority_lineage != lineage || window.principal != principal {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "scope digest resolves to a different retained owner identity"
+                        .to_owned(),
+                });
+            }
+            if evidence.evidence_until_ms > now_ms {
+                matches.push(evidence);
+            }
+        }
+        if let Some(key) = window_key {
+            if matches.len() > 1 {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence_set",
+                    reason: "one terminal window key has multiple evidence rows".to_owned(),
+                });
+            }
+            if let Some(evidence) = matches.pop() {
+                if evidence.window.window_key != key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_recovery_expiry_evidence_set",
+                        reason: "terminal evidence key differs from requested key".to_owned(),
+                    });
+                }
+                return Ok(Some(evidence));
+            }
+            return Ok(None);
+        }
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        // Keyless Resume cannot identify which historical window it means.
+        // A single retained terminal row can answer; multiple rows require
+        // the exact keyed ResumeWindow selector instead of guessing by age.
+        if matches.len() > 1 {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        Ok(matches.pop())
+    }
+
     /// Explicit Open refresh retires one authenticated window and only its
     /// own bounded cut rows. The old key cannot be continued after this
     /// transaction; v1 cuts are validated for safe deletion but never used
@@ -10547,10 +10917,21 @@ impl RedbRecoveryStore {
     fn retire_bridge_recovery_window_in(
         write: &redb::WriteTransaction,
         window: &BridgeEventRecoveryWindowRow,
+        now_ms: u64,
     ) -> Result<(), OrsError> {
-        if !matches!(window.version, 1 | 2) {
+        if !matches!(window.version, 1..=3) {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
+        Self::retain_bridge_recovery_expiry_evidence_in(
+            write,
+            std::slice::from_ref(window),
+            if window.expires_at_ms <= now_ms {
+                BridgeRecoveryWindowDisposition::Expired
+            } else {
+                BridgeRecoveryWindowDisposition::Moved
+            },
+            now_ms,
+        )?;
         {
             let mut windows = write
                 .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
@@ -10565,11 +10946,14 @@ impl RedbRecoveryStore {
                 || stored.authority_lineage != window.authority_lineage
                 || stored.principal != window.principal
                 || stored.owner_scope_digest != window.owner_scope_digest
-                || (stored.version == 2
+                || (stored.version >= 2
                     && (stored.source_revision != window.source_revision
                         || stored.window_sequence != window.window_sequence
                         || stored.live_generation != window.live_generation
-                        || stored.presenting_connection != window.presenting_connection))
+                        || stored.presenting_connection != window.presenting_connection
+                        || stored.current_live_generation != window.current_live_generation
+                        || stored.current_presenting_connection
+                            != window.current_presenting_connection))
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_event_recovery_window",
@@ -10707,8 +11091,8 @@ impl RedbRecoveryStore {
         principal: &str,
         live_generation: u64,
         presenting_connection: &str,
+        now_ms: u64,
     ) -> Result<BridgeEventRecoveryWindowRow, OrsError> {
-        let now_ms = current_unix_ms_u64()?;
         let scope = Self::bridge_owner_scope_digest(lineage, principal)?;
         let expired = {
             let windows = write
@@ -10729,21 +11113,35 @@ impl RedbRecoveryStore {
                     });
                 }
                 if row.expires_at_ms <= now_ms {
-                    expired.push(row.window_key);
+                    expired.push(row);
                 }
             }
             expired
         };
+        // Evidence retention and window/cut cleanup share this transaction.
+        // If the bounded set cannot retain a natural expiry, Open fails
+        // without deleting its source row. Prune elapsed evidence even when
+        // this Open has no expired live rows to clean up.
+        Self::retain_bridge_recovery_expiry_evidence_in(
+            write,
+            &expired,
+            BridgeRecoveryWindowDisposition::Expired,
+            now_ms,
+        )?;
         if !expired.is_empty() {
+            let expired_keys: Vec<String> = expired
+                .iter()
+                .map(|window| window.window_key.clone())
+                .collect();
             {
                 let mut windows = write
                     .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
                     .map_err(storage)?;
-                for key in &expired {
+                for key in &expired_keys {
                     windows.remove(key.as_str()).map_err(storage)?;
                 }
             }
-            let prefixes: Vec<String> = expired.iter().map(|key| format!("{key}::")).collect();
+            let prefixes: Vec<String> = expired_keys.iter().map(|key| format!("{key}::")).collect();
             let cut_keys = {
                 let cuts = write
                     .open_table(BRIDGE_EVENT_RECOVERY_CUTS)
@@ -10776,10 +11174,9 @@ impl RedbRecoveryStore {
         }
         let reusable = existing.into_iter().find(|row| row.expires_at_ms > now_ms);
         if let Some(window) = &reusable {
-            if window.version != 2
+            if !matches!(window.version, 2 | 3)
                 || window.continuation_secret.is_none()
-                || window.live_generation != live_generation
-                || window.presenting_connection != presenting_connection
+                || !window.current_presentation_matches(live_generation, presenting_connection)
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
@@ -10827,7 +11224,7 @@ impl RedbRecoveryStore {
             Self::bridge_recovery_window_denominators_in(write, &scope, cutoff)?;
         let expires_at_ms = now_ms.saturating_add(BRIDGE_RECOVERY_WINDOW_TTL_MS);
         let mut row = BridgeEventRecoveryWindowRow {
-            version: 2,
+            version: 3,
             window_key: String::new(),
             continuation_secret: Some(format!(
                 "{}{}",
@@ -10841,6 +11238,8 @@ impl RedbRecoveryStore {
             window_sequence: sequence,
             live_generation,
             presenting_connection: presenting_connection.to_owned(),
+            current_live_generation: Some(live_generation),
+            current_presenting_connection: Some(presenting_connection.to_owned()),
             owner_cutoff: cutoff,
             stream_list_total,
             unscoped_gap_total,
@@ -11019,6 +11418,11 @@ impl RedbRecoveryStore {
         };
         match selector {
             BridgeRecoverySelector::Resume { .. } => Ok(BridgeRecoveryScopeSelector::Resume),
+            BridgeRecoverySelector::ResumeWindow { window_key, .. } => {
+                Ok(BridgeRecoveryScopeSelector::ResumeWindow {
+                    window_key: window_key.clone(),
+                })
+            }
             BridgeRecoverySelector::Streams {
                 window_key,
                 after_stream,
@@ -11112,7 +11516,9 @@ impl RedbRecoveryStore {
         selector: &BridgeRecoverySelector,
     ) -> Result<(), OrsError> {
         let provided = match selector {
-            BridgeRecoverySelector::Resume { .. } => return Err(OrsError::RecoveryOwnerMismatch),
+            BridgeRecoverySelector::Resume { .. } | BridgeRecoverySelector::ResumeWindow { .. } => {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            }
             BridgeRecoverySelector::Streams {
                 continuation_proof, ..
             }
@@ -12027,7 +12433,12 @@ impl RedbRecoveryStore {
             stream_pages_pending: true,
             unproven_scope_present,
         };
-        let mut stream_pages = streams.to_vec();
+        let terminal = disposition != BridgeRecoveryWindowDisposition::Active;
+        let mut stream_pages = if terminal {
+            Vec::new()
+        } else {
+            streams.to_vec()
+        };
         for page in &mut stream_pages {
             let object = page
                 .as_object_mut()
@@ -12047,7 +12458,9 @@ impl RedbRecoveryStore {
             "window_disposition_reason": disposition.reason(),
             "selected_scope": selected_scope,
             "stream_list_complete": false,
-            "stream_list_continuation": window.stream_list_continuation,
+            "stream_list_continuation": if terminal { serde_json::Value::Null } else {
+                window.stream_list_continuation.clone().map_or(serde_json::Value::Null, serde_json::Value::String)
+            },
             "stream_list_proof": serde_json::Value::Null,
             "stream_list_total": window.stream_list_total,
             "unscoped_gaps_complete": false,
@@ -12057,10 +12470,24 @@ impl RedbRecoveryStore {
             "unscoped_gap_capacity": serde_json::Value::Null,
             "unresolved_frontier": unresolved,
             "streams": stream_pages,
-            "unscoped_gaps": unscoped_gaps,
+            "unscoped_gaps": if terminal { &[] } else { unscoped_gaps },
             "unproven_scope_present": unproven_scope_present,
         });
-        if window.version == 2 {
+        if window.version >= 2 {
+            let current_live_generation =
+                window
+                    .current_live_generation()
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_window",
+                        reason: "terminal window has no current generation".to_owned(),
+                    })?;
+            let current_presenting_connection =
+                window
+                    .current_presenting_connection()
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_window",
+                        reason: "terminal window has no current presenter".to_owned(),
+                    })?;
             let object = response
                 .as_object_mut()
                 .ok_or(OrsError::ProjectionLimitExceeded)?;
@@ -12070,11 +12497,11 @@ impl RedbRecoveryStore {
             );
             object.insert(
                 "window_live_generation".to_owned(),
-                serde_json::Value::from(window.live_generation),
+                serde_json::Value::from(current_live_generation),
             );
             object.insert(
                 "window_presenting_connection".to_owned(),
-                serde_json::Value::String(window.presenting_connection.clone()),
+                serde_json::Value::String(current_presenting_connection.to_owned()),
             );
         }
         Self::bridge_recovery_seal_reply(
@@ -16333,7 +16760,7 @@ impl RedbRecoveryStore {
             .unwrap_or(serde_json::Value::Null);
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
-        let (mut window, opening) = match &selector {
+        let (mut window, mut opening) = match &selector {
             BridgeRecoveryScopeSelector::Open => {
                 let matches =
                     Self::bridge_recovery_windows_for_owner_in(&write, &lineage, &principal)?;
@@ -16346,10 +16773,10 @@ impl RedbRecoveryStore {
                 }
                 if let Some(window) = first_active {
                     if window.version == 1 {
-                        Self::retire_bridge_recovery_window_in(&write, &window)?;
+                        Self::retire_bridge_recovery_window_in(&write, &window, now_ms)?;
                     } else {
-                        let incompatible = window.live_generation != live_generation
-                            || window.presenting_connection != presenting_connection
+                        let incompatible = !window
+                            .current_presentation_matches(live_generation, &presenting_connection)
                             || window.continuation_secret.is_none()
                             || window.source_revision
                                 != Self::bridge_recovery_source_revision_in(
@@ -16357,7 +16784,7 @@ impl RedbRecoveryStore {
                                     &window.owner_scope_digest,
                                 )?;
                         if incompatible {
-                            Self::retire_bridge_recovery_window_in(&write, &window)?;
+                            Self::retire_bridge_recovery_window_in(&write, &window, now_ms)?;
                         }
                     }
                 }
@@ -16368,6 +16795,7 @@ impl RedbRecoveryStore {
                         &principal,
                         live_generation,
                         &presenting_connection,
+                        now_ms,
                     )?,
                     true,
                 )
@@ -16375,29 +16803,63 @@ impl RedbRecoveryStore {
             BridgeRecoveryScopeSelector::Resume => {
                 let mut matches =
                     Self::bridge_recovery_windows_for_owner_in(&write, &lineage, &principal)?;
+                if matches.is_empty() {
+                    if let Some(evidence) = Self::bridge_recovery_expiry_evidence_for_owner_in(
+                        &write, &lineage, &principal, None, now_ms,
+                    )? {
+                        drop(write);
+                        return Self::bridge_recovery_typed_reply(
+                            &evidence.window,
+                            evidence.disposition,
+                            recovery_scope,
+                            &selected_scope,
+                            None,
+                            &[],
+                            &[],
+                        );
+                    }
+                    return Err(OrsError::RecoveryOwnerMismatch);
+                }
                 if matches.len() != 1 {
                     return Err(OrsError::RecoveryOwnerMismatch);
                 }
                 (matches.remove(0), false)
             }
-            BridgeRecoveryScopeSelector::Streams { window_key, .. }
+            BridgeRecoveryScopeSelector::ResumeWindow { window_key }
+            | BridgeRecoveryScopeSelector::Streams { window_key, .. }
             | BridgeRecoveryScopeSelector::Stream { window_key, .. }
-            | BridgeRecoveryScopeSelector::UnscopedGaps { window_key, .. } => (
-                Self::load_bridge_recovery_window_in(&write, window_key, &lineage, &principal)?
-                    .ok_or(OrsError::RecoveryOwnerMismatch)?,
-                false,
-            ),
+            | BridgeRecoveryScopeSelector::UnscopedGaps { window_key, .. } => {
+                let Some(window) =
+                    Self::load_bridge_recovery_window_in(&write, window_key, &lineage, &principal)?
+                else {
+                    if let Some(evidence) = Self::bridge_recovery_expiry_evidence_for_owner_in(
+                        &write,
+                        &lineage,
+                        &principal,
+                        Some(window_key),
+                        now_ms,
+                    )? {
+                        drop(write);
+                        return Self::bridge_recovery_typed_reply(
+                            &evidence.window,
+                            evidence.disposition,
+                            recovery_scope,
+                            &selected_scope,
+                            None,
+                            &[],
+                            &[],
+                        );
+                    }
+                    return Err(OrsError::RecoveryOwnerMismatch);
+                };
+                (window, false)
+            }
         };
-        if window.version == 1 {
-            let disposition = if window.expires_at_ms <= now_ms {
-                BridgeRecoveryWindowDisposition::Expired
-            } else {
-                BridgeRecoveryWindowDisposition::Moved
-            };
+        if window.expires_at_ms <= now_ms {
             drop(write);
             return Self::bridge_recovery_typed_reply(
                 &window,
-                disposition,
+                BridgeRecoveryWindowDisposition::Expired,
                 recovery_scope,
                 &selected_scope,
                 None,
@@ -16405,11 +16867,29 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if window.version != 2
-            || window.live_generation != live_generation
-            || window.presenting_connection != presenting_connection
-        {
-            return Err(OrsError::RecoveryOwnerMismatch);
+        if window.version == 1 {
+            drop(write);
+            return Self::bridge_recovery_typed_reply(
+                &window,
+                BridgeRecoveryWindowDisposition::Moved,
+                recovery_scope,
+                &selected_scope,
+                None,
+                &[],
+                &[],
+            );
+        }
+        if !matches!(window.version, 2 | 3) {
+            drop(write);
+            return Self::bridge_recovery_typed_reply(
+                &window,
+                BridgeRecoveryWindowDisposition::Moved,
+                recovery_scope,
+                &selected_scope,
+                None,
+                &[],
+                &[],
+            );
         }
         if matches!(
             selector,
@@ -16423,21 +16903,11 @@ impl RedbRecoveryStore {
             // the only persisted signing authority and no cursor ledger exists.
             Self::verify_bridge_recovery_selector_proof(&window, recovery_scope)?;
         }
-        if window.expires_at_ms <= now_ms {
-            drop(write);
-            return Self::bridge_recovery_typed_reply(
-                &window,
-                BridgeRecoveryWindowDisposition::Expired,
-                recovery_scope,
-                &selected_scope,
-                None,
-                &[],
-                &[],
-            );
-        }
-        if matches!(selector, BridgeRecoveryScopeSelector::Resume)
-            && window.continuation_secret.is_none()
-        {
+        let is_resume = matches!(
+            selector,
+            BridgeRecoveryScopeSelector::Resume | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+        );
+        if is_resume && window.continuation_secret.is_none() {
             drop(write);
             return Self::bridge_recovery_typed_reply(
                 &window,
@@ -16463,12 +16933,37 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
+        if !window.current_presentation_matches(live_generation, &presenting_connection) {
+            if is_resume {
+                // Rebinding changes only the current authenticated presenter.
+                // The issuer fields remain in the stable v2 key preimage, and
+                // cuts plus selector secret remain intact so a lost Resume
+                // reply can be retried idempotently.
+                window.version = 3;
+                window.current_live_generation = Some(live_generation);
+                window.current_presenting_connection = Some(presenting_connection.clone());
+                opening = true;
+            } else {
+                drop(write);
+                return Self::bridge_recovery_typed_reply(
+                    &window,
+                    BridgeRecoveryWindowDisposition::Moved,
+                    recovery_scope,
+                    &selected_scope,
+                    None,
+                    &[],
+                    &[],
+                );
+            }
+        }
 
         let mut stream_owners: Vec<(BridgeStreamOwnerRow, u64)> = Vec::new();
         let mut requested_stream: Option<(u64, u64, u64, usize, usize, usize)> = None;
         let mut requested_gap: Option<(usize, usize)> = None;
         match &selector {
-            BridgeRecoveryScopeSelector::Open | BridgeRecoveryScopeSelector::Resume => {
+            BridgeRecoveryScopeSelector::Open
+            | BridgeRecoveryScopeSelector::Resume
+            | BridgeRecoveryScopeSelector::ResumeWindow { .. } => {
                 let page = Self::bridge_recovery_owner_page_in(
                     &write,
                     &window,
@@ -16602,7 +17097,11 @@ impl RedbRecoveryStore {
             .next(),
         };
         if let Some((owner, _)) = &gap_owner_for_page {
-            if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
+            if matches!(
+                selector,
+                BridgeRecoveryScopeSelector::Resume
+                    | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+            ) {
                 Self::load_bridge_recovery_cut_in(&write, &window.window_key, &owner.namespace)?
                     .ok_or(OrsError::RecoveryOwnerMismatch)?;
             } else {
@@ -16610,7 +17109,11 @@ impl RedbRecoveryStore {
             }
         }
         for (owner, _) in &stream_owners {
-            if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
+            if matches!(
+                selector,
+                BridgeRecoveryScopeSelector::Resume
+                    | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+            ) {
                 Self::load_bridge_recovery_cut_in(&write, &window.window_key, &owner.namespace)?
                     .ok_or(OrsError::RecoveryOwnerMismatch)?;
             } else {
@@ -16643,12 +17146,13 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if read_window.version != 2
+        if !matches!(read_window.version, 2 | 3)
             || read_window.source_revision
                 != Self::bridge_recovery_source_revision_for(
                     &read,
                     &read_window.owner_scope_digest,
                 )?
+            || !read_window.current_presentation_matches(live_generation, &presenting_connection)
         {
             return Self::bridge_recovery_typed_reply(
                 &read_window,
@@ -16662,7 +17166,9 @@ impl RedbRecoveryStore {
         }
         if matches!(
             selector,
-            BridgeRecoveryScopeSelector::Resume | BridgeRecoveryScopeSelector::Streams { .. }
+            BridgeRecoveryScopeSelector::Resume
+                | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+                | BridgeRecoveryScopeSelector::Streams { .. }
         ) {
             // Resume re-derives the deterministic first outer page, while a
             // Streams reply projects only that selector's page frontier. Both
@@ -16966,8 +17472,8 @@ impl RedbRecoveryStore {
             "window_identity_version": read_window.version,
             "expires_at_ms": read_window.expires_at_ms,
             "window_source_revision": read_window.source_revision,
-            "window_live_generation": read_window.live_generation,
-            "window_presenting_connection": read_window.presenting_connection,
+            "window_live_generation": live_generation,
+            "window_presenting_connection": presenting_connection,
             "window_status": "active",
             "window_disposition": BridgeRecoveryWindowDisposition::Active,
             "window_disposition_reason": BridgeRecoveryWindowDisposition::Active.reason(),
