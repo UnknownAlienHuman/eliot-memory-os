@@ -28,13 +28,13 @@ Evidence discipline
 
 Honest limits, stated up front
 ------------------------------
-``cargo check``/``cargo clippy -D warnings`` do not currently pass on this base
-(there are pre-existing hard compile errors in
-``crates/meta/eliot-learning-activation-assessment/tests/` and
-``bins/eliotd`, ``bins/eliot-agent-bridge``, ``crates/governor/eliot-authority``
-and ``crates/kernel/eliot-kernel-service`` test targets). Cases 30, 31 and 32
-therefore assert the real requirement and FAIL until those owners land. That
-is the intended signal; this suite must not be rigged to report green.
+Cases 29, 30, 31 and 32 assert the gates the issue names and nothing weaker:
+``cargo fmt --all -- --check``, ``cargo check --locked --workspace
+--all-targets``, ``cargo clippy --locked --workspace --all-targets -- -D
+warnings``, and a second identical clippy run. On a base that is not clean
+those cases FAIL. That is the intended signal; this suite must not be rigged to
+report green, and it must not pre-declare a crate as broken either — whatever
+the run measures is what the ledger records.
 """
 
 from __future__ import annotations
@@ -182,6 +182,15 @@ CAPTURE_WORKSPACE = [
 ]
 SECOND_CAPTURE_WORKSPACE = CAPTURE_WORKSPACE  # identical source/tool/config
 
+# The exact gates the issue's verification block names. They are literals here
+# so the cases can assert that the command that actually ran is the required
+# one, instead of comparing a literal with itself.
+FMT_CMD = ["cargo", "fmt", "--all", "--", "--check"]
+CHECK_CMD = ["cargo", "check", "--locked", "--workspace", "--all-targets"]
+DENY_CMD = [
+    "cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings",
+]
+
 
 # ---------------------------------------------------------------------------
 # Small helpers.
@@ -193,7 +202,21 @@ def sha256_text(text: str) -> str:
 
 
 def repo_rel(path: str) -> str:
-    return path.replace("\\", "/").split("W2-838/")[-1].split("M-W2/")[-1]
+    """Normalise a diagnostic path to a repository-relative POSIX path.
+
+    Cargo normally emits workspace-relative paths, but rustc may report an
+    absolute one (a build script, an out-of-tree invocation, or a different
+    working directory). Both forms are reduced to the same spelling here so
+    the frozen path literals in this module match from any checkout, not only
+    from a worktree with a particular directory name.
+    """
+    value = path.replace("\\", "/")
+    root = REPO_ROOT.as_posix().rstrip("/") + "/"
+    if value.startswith(root):
+        return value[len(root):]
+    if os.path.isabs(value) and os.path.exists(value):
+        return os.path.relpath(value, REPO_ROOT).replace("\\", "/")
+    return value
 
 
 def git(*args: str) -> str:
@@ -208,13 +231,15 @@ def git(*args: str) -> str:
 
 
 def run_capture(argv: list[str], timeout: int = 5400) -> tuple[int, str, str]:
-    env = dict(os.environ)
-    env.setdefault("CARGO_INCREMENTAL", "0")
-    env.setdefault(
-        "CARGO_TARGET_DIR", r"C:\Development\Rust\projects\eliot-swarm\targets\W2"
-    )
+    """Run one command and return (exit, stdout, stderr).
+
+    The ambient Cargo environment is inherited rather than pinned: this suite
+    never chooses a build directory for the operator. CARGO_INCREMENTAL is
+    left alone too, because a caller that deliberately shares a target
+    directory across worktrees owns that decision.
+    """
     proc = subprocess.run(
-        argv, cwd=REPO_ROOT, capture_output=True, text=True, check=False, env=env, timeout=timeout
+        argv, cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=timeout
     )
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -317,6 +342,38 @@ def code_with_comments_removed(text: str) -> str:
     return re.sub(r"/\*.*?\*/", "", stripped, flags=re.S)
 
 
+_ITEM_SURFACE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
+    r"(?:default\s+)?(?:const\s+|async\s+|unsafe\s+|extern\s+\"[^\"]*\"\s+)*"
+    r"(fn|struct|enum|trait|type|const|static|mod|union|macro_rules!)\s+([A-Za-z_]\w*)"
+)
+_USE_SURFACE = re.compile(
+    r"^\s*(?:pub\s+)?use\s+[^;]+;")
+
+
+def _is_comment_or_blank(line: str) -> bool:
+    stripped = line.strip()
+    return not stripped or stripped.startswith(("//", "/*", "*", "*/"))
+
+
+def _item_surface(text: str) -> list[str]:
+    """Declared item and import surface of a Rust file, comments removed.
+
+    A documentation rewrite is invisible here. A code correction may replace
+    the body of a function but must not add, remove or rename a declared item
+    or an import: that is the API/wire/cfg/Serde boundary cases 10 and 27
+    police from the other side.
+    """
+    surface: list[str] = []
+    for line in code_with_comments_removed(text).splitlines():
+        declared = _ITEM_SURFACE.match(line)
+        if declared:
+            surface.append("decl %s %s" % (declared.group(1), declared.group(2)))
+        elif _USE_SURFACE.match(line):
+            surface.append("use " + line.strip())
+    return surface
+
+
 # ---------------------------------------------------------------------------
 # The acceptance oracle. Every validator returns a list of violation strings;
 # an empty list means "accepted". Cases assert the real evidence is accepted
@@ -367,6 +424,24 @@ def validate_row(row: dict, *, scope: str) -> list[str]:
             bad.append("argument-count reason is re-derivable from configuration")
     if row["disposition"] == "ALREADY_RESOLVED_CURRENT_EVIDENCE" and not row.get("reachability"):
         bad.append("an already-resolved disposition requires the current reachability evidence")
+    # Case 15: expect/unwrap may only be absorbed at a real diagnostic
+    # assertion boundary inside a test span. A production `unwrap()` has no
+    # assertion boundary to preserve, and a reason that never names one is a
+    # swallowed result, not a preserved assertion.
+    if row["lint"] in ("clippy::expect_used", "clippy::unwrap_used") and row["disposition"] in (
+        "ACCEPTED_NARROW_EXPECTATION",
+        "FIXED_ITEM_EXPECTATION",
+    ):
+        if row["target_class"] != "test":
+            bad.append(
+                "expect/unwrap may only be annotated at a test assertion boundary, not on a %s row"
+                % row["target_class"]
+            )
+        if not _reason_names_assertion_boundary(row.get("reason", "")):
+            bad.append(
+                "an expect/unwrap expectation must name the diagnostic assertion boundary it "
+                "preserves, not a swallowed Result: %r" % row.get("reason")
+            )
     if _reachability_is_test_only(row.get("reachability", "")) and row["disposition"] == "ALREADY_RESOLVED_CURRENT_EVIDENCE":
         bad.append("a unit test is not a production caller and cannot prove reachability")
     if _reachability_is_test_only(row.get("reachability", "")) and row["target_class"] == "production":
@@ -427,6 +502,23 @@ def _reachability_is_test_only(reachability: str) -> bool:
     return "/tests/" in value or value.startswith("tests/") or "_tests.rs" in value
 
 
+def _reason_names_assertion_boundary(reason: str) -> bool:
+    """True when the reason names a real diagnostic assertion boundary."""
+    lowered = " ".join(str(reason or "").lower().split())
+    return any(
+        token in lowered
+        for token in (
+            "assert",
+            "assertion",
+            "panic",
+            "diagnostic",
+            "unreachable",
+            "test boundary",
+            "negative control",
+        )
+    )
+
+
 def validate_row_set(rows: list[dict], *, expected_keys: set[str] | None = None) -> list[str]:
     bad: list[str] = []
     for row in rows:
@@ -477,6 +569,20 @@ def validate_stderr_additions(added: list[str]) -> list[str]:
         for line in added
         if "eprintln!" in line or "print_stderr" in line
     ]
+
+
+def validate_added_lines_record(record: dict) -> list[str]:
+    """Adapter for a fixture mutation whose record wraps the added lines.
+
+    Without this the validator would iterate the record's *keys* and reject
+    nothing, which would turn every added-line negative control into a vacuous
+    pass. The adapter is explicit so the shape mismatch cannot hide again.
+    """
+    return validate_added_lines(record["added_lines"])
+
+
+def validate_stderr_additions_record(record: dict) -> list[str]:
+    return validate_stderr_additions(record["added_lines"])
 
 
 def validate_unwired_annotation(row: dict, proven_owners: frozenset[str]) -> list[str]:
@@ -579,6 +685,7 @@ class ClippyBaselineAcceptance(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
         cls.mutations = cls.fixture["mutations"]
+        cls.controls = cls.fixture["controls"]
 
         # --- source / toolchain / lock / workspace identity -----------------
         cls.toolchain_file = (REPO_ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
@@ -686,15 +793,12 @@ class ClippyBaselineAcceptance(unittest.TestCase):
         ]
 
         # --- gates ----------------------------------------------------------
-        cls.fmt_exit, cls.fmt_stdout, cls.fmt_stderr = run_capture(
-            ["cargo", "fmt", "--all", "--", "--check"], timeout=900
-        )
-        cls.check_exit, cls.check_stdout, cls.check_stderr = run_capture(
-            ["cargo", "check", "--locked", "--workspace", "--all-targets"]
-        )
-        cls.deny_exit, cls.deny_stdout, cls.deny_stderr = run_capture(
-            ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]
-        )
+        cls.fmt_cmd = list(FMT_CMD)
+        cls.check_cmd = list(CHECK_CMD)
+        cls.deny_cmd = list(DENY_CMD)
+        cls.fmt_exit, cls.fmt_stdout, cls.fmt_stderr = run_capture(cls.fmt_cmd, timeout=900)
+        cls.check_exit, cls.check_stdout, cls.check_stderr = run_capture(cls.check_cmd)
+        cls.deny_exit, cls.deny_stdout, cls.deny_stderr = run_capture(cls.deny_cmd)
 
         # --- the required second Clippy run, once ---------------------------
         cls.second_cmd = SECOND_CAPTURE_WORKSPACE
@@ -950,12 +1054,19 @@ class ClippyBaselineAcceptance(unittest.TestCase):
             "validator; the oracle has a hole" % name,
         )
 
-    def assertMutationAccepted(self, name: str, validator, *args, **kwargs) -> None:
-        record = self.mutations[name]["record"]
+    def assertControlAccepted(self, name: str, validator, *args, **kwargs) -> None:
+        """A positive control the oracle must accept.
+
+        A suite of negative controls alone can pass with an oracle that rejects
+        everything. This control is a well-formed row, so if the validators ever
+        start rejecting valid accounting the suite says so instead of quietly
+        proving nothing.
+        """
+        record = self.controls[name]["record"]
         self.assertEqual(
             [],
             validator(record, *args, **kwargs),
-            "control mutation %r was rejected; the negative set is over-broad" % name,
+            "control %r was rejected; the negative set is over-broad" % name,
         )
 
     def assertHasMethod(self, proof: str) -> None:
@@ -1017,7 +1128,13 @@ class ClippyBaselineAcceptance(unittest.TestCase):
             sum(self.record_reasons.values()), len(self.workspace_records),
             "every record is accounted for in the reason histogram",
         )
-        # A truncated stream must be rejected by the same parser.
+        # A truncated stream must be rejected by the same parser. The mutation
+        # is declared as runtime-produced rather than authored evidence, so the
+        # case slices the live capture instead of shipping a canned stream.
+        self.assertIn("truncated_stream", self.mutations)
+        self.assertIn(
+            "not authored evidence", self.mutations["truncated_stream"]["record"]["note"]
+        )
         truncated = self.workspace_stdout[: len(self.workspace_stdout) // 2]
         with self.assertRaises(ValueError):
             parse_clippy_stream(truncated)
@@ -1081,6 +1198,8 @@ class ClippyBaselineAcceptance(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)), "each warning maps to exactly one row")
         self.assertMutationRejected("row_lint_missing", validate_row, scope="row")
         self.assertMutationRejected("row_disposition_unknown", validate_row, scope="row")
+        # The negative set must not be over-broad: a well-formed row is accepted.
+        self.assertControlAccepted("valid_row", validate_row, scope="row")
 
     # -- 5 ---------------------------------------------------------------
     # WORK_UNIT_CASE: 838/5
@@ -1107,19 +1226,54 @@ class ClippyBaselineAcceptance(unittest.TestCase):
     # -- 6 ---------------------------------------------------------------
     # WORK_UNIT_CASE: 838/6
     def test_06_documentation_correction_preserves_production_tokens(self) -> None:
-        doc_changed = [
-            path
-            for path, before in self.base_source.items()
-            if before and before != self.head_source.get(path, "")
-        ]
-        for path in doc_changed:
-            before, after = self.base_source[path], self.head_source[path]
-            lost = production_tokens(before) - production_tokens(after)
-            gained = production_tokens(after) - production_tokens(before)
-            self.assertFalse(
-                lost - gained,
-                "a correction in %s removed production tokens %r" % (path, sorted(lost - gained)),
+        """A comment rewrite may not consume production code.
+
+        The invariant is measured on the real delta, not assumed. Every changed
+        file is split into its comment text and its comment-stripped code and
+        the two are classified independently:
+
+        * a *documentation* correction changes comments only, so its code token
+          set must be exactly the base's;
+        * a *code* correction may legitimately drop the token it replaces (this
+          branch drops ``unwrap_or_else`` and a closure binding), so the
+          invariant that binds it is the declared item surface - every imported
+          or declared item name must survive.
+
+        A documentation correction that ate a production token would break the
+        first rule, which is what the negative control below models.
+        """
+        comment_corrections: list[str] = []
+        code_corrections: list[str] = []
+        for path in self.rust_paths:
+            before, after = self.base_source.get(path, ""), self.head_source.get(path, "")
+            if not before or before == after:
+                continue
+            added, _ = changed_lines(self.file_diffs[path])
+            if all(_is_comment_or_blank(line) for line in added):
+                comment_corrections.append(path)
+                self.assertEqual(
+                    production_tokens(code_with_comments_removed(before)),
+                    production_tokens(code_with_comments_removed(after)),
+                    "the documentation correction in %s also changed production code" % path,
+                )
+                continue
+            code_corrections.append(path)
+            self.assertEqual(
+                _item_surface(before),
+                _item_surface(after),
+                "a code correction in %s changed the declared item surface" % path,
             )
+        # The measured fact on this branch: every correction is a code
+        # correction, so the documentation rule has no live instance here and
+        # is proved by the negative control rather than by a vacuous pass.
+        self.assertEqual(
+            [], comment_corrections,
+            "a documentation correction appeared in the delta (%r); the documentation rule must "
+            "then be applied to it explicitly" % (comment_corrections,),
+        )
+        self.assertTrue(
+            code_corrections, "this branch made at least one code correction to measure"
+        )
         mutation = self.mutations["doc_correction_drops_production_token"]["record"]
         dropped = set(mutation["before_production_tokens"]) - set(mutation["after_production_tokens"])
         self.assertTrue(dropped, "the doc-drop mutation must actually drop a production token")
@@ -1213,7 +1367,7 @@ class ClippyBaselineAcceptance(unittest.TestCase):
                     before.count(token), after.count(token),
                     "%s changed the count of %r" % (path, token),
                 )
-        self.assertMutationRejected("api_wire_change", validate_added_lines)
+        self.assertMutationRejected("api_wire_change", validate_added_lines_record)
 
     # -- 11 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/11
@@ -1227,12 +1381,19 @@ class ClippyBaselineAcceptance(unittest.TestCase):
             )
         self.assertNotIn("--exclude", self.capture_cmd)
         self.assertNotIn("--no-deps", self.capture_cmd, "the required workspace capture must not exclude dependencies")
+        # The executed command is the exact command the issue names, not a
+        # variant of it and not a literal compared with itself.
         self.assertEqual(
             ["cargo", "check", "--locked", "--workspace", "--all-targets"],
-            ["cargo", "check", "--locked", "--workspace", "--all-targets"],
+            self.check_cmd,
             "the check gate is the exact command the issue names",
         )
-        self.assertMutationRejected("warning_downgrade", validate_added_lines)
+        self.assertEqual(
+            ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"],
+            self.deny_cmd,
+            "the clippy gate is the exact command the issue names",
+        )
+        self.assertMutationRejected("warning_downgrade", validate_added_lines_record)
 
     # -- 12 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/12
@@ -1244,8 +1405,8 @@ class ClippyBaselineAcceptance(unittest.TestCase):
             before_allow = re.findall(r"#!\s*\[\s*allow", before)
             after_allow = re.findall(r"#!\s*\[\s*allow", after)
             self.assertEqual(before_allow, after_allow, "%s added a crate/module-level allow" % path)
-        self.assertMutationRejected("broad_workspace_suppression", validate_added_lines)
-        self.assertMutationRejected("secret_canary", validate_added_lines)
+        self.assertMutationRejected("broad_workspace_suppression", validate_added_lines_record)
+        self.assertMutationRejected("secret_canary", validate_added_lines_record)
 
     # -- 13 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/13
@@ -1290,22 +1451,53 @@ class ClippyBaselineAcceptance(unittest.TestCase):
     # -- 15 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/15
     def test_15_assertion_expect_unwrap_still_fails_on_its_negative(self) -> None:
-        # The suite's own negative controls must actually fail, not be vacuous.
-        probe = self.mutations["clean_control_source"]
-        self.assertNotIn("unrelated_dead_probe", probe)
-        with self.assertRaises(AssertionError):
-            self.assertEqual(1, 2, "control: unittest must be able to fail")
-        self.assertIsInstance(self.in_scope_ownable, list)
-        expect_rows = [r for r in self.ledger if r["lint"] in ("clippy::expect_used", "clippy::unwrap_used")]
-        for row in expect_rows:
-            self.assertTrue(row["disposition"] in VALID_DISPOSITIONS)
-            self.assertTrue(row["focused_proof"])
-        # A mutation that turns an assertion boundary into a swallowed result
-        # must be rejected.
-        self.assertMutationRejected(
-            "row_no_focused_proof",
-            validate_row,
-            scope="row",
+        """An expect/unwrap allowance must sit on a real, still-failing gate.
+
+        Two halves, both measured. First, the real lint gate: the fixture's
+        clean control module compiles under ``-D warnings`` and the same module
+        with one unrelated dead item does not, so the gate the negative cases
+        rely on actually has teeth. Second, the oracle: a row that absorbs
+        ``expect_used``/``unwrap_used`` outside a test assertion boundary, with
+        a reason that names no assertion, is rejected by the same
+        :func:`validate_row` applied to real evidence. A swallowed ``Result``
+        is therefore not acceptable accounting.
+        """
+        clean = self.rustc_probe["clean_control"]
+        dead = self.rustc_probe["dead_function"]
+        self.assertEqual(
+            0, clean["exit"], "the control module must compile clean under -D warnings: %s" % clean["stderr"]
+        )
+        self.assertNotEqual(
+            0, dead["exit"],
+            "the real gate must fail on an unrelated dead item, otherwise the negative cases "
+            "below are asserting against a gate that never fires",
+        )
+        # The probes are the fixture's real-gate sources, not authored copies
+        # of a previous run's output.
+        self.assertNotIn("unrelated_dead_probe", self.fixture["real_gate_probes"]["clean_control_source"])
+        self.assertIn("unrelated_dead_probe", self.fixture["real_gate_probes"]["dead_function_source"])
+        for row in self.ledger:
+            if row["lint"] in ("clippy::expect_used", "clippy::unwrap_used"):
+                self.assertIn(
+                    row["disposition"], VALID_DISPOSITIONS,
+                    "every measured expect/unwrap row carries a reconciliation verb",
+                )
+                self.assertTrue(row["focused_proof"], "row %s names no focused proof" % row["key"])
+                if row["disposition"] in ("ACCEPTED_NARROW_EXPECTATION", "FIXED_ITEM_EXPECTATION"):
+                    self.assertEqual(
+                        "test", row["target_class"],
+                        "row %s absorbs expect/unwrap outside a test span" % row["key"],
+                    )
+        # A reason that never names an assertion boundary is a swallowed Result.
+        self.assertMutationRejected("expect_used_swallowed_result", validate_row, scope="row")
+        # And the same rule accepts a reason that does name one.
+        control = dict(self.mutations["expect_used_swallowed_result"]["record"])
+        control["target_class"] = "test"
+        control["path"] = "crates/eliot-app/tests/dogfood_runtime.rs"
+        control["reason"] = "diagnostic assertion boundary in a dogfood assertion helper"
+        self.assertEqual(
+            [], validate_row(control, scope="row"),
+            "the negative set is over-broad: a real assertion boundary must be accepted",
         )
 
     # -- 16 --------------------------------------------------------------
@@ -1373,7 +1565,7 @@ class ClippyBaselineAcceptance(unittest.TestCase):
         stderr_at = min(i for i, l in enumerate(mutation["added_lines"]) if "eprintln!" in l)
         result_at = min(i for i, l in enumerate(mutation["added_lines"]) if "map_governor" in l)
         self.assertLess(stderr_at, result_at, "the mutation must place stderr before the structured result")
-        self.assertMutationRejected("stderr_before_structured_failure", validate_stderr_additions)
+        self.assertMutationRejected("stderr_before_structured_failure", validate_stderr_additions_record)
 
     # -- 20 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/20
@@ -1397,26 +1589,56 @@ class ClippyBaselineAcceptance(unittest.TestCase):
                     re.search(pattern, rendered),
                     "a secret/protected canary appears in a captured diagnostic",
                 )
-        self.assertMutationRejected("secret_canary", validate_added_lines)
+        self.assertMutationRejected("secret_canary", validate_added_lines_record)
 
     # -- 21 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/21
     def test_21_complete_current_projection_call_graph_and_historical_five_reconciliation(self) -> None:
-        projection = (REPO_ROOT / "bins/eliotd/src/activation_projection.rs").read_text(encoding="utf-8")
+        projection_path = "bins/eliotd/src/activation_projection.rs"
+        projection = (REPO_ROOT / projection_path).read_text(encoding="utf-8")
+        # The module-wide dead_code suppression the issue names is gone from
+        # current source. A test-module expect_used allowance is a different
+        # thing: it is a real, already-accepted test scope, so the check is that
+        # no module-level allow survives outside a #[cfg(test)] module.
         self.assertNotIn("#![allow(dead_code)]", projection)
-        self.assertNotIn("#![allow(", projection, "activation_projection carries no module-wide suppression")
+        for lineno, text in enumerate(projection.splitlines(), start=1):
+            if not text.lstrip().startswith("#!["):
+                continue
+            enclosing = "\n".join(projection.splitlines()[:lineno])
+            enclosing_mod = re.findall(r"#\[cfg\(test\)\]\s*\nmod\s+(\w+)", enclosing)
+            self.assertTrue(
+                enclosing_mod,
+                "%s:%d carries a module-level allow outside any #[cfg(test)] module: %r"
+                % (projection_path, lineno, text.strip()),
+            )
         for fn, caller in sorted(PROJECTION_FIVE.items()):
             self.assertIn("fn %s(" % fn, projection, "%s must exist in current source" % fn)
-            caller_path = caller.split("::")[0]
+            caller_path, _, caller_symbol = caller.partition("::")
+            self.assertTrue(caller_symbol, "a recorded caller must name its symbol: %s" % fn)
             self.assertTrue(
                 (REPO_ROOT / caller_path).is_file(), "the recorded caller path must exist"
             )
-            self.assertIn(
-                caller_path.split("::")[-1], projection + (REPO_ROOT / caller_path).read_text(encoding="utf-8"),
-            )
+            caller_source = (REPO_ROOT / caller_path).read_text(encoding="utf-8")
             # The caller must be a production src path, never a tests/ path.
             self.assertNotIn("/tests/", caller_path)
             self.assertNotIn("_tests.rs", caller_path)
+            # And it must actually reach the item in current source, not merely
+            # be named in a comment: a call site, an arm, or a definition.
+            occurrences = len(re.findall(r"\b%s\s*\(" % re.escape(fn), caller_source))
+            self.assertGreater(
+                occurrences, 0,
+                "%s records reachability via %s::%s but current source never calls it"
+                % (fn, caller_path, caller_symbol),
+            )
+        # The four mapping helpers are reached from one production inner mapper.
+        inner = "map_governor_outcome_to_protocol_inner"
+        for fn in ("map_coverage", "map_selection", "map_retry", "build_protocol_result"):
+            self.assertGreater(
+                len(re.findall(r"\b%s\s*\(" % re.escape(fn), projection)),
+                1,
+                "%s has only its definition in the projection; it is not reached by %s"
+                % (fn, inner),
+            )
         self.assertEqual(
             len(PROJECTION_FIVE), HISTORICAL_DEAD_PROJECTION_FUNCTIONS,
             "the historical five must be reconciled item by item",
@@ -1434,7 +1656,7 @@ class ClippyBaselineAcceptance(unittest.TestCase):
                 continue
             text = self.head_source.get(path, "")
             self.assertNotRegex(text, r"#!\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]")
-        self.assertMutationRejected("module_wide_dead_code", validate_added_lines)
+        self.assertMutationRejected("module_wide_dead_code", validate_added_lines_record)
         # The narrow replacement is present and is an item, not a module.
         head = self.head_source.get("crates/eliot-app/src/host_runtime/event_and_authority.rs", "")
         self.assertIn("#[expect(dead_code, reason =", head)
@@ -1564,10 +1786,17 @@ class ClippyBaselineAcceptance(unittest.TestCase):
         self.assertFalse(
             [r for r in corrections if not r["focused_proof"]],
         )
+        # A mechanical correction whose proof is blanked out is rejected by the
+        # same validator that accepted the real row.
+        self.assertMutationRejected("row_no_focused_proof", validate_row, scope="row")
 
     # -- 29 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/29
     def test_29_actual_full_fmt_check_passes(self) -> None:
+        self.assertEqual(
+            ["cargo", "fmt", "--all", "--", "--check"], self.fmt_cmd,
+            "the fmt gate is the exact command the issue names",
+        )
         self.assertEqual(
             0, self.fmt_exit,
             "cargo fmt --all -- --check failed on the current source:\n%s" % self.fmt_stderr[-4000:],
@@ -1577,15 +1806,24 @@ class ClippyBaselineAcceptance(unittest.TestCase):
     # WORK_UNIT_CASE: 838/30
     def test_30_actual_locked_workspace_all_target_check_passes(self) -> None:
         self.assertEqual(
+            ["cargo", "check", "--locked", "--workspace", "--all-targets"], self.check_cmd,
+            "the check gate is the exact command the issue names",
+        )
+        self.assertEqual(
             0, self.check_exit,
             "cargo check --locked --workspace --all-targets does not pass on this base; "
-            "%d hard errors remain, all outside the 28-path whitelist:\n%s"
+            "%d hard errors remain, all recorded in the ledger:\n%s"
             % (len(self.current_errors), self.check_stderr[-4000:]),
         )
 
     # -- 31 --------------------------------------------------------------
     # WORK_UNIT_CASE: 838/31
     def test_31_actual_locked_workspace_all_target_clippy_deny_warnings_passes(self) -> None:
+        self.assertEqual(
+            ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"],
+            self.deny_cmd,
+            "the clippy gate is the exact command the issue names",
+        )
         self.assertEqual(
             0, self.deny_exit,
             "cargo clippy --locked --workspace --all-targets -- -D warnings does not pass; "
