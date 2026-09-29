@@ -42,10 +42,6 @@
 //! is no facade-side table: nothing in this module is a second store, and no
 //! terminal host fact is produced without an owner journal entry behind it.
 
-use crate::{
-    AgentBridgeCore, BridgeError, HostEventEnvelope, RouteFingerprint, TransportEdge,
-    TransportEdgeKind,
-};
 use crate::mcp_correlation::{
     Assessment, AssessmentInputs, AssessmentLog, AssessmentRevision, CanonicalDisposition,
     CoverageIndeterminacy, CoverageProof, EliotEmissionObservation, HostTerminalObservation,
@@ -55,6 +51,10 @@ use crate::mcp_correlation::{
 use crate::mcp_host_observation::{
     HostEventJoinKeys, HostObservationReject, HostOwnerBinding, check_event_replay,
     normalize_terminal_observation,
+};
+use crate::{
+    AgentBridgeCore, BridgeError, HostEventEnvelope, RouteFingerprint, TransportEdge,
+    TransportEdgeKind,
 };
 
 /// Submits one host event through the existing admitted event route.

@@ -82,20 +82,19 @@ mod mcp_correlation;
 mod mcp_host_observation;
 pub use mcp_bridge_join::{
     BridgeHostCoverage, DeadlineSweepRequest, FaultEdgeSubmission, ReconcileError,
-    TerminalReconcileRequest, read_host_coverage, reconcile_deadline_sweep, reconcile_terminal_event,
-    submit_derived_fault, submit_host_event,
+    TerminalReconcileRequest, read_host_coverage, reconcile_deadline_sweep,
+    reconcile_terminal_event, submit_derived_fault, submit_host_event,
 };
 pub use mcp_correlation::{
     Assessment, AssessmentEvidence, AssessmentInputs, AssessmentLog, AssessmentLogError,
-    AssessmentRevision, AssessmentSummary, CanonicalDisposition, CommitEvidence,
-    CorrelationAssessmentState, CorrelationIdentity, CorrelationIdentityParts, CorrelationStage,
-    CoverageGap, CoverageIndeterminacy, CoverageProof, CORRELATION_IDENTITY_VERSION,
-    CORRELATION_SCHEMA_ID, EmissionCause, EliotEmissionObservation, HandlerOutcome,
-    HostObservationEvidence, HostTerminalObservation, HostTerminalState, MAX_ASSESSMENT_REVISIONS,
-    MAX_SUMMARY_EVIDENCE, ObservationWindow, OperationEffectClass, OperationIdentity,
-    OwnerBindingError, OwnerValidatedOperationBinding, PartialObservation, RecoveryAction,
-    RecoveryDirective, RouteDegradation, RouteDegradationCode, StdioEmissionReceipt,
-    assess_correlation, derive_recovery, sha256_hex,
+    AssessmentRevision, AssessmentSummary, CORRELATION_IDENTITY_VERSION, CORRELATION_SCHEMA_ID,
+    CanonicalDisposition, CommitEvidence, CorrelationAssessmentState, CorrelationIdentity,
+    CorrelationIdentityParts, CorrelationStage, CoverageIndeterminacy, CoverageProof,
+    EliotEmissionObservation, EmissionCause, HandlerOutcome, HostObservationEvidence,
+    HostTerminalObservation, HostTerminalState, MAX_ASSESSMENT_REVISIONS, MAX_SUMMARY_EVIDENCE,
+    ObservationWindow, OperationEffectClass, OperationIdentity, OwnerBindingError,
+    OwnerValidatedOperationBinding, PartialObservation, RecoveryAction, RouteDegradation,
+    RouteDegradationCode, StdioEmissionReceipt, assess_correlation, derive_recovery, sha256_hex,
 };
 pub use mcp_host_observation::{
     HostEventJoinKeys, HostEventReplay, HostObservationReject, HostOwnerBinding, ReplayConflict,

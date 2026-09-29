@@ -144,8 +144,7 @@ impl CorrelationTracker {
     /// Records one emission, reporting whether an older record rotated out.
     fn track(&mut self, record: TrackedCorrelation) -> CorrelationTrackOutcome {
         if let Some(existing) = self.records.iter_mut().find(|held| {
-            held.emission.identity.identity_digest
-                == record.emission.identity.identity_digest
+            held.emission.identity.identity_digest == record.emission.identity.identity_digest
         }) {
             // Same identity. The owner refuses a changed replay under one
             // event identity before this point, so replacing the retained

@@ -537,13 +537,21 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                 correlation_digest,
                 state,
                 edge_filed,
-            }) => (correlation_digest, state.as_str(), edge_filed, String::new()),
+            }) => (
+                correlation_digest,
+                state.as_str(),
+                edge_filed,
+                String::new(),
+            ),
             Ok(crate::mcp_correlation::HostEventReconciliation::NotTerminal) => {
                 (String::new(), "not_terminal", false, String::new())
             }
-            Ok(crate::mcp_correlation::HostEventReconciliation::NoTrackedCorrelation) => {
-                (String::new(), "no_tracked_correlation", false, String::new())
-            }
+            Ok(crate::mcp_correlation::HostEventReconciliation::NoTrackedCorrelation) => (
+                String::new(),
+                "no_tracked_correlation",
+                false,
+                String::new(),
+            ),
             Err(error) => (String::new(), "unreconciled", false, error.to_string()),
         };
         tracing::info!(

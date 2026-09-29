@@ -244,10 +244,7 @@ impl McpInvocationCorrelation {
         dead_code,
         reason = "owner seam: invoked only once a tool owner mints bindings; unset keeps resubmit omitted (#2899)"
     )]
-    pub fn observe_owner_operation_binding(
-        &mut self,
-        binding: OwnerValidatedOperationBinding,
-    ) {
+    pub fn observe_owner_operation_binding(&mut self, binding: OwnerValidatedOperationBinding) {
         self.operation_binding = Some(binding);
     }
 
@@ -343,9 +340,7 @@ impl McpInvocationCorrelation {
     /// carriers. It never observes exact readback, so committed-with-readback
     /// and rolled-back dispositions stay with the canonical owner.
     #[must_use]
-    pub fn facade_canonical_disposition(
-        &self,
-    ) -> eliot_agent_bridge_core::CanonicalDisposition {
+    pub fn facade_canonical_disposition(&self) -> eliot_agent_bridge_core::CanonicalDisposition {
         let commit = eliot_agent_bridge_core::CommitEvidence {
             canonical_receipt_write_id: self.receipt_write_id.clone(),
             exact_readback_match: None,
@@ -413,11 +408,10 @@ impl McpInvocationCorrelation {
             .degradation
             .as_ref()
             .map_or("", |degradation| degradation.code.as_str());
-        let recovery_actions = latest
-            .assessment
-            .recovery
-            .as_ref()
-            .map_or_else(String::new, eliot_agent_bridge_core::RecoveryDirective::action_names);
+        let recovery_actions = latest.assessment.recovery.as_ref().map_or_else(
+            String::new,
+            eliot_agent_bridge_core::RecoveryDirective::action_names,
+        );
         tracing::info!(
             schema = self.schema,
             mcp_request_id = %self.mcp_request_id,
@@ -468,5 +462,3 @@ fn request_id_string(id: Option<&Value>) -> String {
         Some(other) => other.to_string(),
     }
 }
-
-
