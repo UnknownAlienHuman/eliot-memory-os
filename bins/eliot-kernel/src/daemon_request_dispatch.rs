@@ -513,6 +513,12 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
         "query_owner_bundle" => "query_owner_bundle",
+        eliot_protocol::BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION => {
+            eliot_protocol::BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION
+        }
+        eliot_protocol::BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION => {
+            eliot_protocol::BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION
+        }
         "initialize_owner_revision" => "initialize_owner_revision",
         PUBLISH_GOVERNOR_AUTHORITY_OPERATION => PUBLISH_GOVERNOR_AUTHORITY_OPERATION,
         "activate_grant" => "activate_grant",
@@ -2925,6 +2931,81 @@ impl KernelComposition {
                     Err(KernelBuildError::Core(_)) => Err(TransportError::IdentityConflict),
                     Err(_) => Err(TransportError::SessionFenced),
                 }
+            }
+            eliot_protocol::BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION => {
+                let operation: eliot_protocol::BridgeEventPrivacyOwnerPublishOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                operation
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if operation.state_fence != session.module_generation.state_fence
+                    || !operation
+                        .state_fence
+                        .authority_epoch
+                        .is_same_authority(&session.authority_epoch)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                // The dedicated durable Bridge privacy owner has not yet been
+                // added to ORS. Parse and validate the exact owner evidence,
+                // but do not retain it in process memory or issue a positive
+                // receipt; restart-safe binding is required before event
+                // admission can consume it.
+                let receipt = eliot_protocol::BridgeEventPrivacyOwnerReceipt {
+                    disposition: eliot_protocol::BridgeEventPrivacyOwnerDisposition::Unavailable,
+                    scope_ref: operation.scope_ref,
+                    owner_revision: Some(operation.owner_revision),
+                    policy_snapshot_id: Some(operation.policy_snapshot_id),
+                    policy_revision: Some(operation.policy_revision),
+                    state_fence: operation.state_fence,
+                    owner_snapshot_json: None,
+                    owner_snapshot_sha256: Some(operation.owner_snapshot_sha256),
+                    reason_code: Some("OWNER_PORT_UNAVAILABLE".to_owned()),
+                };
+                Ok(serde_json::json!({
+                    "status": "known",
+                    "value": {
+                        "kind": "bridge_event_privacy_owner_receipt",
+                        "value": receipt,
+                    },
+                    "recovery": null,
+                }))
+            }
+            eliot_protocol::BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION => {
+                let query: eliot_protocol::BridgeEventPrivacyOwnerQuery =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                query
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if query.state_fence != session.module_generation.state_fence
+                    || !query
+                        .state_fence
+                        .authority_epoch
+                        .is_same_authority(&session.authority_epoch)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let receipt = eliot_protocol::BridgeEventPrivacyOwnerReceipt {
+                    disposition: eliot_protocol::BridgeEventPrivacyOwnerDisposition::Unavailable,
+                    scope_ref: query.scope_ref,
+                    owner_revision: None,
+                    policy_snapshot_id: None,
+                    policy_revision: None,
+                    state_fence: query.state_fence,
+                    owner_snapshot_json: None,
+                    owner_snapshot_sha256: None,
+                    reason_code: Some("OWNER_PORT_UNAVAILABLE".to_owned()),
+                };
+                Ok(serde_json::json!({
+                    "status": "known",
+                    "value": {
+                        "kind": "bridge_event_privacy_owner_readback",
+                        "value": receipt,
+                    },
+                    "recovery": null,
+                }))
             }
             PUBLISH_GOVERNOR_AUTHORITY_OPERATION => {
                 let operation: GovernorAuthorityPublishOperation =
