@@ -42,11 +42,13 @@
 //! handling, no second archive format, no concrete Surreal/Host/Watchdog
 //! binary dependency.
 
+use std::path::{Path, PathBuf};
+
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupClass, BackupError, CanonicalRecord, ExportFence,
     HostStateAuditFence, OrsSnapshotFence, WatchdogSpoolFence, suspended_recovery_entries,
 };
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
@@ -629,7 +631,8 @@ pub struct PublishedArchive {
 }
 
 /// Durable receipt for one publication operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicationReceipt {
     /// Publication operation identity the receipt answers for.
     pub operation_id: String,
@@ -637,6 +640,37 @@ pub struct PublicationReceipt {
     pub archive_sha256: String,
     /// Whether the archive is durably recorded by the owner.
     pub durable: bool,
+}
+
+impl PublicationReceipt {
+    /// Validates the shape of a receipt read back from the retained-archive
+    /// owner.
+    ///
+    /// This is the ONLY check `reconcile` applies to the recorded value: it
+    /// validates the ORIGINAL record the owner wrote, and never substitutes a
+    /// checksum recomputed over whatever bytes happen to be in hand. A receipt
+    /// that does not claim durability, names a blank operation, or carries a
+    /// non-digest archive value is refused as a typed failure rather than
+    /// adopted.
+    pub fn validate(&self) -> Result<(), KernelCaptureError> {
+        non_blank(&self.operation_id, "publish.receipt.operation_id")?;
+        if self.operation_id.len() > MAX_PUBLICATION_ID_LEN {
+            return Err(KernelCaptureError::OwnerEvidenceInvalid(
+                "publication receipt operation identity is not a bounded identity".to_owned(),
+            ));
+        }
+        if !is_hex64(&self.archive_sha256) {
+            return Err(KernelCaptureError::OwnerEvidenceInvalid(
+                "publication receipt archive digest is not a 64-hex digest".to_owned(),
+            ));
+        }
+        if !self.durable {
+            return Err(KernelCaptureError::OwnerEvidenceInvalid(
+                "publication receipt does not claim a durable archive".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Publication port over the admitted artifact/blob owner.
