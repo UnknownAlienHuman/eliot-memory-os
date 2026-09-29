@@ -103,7 +103,12 @@ impl InstancePoolConfig {
 /// compilation target, the guest ABI world and its WIT digest, the fixed
 /// provider settings, and the capacity numbers; it changes if and only if
 /// those settings change. Structural knobs are recorded as wasmtime
-/// defaults, never silently absorbed.
+/// defaults, never silently absorbed. This is the engine/config/target/ABI
+/// leg of the cache identity: the artifact and component-configuration
+/// legs travel in [`PoolCacheKey`] (revalidated against the same buffers
+/// by [`ComponentPool::compile`] on every lookup), and the admitted
+/// per-invocation policy leg is enforced by Store limits plus the
+/// allow-list gate in the constructing caller — no cache pass bypass.
 #[must_use]
 pub fn pooled_configuration_digest(pool: &InstancePoolConfig) -> Sha256Digest {
     Sha256Digest::of_bytes(pooled_configuration_descriptor(pool).as_bytes())
@@ -128,10 +133,13 @@ fn pooled_configuration_descriptor(pool: &InstancePoolConfig) -> String {
 /// engine-bound, so the cache and its engines share one owner and one
 /// lifetime: entries are valid exactly while the pool lives, and a fresh
 /// pool rebuilds from artifact bytes (never from a previous pool,
-/// generation, or proof).
+/// generation, or proof). The pool retains its own engine-configuration
+/// digest so [`Self::compile`] can revalidate a presented key against the
+/// engines that will serve the entry: a foreign key can never pass.
 pub struct ComponentPool {
     epoch_engine: Engine,
     fuel_engine: Engine,
+    engine_configuration: Sha256Digest,
     cache: HashMap<PoolCacheKey, (Component, Component)>,
 }
 
@@ -140,6 +148,7 @@ impl std::fmt::Debug for ComponentPool {
         formatter
             .debug_struct("ComponentPool")
             .field("cached_pairs", &self.cache.len())
+            .field("engine_configuration", &self.engine_configuration)
             .finish_non_exhaustive()
     }
 }
@@ -152,24 +161,38 @@ impl ComponentPool {
         Ok(Self {
             epoch_engine: Engine::new(&pool.engine_config(false))?,
             fuel_engine: Engine::new(&pool.engine_config(true))?,
+            engine_configuration: pooled_configuration_digest(pool),
             cache: HashMap::new(),
         })
     }
 
     /// Compiles one immutable artifact under both pooled engines through
-    /// the digest-keyed cache. The presented bytes are re-hashed against
-    /// the key on every call: a key naming a different artifact than the
-    /// bytes is denied instead of serving a foreign cached component, so
-    /// the key can never bypass identity. A hit returns the previously
+    /// the digest-keyed cache. The full key is revalidated on every call
+    /// before any cache lookup: the presented artifact and
+    /// component-configuration bytes are re-hashed against the key, and
+    /// the key's engine configuration must equal this pool's digest. Any
+    /// mismatch is denied instead of serving a foreign cached component,
+    /// so the key can never bypass identity. A hit returns the previously
     /// compiled pair without recompiling; a miss compiles, inserts under
     /// the exact key, and returns the fresh pair.
     pub fn compile(
         &mut self,
         key: &PoolCacheKey,
         artifact: &[u8],
+        component_configuration: &[u8],
     ) -> Result<(Component, Component), wasmtime::Error> {
         if Sha256Digest::of_bytes(artifact) != key.artifact {
             return Err(wasmtime::Error::msg("pool cache key artifact mismatch"));
+        }
+        if Sha256Digest::of_bytes(component_configuration) != key.component_configuration {
+            return Err(wasmtime::Error::msg(
+                "pool cache key component-configuration mismatch",
+            ));
+        }
+        if key.engine_configuration != self.engine_configuration {
+            return Err(wasmtime::Error::msg(
+                "pool cache key engine-configuration mismatch",
+            ));
         }
         if let Some(compiled) = self.cache.get(key) {
             return Ok(compiled.clone());

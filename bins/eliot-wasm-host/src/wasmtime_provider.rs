@@ -243,6 +243,8 @@ pub enum WasmtimeBuildError {
     VersionMismatch,
     #[error("artifact digest does not match supplied bytes")]
     ArtifactDigestMismatch,
+    #[error("artifact is not admitted by the invocation limits")]
+    ArtifactNotAdmitted,
     #[error("WIT interface digest does not match checked-in WIT bytes")]
     WitDigestMismatch,
     #[error("engine configuration digest does not match provider settings")]
@@ -304,21 +306,36 @@ impl WasmtimeComponentEngine {
     /// digest recomputed from the checked-in world); the artifact digest
     /// is recomputed from the bytes (TOCTOU-checked by the guest-runner
     /// child against the bytes it actually read before calling here).
+    /// Admitted-artifact policy is enforced before any engine is built
+    /// or any byte is compiled: the same buffer's digest must be
+    /// allow-listed and its length within the admitted ceiling, else
+    /// [`WasmtimeBuildError::ArtifactNotAdmitted`]; the pool then
+    /// revalidates the full key (artifact, component configuration,
+    /// engine configuration) against the same buffers on lookup, so a
+    /// mismatched admission or a foreign key can never reach
+    /// compile/instantiate through a cache pass.
     pub fn new_for_admitted_limits(
         artifact: &[u8],
         component_configuration: &[u8],
         limits: &InvocationLimits,
     ) -> Result<Self, WasmtimeBuildError> {
+        let artifact_digest = Sha256Digest::of_bytes(artifact);
+        let artifact_bytes = artifact.len() as u64;
+        if artifact_bytes > limits.artifact_access.max_bytes
+            || !limits.artifact_access.allowed_digests.contains(&artifact_digest)
+        {
+            return Err(WasmtimeBuildError::ArtifactNotAdmitted);
+        }
         let pool_config = crate::pool::InstancePoolConfig::from_limits(limits);
         let mut pool =
             crate::pool::ComponentPool::new(&pool_config).map_err(WasmtimeBuildError::Config)?;
         let key = crate::pool::PoolCacheKey {
-            artifact: Sha256Digest::of_bytes(artifact),
+            artifact: artifact_digest.clone(),
             component_configuration: Sha256Digest::of_bytes(component_configuration),
             engine_configuration: crate::pool::pooled_configuration_digest(&pool_config),
         };
         let (epoch_component, fuel_component) = pool
-            .compile(&key, artifact)
+            .compile(&key, artifact, component_configuration)
             .map_err(WasmtimeBuildError::Compile)?;
         let (epoch_engine, fuel_engine) = pool.into_engines();
         Ok(Self {
@@ -333,9 +350,9 @@ impl WasmtimeComponentEngine {
                 engine_configuration_digest: key.engine_configuration,
                 wit_interface_digest: Sha256Digest::of_bytes(include_bytes!("../wit/guest.wit")),
             },
-            artifact_digest: key.artifact,
+            artifact_digest,
             component_configuration_digest: key.component_configuration,
-            artifact_bytes: artifact.len() as u64,
+            artifact_bytes,
         })
     }
 
@@ -698,7 +715,18 @@ fn canonical_configuration_descriptor() -> &'static [u8] {
     b"wasmtime=47.0.4;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
 }
 
-fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
+/// Builds one provider engine with the exact settings every guarded
+/// invocation relies on: component model on, epoch interruption on, and
+/// the fixed provider stack ceiling. This is the single owner of those
+/// settings (issue #758, item 13): both the epoch engine and the fuel
+/// engine come from here, so component initialization and every guest
+/// call execute under the same Store fuel budget and epoch deadline that
+/// the invocation installs before instantiation. An infinite loop traps
+/// `OutOfFuel` on the fuel engine (reported as fuel exhaustion at the
+/// stage actually reached, including initialization/descriptor) or
+/// `Interrupt` on the epoch engine; neither budget bounds synchronous
+/// compilation, which runs outside any Store.
+pub(crate) fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.consume_fuel(consume_fuel);
