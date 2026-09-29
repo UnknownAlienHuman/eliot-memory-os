@@ -8,9 +8,9 @@
 //! provenance; `resource_snapshot` holds one row per canonical URI
 //! carrying the content digest, the verbatim base64 bytes, the owner
 //! revision, and the admission fence. Concurrent ledger writers arbitrate
-//! through the in-transaction revision compare-and-set inside the
-//! canonical transaction; retries recompute from fresh rows, never from
-//! stale reads. Snapshot rows are immutable: a rewrite with different
+//! through the caller's revision compare-and-set inside the canonical
+//! transaction; a stale caller revision returns a deterministic conflict.
+//! Snapshot rows are immutable: a rewrite with different
 //! bytes fails closed before the transaction, and a create race converges
 //! through the same contention retry. Row writes commit inside the
 //! canonical transaction beside the receipt and outbox rows, so rows,
@@ -42,8 +42,8 @@ pub(crate) struct ReactiveSessionWrite {
     pub scope_id: String,
     /// Task-binding provenance from the transition envelope, when bound.
     pub task_id: Option<String>,
-    /// Revision observed at pre-transaction read (`None` for creates).
-    pub expected_revision: Option<u64>,
+    /// Caller-observed revision, compared again inside the canonical transaction.
+    pub expected_revision: u64,
 }
 
 /// One computed resource-snapshot row write for the canonical transaction.
@@ -172,6 +172,7 @@ pub(crate) async fn prepare_reactive_writes(
         match decoded {
             DecodedReactiveMutation::ApplyLedger {
                 session_id,
+                expected_revision,
                 ledger_json,
             } => {
                 let current = read_reactive_row(db, config, &session_id).await?;
@@ -180,8 +181,11 @@ pub(crate) async fn prepare_reactive_writes(
                 {
                     return Err(AdapterError::Store(StoreError::FenceMismatch));
                 }
-                let expected_revision = current.as_ref().map(|row| row.revision);
-                let revision = checked_revision(expected_revision)?;
+                let observed_revision = current.as_ref().map_or(0, |row| row.revision);
+                if observed_revision != expected_revision {
+                    return Err(AdapterError::Store(StoreError::RevisionConflict));
+                }
+                let revision = checked_revision(Some(expected_revision))?;
                 writes.sessions.push(ReactiveSessionWrite {
                     session_id,
                     ledger_json,
@@ -377,21 +381,22 @@ fn decode_snapshot_row(value: &Value) -> Result<StoredResourceSnapshot, AdapterE
 
 /// Builds the canonical-transaction fragment persisting reactive rows.
 ///
-/// One compare-and-set per session write: creates refuse when a row
-/// already exists, updates refuse on missing rows or revision drift.
+/// One caller-revision compare-and-set per session write: expected revision
+/// zero creates only when absent; positive revisions update only an exact
+/// match. A mismatch is a deterministic semantic conflict.
 /// Snapshot writes are create-or-converge: missing rows create, identical
 /// rows pass silently, divergent rows abort the transaction (a create race
 /// converges through retry into the deterministic pre-transaction
-/// conflict). Drift surfaces the `reactive_session_conflict` /
-/// `reactive_snapshot_conflict` markers so the apply loop retries with
-/// fresh rows. Rows commit in the same transaction as the receipt and
-/// outbox rows, so rows, receipt, and outbox stay atomic.
+/// conflict). Session revision drift surfaces
+/// `reactive_session_conflict`; snapshot allocation drift surfaces
+/// `reactive_snapshot_conflict`. Rows commit in the same transaction as the
+/// receipt and outbox rows, so rows, receipt, and outbox stay atomic.
 pub(crate) fn reactive_write_statements(writes: &ReactiveWrites) -> (String, Map<String, Value>) {
     let mut sql = String::new();
     let mut bindings = Map::new();
     for (index, write) in writes.sessions.iter().enumerate() {
         let suffix = format!("session_{index}");
-        if write.expected_revision.is_some() {
+        if write.expected_revision > 0 {
             sql.push_str(
                 "LET $reactive_current_{s} = (SELECT revision FROM ONLY type::record($reactive_table_{s}, $reactive_key_{s})); IF type::is_object($reactive_current_{s}) { IF $reactive_current_{s}.revision != $reactive_expected_{s} { THROW 'reactive_session_conflict'; } ELSE { UPDATE type::record($reactive_table_{s}, $reactive_key_{s}) CONTENT $reactive_record_{s}; }; } ELSE { THROW 'reactive_session_conflict'; };"
                     .replace("{s}", &suffix)
@@ -504,7 +509,7 @@ mod template_tests {
                     state_fence: test_fence(),
                     scope_id: "scope-1".to_owned(),
                     task_id: None,
-                    expected_revision: None,
+                    expected_revision: 0,
                 },
                 ReactiveSessionWrite {
                     session_id: "session-old".to_owned(),
@@ -515,7 +520,7 @@ mod template_tests {
                     state_fence: test_fence(),
                     scope_id: "scope-1".to_owned(),
                     task_id: Some("task-1".to_owned()),
-                    expected_revision: Some(3),
+                    expected_revision: 3,
                 },
             ],
             snapshots: vec![ResourceSnapshotWrite {

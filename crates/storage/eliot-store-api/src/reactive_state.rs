@@ -23,8 +23,11 @@
 //! Ledger bytes are the bridge's `reactive_ledger_snapshot()` output —
 //! canonical JSON stamped with [`REACTIVE_LEDGER_CONTRACT_V1`] — carried
 //! here as one opaque string so the store preserves them verbatim and a
-//! readback is byte-identical to what the bridge wrote. The store
-//! validates the contract stamp and bounds structurally; full ledger
+//! readback is byte-identical to what the bridge wrote. Each upsert carries
+//! the caller's expected session-ledger revision (`0` for absence), which
+//! the backend compares atomically with the row it replaces. Read payloads
+//! expose `ledger_revision` independently from response revision heads. The
+//! store validates the contract stamp and bounds structurally; full ledger
 //! semantics (`from_json_bytes`/`restore_reactive_ledger`) stay at the
 //! bridge endpoints, which already round-trip byte-equal.
 //!
@@ -86,6 +89,8 @@ pub const RESOURCE_URI_SCHEME: &str = "eliot://";
 
 /// Mutation session selector (ledger upsert; exact read selector).
 pub const REACTIVE_PARAM_SESSION_ID: &str = "session_id";
+/// Caller-observed ledger owner revision (`0` means no row exists).
+pub const REACTIVE_PARAM_EXPECTED_REVISION: &str = "expected_revision";
 /// Opaque canonical ledger-snapshot JSON (ledger upsert).
 pub const REACTIVE_PARAM_LEDGER_JSON: &str = "ledger_json";
 /// Canonical `eliot://` resource identity (snapshot legs; exact read selector).
@@ -99,7 +104,9 @@ pub const REACTIVE_PARAM_CONTENT_BASE64: &str = "content_base64";
 pub const REACTIVE_PAGE_SESSION_ID: &str = "session_id";
 /// Read payload field: verbatim ledger snapshot (null when absent).
 pub const REACTIVE_PAGE_LEDGER_JSON: &str = "ledger_json";
-/// Read payload field: owner revision read at.
+/// Read payload field: session-ledger owner revision read at.
+pub const REACTIVE_PAGE_LEDGER_REVISION: &str = "ledger_revision";
+/// Backwards-compatible alias for the session-ledger owner revision.
 pub const REACTIVE_PAGE_REVISION: &str = "revision";
 /// Read payload field: projection fence.
 pub const REACTIVE_PAGE_STATE_FENCE: &str = "state_fence";
@@ -155,6 +162,8 @@ pub enum DecodedReactiveMutation {
     ApplyLedger {
         /// Kernel-owned activation-sealed session binding.
         session_id: String,
+        /// Caller-observed session-ledger revision (`0` means absent).
+        expected_revision: u64,
         /// Verbatim canonical ledger-snapshot JSON.
         ledger_json: String,
     },
@@ -173,12 +182,17 @@ pub enum DecodedReactiveMutation {
 #[must_use]
 pub fn reactive_ledger_mutation_request(
     session_id: String,
+    expected_revision: u64,
     ledger_json: String,
 ) -> NamedMutationRequest {
     let mut parameters = BTreeMap::new();
     parameters.insert(
         REACTIVE_PARAM_SESSION_ID.to_owned(),
         Value::String(session_id),
+    );
+    parameters.insert(
+        REACTIVE_PARAM_EXPECTED_REVISION.to_owned(),
+        Value::String(expected_revision.to_string()),
     );
     parameters.insert(
         REACTIVE_PARAM_LEDGER_JSON.to_owned(),
@@ -268,6 +282,13 @@ pub fn validate_reactive_mutation_params(
     match operation {
         NamedMutationOperation::ApplyReactiveInjectionState => {
             validate_session_id(text_param(parameters, REACTIVE_PARAM_SESSION_ID)?)?;
+            let expected_revision = text_param(parameters, REACTIVE_PARAM_EXPECTED_REVISION)?;
+            expected_revision
+                .parse::<u64>()
+                .map_err(|_| StoreError::InvalidField {
+                    field: "reactive.expected_revision",
+                    reason: "expected revision must be an unsigned 64-bit decimal",
+                })?;
             validate_ledger_json(text_param(parameters, REACTIVE_PARAM_LEDGER_JSON)?)?;
             Ok(())
         }
@@ -304,6 +325,12 @@ pub fn decode_reactive_mutation(
         NamedMutationOperation::ApplyReactiveInjectionState => {
             Ok(DecodedReactiveMutation::ApplyLedger {
                 session_id: text_of(REACTIVE_PARAM_SESSION_ID)?,
+                expected_revision: text_of(REACTIVE_PARAM_EXPECTED_REVISION)?
+                    .parse::<u64>()
+                    .map_err(|_| StoreError::InvalidField {
+                        field: "reactive.expected_revision",
+                        reason: "expected revision must be an unsigned 64-bit decimal",
+                    })?,
                 ledger_json: text_of(REACTIVE_PARAM_LEDGER_JSON)?,
             })
         }

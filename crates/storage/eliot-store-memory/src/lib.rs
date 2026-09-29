@@ -309,6 +309,10 @@ impl MemoryStore {
             expected_revision_heads,
             expected_ordering_heads,
         )?;
+        // Reactive ledger CAS failures must be known before any other named
+        // operation can mutate this in-memory transaction state. The same
+        // expected revision is checked again by the locked write leg below.
+        validate_reactive_expected_revisions(&state, &transition)?;
         if transition
             .named_operations
             .iter()
@@ -871,22 +875,26 @@ fn dispatch_apply_reactive_state(
         let row_json = match decoded {
             DecodedReactiveMutation::ApplyLedger {
                 session_id,
+                expected_revision,
                 ledger_json,
             } => {
-                let revision = state
-                    .reactive_sessions
-                    .get(&session_id)
-                    .map(|row| {
-                        if row.state_fence != transition.state_fence {
-                            return Err(StoreError::FenceMismatch);
-                        }
-                        row.revision.checked_add(1).ok_or(StoreError::InvalidField {
+                let current_revision = match state.reactive_sessions.get(&session_id) {
+                    Some(row) if row.state_fence != transition.state_fence => {
+                        return Err(StoreError::FenceMismatch);
+                    }
+                    Some(row) => row.revision,
+                    None => 0,
+                };
+                if current_revision != expected_revision {
+                    return Err(StoreError::RevisionConflict);
+                }
+                let revision =
+                    expected_revision
+                        .checked_add(1)
+                        .ok_or(StoreError::InvalidField {
                             field: "reactive.revision",
                             reason: "owner revision overflow",
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or(1);
+                        })?;
                 let row = ReactiveSessionRow {
                     session_id: session_id.clone(),
                     ledger_json: ledger_json.clone(),
@@ -952,6 +960,42 @@ fn dispatch_apply_reactive_state(
         outbox.validate()?;
         plan.outbox_records.push(outbox);
         reactive_index = reactive_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Compares every admitted ledger write against the held state's session
+/// revision before any operation in the transition can mutate rows, outbox,
+/// or receipt state.
+fn validate_reactive_expected_revisions(
+    state: &MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    if transition.transition_class != TransitionClass::ReactiveState {
+        return Ok(());
+    }
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::ApplyReactiveInjectionState {
+            continue;
+        }
+        let DecodedReactiveMutation::ApplyLedger {
+            session_id,
+            expected_revision,
+            ..
+        } = decode_reactive_mutation(command.operation, &command.parameters)?
+        else {
+            return Err(StoreError::UnknownOperation);
+        };
+        let current_revision = match state.reactive_sessions.get(&session_id) {
+            Some(row) if row.state_fence != transition.state_fence => {
+                return Err(StoreError::FenceMismatch);
+            }
+            Some(row) => row.revision,
+            None => 0,
+        };
+        if current_revision != expected_revision {
+            return Err(StoreError::RevisionConflict);
+        }
     }
     Ok(())
 }
@@ -2029,6 +2073,7 @@ fn reactive_ledger_payload(
     serde_json::to_value(json!({
         "session_id": session_id,
         "ledger_json": ledger_json,
+        "ledger_revision": revision,
         "revision": revision,
         "state_fence": fence,
     }))
