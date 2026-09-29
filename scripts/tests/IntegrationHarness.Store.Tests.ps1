@@ -165,9 +165,13 @@ function New-StoreTestLauncher {
     return ({ param($input_) return @{ observedPid = $ObservedPid; observedNonce = $Nonce; imagePath = $image; startTimeUtc = $started } }).GetNewClosure()
 }
 
+$script:TestAllocationSerial = 0
 function Get-StoreTestAllocation {
-    param([hashtable]$Binding, [int]$Port = 18001, [string]$EntropySeed = 'abcdef01')
+    param([hashtable]$Binding, [int]$Port = 0, [string]$EntropySeed = '')
     if ($null -eq $Binding) { $Binding = Get-StoreTestBinding }
+    $script:TestAllocationSerial++
+    if ($Port -le 0) { $Port = 18020 + $script:TestAllocationSerial }
+    if ([string]::IsNullOrWhiteSpace($EntropySeed)) { $EntropySeed = ('{0:x8}' -f $script:TestAllocationSerial) }
     $plan = Invoke-StorePlan -Binding $Binding -Requirement (Get-StoreTestRequirement)
     $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
     $reservation = { param($ctx) return (New-StoreTestReservation -Port $Port) }.GetNewClosure()
@@ -659,9 +663,9 @@ function Test-StoreCase21 {
     $cleanProcess = { param($ctx) return @{ pid = $ctx['pid']; alive = $false; descendants = @() } }
     $cleanPort = { param($ctx) return @{ endpoint = $ctx['endpoint']; open = $false } }
     $cleanFiles = { param($ctx) return @{ runRoot = $ctx['runId']; runId = $ctx['runId'] } }
-    $first = Invoke-StoreVerifyCleanup -Binding $binding -Allocation $allocation -StartReceipt $start -ProcessObserver $cleanProcess -PortObserver $cleanPort -FileProbe {
-        param($ctx) return @{ runRoot = (Get-StoreTestAllocation (Get-StoreTestBinding))['runRoot']; locksHeld = $false; secretsPresent = $false; rootsPresent = $false; entries = @() }
-    }
+    $outerRoot = [string]$allocation['runRoot']
+    $firstProbe = { param($ctx) return @{ runRoot = $outerRoot; locksHeld = $false; secretsPresent = $false; rootsPresent = $false; entries = @() } }.GetNewClosure()
+    $first = Invoke-StoreVerifyCleanup -Binding $binding -Allocation $allocation -StartReceipt $start -ProcessObserver $cleanProcess -PortObserver $cleanPort -FileProbe $firstProbe
     $secondProbe = { param($ctx) return @{ runRoot = $first['ownedRoot']; locksHeld = $false; secretsPresent = $false; rootsPresent = $false; entries = @() } }.GetNewClosure()
     $second = Invoke-StoreVerifyCleanup -Binding $binding -Allocation $allocation -StartReceipt $start -ProcessObserver $cleanProcess -PortObserver $cleanPort -FileProbe $secondProbe
     Assert-StoreTrue $Failures ([bool]$second['cleaned']) '21-cleaned'
