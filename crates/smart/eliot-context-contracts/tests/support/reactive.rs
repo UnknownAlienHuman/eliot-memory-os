@@ -10,8 +10,9 @@ use eliot_context_contracts::{
     IntegrationCoverageProfile, LossPolicy, MeasurementRef, MeasurementStatus,
     PriorDeliveryBinding, PrivacyClass, ProofBinding, ProviderDisposition, ProviderId,
     ProviderRole, ProviderRoleDenominator, QUALITY_APPLICABILITY_INPUTS,
-    QUALITY_RESULT_SCHEMA_VERSION, QualityApplicability, QualityDimension, QualityDimensionResult,
-    QualityDimensionState, QualityScorecard, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
+    QUALITY_RESULT_SCHEMA_VERSION, QUALITY_SCORECARD_SCHEMA_VERSION, QualityApplicability,
+    QualityDimension, QualityDimensionResult, QualityDimensionState, QualityOutputBinding,
+    QualityScorecard, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
     SerializedContextMeasurement, SessionDeliverySnapshot, SnapshotCompleteness,
     SnapshotDenominator, SourceSnapshot,
 };
@@ -118,6 +119,24 @@ fn resolved_applicability() -> QualityApplicability {
     }
 }
 
+/// Intrinsically well-formed output binding for a card that is only checked for
+/// structural integrity. A card bound to a real packet's exact output is built
+/// by its owner; these fixtures only need the field to be well formed.
+pub fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "fixture-route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
+    }
+}
+
 fn quality(binding: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -134,7 +153,9 @@ fn quality(binding: &ContextBinding) -> QualityScorecard {
         QualityDimension::TelemetryMeasurementCostCoverage,
     ];
     QualityScorecard {
+        schema_version: QUALITY_SCORECARD_SCHEMA_VERSION,
         binding: binding.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()

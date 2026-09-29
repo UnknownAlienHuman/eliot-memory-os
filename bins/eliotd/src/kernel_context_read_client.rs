@@ -82,9 +82,10 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
-    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextError, ContextOutcome, ContextRecipe,
-    DecisionContextIncomplete, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
-    QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
+    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
+    ContextRecipe, DecisionContextIncomplete, MeasurementCompositionProfile,
+    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
@@ -1306,6 +1307,33 @@ pub enum PacketCompositionError {
     /// The assembly owner rejected the admitted set.
     #[error("packet assembly failed: {0}")]
     Assembly(Box<AssemblyError>),
+    /// The compilation could not produce a complete grade for the packet it
+    /// attempted, and it did not fabricate a successful Active View in place of
+    /// one.
+    ///
+    /// The attempted recipe revision, the exact compilation binding and the
+    /// COMPLETE card — all twelve dimension results, including every failed,
+    /// unknown, degraded and not-applicable one with the missing evidence it
+    /// names — cross this boundary typed. They are not collapsed into the
+    /// generic [`PacketCompositionError::Assembly`] string, and no result is
+    /// dropped so the failure fits a smaller payload. The refusal is the
+    /// operation-scoped answer the assembly owner already produced, so a host
+    /// reader does not re-derive which operation was blocked, by which
+    /// dimension, or by which unresolved applicability input.
+    #[error("packet quality is incomplete for attempted recipe {attempted_recipe_digest}")]
+    QualityIncomplete {
+        /// Canonical digest of the recipe this compilation actually attempted.
+        attempted_recipe_digest: String,
+        /// Exact task/attempt/scope/decision/fence the attempt was made under.
+        /// Boxed like every other payload-carrying variant here, so this typed
+        /// refusal does not make the composition error large.
+        attempted_binding: Box<ContextBinding>,
+        /// The complete graded card, refused rather than truncated.
+        quality: Box<QualityScorecard>,
+        /// The typed operation-scoped refusal naming the blocking results and
+        /// the unresolved applicability inputs.
+        refusal: Box<QualityRefusal>,
+    },
     /// The assembled packet does not carry exactly the materials the
     /// per-material rank traces reported as delivered. The admission owner's
     /// trace set is the delivery acceptance record, so a divergence between it
@@ -1467,7 +1495,7 @@ impl KernelContextReadClient {
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         let (admitted, delivery) = admit_packet_candidates(&input)?;
         let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
-            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
+            .map_err(|error| composition_failure(error, recipe, &request.binding))?;
         check_delivered_traces(&delivery, &assembled)
             .map_err(PacketCompositionError::TraceDelivery)?;
         // #1727: the assembled packet is not delivered on the strength of its
@@ -1483,6 +1511,34 @@ impl KernelContextReadClient {
             .verify_boundaries()
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         Ok((assembled, delivery))
+    }
+}
+
+/// Projects one assembly refusal onto the daemon-facing composition error
+/// without losing the typed detail it carries.
+///
+/// [`AssemblyError::QualityIncomplete`] already retains the complete scorecard
+/// and the typed operation-scoped refusal the assembly owner produced. That
+/// refusal is re-projected here with the recipe revision that was actually
+/// attempted and the exact compilation binding, so the host-facing response
+/// names what was tried, every failed or unknown dimension result, and the
+/// unresolved applicability inputs. Every other assembly failure keeps its own
+/// typed variant: nothing is stringified and no result is dropped.
+fn composition_failure(
+    error: AssemblyError,
+    recipe: &ContextRecipe,
+    binding: &ContextBinding,
+) -> PacketCompositionError {
+    match error {
+        AssemblyError::QualityIncomplete(quality, refusal) => {
+            PacketCompositionError::QualityIncomplete {
+                attempted_recipe_digest: recipe.recipe_sha256.clone(),
+                attempted_binding: Box::new(binding.clone()),
+                quality,
+                refusal,
+            }
+        }
+        other => PacketCompositionError::Assembly(Box::new(other)),
     }
 }
 

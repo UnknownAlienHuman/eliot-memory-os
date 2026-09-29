@@ -221,6 +221,24 @@ fn resolved_applicability() -> QualityApplicability {
     }
 }
 
+/// Intrinsically well-formed output binding for a card that is only checked for
+/// structural integrity, or for a packet assembly refuses before the grade is
+/// read. [`quality_for`] is the card a real packet accepts.
+fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "fixture-route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
+    }
+}
+
 fn quality(context: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -237,7 +255,9 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
         QualityDimension::TelemetryMeasurementCostCoverage,
     ];
     QualityScorecard {
+        schema_version: QUALITY_SCORECARD_SCHEMA_VERSION,
         binding: context.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()
@@ -257,6 +277,47 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
             })
             .collect(),
     }
+}
+
+/// The card a real packet accepts: it records the exact output it graded, so
+/// the recipe revision, the fence, the admitted set's own canonical payload
+/// digest and the ordered rendered payload digest are this packet's values.
+fn quality_for(admitted: &AdmittedContextSet, recipe: &ContextRecipe) -> QualityScorecard {
+    let mut card = quality(&admitted.binding);
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)
+            .expect("fixture fence digest");
+    let rendered = rendered_for(admitted);
+    card.output.recipe_digest = recipe.recipe_sha256.clone();
+    card.output.fence_digest = fence_digest.clone();
+    card.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("fixture admitted digest");
+    card.output.rendered_digest = ActiveUnderstandingView::canonical_output_digest(
+        &admitted.binding,
+        &recipe.recipe_sha256,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("fixture rendered digest");
+    card.output.omission_handles = admitted.economy.displaced.clone();
+    card
+}
+
+/// The A-18 role/provider/atom ordering the assembly owner renders in.
+fn rendered_for(admitted: &AdmittedContextSet) -> Vec<RenderedAtom> {
+    let mut rendered: Vec<RenderedAtom> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
+    rendered.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.atom_id.cmp(&right.atom_id))
+    });
+    rendered
 }
 
 fn measurement(context: &ContextBinding, bytes: &[u8]) -> SerializedContextMeasurement {
@@ -349,7 +410,7 @@ fn assembles_exact_admitted_projection_and_measures_once() {
     let view = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| {
             calls += 1;
@@ -381,7 +442,7 @@ fn non_public_admitted_privacy_is_refused_before_measurement() {
         let result = assemble_active_view(
             &value,
             &recipe(&context),
-            quality(&context),
+            quality_for(&value, &recipe(&context)),
             &policy(100_000),
             |_bytes| {
                 calls += 1;
@@ -408,7 +469,7 @@ fn canonical_payload_matches_a15_digest_and_order() {
     let left = assemble_active_view(
         &first,
         &recipe(&context),
-        quality(&context),
+        quality_for(&first, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -428,7 +489,7 @@ fn canonical_payload_matches_a15_digest_and_order() {
     let right = assemble_active_view(
         &second,
         &recipe(&context),
-        quality(&context),
+        quality_for(&second, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -457,7 +518,7 @@ fn measurement_mismatch_is_typed_and_rejected() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| {
             let mut measured = measurement(&context, bytes);
@@ -472,7 +533,7 @@ fn measurement_mismatch_is_typed_and_rejected() {
     let unsupported = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| {
             let mut measured = measurement(&context, bytes);
@@ -513,7 +574,7 @@ fn output_byte_limit_is_checked_before_measurement() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(bytes - 1),
         |_bytes| panic!("measurement must not run after byte-limit rejection"),
     );
@@ -531,7 +592,7 @@ fn oversized_nested_material_is_rejected_before_rendering() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_bytes| panic!("measurement must not run after preflight rejection"),
     );
@@ -546,7 +607,7 @@ fn rendered_fields_and_quality_binding_are_retained() {
     let view = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -566,7 +627,7 @@ fn rendered_fields_and_quality_binding_are_retained() {
     let result = assemble_active_view(
         &stale_admission,
         &recipe(&context),
-        quality(&context),
+        quality_for(&stale_admission, &recipe(&context)),
         &policy(100_000),
         |_bytes| panic!("stale admission digest must preflight before measurement"),
     );
@@ -589,7 +650,7 @@ fn rendered_fields_and_quality_binding_are_retained() {
     let result = assemble_active_view(
         &value,
         &mismatched_recipe,
-        quality(&context),
+        quality_for(&value, &mismatched_recipe),
         &policy(100_000),
         |_bytes| panic!("mandatory-role mismatch must preflight before measurement"),
     );
@@ -609,7 +670,7 @@ fn fence_digest_binds_to_admitted_state_fence() {
     let view = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -645,7 +706,7 @@ fn forged_fence_digest_is_rejected_as_invalid_fence() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &forged_policy,
         |bytes| {
             calls += 1;
@@ -879,7 +940,7 @@ fn multi_role_provider_set_is_deterministic() {
     let left = assemble_active_view(
         &value,
         &recipe,
-        quality(&context),
+        quality_for(&value, &recipe),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -887,7 +948,7 @@ fn multi_role_provider_set_is_deterministic() {
     let right = assemble_active_view(
         &value,
         &recipe,
-        quality(&context),
+        quality_for(&value, &recipe),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -926,7 +987,7 @@ fn denominator_mismatch_is_rejected() {
     let result = assemble_active_view(
         &value,
         &foreign,
-        quality(&context),
+        quality_for(&value, &foreign),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     );
@@ -942,7 +1003,7 @@ fn denominator_mismatch_is_rejected() {
     let result = assemble_active_view(
         &broken,
         &recipe(&broken_context),
-        quality(&broken_context),
+        quality_for(&broken, &recipe(&broken_context)),
         &policy(100_000),
         |bytes| Ok(measurement(&broken_context, bytes)),
     );
@@ -962,7 +1023,7 @@ fn duplicate_atom_identity_is_rejected() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_bytes| panic!("duplicate must fail before measurement"),
     );
@@ -992,7 +1053,7 @@ fn missing_admitted_material_yields_exact_incomplete() {
     let result = assemble_active_view(
         &value,
         &missing_recipe,
-        quality(&context),
+        quality_for(&value, &missing_recipe),
         &policy(100_000),
         |_bytes| panic!("incomplete floor must precede measurement"),
     );
@@ -1021,7 +1082,7 @@ fn nonadmitted_rendering_material_is_rejected() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_bytes| panic!("nonadmitted material must fail before measurement"),
     );
@@ -1039,7 +1100,7 @@ fn dropping_admitted_atom_to_fit_fails_selection_integrity() {
     let full = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1048,7 +1109,7 @@ fn dropping_admitted_atom_to_fit_fails_selection_integrity() {
     let tight = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(full.serialized_bytes.len() as u64 - 1),
         |_bytes| panic!("tight bound must fail before measurement"),
     );
@@ -1098,7 +1159,7 @@ fn adding_omitted_atom_fails() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_bytes| panic!("injected atom must fail membership"),
     );
@@ -1117,7 +1178,7 @@ fn changed_role_required_protected_state_fails() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_bytes| panic!("changed role must fail before measurement"),
     );
@@ -1142,7 +1203,7 @@ fn changed_role_required_protected_state_fails() {
     let result = assemble_active_view(
         &value,
         &widened,
-        quality(&context),
+        quality_for(&value, &widened),
         &policy(100_000),
         |_bytes| panic!("widened mandatory roles must fail denominator"),
     );
@@ -1164,7 +1225,7 @@ fn splitting_merging_whole_atoms_fails() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_bytes| panic!("split representation must fail before measurement"),
     );
@@ -1182,7 +1243,7 @@ fn splitting_merging_whole_atoms_fails() {
     let result = assemble_active_view(
         &merged,
         &recipe(&merged_context),
-        quality(&merged_context),
+        quality_for(&merged, &recipe(&merged_context)),
         &policy(100_000),
         |_bytes| panic!("merged summary must fail before measurement"),
     );
@@ -1202,7 +1263,7 @@ fn provider_store_never_invoked_projection_is_pure() {
     let first = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| {
             calls += 1;
@@ -1216,7 +1277,7 @@ fn provider_store_never_invoked_projection_is_pure() {
     let second = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| {
             replay_calls += 1;
@@ -1237,7 +1298,7 @@ fn no_ranking_compression_summary_implementation() {
     let view = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1268,7 +1329,7 @@ fn no_ranking_compression_summary_implementation() {
     let result = assemble_active_view(
         &summarized,
         &recipe(&summarized_context),
-        quality(&summarized_context),
+        quality_for(&summarized, &recipe(&summarized_context)),
         &policy(100_000),
         |_bytes| panic!("summary must not rank as a substitute"),
     );
@@ -1286,7 +1347,7 @@ fn normative_layout_and_stable_tiebreak_enforced() {
     let left = assemble_active_view(
         &first,
         &recipe(&context),
-        quality(&context),
+        quality_for(&first, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1307,7 +1368,7 @@ fn normative_layout_and_stable_tiebreak_enforced() {
     let right = assemble_active_view(
         &reversed,
         &recipe(&context),
-        quality(&context),
+        quality_for(&reversed, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1320,7 +1381,7 @@ fn normative_layout_and_stable_tiebreak_enforced() {
     let ordered = assemble_active_view(
         &multi,
         &multi_recipe,
-        quality(&multi_context),
+        quality_for(&multi, &multi_recipe),
         &policy(100_000),
         |bytes| Ok(measurement(&multi_context, bytes)),
     )
@@ -1450,7 +1511,7 @@ fn omission_expansion_records_are_retained() {
     let view = assemble_active_view(
         &value,
         &recipe,
-        quality(&context),
+        quality_for(&value, &recipe),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1501,7 +1562,7 @@ fn missing_changed_crosstask_expansion_handle_fails() {
     let result = assemble_active_view(
         &wrong_atom,
         &recipe(&wrong_context),
-        quality(&wrong_context),
+        quality_for(&wrong_atom, &recipe(&wrong_context)),
         &policy_for(&wrong_context, 100_000),
         |_bytes| panic!("changed handle must fail before measurement"),
     );
@@ -1522,7 +1583,7 @@ fn missing_changed_crosstask_expansion_handle_fails() {
     let result = assemble_active_view(
         &cross_task,
         &recipe(&cross_context),
-        quality(&cross_context),
+        quality_for(&cross_task, &recipe(&cross_context)),
         &policy_for(&cross_context, 100_000),
         |_bytes| panic!("cross-task handle must fail before measurement"),
     );
@@ -1548,7 +1609,7 @@ fn final_utf8_measurement_includes_non_ascii_bytes() {
     let view = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1582,7 +1643,7 @@ fn estimate_and_exact_observation_identities_are_distinct() {
     let exact = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1605,7 +1666,7 @@ fn estimate_and_exact_observation_identities_are_distinct() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_| Ok(estimated.clone()),
     );
@@ -1623,7 +1684,7 @@ fn protected_output_review_headroom_not_consumed() {
     let exact = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1642,7 +1703,7 @@ fn protected_output_review_headroom_not_consumed() {
     let snug = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(fit_bytes),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1654,7 +1715,7 @@ fn protected_output_review_headroom_not_consumed() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_| Ok(consumed.clone()),
     );
@@ -1677,7 +1738,7 @@ fn unknown_measurement_cannot_prove_fit() {
         let result = assemble_active_view(
             &value,
             &recipe(&context),
-            quality(&context),
+            quality_for(&value, &recipe(&context)),
             &policy(100_000),
             |_| Ok(unknown.clone()),
         );
@@ -1694,7 +1755,7 @@ fn unknown_measurement_cannot_prove_fit() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_| Ok(stu_without_estimate.clone()),
     );
@@ -1713,7 +1774,7 @@ fn overflow_preserves_admitted_evidence() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(10),
         |_bytes| panic!("overflow must precede measurement"),
     );
@@ -1733,7 +1794,7 @@ fn measurement_port_called_exactly_once_on_final_bytes() {
     let view = assemble_active_view(
         &value,
         &recipe,
-        quality(&context),
+        quality_for(&value, &recipe),
         &policy(100_000),
         |bytes| {
             calls += 1;
@@ -1759,11 +1820,16 @@ fn measurement_port_called_exactly_once_on_final_bytes() {
         fence_digest: "b".repeat(64),
         ..policy(100_000)
     };
-    let result: Result<_, AssemblyError> =
-        assemble_active_view(&value, &recipe, quality(&context), &forged, |bytes| {
+    let result: Result<_, AssemblyError> = assemble_active_view(
+        &value,
+        &recipe,
+        quality_for(&value, &recipe),
+        &forged,
+        |bytes| {
             refused_calls += 1;
             Ok(measurement(&context, bytes))
-        });
+        },
+    );
     assert!(result.is_err());
     assert_eq!(refused_calls, 0, "no local fallback call on refusal");
 }
@@ -1786,7 +1852,7 @@ fn source_guard_rejects_local_fallback_estimators() {
     let view = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1800,7 +1866,7 @@ fn source_guard_rejects_local_fallback_estimators() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_| Ok(char_measured.clone()),
     );
@@ -1815,7 +1881,7 @@ fn source_guard_rejects_local_fallback_estimators() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |_| Ok(tokenizer_fallback.clone()),
     );
@@ -1833,7 +1899,7 @@ fn one_semantic_occurrence_per_admitted_atom() {
     let view = assemble_active_view(
         &value,
         &recipe,
-        quality(&context),
+        quality_for(&value, &recipe),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -1876,7 +1942,7 @@ fn duplicate_rendered_occurrence_is_rejected() {
     let result = assemble_active_view(
         &duplicated,
         &recipe(&duplicated_context),
-        quality(&duplicated_context),
+        quality_for(&duplicated, &recipe(&duplicated_context)),
         &policy(100_000),
         |_bytes| panic!("duplicate rendered must fail before measurement"),
     );
@@ -1898,7 +1964,7 @@ fn missing_omission_coverage_evidence_is_rejected() {
     let result = assemble_active_view(
         &value,
         &omission_recipe,
-        quality(&context),
+        quality_for(&value, &omission_recipe),
         &policy_for(&context, 100_000),
         |_bytes| panic!("missing omission record must fail"),
     );
@@ -1993,7 +2059,7 @@ fn exact_twelve_quality_dimensions_and_wire_names() {
     assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -2107,7 +2173,7 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
     let complete = assemble_active_view(
         &complete_value,
         &recipe(&complete_context),
-        quality(&complete_context),
+        quality_for(&complete_value, &recipe(&complete_context)),
         &policy(100_000),
         |bytes| Ok(measurement(&complete_context, bytes)),
     );
@@ -2128,7 +2194,7 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
     let upstream = assemble_active_view(
         &missing_value,
         &missing_recipe,
-        quality(&missing_context),
+        quality_for(&missing_value, &missing_recipe),
         &policy(100_000),
         |_| panic!("upstream gap precedes measurement"),
     );
@@ -2153,7 +2219,7 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
     let tight = assemble_active_view(
         &complete_value,
         &recipe(&complete_context),
-        quality(&complete_context),
+        quality_for(&complete_value, &recipe(&complete_context)),
         &policy(10),
         |_| panic!("byte ceiling precedes measurement"),
     );
@@ -2165,7 +2231,7 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
     let measured = assemble_active_view(
         &complete_value,
         &recipe(&complete_context),
-        quality(&complete_context),
+        quality_for(&complete_value, &recipe(&complete_context)),
         &policy(100_000),
         |_| Ok(bad_bytes.clone()),
     );
@@ -2185,7 +2251,7 @@ fn unknown_fields_variants_protected_defaults_are_rejected() {
     let result = assemble_active_view(
         &value,
         &bad_schema,
-        quality(&context),
+        quality_for(&value, &bad_schema),
         &policy(100_000),
         |_bytes| panic!("unknown schema must fail"),
     );
@@ -2201,7 +2267,7 @@ fn unknown_fields_variants_protected_defaults_are_rejected() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &bad_digest,
         |_bytes| panic!("unknown digest shape must fail"),
     );
@@ -2217,7 +2283,7 @@ fn unknown_fields_variants_protected_defaults_are_rejected() {
     let result = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &unknown_policy,
         |_bytes| panic!("unknown measurement status must fail"),
     );
@@ -2283,7 +2349,7 @@ fn no_admission_delivery_authority_effect_finish_path() {
     let view = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
@@ -2296,7 +2362,7 @@ fn no_admission_delivery_authority_effect_finish_path() {
     let replay = assemble_active_view(
         &value,
         &recipe(&context),
-        quality(&context),
+        quality_for(&value, &recipe(&context)),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )

@@ -2,7 +2,8 @@
 
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
-    QualityOperation, QualityRefusalKind, QualityScorecard, SerializedContextMeasurement,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    SerializedContextMeasurement,
 };
 
 use crate::{AssemblyError, boundary, bounds, measurement, render};
@@ -184,6 +185,13 @@ where
         &expected_fence_digest,
         &rendered,
     )?;
+    require_graded_output(
+        &quality,
+        admitted,
+        &recipe.recipe_sha256,
+        &expected_fence_digest,
+        &output_digest,
+    )?;
     let final_bytes =
         u64::try_from(bytes.len()).map_err(|_| AssemblyError::Contract(ContextError::Overflow))?;
     if final_bytes > policy.max_serialized_bytes {
@@ -230,6 +238,45 @@ where
         boundaries,
         boundary_binding,
     })
+}
+
+/// Require that the card graded the exact output this assembly just produced.
+///
+/// The card is compared against the recipe revision, the fence, the admitted
+/// set's own canonical payload digest, the ordered rendered payload digest and
+/// the omission handles. Every one of those is the packet's own recorded value,
+/// recomputed by its existing owner, and the scorecard is an input to none of
+/// them, so grading the final representation and hashing that representation
+/// stay two ordered steps rather than a receipt containing its own output hash.
+///
+/// A card swapped in from another same-fence packet with a different recipe or
+/// membership records a different value here, so it is refused with the card
+/// retained: the caller receives the exact grades that were rejected instead of
+/// a fabricated success.
+fn require_graded_output(
+    quality: &QualityScorecard,
+    admitted: &AdmittedContextSet,
+    recipe_digest: &str,
+    fence_digest: &str,
+    rendered_digest: &str,
+) -> Result<(), AssemblyError> {
+    if quality.output.recipe_digest != recipe_digest
+        || quality.output.fence_digest != fence_digest
+        || quality.output.admitted_digest != admitted.canonical_payload_digest()?
+        || quality.output.rendered_digest != rendered_digest
+        || quality.output.omission_handles != admitted.economy.displaced
+    {
+        return Err(AssemblyError::QualityIncomplete(
+            Box::new(quality.clone()),
+            Box::new(QualityRefusal {
+                kind: QualityRefusalKind::InvalidScorecard,
+                operation: QualityOperation::Compile,
+                blocking: Vec::new(),
+                unresolved_applicability: Vec::new(),
+            }),
+        ));
+    }
+    Ok(())
 }
 
 fn preflight(
