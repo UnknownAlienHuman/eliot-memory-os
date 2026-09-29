@@ -906,7 +906,18 @@ pub(crate) async fn prepare_ul_auditor_scope(
     .await
 }
 
-#[allow(dead_code)]
+// #838: exact item annotation, not a module-wide suppression. The long-horizon
+// (360 minute) cognitive-external launch scope is the sibling of the 30 minute
+// UL auditor scope above; only the auditor scope has a current caller, so
+// `dead_code` fires on this item alone. `expect` (not `allow`) is the removal
+// trigger: the moment any caller wires this path the expectation is unfulfilled
+// and `unfulfilled_lint_expectations` becomes an error under `-D warnings`, so
+// the annotation retires itself. Owner: no sibling issue currently owns the
+// eliot-app cognitive-external launch wiring (recorded BLOCKED-BY scope in the
+// #838 accounting); #839 owns the eliotd activation flight, not this item.
+// Removal condition: a production caller of `prepare_cognitive_external_scope`
+// lands, or the 360 minute scope is withdrawn and the function is deleted.
+#[expect(dead_code, reason = "unwired cognitive-external launch scope; expect is the removal trigger")]
 pub(crate) async fn prepare_cognitive_external_scope(
     config_path: &Path,
     host: AgentHostId,
