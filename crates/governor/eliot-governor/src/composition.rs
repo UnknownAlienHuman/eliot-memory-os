@@ -60,7 +60,9 @@ use eliot_diagnostic::{
     DiagnosticSeverity, DiagnosticStatus,
 };
 use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
-use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
+use eliot_finish::{
+    DescendantClosure, FinishDecisionReceipt, FinishLifecycleAction, FinishService,
+};
 use eliot_instrument_api::{
     CaptureProvenance, EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
     InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
@@ -841,6 +843,139 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The product-proof contract type this crate projects, re-exported so
+/// callers name the record through the composition's own surface.
+pub type ProductProofStatus = eliot_reports::product_proof::ProductProofStatus;
+
+/// The fail-closed product-proof rollup this crate publishes.
+pub type ProductProofRollup = eliot_reports::product_proof::ProductProofRollup;
+
+/// Narrows a product-proof contract refusal to this crate's error type.
+///
+/// The composition already reports every owner refusal as
+/// [`CompositionError::Provider`], so this keeps the product-proof producer on
+/// the same typed path instead of a string error, and a record the contract
+/// rejects is an ordinary composition refusal the daemon already handles.
+fn product_proof_error(error: impl std::fmt::Display) -> CompositionError {
+    CompositionError::Provider(error.to_string())
+}
+
+/// The I18.22 execution position a finish lifecycle action actually reached.
+///
+/// The semantic outcome stays on the decision's own axis, so why a run did not
+/// complete stays distinct from what it would have proven. A close of any kind
+/// is a terminal position. A continuation or a suspension is not a terminal
+/// position, so it is recorded as the terminal `Failed` position the owner
+/// actually observed — the run did not complete and reached no verdict — which
+/// keeps a non-terminal lifecycle action from being written as an in-flight
+/// attempt the record cannot represent.
+fn product_proof_execution(action: FinishLifecycleAction) -> ExecutionStatus {
+    match action {
+        FinishLifecycleAction::CloseCompleted => ExecutionStatus::Succeeded,
+        FinishLifecycleAction::ClosePartial => ExecutionStatus::Partial,
+        FinishLifecycleAction::CloseCancelled => ExecutionStatus::Cancelled,
+        FinishLifecycleAction::CloseSuperseded => ExecutionStatus::Unknown,
+        FinishLifecycleAction::ContinueActive | FinishLifecycleAction::EnterSuspended => {
+            ExecutionStatus::Failed
+        }
+        FinishLifecycleAction::EnterBlocked => ExecutionStatus::Blocked,
+    }
+}
+
+/// Builds the product-proof revision for one real installed Windows attempt.
+///
+/// Every value is read from the retained finish decision the acceptance owner
+/// actually derived: the run identity is the receipt's own decision id, the
+/// execution position is its own lifecycle action, the semantic outcome is the
+/// owner mapping of its own decision, and the I18.22 failure class is that same
+/// position. The retained evidence is rebuilt from the previous record's own
+/// identities plus the receipt's canonical bytes, so the revision neither drops
+/// a previously retained fact nor invents one — and it re-reads the original
+/// receipt through its own canonical digest rather than recomputing a checksum
+/// over what is held.
+///
+/// This is a free function rather than a method on the record because the
+/// record is owned by `eliot-reports` and Rust forbids an inherent impl for a
+/// foreign type.
+fn product_proof_revision(
+    previous: &ProductProofStatus,
+    receipt: &FinishDecisionReceipt,
+) -> Result<eliot_finish::product_proof::ProductProofRevision, CompositionError> {
+    let execution = product_proof_execution(receipt.lifecycle_action);
+    let observed = execution == ExecutionStatus::Succeeded;
+    let outcome = eliot_finish::product_proof::outcome_of_decision(&receipt.decision);
+    let position = format!("{execution:?}");
+    let attempt = match eliot_finish::product_proof::failure_class_of_execution(execution) {
+        Some(failure_class) => eliot_reports::product_proof::ProductProofRunAttempt::incomplete(
+            receipt.decision_id.clone(),
+            execution,
+            failure_class,
+            format!(
+                "installed Windows attempt {} ended {position}: {}",
+                receipt.decision_id, receipt.decision.next_allowed_action
+            ),
+        ),
+        None => eliot_reports::product_proof::ProductProofRunAttempt::completed(
+            receipt.decision_id.clone(),
+            execution,
+            format!(
+                "installed Windows attempt {} completed: {}",
+                receipt.decision_id, receipt.decision.next_allowed_action
+            ),
+        ),
+    }
+    .map_err(product_proof_error)?;
+    let receipt_bytes = canonical_json_bytes(receipt).map_err(product_proof_error)?;
+    let live_evidence = if observed {
+        vec![
+            eliot_reports::product_proof::ProductProofEvidence::new(
+                eliot_reports::product_proof::ProductProofEvidenceDomain::Runtime,
+                format!("installed-route-receipt:{}", receipt.receipt_digest),
+                format!(
+                    "installed route attempt {} produced finish receipt {}",
+                    receipt.decision_id, receipt.receipt_digest
+                ),
+                eliot_reports::projection::ReportInputRevision::new(
+                    eliot_reports::projection::ReportInputSource::ProductSupport,
+                    receipt.attempt_id.clone(),
+                    receipt.task_revision,
+                    &receipt_bytes,
+                )
+                .map_err(product_proof_error)?,
+            )
+            .map_err(product_proof_error)?,
+        ]
+    } else {
+        Vec::new()
+    };
+    let missing_evidence = if observed {
+        Vec::new()
+    } else {
+        previous.missing_evidence.clone()
+    };
+    let reason = format!(
+        "installed Windows attempt {} recorded as {outcome:?} for finish authority {}",
+        receipt.decision_id, receipt.finish_authority_ref
+    );
+    Ok(eliot_finish::product_proof::ProductProofRevision {
+        attempt,
+        outcome,
+        reason,
+        missing_evidence,
+        live_evidence,
+        retained: eliot_reports::product_proof::ProductProofRetainedEvidence {
+            raw_log_refs: previous.retained.raw_log_refs.clone(),
+            executable: previous.retained.executable.clone(),
+            environment: previous.retained.environment.clone(),
+            stage_receipts: eliot_reports::product_proof::ProductProofStageReceipts {
+                installed_route: eliot_reports::product_proof::ProductProofStageReceipt::Observed {
+                    receipt_id: receipt.receipt_digest.clone(),
+                },
+            },
+        },
+    })
 }
 
 /// Errors raised before daemon readiness.
@@ -4696,6 +4831,107 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             self.kernel.as_ref(),
             finish_revision,
         )
+    }
+
+    /// Returns the terminal product-proof record this composition's
+    /// ProductProof/FinishService acceptance owner builds for the parked
+    /// Windows acceptance item (issue #1903).
+    ///
+    /// The composition owns the single [`FinishService`] in
+    /// [`GovernorOwners::finish`], so this is the owner boundary itself. Every
+    /// value the record carries is read, not composed: the executable identity
+    /// and its content digest are this composition's own retained
+    /// [`KernelGenerationSnapshot`], the finish authority is that snapshot's own
+    /// service and generation, and the installed-route stage is observed only
+    /// when the caller supplies the retained installed-route receipt identity
+    /// the #11 pulse actually produced.
+    ///
+    /// The returned rollup is the owner's own fail-closed rollup, unmodified.
+    /// While no installed-route receipt exists the stage is recorded as
+    /// `Missing`, the outcome is `Blocked`, and the rollup is `Refused`.
+    /// Nothing here relaxes the `PASS` refusal: the record is a pass only when
+    /// an installed-route execution was actually observed and the run that
+    /// observed it succeeded.
+    pub fn product_proof_status(
+        &self,
+        installed_route_receipt: Option<&str>,
+    ) -> Result<(ProductProofStatus, ProductProofRollup), CompositionError> {
+        let snapshot = &self.snapshot;
+        // The identity this record would launch is the exact Host-approved
+        // generation this composition runs under, so the record names the bytes
+        // that would run. `installed` stays `false` because an installed-route
+        // execution has not launched them.
+        let executable = eliot_reports::product_proof::ProductProofExecutableIdentity::new(
+            format!("{}.exe", snapshot.service),
+            Some(snapshot.artifact_digest.clone()),
+            false,
+        )
+        .map_err(product_proof_error)?;
+        // The platform is this process's real compiled target, read from the
+        // toolchain, so the record names the environment that would run the
+        // proof rather than an assumed one.
+        let environment = eliot_reports::product_proof::ProductProofEnvironmentIdentity::new(
+            format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            Some(snapshot.principal.clone()),
+        )
+        .map_err(product_proof_error)?;
+        // The authority is the snapshot's own service and generation, so the
+        // record cites the generation actually running rather than a composed
+        // constant.
+        let authority_ref = format!(
+            "eliot.governor.finish/{}/{}",
+            snapshot.service,
+            snapshot.generation.value()
+        );
+        let raw_log_refs = installed_route_receipt
+            .map(|receipt| vec![receipt.to_owned()])
+            .unwrap_or_default();
+        let inputs = eliot_finish::product_proof::ProductProofStageInputs {
+            authority_ref: &authority_ref,
+            owner: crate::COORDINATOR,
+            proof_ceiling: crate::PROOF_CEILING,
+            installed_route_receipt,
+            raw_log_refs: &raw_log_refs,
+            executable: Some(executable),
+            environment: Some(environment),
+        };
+        // The record producers are associated functions of the owner's own type
+        // and are called through the type, not through the owned instance: each
+        // one builds the record from the facts handed to it and reads no state
+        // from the `FinishService` value, so a receiver would invent a receiver
+        // the definition does not have. `self.owners.finish` is still the one
+        // `FinishService` in this composition, and this is that same owner type.
+        let parked = FinishService::product_proof_parked(&inputs).map_err(product_proof_error)?;
+        // The same record is then revised from the owner's latest retained
+        // finish decision, so the next installed Windows attempt updates this
+        // one acceptance item in place instead of a parallel record appearing.
+        // A revision is only built from a decision that a real installed-route
+        // execution produced; with no installed-route receipt the parked record
+        // stands unchanged, which is the current truthful state. The revision
+        // borrows the retained receipt instead of copying it.
+        let status = match (installed_route_receipt, self.latest_finish_receipt()) {
+            (Some(_), Some(receipt)) => FinishService::revise_product_proof_status(
+                &parked,
+                product_proof_revision(&parked, &receipt)?,
+            )
+            .map_err(product_proof_error)?,
+            _ => parked,
+        };
+        let rollup = status.rollup();
+        Ok((status, rollup))
+    }
+
+    /// The most recently retained finish decision receipt, if one exists.
+    ///
+    /// Receipts are keyed by attempt id in a deterministic projection, so the
+    /// newest decision is selected by exact canonical attempt identity rather
+    /// than by map iteration order.
+    fn latest_finish_receipt(&self) -> Option<FinishDecisionReceipt> {
+        self.owners
+            .finish
+            .receipts()
+            .into_iter()
+            .max_by(|left, right| left.attempt_id.cmp(&right.attempt_id))
     }
 
     /// Publishes the current durable `TestD` verifier execution fact through

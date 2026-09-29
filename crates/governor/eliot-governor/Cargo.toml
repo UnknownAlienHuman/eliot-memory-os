@@ -56,6 +56,12 @@ eliot-problem.workspace = true
 eliot-protocol.workspace = true
 eliot-read = { path = "../eliot-read", version = "0.1.0" }
 eliot-receipts.workspace = true
+# Issue #1903: the composition owns the ProductProof/FinishService acceptance
+# owner, so it projects that owner's terminal product-proof record and its
+# fail-closed rollup to the live daemon status surface. The edge is one-way:
+# `eliot-reports` is a pure report-projection crate that holds no owner, store
+# handle, or authority source, and it does not depend on this crate.
+eliot-reports.workspace = true
 eliot-session.workspace = true
 eliot-skill.workspace = true
 eliot-store-api.workspace = true

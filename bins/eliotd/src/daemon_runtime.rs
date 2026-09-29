@@ -480,6 +480,74 @@ fn decide_campaign_packet_tick(flight: &CampaignPacketFlight) -> CampaignPacketT
     }
 }
 
+/// The published product-proof status for one acceptance item (issue #1903).
+///
+/// This is the wire view of the ProductProof/FinishService acceptance owner's
+/// terminal record and its fail-closed rollup. It is a projection of those two
+/// values: the disposition is the rollup's own verdict, and the remaining
+/// fields repeat the record's outcome, reason, owner, authority, required
+/// missing evidence, and retained build-evidence handle. The build handle is
+/// present as non-product proof only, so a successful release build is never
+/// read as a live pass.
+#[derive(Debug, Serialize)]
+pub(super) struct ProductProofStatusWire {
+    /// Acceptance item this status describes.
+    pub(super) proof_id: String,
+    /// Product-proof contract identity the record carries.
+    pub(super) contract: String,
+    /// Exact I18.24 outcome observed for the required product property.
+    pub(super) outcome: eliot_instrument_api::VerificationOutcome,
+    /// `pass` or `refused`, taken verbatim from the owner's fail-closed rollup.
+    pub(super) disposition: String,
+    /// Factual reason for that outcome.
+    pub(super) reason: String,
+    /// Acceptance owner accountable for the proof.
+    pub(super) owner: String,
+    /// Authority that imposed the stop condition.
+    pub(super) authority_ref: String,
+    /// Required evidence that is still absent, in canonical order.
+    pub(super) missing_evidence: Vec<String>,
+    /// Retained build evidence, explicitly not a product outcome.
+    pub(super) build_evidence_id: Option<String>,
+    /// Whether the required installed-route execution was observed.
+    pub(super) installed_route_observed: bool,
+}
+
+impl ProductProofStatusWire {
+    /// Projects the owner's record and its own rollup onto the status surface.
+    ///
+    /// The disposition is read from the rollup the owner produced, not decided
+    /// here, so a second verdict cannot exist: this function cannot turn a
+    /// refused record into a pass. A refused record still publishes, because
+    /// the current product state *is* a refusal — an operator must be able to
+    /// read the exact outcome, reason, owner, authority, and required missing
+    /// evidence without the record ever becoming a pass.
+    fn project(
+        status: &eliot_reports::product_proof::ProductProofStatus,
+        rollup: &eliot_reports::product_proof::ProductProofRollup,
+    ) -> Self {
+        Self {
+            proof_id: status.proof_id.clone(),
+            contract: status.contract.clone(),
+            outcome: status.outcome,
+            disposition: match rollup {
+                eliot_reports::product_proof::ProductProofRollup::Pass { .. } => "pass",
+                eliot_reports::product_proof::ProductProofRollup::Refused { .. } => "refused",
+            }
+            .to_owned(),
+            reason: status.reason.clone(),
+            owner: status.authority.owner.clone(),
+            authority_ref: status.authority.authority_ref.clone(),
+            missing_evidence: status.missing_evidence.clone(),
+            build_evidence_id: status
+                .build_evidence
+                .as_ref()
+                .map(|build| build.evidence.evidence_id.clone()),
+            installed_route_observed: status.retained.installed_route_observed(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(super) enum ReadyMessage {
@@ -491,6 +559,20 @@ pub(super) enum ReadyMessage {
         authority_epoch: u64,
         health: String,
         degraded: bool,
+        /// Issue #1903: the terminal product-proof status for the parked
+        /// Windows acceptance item, as the ProductProof/FinishService owner
+        /// built it from the stage receipts it actually holds. It is published
+        /// on the live daemon status surface so an operator reads the current
+        /// product status here instead of from a type that has no consumer.
+        /// The rollup is fail-closed: it reports `pass` only when the record
+        /// validated and its required installed-route execution was actually
+        /// observed, and otherwise carries the exact outcome, reason, and
+        /// authority. This field is additive; a reader that ignores it keeps
+        /// the previous meaning of this message exactly. It is absent only
+        /// when the acceptance owner refused to build a record at all, which
+        /// is a recorded absence rather than a fabricated verdict.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        product_proof: Option<ProductProofStatusWire>,
     },
     /// Kernel health degraded while the daemon remains observable.
     Degraded {
@@ -758,7 +840,31 @@ pub(super) fn run() -> Result<(), String> {
         ..composition_status
     };
     let _ = eliotd::diagnostics::emit_daemon_readiness(status.ready, status.degraded);
-    write_json(&ready_message(&status))?;
+    // Issue #1903: the composition's ProductProof/FinishService acceptance
+    // owner constructs the terminal product-proof record for the parked
+    // Windows acceptance item and this publishes its fail-closed rollup on the
+    // live daemon status surface, on the real startup path that writes the
+    // ready record. No installed-route receipt is supplied here because none
+    // exists: the #11 installed Windows pulse has never run on this host, so
+    // the required stage is published as explicitly missing and the record
+    // rolls up as `refused`. The record is built by that owner from the
+    // generation this daemon is actually running under, so a refused record
+    // publishes its exact outcome, reason, owner, authority, and required
+    // missing evidence rather than a pass. Building it never fails the daemon:
+    // a record the owner refuses leaves the field absent, which is a recorded
+    // absence rather than a fabricated verdict, and readiness, protocol
+    // framing, and exit behavior are unchanged.
+    let product_proof = match composition.product_proof_status(None) {
+        Ok((record, rollup)) => Some(ProductProofStatusWire::project(&record, &rollup)),
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::diagnostics",
+                "product proof status unavailable: {error}"
+            );
+            None
+        }
+    };
+    write_json(&ready_message(&status, product_proof))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -4776,7 +4882,10 @@ fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
 }
 
-fn ready_message(status: &DaemonStatus) -> ReadyMessage {
+fn ready_message(
+    status: &DaemonStatus,
+    product_proof: Option<ProductProofStatusWire>,
+) -> ReadyMessage {
     ReadyMessage::Ready {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
@@ -4784,6 +4893,7 @@ fn ready_message(status: &DaemonStatus) -> ReadyMessage {
         authority_epoch: status.authority_epoch,
         health: status.health.clone(),
         degraded: status.degraded,
+        product_proof,
     }
 }
 

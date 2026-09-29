@@ -1486,6 +1486,33 @@ impl DaemonComposition {
         self.governor.kernel_snapshot()
     }
 
+    /// Returns the ProductProof/FinishService acceptance owner's terminal
+    /// product-proof record for the parked Windows acceptance item, together
+    /// with its own fail-closed rollup (issue #1903).
+    ///
+    /// The acceptance owner is the Governor composition this daemon already
+    /// holds, so this is a read of that owner rather than a second source of the
+    /// same fact. `installed_route_receipt` is the retained installed-route
+    /// receipt identity, when one exists; passing `None` records the required
+    /// stage as explicitly missing, which is the current truthful state.
+    ///
+    /// The rollup is the owner's own: it reports `Pass` only when the record
+    /// validated and its required installed-route execution was actually
+    /// observed, and it otherwise carries the exact outcome, reason, authority,
+    /// and missing evidence. A refusal is a normal result here, not an error.
+    pub fn product_proof_status(
+        &self,
+        installed_route_receipt: Option<&str>,
+    ) -> Result<
+        (
+            eliot_governor::ProductProofStatus,
+            eliot_governor::ProductProofRollup,
+        ),
+        CompositionError,
+    > {
+        self.governor.product_proof_status(installed_route_receipt)
+    }
+
     /// Returns the live Governor owner handle.
     ///
     /// This is the owner that mints and re-verifies learning admission permits,

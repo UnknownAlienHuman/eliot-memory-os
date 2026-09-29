@@ -313,6 +313,12 @@ eliot-session = { path = "crates/governor/eliot-session", version = "0.1.0" }
 eliot-skill = { path = "crates/governor/eliot-skill", version = "0.1.0" }
 eliot-task = { path = "crates/governor/eliot-task", version = "0.1.0" }
 eliot-testd-core = { path = "crates/instrument/eliot-testd-core", version = "0.1.0" }
+# Issue #1903: the ProductProof/FinishService acceptance owner constructs the
+# terminal product-proof status record, so the pure report-projection crate that
+# types it is a direct dependency of the owner. `eliot-reports` stays a read-only
+# projection with no owner, store handle, or authority source, and it does not
+# depend back on the owner, so no finish authority crosses this edge.
+eliot-reports = { path = "crates/instrument/eliot-reports", version = "0.1.0" }
 eliot-doctor-core = { path = "crates/meta/eliot-doctor-core", version = "0.1.0" }
 eliot-runtime-status = { path = "crates/meta/eliot-runtime-status", version = "0.1.0" }
 eliot-cognitive-quality = { path = "crates/smart/eliot-cognitive-quality", version = "0.1.0" }

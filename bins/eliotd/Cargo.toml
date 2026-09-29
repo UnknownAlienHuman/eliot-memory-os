@@ -123,6 +123,12 @@ eliot-protocol.workspace = true
 eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-read = { path = "../../crates/governor/eliot-read", version = "0.1.0" }
 eliot-receipts.workspace = true
+# Issue #1903: the daemon's ready status message publishes the ProductProof /
+# FinishService acceptance owner's terminal product-proof record and its
+# fail-closed rollup, so this binary names the report contract types it
+# projects. The owner that constructs the record is `eliot-governor`; this edge
+# carries only the read-only wire view. `eliot-reports` depends on no owner.
+eliot-reports.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
 eliot-skill.workspace = true
