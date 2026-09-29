@@ -241,7 +241,9 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///
 /// Measured on `origin/main@0488753d` (2026-09-26) by walking every call
 /// site upward, because an earlier revision of this note asserted a consumer
-/// that does not exist. The state of this join is:
+/// that does not exist, and re-measured on `origin/main@941bc3fc` (2026-09-28)
+/// because the `#1862` rework removed the donor leg this note named. The state
+/// of this join is:
 ///
 /// - The production call site of the traced join is
 ///   `bins/eliotd/src/kernel_context_read_client.rs::admit_packet_candidates`,
@@ -249,18 +251,23 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   [`MaterialRankTraceDelivery`] to the packet composition.
 /// - That call site is not itself reachable from `fn main` yet:
 ///   `KernelContextReadClient::compile_context_packet` has no call site in
-///   the tree, and the live `eliot.packet` daemon poller
+///   the tree. The live `eliot.packet` daemon poller
 ///   (`daemon_runtime::run_campaign_packet_poll` ->
-///   `campaign_packet::serve_campaign_packet_pair` ->
-///   `eliot_context::ContextCompiler::compile_with_campaign_learning_state`)
-///   compiles through the `#40`-frozen `eliot-context` facade, which does not
-///   depend on this crate at all.
+///   `campaign_packet::serve_campaign_packet_pair`) no longer reaches a Context
+///   compiler at all: the `#1862` rework removed its `#[allow(deprecated)]`
+///   call to `eliot_context::ContextCompiler::compile_with_campaign_learning_state`,
+///   which now has zero product callers, and that route's product is the
+///   immutable campaign learning-state view that
+///   `eliot_learning_state_view::validate_campaign_learning_state_view_current`
+///   admits against the fresh authenticated owner reads. `eliot-context` does
+///   not depend on this crate, so that poller reaches no admission owner
+///   either.
 /// - `bins/eliot-wasm-host`'s `admit_governed_host` reaches
 ///   `admit_context_with_learning` but has no call site either.
 ///
-/// So the join is owned and reachable from a production composition that
-/// itself awaits its runtime edge; the missing link is the daemon packet edge
-/// above, not a supplier here. Read this as a measured absence, not as a
+/// So the join is owned and sits inside a production composition that awaits
+/// its runtime edge; what is still missing is a production caller for that
+/// composition, not a supplier here. Read this as a measured absence, not as a
 /// scheduled M2/O1 tick.
 pub fn admit_context_traced(
     input: &AdmissionInput,
