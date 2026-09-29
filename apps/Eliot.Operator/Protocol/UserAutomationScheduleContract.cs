@@ -955,7 +955,7 @@ public sealed record UserAutomationOutcome(
 public sealed record UserAutomationResultValidationContext
 {
     // A reviewed decoder change must explicitly acknowledge the Rust result schema.
-    private const string SupportedUserAutomationResultSchemaSha256 = "97e2c5cdde5475940818fd97844dd08a293777941f0e2f9769936c370cb5b9c9";
+    private const string SupportedUserAutomationResultSchemaSha256 = "a33f0f2df3f54d99ac0af98f256bd4766f943552a46be06c98e5f74f4462dc5c";
 
     private UserAutomationResultValidationContext(
         string expectedOperationId,
