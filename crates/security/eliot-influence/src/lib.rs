@@ -2663,6 +2663,136 @@ impl RuntimeVerdict {
     }
 }
 
+/// Quarantine refusal for the policy gate (A4.7).
+///
+/// Returns the verdict parts when source quarantine denies every use, `None`
+/// when the source may proceed to the remaining checks.
+fn quarantine_refusal(
+    subject: &RuntimeSubject,
+) -> Option<(RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>)> {
+    if matches!(
+        subject.quarantine,
+        QuarantineState::None | QuarantineState::Released
+    ) {
+        None
+    } else {
+        Some((
+            RuntimeVerdictKind::Deny,
+            vec![RuntimeReason::SourceQuarantined],
+            None,
+        ))
+    }
+}
+
+/// Freshness refusal for the policy gate (A5.2, A5.5).
+///
+/// Stale or superseded positions stay inspectable but cannot satisfy
+/// decision-grade uses: decision input degrades to exploratory read while
+/// verifier and confirmatory uses are denied outright.
+fn freshness_refusal(
+    subject: &RuntimeSubject,
+    requested: RuntimeUse,
+) -> Option<(RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>)> {
+    if subject.freshness == FreshnessStatus::Current
+        || matches!(requested, RuntimeUse::ExploratoryRead)
+    {
+        return None;
+    }
+    let stale = RuntimeReason::SourceStale {
+        freshness: subject.freshness,
+    };
+    if matches!(requested, RuntimeUse::DecisionInput) {
+        Some((
+            RuntimeVerdictKind::DegradedUse,
+            vec![stale],
+            Some(RuntimeUse::ExploratoryRead),
+        ))
+    } else {
+        Some((RuntimeVerdictKind::Deny, vec![stale], None))
+    }
+}
+
+/// Self-report refusal for the policy gate (A5.5).
+///
+/// Elevated-impact uses must not rely on the actor's self-report when an
+/// independent route is practical: a non-independent source finishes honestly
+/// degraded at decision input.
+fn self_report_refusal(
+    subject: &RuntimeSubject,
+    requested: RuntimeUse,
+) -> Option<(RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>)> {
+    if !matches!(
+        requested,
+        RuntimeUse::VerifierInput | RuntimeUse::ConfirmatoryAcceptance
+    ) || subject.independence == IndependenceLevel::Independent
+    {
+        return None;
+    }
+    Some((
+        RuntimeVerdictKind::DegradedUse,
+        vec![RuntimeReason::SelfReportRequiresIndependentRoute],
+        Some(RuntimeUse::DecisionInput),
+    ))
+}
+
+/// Capped-use refusal for the policy gate.
+///
+/// The subject's allowed set does not reach the requested use:
+/// exploratory-only subjects are denied outright, wider subjects degrade to
+/// the nearest weaker allowance.
+fn capped_refusal(
+    subject: &RuntimeSubject,
+    requested: RuntimeUse,
+    required: EpistemicUse,
+) -> (RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>) {
+    let not_allowed = RuntimeReason::EpistemicUseNotAllowed {
+        requested: required,
+        allowed: subject.allowed_uses.clone(),
+    };
+    if subject.is_exploratory_only() {
+        let specific = match requested {
+            RuntimeUse::ExploratoryRead => None,
+            RuntimeUse::DecisionInput => Some(RuntimeReason::UseCappedToExploratory),
+            RuntimeUse::VerifierInput => Some(RuntimeReason::ExploratoryOnlyCannotSatisfyVerifier),
+            RuntimeUse::ConfirmatoryAcceptance => {
+                Some(RuntimeReason::ExploratoryOnlyCannotSatisfyConfirmatory)
+            }
+        };
+        let mut reasons = vec![not_allowed];
+        if let Some(reason) = specific {
+            reasons.push(reason);
+        }
+        return (RuntimeVerdictKind::Deny, reasons, None);
+    }
+    let (reasons, fallback) = match requested {
+        RuntimeUse::ExploratoryRead => (vec![not_allowed], None),
+        RuntimeUse::DecisionInput => (
+            vec![not_allowed, RuntimeReason::UseCappedToExploratory],
+            Some(RuntimeUse::ExploratoryRead),
+        ),
+        RuntimeUse::VerifierInput => (
+            vec![
+                not_allowed,
+                RuntimeReason::VerifierRequiresVerificationInput,
+            ],
+            Some(RuntimeUse::DecisionInput),
+        ),
+        RuntimeUse::ConfirmatoryAcceptance => (
+            vec![
+                not_allowed,
+                RuntimeReason::ConfirmatoryRequiresQualification,
+            ],
+            Some(RuntimeUse::DecisionInput),
+        ),
+    };
+    let kind = if fallback.is_some() {
+        RuntimeVerdictKind::DegradedUse
+    } else {
+        RuntimeVerdictKind::Deny
+    };
+    (kind, reasons, fallback)
+}
+
 /// Mandatory policy gate for the reachable influence runtime path.
 ///
 /// Every boundary (`admit_context`, `inject_pending`, `decide_material`,
@@ -2704,35 +2834,13 @@ pub fn policy_gate(
             None,
         ));
     }
-    // Privacy/erasure state denies on its own (A4.7): a quarantined source is
-    // denied every use even when its dependency closure is still active.
-    if !matches!(
-        subject.quarantine,
-        QuarantineState::None | QuarantineState::Released
-    ) {
-        return Ok(stated(
-            RuntimeVerdictKind::Deny,
-            vec![RuntimeReason::SourceQuarantined],
-            None,
-        ));
+    // Privacy/erasure state denies on its own (A4.7), and stale positions
+    // cannot satisfy decision-grade uses (A5.2, A5.5).
+    if let Some((kind, reasons, fallback)) = quarantine_refusal(subject) {
+        return Ok(stated(kind, reasons, fallback));
     }
-    // Stale or superseded positions stay inspectable but cannot satisfy
-    // decision-grade uses (A5.2, A5.5): decision input degrades to exploratory
-    // read while verifier and confirmatory uses are denied outright.
-    if subject.freshness != FreshnessStatus::Current
-        && !matches!(requested, RuntimeUse::ExploratoryRead)
-    {
-        let stale = RuntimeReason::SourceStale {
-            freshness: subject.freshness,
-        };
-        if matches!(requested, RuntimeUse::DecisionInput) {
-            return Ok(stated(
-                RuntimeVerdictKind::DegradedUse,
-                vec![stale],
-                Some(RuntimeUse::ExploratoryRead),
-            ));
-        }
-        return Ok(stated(RuntimeVerdictKind::Deny, vec![stale], None));
+    if let Some((kind, reasons, fallback)) = freshness_refusal(subject, requested) {
+        return Ok(stated(kind, reasons, fallback));
     }
 
     let required = requested.required_use();
@@ -2747,68 +2855,14 @@ pub fn policy_gate(
                 Some(RuntimeUse::DecisionInput),
             ));
         }
-        // Elevated-impact uses must not rely on the actor's self-report when
-        // an independent route is practical (A5.5): a non-independent source
-        // finishes honestly degraded at decision input.
-        if matches!(
-            requested,
-            RuntimeUse::VerifierInput | RuntimeUse::ConfirmatoryAcceptance
-        ) && subject.independence != IndependenceLevel::Independent
-        {
-            return Ok(stated(
-                RuntimeVerdictKind::DegradedUse,
-                vec![RuntimeReason::SelfReportRequiresIndependentRoute],
-                Some(RuntimeUse::DecisionInput),
-            ));
+        // Elevated-impact uses must not rely on the actor's self-report (A5.5).
+        if let Some((kind, reasons, fallback)) = self_report_refusal(subject, requested) {
+            return Ok(stated(kind, reasons, fallback));
         }
         return Ok(stated(RuntimeVerdictKind::Allow, Vec::new(), None));
     }
 
-    let not_allowed = RuntimeReason::EpistemicUseNotAllowed {
-        requested: required,
-        allowed: subject.allowed_uses.clone(),
-    };
-    if subject.is_exploratory_only() {
-        let specific = match requested {
-            RuntimeUse::ExploratoryRead => None,
-            RuntimeUse::DecisionInput => Some(RuntimeReason::UseCappedToExploratory),
-            RuntimeUse::VerifierInput => Some(RuntimeReason::ExploratoryOnlyCannotSatisfyVerifier),
-            RuntimeUse::ConfirmatoryAcceptance => {
-                Some(RuntimeReason::ExploratoryOnlyCannotSatisfyConfirmatory)
-            }
-        };
-        let mut reasons = vec![not_allowed];
-        if let Some(reason) = specific {
-            reasons.push(reason);
-        }
-        return Ok(stated(RuntimeVerdictKind::Deny, reasons, None));
-    }
-    let (reasons, fallback) = match requested {
-        RuntimeUse::ExploratoryRead => (vec![not_allowed], None),
-        RuntimeUse::DecisionInput => (
-            vec![not_allowed, RuntimeReason::UseCappedToExploratory],
-            Some(RuntimeUse::ExploratoryRead),
-        ),
-        RuntimeUse::VerifierInput => (
-            vec![
-                not_allowed,
-                RuntimeReason::VerifierRequiresVerificationInput,
-            ],
-            Some(RuntimeUse::DecisionInput),
-        ),
-        RuntimeUse::ConfirmatoryAcceptance => (
-            vec![
-                not_allowed,
-                RuntimeReason::ConfirmatoryRequiresQualification,
-            ],
-            Some(RuntimeUse::DecisionInput),
-        ),
-    };
-    let kind = if fallback.is_some() {
-        RuntimeVerdictKind::DegradedUse
-    } else {
-        RuntimeVerdictKind::Deny
-    };
+    let (kind, reasons, fallback) = capped_refusal(subject, requested, required);
     Ok(stated(kind, reasons, fallback))
 }
 
