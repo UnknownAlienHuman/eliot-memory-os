@@ -38,14 +38,38 @@
 //! from the owner side of each comparison, never from the presented side.
 //!
 //! For two further fields this path still has no owner evidence at all: a
-//! purge-ledger revision and a forensic audit note. The purge-ledger revision is
-//! owner-issued by the ORS owner
-//! (`RedbRecoveryStore::purge_ledger_revision`, and its historical
-//! `backup_verification_purge_ledger_revision` binding), and Host backup
-//! preparation opens no ORS store: adding one would make this composition root a
-//! second store owner, which `crates/storage/AGENTS.md` and
-//! `bins/AGENTS.md` forbid. A presented value could therefore not be
-//! corroborated by anything, so it is **refused** with
+//! purge-ledger revision and a forensic audit note. Both gaps are **producer**
+//! gaps, each proved below, and neither is closed by any value this composition
+//! could compute for itself.
+//!
+//! - The purge-ledger revision is owner-issued by the ORS owner
+//!   (`RedbRecoveryStore::purge_ledger_revision`, and its historical
+//!   `backup_verification_purge_ledger_revision` binding). This composition
+//!   holds no ORS handle and must not take one: `crates/storage/AGENTS.md`
+//!   forbids a **second mutable** root owner, and a Host-side read of the ORS
+//!   `META` counter would additionally be a second copy of the owner's own rule
+//!   (`META` and `PURGE_LEDGER_REVISION_KEY` are private to
+//!   `crates/kernel/eliot-ors/src/store.rs`). What is missing is exactly one
+//!   seam, and the tree already shows the accepted shape of it: `eliot-ors`
+//!   publishes short-lived, read-only, schema-checked readers
+//!   (`eliot_ors::read_current_supervision_lease_read_only`,
+//!   `crates/kernel/eliot-ors/src/status.rs:657`) that this very bin already
+//!   consumes read-only over a retained `ProtectedRuntimePathLease`
+//!   (`crate::watchdog_publication`, `watchdog_publication.rs:170`) without
+//!   becoming a store owner. No such reader exists for the purge-ledger counter,
+//!   and adding one means editing `crates/kernel/eliot-ors`, which is outside
+//!   this issue's mutable scope. That is the whole unblocking precondition.
+//! - The forensic audit note has no producer at all.
+//!   `eliot_backup::HostStateAuditFence` and its wire form
+//!   `eliot_protocol::backup::HostAuditRef` are constructed only in
+//!   `#[cfg(test)]` fixtures; in production the fence is a caller-presented
+//!   optional field of `eliot_kernel::backup_capture::CaptureRequest`, copied
+//!   straight out of the caller's port bundle. The "owner that observed the
+//!   installation lineage" this refusal names therefore does not exist as a
+//!   port, so there is no owner read to take at issue time.
+//!
+//! A presented value for either field could consequently not be corroborated by
+//! anything, so it is **refused** with
 //! [`ProjectionError::OwnerEvidenceUnavailable`], which names the missing owner
 //! obligation, instead of being copied into an owner-issued projection and its
 //! digest. With no claim presented the record carries the absence and the digest
@@ -1195,13 +1219,25 @@ pub fn bind_approved_build(
 ///
 /// - a non-zero `purge_ledger_revision` — the revision is owner-issued by the
 ///   ORS owner (`RedbRecoveryStore::purge_ledger_revision`, with its historical
-///   `backup_verification_purge_ledger_revision` binding), and Host backup
-///   preparation opens no ORS store. Reading one here would make this
-///   composition root a second store owner, which `crates/storage/AGENTS.md`
-///   forbids, so the absence of an owner source is a real boundary and not a
-///   gap this lane may paper over;
-/// - any `audit` note — the note is caller-authored and nothing here compares
-///   its digest or observed dispositions to Host state, so binding it would
+///   `backup_verification_purge_ledger_revision` binding). This composition
+///   holds no ORS handle, and it must not open one: `crates/storage/AGENTS.md`
+///   forbids a **second mutable** root owner, so the absence of an owner source
+///   is a real boundary and not a gap this lane may paper over by reading the
+///   ORS `META` counter itself. **Unblocking precondition**, named here so the
+///   next reader does not re-derive it: one read-only, schema-checked
+///   purge-ledger reader beside
+///   `eliot_ors::read_current_supervision_lease_read_only`
+///   (`crates/kernel/eliot-ors/src/status.rs:657`), consumed by this bin the way
+///   `crate::watchdog_publication` already consumes that one — a short-lived
+///   read over a retained `ProtectedRuntimePathLease`, not a store owner. That
+///   is an edit to `crates/kernel/eliot-ors`, outside this issue's mutable
+///   scope;
+/// - any `audit` note — there is no producer to read one from.
+///   `eliot_backup::HostStateAuditFence` and `eliot_protocol::backup::HostAuditRef`
+///   are constructed only in `#[cfg(test)]` fixtures; in production the fence is
+///   a caller-presented optional field of
+///   `eliot_kernel::backup_capture::CaptureRequest`, so nothing here can compare
+///   its digest or observed dispositions to Host state and binding it would
 ///   carry unverified disposition claims into an owner-issued receipt. The
 ///   note's own typed non-authoritative ceiling
 ///   ([`AuditFenceNote::validate`]) is enforced where a note is admissible at
@@ -1327,9 +1363,13 @@ pub fn project_backup_config_owner_bound(
                 field: "purge_ledger_revision",
                 obligation: "the purge-ledger owner must issue the revision observed by Host backup \
                      preparation; it is issued by the ORS owner \
-                     (`RedbRecoveryStore::purge_ledger_revision`) and Host backup preparation opens \
-                     no ORS store, so no registry, approved-generation, commit-fence or host-state \
-                     record observed here carries one",
+                     (`RedbRecoveryStore::purge_ledger_revision`) and this composition holds no ORS \
+                     handle, because `crates/storage/AGENTS.md` forbids a second mutable root owner; \
+                     no registry, approved-generation, commit-fence or host-state record observed \
+                     here carries one, and the unblocking seam is a read-only, schema-checked \
+                     purge-ledger reader beside \
+                     `eliot_ors::read_current_supervision_lease_read_only` in \
+                     `crates/kernel/eliot-ors/src/status.rs`",
             },
         ));
     }
@@ -1339,8 +1379,11 @@ pub fn project_backup_config_owner_bound(
             ProjectionError::OwnerEvidenceUnavailable {
                 field: "audit",
                 obligation: "a HostStateAuditFence must be issued or corroborated by the owner that \
-                     observed the installation lineage; a caller-authored note is not evidence \
-                     and I5.13 keeps that fence optional",
+                     observed the installation lineage; no such producer exists — \
+                     `HostStateAuditFence` and `HostAuditRef` are built only in test fixtures and \
+                     in production the fence is a caller-presented optional field of \
+                     `eliot_kernel::backup_capture::CaptureRequest` — so a caller-authored note is \
+                     not evidence and I5.13 keeps that fence optional",
             },
         ));
     }

@@ -85,11 +85,23 @@
 //! differs, so a stale or foreign lease cannot reach a receipt.
 //!
 //! The projection still **refuses** a presented purge-ledger revision or
-//! forensic audit note, because no owner reachable from Host issues or
-//! corroborates either: the purge revision belongs to the ORS owner and this
-//! module opens no ORS store, and a forensic note is caller-authored. This
-//! module passes those presented values through so the refusal is real, and it
-//! never renders a caller-authored forensic note into a receipt:
+//! forensic audit note, and both refusals are backed by a proved **producer**
+//! absence rather than by a value this module declined to read:
+//!
+//! - the purge revision belongs to the ORS owner
+//!   (`RedbRecoveryStore::purge_ledger_revision`). This module holds no ORS
+//!   handle, and it must not open one: `crates/storage/AGENTS.md` forbids a
+//!   second *mutable* root owner, so the composition reads the installation
+//!   registry and nothing else. The unblocking seam is named in
+//!   [`crate::backup_config_projection::project_backup_config_owner_bound`];
+//!
+//! - a forensic note has no producer to read one from:
+//!   `eliot_backup::HostStateAuditFence` is built only in `#[cfg(test)]`
+//!   fixtures, and in production the fence is a caller-presented optional field
+//!   of `eliot_kernel::backup_capture::CaptureRequest`.
+//!
+//! This module passes those presented values through so the refusal is real, and
+//! it never renders a caller-authored forensic note into a receipt:
 //! [`DestinationAdmission::audit_fence_note`] and
 //! [`PreparedDestination::audit_fence_note`] are therefore always absent here.
 //! I5.13 keeps the HostStateAuditFence optional for exactly this reason. No
@@ -3168,10 +3180,15 @@ impl OwnerEvidence {
     /// now a claim is refused unless it equals owner evidence.
     ///
     /// The presented purge-ledger revision and optional forensic note are passed
-    /// through unchanged **so the projector still refuses them**: the revision is
-    /// owner-issued by the ORS owner and Host backup preparation opens no ORS
-    /// store, and no owner reachable from Host issues or corroborates a
-    /// caller-authored forensic note. The returned
+    /// through unchanged **so the projector still refuses them**, and each
+    /// refusal names a producer that does not exist rather than a value this
+    /// method chose not to read. The revision is owner-issued by the ORS owner
+    /// and `OwnerEvidence` holds no ORS handle, because
+    /// `crates/storage/AGENTS.md` forbids a second mutable root owner; a
+    /// forensic note has no producer at all, since `HostStateAuditFence` is
+    /// built only in test fixtures and in production arrives as a
+    /// caller-presented optional field of
+    /// `eliot_kernel::backup_capture::CaptureRequest`. The returned
     /// [`BackupConfigProjection`] therefore carries a zero purge-ledger
     /// revision, and the projection digest binds that absence explicitly. No
     /// secret-typed field exists on this path and no credential-typed value is
