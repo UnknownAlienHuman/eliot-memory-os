@@ -718,15 +718,24 @@ impl StartupCoordinator {
     /// projecting the owner's exact revision, fingerprint, and authorization
     /// axes across the boundary; until it records, every
     /// Material/Critical gate refuses. The revision must
-    /// start at one and strictly advance: replaying the current or an older
-    /// revision is rejected, so revoked authority can never be resurrected
+    /// start at one and strictly advance: replaying an older revision is
+    /// rejected, so revoked authority can never be resurrected
     /// by re-presenting superseded bytes. Recording a degraded profile
     /// under a new revision revokes everything issued under the old one.
     ///
+    /// Bounded-refresh tolerance: re-presenting the exact currently recorded
+    /// revision, fingerprint, and profile acknowledges without advancing, so
+    /// the daemon's scheduler-driven republish (unchanged derivation, or a
+    /// restarted daemon re-presenting what the Kernel already holds) is not
+    /// misread as a replay attack. The same revision with a different
+    /// fingerprint or profile is still rejected as a conflicting derivation:
+    /// only one live Governor-owned derivation instance may feed these gates.
+    ///
     /// # Errors
     ///
-    /// Returns the fixed-shape reason when the revision is zero or not
-    /// strictly newer than the recorded one, or when the fingerprint does
+    /// Returns the fixed-shape reason when the revision is zero, older than
+    /// the recorded one, or names the recorded revision with different
+    /// content, or when the fingerprint does
     /// not name the exact active fingerprint.
     fn record_governor_derived_authority(
         &mut self,
@@ -741,6 +750,18 @@ impl StartupCoordinator {
         if let Some(current) = self.governor_authority.as_ref()
             && revision <= current.revision
         {
+            if revision == current.revision
+                && fingerprint == current.fingerprint
+                && profile == current.profile
+            {
+                return Ok(());
+            }
+            if revision == current.revision {
+                let recorded = current.revision;
+                return Err(format!(
+                    "governor authority revision {revision} conflicts with the recorded revision {recorded}"
+                ));
+            }
             return Err(format!(
                 "governor authority revision {revision} does not advance the recorded revision {}",
                 current.revision,

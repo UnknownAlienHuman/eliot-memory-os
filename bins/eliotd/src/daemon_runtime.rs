@@ -54,8 +54,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
+use eliot_governor::{CompositionError, KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
+use eliot_integration_coverage::{
+    ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
+    IntegrationCoverageProfile, TraceFreshness, WatchdogEvidence,
+};
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
@@ -877,6 +881,7 @@ pub(super) fn run() -> Result<(), String> {
         supervision_progress,
         startup_readiness,
         startup_maintenance_observations,
+        format!("eliotd-exe:{}", launch.executable_sha256),
     ));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
@@ -1559,6 +1564,11 @@ async fn run_loop(
     // late completion can never overwrite newer owner observations.
     startup_readiness: StartupReadinessProjection,
     startup_maintenance_observations: [MaintenanceObservation; 2],
+    // Issue #1935 AUD1 (I7.16): the one host/adapter fact this process
+    // attests (`eliotd-exe:<digest>`, same construction as the supervision
+    // producer's `daemon_artifact_id`). The Governor-authority publish flight
+    // below derives every projection under exactly this fingerprint.
+    installation_fingerprint: String,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // One projection instance is shared with the heartbeat future. Both
@@ -1608,6 +1618,21 @@ async fn run_loop(
     // when idle and its completion branch settles it back, exactly like the
     // other flights. No second owner and no untracked spawn exist.
     let mut owner_feed_flight = OwnerFeedFlight::Idle;
+    // Issue #1935 AUD1 (I7.16): sole owner of the live Governor-authority
+    // publish state. The health completion branch starts one bounded
+    // derive->publish pass when idle and its completion branch settles it
+    // back; the pass publishes the current Governor derivation on the
+    // existing heartbeat cadence (no new timer, thread, or executor). A
+    // failed pass keeps the Kernel's last-good recording and reports the
+    // feed unknown, never empty/complete, and never fails the daemon.
+    let mut governor_authority_state = GovernorAuthorityFeedState {
+        installation_fingerprint,
+        last_published_revision: None,
+        last_published_fingerprint: None,
+    };
+    // Sole owner of Governor-authority publish sync state, mirroring
+    // [`OwnerFeedFlight`]: `Idle` means no publish pass is outstanding.
+    let mut governor_authority_flight = GovernorAuthorityFlight::Idle;
     // #740 A14: one repeated-failure guard per repeating diagnostic stream.
     // Each guard travels with its own flight future and returns at
     // settlement, so capped output never conflates distinct operations.
@@ -1684,6 +1709,8 @@ async fn run_loop(
                     &mut deferred_supervision_activity,
                     &mut solo_poll_flight,
                     &mut solo_poll_last_refusal,
+                    &mut governor_authority_flight,
+                    &mut governor_authority_state,
                 )
                 .await?;
                 // #1862: the campaign-packet flight keeps its own queue, claim,
@@ -1816,6 +1843,16 @@ async fn run_loop(
                     &mut owner_feed_failure_guard,
                 );
             }
+            governor_authority_completion =
+                next_governor_authority_completion(&mut governor_authority_flight) =>
+            {
+                settle_governor_authority_completion(
+                    governor_authority_completion,
+                    &mut governor_authority_state,
+                    &mut governor_authority_flight,
+                    &mut governor_authority_failure_guard,
+                );
+            }
             maintenance_guard = next_maintenance_completion(&mut maintenance_flight) => {
                 settle_maintenance_completion(
                     maintenance_guard,
@@ -1827,6 +1864,16 @@ async fn run_loop(
                 settle_improvement_intake_completion(&mut improvement_intake_flight, completion);
             }
             heartbeat_completion = next_health_heartbeat_completion(&mut health_heartbeat_flight) => {
+                // Issue #1935 AUD1 (I7.16): the tick outcome is this pass's
+                // trace-freshness input — the authenticated daemon->Kernel
+                // trace demonstrably flowed on a successful heartbeat. A
+                // failed tick exits through `settle_*` below, so `Stale` is
+                // sourced here only if that ever stops failing closed.
+                let governor_trace = if heartbeat_completion.result.is_ok() {
+                    TraceFreshness::Fresh
+                } else {
+                    TraceFreshness::Stale
+                };
                 settle_health_heartbeat_completion(
                     heartbeat_completion,
                     &mut health_heartbeat_flight,
@@ -1842,6 +1889,17 @@ async fn run_loop(
                     &mut owner_feed,
                     &mut owner_feed_flight,
                     &mut owner_feed_failure_guard,
+                );
+                // The Governor-authority publish rides the same settled
+                // heartbeat: bounded refresh with no new cadence, and the
+                // fresh trace observation above as its freshness input.
+                maybe_start_governor_authority_publish(
+                    &kernel,
+                    &composition,
+                    &governor_authority_state,
+                    governor_trace,
+                    &mut governor_authority_flight,
+                    &mut governor_authority_failure_guard,
                 );
             }
             _ = cadence.health_heartbeat.tick() => {
@@ -2743,6 +2801,11 @@ async fn drain_flights_on_shutdown(
     deferred_activity: &mut DeferredSupervisionActivity,
     solo_poll_flight: &mut SoloPollFlight,
     solo_poll_last_refusal: &mut Option<String>,
+    // Issue #1935 AUD1: the live Governor-authority publish flight drains
+    // like every other flight, so a shutdown never abandons an in-flight
+    // derive->publish exchange without consuming its acknowledgement.
+    governor_authority_flight: &mut GovernorAuthorityFlight,
+    governor_authority_state: &mut GovernorAuthorityFeedState,
 ) -> Result<RunLoopExit, String> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -2763,6 +2826,7 @@ async fn drain_flights_on_shutdown(
             && matches!(improvement_intake_flight, ImprovementIntakeFlight::Idle)
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
             && matches!(solo_poll_flight, SoloPollFlight::Idle)
+            && matches!(governor_authority_flight, GovernorAuthorityFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -2873,6 +2937,16 @@ async fn drain_flights_on_shutdown(
                     solo_poll_last_refusal,
                 );
             }
+            governor_authority_completion =
+                next_governor_authority_completion(governor_authority_flight) =>
+            {
+                settle_governor_authority_completion(
+                    governor_authority_completion,
+                    governor_authority_state,
+                    governor_authority_flight,
+                    &mut shutdown_failure_guard,
+                );
+            }
             () = tokio::time::sleep_until(deadline) => {
                 // Budget exhausted with work still outstanding: drop every
                 // flight without starting anything new. Classify activation
@@ -2886,6 +2960,7 @@ async fn drain_flights_on_shutdown(
                 *improvement_intake_flight = ImprovementIntakeFlight::Idle;
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
+                *governor_authority_flight = GovernorAuthorityFlight::Idle;
                 *supervision_progress = None;
                 deferred_activity.clear();
                 return Ok(exit);
@@ -3090,6 +3165,318 @@ async fn run_owner_feed_sync(
         }
     }
     trigger
+}
+
+/// Sole owner of the live Governor-authority publish state in `run_loop`
+/// (issue #1935 AUD1, I7.16).
+///
+/// `installation_fingerprint` is the one host/adapter fact this process
+/// attests: the Host-admitted launch contour digest (`eliotd-exe:<digest>`,
+/// same construction as the supervision producer's `daemon_artifact_id`).
+/// `last_published_*` names the exact projection the Kernel last
+/// acknowledged; both stay `None` until the first acknowledged publish. The
+/// feed publishes a new projection whenever the owner derivation advances
+/// (on change, including the first publish) and re-derives on every bounded
+/// heartbeat tick (bounded refresh). A failed pass changes nothing: the
+/// Kernel keeps its last-good recording and the feed reports unknown.
+#[derive(Clone)]
+struct GovernorAuthorityFeedState {
+    installation_fingerprint: String,
+    last_published_revision: Option<u64>,
+    last_published_fingerprint: Option<String>,
+}
+
+/// What one Governor-authority pass proved (issue #1935 AUD1).
+struct GovernorAuthorityPassReport {
+    /// Kernel-acknowledged revision after the pass.
+    revision: u64,
+    /// Fingerprint the acknowledged revision was issued under.
+    fingerprint: String,
+    /// True when the pass published across the authenticated boundary;
+    /// false when the owner re-derivation was unchanged and the Kernel
+    /// acknowledged the already-recorded revision again.
+    published: bool,
+    /// Owner-revoked capability ids when the pass published a
+    /// route-mismatch revision; empty otherwise.
+    revoked: Vec<String>,
+}
+
+/// Completion of one in-flight Governor-authority pass: the updated feed
+/// state travels back with the outcome, exactly like
+/// [`OwnerFeedFlight`](OwnerFeedFlight).
+type GovernorAuthorityCompletion = (
+    GovernorAuthorityFeedState,
+    RepeatedFailureGuard,
+    Result<GovernorAuthorityPassReport, CompositionError>,
+);
+
+struct GovernorAuthorityFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = GovernorAuthorityCompletion>>>,
+}
+
+/// Sole owner of Governor-authority publish sync state in `run_loop`,
+/// mirroring [`OwnerFeedFlight`]. `Idle` means no publish pass is
+/// outstanding; `InFlight` holds the one pending bounded derive->publish
+/// exchange. No second owner and no second concurrent exchange exist.
+enum GovernorAuthorityFlight {
+    Idle,
+    InFlight(GovernorAuthorityFlightState),
+}
+
+/// Builds this tick's Governor-derivation coverage input (issue #1935 AUD1,
+/// I7.16).
+///
+/// Honest-absence construction, never synthesis: the fingerprint is the one
+/// host/adapter fact this process attests (Host-admitted launch contour);
+/// every lifecycle event is `UNAVAILABLE` with `UNKNOWN`
+/// completeness/ordering and explicit gap evidence because no host
+/// lifecycle-event observation is threaded to this runtime; the profile
+/// completeness is therefore `UNKNOWN` (never empty/complete) with its own
+/// gap. Verification promotes only the fingerprint's production presence —
+/// this exact contour is live, and the designated driver below reaches the
+/// owner only through the readiness-gated
+/// [`eliotd::maintain_governor_authority_feed`] — and grants no enforcement
+/// or completeness: the owner derives both authorization axes false and the
+/// Kernel records its minimal profile, so enforcement-dependent operations
+/// stay refused until real host observation arrives.
+///
+/// # Errors
+///
+/// Returns the owner's fail-closed reason when the fingerprint or the fixed
+/// gap text does not validate, or when the candidate cannot be verified
+/// against the exact active fingerprint.
+fn governor_authority_tick_coverage(
+    fingerprint: &str,
+) -> Result<IntegrationCoverageProfile, CompositionError> {
+    let events: Vec<EventCoverage> = ALL_EVENTS
+        .iter()
+        .map(|event| EventCoverage {
+            event: *event,
+            disposition: EventDisposition::Unavailable,
+            ordering: DispatchOrdering::Unknown,
+            completeness: EventCompleteness::Unknown,
+            proof_ceiling: "none: host lifecycle event unobserved by this runtime".to_owned(),
+            source: "eliotd daemon runtime: no host lifecycle-event observation threaded"
+                .to_owned(),
+            gaps: vec![format!(
+                "{event:?}: no host lifecycle-event observation threaded to the eliotd runtime"
+            )],
+        })
+        .collect();
+    IntegrationCoverageProfile::candidate(
+        fingerprint.to_owned(),
+        events,
+        EventCompleteness::Unknown,
+        "none: no host lifecycle-event observation",
+        "eliotd daemon runtime heartbeat observation",
+        vec![
+            "no host lifecycle-event observation threaded to the eliotd runtime; enforcement and completeness unevidenced"
+                .to_owned(),
+        ],
+    )
+    .and_then(|candidate| candidate.verify(fingerprint, true))
+    .map_err(|error| CompositionError::Owner(format!("governor authority tick coverage: {error}")))
+}
+
+/// Builds this tick's Watchdog-evidence input (issue #1935 AUD1).
+///
+/// No Watchdog supervision evidence is threaded to this runtime, so the
+/// evidence honestly reports itself unevidenced and stale: it can only ever
+/// narrow the derived authorization axes, never widen them.
+fn governor_authority_tick_watchdog() -> WatchdogEvidence {
+    WatchdogEvidence {
+        supervisor_id: "unknown: no Watchdog supervision evidence threaded to the eliotd runtime"
+            .to_owned(),
+        fresh: false,
+        summary: "Watchdog supervision unevidenced on this tick; the supervision claim is withheld, never inferred"
+            .to_owned(),
+    }
+}
+
+/// Drives one bounded Governor-authority publish pass (issue #1935 AUD1,
+/// I7.16).
+///
+/// The route-mismatch tripwire runs first: when the live installation
+/// fingerprint no longer matches the acknowledged projection, the pass
+/// publishes the owner's degraded revision through the designated
+/// [`eliotd::maintain_governor_authority_route_mismatch`] driver, so
+/// dependent authority revokes under the existing owner/Kernel revoke paths.
+/// Otherwise the pass re-derives from this tick's coverage, Watchdog, and
+/// trace inputs and publishes through the designated
+/// [`eliotd::maintain_governor_authority_feed`] driver. Composition
+/// readiness gates both arms inside those drivers: a not-ready composition
+/// publishes nothing, keeps the Kernel's last-good recording, and reports
+/// the feed unknown. The composition guard is held across the one bounded
+/// publish exchange because the live derivation borrow spans it. This is the
+/// loop's only guard-across-transport hold: no second publisher exists, the
+/// exchange is one bounded transact the Kernel never re-enters composition
+/// from, and the missed-tick `Skip` cadence bounds any queueing behind it —
+/// so activation and health flights stay pollable and no lock cycle exists.
+///
+/// # Errors
+///
+/// Returns the readiness, owner-validation, or transport/receipt failure the
+/// designated driver reported, typed as received. Every arm keeps the
+/// Kernel's last-good recording: retained feed state mutates only after an
+/// acknowledged publish.
+async fn drive_governor_authority_pass(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    state: &mut GovernorAuthorityFeedState,
+    trace: TraceFreshness,
+) -> Result<GovernorAuthorityPassReport, CompositionError> {
+    if let Some(expected) = state.last_published_fingerprint.clone()
+        && expected != state.installation_fingerprint
+    {
+        let observed = state.installation_fingerprint.clone();
+        let mut guard = composition.lock().await;
+        let (revision, revoked) = eliotd::maintain_governor_authority_route_mismatch(
+            &mut *guard,
+            kernel,
+            &expected,
+            &observed,
+        )
+        .await?;
+        state.last_published_revision = Some(revision);
+        state.last_published_fingerprint = Some(observed.clone());
+        return Ok(GovernorAuthorityPassReport {
+            revision,
+            fingerprint: observed,
+            published: true,
+            revoked,
+        });
+    }
+    let coverage = governor_authority_tick_coverage(&state.installation_fingerprint)?;
+    let watchdog = governor_authority_tick_watchdog();
+    let mut guard = composition.lock().await;
+    let revision =
+        eliotd::maintain_governor_authority_feed(&mut *guard, kernel, &coverage, &watchdog, trace)
+            .await?;
+    let published = state.last_published_revision != Some(revision);
+    let fingerprint = state.installation_fingerprint.clone();
+    state.last_published_revision = Some(revision);
+    state.last_published_fingerprint = Some(fingerprint.clone());
+    Ok(GovernorAuthorityPassReport {
+        revision,
+        fingerprint,
+        published,
+        revoked: Vec::new(),
+    })
+}
+
+/// Starts one Governor-authority publish pass on its own polled flight
+/// (issue #1935 AUD1).
+///
+/// The pass keeps its composition borrow inside the flight future so the
+/// loop stays pollable while the bounded derive->publish exchange is
+/// outstanding, exactly like the owner-feed exchange. The stream's
+/// repeated-failure guard travels with the future, so a standing feed
+/// failure cannot emit unbounded records. The feed never gates readiness
+/// and never fails the daemon: every failure keeps the Kernel's last-good
+/// recording and reports the feed unknown at settlement.
+fn maybe_start_governor_authority_publish(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    state: &GovernorAuthorityFeedState,
+    trace: TraceFreshness,
+    flight: &mut GovernorAuthorityFlight,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    if !matches!(flight, GovernorAuthorityFlight::Idle) {
+        return;
+    }
+    let kernel_clone = Arc::clone(kernel);
+    let composition_clone = Arc::clone(composition);
+    let mut state_snapshot = state.clone();
+    let failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
+    *flight = GovernorAuthorityFlight::InFlight(GovernorAuthorityFlightState {
+        future: Box::pin(async move {
+            let result = drive_governor_authority_pass(
+                &kernel_clone,
+                &composition_clone,
+                &mut state_snapshot,
+                trace,
+            )
+            .await;
+            (state_snapshot, failure_guard, result)
+        }),
+    });
+}
+
+/// Polls the one in-flight Governor-authority pass, pending forever while
+/// idle so health and shutdown stay pollable with no pass outstanding.
+async fn next_governor_authority_completion(
+    flight: &mut GovernorAuthorityFlight,
+) -> GovernorAuthorityCompletion {
+    match flight {
+        GovernorAuthorityFlight::Idle => {
+            std::future::pending::<GovernorAuthorityCompletion>().await
+        }
+        GovernorAuthorityFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed Governor-authority pass back to idle (issue #1935
+/// AUD1).
+///
+/// A published advance emits its acknowledged revision; a published
+/// route-mismatch revision additionally names the revoked capability count,
+/// proving the degraded derivation revoked through the existing paths; an
+/// unchanged refresh acknowledgement stays quiet. Every failure keeps the
+/// Kernel's last-good recording (the pass mutates retained state only after
+/// an acknowledged publish) and reports the feed unknown — never empty or
+/// complete — under the stream's failure guard.
+fn settle_governor_authority_completion(
+    completion: GovernorAuthorityCompletion,
+    state: &mut GovernorAuthorityFeedState,
+    flight: &mut GovernorAuthorityFlight,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    let (next_state, next_guard, result) = completion;
+    *state = next_state;
+    *failure_guard = next_guard;
+    *flight = GovernorAuthorityFlight::Idle;
+    match result {
+        Ok(report) if report.published && report.revoked.is_empty() => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.governor_authority_published",
+                revision = report.revision,
+                fingerprint = %report.fingerprint,
+                "the live Governor derivation published across the authenticated boundary",
+            );
+        }
+        Ok(report) if report.published => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.governor_authority_route_mismatch_published",
+                revision = report.revision,
+                fingerprint = %report.fingerprint,
+                revoked_capabilities = report.revoked.len(),
+                "the live Governor derivation published a route-mismatch revision; dependent authority revoked",
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "governor-authority-feed",
+                    &error.to_string(),
+                )
+                .emit();
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.governor_authority_unknown",
+                    completeness = "unknown",
+                    authorizes_enforcement = false,
+                    authorizes_complete_coverage_ops = false,
+                    reason = %error,
+                    "the Governor-authority feed failed; the Kernel keeps its last-good recording and this feed claims neither empty nor complete coverage",
+                );
+            }
+        }
+    }
 }
 
 /// Starts one local-read poll step for the outbound-only poller (Implements
