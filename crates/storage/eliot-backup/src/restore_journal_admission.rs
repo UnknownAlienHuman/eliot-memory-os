@@ -35,16 +35,11 @@
 //!   with is written by the existing compare-and-swap, not here.
 //!
 //! Existence and shape prove nothing. [`RestoreJournalAdmission::binds_owner_record`]
-//! re-reads the owner's own record for the exact operation this plan names and
-//! requires exact agreement on the owner binding, the database, the
-//! installation, the generation, the journal identity, the receipt and the
-//! transaction, so an admission that is well formed but borrowed from a
-//! different operation or installation fails closed.
-//!
-//! The live journal is a corroboration of that record, not a substitute for it.
-//! When a row already exists under this operation's key it must carry this
-//! transaction; a fresh operation has none, because the engine creates it when
-//! the engine starts. The primary proof is always the owner's durable record.
+//! re-reads both the durable journal and the owner's record for the exact
+//! operation this plan names, and requires exact agreement on the owner
+//! binding, the database, the installation, the generation, the journal
+//! identity and the receipt, so an admission that is well formed but borrowed
+//! from a different operation or installation fails closed.
 //!
 //! This crate supplies no owner of its own. The durable owner of a restore
 //! journal is the composition that holds that journal together with the
@@ -67,15 +62,6 @@ use super::{
 /// currently carries, and the admission receipt it wrote for this exact stream.
 /// Nothing here is caller-presented, and a value the caller supplies for a
 /// *different* operation does not appear in this record.
-///
-/// The `transaction` is load-bearing rather than descriptive. The journal row
-/// the engine writes is created *during* the restore, so an admission issued
-/// before the first run legitimately has no row to read; the owner's own
-/// durable record of the operation it admitted is therefore the primary proof,
-/// and it is only meaningful if it names WHICH operation was admitted. An owner
-/// that records a journal key without the transaction has recorded a stream, not
-/// an operation, and every admission minted from it would be reusable across
-/// operations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableJournalRecord {
     /// The composition-boundary receipt reference of the owner that read the
@@ -91,11 +77,6 @@ pub struct DurableJournalRecord {
     pub journal_identity_ref: String,
     /// The admission receipt committed for this operation.
     pub admission_receipt_ref: String,
-    /// The exact restore transaction this owner durably admitted.
-    ///
-    /// The owner must read this from its own committed state for this journal
-    /// key, never recompute it from a value handed in alongside.
-    pub transaction: RestoreTransaction,
 }
 
 /// The durable owner of the journal behind one restore operation.
@@ -104,28 +85,8 @@ pub struct DurableJournalRecord {
 /// implementation must answer from its own persisted state, read at call time,
 /// for the journal identity the plan derives. An implementation that echoes a
 /// presented value is not an owner, and the binding check below will not rescue
-/// it: the check compares that answer, transaction included, against a second
-/// read of the same owner, so a value that was never committed durably cannot
-/// agree with itself across the two reads of a live store.
-///
-/// What an implementation owes, in order:
-///
-/// 1. Answer for the `journal_key` it was asked about, or refuse. It must not
-///    answer for whichever key it likes.
-/// 2. Read the database, the installation, the generation and the receipt from
-///    its own committed records, and return the receipt's recorded value
-///    rather than a digest recomputed over what it is holding.
-/// 3. Return the transaction it durably admitted, from that same committed
-///    state. This is what makes the record an *operation* record; without it
-///    the same admission would be replayable for any other plan sharing the
-///    stream, and the issuer refuses.
-/// 4. Refuse, typed, when it holds nothing for that key. An empty record is not
-///    an answer.
-///
-/// A real implementation belongs beside the store it reads: the composition
-/// that holds the restore journal together with the installation registry it
-/// admits against. This crate supplies no owner of its own, and a port with no
-/// owner behind it issues nothing.
+/// it: the check compares that answer against the durable journal row, so a
+/// value that was never committed to that row cannot agree with it.
 pub trait RestoreJournalAdmissionOwner {
     /// Reads the owner's durable journal record for `journal_key`.
     ///
@@ -160,34 +121,19 @@ impl AdmittedJournalOperation {
         })
     }
 
-    /// Requires that the live journal is not some OTHER operation's stream.
+    /// Requires that the live journal is this operation's own durable journal.
     ///
     /// The row is read through the accepted [`RestoreJournalPort`] seam the
     /// restore engine writes through, so the admission can only ever be issued
-    /// against the journal that really holds this exact transaction.
-    ///
-    /// Absence is NOT a refusal, and the reason is ordering, not leniency.
-    /// [`RestorePlan::execute_with_journal`] creates the first row itself, at
-    /// the moment the engine starts, so a fresh operation has no row at all
-    /// until after the composition must already hold an admission: the
-    /// engine's own entry refuses an operation that is not already admitted.
-    /// Requiring a row here would make the fresh production path unreachable
-    /// and leave only the resume path issuable, which is exactly the kind of
-    /// "works because a row happened to exist" proof this artifact exists to
-    /// remove.
-    ///
-    /// So the live journal is a *corroboration*, not the primary proof: when a
-    /// row is present it must carry this exact transaction, and a row for
-    /// another operation is refused. When no row is present the primary proof
-    /// is the owner's own durable record, which
-    /// [`DurableJournalRecord::transaction`] pins to this operation.
-    fn refuses_foreign_stream<J>(&self, journal: &mut J) -> Result<(), BackupError>
+    /// against a journal that really holds this exact transaction, and the
+    /// owner-reported record can only be compared against a row that exists.
+    fn is_journal_of<J>(&self, journal: &mut J) -> Result<(), BackupError>
     where
         J: RestoreJournalPort + ?Sized,
     {
-        let Some(row) = journal.load(&self.journal_key)? else {
-            return Ok(());
-        };
+        let row = journal
+            .load(&self.journal_key)?
+            .ok_or(BackupError::RestoreJournalRequired)?;
         if row.journal_key != self.journal_key || row.transaction != self.transaction {
             return Err(BackupError::RestoreJournalMismatch);
         }
@@ -201,20 +147,18 @@ impl RestoreJournalAdmission {
     /// Every field is copied from the owner's durable record for the journal
     /// identity this plan derives; none is an argument, so no caller can select
     /// the database, the installation, the generation, the journal identity or
-    /// the receipt. The owner's recorded `transaction` must equal the one this
-    /// plan derives, so a record that admitted a different operation under the
-    /// same stream cannot mint this one. `fixture_proof_only` is `false`
-    /// because the record came from a durable owner rather than a fixture, and
-    /// the result is immediately re-proved against a fresh read of both the
-    /// same owner and the same live journal, so an owner whose record is not
-    /// stable across the issue refuses instead of issuing.
+    /// the receipt. `fixture_proof_only` is `false` because the record came from
+    /// a durable owner rather than a fixture, and the result is immediately
+    /// re-proved against a fresh read of both the same owner and the same live
+    /// journal, so an owner whose record is not stable across the issue refuses
+    /// instead of issuing.
     ///
     /// # Errors
     ///
-    /// Returns [`BackupError::RestoreJournalMismatch`] when the owner's record
-    /// does not name this plan's transaction, or when the live journal already
-    /// holds a different operation under this key, and the owner's own typed
-    /// error when its record cannot be read.
+    /// Returns [`BackupError::RestoreJournalRequired`] when the journal holds
+    /// no durable row for this operation,
+    /// [`BackupError::RestoreJournalMismatch`] when the re-read record does not
+    /// agree with the one issued, and the owner's own typed error otherwise.
     pub fn issue_for_operation<O, J>(
         owner: &O,
         journal: &mut J,
@@ -226,11 +170,6 @@ impl RestoreJournalAdmission {
     {
         let operation = AdmittedJournalOperation::of(plan)?;
         let record = owner.durable_journal_record(&operation.journal_key)?;
-        if record.transaction != operation.transaction
-            || record.journal_identity_ref != operation.journal_key
-        {
-            return Err(BackupError::RestoreJournalMismatch);
-        }
         let admission = Self {
             persistent_owner: record.persistent_owner,
             database_ref: record.database_ref,
@@ -241,7 +180,6 @@ impl RestoreJournalAdmission {
             fixture_proof_only: false,
         };
         admission.validate()?;
-        operation.refuses_foreign_stream(journal)?;
         admission.binds_owner_record(owner, journal, plan)?;
         Ok(admission)
     }
@@ -250,22 +188,23 @@ impl RestoreJournalAdmission {
     /// the owner's record for the operation `plan` names.
     ///
     /// This is the operation and installation binding. The journal identity
-    /// must be the one this plan derives, the live journal must not already
-    /// hold a different operation under it, and the owner binding, database,
-    /// installation, generation, receipt AND transaction must equal what the
-    /// owner durably holds for that same journal. A structurally valid
-    /// admission issued for a different operation, or one whose installation
-    /// has moved under the registry, fails closed, as does an admission that
-    /// never admitted a production durable journal. Both refusals are the
-    /// crate's existing typed journal errors, not a generic code, and the
-    /// owner's own error is passed through rather than collapsed into one.
+    /// must be the one this plan derives, the live journal must already hold
+    /// this exact transaction, and the owner binding, database, installation,
+    /// generation and receipt must equal what the owner durably holds for that
+    /// same journal. A structurally valid admission issued for a different
+    /// operation, or one whose installation has moved under the registry, fails
+    /// closed, as does an admission that never admitted a production durable
+    /// journal. Both refusals are the crate's existing typed journal errors,
+    /// not a generic code, and the owner's own error is passed through rather
+    /// than collapsed into one.
     ///
     /// # Errors
     ///
     /// Returns [`BackupError::RestoreJournalRequired`] when the admission is
-    /// fixture-only, [`BackupError::RestoreJournalMismatch`] on any difference
-    /// from the durable journal or the owner's current record, and the owner's
-    /// own typed error when that record cannot be read.
+    /// fixture-only or the journal holds no row for this operation,
+    /// [`BackupError::RestoreJournalMismatch`] on any difference from the
+    /// durable journal or the owner's current record, and the owner's own typed
+    /// error when that record cannot be read.
     pub fn binds_owner_record<O, J>(
         &self,
         owner: &O,
@@ -284,10 +223,9 @@ impl RestoreJournalAdmission {
         if self.journal_identity_ref != operation.journal_key {
             return Err(BackupError::RestoreJournalMismatch);
         }
-        operation.refuses_foreign_stream(journal)?;
+        operation.is_journal_of(journal)?;
         let current = owner.durable_journal_record(&operation.journal_key)?;
         let agrees = current.journal_identity_ref == operation.journal_key
-            && current.transaction == operation.transaction
             && self.persistent_owner == current.persistent_owner
             && self.database_ref == current.database_ref
             && self.installation_ref == current.installation_ref
