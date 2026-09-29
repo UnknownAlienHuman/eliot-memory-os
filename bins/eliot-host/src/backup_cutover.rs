@@ -2798,9 +2798,8 @@ pub fn read_cutover_disposition(
         // `second`, and the third sample exists only to prove that `second` is
         // still current; the mapper therefore receives both journal-derived
         // inputs from one read.
-        let retirement =
-            resolve_cutover_retirement(host, &second, readback, retirement_receipt)
-                .map_err(|error| note_cutover_read_error(op, error))?;
+        let retirement = resolve_cutover_retirement(host, &second, readback, retirement_receipt)
+            .map_err(|error| note_cutover_read_error(op, error))?;
         let third = host
             .journal
             .snapshot()
@@ -2941,9 +2940,7 @@ pub(crate) fn resolve_cutover_retirement(
         RetirementBinding::WithoutPredecessorRelation => {
             Ok(CutoverRetirementEvidence::RelationUnproven)
         }
-        RetirementBinding::NotThisReadbacksRetirement => {
-            Ok(CutoverRetirementEvidence::Unbound)
-        }
+        RetirementBinding::NotThisReadbacksRetirement => Ok(CutoverRetirementEvidence::Unbound),
     }
 }
 
