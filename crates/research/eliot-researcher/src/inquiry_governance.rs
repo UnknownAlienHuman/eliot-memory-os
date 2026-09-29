@@ -4959,7 +4959,22 @@ impl InquiryGovernance {
         }
         if self.compilation_inputs.profile_digest != self.profile.integrity_digest
             || self.compilation_inputs.evidence_set_id != self.evidence_set_id
+            || self.compilation_inputs.lane != self.profile.lane
+            || self.compilation_inputs.lane_registration_digest
+                != self
+                    .profile
+                    .independence_and_blinding_policy
+                    .lane_registration_digest
         {
+            // The work graph receives the lane and the committed registration the
+            // work was compiled under, so a bundle that carried another lane or
+            // another registration would let queued execution and resume present
+            // a registration the profile does not hold. The registration identity
+            // is compared against the profile's own
+            // `independence_and_blinding_policy.lane_registration_digest`, which
+            // originates from the unforgeable `CommittedLaneRegistration`; the
+            // check is therefore on the registration itself, never on
+            // `registered_before_outcome_exposure` or on any timestamp.
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.compilation_inputs",
             });
@@ -5346,7 +5361,8 @@ impl std::fmt::Display for InquiryGovernance {
              expected_members={} open_members={} accounted={} all_closed={} enumeration={} \
              observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
-             materialisable={} deferred={} certified={} compilation_inputs={} freeze={} \
+             materialisable={} deferred={} certified={} compilation_inputs={} \
+             work_graph_lane={} work_graph_registration={} freeze={} \
              lane_class={} lane_result={} lane_result_grade={} lane_result_lane={} \
              lane_delivered_handles={} lane_discipline={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
@@ -5394,6 +5410,11 @@ impl std::fmt::Display for InquiryGovernance {
             self.compilation_inputs.deferred().len(),
             certified,
             self.compilation_inputs.digest,
+            self.compilation_inputs.lane.wire_name(),
+            self.compilation_inputs
+                .lane_registration_digest
+                .as_deref()
+                .unwrap_or("none"),
             self.freeze.digest,
             self.lane_discipline.evidence_class.wire_name(),
             self.lane_discipline.result_id,

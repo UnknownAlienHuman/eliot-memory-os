@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use eliot_contracts::StateFence;
 
 use crate::evidence_portfolio::{freeze, push_count, push_field, text};
-use crate::inquiry_governance::{InquiryError, InquiryProtocolProfile};
+use crate::inquiry_governance::{InquiryError, InquiryLane, InquiryProtocolProfile};
 
 /// Acceptance-certificate kind that satisfies one obligation (I21.5).
 ///
@@ -468,6 +468,25 @@ pub struct TaskGraphCompilationInputs {
     pub profile_revision: u64,
     /// Exact profile revision digest.
     pub profile_digest: String,
+    /// Lane the obligations were compiled under.
+    ///
+    /// I21.2 keeps the lane class separate from the grade requirement, so the
+    /// work graph receives which of the two lanes authorises the work rather
+    /// than a grade it could re-derive and mistake for either. It is the
+    /// resolved lane of the exact profile revision above, not a value the
+    /// caller may restate.
+    pub lane: InquiryLane,
+    /// Committed lane-registration identity governing this bundle, or `None`
+    /// for a purely exploratory revision.
+    ///
+    /// This is the I21.4 registration revision, carried so a queued execution
+    /// or a resume presents the registration the work was compiled under. The
+    /// value is the profile's own `lane_registration_digest`, which originates
+    /// from the unforgeable `CommittedLaneRegistration` rather than from a
+    /// caller string or a timestamp, and it is inside the digest preimage
+    /// below, so a bundle cannot name one registration and be digested over
+    /// another.
+    pub lane_registration_digest: Option<String>,
     /// Obligations in canonical order.
     pub obligations: Vec<InquiryObligation>,
     /// Reopen conditions the profile declares for this inquiry.
@@ -517,6 +536,11 @@ impl TaskGraphCompilationInputs {
             profile_id: profile.profile_id.clone(),
             profile_revision: profile.revision,
             profile_digest: profile.integrity_digest.clone(),
+            lane: profile.lane,
+            lane_registration_digest: profile
+                .independence_and_blinding_policy
+                .lane_registration_digest
+                .clone(),
             obligations: sorted,
             reopen_conditions,
             state_fence: profile.state_fence.clone(),
@@ -571,6 +595,11 @@ impl TaskGraphCompilationInputs {
             &self.profile_revision.to_string(),
         );
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
+        push_field(&mut preimage, "lane", self.lane.wire_name());
+        match &self.lane_registration_digest {
+            Some(digest) => push_field(&mut preimage, "lane_registration_digest", digest),
+            None => push_field(&mut preimage, "lane_registration_digest", "none"),
+        }
         push_count(&mut preimage, "obligations", self.obligations.len());
         for obligation in &self.obligations {
             push_field(&mut preimage, "obligation_id", &obligation.obligation_id);
