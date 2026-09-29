@@ -65,7 +65,8 @@ pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
     NegativeMemoryActivationReceipt, NegativeMemoryActivationRefusal,
     NegativeMemoryActivationRequest, commit_negative_memory_activation,
-    negative_memory_activation_mutation_request, validate_negative_memory_activation,
+    negative_memory_activation_mutation_request, negative_memory_policy_admission_ref,
+    validate_negative_memory_activation,
 };
 pub use negative_memory_context::{
     AdmittedNegativeMemoryRule, MAX_ADMITTED_NEGATIVE_MEMORY_RULES, MAX_NEGATIVE_MEMORY_DIMENSIONS,
@@ -80,6 +81,16 @@ pub use negative_memory_context::{
 pub use negative_memory_gate::{
     NegativeMemoryGateDecision, NegativeMemoryGateInput, NegativeMemoryGateRefusal,
     NegativeMemoryProceedWarning, evaluate_negative_memory_gate,
+    negative_memory_gate_refusal_message, refusal_as_composition_error,
+};
+pub use negative_memory_probe::{
+    NegativeMemoryProbeAdmission, NegativeMemoryProbeBudget, NegativeMemoryProbeEffectCeiling,
+    NegativeMemoryProbeExecution, NegativeMemoryProbeProposal, NegativeMemoryProbeRefusal,
+    admit_negative_memory_probe, execute_negative_memory_probe,
+};
+pub use negative_memory_read::{
+    NegativeMemoryReadRefusal, ResolvedNegativeMemoryRuleSet,
+    plan_negative_memory_rule_read, resolve_negative_memory_rule_read,
 };
 mod controlboard_projection;
 mod learning_admission;
@@ -91,6 +102,8 @@ mod migration_inventory;
 mod negative_memory_activation;
 mod negative_memory_context;
 mod negative_memory_gate;
+mod negative_memory_probe;
+mod negative_memory_read;
 mod observation_reconciliation;
 pub mod opencode_action_gate;
 mod operator_intent;
@@ -194,8 +207,8 @@ pub use migration_inventory::{
     impact_entry_node, impact_node, lookup_by_package, migration_inventory_guard, resolve,
 };
 pub use observation_reconciliation::{
-    GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
-    WatchdogEntryKind,
+    GovernorObservationReconciliation, NegativeMemoryGateObservation, NegativeMemoryGateOutcome,
+    WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
 };
 pub use opencode_action_gate::{
     GovernorActionGateRefusal, GovernorActionGateRequest, GovernorActionGateVerdict,

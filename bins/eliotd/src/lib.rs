@@ -103,6 +103,7 @@ mod maintenance_trigger_evaluator;
 pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;
 pub mod notification_state_emit;
+mod negative_memory_action_gate;
 mod observation_adapters;
 mod owner_feed;
 mod process_origin;
@@ -265,6 +266,10 @@ pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionRead
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
+};
+pub use negative_memory_action_gate::{
+    NegativeMemoryActionError, NegativeMemoryActionOutcome, NegativeMemoryPendingAction,
+    commit_gated_action,
 };
 pub use notification_acknowledge_emit::emit_notification_acknowledgement;
 pub use notification_state_emit::{

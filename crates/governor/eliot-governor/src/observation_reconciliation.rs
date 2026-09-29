@@ -1169,6 +1169,259 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     }
 }
 
+/// What one negative-memory gate decision did to one pending action.
+///
+/// The variant is the decision's own typed outcome, re-derived from the gate
+/// rather than restated by the caller, so the appended observation cannot
+/// describe a block as a warning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NegativeMemoryGateOutcome {
+    /// An exact admitted match refused the effect under a `Block` policy.
+    Blocked,
+    /// An exact admitted match refused the effect until the named admitted
+    /// discriminating check has run.
+    ProbeRequired,
+    /// A near match or advisory disposition proceeded to ordinary
+    /// authorization. This is a warning, never a permission.
+    ProceededWithWarning,
+    /// A complete bounded enumeration found no applicable rule and the effect
+    /// proceeded.
+    ProceededWithoutWarning,
+}
+
+impl NegativeMemoryGateOutcome {
+    /// The closed wire token for this outcome.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::ProbeRequired => "probe_required",
+            Self::ProceededWithWarning => "proceeded_with_warning",
+            Self::ProceededWithoutWarning => "proceeded_without_warning",
+        }
+    }
+}
+
+/// One matched negative-memory gate decision, as it is appended to the
+/// observation path.
+///
+/// Every identity here is owner-issued or record-derived: the action identity
+/// comes from the gated request, the rule identity and rule-set revision from
+/// the store-observed read the decision was taken over, and the read handle
+/// from that same read. No field is a free-form caller annotation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NegativeMemoryGateObservation {
+    /// The gated action's own operation identity.
+    pub action_operation_id: String,
+    /// The gated action's effect identity.
+    pub action_effect_id: String,
+    /// The gated action's input digest.
+    pub action_input_digest: String,
+    /// The scope the effect was admitted at.
+    pub scope_id: String,
+    /// Immutable record identity of the rule that decided the action.
+    pub record_id: String,
+    /// The exact rule revision that was in force.
+    pub rule_revision: u64,
+    /// The exact rule content digest that was in force.
+    pub record_digest: String,
+    /// The named read the rule set was resolved through.
+    pub read_handle: String,
+    /// The scope revision head the store reported for that read.
+    pub rule_set_revision: u64,
+    /// The decision's own typed outcome.
+    pub outcome: NegativeMemoryGateOutcome,
+    /// Whether the gated effect actually reached the canonical store.
+    ///
+    /// This is a fact about the receipt the caller already holds. A refused
+    /// effect is never reported as committed, and a committed effect is never
+    /// reported as refused.
+    pub committed_effect: bool,
+}
+
+impl NegativeMemoryGateObservation {
+    /// The stable replay identity of this matched decision.
+    ///
+    /// It is derived from the action and the rule, so a replay of the same
+    /// decision converges on the same observation while a different decision
+    /// about the same pair is a distinct observation.
+    #[must_use]
+    pub fn observation_identity(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.action_operation_id, self.record_id, self.rule_revision, self.outcome.as_str()
+        )
+    }
+
+    /// The deduplication key the journal stores this observation under.
+    #[must_use]
+    pub fn dedup_key(&self) -> String {
+        sha256_hex(self.observation_identity().as_bytes())
+    }
+}
+
+/// Builds the deterministic observation submission for one gate outcome.
+///
+/// The event core, scope, provenance and privacy disclosure come from the
+/// gated request's own retained identities, so publishing into `eliot_system`
+/// stays a projection of source data rather than a copy of arbitrary project
+/// contents. Retry carries identical canonical bytes, so a replay converges
+/// and a changed outcome under the same identity conflicts.
+fn negative_memory_gate_submission(
+    operation_id: &OperationId,
+    idempotency_key: &str,
+    identity: &eliot_protocol::RequestIdentity,
+    outcome: &NegativeMemoryGateObservation,
+) -> Result<ObservationSubmission, CompositionError> {
+    let fence = identity.request.metadata.state_fence.clone();
+    let generation = fence.resource_generation.value().to_string();
+    let work_scope = WorkScopeId::new(GOVERNOR_SCOPE_ID)
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let record = ObservationRecordEnvelope {
+        record_id: format!("negative-memory-gate:{}", outcome.dedup_key()),
+        kind: ObservationRecordKind::Telemetry,
+        event: Some(ObservationEventCore {
+            event_id_and_time: ObservationEventIdentity {
+                event_id: format!("negative-memory-gate-event:{}", outcome.dedup_key()),
+                clock: ClockReading::default(),
+            },
+            producer_generation_and_trace: ProducerTrace {
+                producer: "governor-negative-memory-gate".to_owned(),
+                generation,
+                trace_ref: Some(outcome.read_handle.clone()),
+            },
+            kind: ObservationKind::FailureOrRepair,
+            affected_scope: ObservationScope {
+                work_scope,
+                task_ref: None,
+                attempt_ref: Some(outcome.action_operation_id.clone()),
+                module_or_route_ref: Some("negative-memory".to_owned()),
+            },
+            observed_delta: format!(
+                "negative-memory rule {}:{} decided operation {} effect {} as {}",
+                outcome.record_id,
+                outcome.rule_revision,
+                outcome.action_operation_id,
+                outcome.action_effect_id,
+                outcome.outcome.as_str()
+            ),
+            expected_baseline: None,
+            evidence_and_raw_handles: vec![outcome.read_handle.clone()],
+            coverage_and_blind_intervals: CoverageEvidence {
+                disposition: CoverageDisposition::Complete,
+                denominator_source_ref: format!(
+                    "negative-memory-rule-set:{}",
+                    outcome.rule_set_revision
+                ),
+                interval: None,
+                blind_intervals: Vec::new(),
+                observed_count: 1,
+            },
+            privacy_retention_and_disclosure: PrivacyRetentionDisclosure {
+                privacy_domain_ref: "governor-negative-memory".to_owned(),
+                retention_policy_ref: "governor-retention".to_owned(),
+                disclosure_class: "internal".to_owned(),
+            },
+            candidate_importance: 1,
+            dedup_key: outcome.dedup_key(),
+        }),
+        coverage_gap: None,
+        journal_control_event: false,
+        parent_record_id: None,
+    };
+    Ok(ObservationSubmission {
+        operation_id: operation_id.as_str().to_owned(),
+        idempotency_key: idempotency_key.to_owned(),
+        state_fence: fence,
+        record,
+        record_v2: None,
+        capture_route: CaptureRoute::CanonicalJournal,
+        durability: Durability::Durable,
+        plan: None,
+        task_selection: None,
+        evidence: None,
+    })
+}
+
+/// Builds the observation-leg envelope for one gate outcome.
+///
+/// The envelope addresses the governed self scope and binds the stable
+/// publication identity: the action operation, the rule identity and revision,
+/// the rule-set revision, and the read handle. Required proof carries the rule
+/// content digest and the read handle, both of which the decision already
+/// holds, so no reference is invented here.
+fn negative_memory_gate_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    observation_operation: &OperationId,
+    submission: &ObservationSubmission,
+    outcome: &NegativeMemoryGateObservation,
+    manifest_digest: &OperationManifestDigest,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let fence = &identity.request.metadata.state_fence;
+    let request_digest = submission
+        .request_digest()
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("record_id", submission.record.record_id.clone()),
+        ("request_digest", request_digest),
+        ("operation_id", submission.operation_id.clone()),
+        ("idempotency_key", submission.idempotency_key.clone()),
+        ("action_operation_id", outcome.action_operation_id.clone()),
+        ("action_effect_id", outcome.action_effect_id.clone()),
+        ("action_input_digest", outcome.action_input_digest.clone()),
+        ("record_id", outcome.record_id.clone()),
+        ("rule_revision", outcome.rule_revision.to_string()),
+        ("record_digest", outcome.record_digest.clone()),
+        ("read_handle", outcome.read_handle.clone()),
+        ("rule_set_revision", outcome.rule_set_revision.to_string()),
+        ("outcome", outcome.outcome.as_str().to_owned()),
+        ("committed_effect", outcome.committed_effect.to_string()),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: observation_operation.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: submission.idempotency_key.clone(),
+        scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
+            .map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: canonical_digest(submission)?,
+        operation_manifest_digest: manifest_digest.clone(),
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: vec![
+            outcome.record_digest.clone(),
+            outcome.read_handle.clone(),
+        ],
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
+                .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
 /// Watchdog spool entry kind for Governor admission.
 ///
 /// Mirrors `eliot-watchdog-core::WatchdogSpoolPayloadKind` without depending
@@ -1766,6 +2019,105 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             }
         }
         Ok(outcomes)
+    }
+
+    /// Appends one matched negative-memory gate outcome to the canonical
+    /// observation path (issue #1731 W6).
+    ///
+    /// This is the existing observation path, not a second journal: the
+    /// Governor builds the typed observation for the governed self scope, the
+    /// Kernel checks authority, fence and identity through
+    /// [`CanonicalAdmissionOwner::commit`], and the store returns its own
+    /// receipt unchanged.
+    ///
+    /// The publication identity is derived from the **action** being gated and
+    /// the **rule** that decided it, never from retry time, so an identical
+    /// replay reconciles the existing receipt while a changed outcome under the
+    /// same identity conflicts. A lost acknowledgement reads the original
+    /// receipt back through the neutral port rather than committing again.
+    ///
+    /// `committed_effect` records whether the gated effect actually reached the
+    /// store. It is a fact about the canonical receipt the caller already
+    /// holds, never an inference from the decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] when the admitted identity, fence or
+    /// operation binding does not hold, when the journal refuses the
+    /// submission, or when the canonical commit cannot be completed or
+    /// reconciled.
+    pub async fn admit_negative_memory_gate_observation(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        base_operation_id: &OperationId,
+        outcome: &NegativeMemoryGateOutcome,
+    ) -> Result<WriteReceipt, CompositionError> {
+        self.validate_capture_identity_fence(identity)?;
+        let observation_operation = OperationId::new(format!(
+            "{base_operation_id}/negative-memory-gate-{}",
+            outcome.observation_identity()
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?;
+        let idempotency_key = format!(
+            "{}:negative-memory-gate:{}",
+            identity.idempotency_key,
+            outcome.observation_identity()
+        );
+        let submission = negative_memory_gate_submission(
+            &observation_operation,
+            &idempotency_key,
+            identity,
+            outcome,
+        )?;
+        let mut scratch = self.observation.clone();
+        match scratch
+            .admit(submission.clone())
+            .map_err(|error| owner_refused(error.to_string()))?
+        {
+            ObservationAdmissionResult::Accepted { .. }
+            | ObservationAdmissionResult::Replayed { .. } => {}
+            ObservationAdmissionResult::Rejected { rejection } => {
+                return Err(owner_refused(format!(
+                    "negative-memory gate observation is not admissible: {}",
+                    rejection.all_contract_errors.join("; ")
+                )));
+            }
+        }
+        let manifest_digest = production_manifest_digest()?;
+        let envelope = negative_memory_gate_envelope(
+            &eliot_protocol::RequestIdentity {
+                request: identity.request.clone(),
+                idempotency_key: idempotency_key.clone(),
+                deadline_unix_ms: identity.deadline_unix_ms,
+                cancellation_id: identity.cancellation_id.clone(),
+            },
+            &observation_operation,
+            &submission,
+            outcome,
+            &manifest_digest,
+        )?;
+        let expected_hash = envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        if let Some(receipt) = self
+            .reconcile_capture_observation_receipt(
+                identity,
+                &observation_operation,
+                &expected_hash,
+                &manifest_digest,
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        self.commit_observation_leg(
+            identity,
+            &observation_operation,
+            envelope,
+            &expected_hash,
+            &manifest_digest,
+        )
+        .await
     }
 
     /// Admits one independently verified Doctor result into canonical Problem

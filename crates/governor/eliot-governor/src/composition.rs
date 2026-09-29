@@ -19,7 +19,9 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
-use crate::negative_memory_gate::{self, NegativeMemoryGateInput, evaluate_negative_memory_gate};
+use crate::negative_memory_gate::{
+    self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
+};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
@@ -144,6 +146,58 @@ pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
     NativeWorkerExecutableBinding, process_invocation_digest_for,
 };
+
+/// Canonical write result kept together with the negative-memory decision
+/// that admitted that exact request.
+///
+/// The decision is returned rather than discarded so the caller's action
+/// response can reference the same rule revision the effect was admitted
+/// under, instead of restating it from its own memory of the request.
+#[derive(Clone, Debug)]
+pub struct NegativeMemoryGatedCommit {
+    /// The canonical receipt for the committed request.
+    pub receipt: WriteReceipt,
+    /// The exact bound decision used immediately before dispatch.
+    pub decision: NegativeMemoryGateDecision,
+}
+
+/// Measures the gate input against the canonical request it is gating.
+///
+/// These are content comparisons, not shape checks. The gate's request fence
+/// must be the envelope's own request fence; the store-observed read fence must
+/// equal that same fence, so the read is measured against this operation rather
+/// than merely existing; and the read must have been addressed to the scope
+/// this write addresses, so a snapshot resolved in another scope cannot be
+/// presented as this request's rule set.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Recovery`] naming the exact binding that does
+/// not hold. No canonical commit is attempted.
+pub fn bind_gate_to_request(
+    gate: &NegativeMemoryGateInput<'_>,
+    envelope: &CanonicalWriteEnvelope,
+) -> Result<(), CompositionError> {
+    if gate.state_fence != &envelope.request.state_fence {
+        return Err(CompositionError::Recovery(
+            "negative-memory gate: the gate request fence is not this write's request fence"
+                .to_owned(),
+        ));
+    }
+    if gate.resolved.store_observed_fence() != &envelope.request.state_fence {
+        return Err(CompositionError::Recovery(
+            "negative-memory gate: the store-observed read fence is not this write's request fence"
+                .to_owned(),
+        ));
+    }
+    if gate.resolved.scope_id() != &envelope.scope_id {
+        return Err(CompositionError::Recovery(
+            "negative-memory gate: the rule read was addressed to a different scope than this write"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 /// The only application write port exposed to the daemon.
 ///
@@ -6461,8 +6515,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
-    /// Applies one Canonical-admitted transition only after the governed
-    /// negative-memory gate admits the effect (issue #1731 W4, I12.19).
+    /// Applies one canonical transition only after the governed negative-memory
+    /// gate admits the exact request (issue #1731 W4, I12.19).
     ///
     /// This is the mechanical gate application I1.8 names for the semantic
     /// layer: the Governor — the owner allowed to interpret policy — evaluates
@@ -6474,32 +6528,44 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// prepared transition.
     ///
     /// The gate is evaluated through [`evaluate_negative_memory_gate`], which is
-    /// total and pure. Its inputs (`gate`) are the caller's own owner-resolved
-    /// snapshot, dispatch revalidation and admitted policies: this method
-    /// re-reads nothing and invents no rule, but it also **cannot** skip the
-    /// gate, because the gate input is a required parameter rather than an
-    /// option. A caller that has not resolved a rule snapshot therefore cannot
-    /// reach this method at all, and one that resolved an incomplete or
-    /// revision-moved snapshot is refused rather than allowed through.
+    /// total and pure. Its rule input (`gate.resolved`) is a
+    /// [`ResolvedNegativeMemoryRuleSet`](crate::negative_memory_read::ResolvedNegativeMemoryRuleSet),
+    /// whose fields are private and are filled only by the bounded named-read
+    /// resolver: this method re-reads nothing and invents no rule, but it also
+    /// **cannot** skip the gate, because the gate input is a required parameter
+    /// rather than an option. A caller that has not resolved an owner-observed
+    /// rule set therefore cannot reach this method at all, and one that resolved
+    /// an incomplete or revision-moved set is refused rather than allowed
+    /// through.
     ///
-    /// A `Proceed` decision — including a near-match warning — returns without
-    /// error and lets the ordinary authorization path run unchanged; the warning
-    /// confers nothing and is available to the caller through `gate`'s own
-    /// subject. A `Block`, `RequireCheck` or `Unavailable` decision becomes a
-    /// typed [`CompositionError::Recovery`] carrying the exact rule revision,
-    /// admitted policy identity or required discriminating check, so the refusal
-    /// is never reduced to an opaque failure.
+    /// Before the gate runs, [`bind_gate_to_request`] measures the gate input
+    /// against **this envelope**: the gate's request State Fence must be the
+    /// envelope's own request State Fence, the store-observed read fence must
+    /// equal it, and the read must have been addressed to the envelope's own
+    /// scope. Those are content comparisons against the operation being
+    /// admitted, so a rule set resolved for a different generation or a
+    /// different scope cannot be presented as this request's snapshot.
+    ///
+    /// A `Proceed` decision — including a near-match warning — lets the ordinary
+    /// authorization path run unchanged; the warning confers nothing and is
+    /// available to the caller through the returned decision. A `Block`,
+    /// `RequireCheck` or `Unavailable` decision becomes a typed
+    /// [`CompositionError::Recovery`] carrying the exact rule revision, admitted
+    /// policy identity or required discriminating check, so the refusal is never
+    /// reduced to an opaque failure.
     pub async fn commit_canonical_gated_by_negative_memory(
         &self,
         identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
         gate: &NegativeMemoryGateInput<'_>,
-    ) -> Result<WriteReceipt, CompositionError> {
+    ) -> Result<NegativeMemoryGatedCommit, CompositionError> {
+        bind_gate_to_request(gate, &envelope)?;
         let decision = evaluate_negative_memory_gate(gate);
         if let Some(refusal) = negative_memory_gate::refusal_as_composition_error(&decision) {
             return Err(refusal);
         }
-        self.commit_canonical(identity, envelope).await
+        let receipt = self.commit_canonical(identity, envelope).await?;
+        Ok(NegativeMemoryGatedCommit { receipt, decision })
     }
 
     /// Admits one scope-sensitive effect under material readiness
