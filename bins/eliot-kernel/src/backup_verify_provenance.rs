@@ -312,16 +312,16 @@ impl OwnerProvenanceEvidence {
         &self,
         identity: &mut BackupVerifyRequestIdentity,
     ) -> Result<(), BackupProvenanceError> {
-        identity.archive_handle = match &self.archive_handle {
-            Some(handle) => Some(BackupVerifyArchiveHandleRef {
-                artifact_id: handle.artifact_id.as_str().to_owned(),
-                owner_contract: handle.contract.name.as_str().to_owned(),
-                source_revision: handle.source_revision.clone(),
-                content_sha256: handle.content_sha256.clone(),
-                byte_length: handle.byte_length,
-            }),
-            None => None,
-        };
+        identity.archive_handle =
+            self.archive_handle
+                .as_ref()
+                .map(|handle| BackupVerifyArchiveHandleRef {
+                    artifact_id: handle.artifact_id.as_str().to_owned(),
+                    owner_contract: handle.contract.name.as_str().to_owned(),
+                    source_revision: handle.source_revision.clone(),
+                    content_sha256: handle.content_sha256.clone(),
+                    byte_length: handle.byte_length,
+                });
         identity.capture_receipt_digest = self
             .capture_receipt
             .as_ref()
@@ -408,12 +408,12 @@ pub(crate) fn check_provenance_binding(
     presented_bytes: &[u8],
 ) -> Result<(), BackupProvenanceError> {
     if let Some(handle) = &evidence.archive_handle {
-        handle
-            .validate(ARCHIVE_HANDLE_FIELD)
-            .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
+        handle.validate(ARCHIVE_HANDLE_FIELD).map_err(|source| {
+            BackupProvenanceError::OwnerValueInvalid {
                 field: ARCHIVE_HANDLE_FIELD,
                 source,
-            })?;
+            }
+        })?;
         if handle.content_sha256 != report.archive_sha256 {
             return Err(BackupProvenanceError::NotBound {
                 field: "backup_verify.archive_handle.content_sha256",
@@ -442,11 +442,12 @@ pub(crate) fn check_provenance_binding(
                 field: "backup_verify.capture_receipt.archive_id",
             });
         }
-        BackupClassWire::validate_transition(wire_class(report.class), receipt.class)
-            .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
+        BackupClassWire::validate_transition(wire_class(report.class), receipt.class).map_err(
+            |source| BackupProvenanceError::OwnerValueInvalid {
                 field: "backup_verify.capture_receipt.class",
                 source,
-            })?;
+            },
+        )?;
         if archived_state_fence_digest(&receipt.fence)
             .map_err(|_| BackupProvenanceError::ArchiveFenceUndecidable)?
             != report.archived_state_fence_digest

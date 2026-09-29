@@ -2341,23 +2341,18 @@ impl KernelComposition {
                 &bounded_reason(&refusal.reason()),
             ));
         }
-        let identity = match backup_verify_identity(
-            session,
-            &caller,
-            &report,
-            &provenance,
-            idempotency_key,
-        ) {
-            Ok(identity) => identity,
-            Err(reason) => {
-                return Ok(invalid_reply(
-                    BACKUP_VERIFY_OPERATION,
-                    idempotency_key,
-                    "backup.verify",
-                    &bounded_reason(&reason),
-                ));
-            }
-        };
+        let identity =
+            match backup_verify_identity(session, &caller, &report, &provenance, idempotency_key) {
+                Ok(identity) => identity,
+                Err(reason) => {
+                    return Ok(invalid_reply(
+                        BACKUP_VERIFY_OPERATION,
+                        idempotency_key,
+                        "backup.verify",
+                        &bounded_reason(&reason),
+                    ));
+                }
+            };
         let Ok(request_digest) = backup_verify_request_digest(&identity) else {
             return Ok(verification_not_recorded_reply(idempotency_key));
         };
