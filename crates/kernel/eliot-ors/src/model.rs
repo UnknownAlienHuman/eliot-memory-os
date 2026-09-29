@@ -85,6 +85,170 @@ pub type RecoveryOwner = OpaqueLabel;
 /// Operation/checkpoint identity preserved without creating an authority owner.
 pub type OperationIdentity = OpaqueLabel;
 
+/// Current explicit version of the authenticated bridge event owner namespace.
+///
+/// The version is fixed by the ORS contract and is included in the canonical
+/// namespace digest; callers cannot select an older or weaker encoding.
+pub const BRIDGE_EVENT_OWNER_NAMESPACE_VERSION: u16 = 3;
+
+/// Authenticated semantic scope retained for a bridge event owner.
+///
+/// `UnboundObservation` is a task-free, owner-issued observation scope. It is
+/// not a caller-selected task, and the `producer_id` on
+/// [`BridgeEventOwnerNamespace`] still identifies the admitted producer
+/// occurrence. Neither variant is authentication evidence by itself: Kernel
+/// must derive it from its retained owner state and ORS must compare the whole
+/// value against the expected stored owner revision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeEventOwnerScope {
+    /// A semantic application Session, optionally narrowed to one Attempt.
+    ApplicationSession {
+        session_id: OpaqueLabel,
+        attempt_id: Option<OpaqueLabel>,
+    },
+    /// An explicitly unbound observation scope with no task or Attempt claim.
+    UnboundObservation { observation_scope_id: OpaqueLabel },
+}
+
+/// Resource name and store-issued incarnation within a bridge owner namespace.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeEventOwnerResource {
+    /// A durable event stream. Its incarnation is assigned by ORS on first
+    /// binding and changes only through the store's checked owner transition.
+    Stream {
+        local_stream: OpaqueLabel,
+        incarnation: u64,
+    },
+    /// A connection-level coverage gap for which no stream is known.
+    UnscopedGap { local_gap_id: OpaqueLabel },
+}
+
+/// Typed, versioned identity for one authenticated bridge event owner.
+///
+/// This is an identity value, not a capability. The installation, principal,
+/// producer, semantic scope, authority lineage and stream incarnation must
+/// come from Kernel-owned admission state. Connection ID and producer
+/// generation remain observation metadata and are deliberately absent here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventOwnerNamespace {
+    /// Stable authenticated installation identity from the Host binding.
+    pub installation_id: OpaqueLabel,
+    /// Authority lineage retained by the admission owner.
+    pub authority_lineage: OpaqueLabel,
+    /// Authenticated semantic principal; never an operating-system user name.
+    pub principal: OpaqueLabel,
+    /// Admitted producer identity for this stream or unscoped gap.
+    pub producer_id: OpaqueLabel,
+    /// Application-session or explicit owner-issued unbound observation scope.
+    pub owner_scope: BridgeEventOwnerScope,
+    /// Local resource identity and store-assigned incarnation, when applicable.
+    pub resource: BridgeEventOwnerResource,
+}
+
+impl BridgeEventOwnerNamespace {
+    /// Checks identity component shape without authenticating the source.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_bridge_event_owner_component(&self.installation_id, "installation_id")?;
+        validate_bridge_event_owner_component(&self.authority_lineage, "authority_lineage")?;
+        validate_bridge_event_owner_component(&self.principal, "principal")?;
+        validate_bridge_event_owner_component(&self.producer_id, "producer_id")?;
+        match &self.owner_scope {
+            BridgeEventOwnerScope::ApplicationSession {
+                session_id,
+                attempt_id,
+            } => {
+                validate_bridge_event_owner_component(session_id, "session_id")?;
+                if let Some(attempt_id) = attempt_id {
+                    validate_bridge_event_owner_component(attempt_id, "attempt_id")?;
+                }
+            }
+            BridgeEventOwnerScope::UnboundObservation {
+                observation_scope_id,
+            } => {
+                validate_bridge_event_owner_component(
+                    observation_scope_id,
+                    "observation_scope_id",
+                )?;
+            }
+        }
+        match &self.resource {
+            BridgeEventOwnerResource::Stream {
+                local_stream,
+                incarnation,
+            } => {
+                validate_bridge_event_owner_component(local_stream, "local_stream")?;
+                if *incarnation == 0 {
+                    return Err(OrsError::InvalidField {
+                        field: "stream_incarnation",
+                        reason: "bridge stream incarnation is store-assigned and nonzero",
+                    });
+                }
+            }
+            BridgeEventOwnerResource::UnscopedGap { local_gap_id } => {
+                validate_bridge_event_owner_component(local_gap_id, "local_gap_id")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical SHA-256 namespace digest for this exact owner.
+    ///
+    /// Canonical JSON keeps labels unambiguous without delimiter-based key
+    /// construction. The fixed domain includes namespace version 3. This
+    /// digest selects a candidate row only; the store must still compare every
+    /// field and the expected owner revision in the same write transaction.
+    pub fn namespace_digest(&self) -> Result<String, OrsError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(&BridgeEventOwnerNamespacePreimage {
+            domain: "eliot.bridge-event-owner",
+            version: BRIDGE_EVENT_OWNER_NAMESPACE_VERSION,
+            installation_id: self.installation_id.as_str(),
+            authority_lineage: self.authority_lineage.as_str(),
+            principal: self.principal.as_str(),
+            producer_id: self.producer_id.as_str(),
+            owner_scope: &self.owner_scope,
+            resource: &self.resource,
+        })
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+#[derive(Serialize)]
+struct BridgeEventOwnerNamespacePreimage<'a> {
+    domain: &'static str,
+    version: u16,
+    installation_id: &'a str,
+    authority_lineage: &'a str,
+    principal: &'a str,
+    producer_id: &'a str,
+    owner_scope: &'a BridgeEventOwnerScope,
+    resource: &'a BridgeEventOwnerResource,
+}
+
+fn validate_bridge_event_owner_component(
+    label: &OpaqueLabel,
+    field: &'static str,
+) -> Result<(), OrsError> {
+    validate_text(label.as_str(), field)?;
+    if label.as_str().contains("::") {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "owner identity components must not contain the key separator",
+        });
+    }
+    if label.as_str() == "-" {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "owner identity components must not equal the unbound marker",
+        });
+    }
+    Ok(())
+}
+
 /// Operation reserved by ORS for one authenticated supervision-lease revision.
 ///
 /// The operation is deliberately separate from the lifecycle state.  ORS
