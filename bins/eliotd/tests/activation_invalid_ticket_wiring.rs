@@ -49,6 +49,7 @@ fn valid_ticket() -> TestResult<AgentActivationResolutionTicket> {
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-202-1".to_owned(),
+        workspace_selector: None,
         cancellation_id: "activation-cancellation-202-1".to_owned(),
         state_fence: test_fence()?,
         kernel_deadline_unix_ms: 10_000,

@@ -1208,6 +1208,19 @@ pub enum BootstrapScanOutcome {
 pub struct BootstrapScanner;
 
 impl BootstrapScanner {
+    /// Returns the scanner's smallest discriminative question when no
+    /// owner-issued privacy classification is available. Identity evidence is
+    /// validated but no lease read is charged and no receipt is persisted.
+    fn privacy_boundary_question(
+        evidence: &BootstrapScanEvidence,
+    ) -> Result<BootstrapScanOutcome, WorkScopeError> {
+        evidence.validate()?;
+        Ok(BootstrapScanOutcome::PrivacyBoundaryRequired {
+            code: SCAN_PRIVACY_BOUNDARY_REQUIRED.to_owned(),
+            discriminative_question: discriminative_question(&evidence.canonical_root_ref)?,
+        })
+    }
+
     /// Runs one privacy-bounded scan against the lease key, lease, owner
     /// binding, boundary, and store.
     ///
@@ -1246,7 +1259,7 @@ impl BootstrapScanner {
         scan_ref: impl Into<String>,
         lease: &mut DiscoveryReadLease,
         key: &DiscoveryLeaseKey,
-        store: &mut impl ScanDisclosureStore,
+        store: &mut (impl ScanDisclosureStore + ?Sized),
         binding: &ScanDisclosureOwnerBinding,
         candidate_privacy: PrivacyClass,
         privacy_boundary: Option<&PrivacyBoundary>,
@@ -1483,10 +1496,13 @@ impl BootstrapScanner {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapDiscoveryInputs {
     pub scan_ref: String,
-    pub candidate_privacy: PrivacyClass,
+    /// Missing classification is a privacy question, never inferred from
+    /// filesystem or VCS facts.
+    pub candidate_privacy: Option<PrivacyClass>,
     pub privacy_boundary: Option<PrivacyBoundary>,
     pub observed: ObservedScopeResources,
-    pub policy: DescriptorPolicy,
+    /// Owner policy is absent during the bounded identity-only pass.
+    pub policy: Option<DescriptorPolicy>,
     pub evidence: BootstrapScanEvidence,
     pub proposed_kind: ScopeKind,
     pub identity_fingerprint: String,
@@ -1494,8 +1510,8 @@ pub struct BootstrapDiscoveryInputs {
     pub now: u64,
 }
 
-/// Runs the production bootstrap discovery flow: keyed lease, owner-bound
-/// store, guarded scan, durable receipt write.
+/// Runs the production bootstrap discovery flow: keyed lease, optional
+/// owner-bound store, guarded scan, and durable receipt write.
 ///
 /// This is the non-test caller that wires the seams together. It validates
 /// the live observations and owner policy, binds the scan evidence to what
@@ -1504,12 +1520,14 @@ pub struct BootstrapDiscoveryInputs {
 /// VCS references must equal the observed generation exactly — arbitrary
 /// caller strings that name nothing observed fail closed), checks the owner
 /// binding against the lease and the privacy boundary, takes the
-/// verifier candidates from the owner's registered verifier references, and
+/// verifier candidates from the owner's registered verifier references. If
+/// privacy class, boundary, or policy is missing, it returns the scanner's
+/// bounded question after validating the Host observations and lease key;
+/// that path charges no lease and persists nothing. A completed scan requires
+/// both an admitted owner binding and the installation-bound `store`, then
 /// runs [`BootstrapScanner::scan`], which verifies the lease key, runs the
 /// forbidden-operation guard, charges the lease, and durably writes the
-/// receipt through the installation-bound `store` before reporting
-/// completion. The caller never chooses storage: `store` is the injected
-/// owner port already bound to the installation contour.
+/// receipt before reporting completion. The caller never chooses storage.
 ///
 /// Exclusion holds by construction: the intake types have no fields for
 /// command lines, recent output, neighboring roots, or raw secret literals,
@@ -1520,10 +1538,11 @@ pub struct BootstrapDiscoveryInputs {
 /// Returns an error when the owner binding disagrees with the lease or the
 /// privacy boundary, when observations, policy, evidence, or references are
 /// malformed, when evidence names nothing observed, or when the scan itself
-/// fails (see [`BootstrapScanner::scan`]).
+/// fails (see [`BootstrapScanner::scan`]), or when a fully specified scan
+/// lacks its installation-bound owner binding/store.
 pub fn run_bootstrap_discovery(
-    store: &mut impl ScanDisclosureStore,
-    binding: &ScanDisclosureOwnerBinding,
+    store: Option<&mut (dyn ScanDisclosureStore + '_)>,
+    binding: Option<&ScanDisclosureOwnerBinding>,
     lease: &mut DiscoveryReadLease,
     key: &DiscoveryLeaseKey,
     discovery: &BootstrapDiscoveryInputs,
@@ -1533,22 +1552,38 @@ pub fn run_bootstrap_discovery(
         &discovery.identity_fingerprint,
         "discovery.identity_fingerprint",
     )?;
-    binding.admit()?;
-    if binding.lease_ref != lease.lease_ref
-        || binding.candidate_root_ref != lease.candidate_root_ref
-    {
-        return Err(WorkScopeError::ScanContourNotAdmitted);
-    }
-    if discovery
-        .privacy_boundary
-        .as_ref()
-        .is_some_and(|boundary| binding.privacy_boundary_ref != boundary.boundary_ref)
-    {
-        return Err(WorkScopeError::ScanContourNotAdmitted);
+    if let Some(binding) = binding {
+        binding.admit()?;
+        if binding.lease_ref != lease.lease_ref
+            || binding.candidate_root_ref != lease.candidate_root_ref
+        {
+            return Err(WorkScopeError::ScanContourNotAdmitted);
+        }
+        if discovery
+            .privacy_boundary
+            .as_ref()
+            .is_some_and(|boundary| binding.privacy_boundary_ref != boundary.boundary_ref)
+        {
+            return Err(WorkScopeError::ScanContourNotAdmitted);
+        }
     }
     discovery.observed.validate()?;
-    discovery.policy.validate()?;
+    if let Some(policy) = &discovery.policy {
+        policy.validate()?;
+    }
     discovery.evidence.validate()?;
+    key.validate()?;
+    lease
+        .validate()
+        .map_err(|_| WorkScopeError::InvalidCounter { field: "lease" })?;
+    if !lease.key_matches(
+        &key.proposer_ref,
+        &key.session_ref,
+        &key.host_ref,
+        &key.root_filesystem_identity_ref,
+    ) {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
     if !discovery
         .observed
         .root_identities
@@ -1574,18 +1609,33 @@ pub fn run_bootstrap_discovery(
     {
         return Err(WorkScopeError::BindingReceiptMismatch);
     }
+    let Some(policy) = &discovery.policy else {
+        return BootstrapScanner::privacy_boundary_question(&discovery.evidence);
+    };
+    let Some(candidate_privacy) = discovery.candidate_privacy else {
+        return BootstrapScanner::privacy_boundary_question(&discovery.evidence);
+    };
+    let Some(boundary) = discovery.privacy_boundary.as_ref() else {
+        return BootstrapScanner::privacy_boundary_question(&discovery.evidence);
+    };
+    let Some(binding) = binding else {
+        return Err(WorkScopeError::ScanContourNotAdmitted);
+    };
+    let Some(store) = store else {
+        return Err(WorkScopeError::ScanReceiptInaccessible);
+    };
     BootstrapScanner::scan(
         discovery.scan_ref.clone(),
         lease,
         key,
         store,
         binding,
-        discovery.candidate_privacy,
-        discovery.privacy_boundary.as_ref(),
+        candidate_privacy,
+        Some(boundary),
         &discovery.evidence,
         discovery.proposed_kind,
         discovery.identity_fingerprint.clone(),
-        &discovery.policy.verifier_refs,
+        &policy.verifier_refs,
         discovery.governing_source_refs.clone(),
         discovery.now,
     )
@@ -1654,9 +1704,7 @@ pub fn candidate_source_roles() -> Vec<GoverningSourceRole> {
 
 fn discriminative_question(canonical_root_ref: &str) -> Result<String, WorkScopeError> {
     text(canonical_root_ref, "canonical_root_ref")?;
-    Ok(format!(
-        "which privacy boundary authorizes discovery for {canonical_root_ref}?"
-    ))
+    Ok("which privacy boundary authorizes discovery for this workspace?".to_owned())
 }
 
 fn read_label(class: DiscoveryRead) -> &'static str {
