@@ -9,6 +9,7 @@
 
 mod admission_reservation;
 mod backup_snapshot;
+mod control_reserve;
 mod cutover_ownership;
 mod doctor;
 mod effect_operation_lease;
@@ -43,6 +44,10 @@ pub use backup_snapshot::{
     OrsFamilyCursor, OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation,
     OrsOperationalCursor, OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition,
     RowFamilyDisposition, RowFamilyKind, RowPayloadState, StoredEffectClass,
+};
+pub use control_reserve::{
+    ORS_DURABLE_BYTES_BOTTLENECK, ORS_TRANSACTION_BOTTLENECK, OrsDimension, OrsPermit,
+    OrsPermitOperation, OrsReserve, OrsReserveError,
 };
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
