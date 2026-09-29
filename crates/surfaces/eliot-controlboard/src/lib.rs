@@ -2401,10 +2401,13 @@ mod tests {
         let resolution_receipt = board_resolution_receipt();
         // Derived before the envelope is moved into the record below.
         let resolution_receipt_id = resolution_receipt.identity.receipt_id.as_str().to_owned();
-        let resolution_authority_id =
-            resolution_receipt.core.authority.authority_id.as_str().to_owned();
-        let resolution_authority_owner =
-            resolution_receipt.core.authority.authority_owner.clone();
+        let resolution_authority_id = resolution_receipt
+            .core
+            .authority
+            .authority_id
+            .as_str()
+            .to_owned();
+        let resolution_authority_owner = resolution_receipt.core.authority.authority_owner.clone();
         Notification {
             notification_id: serde_json::from_value(serde_json::json!(format!(
                 "notification-{key}"
