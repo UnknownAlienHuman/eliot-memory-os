@@ -701,13 +701,13 @@ impl KernelBackupRestore {
     /// This is the production entry to
     /// [`RestoreJournalAdmission::issue_for_operation`]. The owner is
     /// [`OrsRestoreJournalOwner`], built from the same composition-owned
-    /// [`RedbRecoveryStore`] handle, the same [`OrsRestoreBinding`], the same
-    /// live effect fence and the same sealed payload root
+    /// [`RedbRecoveryStore`] handle, the same [`OrsRestoreBinding`] and the same
+    /// live effect fence
     /// [`restore_with_ors_journal`](Self::restore_with_ors_journal) seals the
     /// journal's rows with, and the journal it proves is the same durable ORS
     /// journal. Nothing here is a request field: the owner-issued references are
-    /// read out of the ORS stream-binding row and the durable journal record the
-    /// owner already committed, and `fixture_proof_only` is never set.
+    /// read out of the ORS stream-binding row the owner already committed, and
+    /// `fixture_proof_only` is never set.
     ///
     /// The admission is issued against a journal that ALREADY holds `plan`'s
     /// transaction, because an admission admits an existing durable journal and
@@ -740,21 +740,18 @@ impl KernelBackupRestore {
         kernel_fence: &StateFence,
         identity: &OrsRestoreBinding,
     ) -> Result<RestoreJournalAdmission, KernelRestoreError> {
-        let sealed_root = self
-            .work_root
-            .join(".eliot")
-            .join(RESTORE_JOURNAL_PAYLOAD_AREA);
         let owner = OrsRestoreJournalOwner::production(
             std::sync::Arc::clone(ors),
             identity.clone(),
             kernel_fence,
-            std::path::PathBuf::clone(&sealed_root),
         )?;
         let mut journal = OrsRestoreJournal::production(
             std::sync::Arc::clone(ors),
             kernel_fence,
             identity.clone(),
-            sealed_root,
+            self.work_root
+                .join(".eliot")
+                .join(RESTORE_JOURNAL_PAYLOAD_AREA),
         )?;
         RestoreJournalAdmission::issue_for_operation(&owner, &mut journal, plan)
             .map_err(backup_to_kernel)
