@@ -271,12 +271,18 @@ enum CaptureEvidenceRelation {
     /// REQUIRES that the owner-issued evidence be ABSENT. A candidate that
     /// carries a receipt is claiming provenance it does not have.
     RequiresOwnerEvidenceAbsence,
-    /// No relation is defined for this level. A level in this state is refused
-    /// rather than reported: an unnamed relation is not a relation.
-    Undefined,
 }
 
 /// The ONE typed owner of this surface's verification proof vocabulary.
+///
+/// There is deliberately no "undefined" member. A level with no stated relation
+/// would need a fallible table, and this is the structural reason the old
+/// fallible shape is gone: [`VerifyProofLevel::capture_evidence`] is total over
+/// every level, so a level CANNOT be added without stating the evidence it
+/// requires, and [`require_proven_claim`] matches the two relations
+/// exhaustively with no arm to fall through. An unnamed relation is not a
+/// relation, and the type now makes one unrepresentable rather than refusing it
+/// at runtime.
 ///
 /// It replaces the three level literals and the `BACKUP_LEVELS` string array
 /// this module used to keep in parallel with the owner's
@@ -2110,25 +2116,13 @@ fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenCla
                 });
             }
         }
-        // Fail closed on a level added to the typed owner without a relation to
-        // the owner's capture evidence. `verify_evidence` already refuses a
-        // level outside the type, so this arm is the standing guard for a
-        // member whose relation is still `Undefined`: an unnamed relation is
-        // not a relation, and a level this surface cannot bound is not a level
-        // it may report.
-        CaptureEvidenceRelation::Undefined => {
-            return Err(UnprovenClaim {
-                obligation: format!(
-                    "a defined capture-provenance relation for verification level {} (no relation to the owner's capture evidence is defined for it on this surface)",
-                    evidence.level.wire_name()
-                ),
-                reason: format!(
-                    "owner claimed verification level {} for archive {}, which this surface cannot relate to the owner's own capture evidence; it reports no proof level it cannot bound",
-                    evidence.level.wire_name(),
-                    evidence.bundle_id
-                ),
-            });
-        }
+        // No catch-all arm exists, and that is the guarantee rather than an
+        // omission. `VerifyProofLevel::capture_evidence` is total over every
+        // level, so there is no member this surface can decode but cannot
+        // relate: adding a level forces its relation to be stated here, and the
+        // compiler forces this match to handle it. The old fallible shape needed
+        // a runtime "unrelatable level" refusal; the typed owner makes that
+        // state unrepresentable instead.
     }
     // The class ceiling's REACHABILITY, as distinct from its spelling. A
     // read-only verify holds no authority to declare operational validation or
