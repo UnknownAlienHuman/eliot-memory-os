@@ -191,6 +191,13 @@ pub struct GovernanceProfile {
 
 impl GovernanceProfile {
     /// Lowest profile: no observation, enforcement, or supervision.
+    ///
+    /// The only crate-external constructor, kept for fail-closed
+    /// status/reporting legs (I7.16, #1935 AUD1): its ceiling is
+    /// [`AuthorityCeiling::LowImpact`] by construction, so it can never
+    /// authorize enforcement-dependent operations. Every Material/Critical
+    /// gate admits only the recorded Governor-issued projection, never a
+    /// caller-minted profile.
     #[must_use]
     pub const fn minimal() -> Self {
         Self {
@@ -203,10 +210,13 @@ impl GovernanceProfile {
     /// Full profile: independently observed, enforced, independently
     /// supervised. The only profile that permits Critical.
     ///
-    /// Minting is crate-local: production gates admit only the recorded
-    /// Governor-issued projection, never a caller-minted profile.
+    /// Minting is module-local (I7.16, #1935 AUD1): the Governor-fed
+    /// [`governor_authorization_axes_to_profile`] ladder is the only
+    /// production minter, and it mints only from the recorded
+    /// Governor-issued revision/fingerprint/axes. Production gates admit
+    /// only the recorded projection, never a caller-minted profile.
     #[must_use]
-    pub(crate) const fn full() -> Self {
+    const fn full() -> Self {
         Self {
             observation: GovernanceObservation::IndependentlyObserved,
             enforcement: GovernanceEnforcement::Enforced,
@@ -217,10 +227,13 @@ impl GovernanceProfile {
     /// Material-grade profile: host-observed, interceptable,
     /// watchdog-observed. Permits Material but never Critical.
     ///
-    /// Minting is crate-local: production gates admit only the recorded
-    /// Governor-issued projection, never a caller-minted profile.
+    /// Minting is module-local (I7.16, #1935 AUD1): the Governor-fed
+    /// [`governor_authorization_axes_to_profile`] ladder is the only
+    /// production minter, and it mints only from the recorded
+    /// Governor-issued revision/fingerprint/axes. Production gates admit
+    /// only the recorded projection, never a caller-minted profile.
     #[must_use]
-    pub(crate) const fn material_grade() -> Self {
+    const fn material_grade() -> Self {
         Self {
             observation: GovernanceObservation::HostObserved,
             enforcement: GovernanceEnforcement::Interceptable,
@@ -1100,7 +1113,7 @@ impl StartupCoordinator {
 /// (degraded or route-mismatched) that lands mid-admission fails the
 /// request closed instead of admitting under a superseded profile, and any
 /// authority issued under an older revision is rejected as stale. No
-/// hard-coded [`GovernanceProfile::full`] reaches an effect through here.
+/// hard-coded `GovernanceProfile::full()` reaches an effect through here.
 impl super::KernelComposition {
     /// Admits one Material/Critical effect for one exact target fence under
     /// the current Governor-issued authority.
