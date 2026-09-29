@@ -127,6 +127,49 @@ fn observe_frame(event: &'static str, outcome: &'static str) {
     );
 }
 
+impl KernelComposition {
+    /// Observes one failed transport frame read without payload.
+    ///
+    /// F-LOG-KERNEL-1 (#897 T10): the transport read happens in
+    /// `eliot-ipc::receive_frame`, before the decoded `Frame` ever reaches
+    /// `dispatch_frame`, so partial/zero/EOF input never reaches that seam.
+    /// The front-door driver calls this on every read error before fencing.
+    /// Only static event/outcome literals are emitted: byte counts classify
+    /// the outcome and never reach the record, and the `Io` message is never
+    /// logged (W6, I15.4).
+    pub fn observe_frame_read_input(error: &TransportError) {
+        let outcome: &'static str = match error {
+            TransportError::Protocol(eliot_protocol::ProtocolError::PartialFrame {
+                actual: 0,
+                ..
+            }) => "eof",
+            TransportError::Protocol(eliot_protocol::ProtocolError::PartialFrame { .. }) => {
+                "partial"
+            }
+            TransportError::Protocol(eliot_protocol::ProtocolError::ZeroLengthFrame) => "zero",
+            TransportError::Cancelled => "cancelled",
+            TransportError::Timeout => "unknown",
+            _ => "failed",
+        };
+        observe_frame("kernel.frame_read", outcome);
+    }
+
+    /// Observes one transport frame write outcome without payload.
+    ///
+    /// F-LOG-KERNEL-1 (#897 T15): the front-door driver owns every
+    /// `send_frame` write, so dispatch-side preparation is never delivery.
+    /// The driver calls this from `send_checked`: `Delivered` stays a
+    /// transport acknowledgement (never semantic completion, T16) and
+    /// `UnknownOutcome` remains `unknown` rather than collapsing into
+    /// success or failure.
+    pub fn observe_frame_write_outcome(delivered: bool) {
+        observe_frame(
+            "kernel.frame_write",
+            if delivered { "success" } else { "unknown" },
+        );
+    }
+}
+
 /// Publishes one capability-scoped health result on the Kernel diagnostics
 /// plane.
 ///
