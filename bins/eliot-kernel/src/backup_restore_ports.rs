@@ -282,6 +282,12 @@ fn is_hex64(value: &str) -> bool {
 /// PROVE that a path is its own to remove, so it preserved what it could not
 /// attribute and the primary engine failure was still returned typed. A
 /// cleanup refusal is never reported as a successful cleanup.
+///
+/// [`Self::PublishedPhaseMaterialRetained`] is the same posture reached from
+/// the opposite direction: there the path IS provably this execution's, and it
+/// is provably material a committed phase receipt attests, which is a stronger
+/// reason to keep it than any of the reasons above. It is a refusal to unlink,
+/// never a claim that the sweep failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StagedCleanupRefusal {
     /// The destination was reopened for resume rather than constructed for
@@ -303,6 +309,28 @@ pub enum StagedCleanupRefusal {
     BudgetReached,
     /// A staged path could not be unlinked; it is preserved.
     RemovalFailed,
+    /// Published restore-phase material was PRESERVED rather than unlinked.
+    ///
+    /// The destination still holds material a durable phase receipt — and
+    /// therefore the ORS journal's applied phase set — describes. A same-
+    /// transaction resume enters the engine at a LATER phase and never
+    /// re-runs these, so unlinking them would destroy resume state while every
+    /// attestation of it survived (A13.7, ARCH-RES-03: recovery preserves
+    /// history, purge, revocation and fencing). A journal error, an unobserved
+    /// effect, or any other engine failure is not authority to remove it;
+    /// destructive rollback of published material needs a separately recorded
+    /// owner decision and observed outcome.
+    ///
+    /// The counts are bounded by the same staged-output accounting that
+    /// admitted the writes and name no path, so this cannot become an
+    /// unbounded output channel or a directory scan.
+    PublishedPhaseMaterialRetained {
+        /// Published paths left on disk, each either attested by a committed
+        /// phase receipt or not provably unattested.
+        members: u64,
+        /// Bytes left on disk, summed from the lengths the writes admitted.
+        bytes: u64,
+    },
 }
 
 impl std::fmt::Display for StagedCleanupRefusal {
@@ -314,6 +342,13 @@ impl std::fmt::Display for StagedCleanupRefusal {
             Self::PathNotOurs => "a staged path is not a plain file under the destination",
             Self::BudgetReached => "the derived removal budget was reached",
             Self::RemovalFailed => "a staged path could not be removed",
+            Self::PublishedPhaseMaterialRetained { members, bytes } => {
+                return write!(
+                    formatter,
+                    "published phase material attested by a committed receipt was preserved \
+                     ({members} members, {bytes} bytes retained for resume)"
+                );
+            }
         };
         formatter.write_str(reason)
     }

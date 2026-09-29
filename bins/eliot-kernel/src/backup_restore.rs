@@ -63,6 +63,24 @@
 //! which must upgrade reconciliation there, never downgrade readback to a
 //! blind re-apply here.
 //!
+//! The engine-error path does not undo what the journal already recorded.
+//! [`KernelRestoreTarget`] splits its own output into the scratch temporaries
+//! it reserves before each write and the destination material each phase
+//! publishes, and only the first kind is a deletion candidate. A published
+//! path is a candidate only when a fallible read PROVES that no phase receipt
+//! on disk attests the phase that published it. The phase receipt is written
+//! before the engine's `ReceiptPersisted` compare-and-swap, so its presence is
+//! the earliest durable point from which the material it attests must not be
+//! unlinked; an unreadable receipt, an unattributable path, or a binding that
+//! does not parse all resolve to "preserved", never to "removed". What is
+//! preserved is reported as preserved —
+//! [`StagedCleanup::PublishedMaterialPreserved`] reaches the caller as a typed
+//! disposition beside the unchanged primary failure — because a run that
+//! unlinked bytes a durable journal record and a still-present phase receipt
+//! attest leaves the next resume entering the engine at a phase whose
+//! predecessors no longer exist, and that is a loss, not a cleanup (A13.7,
+//! ARCH-RES-03: recovery preserves history, purge, revocation and fencing).
+//!
 //! The durable journal is injected as `J: RestoreJournalPort` with
 //! owner-issued [`RestoreJournalAdmission`](eliot_backup::RestoreJournalAdmission):
 //! production refuses fixture-flagged or unadmitted journals, and this file
@@ -417,8 +435,12 @@ fn staged_member_bytes(bundle: &BackupBundle) -> Result<usize, BackupError> {
 /// not is refused BEFORE the exceeding write instead of after it. The only
 /// archive that can meet the byte bound is one whose declared members plus this
 /// owner's own output exceed [`MAX_STAGED_OUTPUT_BYTES`]; that refusal is
-/// deliberate, and the failure path removes what this execution staged rather
-/// than leaving a half-written destination behind.
+/// deliberate, and the failure path reclaims the scratch temporaries this
+/// execution reserved rather than leaving them behind. Published phase
+/// material is NOT part of that reclamation: a write refused here left its
+/// phase without a committed receipt, so that phase re-applies on resume, and
+/// this accounting exists to bound the write, never to authorise unlinking a
+/// phase a durable receipt already attests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StagedOutputBudget {
     members: usize,
@@ -914,13 +936,16 @@ impl KernelBackupRestore {
     /// Every staged write is admitted against the archive-derived
     /// [`StagedOutputBudget`] BEFORE it happens, so an archive that cannot
     /// fit the budget is refused rather than written past it. When the
-    /// journaled engine fails, the output this execution staged is removed by
-    /// a bounded, ownership-scoped cleanup (see
-    /// [`KernelRestoreTarget::cleanup_staged_output`]) and the typed cleanup
-    /// disposition is carried by the SAME primary failure: the cause is never
-    /// replaced, and a resume, a foreign admission, a destination that left
-    /// the isolated area, and every path this execution did not write are
-    /// preserved rather than removed.
+    /// journaled engine fails, a bounded, ownership-scoped cleanup (see
+    /// [`KernelRestoreTarget::cleanup_staged_output`]) reclaims the scratch
+    /// temporaries this execution reserved and the published material no
+    /// committed phase receipt covers. The typed cleanup disposition is
+    /// carried by the SAME primary failure: the cause is never replaced, and
+    /// published phase material that a durable receipt attests, a resume, a
+    /// foreign admission, a destination that left the isolated area, and
+    /// every path this execution did not write are preserved rather than
+    /// removed. When anything of that kind is preserved, the disposition says
+    /// so instead of reporting a plain removal.
     ///
     /// This entry holds no ORS owner handle, so it runs the same engine with
     /// the purge-ledger owner route absent. An archive that carries purge
@@ -1514,16 +1539,65 @@ enum ObservedEffect {
 ///
 /// A disposition, not an error: the primary engine failure is returned either
 /// way, so this only has to say what happened to the staged bytes.
+///
+/// The variants are distinguished by what SURVIVED, not by how the sweep
+/// went. `Removed` and `NothingStaged` both mean the destination holds no
+/// output of this execution; `PublishedMaterialPreserved` means it does, and
+/// that fact is the one a caller cannot reconstruct from the primary failure
+/// alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StagedCleanup {
     /// This execution staged no removable file; nothing was removed and
     /// nothing is owed.
     NothingStaged,
-    /// Every removable file this execution staged was removed.
+    /// Every removable file this execution staged was removed, and no
+    /// published phase material was retained.
     Removed,
+    /// Published restore-phase material was PRESERVED rather than unlinked,
+    /// because a phase receipt on disk attests it or because that cannot be
+    /// ruled out.
+    ///
+    /// This is deliberately distinct from [`Self::Removed`]. A durable journal
+    /// record and a still-present phase receipt describe material this
+    /// destination is expected to hold; unlinking it destroys resume state
+    /// while every durable attestation of it survives. Reporting a plain
+    /// removal here would tell the caller the opposite of what is on disk.
+    ///
+    /// The counts come from the same accounting that admitted the writes, so
+    /// they are bounded by [`StagedOutputBudget`] and cost no directory scan.
+    /// They are counts, not paths: the disposition names no file, so it cannot
+    /// become an unbounded output channel.
+    PublishedMaterialPreserved {
+        /// Published paths retained, each either attested by a committed phase
+        /// receipt or not provably unattested.
+        members: u64,
+        /// Bytes retained, summed from the lengths the writes actually
+        /// admitted.
+        bytes: u64,
+    },
     /// Cleanup preserved what it could not attribute to this execution, for
     /// the exact typed reason.
     Refused(StagedCleanupRefusal),
+}
+
+/// Whether a phase receipt on disk proves a published path is this
+/// transaction's own uncommitted scratch or is material a durable record
+/// already attests.
+///
+/// Absence of proof is never proof of absence, so [`Self::Unattested`] is only
+/// ever returned from a fallible read that PROVED the receipt is not there.
+/// A read that failed for any other reason, bytes that do not parse, and a
+/// binding that names another transaction are [`Self::Unknown`], and
+/// [`Self::Unknown`] preserves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhaseAttestation {
+    /// A phase receipt naming this transaction and this phase is on disk.
+    Attested,
+    /// A fallible read proved no such receipt exists, so the phase never
+    /// reached receipt persistence and nothing durable claims this path.
+    Unattested,
+    /// Whether a committed receipt covers this path could not be decided.
+    Unknown,
 }
 
 /// Kernel restore target over the accepted effect seam.
@@ -1590,9 +1664,43 @@ struct KernelRestoreTarget<'a> {
     staged_members: usize,
     /// Bytes staged so far, against [`StagedOutputBudget::bytes`].
     staged_bytes: usize,
-    /// Exact paths this execution wrote, in write order, each under the
-    /// destination root. Nothing else is ever a cleanup candidate.
-    staged: Vec<PathBuf>,
+    /// Exact unpublished temporary paths this execution RESERVED before
+    /// writing them, in write order.
+    ///
+    /// Reserved before the write, not after it, so a failed write or a failed
+    /// rename still leaves a bounded, owned cleanup candidate instead of an
+    /// untracked orphan. These are scratch by construction: no phase receipt
+    /// can name a temporary, because [`Self::phase_receipt_path`] derives
+    /// every receipt path from the phase alone.
+    scratch: Vec<PathBuf>,
+    /// Exact destination material this execution published, in write order,
+    /// each attributed to the phase that published it.
+    ///
+    /// This is NOT a deletion list. An entry becomes a cleanup candidate only
+    /// when [`Self::phase_attestation`] PROVES no phase receipt on disk
+    /// covers it; see [`Self::cleanup_staged_output`].
+    published: Vec<PublishedPath>,
+    /// The phase whose effect is currently running, set for the duration of
+    /// one [`Self::apply_phase`] call.
+    ///
+    /// This is how a published path learns which receipt attests it without
+    /// re-deriving the phase→member mapping for every phase shape. It is
+    /// cleared on every exit, success or failure, so no attribution outlives
+    /// the phase that made it.
+    active_phase: Option<RestorePhase>,
+}
+
+/// One destination path this execution published, with the phase that
+/// published it and the length it was admitted at.
+///
+/// The length is the one the write budget already checked, so summing these
+/// costs nothing and scans nothing.
+struct PublishedPath {
+    path: PathBuf,
+    bytes: u64,
+    /// `None` when the write was not attributable to a phase at all, which
+    /// itself is a reason to preserve rather than remove.
+    phase: Option<RestorePhase>,
 }
 
 impl<'a> KernelRestoreTarget<'a> {
@@ -1622,7 +1730,9 @@ impl<'a> KernelRestoreTarget<'a> {
             budget: StagedOutputBudget::derive(bundle)?,
             staged_members: 0,
             staged_bytes: 0,
-            staged: Vec::new(),
+            scratch: Vec::new(),
+            published: Vec::new(),
+            active_phase: None,
         })
     }
 
@@ -1788,11 +1898,26 @@ impl<'a> KernelRestoreTarget<'a> {
                 .map_err(|error| BackupError::Target(error.to_string()))?;
         }
         let tmp = path.with_extension("tmp-restore");
+        // Reserve the temporary BEFORE any byte exists, so a failed write or a
+        // failed rename still has a bounded, owned cleanup candidate instead
+        // of an untracked orphan. It stays scratch: no phase receipt can name
+        // a `.tmp-restore` path, because `phase_receipt_path` derives every
+        // receipt path from the phase alone, and the successful rename below
+        // simply leaves this entry pointing at a path that no longer exists.
+        self.scratch.push(tmp.clone());
         std::fs::write(&tmp, bytes).map_err(|error| BackupError::Target(error.to_string()))?;
         std::fs::rename(&tmp, &path).map_err(|error| BackupError::Target(error.to_string()))?;
         self.staged_members = members;
         self.staged_bytes = staged_bytes;
-        self.staged.push(path);
+        // The published path is recorded with the phase that published it and
+        // the length that write was admitted at, so the error-path cleanup can
+        // ask the phase receipts on disk whether that material is attested
+        // without re-deriving the phase-to-member mapping or stat-ing it.
+        self.published.push(PublishedPath {
+            path,
+            bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            phase: self.active_phase.clone(),
+        });
         Ok(())
     }
 
@@ -1808,9 +1933,9 @@ impl<'a> KernelRestoreTarget<'a> {
     /// prefix component are all refused, and so is a path that names no segment
     /// at all. Refusal happens before any directory is created, before the
     /// staged-member and staged-byte counters are committed, and before any byte
-    /// is written — so a refused path is also absent from `self.staged`, and the
-    /// ownership-scoped cleanup can never be pointed at a path outside the
-    /// isolated root.
+    /// is written — so a refused path is also absent from `self.scratch` and
+    /// `self.published`, and the ownership-scoped cleanup can never be pointed
+    /// at a path outside the isolated root.
     ///
     /// This is the same refusal the file-runner target enforces
     /// (`eliot_backup`'s `FileRestoreTarget::contained_member_path`, issue
@@ -1890,9 +2015,13 @@ impl<'a> KernelRestoreTarget<'a> {
     /// The engine's typed failure is the cause and is never replaced. When the
     /// cleanup removed everything, or had nothing removable to remove, the
     /// refusal stays plain [`KernelRestoreError::TargetFailed`] — there is no
-    /// second fact to report. When the cleanup preserved what it could not
-    /// attribute, that exact typed reason travels with the SAME primary
-    /// failure, so nothing is lost and nothing is stringified.
+    /// second fact to report. When the cleanup preserved anything, that fact
+    /// travels with the SAME primary failure as a typed disposition: either
+    /// the exact reason it could not attribute a path, or the bounded counts
+    /// of published phase material it deliberately kept. Neither replaces the
+    /// cause and neither is stringified, but the caller can no longer read a
+    /// plain removal off an error whose destination still holds the material
+    /// a durable receipt attests.
     fn refuse_with_staged_cleanup(
         &self,
         destination: &KernelIsolatedDestination,
@@ -1904,52 +2033,164 @@ impl<'a> KernelRestoreTarget<'a> {
             StagedCleanup::NothingStaged | StagedCleanup::Removed => {
                 KernelRestoreError::TargetFailed(primary)
             }
+            StagedCleanup::PublishedMaterialPreserved { members, bytes } => {
+                KernelRestoreError::StagedCleanupIncomplete {
+                    primary,
+                    cleanup: StagedCleanupRefusal::PublishedPhaseMaterialRetained {
+                        members,
+                        bytes,
+                    },
+                }
+            }
             StagedCleanup::Refused(cleanup) => {
                 KernelRestoreError::StagedCleanupIncomplete { primary, cleanup }
             }
         }
     }
 
-    /// Bounded, ownership-scoped removal of the output THIS execution staged.
+    /// Decides whether a published path is this transaction's own uncommitted
+    /// scratch or is material a durable record already attests.
     ///
-    /// Ownership, in the order it is proved:
+    /// The evidence is the phase receipt, which is the same observation
+    /// [`Self::load_applied`] reconciles against and which
+    /// [`Self::persist_applied`] writes BEFORE the engine's `ReceiptPersisted`
+    /// compare-and-swap. Its presence on disk is therefore the earliest
+    /// durable point at which the material it attests must not be unlinked:
+    /// once the CAS has committed, the journal's applied phase set names that
+    /// phase, and a resume will enter the engine at the NEXT one without ever
+    /// re-running it.
     ///
-    /// 1. candidates are the exact paths this execution wrote
-    ///    ([`Self::staged`]) minus the preserved observation classes, so a
-    ///    prior execution's staging, a pinned admission, and the reconcileable
-    ///    phase receipts are never candidates at all;
-    /// 2. a destination that was resumed rather than constructed fresh is
-    ///    refused outright, because its contents are not provably ours;
-    /// 3. the pinned destination admission is re-read through the same
+    /// The read is fallible and every uncertainty resolves to
+    /// [`PhaseAttestation::Unknown`], which preserves:
+    ///
+    /// - a path published with no phase attributed to it, or whose receipt
+    ///   path cannot even be derived, is unattributable, so it is preserved;
+    /// - a receipt that cannot be read for any reason other than absence, or
+    ///   whose bytes do not parse, is undecidable, so it is preserved;
+    /// - a receipt that parses but names another transaction does not prove
+    ///   this transaction's phase, and cannot prove it did not, so it is
+    ///   preserved;
+    /// - only a proven absence of the receipt — `NotFound` from a fallible
+    ///   read, not an assumed one — yields
+    ///   [`PhaseAttestation::Unattested`], and that is the single answer that
+    ///   authorises removal.
+    ///
+    /// The cost is one bounded read per published path, over a path set
+    /// already capped by [`StagedOutputBudget::members`], and it runs on the
+    /// error path only.
+    fn phase_attestation(&self, path: &PublishedPath, transaction_id: &str) -> PhaseAttestation {
+        let Some(phase) = path.phase.as_ref() else {
+            return PhaseAttestation::Unknown;
+        };
+        let Ok(receipt_path) = self.phase_receipt_path(phase) else {
+            return PhaseAttestation::Unknown;
+        };
+        let bytes = match std::fs::read(&receipt_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return PhaseAttestation::Unattested;
+            }
+            Err(_) => return PhaseAttestation::Unknown,
+        };
+        match serde_json::from_slice::<RestoreAppliedEffect>(&bytes) {
+            // Bound to this exact transaction AND phase: the receipt describes
+            // the material this path holds.
+            Ok(applied)
+                if applied.receipt.transaction_id == transaction_id
+                    && applied.receipt.phase == *phase =>
+            {
+                PhaseAttestation::Attested
+            }
+            // Parsed, but not this transaction's or this phase's receipt.
+            _ => PhaseAttestation::Unknown,
+        }
+    }
+
+    /// Bounded, ownership-scoped removal of the output THIS execution wrote.
+    ///
+    /// Ownership is proved in two independent steps, and BOTH must pass before
+    /// a path is unlinked:
+    ///
+    /// 1. **This execution wrote it.** Candidates are drawn from
+    ///    [`Self::scratch`] (the unpublished temporaries reserved before each
+    ///    write) and from [`Self::published`] entries whose phase
+    ///    [`Self::phase_attestation`] PROVES no phase receipt covers. A path
+    ///    this execution never wrote is in neither, so another execution's
+    ///    staging, a pinned admission, and the reconcileable phase receipts are
+    ///    never candidates at all;
+    /// 2. **The destination is still this execution's.** A destination that
+    ///    was resumed rather than constructed fresh is refused outright; the
+    ///    pinned destination admission is re-read through the same
     ///    [`KernelBackupRestore::refuse_foreign_destination`] gate that
     ///    admitted it, so a destination pinned to another transaction or
-    ///    target is refused rather than emptied;
-    /// 4. the destination root and the isolated area are resolved again HERE,
-    ///    not reused from open time, and the root must still sit inside
+    ///    target is refused rather than emptied; and the destination root and
+    ///    the isolated area are resolved again HERE, not reused from open
+    ///    time, and the root must still sit inside
     ///    `<work_root>/.eliot/restore-isolated/<label>`, so a swapped or
     ///    re-pointed destination cannot redirect a removal.
     ///
+    /// Step 1 is where a destructive unlink would otherwise happen. A path in
+    /// [`Self::published`] is removed ONLY on a proven absence of its phase
+    /// receipt. Material that a committed receipt attests, material whose
+    /// receipt is unreadable, and material that no phase can be attributed to
+    /// are all PRESERVED and counted, and the count is what the returned
+    /// [`StagedCleanup`] reports: this cleanup never presents a preserved
+    /// destination as a removed one. What survives is not a leak — the journal
+    /// skips those phases on resume and the retained receipts describe exactly
+    /// the bytes left behind.
+    ///
     /// Bounded work, in three dimensions: the walk is over a known path set,
     /// so there is no unbounded directory recursion; the set is at most
-    /// [`StagedOutputBudget::members`] because those are the same writes the
-    /// budget admitted; and the aggregate unlinked bytes stop at
-    /// [`StagedOutputBudget::bytes`], the same ceiling that admitted them.
-    /// Empty directories left behind are reclaimed with
+    /// [`StagedOutputBudget::members`] plus the reserved temporaries, which are
+    /// the same writes the budget admitted; and the aggregate unlinked bytes
+    /// stop at [`StagedOutputBudget::bytes`], the same ceiling that admitted
+    /// them. Empty directories left behind are reclaimed with
     /// [`std::fs::remove_dir`], which cannot remove a non-empty directory, so
-    /// a directory this pass did not empty always survives.
+    /// a directory this pass did not empty always survives — which is now the
+    /// common case, because retained material keeps its directory alive.
     fn cleanup_staged_output(
         &self,
         destination: &KernelIsolatedDestination,
         transaction_id: &str,
         target_id: &str,
     ) -> StagedCleanup {
-        let candidates: Vec<&PathBuf> = self
-            .staged
+        // Scratch temporaries are candidates on ownership alone: no phase
+        // receipt can name one, so nothing durable claims them and a failed
+        // write or rename must not leave them behind.
+        let mut candidates: Vec<&PathBuf> = self
+            .scratch
             .iter()
             .filter(|path| !Self::is_preserved_observation(path, &self.root))
             .collect();
+        // Published material is a candidate only on proven non-attestation, and
+        // everything else is counted as preserved so the disposition reports
+        // the truth about what the destination still holds.
+        let mut preserved_members = 0u64;
+        let mut preserved_bytes = 0u64;
+        for path in &self.published {
+            if Self::is_preserved_observation(&path.path, &self.root) {
+                continue;
+            }
+            match self.phase_attestation(path, transaction_id) {
+                PhaseAttestation::Unattested => candidates.push(&path.path),
+                PhaseAttestation::Attested | PhaseAttestation::Unknown => {
+                    preserved_members = preserved_members.saturating_add(1);
+                    preserved_bytes = preserved_bytes.saturating_add(path.bytes);
+                }
+            }
+        }
         if candidates.is_empty() {
-            return StagedCleanup::NothingStaged;
+            return if preserved_members == 0 {
+                StagedCleanup::NothingStaged
+            } else {
+                // Nothing was removable, and published material survived. That
+                // is not a no-op: the caller must be able to tell this
+                // destination apart from one that was emptied.
+                StagedCleanup::PublishedMaterialPreserved {
+                    members: preserved_members,
+                    bytes: preserved_bytes,
+                }
+            };
         }
         if destination.is_resumed() {
             return StagedCleanup::Refused(StagedCleanupRefusal::AdmittedResume);
@@ -2028,8 +2269,16 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         Self::reclaim_empty_directories(&parents, &self.root);
         match refusal {
+            // A refusal means the sweep preserved what it could not attribute
+            // or unlink. That already tells the caller something survived, and
+            // the refusal names exactly why, so it is reported rather than the
+            // retained counts.
             Some(refusal) => StagedCleanup::Refused(refusal),
-            None => StagedCleanup::Removed,
+            None if preserved_members == 0 => StagedCleanup::Removed,
+            None => StagedCleanup::PublishedMaterialPreserved {
+                members: preserved_members,
+                bytes: preserved_bytes,
+            },
         }
     }
 
@@ -2046,9 +2295,9 @@ impl<'a> KernelRestoreTarget<'a> {
     /// - [`RESTORE_EVIDENCE_FILE`] is the finalize evidence a later resume
     ///   re-reads and cutover qualification requires.
     ///
-    /// A path this execution never wrote is absent from [`Self::staged`] by
-    /// construction, so another execution's output is preserved without
-    /// needing to be recognised here.
+    /// A path this execution never wrote is absent from [`Self::scratch`] and
+    /// [`Self::published`] by construction, so another execution's output is
+    /// preserved without needing to be recognised here.
     fn is_preserved_observation(path: &Path, root: &Path) -> bool {
         let Ok(relative) = path.strip_prefix(root) else {
             return true;
@@ -2398,14 +2647,25 @@ impl<'a> KernelRestoreTarget<'a> {
         Ok(applied)
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Runs one phase and pins it as the attribution for every path this phase
+    /// publishes.
+    ///
+    /// The pin exists for one reason: [`Self::write_file`] must record which
+    /// phase receipt attests a path it publishes, so that
+    /// [`Self::phase_attestation`] can ask the receipts on disk instead of
+    /// re-deriving the phase-to-member mapping per phase shape. It is set
+    /// before the phase runs and cleared on every exit — refusal, owner error
+    /// or success — so no path is ever attributed to a phase that is no longer
+    /// running, and an unattributed write (which preserves) can only arise from
+    /// a direct target call outside the engine.
     fn apply_phase(
         &mut self,
         plan: &RestorePlan,
         bundle: &BackupBundle,
         intent: &RestoreIntent,
     ) -> Result<RestoreAppliedEffect, BackupError> {
-        match &intent.phase {
+        self.active_phase = Some(intent.phase.clone());
+        let outcome = match &intent.phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             RestorePhase::PrepareIsolatedRoot => self.apply_prepare(plan, bundle, intent),
             RestorePhase::ApplyPurgeLedger => self.apply_purge_phase(bundle, intent),
@@ -2423,7 +2683,9 @@ impl<'a> KernelRestoreTarget<'a> {
             RestorePhase::RebuildProjections => self.apply_rebuild(bundle, intent),
             RestorePhase::VerifyReceiptEventChain => self.apply_verify(bundle, intent),
             RestorePhase::FinalizeIsolatedRoot => self.apply_finalize(plan, bundle, intent),
-        }
+        };
+        self.active_phase = None;
+        outcome
     }
 
     fn obligation(
