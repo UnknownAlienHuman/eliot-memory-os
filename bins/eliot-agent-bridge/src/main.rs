@@ -1970,7 +1970,7 @@ fn dry_run_invocation_via_owner(
             inert_validation: "passed",
             statement: format!(
                 "kernel owner validated the exact tool bytes into serving lane `{lane}`; \
-                owner-confirmed connection, fence, and scope match the live binding at preview \
+                owner-confirmed connection and fence match the live binding at preview \
                 time; no simulation ran, no effects were issued, and nothing was staged"
             ),
         },
