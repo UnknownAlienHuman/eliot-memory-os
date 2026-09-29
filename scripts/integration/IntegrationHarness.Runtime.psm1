@@ -888,7 +888,7 @@ function Invoke-RuntimeAllocate {
 }
 function Invoke-RuntimeStart {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$Allocation, [Parameter(Mandatory)][AllowNull()][scriptblock]$Acquisition, [Parameter(Mandatory)][AllowNull()][scriptblock]$Launcher, [Parameter(Mandatory)][AllowNull()][scriptblock]$OwnerIssuance, [Parameter()][AllowNull()][scriptblock]$Entropy, [Parameter()][AllowNull()][hashtable]$Plan, [Parameter()][switch]$VerifyArtifactFile, [Parameter()][AllowNull()][hashtable]$OwnerHandshake, [Parameter()][AllowNull()][scriptblock]$Clock)
+    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$Allocation, [Parameter(Mandatory)][AllowNull()][scriptblock]$Acquisition, [Parameter(Mandatory)][AllowNull()][scriptblock]$Launcher, [Parameter(Mandatory)][AllowNull()][scriptblock]$OwnerIssuance, [Parameter()][AllowNull()][scriptblock]$Entropy, [Parameter()][AllowNull()][hashtable]$Plan, [Parameter()][AllowNull()][hashtable]$OwnerHandshake, [Parameter()][AllowNull()][scriptblock]$Clock)
     [void](Test-RuntimeBindingShape -Binding $Binding)
     $runId = [string]$Binding['runId']
     if ([string]$Allocation['runId'] -cne $runId) { throw [System.InvalidOperationException]::new('RUNTIME-START-MISMATCH: allocation run identity does not match binding.') }
