@@ -170,16 +170,4 @@ impl PurgeLedgerRevisionBinding {
         crate::model::validate_text(&self.record_key, "purge_ledger_record_key")?;
         Ok(())
     }
-
-    /// Returns whether two bindings record the same observation of the same
-    /// operation.
-    ///
-    /// Equality is over the whole observation, not the operation alone. A second
-    /// stage of one operation that observed a different revision means a purge
-    /// landed between the two stages, so the binding is no longer replayable as
-    /// the answer the first stage committed.
-    #[must_use]
-    pub fn same_observation(&self, other: &Self) -> bool {
-        self.record_key == other.record_key && self.observed_revision == other.observed_revision
-    }
 }

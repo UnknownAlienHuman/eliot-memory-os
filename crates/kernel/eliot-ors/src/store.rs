@@ -6006,10 +6006,10 @@ impl RedbRecoveryStore {
     /// A replay of the same operation is idempotent: an existing binding for the
     /// same key is left exactly as the first stage recorded it, so the replayed
     /// answer keeps the purge state that was actually observed instead of
-    /// silently moving to a later one. A binding that disagrees with the
-    /// revision this owner currently holds is an integrity failure rather than
-    /// an answer, because a revision that went backwards is not a fact the
-    /// ledger can have produced.
+    /// silently moving to a later one. A binding that is BEHIND the current
+    /// counter is ordinary — it is an earlier operation's answer — while one
+    /// AHEAD of the counter is an integrity failure rather than an answer,
+    /// because a revision the ledger never reached cannot have been observed.
     fn bind_purge_ledger_revision(
         write: &redb::WriteTransaction,
         record_key: &str,
@@ -6095,6 +6095,14 @@ impl RedbRecoveryStore {
     }
 
     /// Stages one durable `backup.verify` result under its scoped namespace key.
+    ///
+    /// A newly stored row is committed together with ORS's own binding of the
+    /// operation to the purge-ledger revision that was authoritative at that
+    /// instant, so the answer records the purge state it was produced under
+    /// rather than leaving the purge axis of target compatibility absent. The
+    /// binding is read back with
+    /// [`Self::backup_verification_purge_ledger_revision`]; the current
+    /// owner-issued revision is [`Self::purge_ledger_revision`].
     ///
     /// Persist-before-answer: the row is committed before the route answers, so a
     /// lost response reconciles to this same persisted result instead of
