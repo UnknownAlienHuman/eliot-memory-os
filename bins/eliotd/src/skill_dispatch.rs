@@ -866,11 +866,8 @@ fn commit_activation_candidate(
     // route and the fence the owner actually retains. A receipt naming a
     // foreign fence or a route the owner never bound the Skill to is refused
     // here even though its shape validates.
-    let view = match read_activation_owner_view(composition, &candidate.receipt.skill_id) {
-        Some(view) => view,
-        None => {
-            return SkillResultEnvelope::refused(&eliot_skill::SkillError::NotFound);
-        }
+    let Some(view) = read_activation_owner_view(composition, &candidate.receipt.skill_id) else {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::NotFound);
     };
     if candidate.receipt.state_fence != view.state_fence {
         return SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch);
