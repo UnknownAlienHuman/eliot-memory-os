@@ -766,6 +766,91 @@ impl AdmittedSwarmPlan {
         binding.affected_branch = None;
         binding
     }
+
+    /// Sealed-denominator membership gate for one child slot.
+    ///
+    /// Fail-closed: a slot outside the frozen work graph is
+    /// [`SwarmError::WrongPartition`], never an implicit admission. The launch
+    /// path must call this before persisting intent or requesting execution so
+    /// no child widens the admitted plan.
+    ///
+    /// Production callers on the launch path:
+    /// `crates/agent/eliot-swarm/src/adapter_launch.rs::launch_sealed_child`
+    /// and
+    /// `crates/agent/eliot-swarm/src/durable_dispatch.rs::verify_sealed_dispatch`.
+    pub fn check_child_slot(&self, slot: &WorkItemId) -> Result<(), SwarmError> {
+        if self
+            .proposal
+            .work_items
+            .iter()
+            .any(|item| &item.work_item_id == slot)
+        {
+            Ok(())
+        } else {
+            Err(SwarmError::WrongPartition)
+        }
+    }
+}
+
+/// Derives one deterministic child operation identity from the parent durable
+/// job, child slot, frozen plan revision and State Fence digest.
+///
+/// Same tuple always yields the same identity; any change to prompt,
+/// provider/route, budget, capabilities, plan revision or fence must change an
+/// input, otherwise the relaunch is a different child requiring a new plan
+/// revision. Fail-closed on blank or control-character inputs.
+///
+/// Production caller:
+/// `crates/agent/eliot-swarm/src/durable_dispatch.rs::verify_sealed_dispatch`.
+pub fn derive_child_operation_id(
+    job_handle: &str,
+    plan_revision: &RevisionId,
+    child_slot: &WorkItemId,
+    fence_digest: &str,
+) -> Result<String, SwarmError> {
+    validate_text(job_handle, "job_handle")?;
+    validate_text(plan_revision.as_str(), "plan_revision")?;
+    validate_text(child_slot.as_str(), "child_slot")?;
+    validate_text(fence_digest, "fence_digest")?;
+    Ok(format!(
+        "{}:{}:{}:{}",
+        job_handle,
+        plan_revision.as_str(),
+        child_slot.as_str(),
+        fence_digest
+    ))
+}
+
+/// Derives one deterministic child attempt identity from the same
+/// parent/slot/revision/fence tuple as [`derive_child_operation_id`].
+///
+/// Production caller:
+/// `crates/agent/eliot-swarm/src/durable_dispatch.rs::verify_sealed_dispatch`.
+pub fn derive_child_attempt_id(
+    job_handle: &str,
+    plan_revision: &RevisionId,
+    child_slot: &WorkItemId,
+    fence_digest: &str,
+) -> Result<AgentAttemptId, SwarmError> {
+    let operation_id =
+        derive_child_operation_id(job_handle, plan_revision, child_slot, fence_digest)?;
+    AgentAttemptId::new(format!("{operation_id}-attempt")).map_err(|_| SwarmError::Contract)
+}
+
+/// Derives one deterministic child cancellation identity from the same
+/// parent/slot/revision/fence tuple as [`derive_child_operation_id`].
+///
+/// Production caller:
+/// `crates/agent/eliot-swarm/src/durable_dispatch.rs::verify_sealed_dispatch`.
+pub fn derive_child_cancellation_id(
+    job_handle: &str,
+    plan_revision: &RevisionId,
+    child_slot: &WorkItemId,
+    fence_digest: &str,
+) -> Result<String, SwarmError> {
+    let operation_id =
+        derive_child_operation_id(job_handle, plan_revision, child_slot, fence_digest)?;
+    Ok(format!("{operation_id}-cancel"))
 }
 
 fn validate_plan_graph(proposal: &SwarmPlanProposal) -> Result<(), SwarmError> {

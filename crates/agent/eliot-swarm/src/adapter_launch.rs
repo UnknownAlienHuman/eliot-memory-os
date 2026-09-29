@@ -45,11 +45,14 @@
 
 use eliot_agent_api::WorkLeaseId;
 use eliot_agent_contracts::{RevisionId, WorkItem, WorkItemId};
+use eliot_coordination::SwarmPlanAttachmentConsumerPort;
 
 use super::{
-    SwarmError,
+    AdmittedSwarmPlan, ReceiptEnvelope, ReceiptVerificationPort, SwarmError,
     durable_dispatch::{
-        DispatchedLaunch, DurableJobAttachment, ReplayVerdict, dispatch_child, verify_exact_replay,
+        DispatchedLaunch, DurableJobAttachment, ReplayVerdict, SealedChildIdentities,
+        attach_plan_job_through_port, dispatch_child, rehydrate_attachment_through_port,
+        verify_exact_replay, verify_sealed_dispatch,
     },
     durable_work::{DurableWorkStore, RouteGrant, WorkExecutor, WorkUnitId},
     validate_text,
@@ -228,6 +231,141 @@ pub fn launch_admitted_child(
         adapter_digest: registry.adapter_entry_digest,
         generation: registry.generation,
     })
+}
+
+/// One registry-admitted child launch sealed against its plan denominator
+/// and durable-job attachment, with the fence-qualified identities bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedChildLaunch {
+    /// Registry-admitted launch built by [`launch_admitted_child`].
+    pub launch: AdmittedChildLaunch,
+    /// Canonical identities bound by [`verify_sealed_dispatch`].
+    pub identities: SealedChildIdentities,
+}
+
+/// Child slot plus registry-adjudicated launch inputs for one sealed launch.
+#[derive(Clone, Copy, Debug)]
+pub struct SealedChildInputs<'a> {
+    /// Plan work item to launch; must sit in the sealed denominator.
+    pub item: &'a WorkItem,
+    /// Registry launch request projected by the caller.
+    pub request: &'a RegistryLaunchRequest<'a>,
+    /// Registry route adjudication projected by the caller.
+    pub registry: &'a RegistryRouteAdjudication<'a>,
+    /// Prior dispatch for exact-replay reconciliation, if any.
+    pub prior: Option<&'a DispatchedLaunch>,
+}
+
+/// Launches one child of a sealed plan through the admitted registry path
+/// and binds the sealed identities.
+///
+/// Order: sealed-denominator membership and the plan/attachment owner binding
+/// are proved before the dispatch is built; the full envelope is re-verified
+/// after. The returned intent is still candidate-only: the caller persists it
+/// through the owner-side append path (`DurableWorkStore` append, or the
+/// daemon `LaunchIntentLedger`) BEFORE calling the executor, and reconciles
+/// through [`verify_exact_replay`] plus attachment rehydration before any
+/// relaunch, so no launched child is omitted from restart accounting.
+/// DAG acyclicity and denominator finiteness were proven at admission and are
+/// not re-proved here.
+pub fn launch_sealed_child(
+    store: &dyn DurableWorkStore,
+    executor: &dyn WorkExecutor,
+    plan: &AdmittedSwarmPlan,
+    attachment: &DurableJobAttachment,
+    inputs: SealedChildInputs<'_>,
+) -> Result<SealedChildLaunch, SwarmError> {
+    plan.check_child_slot(&inputs.item.work_item_id)?;
+    if plan.revision() != attachment.plan_revision()
+        || plan.provider_binding().state_fence_digest.as_str() != attachment.state_fence_digest()
+    {
+        return Err(SwarmError::StaleLineage);
+    }
+    let launch = launch_admitted_child(
+        store,
+        executor,
+        attachment,
+        inputs.item,
+        inputs.request,
+        inputs.registry,
+        inputs.prior,
+    )?;
+    let identities = verify_sealed_dispatch(plan, attachment, &launch.launch)?;
+    Ok(SealedChildLaunch { launch, identities })
+}
+
+/// In-crate composition of one swarm execution contour: one Governor
+/// durable-job owner, one admitted plan denominator, the registry-adjudicated
+/// launch path, and the owner-side persist/execute seam.
+///
+/// The owner is the Governor-vended consumer port behind `P`; generation and
+/// process truth stay Kernel-owned (#22) and the adapter registry stays
+/// #874-owned — both travel here only as caller-projected adjudication, which
+/// this contour re-checks but never mints. The store and executor pin the
+/// feeding seam: this contour performs no append and no executor call itself;
+/// the daemon composition feeds each sealed intent through append-before-launch
+/// in this exact order.
+///
+/// Expected production wiring (sibling STITCH, owns the daemon composition):
+/// `bins/eliotd/src/swarm_composition.rs::SwarmComposition` over this
+/// contour's `attach`, `launch`, and `rehydrate`.
+pub struct SwarmLaunchContour<'a, P: SwarmPlanAttachmentConsumerPort> {
+    owner: &'a P,
+    store: &'a dyn DurableWorkStore,
+    executor: &'a dyn WorkExecutor,
+}
+
+impl<'a, P: SwarmPlanAttachmentConsumerPort> SwarmLaunchContour<'a, P> {
+    /// Binds one Governor owner port to the persist/execute seam. The owners
+    /// are caller-held; this contour performs no I/O on construction.
+    #[must_use]
+    pub fn new(
+        owner: &'a P,
+        store: &'a dyn DurableWorkStore,
+        executor: &'a dyn WorkExecutor,
+    ) -> Self {
+        Self {
+            owner,
+            store,
+            executor,
+        }
+    }
+
+    /// Attaches one admitted plan to one durable job through the Governor
+    /// owner. One owner, one canonical decision per plan revision.
+    pub fn attach(
+        &self,
+        plan: &AdmittedSwarmPlan,
+        job_handle: &str,
+        attachment_receipt: ReceiptEnvelope,
+        verifier: Option<&dyn ReceiptVerificationPort>,
+    ) -> Result<DurableJobAttachment, SwarmError> {
+        attach_plan_job_through_port(plan, self.owner, job_handle, attachment_receipt, verifier)
+    }
+
+    /// Rehydrates one sealed binding after restart through the same Governor
+    /// owner. Unknown outcomes stay unknown; reconcile before any relaunch.
+    pub fn rehydrate(
+        &self,
+        plan: &AdmittedSwarmPlan,
+        expected: &DurableJobAttachment,
+        attachment_receipt: ReceiptEnvelope,
+        verifier: Option<&dyn ReceiptVerificationPort>,
+    ) -> Result<DurableJobAttachment, SwarmError> {
+        rehydrate_attachment_through_port(plan, self.owner, expected, attachment_receipt, verifier)
+    }
+
+    /// Launches one sealed child through the admitted registry path and binds
+    /// its sealed identities. Candidate-only: persist the returned intent
+    /// through the owner append path before executing it.
+    pub fn launch(
+        &self,
+        plan: &AdmittedSwarmPlan,
+        attachment: &DurableJobAttachment,
+        inputs: SealedChildInputs<'_>,
+    ) -> Result<SealedChildLaunch, SwarmError> {
+        launch_sealed_child(self.store, self.executor, plan, attachment, inputs)
+    }
 }
 
 #[cfg(test)]
