@@ -272,9 +272,53 @@ impl RouteAdmissionVisibility {
     /// Deterministic field-level difference classification between the
     /// requested and observed fingerprints, in canonical field order.
     /// Empty means field-complete equality.
+    ///
+    /// This reports and decides nothing: it names every differing dimension,
+    /// including the account-scoped ones a stale marker must not act on.
     #[must_use]
     pub fn diverged_fields(&self) -> Vec<String> {
         route_divergence_fields(&self.requested_route, &self.observed_route)
+    }
+
+    /// Behaviour-bearing execution-identity dimensions on which the
+    /// runtime-observed route differs from the requested route, narrowed to
+    /// the adapter and serializer identity I3.4 names.
+    ///
+    /// I3.4 keeps the requested route and the observed route separate
+    /// precisely so a divergence between them is visible, and states that a
+    /// "runtime/adapter/provider/serializer change makes dependent evidence
+    /// stale". This is that rule over the two dimensions whose evidence the
+    /// requested route cannot possibly cover: `adapter`, `adapter_hash` and
+    /// `serializer_hash` are the runtime-exposed execution identity, so a
+    /// route that executed under a different adapter or serializer did not
+    /// execute the route its evidence was taken against.
+    ///
+    /// `provider`, `model` and `auth_billing` are deliberately NOT selected.
+    /// A runtime that does not expose them yields the explicit
+    /// [`UNKNOWN_ROUTE_FACT`] marker, and I3.4 requires that an account-scoped
+    /// difference never generalize into another account's or route's evidence
+    /// ("capability may be route/account-specific and cannot be generalized
+    /// silently"). Those dimensions stay visible through
+    /// [`diverged_fields`](Self::diverged_fields) and decide nothing here.
+    ///
+    /// Empty means the observed execution identity is the requested one on
+    /// every dimension this rule covers. The result is load-bearing, not
+    /// diagnostic: the admission consumer refuses an otherwise-admitted
+    /// disposition whenever it is non-empty — see
+    /// [`eliotd::admit_production_route`](crate::capability_admission::admit_production_route).
+    #[must_use]
+    pub fn stale_dimensions(&self) -> Vec<&'static str> {
+        let mut stale = Vec::new();
+        if self.observed_route.adapter != self.requested_route.adapter {
+            stale.push("adapter");
+        }
+        if self.observed_route.adapter_hash != self.requested_route.adapter_hash {
+            stale.push("adapter_hash");
+        }
+        if self.observed_route.serializer_hash != self.requested_route.serializer_hash {
+            stale.push("serializer_hash");
+        }
+        stale
     }
 }
 
