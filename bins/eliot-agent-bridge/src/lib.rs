@@ -70,6 +70,7 @@ pub mod memory_handle_join;
 pub mod opencode_host_events;
 pub mod reactive_injection_receipts;
 pub mod reactive_runtime_composition;
+pub mod route_identity_gate;
 pub mod settled_plan_transport;
 mod transport_profile;
 mod understanding_bootstrap;
