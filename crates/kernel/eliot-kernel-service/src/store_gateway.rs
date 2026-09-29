@@ -19,18 +19,9 @@ use eliot_contracts::{
     ArtifactId, HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
     ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
-use eliot_kernel_core::KernelError;
-use eliot_runtime_contracts::{
-    AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, EarliestRecoveryCondition,
-    EvidenceCoverageState, HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION,
-    I14AlternativeRoute, I14BackpressureCause, I14BackpressureResponseV1, I14CurrentnessState,
-    I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction, I14RecoveryDirectiveV1,
-    I14RequiredAuthority, I14ResolutionState, I14WorkOutcome, NormalWorkClass,
-    RecoveryCommitStatus, StatePreservationStatus,
-};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
+use eliot_kernel_core::KernelError;
 use eliot_kernel_core::UserAutomationOperation;
 use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
@@ -48,6 +39,15 @@ use eliot_ors::{
     WriterReservationToken,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
+use eliot_runtime_contracts::{
+    AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
+    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
+    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
+    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
     NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
@@ -7884,10 +7884,11 @@ pub fn store_read_profile_revision() -> Result<ArtifactId, KernelError> {
             _ => "generated operation manifests are not well formed",
         },
     })?;
-    let digest = operation_manifest_set_digest(&entries).map_err(|_| KernelError::InvalidField {
-        field: "store_read_profile_revision.digest",
-        reason: "operation manifest set digest could not be computed",
-    })?;
+    let digest =
+        operation_manifest_set_digest(&entries).map_err(|_| KernelError::InvalidField {
+            field: "store_read_profile_revision.digest",
+            reason: "operation manifest set digest could not be computed",
+        })?;
     ArtifactId::new(digest.as_str()).map_err(|_| KernelError::InvalidField {
         field: "store_read_profile_revision.artifact_id",
         reason: "operation manifest set digest is not a valid artifact identity",

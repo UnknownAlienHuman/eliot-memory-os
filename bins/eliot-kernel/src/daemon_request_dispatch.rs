@@ -8966,7 +8966,8 @@ fn store_read_unavailable_directive(
 ) -> Option<serde_json::Value> {
     // `eliot_contracts::OperationId` is the I14.5 directive's operation identity
     // and is distinct from this module's process-lane `OperationId` import.
-    let operation_id = operation_id.map(|handle| eliot_contracts::OperationId::new(handle.to_owned()));
+    let operation_id =
+        operation_id.map(|handle| eliot_contracts::OperationId::new(handle.to_owned()));
     let operation_id = match operation_id {
         Some(Err(_)) => return None,
         Some(Ok(operation_id)) => Some(operation_id),
