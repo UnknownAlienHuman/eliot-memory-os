@@ -38,9 +38,9 @@
 //! the closed `RecordLearningRecord` mutation
 //! ([`eliot_store_api::LearningRecordKind::Candidate`]). No second write
 //! path, store client or durability scheme is introduced here, and no
-//! in-memory `BoundedBacklog` is treated as durable: the backlog is used only
-//! for its deduplication registry within this one pass, and the committed
-//! record is the durable artifact.
+//! in-memory `BoundedBacklog` state is treated as durable: the backlog is a
+//! per-pass REGISTRY rebuilt from the committed records on every pass (see
+//! below), so the committed records are the only durable artifact.
 //!
 //! # What deduplication is and is NOT guaranteed here
 //!
@@ -51,13 +51,26 @@
 //! instead of appending a new candidate per cadence tick. That is the durable
 //! half of I12.24's "deduplicated by target surface and evidence lineage".
 //!
-//! The BACKLOG is still constructed per pass in
-//! `daemon_runtime::improvement_intake_artifact` and is never read across
-//! passes, so the in-memory merge branch of `admit_reporting_pressure` stays
-//! unreachable in this daemon and cross-pass archive relief is not restored
-//! after a restart. Carrying the registry across restarts needs an owner that
-//! reads committed learning rows back into a backlog, which this issue does
-//! not create; the statement above is limited to what the code does.
+//! The registry is REBUILT from this daemon's own committed rows, through the
+//! existing authenticated read route
+//! ([`crate::improvement_dedup_read::read_candidate_scope`] →
+//! [`crate::improvement_dedup_read::restored_registry`]), so the
+//! evidence-lineage merge branch of `admit_reporting_pressure` is reachable
+//! against entries an EARLIER pass or an earlier process committed, and not
+//! only within one pass. The merge RESULT is made durable in its own right by
+//! [`commit_lineage_merge_receipt`], which the next pass reads back as the
+//! surviving entry rather than rebuilding from the pre-merge candidate row.
+//!
+//! What is deliberately NOT claimed:
+//! `DurableCandidateRecord::into_entry`
+//! (`crates/meta/eliot-improvement/src/candidate_bounds.rs`) rebuilds
+//! `TrackedCandidate::merged_from` empty and takes the restored
+//! entry's `value` from the bound's `min_value` floor rather than from a
+//! per-candidate assessment, because the committed candidate document records
+//! neither. So the absorbed-id list a merge accumulated, and a per-candidate
+//! value a `LowValue` archival would need, are not restored across a restart;
+//! the unioned evidence lineage IS, because it lives in the candidate's own
+//! `evidence_refs`. The statement is limited to what the code does.
 //!
 //! # Promotion stays refused, by construction, not by omission
 //!
