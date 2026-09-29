@@ -2367,6 +2367,7 @@ dependencies = [
  "eliot-store-api",
  "eliot-store-memory",
  "eliot-store-surreal-adapter",
+ "eliot-windows-ipc",
  "schemars",
  "secrecy",
  "serde",
@@ -3452,6 +3453,7 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-wasm-runtime",
+ "eliot-windows-ipc",
  "serde",
  "serde_json",
  "thiserror",
@@ -3513,6 +3515,7 @@ name = "eliot-windows-ipc"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "windows-sys",
 ]
