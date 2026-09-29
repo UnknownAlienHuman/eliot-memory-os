@@ -147,6 +147,13 @@ pub enum AdviceRejected {
 /// procedural memory. Records stay durable through the gate's serde snapshot;
 /// the snapshot store owner is external, since this module holds no
 /// filesystem, store, or runtime handles.
+///
+/// Every committed record is returned by the mutator that committed it
+/// ([`AdviceGate::propose`], [`AdviceGate::record_owner_decision`],
+/// [`AdviceGate::record_verifier_outcome`]). The two extra read accessors
+/// `candidates` and `candidate` were removed in #1143 work item 4: they had an
+/// empty caller set across the whole workspace, so they were a second way to
+/// observe the same private ledger with no reader, not an owner of it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdviceGate {
@@ -167,17 +174,6 @@ impl AdviceGate {
     #[must_use]
     pub fn negative_memory(&self) -> &BTreeMap<String, NegativeMemoryEntry> {
         &self.negative_memory
-    }
-
-    #[must_use]
-    pub fn candidates(&self) -> &BTreeMap<String, AdviceCandidate> {
-        &self.candidates
-    }
-
-    /// Read back the latest committed candidate record for a hypothesis.
-    #[must_use]
-    pub fn candidate(&self, hypothesis_key: &str) -> Option<&AdviceCandidate> {
-        self.candidates.get(hypothesis_key)
     }
 
     /// Stable hypothesis key: `<class>:<normalised statement>`.
@@ -240,7 +236,7 @@ impl AdviceGate {
         let evidence: Vec<String> = proposal
             .discriminating_evidence
             .iter()
-            .map(|item| item.split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|item| fold_whitespace(item.as_str()))
             .filter(|item| !item.is_empty())
             .collect();
         if evidence.is_empty() {
@@ -367,12 +363,21 @@ impl AdviceGate {
     }
 }
 
+/// The single owner of the advice-text whitespace fold.
+///
+/// `AdviceGate::propose` folded every discriminator and
+/// `AdviceGate::hypothesis_key_for` folded the statement through two separate
+/// copies of this rule. #1143 work item 4 collapsed them into this one owner
+/// so the fold cannot drift into two disagreeing normalization paths. Case
+/// folding is deliberately NOT here: it belongs to the hypothesis key alone,
+/// because discriminator identity is case-significant and
+/// [`AdviceGate::record_failure`] accumulates it verbatim.
+fn fold_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn normalise_statement(statement: &str) -> String {
-    statement
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    fold_whitespace(statement).to_lowercase()
 }
 
 #[cfg(test)]

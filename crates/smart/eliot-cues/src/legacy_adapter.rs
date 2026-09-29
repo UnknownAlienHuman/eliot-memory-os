@@ -23,7 +23,9 @@ use eliot_observation::ObservationAdmissionReceipt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{FacadeError, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration};
+use crate::{
+    FacadeError, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration, is_blank_or_control,
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,11 +80,7 @@ fn parse_legacy_index_row(
         });
     }
     let _ = (legacy.negative_memory, legacy.token_estimate);
-    if legacy.record_kind.trim().is_empty()
-        || legacy.record_kind.chars().any(char::is_control)
-        || legacy.lifecycle.trim().is_empty()
-        || legacy.lifecycle.chars().any(char::is_control)
-    {
+    if is_blank_or_control(&legacy.record_kind) || is_blank_or_control(&legacy.lifecycle) {
         return Err(FacadeError::LegacyBytesInvalid {
             field: "row.legacy_metadata",
         });
@@ -571,7 +569,7 @@ pub fn convert_v1_row(
             what: "migration.row_payload",
         });
     }
-    if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
+    if is_blank_or_control(legacy_row_id) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",
         });
