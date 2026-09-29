@@ -374,9 +374,9 @@ use eliot_kernel_core::{
     RouteScope, bind_canonical_owner, owner_bundle_digest,
 };
 #[cfg(windows)]
-pub use eliot_kernel_service::KernelStoreGateway;
-#[cfg(windows)]
 use eliot_kernel_service::HostProcessBinding;
+#[cfg(windows)]
+pub use eliot_kernel_service::KernelStoreGateway;
 #[cfg(windows)]
 use eliot_kernel_service::StoreRebindQuery;
 use eliot_kernel_service::{

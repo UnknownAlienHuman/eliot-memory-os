@@ -227,12 +227,11 @@ pub use wire::{
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
     CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, EcxfExportReport,
-    EcxfExportRequest, ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus,
-    SemanticDimension, StoreBackupOperation, StoreBackupRequest, StoreBackupResponse,
-    StoreBackupStatus, StoreBackupStatusOutcome, StoreRequest, StoreResponse,
-    StoreSemanticReadiness, StoreWireError, decode_request_frame,
-    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
-    request_frame, request_frame_with_payload_authority, response_frame,
+    EcxfExportRequest, ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus, SemanticDimension,
+    StoreBackupOperation, StoreBackupRequest, StoreBackupResponse, StoreBackupStatus,
+    StoreBackupStatusOutcome, StoreRequest, StoreResponse, StoreSemanticReadiness, StoreWireError,
+    decode_request_frame, decode_request_frame_with_authority, decode_response_frame,
+    dreamer_job_capability, request_frame, request_frame_with_payload_authority, response_frame,
 };
 
 mod capability_evidence_store;

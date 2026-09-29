@@ -25,12 +25,12 @@ use eliot_store_api::StoreBackupRequest;
 use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureIdentityContext;
-use eliot_store_api::StoreSemanticReadiness;
 use eliot_store_api::StoreGenesisRequest;
 use eliot_store_api::StoreHealth;
 use eliot_store_api::StoreHealthStatus;
 use eliot_store_api::StoreRecoveryRequest;
 use eliot_store_api::StoreRecoverySnapshot;
+use eliot_store_api::StoreSemanticReadiness;
 use eliot_store_api::WriteReceipt;
 use eliot_store_api::{canonical_json_bytes, sha256_hex};
 

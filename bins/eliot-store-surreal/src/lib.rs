@@ -55,8 +55,7 @@ use eliot_store_api::{
 #[cfg(test)]
 use eliot_store_surreal_adapter::SchemaGeneration;
 use eliot_store_surreal_adapter::{
-    AdapterError, MigrationReceipt, PINNED_SURREALDB_MAJOR, SemanticReadiness,
-    SurrealStoreAdapter,
+    AdapterError, MigrationReceipt, PINNED_SURREALDB_MAJOR, SemanticReadiness, SurrealStoreAdapter,
 };
 #[cfg(test)]
 use secrecy::SecretString;
@@ -512,9 +511,7 @@ impl StoreComposition {
             },
             expected_generation: match &readiness {
                 SemanticReadiness::Ready { generation } => Some(generation.to_string()),
-                SemanticReadiness::MigrationRequired { expected, .. } => {
-                    Some(expected.to_string())
-                }
+                SemanticReadiness::MigrationRequired { expected, .. } => Some(expected.to_string()),
                 SemanticReadiness::Unavailable => None,
             },
             observed_generation: match &readiness {

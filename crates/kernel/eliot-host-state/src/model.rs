@@ -1222,10 +1222,7 @@ impl ManagedDependencyRecord {
         {
             return Err(CanonicalStoreObservationRefusal::ProcessApprovalMismatch);
         }
-        if !lineage_matches_exactly(
-            &self.pid_job_lineage_refs,
-            required_pid_job_lineage_refs,
-        ) {
+        if !lineage_matches_exactly(&self.pid_job_lineage_refs, required_pid_job_lineage_refs) {
             return Err(CanonicalStoreObservationRefusal::MissingPidJobLineage);
         }
         if !self.observed_liveness() {
@@ -1252,9 +1249,13 @@ fn lineage_matches_exactly(observed: &[PlatformHandle], required: &[PlatformHand
     if observed.is_empty() || observed.len() != required.len() {
         return false;
     }
-    required
-        .iter()
-        .all(|reference| observed.iter().filter(|member| *member == reference).count() == 1)
+    required.iter().all(|reference| {
+        observed
+            .iter()
+            .filter(|member| *member == reference)
+            .count()
+            == 1
+    })
 }
 
 /// The exact Host-managed process instance observed live for a canonical store.

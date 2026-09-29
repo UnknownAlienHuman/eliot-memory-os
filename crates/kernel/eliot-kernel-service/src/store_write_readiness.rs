@@ -108,22 +108,20 @@ pub fn qualify_canonical_store_writes(
         return Err(CanonicalStoreWriteRefusal::ForeignJobObject);
     }
     if !semantic.is_ready() {
-        return Err(match (
-            semantic.version,
-            semantic.schema,
-            semantic.transaction,
-        ) {
-            (SemanticDimension::Incompatible, _, _) => {
-                CanonicalStoreWriteRefusal::VersionIncompatible
-            }
-            (_, SemanticDimension::Incompatible, _) => {
-                CanonicalStoreWriteRefusal::SchemaIncompatible
-            }
-            (_, _, SemanticDimension::Incompatible) => {
-                CanonicalStoreWriteRefusal::TransactionNotViable
-            }
-            _ => CanonicalStoreWriteRefusal::SemanticUnobserved,
-        });
+        return Err(
+            match (semantic.version, semantic.schema, semantic.transaction) {
+                (SemanticDimension::Incompatible, _, _) => {
+                    CanonicalStoreWriteRefusal::VersionIncompatible
+                }
+                (_, SemanticDimension::Incompatible, _) => {
+                    CanonicalStoreWriteRefusal::SchemaIncompatible
+                }
+                (_, _, SemanticDimension::Incompatible) => {
+                    CanonicalStoreWriteRefusal::TransactionNotViable
+                }
+                _ => CanonicalStoreWriteRefusal::SemanticUnobserved,
+            },
+        );
     }
     Ok(CanonicalStoreWriteReadiness {
         instance: handoff.clone(),
