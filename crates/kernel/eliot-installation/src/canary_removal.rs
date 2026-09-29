@@ -2333,6 +2333,28 @@ where
     // before the mutating call, so a canary admission staged between two rows
     // of one drive refuses this dependent stop/delete.
     observe_admission_fence(&registry.load()?, &operation.plan)?;
+    // The owner effects are re-observed here too, against a transaction
+    // re-loaded from the durable store rather than the one the entry fence read.
+    // A pending write, ORS operation, outbox row or possible external effect
+    // staged between two rows of one drive, a canary lease/session/route
+    // authority rebound to a neighbour, or a substituted owner-derived identity
+    // therefore refuses this mutating call instead of being inherited from the
+    // entry observation. The refusal writes nothing, so the durable incomplete
+    // recovery survives with its blocking effect exactly as observed.
+    let observed_install = store
+        .load(&operation.plan.install_transaction_id)?
+        .ok_or(InstallationError::TransactionNotFound {
+            transaction_id: operation.plan.install_transaction_id.as_str().to_owned(),
+        })?;
+    observed_install.validate()?;
+    if observed_install.transaction_id != install.transaction_id
+        || observed_install.installer_plan_digest != operation.plan.install_plan_digest
+        || observed_install.candidate_manifest.generation != operation.plan.generation
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    require_quiesced_owner_effects(&observed_install, &operation.plan)?;
+    require_complete_effect_coverage(&observed_install, &operation.plan)?;
     let admitted_attempt = if resume {
         let Some(next) = attempt.next() else {
             return unknown_row(store, operation, position, exhausted_bound_ref(&row)?);
@@ -2601,6 +2623,21 @@ where
             )));
         }
         observe_admission_fence(&current, &operation.plan)?;
+        // The owner effects are re-observed here as well, against a transaction
+        // re-loaded from the durable store, so a pending write, ORS operation,
+        // outbox row or possible external effect, or a rebound lease/session/route
+        // authority, staged during the per-row readback refuses the terminal
+        // commit rather than being inherited from the entry observation. Like the
+        // two refusals above, this one writes nothing.
+        let observed_install = coordinator
+            .store()
+            .load(&operation.plan.install_transaction_id)?
+            .ok_or(InstallationError::TransactionNotFound {
+                transaction_id: operation.plan.install_transaction_id.as_str().to_owned(),
+            })?;
+        observed_install.validate()?;
+        require_quiesced_owner_effects(&observed_install, &operation.plan)?;
+        require_complete_effect_coverage(&observed_install, &operation.plan)?;
         let terminal = registry.mutate_atomic(operation.plan.registry_revision, |projection| {
             projection.retire_retired_generation(&operation.plan.generation)
         });
