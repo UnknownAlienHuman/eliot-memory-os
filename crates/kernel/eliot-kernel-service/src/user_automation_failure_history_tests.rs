@@ -439,8 +439,7 @@ fn normalization_envelope(automation_id: &str, revision_id: &str) -> String {
                 request_id: request_id.clone(),
                 session_id: None,
                 task_id: None,
-                product_id: eliot_contracts::ProductId::new("product-automation")
-                    .expect("product"),
+                product_id: eliot_contracts::ProductId::new("product-automation").expect("product"),
                 source_id: eliot_contracts::SourceId::new("owner-1").expect("source"),
                 state_fence: state_fence.clone(),
                 clock: eliot_contracts::ClockReading::default(),
@@ -482,10 +481,8 @@ fn normalization_envelope(automation_id: &str, revision_id: &str) -> String {
             proof: eliot_receipts::ProofCeiling::ScopedVerification,
         },
     };
-    serde_json::to_string(
-        &eliot_receipts::ReceiptEnvelope::issue(core).expect("envelope issues"),
-    )
-    .expect("envelope serializes")
+    serde_json::to_string(&eliot_receipts::ReceiptEnvelope::issue(core).expect("envelope issues"))
+        .expect("envelope serializes")
 }
 
 /// Creates the owning revision directly through the reference contour.

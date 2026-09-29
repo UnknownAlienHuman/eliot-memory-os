@@ -1061,9 +1061,10 @@ pub fn automation_normalization_read_request(
         1,
         state_fence,
     )?;
-    request
-        .parameters
-        .insert(AUTOMATION_PARAM_REVISION.to_owned(), Value::String(revision));
+    request.parameters.insert(
+        AUTOMATION_PARAM_REVISION.to_owned(),
+        Value::String(revision),
+    );
     request.parameters.insert(
         AUTOMATION_PARAM_RECEIPT_ID.to_owned(),
         Value::String(receipt_id),

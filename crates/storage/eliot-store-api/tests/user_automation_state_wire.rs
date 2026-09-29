@@ -19,16 +19,15 @@ use eliot_store_api::{
     AUTOMATION_OPERATION_RESUME, AUTOMATION_OPERATION_RUN_NOW, AUTOMATION_QUERY_CURRENT,
     AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS,
     AUTOMATION_QUERY_LIST, AUTOMATION_QUERY_NORMALIZATION, AUTOMATION_STATE_ACTIVE,
-    AUTOMATION_STATE_PAUSED,
-    AUTOMATION_STATE_RETIRED, DecodedAutomationMutation, EffectClass, MAX_AUTOMATION_PAGE_RECORDS,
-    NamedMutationOperation, NamedReadOperation, OperationKind, StoreError, TransitionClass,
-    USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
-    USER_AUTOMATION_STATE_SCHEMA_V1, automation_create_params, automation_edit_params,
-    automation_mutation_request, automation_read_request, automation_run_now_params,
-    automation_state_transition_params, decode_automation_mutation, generated_operation_manifests,
-    is_configuration_state_wire, named_mutation_operation_by_name, named_mutation_operation_name,
-    named_read_operation_by_name, named_read_operation_name, validate_automation_mutation_params,
-    validate_automation_read_params,
+    AUTOMATION_STATE_PAUSED, AUTOMATION_STATE_RETIRED, DecodedAutomationMutation, EffectClass,
+    MAX_AUTOMATION_PAGE_RECORDS, NamedMutationOperation, NamedReadOperation, OperationKind,
+    StoreError, TransitionClass, USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME,
+    USER_AUTOMATION_SCOPE, USER_AUTOMATION_STATE_SCHEMA_V1, automation_create_params,
+    automation_edit_params, automation_mutation_request, automation_read_request,
+    automation_run_now_params, automation_state_transition_params, decode_automation_mutation,
+    generated_operation_manifests, is_configuration_state_wire, named_mutation_operation_by_name,
+    named_mutation_operation_name, named_read_operation_by_name, named_read_operation_name,
+    validate_automation_mutation_params, validate_automation_read_params,
 };
 use serde_json::{Value, json};
 
@@ -60,10 +59,10 @@ fn invocation_json(automation_id: &str, revision: &str, nonce: &str) -> String {
 /// hand-writing JSON that merely looks like an envelope.
 fn normalization_envelope(automation_id: &str, revision: &str) -> (String, String) {
     use eliot_receipts::{
-        ArtifactBinding, AuthorityBinding, CausalBinding, ContractId, EffectClass, OperationBinding,
-        OperationId, ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind,
-        RequestBinding, RequestId, RequestMetadata, ResourceGeneration, TransactionSequence,
-        WorkScopeBinding, WorkScopeId,
+        ArtifactBinding, AuthorityBinding, CausalBinding, ContractId, EffectClass,
+        OperationBinding, OperationId, ProofCeiling, ReceiptCore, ReceiptDisposition,
+        ReceiptEnvelope, ReceiptKind, RequestBinding, RequestId, RequestMetadata,
+        ResourceGeneration, TransactionSequence, WorkScopeBinding, WorkScopeId,
     };
     let state_fence = wire_fence();
     let request_id = RequestId::new("normalize-request").expect("request id");
@@ -131,7 +130,10 @@ fn normalization_envelope(automation_id: &str, revision: &str) -> (String, Strin
     };
     let envelope = ReceiptEnvelope::issue(core).expect("envelope issues");
     let identity = envelope.identity.receipt_id.as_str().to_owned();
-    (serde_json::to_string(&envelope).expect("envelope serializes"), identity)
+    (
+        serde_json::to_string(&envelope).expect("envelope serializes"),
+        identity,
+    )
 }
 
 fn wire_fence() -> StateFence {

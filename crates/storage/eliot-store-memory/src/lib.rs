@@ -1012,7 +1012,8 @@ fn dispatch_apply_automation_state(
                 match state.automation_revisions.get(&key) {
                     Some(existing)
                         if existing.revision_json != revision_json
-                            || existing.normalization_envelope_json != normalization_envelope_json =>
+                            || existing.normalization_envelope_json
+                                != normalization_envelope_json =>
                     {
                         return Err(StoreError::IdentityConflict);
                     }
@@ -1073,7 +1074,8 @@ fn dispatch_apply_automation_state(
                 match state.automation_revisions.get(&key) {
                     Some(existing)
                         if existing.revision_json != revision_json
-                            || existing.normalization_envelope_json != normalization_envelope_json =>
+                            || existing.normalization_envelope_json
+                                != normalization_envelope_json =>
                     {
                         return Err(StoreError::IdentityConflict);
                     }
@@ -2498,20 +2500,22 @@ fn automation_state_payload(
                     field: "automation_id",
                     reason: "exact automation selector is required",
                 })?;
-            let revision = decoded
-                .requested_revision
-                .as_deref()
-                .ok_or(StoreError::InvalidField {
-                    field: AUTOMATION_PARAM_REVISION,
-                    reason: "exact immutable revision selector is required",
-                })?;
-            let receipt_id = decoded
-                .requested_receipt_id
-                .as_deref()
-                .ok_or(StoreError::InvalidField {
-                    field: AUTOMATION_PARAM_RECEIPT_ID,
-                    reason: "exact receipt identity selector is required",
-                })?;
+            let revision =
+                decoded
+                    .requested_revision
+                    .as_deref()
+                    .ok_or(StoreError::InvalidField {
+                        field: AUTOMATION_PARAM_REVISION,
+                        reason: "exact immutable revision selector is required",
+                    })?;
+            let receipt_id =
+                decoded
+                    .requested_receipt_id
+                    .as_deref()
+                    .ok_or(StoreError::InvalidField {
+                        field: AUTOMATION_PARAM_RECEIPT_ID,
+                        reason: "exact receipt identity selector is required",
+                    })?;
             automation_normalization_envelopes_payload(state, fence, &id, revision, receipt_id)
         }
         _ => Err(StoreError::InvalidField {

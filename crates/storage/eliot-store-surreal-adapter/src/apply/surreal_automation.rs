@@ -2293,7 +2293,8 @@ mod template_tests {
                 automation_id: "auto-1".to_owned(),
                 revision: "r-1".to_owned(),
                 revision_json: r#"{"revision":"r-1"}"#.to_owned(),
-                normalization_envelope_json: r#"{"identity":{"receipt_id":"receipt-a"}}"#.to_owned(),
+                normalization_envelope_json: r#"{"identity":{"receipt_id":"receipt-a"}}"#
+                    .to_owned(),
                 state_fence: test_fence(),
                 scope_id: "user-automation".to_owned(),
                 task_id: None,

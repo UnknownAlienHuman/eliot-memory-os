@@ -758,11 +758,13 @@ fn owner_retains_and_reads_back_its_normalization_envelope() {
     // The retained envelope comes back as the OWNER'S OWN bytes, and the
     // envelope's own identity is what selects it.
     let envelopes = read_normalization(&store, "auto-1", "r-1", &create_identity);
-    assert_eq!(envelopes.len(), 1, "the owner's retained envelope is answerable");
     assert_eq!(
-        envelopes[0]
-            .get("envelope_json")
-            .and_then(Value::as_str),
+        envelopes.len(),
+        1,
+        "the owner's retained envelope is answerable"
+    );
+    assert_eq!(
+        envelopes[0].get("envelope_json").and_then(Value::as_str),
         Some(create_envelope.as_str()),
         "the readback returns the exact bytes the owner retained, not a re-derived value"
     );
@@ -803,12 +805,7 @@ fn owner_retains_and_reads_back_its_normalization_envelope() {
     );
     let replay = automation_mutation_request(replay);
     assert_eq!(
-        apply(
-            &store,
-            "create-replay",
-            replay.operation,
-            replay.parameters
-        ),
+        apply(&store, "create-replay", replay.operation, replay.parameters),
         Err(StoreError::IdentityConflict),
         "an immutable revision row cannot be re-bound to a different envelope"
     );

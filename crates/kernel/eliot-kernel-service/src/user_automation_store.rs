@@ -282,32 +282,26 @@ impl<C> CanonicalUserAutomationStore<C> {
             })?;
         let mut envelopes = Vec::with_capacity(entries.len());
         for entry in entries {
-            let document =
-                entry
-                    .get("envelope_json")
-                    .and_then(Value::as_str)
-                    .ok_or(StoreError::InvalidField {
-                        field: "automation.envelope_json",
-                        reason: "retained normalization envelope is missing its verbatim bytes",
-                    })?;
-            let envelope: ReceiptEnvelope =
-                serde_json::from_str(document).map_err(|error| {
-                    StoreError::Serialization(error.to_string())
-                })?;
+            let document = entry.get("envelope_json").and_then(Value::as_str).ok_or(
+                StoreError::InvalidField {
+                    field: "automation.envelope_json",
+                    reason: "retained normalization envelope is missing its verbatim bytes",
+                },
+            )?;
+            let envelope: ReceiptEnvelope = serde_json::from_str(document)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
             envelope.validate().map_err(StoreError::Receipt)?;
             // Selection is by the envelope's OWN identity, and it is re-checked
             // here on the way out: an owner that returned an envelope other
             // than the one the immutable revision names is answered as a
             // conflict rather than passed to preflight as if it were the claim.
-            let selected = entry
-                .get("receipt_id")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
+            let selected = entry.get("receipt_id").and_then(Value::as_str).ok_or(
+                StoreError::InvalidField {
                     field: "automation.receipt_id",
                     reason: "retained normalization envelope is missing its identity",
-                })?;
-            if envelope.identity.receipt_id.as_str() != selected
-                || selected != requested_receipt_id
+                },
+            )?;
+            if envelope.identity.receipt_id.as_str() != selected || selected != requested_receipt_id
             {
                 return Err(StoreError::IdentityConflict);
             }

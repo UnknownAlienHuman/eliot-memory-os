@@ -1003,9 +1003,7 @@ async fn owner_retains_and_reads_back_its_normalization_envelope() {
         Value::String(normalization_envelope("auto-1", "r-1-other").0),
     );
     assert_eq!(
-        apply(adapter, "create-replay", replay)
-            .await
-            .map(|_| ()),
+        apply(adapter, "create-replay", replay).await.map(|_| ()),
         Err(StoreError::IdentityConflict),
         "an immutable revision row cannot be re-bound to a different envelope"
     );
