@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::WorkerError;
-pub use crate::generated::WorkerRequest;
+pub use crate::generated::{NativeWorkerExecuteEbpCallV1, WorkerRequest};
 
 /// Stable version of A-13's language-neutral native-worker protocol.
 pub const PROTOCOL_VERSION: &str = "eliot-native-worker/v2";
@@ -280,7 +280,7 @@ impl WorkerFrame {
     content = "payload"
 )]
 pub enum WorkerFrameBody {
-    Execute(WorkerRequest),
+    Execute(NativeWorkerExecuteEbpCallV1),
     Cancel(CancelRequest),
     Heartbeat,
     Health,
