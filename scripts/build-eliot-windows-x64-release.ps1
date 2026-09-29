@@ -1707,7 +1707,15 @@ function Test-ExcludedDispositions([string]$Repo, [string]$SourceCommit) {
         throw 'release excluded-disposition gate is missing: scripts/verify-excluded-dispositions-1811.py'
     }
     $receiptPath = Get-ExcludedDispositionReceiptPath $Repo
-    & python $gate --root $Repo --trust-class T0 --receipt-out $receiptPath
+    # Issue #1811 (items A4/AUD1/AUD4): the gate's own EXCLUDED_DISPOSITIONS
+    # report is operator-facing text, not this function's result. A native
+    # command's stdout enters the PowerShell success stream, so returning it
+    # unbound would make the caller receive [report..., binding] instead of the
+    # binding; the final manifest comparison and the admitted-set re-derivation
+    # would then read empty arrays out of the wrong elements and refuse a
+    # genuinely admitted set. The report is written to the host, which is where
+    # the refusal below already tells the operator to read it.
+    & python $gate --root $Repo --trust-class T0 --receipt-out $receiptPath | Write-Host
     if ($LASTEXITCODE -ne 0) {
         throw "release excluded-disposition gate rejected undeclared excluded input (see EXCLUDED_DISPOSITIONS output above; required evidence: provenance, lock, toolchain, license, SBOM)"
     }
@@ -1781,8 +1789,11 @@ function Assert-ExcludedDispositionReceipt([string]$Repo, [string]$SourceCommit,
         throw 'retained excluded-disposition gate receipt changed after the pre-build check'
     }
     $recheckPath = Join-Path (Join-Path $Repo '.eliot/excluded-dispositions') 'gate-recheck-receipt.json'
+    # Same seam as the pre-build call above: the re-check report is
+    # operator-facing text, so it must not become the first elements of the
+    # recheck binding this function returns and the plan retains.
     & python $gate --root $Repo --trust-class ([string]$Binding.trust_class) `
-        --receipt $receiptPath --receipt-out $recheckPath
+        --receipt $receiptPath --receipt-out $recheckPath | Write-Host
     if ($LASTEXITCODE -ne 0) {
         throw "final staged input manifest does not match the retained excluded-disposition gate receipt (see EXCLUDED_DISPOSITIONS output above)"
     }
