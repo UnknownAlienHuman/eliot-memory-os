@@ -163,6 +163,16 @@ pub(crate) struct HintVerification {
 /// hashes the supplied bytes itself and drops them; only digests are
 /// retained.
 ///
+/// Ingress contract (fail-closed): both content sides must be present so the
+/// ledger hashes real before/after source bytes, and `diff_handle` must be
+/// the exact transition digest for `(change_id, before, after)` — a copied
+/// unrelated digest does not resolve and is refused with
+/// [`ChangeMonitorError::InvalidGovernedChange`]. The fence fields must be
+/// the joined generation and the invalidation outcome the producing lane
+/// actually observed. A lane that observed only its own IPC envelope
+/// (request/result digests, no tracked-source bytes) cannot satisfy this
+/// contract; its record is refused, never stored as source identity.
+///
 /// Caller (I10.21 A1):
 /// `super::daemon_claim_queue::observe_finish_governed_change`, which feeds
 /// the record from the completed `eliot.finish` receipt.
@@ -500,11 +510,13 @@ pub(crate) fn confirm_hint(
 /// attempt receipt, the diff handle, and the observed State-Fence
 /// invalidation (I10.21 A1). Content checksums are computed here over the
 /// exact bytes supplied; the bytes are dropped and only digests retained.
-/// A recorded governed transition reconciles the matching unknown-origin
-/// change for the exact same resource transition. History is never
-/// rewritten: an exact replay is reported, a conflicting identity is
-/// refused, and a lease/session/operation owned by another operation is
-/// never reused.
+/// A record without both content sides, or whose diff handle does not name
+/// its exact before/after transition, is refused: the ledger stores source
+/// identity, never envelope identity. A recorded governed transition
+/// reconciles the matching unknown-origin change for the exact same
+/// resource transition. History is never rewritten: an exact replay is
+/// reported, a conflicting identity is refused, and a lease/session/
+/// operation owned by another operation is never reused.
 ///
 /// Caller (I10.21 A1):
 /// `super::daemon_claim_queue::observe_finish_governed_change`.
@@ -537,7 +549,27 @@ pub(crate) fn record_governed_tool_change(
     }
     let before_digest = change.before_bytes.as_deref().map(crate::sha256_hex);
     let after_digest = change.after_bytes.as_deref().map(crate::sha256_hex);
+    // I10.21 A1: both content sides must be real bytes the producing lane
+    // read back. `None` on either side means no source identity exists for
+    // that side (an envelope/request digest is operation identity, not
+    // content), so there is no before/after pair to record.
+    let (Some(before_digest), Some(after_digest)) = (before_digest, after_digest) else {
+        return Err(ChangeMonitorError::InvalidGovernedChange);
+    };
     if before_digest == after_digest {
+        return Err(ChangeMonitorError::InvalidGovernedChange);
+    }
+    // I10.21 A1: the diff handle must resolve to the exact recorded
+    // transition through the ledger's own transition binder (shared with
+    // `confirm_hint` and the finish-leg reconciliation, never a second
+    // resolver). A byte copy of an unrelated digest names no transition
+    // this ledger recorded and is refused.
+    let (_, transition_digest) = material_transition_ids(
+        &change.change_id,
+        Some(before_digest.as_str()),
+        Some(after_digest.as_str()),
+    );
+    if change.diff_handle != transition_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
     }
     let record = GovernedChangeRecord {
@@ -545,9 +577,9 @@ pub(crate) fn record_governed_tool_change(
         path: change.path.clone(),
         before_path: change.before_path.clone(),
         before_revision: change.before_revision.clone(),
-        before_digest: before_digest.clone(),
+        before_digest: Some(before_digest.clone()),
         after_revision: change.after_revision.clone(),
-        after_digest: after_digest.clone(),
+        after_digest: Some(after_digest.clone()),
         session: change.session.clone(),
         action_lease: change.action_lease.clone(),
         operation: change.operation.clone(),
@@ -578,7 +610,7 @@ pub(crate) fn record_governed_tool_change(
         .filter(|(_, unknown)| {
             !unknown.reconciled
                 && unknown.resource == change.resource
-                && unknown.after_digest == after_digest
+                && unknown.after_digest.as_deref() == Some(after_digest.as_str())
         })
         .map(|(unknown_id, _)| (unknown_id.clone(), change.change_id.clone()))
         .collect();

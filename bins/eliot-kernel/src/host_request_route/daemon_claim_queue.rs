@@ -1202,24 +1202,47 @@ fn finish_stale_attempt(
     None
 }
 
-/// Records one completed `eliot.finish` result in the Kernel-owned
+/// Forwards one completed `eliot.finish` result to the Kernel-owned
 /// `ChangeMonitor` ledger (issue #1824, I10.21 A1/A2).
 ///
-/// The finish receipt is the governed-tool evidence: the operation handle
+/// The finish receipt is operation-bound evidence only: the operation handle
 /// is the idempotent change identity, the stored capability names the
-/// resource, the request digest is the before revision, and the canonical
-/// response bytes — already digest-bound to `result_digest` by
+/// resource, the request digest is the operation's own before revision, and
+/// the canonical response bytes — already digest-bound to `result_digest` by
 /// `FinishResultBody::validate` — are the after bytes the ledger hashes
-/// itself. The fenced attempt binds the session, the attempt-scoped lease,
-/// the operation, and the receipt; the checked State Fence showed no
-/// invalidation on this path. Recording also reconciles a matching
-/// unknown-origin change, and the operation's exact transition is
-/// reconciled explicitly when one was recorded. Best-effort: ledger
-/// contention or a shape refusal never fails the submit.
+/// itself. The diff handle is the ledger's own transition digest over the
+/// exact supplied sides, so it resolves to the recorded transition instead
+/// of copying an unrelated digest. The fenced attempt binds the session,
+/// the attempt-scoped lease, the operation, and the receipt; the State-Fence
+/// join `submit_finish_result` checks before persist showed no invalidation
+/// on the finish operation's fence scope.
+///
+/// What this leg cannot supply — and never invents — is the tracked-source
+/// mutation itself: no source path, no baseline content, and no source diff
+/// reach this function. The designated `GovernedProcessEffectPort`
+/// implementor (Governor change-monitor adapter performing real content/Git
+/// readback) does not exist workspace-wide, so `effect_port` stays `None`,
+/// and the finish wire carries no source fields. The ledger therefore
+/// refuses the governed record until a tool-effect lane supplies the real
+/// mutation; the refusal is best-effort and never fails the submit.
+/// Reconciliation of the operation's exact transition is still attempted
+/// explicitly for when the hint lane confirms it material. Best-effort:
+/// ledger contention or a shape refusal never fails the submit.
 fn observe_finish_governed_change(body: &FinishResultBody, persisted: &HostRequestRecord) {
     let Ok(after_bytes) = canonical_json_bytes(&body.response) else {
         return;
     };
+    // I10.21 A1: the only content this leg holds is the finish artifact
+    // itself. `before_bytes` stays `None` because no tracked-source baseline
+    // reaches this function (see above); the ledger refuses the record on
+    // exactly that ground rather than storing envelope identity as source
+    // identity.
+    let after_digest = crate::sha256_hex(&after_bytes);
+    let (_, diff_handle) = super::change_monitor::material_transition_ids(
+        &body.operation_id,
+        None,
+        Some(after_digest.as_str()),
+    );
     let change = super::change_monitor::GovernedToolChange {
         change_id: body.operation_id.clone(),
         resource: persisted.capability_ref.as_str().to_owned(),
@@ -1236,7 +1259,7 @@ fn observe_finish_governed_change(body: &FinishResultBody, persisted: &HostReque
         ),
         operation: body.operation_id.clone(),
         attempt_receipt: body.attempt.attempt_id.clone(),
-        diff_handle: body.result_digest.clone(),
+        diff_handle,
         fence_generation: body.attempt.fencing_generation,
         fence_invalidated: false,
     };
