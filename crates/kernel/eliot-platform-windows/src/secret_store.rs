@@ -387,7 +387,11 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
     }
 
     /// Returns the exact current process-token SID.
-    pub(crate) fn principal_sid(self) -> Result<PlatformHandle, crate::WindowsAdapterError> {
+    ///
+    /// This is an associated function, not a method: the value comes from the
+    /// live process token, and the provider carries no fields or resources that
+    /// a caller-supplied instance could contribute.
+    pub(crate) fn principal_sid() -> Result<PlatformHandle, crate::WindowsAdapterError> {
         let sid =
             crate::current_process_sid().map_err(|_| crate::WindowsAdapterError::Unavailable)?;
         PlatformHandle::new(sid).map_err(|_| crate::WindowsAdapterError::InvalidInput)
@@ -402,7 +406,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
         effect_id: &str,
         owner_sid: &PlatformHandle,
     ) -> Result<PlatformHandle, crate::WindowsAdapterError> {
-        let live_sid = self.principal_sid()?;
+        let live_sid = Self::principal_sid()?;
         if live_sid != *owner_sid
             || [installation_id, transaction_id, effect_id]
                 .iter()
@@ -579,7 +583,7 @@ impl WindowsCurrentUserSupervisionCredentialProvider {
         if !valid_user_mode_supervision_credential_target(target.as_str()) {
             return Err(crate::WindowsAdapterError::InvalidInput);
         }
-        if self.principal_sid()? != *expected_owner_sid {
+        if Self::principal_sid()? != *expected_owner_sid {
             return Err(crate::WindowsAdapterError::IdentityMismatch);
         }
         Ok(())
