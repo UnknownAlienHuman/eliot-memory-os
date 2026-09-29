@@ -802,9 +802,7 @@ fn conformance_diagnosis_evidence(
         trigger_problem_or_metric: trigger_problem_or_metric.to_owned(),
         validity_scope: validity_scope.to_owned(),
     };
-    Ok(eliot_self_quality::sourced_evidence_from_conformance_diagnosis(
-        &finding,
-    )?)
+    Ok(eliot_self_quality::sourced_evidence_from_conformance_diagnosis(&finding)?)
 }
 
 /// The priority axis this daemon assigns a conformance finding, DERIVED from
