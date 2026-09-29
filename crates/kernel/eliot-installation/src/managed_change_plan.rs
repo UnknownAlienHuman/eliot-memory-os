@@ -265,13 +265,16 @@ impl ManagedEnvironmentChangePlan {
 /// gained, lost or changed any observation, stage result or candidate is a
 /// different digest rather than the same label.
 fn survey_content_digest(survey: &InstallationSurvey) -> Result<PlatformHandle, InstallationError> {
-    let bytes = super::canonical_json_bytes(survey).map_err(|error| InstallationError::InvalidField {
-        field: "survey".to_owned(),
-        reason: format!("survey content could not be canonicalized: {error}"),
-    })?;
-    PlatformHandle::new(super::sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
-        field: "managed_change_plan.survey_content_digest".to_owned(),
-        reason: error.to_string(),
+    let bytes =
+        super::canonical_json_bytes(survey).map_err(|error| InstallationError::InvalidField {
+            field: "survey".to_owned(),
+            reason: format!("survey content could not be canonicalized: {error}"),
+        })?;
+    PlatformHandle::new(super::sha256_hex(&bytes)).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "managed_change_plan.survey_content_digest".to_owned(),
+            reason: error.to_string(),
+        }
     })
 }
 

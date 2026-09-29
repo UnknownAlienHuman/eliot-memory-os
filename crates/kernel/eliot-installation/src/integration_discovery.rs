@@ -603,13 +603,22 @@ pub const INTEGRATION_SEED_FAMILIES: &[(&str, IntegrationCategory)] = &[
     ("lm_studio", IntegrationCategory::LocalModelRuntime),
     ("llmster", IntegrationCategory::LocalModelRuntime),
     ("ollama", IntegrationCategory::LocalModelRuntime),
-    ("openai_compatible_local_endpoint", IntegrationCategory::LocalModelRuntime),
+    (
+        "openai_compatible_local_endpoint",
+        IntegrationCategory::LocalModelRuntime,
+    ),
     ("visual_studio_code", IntegrationCategory::EditorHost),
     ("jetbrains_ide", IntegrationCategory::EditorHost),
     ("zed", IntegrationCategory::EditorHost),
     ("visual_studio", IntegrationCategory::EditorHost),
-    ("registered_browser", IntegrationCategory::BrowserProfessionalTool),
-    ("professional_application", IntegrationCategory::BrowserProfessionalTool),
+    (
+        "registered_browser",
+        IntegrationCategory::BrowserProfessionalTool,
+    ),
+    (
+        "professional_application",
+        IntegrationCategory::BrowserProfessionalTool,
+    ),
     ("git", IntegrationCategory::Toolchain),
     ("git_worktree", IntegrationCategory::Toolchain),
     ("rustup", IntegrationCategory::Toolchain),
@@ -657,7 +666,11 @@ impl IntegrationDiscoveryCatalogue {
         }
         handle(&self.origin, "catalogue.origin")?;
         handle(&self.accepted_by, "catalogue.accepted_by")?;
-        handles(&self.supported_platforms, "catalogue.supported_platforms", true)?;
+        handles(
+            &self.supported_platforms,
+            "catalogue.supported_platforms",
+            true,
+        )?;
         if self.revision == 0 {
             return Err(InstallationError::InvalidField {
                 field: "catalogue.revision".to_owned(),
@@ -768,7 +781,8 @@ impl IntegrationDiscoveryCatalogue {
         let mut frontier = vec![family_id.clone()];
         while let Some(current) = frontier.pop() {
             for entry in &self.entries {
-                if entry.declared_dependents.contains(&current) && closure.insert(entry.family_id.clone())
+                if entry.declared_dependents.contains(&current)
+                    && closure.insert(entry.family_id.clone())
                 {
                     frontier.push(entry.family_id.clone());
                 }
@@ -1083,7 +1097,10 @@ pub fn load_accepted_catalogue(
     context: &AcceptedCatalogueContext<'_>,
 ) -> Result<AcceptedIntegrationCatalogue, CatalogueAdmissionError> {
     handle(context.observed_platform, "catalogue.observed_platform")?;
-    let Some(snapshot) = context.store.load_initial_snapshot(context.transaction_id)? else {
+    let Some(snapshot) = context
+        .store
+        .load_initial_snapshot(context.transaction_id)?
+    else {
         return Err(CatalogueAdmissionError::NotPublished);
     };
     if snapshot.payload.installation_id != context.authority.installation_id() {
@@ -1109,12 +1126,10 @@ pub fn load_accepted_catalogue(
     if verified.signer_id() != context.authority.confirmed_owner().as_str() {
         return Err(CatalogueAdmissionError::ForeignInstallation);
     }
-    let signed_publication_ref =
-        PlatformHandle::new(verified.envelope_digest().to_owned()).map_err(|error| {
-            InstallationError::InvalidField {
-                field: "catalogue.signed_publication_ref".to_owned(),
-                reason: error.to_string(),
-            }
+    let signed_publication_ref = PlatformHandle::new(verified.envelope_digest().to_owned())
+        .map_err(|error| InstallationError::InvalidField {
+            field: "catalogue.signed_publication_ref".to_owned(),
+            reason: error.to_string(),
         })?;
 
     let Some(catalogue) = decode_catalogue_setting(
