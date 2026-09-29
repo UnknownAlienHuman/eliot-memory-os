@@ -17,6 +17,7 @@ source_layer = "C1"
 proof_entrypoint = "cargo test -p eliot-kernel-service"
 
 [dependencies]
+eliot-windows-ipc.workspace = true
 eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
 # Issue #2966 step 2: the history projector declares the traversal bounds
@@ -39,7 +40,7 @@ eliot-store-api.workspace = true
 schemars.workspace = true
 sha2.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio.workspace = true
 thiserror.workspace = true
 
