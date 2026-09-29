@@ -2362,6 +2362,7 @@ impl persistence_codec::PersistedValue for BridgeEventRecoveryRevisionRow {
 /// what a selector means; it no longer parses the selector itself.
 enum BridgeRecoveryScopeSelector {
     Open,
+    ResumeOrOpen,
     Resume,
     ResumeWindow {
         window_key: String,
@@ -12819,6 +12820,9 @@ impl RedbRecoveryStore {
             Ok(limit)
         };
         match selector {
+            BridgeRecoverySelector::ResumeOrOpen { .. } => {
+                Ok(BridgeRecoveryScopeSelector::ResumeOrOpen)
+            }
             BridgeRecoverySelector::Resume { .. } => Ok(BridgeRecoveryScopeSelector::Resume),
             BridgeRecoverySelector::ResumeWindow { window_key, .. } => {
                 Ok(BridgeRecoveryScopeSelector::ResumeWindow {
@@ -12918,7 +12922,9 @@ impl RedbRecoveryStore {
         selector: &BridgeRecoverySelector,
     ) -> Result<(), OrsError> {
         let provided = match selector {
-            BridgeRecoverySelector::Resume { .. } | BridgeRecoverySelector::ResumeWindow { .. } => {
+            BridgeRecoverySelector::ResumeOrOpen { .. }
+            | BridgeRecoverySelector::Resume { .. }
+            | BridgeRecoverySelector::ResumeWindow { .. } => {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
             BridgeRecoverySelector::Streams {
@@ -18876,6 +18882,7 @@ impl RedbRecoveryStore {
         let now_ms = current_unix_ms_u64()?;
         let mut read_budget = BridgeRecoveryReadBudget::default();
         let write = self.database.begin_write().map_err(storage)?;
+        let mut created_new_window = false;
         let (mut window, mut opening) = match &selector {
             BridgeRecoveryScopeSelector::Open => {
                 let matches = Self::bridge_recovery_windows_for_owner_in(
@@ -18932,7 +18939,7 @@ impl RedbRecoveryStore {
                     true,
                 )
             }
-            BridgeRecoveryScopeSelector::Resume => {
+            BridgeRecoveryScopeSelector::Resume | BridgeRecoveryScopeSelector::ResumeOrOpen => {
                 let mut matches = Self::bridge_recovery_windows_for_owner_in(
                     &write,
                     &lineage,
@@ -18959,12 +18966,29 @@ impl RedbRecoveryStore {
                             &[],
                         );
                     }
-                    return Err(OrsError::RecoveryOwnerMismatch);
+                    if matches!(selector, BridgeRecoveryScopeSelector::ResumeOrOpen) {
+                        created_new_window = true;
+                        (
+                            Self::create_bridge_recovery_window_in(
+                                &write,
+                                &lineage,
+                                &principal,
+                                live_generation,
+                                &presenting_connection,
+                                now_ms,
+                                &mut read_budget,
+                            )?,
+                            true,
+                        )
+                    } else {
+                        return Err(OrsError::RecoveryOwnerMismatch);
+                    }
+                } else {
+                    if matches.len() != 1 {
+                        return Err(OrsError::RecoveryOwnerMismatch);
+                    }
+                    (matches.remove(0), false)
                 }
-                if matches.len() != 1 {
-                    return Err(OrsError::RecoveryOwnerMismatch);
-                }
-                (matches.remove(0), false)
             }
             BridgeRecoveryScopeSelector::ResumeWindow { window_key }
             | BridgeRecoveryScopeSelector::Streams { window_key, .. }
@@ -19050,10 +19074,13 @@ impl RedbRecoveryStore {
             // the only persisted signing authority and no cursor ledger exists.
             Self::verify_bridge_recovery_selector_proof(&window, recovery_scope)?;
         }
-        let is_resume = matches!(
-            selector,
-            BridgeRecoveryScopeSelector::Resume | BridgeRecoveryScopeSelector::ResumeWindow { .. }
-        );
+        let is_resume = !created_new_window
+            && matches!(
+                selector,
+                BridgeRecoveryScopeSelector::ResumeOrOpen
+                    | BridgeRecoveryScopeSelector::Resume
+                    | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+            );
         if is_resume && window.continuation_secret.is_none() {
             drop(write);
             return Self::bridge_recovery_typed_reply(
@@ -19095,6 +19122,7 @@ impl RedbRecoveryStore {
         let mut requested_gap: Option<(usize, usize)> = None;
         match &selector {
             BridgeRecoveryScopeSelector::Open
+            | BridgeRecoveryScopeSelector::ResumeOrOpen
             | BridgeRecoveryScopeSelector::Resume
             | BridgeRecoveryScopeSelector::ResumeWindow { .. } => {
                 let page = Self::bridge_recovery_owner_page_in(
@@ -19247,11 +19275,7 @@ impl RedbRecoveryStore {
             .next(),
         };
         if let Some((owner, _)) = &gap_owner_for_page {
-            if matches!(
-                selector,
-                BridgeRecoveryScopeSelector::Resume
-                    | BridgeRecoveryScopeSelector::ResumeWindow { .. }
-            ) {
+            if is_resume {
                 Self::load_bridge_recovery_cut_in(
                     &write,
                     &window.window_key,
@@ -19269,11 +19293,7 @@ impl RedbRecoveryStore {
             }
         }
         for (owner, _) in &stream_owners {
-            if matches!(
-                selector,
-                BridgeRecoveryScopeSelector::Resume
-                    | BridgeRecoveryScopeSelector::ResumeWindow { .. }
-            ) {
+            if is_resume {
                 Self::load_bridge_recovery_cut_in(
                     &write,
                     &window.window_key,
@@ -19336,7 +19356,8 @@ impl RedbRecoveryStore {
         }
         if matches!(
             selector,
-            BridgeRecoveryScopeSelector::Resume
+            BridgeRecoveryScopeSelector::ResumeOrOpen
+                | BridgeRecoveryScopeSelector::Resume
                 | BridgeRecoveryScopeSelector::ResumeWindow { .. }
                 | BridgeRecoveryScopeSelector::Streams { .. }
         ) {

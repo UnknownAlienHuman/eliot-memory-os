@@ -38,6 +38,10 @@ pub const BRIDGE_RECOVERY_SELECTOR_VERSION: u64 = 2;
 /// Resume remains revision 2 and does not carry a continuation proof.
 pub const BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION: u64 = 2;
 
+/// Wire revision for atomic first attach: resume an existing owner window,
+/// or open one only when this owner has no window or expiry evidence.
+pub const BRIDGE_RECOVERY_RESUME_OR_OPEN_SELECTOR_VERSION: u64 = 1;
+
 /// Wire revision for a resume selector pinned to one previously issued window.
 /// This is a pure row selector: it carries no continuation proof or authority.
 pub const BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION: u64 = 1;
@@ -72,6 +76,13 @@ pub const BRIDGE_RECOVERY_SELECTOR_GAP_LIMIT: u64 = 256;
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BridgeRecoverySelector {
+    /// On first attach, resume the unique authenticated owner window. Open a
+    /// new finite window only when none exists and no terminal evidence must
+    /// be reported. This avoids a second request racing the owner state.
+    ResumeOrOpen {
+        /// Exactly [`BRIDGE_RECOVERY_RESUME_OR_OPEN_SELECTOR_VERSION`].
+        version: u64,
+    },
     /// Resume the unique active recovery window admitted for the current
     /// authenticated owner scope. The caller supplies neither owner identity
     /// nor a window key; the owner must fail closed if that scope does not
@@ -180,7 +191,7 @@ impl BridgeRecoverySelector {
     /// its exact key without carrying continuation authority.
     pub fn window_key(&self) -> Option<&str> {
         match self {
-            Self::Resume { .. } => None,
+            Self::ResumeOrOpen { .. } | Self::Resume { .. } => None,
             Self::ResumeWindow { window_key, .. }
             | Self::Streams { window_key, .. }
             | Self::Stream { window_key, .. }
@@ -212,7 +223,7 @@ impl BridgeRecoverySelector {
         self.validate()?;
         let mut unsigned = self.clone();
         match &mut unsigned {
-            Self::Resume { .. } | Self::ResumeWindow { .. } => {
+            Self::ResumeOrOpen { .. } | Self::Resume { .. } | Self::ResumeWindow { .. } => {
                 return Err(ContractError::Blank {
                     field: "bridge_recovery_selector.continuation_proof",
                 });
@@ -246,7 +257,7 @@ impl BridgeRecoverySelector {
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_version()?;
         match self {
-            Self::Resume { .. } => {}
+            Self::ResumeOrOpen { .. } | Self::Resume { .. } => {}
             Self::ResumeWindow { window_key, .. } => {
                 validate_digest(window_key, "bridge_recovery_selector.window_key")?;
             }
@@ -350,6 +361,9 @@ impl BridgeRecoverySelector {
 
     fn validate_version(&self) -> Result<(), ContractError> {
         let (version, expected_version) = match self {
+            Self::ResumeOrOpen { version } => {
+                (*version, BRIDGE_RECOVERY_RESUME_OR_OPEN_SELECTOR_VERSION)
+            }
             Self::Resume { version } => (*version, BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION),
             Self::ResumeWindow { version, .. } => {
                 (*version, BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION)

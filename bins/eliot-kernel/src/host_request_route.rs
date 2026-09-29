@@ -6241,10 +6241,14 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let evidence = bridge_owner_evidence(session, frame_fence)?;
-        // Continuation selectors are pure reads. They cannot carry a
-        // consumed frontier because acknowledging one would mutate the
-        // durable cursor before the bounded owner page is accepted.
-        if scope.recovery_scope.is_some() && !scope.consumed.is_empty() {
+        // Continuation selectors are pure reads. The initial atomic
+        // ResumeOrOpen selector may carry the checked consumed frontier;
+        // every later page selector remains mutation-free.
+        let initial_recovery = matches!(
+            scope.recovery_scope.as_ref(),
+            Some(BridgeRecoverySelector::ResumeOrOpen { .. })
+        );
+        if scope.recovery_scope.is_some() && !initial_recovery && !scope.consumed.is_empty() {
             return Err(TransportError::SessionFenced);
         }
         // Contradictory duplicates fail the whole scope before any store
@@ -6255,7 +6259,7 @@ impl KernelComposition {
             "owner_principal": evidence.principal,
             "owner_connection": evidence.connection,
         });
-        let pure_read = scope.recovery_scope.is_some();
+        let pure_read = scope.recovery_scope.is_some() && !initial_recovery;
         // Resolve every consumed entry to its admitted namespace before
         // mutating: any foreign, stale, or ambiguous item rejects the
         // whole scope with nothing changed. An explicit continuation read
@@ -7439,7 +7443,13 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
         }
         None => None,
     };
-    if recovery_scope.is_some() && !consumed.is_empty() {
+    if recovery_scope.is_some()
+        && !matches!(
+            recovery_scope.as_ref(),
+            Some(BridgeRecoverySelector::ResumeOrOpen { .. })
+        )
+        && !consumed.is_empty()
+    {
         return Err(TransportError::SessionFenced);
     }
     Ok(BridgeReconcileScope {
