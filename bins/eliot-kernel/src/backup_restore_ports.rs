@@ -753,9 +753,10 @@ impl OrsRestoreBinding {
 /// [`OrsRestoreBinding`] and the same live [`StateFence`] the adapter seals
 /// every row with, and it answers
 /// [`RestoreJournalAdmissionOwner::durable_journal_record`] from that durable
-/// row alone. It is constructed from production composition
-/// ([`OrsRestoreJournal::production`] takes the same two owner facts) and has
-/// no constructor a request, a config value or a test fixture can reach with a
+/// row alone. It is built from the same production arguments
+/// [`OrsRestoreJournal::production`] takes — the owner handle, the composition
+/// binding, the live effect fence and the sealed payload root — and it has no
+/// constructor a request, a config value or a test fixture can reach with a
 /// value of its own.
 ///
 /// ## What each admitted reference is, and where it is read
@@ -787,33 +788,43 @@ impl OrsRestoreBinding {
 /// - `journal_identity_ref` — the key the durable row was read under, which is
 ///   the plan-derived stream identity the issuer checks the admission against.
 /// - `admission_receipt_ref` — the transaction identity the ORS owner committed
-///   for this stream when it admitted the stream. The ORS binding row carries
-///   no separate receipt column, so the committed operation identity of the
-///   admission IS the owner's receipt reference; it is read back from the row on
-///   every issue and never recomputed.
+///   for this stream when it admitted the stream, cross-checked against the
+///   transaction the durable journal record itself carries. It is read back
+///   from durable state on every issue and never recomputed.
+/// - `transaction` — the whole [`RestoreTransaction`](eliot_backup::RestoreTransaction)
+///   read out of the sealed ORS journal body for this key, not just its
+///   identity. This is what makes the record an OPERATION record: an owner that
+///   returned only a stream identity could mint an admission that any other
+///   plan sharing the stream would also satisfy.
 ///
 /// ## What it refuses
 ///
-/// A missing durable row is [`BackupError::RestoreJournalRequired`], never an
-/// empty record. A row that disagrees with live composition on the source
-/// archive, the archive class, the destination, the writer identity or the
-/// sealed writer fence is [`BackupError::RestoreJournalMismatch`], so a
-/// well-formed admission for another operation, another destination or a
-/// rotated authority fails closed. The row is checked with the ORS owner's own
-/// [`RestoreJournalStreamBinding::validate`]; nothing here recomputes a digest
-/// over values held in memory, because a fresh checksum replaces the proof
-/// instead of checking it.
+/// A missing durable stream binding is [`BackupError::RestoreJournalRequired`],
+/// and so is a bound stream the engine has not yet written a record into,
+/// because this owner holds no committed record of an operation it did not
+/// admit. That is a refusal, not an empty answer: an admission admits an
+/// existing durable journal, and an owner that answered for a stream it has no
+/// committed operation for would make the admission reusable. A row that
+/// disagrees with live composition on the source archive, the archive class, the
+/// destination, the writer identity or the sealed writer fence is
+/// [`BackupError::RestoreJournalMismatch`], and so is a journal record whose
+/// transaction is not the one the stream was bound to, so a well-formed
+/// admission for another operation, another destination or a rotated authority
+/// fails closed. Both the row and the record are checked with the ORS owner's
+/// own validators; nothing here recomputes a digest over values held in memory,
+/// because a fresh checksum replaces the proof instead of checking it.
 pub struct OrsRestoreJournalOwner {
     store: Arc<RedbRecoveryStore>,
     binding: OrsRestoreBinding,
     kernel_fence: StateFence,
     writer_fence_digest: String,
+    sealed_root: PathBuf,
 }
 
 impl OrsRestoreJournalOwner {
     /// Binds the admission owner to the same durable owner handle, the same
-    /// composition binding and the same live effect fence the journal adapter
-    /// seals its rows with.
+    /// composition binding, the same live effect fence and the same sealed
+    /// payload root the journal adapter writes through.
     ///
     /// The writer fence digest is captured from `kernel_fence` with the ORS
     /// owner's own [`StateFenceSnapshot::capture`], at the same authority
@@ -824,6 +835,7 @@ impl OrsRestoreJournalOwner {
         store: Arc<RedbRecoveryStore>,
         binding: OrsRestoreBinding,
         kernel_fence: &StateFence,
+        sealed_root: PathBuf,
     ) -> Result<Self, KernelRestoreError> {
         for (value, field) in [
             (
@@ -853,6 +865,7 @@ impl OrsRestoreJournalOwner {
             binding,
             kernel_fence: kernel_fence.clone(),
             writer_fence_digest: fence_snapshot.sha256,
+            sealed_root,
         })
     }
 }
@@ -886,6 +899,31 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
         if !matches_stream(&self.binding, &bound, &self.writer_fence_digest) {
             return Err(BackupError::RestoreJournalMismatch);
         }
+        // The operation itself is read out of the durable journal, through the
+        // accepted `RestoreJournalPort` seam and the same sealed-payload
+        // verification the engine's own resume path uses. This is a SECOND
+        // adapter instance over the SAME store, not a second journal: it holds
+        // no state machine, writes nothing, and has no persistence of its own.
+        // It exists because the transaction lives inside the sealed body, which
+        // only this adapter may open and verify.
+        let mut journal = OrsRestoreJournal::production(
+            Arc::clone(&self.store),
+            &self.kernel_fence,
+            self.binding.clone(),
+            PathBuf::clone(&self.sealed_root),
+        )
+        .map_err(backup_to_kernel)?;
+        let record = journal
+            .load(journal_key)?
+            .ok_or(BackupError::RestoreJournalRequired)?;
+        // The stream binding and the record inside it must name the same
+        // operation, so a stream cannot hand one transaction's journal to
+        // another.
+        if record.journal_key != journal_key
+            || record.transaction.transaction_id != bound.transaction_id
+        {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
         Ok(DurableJournalRecord {
             persistent_owner: OwnerTrustBinding {
                 owner_id: bound.writer_id,
@@ -896,6 +934,7 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
             generation: self.kernel_fence.resource_generation,
             journal_identity_ref: journal_key.to_owned(),
             admission_receipt_ref: bound.transaction_id,
+            transaction: record.transaction,
         })
     }
 }

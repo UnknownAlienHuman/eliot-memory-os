@@ -736,18 +736,21 @@ impl KernelBackupRestore {
         kernel_fence: &StateFence,
         identity: &OrsRestoreBinding,
     ) -> Result<RestoreJournalAdmission, KernelRestoreError> {
+        let sealed_root = self
+            .work_root
+            .join(".eliot")
+            .join(RESTORE_JOURNAL_PAYLOAD_AREA);
         let owner = OrsRestoreJournalOwner::production(
             std::sync::Arc::clone(ors),
             identity.clone(),
             kernel_fence,
+            std::path::PathBuf::clone(&sealed_root),
         )?;
         let mut journal = OrsRestoreJournal::production(
             std::sync::Arc::clone(ors),
             kernel_fence,
             identity.clone(),
-            self.work_root
-                .join(".eliot")
-                .join(RESTORE_JOURNAL_PAYLOAD_AREA),
+            sealed_root,
         )?;
         RestoreJournalAdmission::issue_for_operation(&owner, &mut journal, plan)
             .map_err(backup_to_kernel)
