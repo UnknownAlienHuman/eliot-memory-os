@@ -197,6 +197,21 @@ fn validate_profile_selection_receipt_shape(
     receipt: &ProfileSelectionReceipt,
     label: &str,
 ) -> Result<(), InstallationError> {
+    const ROOT_ROLES: [&str; 13] = [
+        "immutable_binaries",
+        "durable_data",
+        "user_config",
+        "user_cache",
+        "runtime_state_roots.profile_anchor_root",
+        "runtime_state_roots.installation_root",
+        "runtime_state_roots.host_state_root",
+        "runtime_state_roots.kernel_ors_root",
+        "runtime_state_roots.kernel_work_root",
+        "runtime_state_roots.store_data_root",
+        "runtime_state_roots.store_work_root",
+        "runtime_state_roots.store_temp_root",
+        "runtime_state_roots.watchdog_state_root",
+    ];
     if !matches!(
         receipt.profile,
         ProfileSelection::UserMode | ProfileSelection::PortableDev
@@ -238,21 +253,6 @@ fn validate_profile_selection_receipt_shape(
         &format!("profile_selection_receipt.{label}.authority_descriptor_sha256"),
     )?;
 
-    const ROOT_ROLES: [&str; 13] = [
-        "immutable_binaries",
-        "durable_data",
-        "user_config",
-        "user_cache",
-        "runtime_state_roots.profile_anchor_root",
-        "runtime_state_roots.installation_root",
-        "runtime_state_roots.host_state_root",
-        "runtime_state_roots.kernel_ors_root",
-        "runtime_state_roots.kernel_work_root",
-        "runtime_state_roots.store_data_root",
-        "runtime_state_roots.store_work_root",
-        "runtime_state_roots.store_temp_root",
-        "runtime_state_roots.watchdog_state_root",
-    ];
     if receipt.roots.len() != ROOT_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(format!(
             "profile-selection receipt {label} does not contain all 13 retained root roles"

@@ -125,7 +125,7 @@ pub struct ApprovedGeneration {
     pub last_known_good: bool,
     /// Original no-follow current-user selection of this generation's roots.
     ///
-    /// This is present only for UserMode and PortableDev. Its absence on an
+    /// This is present only for `UserMode` and `PortableDev`. Its absence on an
     /// older projection is reported as migration/recovery when a consumer
     /// requires retained file-object identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]

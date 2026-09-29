@@ -616,7 +616,7 @@ impl InstallationTransaction {
 
     /// Returns the original generation-bound selection of live profile roots.
     ///
-    /// A missing receipt is not replaced from InstallationRoots; callers must
+    /// A missing receipt is not replaced from `InstallationRoots`; callers must
     /// classify it as an explicit migration or recovery condition.
     #[must_use]
     pub const fn profile_selection_receipt(&self) -> Option<&ProfileSelectionReceipt> {
@@ -624,12 +624,12 @@ impl InstallationTransaction {
     }
 
     /// Retains the original no-follow root selection after every admitted
-    /// root-creation/ACL effect and StagePackage publication have been
+    /// root-creation/ACL effect and `StagePackage` publication have been
     /// observed, before executable acceptance.
     ///
     /// The receipt is checked against the transaction's immutable generation
-    /// and exact four-root/runtime-root binding. Replaying the same receipt is
-    /// idempotent; a different receipt can never replace the first.
+    /// and exact `InstallationRoots`/runtime-root binding. Replaying the same
+    /// receipt is idempotent; a different receipt can never replace the first.
     pub(crate) fn record_profile_selection_receipt(
         &mut self,
         receipt: ProfileSelectionReceipt,

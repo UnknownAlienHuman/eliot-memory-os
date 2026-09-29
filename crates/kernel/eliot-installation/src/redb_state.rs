@@ -290,7 +290,7 @@ impl super::RedbInstallationRegistry {
         read_existing_registry(&database).map(Some)
     }
 
-    /// Inspects an existing UserMode or PortableDev registry through a
+    /// Inspects an existing `UserMode` or `PortableDev` registry through a
     /// retained current-user no-follow Host-root lease. This read never
     /// creates a registry file or database.
     #[allow(
@@ -337,7 +337,7 @@ impl super::RedbInstallationRegistry {
         read_existing_registry(&database).map(Some)
     }
 
-    /// Reads one generation's retained UserMode or PortableDev root receipt
+    /// Reads one generation's retained `UserMode` or `PortableDev` root receipt
     /// without creating any registry path. Missing registry or receipt bytes
     /// are explicit migration/recovery outcomes, never path-derived success.
     #[allow(
@@ -362,7 +362,7 @@ impl super::RedbInstallationRegistry {
     }
 
     /// Reads the committed Phase-B activation fence for one exact generation
-    /// through the same bounded UserOwned registry snapshot used by Store and
+    /// through the same bounded `UserOwned` registry snapshot used by Store and
     /// Watchdog restart validation.
     #[allow(
         clippy::needless_pass_by_value,
@@ -392,7 +392,7 @@ impl super::RedbInstallationRegistry {
     }
 
     /// Reads the retained root selection and exact committed Phase-B fence for
-    /// one generation from one validated UserOwned registry snapshot.
+    /// one generation from one validated `UserOwned` registry snapshot.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "the inspection retains the caller-provided current-user root lease"
@@ -782,7 +782,7 @@ enum PublicationJournalStoreFault {
 
 impl RedbInstallationTransactionStore {
     /// Captures the original current-user root identities in one exact
-    /// transaction store after all root/ACL and StagePackage prefix effects
+    /// transaction store after all root/ACL and `StagePackage` prefix effects
     /// have been durably applied. The existing transaction file is opened by
     /// its exact caller-selected path; no file or parent is created.
     pub fn record_profile_selection_receipt_at_exact_path(
