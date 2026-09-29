@@ -698,9 +698,12 @@ impl StartupCoordinator {
     /// Records the live Governor-owned derivation projection (I7.16, #1935
     /// AUD1).
     ///
-    /// Designated producer: the authenticated `publish_governor_authority`
-    /// daemon operation projecting the owner's exact revision, fingerprint,
-    /// and authorization axes across the boundary; until it records, every
+    /// Private revision-rule recorder: the only recording path is the
+    /// designated producer
+    /// ([`KernelComposition::record_governor_issued_coverage_projection`](super::KernelComposition::record_governor_issued_coverage_projection)),
+    /// fed by the authenticated `publish_governor_authority` daemon operation
+    /// projecting the owner's exact revision, fingerprint, and authorization
+    /// axes across the boundary; until it records, every
     /// Material/Critical gate refuses. The revision must
     /// start at one and strictly advance: replaying the current or an older
     /// revision is rejected, so revoked authority can never be resurrected
@@ -712,7 +715,7 @@ impl StartupCoordinator {
     /// Returns the fixed-shape reason when the revision is zero or not
     /// strictly newer than the recorded one, or when the fingerprint does
     /// not name the exact active fingerprint.
-    pub(crate) fn record_governor_derived_authority(
+    fn record_governor_derived_authority(
         &mut self,
         revision: u64,
         fingerprint: String,
