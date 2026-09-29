@@ -227,6 +227,7 @@ pub fn restore_reactive_runtime(
 /// Commits one mutated ledger candidate before installing it in the live
 /// runner. Failed, stale, or uncertain Store outcomes leave the runner's
 /// current ledger and revision untouched.
+#[allow(clippy::result_large_err)]
 pub fn commit_reactive_ledger_candidate(
     runner: &mut BridgeRunner,
     port: &mut dyn KernelHostRequestPort,
@@ -288,6 +289,7 @@ pub fn commit_reactive_ledger_candidate(
 
 /// Runs one reactive ledger operation on a clone and commits that candidate
 /// before returning its result to the stdio response path.
+#[allow(clippy::result_large_err)]
 pub fn mutate_reactive_ledger<T>(
     runner: &mut BridgeRunner,
     port: &mut dyn KernelHostRequestPort,

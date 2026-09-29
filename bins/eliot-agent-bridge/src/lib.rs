@@ -5222,6 +5222,7 @@ impl BridgeRunner {
     }
     /// Installs one exact Store-readback candidate after the mutation port has
     /// committed it; stale candidates never replace newer local state.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn install_committed_reactive_ledger_candidate(
         &mut self,
         candidate: ReactiveInjectionLedger,
@@ -5243,6 +5244,7 @@ impl BridgeRunner {
         self.restore_reactive_ledger_at_revision(bytes, 0)
     }
     /// Restores exact canonical bytes and their Store ledger revision.
+    #[allow(clippy::result_large_err)]
     pub fn restore_reactive_ledger_at_revision(
         &mut self,
         bytes: &[u8],
