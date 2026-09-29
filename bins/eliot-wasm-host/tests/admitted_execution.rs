@@ -398,6 +398,7 @@ fn lease_fixture(fence: &eliot_contracts::StateFence) -> eliot_runtime_contracts
         authority_epoch: test_epoch(),
         state_fence: fence.clone(),
         state: LeaseState::Active,
+        expires_at_ms: 4_000_000_000_000,
     }
 }
 

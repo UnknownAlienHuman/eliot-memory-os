@@ -50,17 +50,19 @@
 //! The runtime leg answers the full denominator through the landed owner read
 //! [`RedbRecoveryStore::load_runtime_leases_by_state_fence`]: the exact-fence
 //! `RuntimeLease` current set from the canonical `ors_runtime_lease_current_v1`
-//! table, re-validated on readback and ordered by lease id. A non-terminal row
-//! for the current fence is a proven blocking obligation and reports
-//! [`KernelIdleLeaseCensus::RuntimeLeased`]; a verified empty set is the
-//! observed store fact, never a caller-supplied default. The durable issuance
-//! writer for that table belongs to #1751; until it lands, the table holds no
-//! rows. The supervision half of the same owner read,
+//! table, re-validated on readback and ordered by lease id. A non-terminal,
+//! unexpired row for the current fence is a proven blocking obligation and
+//! reports [`KernelIdleLeaseCensus::RuntimeLeased`]; a verified empty set is
+//! the observed store fact, never a caller-supplied default. The durable
+//! issuance writer for that table is
+//! [`RedbRecoveryStore::record_runtime_lease_current`], called when the
+//! Kernel grants activation. The supervision half of the same owner read,
 //! [`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`], serves the
 //! authenticated `ReadRuntimeLeaseCensus` wire for Host generation retirement.
 //!
 //! [`RedbRecoveryStore::load_runtime_leases_by_state_fence`]: eliot_ors::RedbRecoveryStore::load_runtime_leases_by_state_fence
 //! [`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`]: eliot_ors::RedbRecoveryStore::load_runtime_lease_census_by_state_fence
+//! [`RedbRecoveryStore::record_runtime_lease_current`]: eliot_ors::RedbRecoveryStore::record_runtime_lease_current
 //! The census is read-only: it issues no lease, revokes nothing, and never
 //! infers an obligation from a live process, an open pipe, or a heartbeat.
 
@@ -255,7 +257,11 @@ impl KernelComposition {
         };
         // The terminal set mirrors the retirement gate the Host consumes
         // (`RuntimeLeaseCensus::is_fully_retired`): only a terminal row stops
-        // blocking the drain.
+        // blocking the drain. A non-terminal row whose recorded expiry has
+        // passed is observed as expired, exactly like the supervision leg's
+        // `expires_at_ms` comparison; the census classifies the recorded
+        // value and never rewrites it.
+        let now_ms = crate::unix_ms();
         let live = rows.iter().any(|lease| {
             !matches!(
                 lease.state,
@@ -264,7 +270,7 @@ impl KernelComposition {
                     | LeaseState::Revoked
                     | LeaseState::Superseded
                     | LeaseState::Closed
-            )
+            ) && now_ms < lease.expires_at_ms
         });
         if live {
             return KernelIdleLeaseCensus::RuntimeLeased;

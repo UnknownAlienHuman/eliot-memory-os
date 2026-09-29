@@ -1120,6 +1120,11 @@ pub struct RuntimeLease {
     pub state_fence: StateFence,
     /// Current lifecycle state.
     pub state: LeaseState,
+    /// Unix-millisecond instant after which the lease no longer blocks the
+    /// retirement census, even while its state is non-terminal. The census
+    /// compares this recorded value against its clock; it never recomputes
+    /// or extends it. Mirrors the supervision binding's `expires_at_ms`.
+    pub expires_at_ms: u64,
 }
 
 impl RuntimeLease {
@@ -1163,6 +1168,12 @@ impl RuntimeLease {
         text(&self.lease_id, "lease_id")?;
         text(&self.scope_ref, "scope_ref")?;
         self.state_fence.validate()?;
+        if self.expires_at_ms == 0 {
+            return Err(RuntimeContractError::InvalidField {
+                field: "expires_at_ms",
+                reason: "must be non-zero",
+            });
+        }
         Ok(())
     }
 }

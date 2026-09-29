@@ -507,7 +507,7 @@ pub use eliot_runtime_contracts::{
 };
 use eliot_runtime_contracts::{
     HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, ResumeBrokerIdentity,
-    ResumeIdentitySnapshot, ResumeProcessIdentity, SupervisionGenerationBinding,
+    ResumeIdentitySnapshot, ResumeProcessIdentity, RuntimeLease, SupervisionGenerationBinding,
     SupervisionJournalEpoch, revalidate_resume_identities,
 };
 use eliot_store_api::StoreHealth;
