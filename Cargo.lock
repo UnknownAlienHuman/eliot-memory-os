@@ -2491,7 +2491,9 @@ dependencies = [
 name = "eliot-maintenance"
 version = "0.1.0"
 dependencies = [
+ "eliot-authority",
  "eliot-contracts",
+ "eliot-receipts",
  "eliot-runtime-contracts",
  "schemars",
  "serde",

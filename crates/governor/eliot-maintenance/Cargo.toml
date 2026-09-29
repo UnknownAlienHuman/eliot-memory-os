@@ -14,7 +14,9 @@ source_layer = "G"
 proof_entrypoint = "cargo test -p eliot-maintenance"
 
 [dependencies]
+eliot-authority.workspace = true
 eliot-contracts.workspace = true
+eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true

@@ -48,7 +48,8 @@ use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
     ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
     ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
-    improvement_retry_permitted, reconcile_unknown_activation, run_improvement_candidate_pipeline,
+    improvement_retry_permitted, reconcile_unknown_activation, retained_improvement_completion,
+    run_improvement_candidate_pipeline,
 };
 
 /// Borrowed inputs for one production improvement-candidate route call.
@@ -245,6 +246,36 @@ pub fn improvement_candidate_retry_permitted(
     disposition: &eliot_maintenance::ImprovementTerminalDisposition,
 ) -> bool {
     improvement_retry_permitted(disposition)
+}
+
+/// Returns the owner-retained result of a completed external effect, if any.
+///
+/// Production forwarder to the Governor-owned
+/// [`eliot_maintenance::retained_improvement_completion`], the crate that owns
+/// the unknown-effect obligation and is therefore the only place the owner's
+/// retained receipt may be read. It decides nothing here: the Governor entry
+/// point returns the retained result only for a settled `Committed` or
+/// `Compensated` outcome bound to that obligation's exact operation identity,
+/// and `None` for an unsettled, foreign, unknown, merely non-success, or
+/// non-obligation disposition. `None` is the denying direction — this route
+/// never invents a result, re-classifies an outcome, or turns a bare rollback
+/// contract reference into a completion.
+///
+/// # What the daemon does not do yet
+///
+/// This is the route's forwarder, and the honest limit is that it has no live
+/// caller: the daemon does not yet produce a request for this route, so nothing
+/// in `eliotd` invokes this function on a live path today (open item A1/W3).
+/// Reading this forwarder as a running reconciliation would overstate the
+/// daemon. What exists today is the mechanism — the Governor-owned entry point
+/// and this forwarder to it — plus the effect owner's obligation to attach its
+/// own receipt, which nothing in this workspace performs, so in practice the
+/// result is `None` for every disposition the pipeline produces today.
+#[must_use]
+pub fn retained_improvement_candidate_completion(
+    disposition: &eliot_maintenance::ImprovementTerminalDisposition,
+) -> Option<&eliot_receipts::ReceiptEnvelope> {
+    retained_improvement_completion(disposition)
 }
 
 /// Returns the Governor maintenance owner identity for the improvement route.

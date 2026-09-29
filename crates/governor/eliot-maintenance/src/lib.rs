@@ -65,10 +65,11 @@ pub use improvement_pipeline::{
     MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS, OP_EVALUATE,
     OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError,
     ProposalCommitment, RetainedImprovementProposal, RollbackContract, TESTD_OWNER,
-    UncheckedRecordIdentity, UnestablishedPriorCause, VERIFIER_OWNER_FAMILY,
+    UnboundOwnerOutcome, UncheckedRecordIdentity, UnestablishedPriorCause, VERIFIER_OWNER_FAMILY,
     assess_improvement_replay, check_checked_record_identity, compare_improvement_commitments,
     improvement_retry_permitted, ingest_improvement_candidate, proposal_digest,
-    reconcile_unknown_activation, run_improvement_candidate_pipeline,
+    reconcile_unknown_activation, retained_improvement_completion,
+    run_improvement_candidate_pipeline,
 };
 pub use trigger_intake::{
     MaintenanceTriggerIntake, TriggerIntakeClasses, TriggerIntakeOperation, TriggerIntakePayload,
