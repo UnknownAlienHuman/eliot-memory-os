@@ -142,14 +142,18 @@ enum Request {
     Cancel {
         request: HostCancellationRequest,
     },
-    /// Dry-run preview of one invocation (I7.17).
+    /// Dry-run preview of one invocation (I7.17, issue #1939 W1).
     ///
     /// Validates the inert request exactly like [`Request::Invoke`] and then
-    /// answers with a typed static preview instead of dispatching: the
-    /// gateway, the trusted port, the runner, and the admitted transport are
-    /// never touched, so no envelope is built, no replay entry is recorded,
-    /// and no external effect can occur. Read-only tools receive a validated
-    /// preview; effectful tools receive `DRY_RUN_UNSUPPORTED`.
+    /// propagates it from the bridge through the kernel/operation owner over
+    /// the live gateway plus trusted-port leg: the owner records the probe,
+    /// issues its operation entry and handle, and returns its acknowledgement,
+    /// which the bridge projects into the normalized dry-run envelope below.
+    /// Read-only tools ride the owner's real read capability with zero
+    /// external effects; effectful tools have no safe simulator, so they
+    /// answer `DRY_RUN_UNSUPPORTED` with a static preview and never reach the
+    /// owner. Cancellation dry runs never dispatch (see [`Request::DryRunCancel`]):
+    /// a propagated cancel would be a real effect, not a probe.
     DryRunInvoke {
         request: HostInvocationRequest,
     },
@@ -449,9 +453,10 @@ enum Response {
     /// [`Response::Cancellation`]: reusing the admitted/responded shape would
     /// let a preview be mistaken for kernel admission, which the bridge must
     /// never imply. The envelope stays normalized stdio framing carrying the
-    /// caller correlation, the preview/unsupported disposition, the static
-    /// effect preview with its evidence/source, and the exact attach snapshot
-    /// observed while constructing it.
+    /// caller correlation, the preview/unsupported disposition, the effect
+    /// preview with its evidence/source, and the exact attach snapshot
+    /// observed while constructing it. The preview is owner-derived after a
+    /// propagated probe and static only when the owner was never consulted.
     DryRun {
         correlation_id: String,
         operation: &'static str,
@@ -525,7 +530,19 @@ struct StopPendingIdentity {
 }
 
 /// Stable identity of the bridge-local static dry-run preview contract.
+///
+/// Used only when the dry-run verdict never reached the owner: effectful
+/// tools with no safe simulator and cancellation probes answer from the
+/// bridge-local plan alone, so the preview carries exactly this source.
 const DRY_RUN_PREVIEW_SOURCE: &str = "bridge-static-preview.v1";
+/// Stable identity of the owner-derived dry-run preview contract.
+///
+/// Used when the dry-run probe propagated from the bridge through the
+/// kernel/operation owner over the trusted port: the owner recorded the
+/// probe, issued its operation entry and handle, and returned its
+/// acknowledgement, and the preview below carries exactly that owner
+/// evidence instead of a bridge-local static plan.
+const DRY_RUN_OWNER_PREVIEW_SOURCE: &str = "kernel-owner-preview.v1";
 /// Disposition of a dry run over a read-only tool with real inert validation.
 const DRY_RUN_PREVIEW_DISPOSITION: &str = "DRY_RUN_PREVIEW";
 /// Honest disposition where the bridge owns no safe simulator (I7.17).
@@ -534,12 +551,12 @@ const DRY_RUN_UNSUPPORTED_DISPOSITION: &str = "DRY_RUN_UNSUPPORTED";
 const DRY_RUN_ROUTE_WITHHELD: &str = "withheld-no-simulator";
 
 /// Closed kernel entries that serve real dispatch, owned by
-/// `bins/eliot-kernel/src/host_request_route.rs`. Repeated here for dry-run
-/// route labeling only: a dry run never sends them, it only names which entry
-/// a validated read-only request would have ridden (the same rows the recorded
-/// dispatch map in `kernel_host_request_client.rs` routes live dispatch
-/// through: `eliot.state` rides submit, `eliot.packet`/`eliot.query` ride
-/// invoke-read).
+/// `bins/eliot-kernel/src/host_request_route.rs`. Repeated here as the single
+/// source for both the live dispatch rows in `kernel_host_request_client.rs`
+/// and the dry-run route binding: `eliot.state` rides submit,
+/// `eliot.packet`/`eliot.query` ride invoke-read. A read-only dry run sends
+/// the validated probe through the owner over exactly these entries, so the
+/// route label names the entry the probe rode, not a would-be dispatch.
 const DRY_RUN_SUBMIT_OPERATION: &str = "agent_host_request_submit";
 const DRY_RUN_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
 
@@ -550,15 +567,19 @@ const DRY_RUN_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
 struct DryRunPreview {
     /// Canonical tool the request names (`None` for cancellation previews).
     canonical_tool_name: Option<String>,
-    /// Exact opaque cancellation target (`None` for invocation previews).
+    /// Owner-issued operation handle for an owner-propagated invocation
+    /// preview, or the exact opaque cancellation target for a cancellation
+    /// preview. `None` for static unsupported invocation previews that never
+    /// reached the owner.
     operation_handle: Option<String>,
     /// `read-only`, `effectful`, or `cancellation-probe`.
     effect_class: &'static str,
-    /// Would-be kernel entry, or `withheld-no-simulator`.
+    /// Kernel entry the owner probe rode, or `withheld-no-simulator`.
     route: &'static str,
     /// Caller deadline preference echoed verbatim; the kernel would own it.
     deadline_preference_ms: Option<u64>,
-    /// Always false: the bridge owns no simulator, so nothing was simulated.
+    /// Always false: no simulation is ever claimed. Read-only previews ride
+    /// a real owner read, unsupported previews ride no execution at all.
     simulated: bool,
 }
 
@@ -566,7 +587,8 @@ struct DryRunPreview {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DryRunEvidence {
-    /// Static preview contract identity.
+    /// Preview contract identity: the static contract when the owner was
+    /// never consulted, the owner contract when the verdict is owner-derived.
     source: &'static str,
     /// Outcome of bridge-local request-shape validation only.
     inert_validation: &'static str,
@@ -865,7 +887,9 @@ fn main() {
             Ok(Request::Cancel { request }) => {
                 handle_cancellation(host_gateway, &mut host_request_client, &request)
             }
-            Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
+            Ok(Request::DryRunInvoke { request }) => {
+                dry_run_invocation(host_gateway, &mut host_request_client, &runner, &request)
+            }
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
             Ok(Request::ForwardHook { event }) => {
                 let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
@@ -1710,11 +1734,12 @@ fn dry_run_binding(runner: &BridgeRunner) -> DryRunBinding {
 /// Classifies one invocation tool for dry-run preview (I7.17).
 ///
 /// Read-only projections (`eliot.state`, `eliot.packet`, `eliot.query`) carry
-/// no external effects, so the bridge answers them with a validated static
-/// preview naming the entry they would have ridden. Every other tool is
-/// effectful and the bridge owns no safe simulator for it, so the honest
-/// answer is `DRY_RUN_UNSUPPORTED`. Returns the effect class, the route
-/// label, and the disposition in that order.
+/// no external effects, so the bridge propagates them through the owner and
+/// answers with the owner-acknowledged preview naming the entry they rode.
+/// Every other tool is effectful and the bridge owns no safe simulator for
+/// it, so the honest answer is `DRY_RUN_UNSUPPORTED` without consulting the
+/// owner. Returns the effect class, the route label, and the disposition in
+/// that order.
 fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'static str) {
     match tool {
         ToolRequest::State(_) => (
@@ -1742,46 +1767,143 @@ fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'sta
     }
 }
 
-/// Answers one invocation dry run with zero side effects (I7.17).
+/// Answers one invocation dry run through the kernel/operation owner (I7.17,
+/// issue #1939 W1).
 ///
 /// Runs the same bridge-local inert validation as a real invoke so malformed
 /// input fails closed with the identical `HOST_REQUEST_INVALID` shape, then
-/// returns the normalized dry-run envelope with the static preview and its
-/// evidence/source. The gateway, the trusted port, and the admitted transport
-/// are never called: no envelope is built, no replay entry is recorded, and
-/// the target state plus the external-effect ledger stay exactly unchanged.
-/// No kernel simulation or external validation runs on this path.
-fn dry_run_invocation(runner: &BridgeRunner, request: &HostInvocationRequest) -> Response {
+/// propagates the validated request from the bridge through the
+/// kernel/operation owner over the exact gateway plus trusted-port leg a live
+/// invoke rides ([`HostRequestGateway::invoke_with_receipt`]). The owner
+/// records the probe, issues its operation entry and handle, and returns its
+/// acknowledgement; the bridge projects that acknowledgement into the
+/// normalized dry-run envelope with the typed preview plus owner
+/// evidence/source. Read-only projections (`eliot.state`, `eliot.packet`,
+/// `eliot.query`) carry no external effects, so the owning read they ride is
+/// the real validation capability: target state and the external-effect
+/// ledger stay exactly unchanged, no delivery is recorded into the runner,
+/// and no reactive drain runs. Effectful tools have no safe simulator, so
+/// they never reach the owner and answer `DRY_RUN_UNSUPPORTED` with the
+/// static preview. A gateway-level failure maps through
+/// [`host_gateway_error`] exactly like live dispatch; an owner rejection
+/// degrades honestly to `DRY_RUN_UNSUPPORTED` citing the owner verdict
+/// instead of inventing a preview.
+fn dry_run_invocation<P: KernelHostRequestPort + ?Sized>(
+    gateway: HostRequestGateway,
+    port: &mut P,
+    runner: &BridgeRunner,
+    request: &HostInvocationRequest,
+) -> Response {
     if let Err(error) = request.validate() {
         return host_gateway_error(&HostGatewayError::from(error));
     }
     let (effect_class, route, disposition) = dry_run_invoke_plan(&request.tool);
-    let statement = if disposition == DRY_RUN_UNSUPPORTED_DISPOSITION {
-        "DRY_RUN_UNSUPPORTED: no validation/simulation ran against the target operation; \
-         only bridge-local request-shape validation passed; no effects were issued and \
-         no transport bytes were sent"
-    } else {
-        "bridge-local inert validation passed; no kernel simulation or external validation \
-         ran; no effects were issued and no transport bytes were sent"
-    };
-    Response::DryRun {
-        correlation_id: request.correlation_id.as_str().to_owned(),
-        operation: "invoke",
-        disposition,
-        preview: DryRunPreview {
-            canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
-            operation_handle: None,
-            effect_class,
-            route,
-            deadline_preference_ms: request.deadline_preference_ms,
-            simulated: false,
+    if disposition == DRY_RUN_UNSUPPORTED_DISPOSITION {
+        // No safe simulator: the owner is never consulted, so no envelope is
+        // built, no replay entry is recorded, and no transport byte moves.
+        return Response::DryRun {
+            correlation_id: request.correlation_id.as_str().to_owned(),
+            operation: "invoke",
+            disposition,
+            preview: DryRunPreview {
+                canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
+                operation_handle: None,
+                effect_class,
+                route,
+                deadline_preference_ms: request.deadline_preference_ms,
+                simulated: false,
+            },
+            evidence: DryRunEvidence {
+                source: DRY_RUN_PREVIEW_SOURCE,
+                inert_validation: "passed",
+                statement: "DRY_RUN_UNSUPPORTED: no validation/simulation ran against the target operation; \
+                 only bridge-local request-shape validation passed; no effects were issued and \
+                 no transport bytes were sent"
+                    .to_owned(),
+            },
+            binding: dry_run_binding(runner),
+        };
+    }
+    match gateway.invoke_with_receipt(port, request) {
+        Err(error) => host_gateway_error(&error),
+        Ok((result, _completion)) => match result.outcome() {
+            HostInvocationOutcome::Accepted { operation_handle } => Response::DryRun {
+                correlation_id: request.correlation_id.as_str().to_owned(),
+                operation: "invoke",
+                disposition,
+                preview: DryRunPreview {
+                    canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
+                    operation_handle: Some(operation_handle.as_str().to_owned()),
+                    effect_class,
+                    route,
+                    deadline_preference_ms: request.deadline_preference_ms,
+                    simulated: false,
+                },
+                evidence: DryRunEvidence {
+                    source: DRY_RUN_OWNER_PREVIEW_SOURCE,
+                    inert_validation: "passed",
+                    statement: format!(
+                        "owner recorded the dry-run probe and issued operation {} via {}; \
+                        read-only admission carries no external effects and target state plus \
+                        external-effect ledger are unchanged; no separate simulation ran, no \
+                        delivery was recorded, and no reactive drain ran",
+                        operation_handle.as_str(),
+                        route,
+                    ),
+                },
+                binding: dry_run_binding(runner),
+            },
+            HostInvocationOutcome::Responded {
+                operation_handle, ..
+            } => Response::DryRun {
+                correlation_id: request.correlation_id.as_str().to_owned(),
+                operation: "invoke",
+                disposition,
+                preview: DryRunPreview {
+                    canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
+                    operation_handle: Some(operation_handle.as_str().to_owned()),
+                    effect_class,
+                    route,
+                    deadline_preference_ms: request.deadline_preference_ms,
+                    simulated: false,
+                },
+                evidence: DryRunEvidence {
+                    source: DRY_RUN_OWNER_PREVIEW_SOURCE,
+                    inert_validation: "passed",
+                    statement: format!(
+                        "owner served the read and issued operation {} via {}; zero external \
+                        effects and target state plus external-effect ledger unchanged; response \
+                        content is not carried by the preview and no delivery was recorded",
+                        operation_handle.as_str(),
+                        route,
+                    ),
+                },
+                binding: dry_run_binding(runner),
+            },
+            HostInvocationOutcome::Rejected { failure } => Response::DryRun {
+                correlation_id: request.correlation_id.as_str().to_owned(),
+                operation: "invoke",
+                disposition: DRY_RUN_UNSUPPORTED_DISPOSITION,
+                preview: DryRunPreview {
+                    canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
+                    operation_handle: None,
+                    effect_class,
+                    route,
+                    deadline_preference_ms: request.deadline_preference_ms,
+                    simulated: false,
+                },
+                evidence: DryRunEvidence {
+                    source: DRY_RUN_OWNER_PREVIEW_SOURCE,
+                    inert_validation: "passed",
+                    statement: format!(
+                        "DRY_RUN_UNSUPPORTED: the owner rejected the dry-run probe ({failure}); no \
+                        validation/simulation ran against the target operation; no effects were \
+                        issued and no delivery was recorded"
+                    ),
+                },
+                binding: dry_run_binding(runner),
+            },
         },
-        evidence: DryRunEvidence {
-            source: DRY_RUN_PREVIEW_SOURCE,
-            inert_validation: "passed",
-            statement: statement.to_owned(),
-        },
-        binding: dry_run_binding(runner),
     }
 }
 
@@ -1792,7 +1914,8 @@ fn dry_run_invocation(runner: &BridgeRunner, request: &HostInvocationRequest) ->
 /// `DRY_RUN_UNSUPPORTED` with the best static preview: the exact opaque
 /// target echoed without interpretation plus the live attach binding. No
 /// probe, cancel, or reconcile envelope is ever sent and the target operation
-/// is untouched. No validation/simulation ran against the target operation.
+/// is untouched — a propagated cancel would be a real effect, not a probe.
+/// No validation/simulation ran against the target operation.
 fn dry_run_cancellation(runner: &BridgeRunner, request: &HostCancellationRequest) -> Response {
     if let Err(error) = request.validate() {
         return host_gateway_error(&HostGatewayError::from(error));
@@ -3934,6 +4057,58 @@ mod tests {
         .expect("test runner must compose without a kernel port")
     }
 
+    /// Scripted stand-in for the kernel/operation owner leg of one read-only
+    /// dry run: records that the bridge propagated the probe and answers with
+    /// the owner-issued handle a recording kernel would return. Never a
+    /// guessed outcome: exactly one staged port outcome per call.
+    struct DryRunOwnerProbePort {
+        calls: usize,
+    }
+
+    impl KernelHostRequestPort for DryRunOwnerProbePort {
+        fn invoke(
+            &mut self,
+            _request: &HostInvocationRequest,
+        ) -> Result<HostInvocationPortOutcome, PortFailure> {
+            self.calls += 1;
+            Ok(HostInvocationPortOutcome::Accepted {
+                operation_handle: HostOperationHandle::new("kernel-operation-dry-run-1")
+                    .expect("valid handle"),
+            })
+        }
+
+        fn cancel(
+            &mut self,
+            _request: &HostCancellationRequest,
+        ) -> Result<HostCancellationPortOutcome, PortFailure> {
+            Err(PortFailure::PlanGap {
+                missing_capability: "test.dry-run-owner-probe.cancel".to_owned(),
+                reason: "cancel not exercised".to_owned(),
+            })
+        }
+    }
+
+    /// Owner leg that must never be consulted: any propagation attempt fails
+    /// the test instead of returning a faked verdict, so the unsupported and
+    /// malformed dry-run paths prove they never reach the owner.
+    struct NeverConsultedOwnerPort;
+
+    impl KernelHostRequestPort for NeverConsultedOwnerPort {
+        fn invoke(
+            &mut self,
+            _request: &HostInvocationRequest,
+        ) -> Result<HostInvocationPortOutcome, PortFailure> {
+            panic!("dry run without a simulator must not reach the owner");
+        }
+
+        fn cancel(
+            &mut self,
+            _request: &HostCancellationRequest,
+        ) -> Result<HostCancellationPortOutcome, PortFailure> {
+            panic!("dry run without a simulator must not reach the owner");
+        }
+    }
+
     // WORK_UNIT_CASE: 977/11
     #[test]
     fn raw_forward_frame_is_not_a_public_operation() {
@@ -3997,17 +4172,26 @@ mod tests {
 
     #[test]
     fn dry_run_read_only_invoke_returns_preview_without_dispatch() {
-        // Zero side effects hold by construction: dry_run_invocation takes
-        // only a read-only runner view and the inert request. No gateway, no
-        // trusted port, and no mutable runner cross this call, so no envelope
-        // is built, no replay entry is recorded, and no transport byte moves.
+        // The canonical dry-run path (issue #1939 W1) propagates the
+        // validated read-only probe from the bridge through the
+        // kernel/operation owner: the owner records the probe, issues its
+        // handle, and returns its acknowledgement, which the bridge projects
+        // into the dry-run envelope. This never takes the live Invoke path:
+        // no Invocation envelope, no delivery recording, no reactive drain,
+        // and no external effects — target state and the external-effect
+        // ledger stay exactly unchanged.
         let Request::DryRunInvoke { request } =
             serde_json::from_str::<Request>(DRY_RUN_INVOKE).expect("dry-run must deserialize")
         else {
             panic!("expected dry-run invoke");
         };
         let runner = dry_run_test_runner();
-        let response = dry_run_invocation(&runner, &request);
+        let mut port = DryRunOwnerProbePort { calls: 0 };
+        let response = dry_run_invocation(HostRequestGateway, &mut port, &runner, &request);
+        assert_eq!(
+            port.calls, 1,
+            "read-only dry run must propagate exactly one owner probe"
+        );
         let Response::DryRun {
             correlation_id,
             operation,
@@ -4025,11 +4209,30 @@ mod tests {
         assert_eq!(preview.canonical_tool_name.as_deref(), Some("eliot.state"));
         assert_eq!(preview.effect_class, "read-only");
         assert_eq!(preview.route, "agent_host_request_submit");
+        assert_eq!(
+            preview.operation_handle.as_deref(),
+            Some("kernel-operation-dry-run-1"),
+            "preview must carry the owner-issued handle, proving the owner recorded the probe"
+        );
         assert_eq!(preview.deadline_preference_ms, Some(5000));
         assert!(!preview.simulated);
-        assert_eq!(evidence.source, "bridge-static-preview.v1");
+        assert_eq!(evidence.source, "kernel-owner-preview.v1");
         assert_eq!(evidence.inert_validation, "passed");
-        assert!(evidence.statement.contains("no kernel simulation"));
+        assert!(
+            evidence.statement.contains("kernel-operation-dry-run-1"),
+            "evidence must cite the owner acknowledgement, got: {}",
+            evidence.statement
+        );
+        assert!(
+            evidence.statement.contains("agent_host_request_submit"),
+            "evidence must cite the ridden entry, got: {}",
+            evidence.statement
+        );
+        assert!(
+            !evidence.statement.contains("simulation"),
+            "owner-ridden preview must not claim a simulation ran, got: {}",
+            evidence.statement
+        );
         assert!(!binding.attached, "unattached preview must say so");
         assert!(binding.connection_id.is_none());
         let value = serde_json::to_value(&Response::DryRun {
@@ -4050,13 +4253,17 @@ mod tests {
 
     #[test]
     fn dry_run_effectful_invoke_returns_unsupported_with_static_preview() {
+        // No safe simulator: the owner leg must never be consulted (the
+        // strict port panics on any propagation attempt), so the answer is
+        // the static preview with the honest unsupported verdict.
         let Request::DryRunInvoke { request } =
             serde_json::from_str::<Request>(DRY_RUN_SEND).expect("dry-run must deserialize")
         else {
             panic!("expected dry-run invoke");
         };
         let runner = dry_run_test_runner();
-        let response = dry_run_invocation(&runner, &request);
+        let mut port = NeverConsultedOwnerPort;
+        let response = dry_run_invocation(HostRequestGateway, &mut port, &runner, &request);
         let Response::DryRun {
             disposition,
             preview,
@@ -4073,7 +4280,9 @@ mod tests {
         );
         assert_eq!(preview.effect_class, "effectful");
         assert_eq!(preview.route, "withheld-no-simulator");
+        assert!(preview.operation_handle.is_none());
         assert!(!preview.simulated);
+        assert_eq!(evidence.source, "bridge-static-preview.v1");
         assert!(evidence.statement.contains("DRY_RUN_UNSUPPORTED"));
         assert!(
             evidence.statement.contains("no validation/simulation ran"),
@@ -4099,7 +4308,8 @@ mod tests {
         };
         assert_eq!(request.tool.canonical_name(), "skill.inject");
         let runner = dry_run_test_runner();
-        let response = dry_run_invocation(&runner, &request);
+        let mut port = NeverConsultedOwnerPort;
+        let response = dry_run_invocation(HostRequestGateway, &mut port, &runner, &request);
         let Response::DryRun {
             disposition,
             preview,
@@ -4158,7 +4368,10 @@ mod tests {
         };
         request.deadline_preference_ms = Some(0);
         let runner = dry_run_test_runner();
-        let response = dry_run_invocation(&runner, &request);
+        // Inert validation runs before classification and propagation: the
+        // strict port proves the malformed probe never reaches the owner.
+        let mut port = NeverConsultedOwnerPort;
+        let response = dry_run_invocation(HostRequestGateway, &mut port, &runner, &request);
         let value = serde_json::to_value(&response).expect("error must serialize");
         assert_eq!(
             value["status"],
@@ -4169,6 +4382,53 @@ mod tests {
             value["code"],
             Value::String("HOST_REQUEST_INVALID".to_owned()),
             "malformed dry run must reuse the live-dispatch rejection shape"
+        );
+    }
+
+    #[test]
+    fn dry_run_owner_rejection_degrades_to_unsupported_without_preview_claims() {
+        // The owner was consulted and refused: the honest answer stays the
+        // dry-run envelope with `DRY_RUN_UNSUPPORTED`, the validated route,
+        // no owner handle, and owner-derived evidence citing the rejection —
+        // never an invented preview and never a validation claim.
+        let Request::DryRunInvoke { request } =
+            serde_json::from_str::<Request>(DRY_RUN_INVOKE).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run invoke");
+        };
+        let runner = dry_run_test_runner();
+        let mut port = UnavailableKernelHostRequestPort;
+        let response = dry_run_invocation(HostRequestGateway, &mut port, &runner, &request);
+        let Response::DryRun {
+            correlation_id,
+            operation,
+            disposition,
+            preview,
+            evidence,
+            ..
+        } = response
+        else {
+            panic!("rejected dry run must stay a dry-run envelope");
+        };
+        assert_eq!(correlation_id, "host-request-1");
+        assert_eq!(operation, "invoke");
+        assert_eq!(disposition, "DRY_RUN_UNSUPPORTED");
+        assert_eq!(preview.canonical_tool_name.as_deref(), Some("eliot.state"));
+        assert_eq!(preview.effect_class, "read-only");
+        assert_eq!(preview.route, "agent_host_request_submit");
+        assert!(preview.operation_handle.is_none());
+        assert!(!preview.simulated);
+        assert_eq!(evidence.source, "kernel-owner-preview.v1");
+        assert_eq!(evidence.inert_validation, "passed");
+        assert!(evidence.statement.contains("DRY_RUN_UNSUPPORTED"));
+        assert!(
+            evidence.statement.contains("no validation/simulation ran"),
+            "rejected preview must state plainly that no validation/simulation ran"
+        );
+        assert!(
+            !evidence.statement.contains("simulation succeeded")
+                && !evidence.statement.contains("validation succeeded"),
+            "rejected preview must not assert external validation occurred"
         );
     }
 
