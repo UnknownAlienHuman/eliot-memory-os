@@ -926,7 +926,17 @@ pub fn admits_record_reference(
         | RecordReferenceSurface::ReceiptHandle => manifest.allows(&presented.reference),
         RecordReferenceSurface::Locator | RecordReferenceSurface::SpanAnchor => {
             match classify_locator(&presented.reference) {
-                LocatorClass::ExternalUri { .. } => manifest.admits_url(&presented.reference),
+                // The exact text compared is `exact_original`, the value this same
+                // call classified, rather than `presented.reference`, the caller's
+                // own string. They are equal today so no verdict moves; what the
+                // field buys is that the allowlist is compared against the
+                // classification rather than beside it. Were a future classifier
+                // revision ever to rewrite the text it returns, this boundary
+                // would compare the manifest with what that revision decided to
+                // admit instead of with a caller string it never classified.
+                LocatorClass::ExternalUri { exact_original } => {
+                    manifest.admits_url(&exact_original)
+                }
                 LocatorClass::InternalUri { .. } | LocatorClass::OpaqueHandle => true,
                 LocatorClass::MalformedOrAmbiguous { .. } => false,
             }

@@ -1591,8 +1591,22 @@ fn admit_locator(
 ) -> Result<(), ResearchContractError> {
     match classify_locator(locator) {
         LocatorClass::InternalUri { .. } | LocatorClass::OpaqueHandle => Ok(()),
-        LocatorClass::ExternalUri { .. } => {
-            if manifest.admits_url(locator) {
+        // The comparison is against `exact_original`, the value the classifier
+        // itself carried out of this same call — not against `locator`, the
+        // caller's own string. Those two are the same text today, so this is not
+        // a behavioural change; what it removes is the *coincidence* being what
+        // makes it correct. Reading the field rather than the parameter is what
+        // binds the exact-byte allowlist to the classification that produced it:
+        // if a future revision of `classify_locator` ever normalises, folds or
+        // rewrites the text it returns, this arm compares the manifest against
+        // whatever that revision decided to admit, and a manifest entry cannot be
+        // matched by a spelling the classifier only recognised after rewriting
+        // it. With the parameter, the same future change would silently compare
+        // an unrewritten caller string against a rewritten classification and
+        // gate on the wrong side of the rewrite — the shape of defect #2894
+        // itself, where the branch that read the URL decision was never reached.
+        LocatorClass::ExternalUri { exact_original } => {
+            if manifest.admits_url(&exact_original) {
                 Ok(())
             } else {
                 Err(ResearchContractError::UrlNotAdmitted)
