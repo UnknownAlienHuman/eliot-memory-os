@@ -31,7 +31,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 
-use super::{DependencyVersion, PromotionGate, SkillCandidate, SkillError, SkillScope, SkillStatus};
+use super::{
+    DependencyVersion, PromotionGate, SkillCandidate, SkillError, SkillScope, SkillStatus,
+    detect_dependency_staleness,
+};
 
 /// Maximum visible characters for one index trigger line (`I7.12`).
 pub const MAX_TRIGGER_CHARS: usize = 140;
@@ -741,6 +744,46 @@ pub struct SkillCatalogue {
     entries: BTreeMap<String, SkillCatalogueEntry>,
 }
 
+/// Live Skill world one catalogue staleness sweep compares standing entries
+/// against (`I7.13`).
+///
+/// Every leg compares stored pins with the exact content the caller observed
+/// for this operation — the live dependency registry set, the live
+/// host/profile versions, the live admitted Tool Definition version, and the
+/// tool owner's view — never a recomputed substitute. Entries pin exactly the
+/// observed dependency set, so added, removed, and changed names all count as
+/// drift.
+pub struct LiveSkillWorld<'a> {
+    /// Currently registered dependency versions (the full live set).
+    pub current_dependencies: &'a [DependencyVersion],
+    /// Live host version the install pins are compared against.
+    pub live_host_version: &'a str,
+    /// Live profile version the install pins are compared against.
+    pub live_profile_version: &'a str,
+    /// Live admitted Tool Definition version (contract leg).
+    pub live_definition_version: &'a str,
+    /// Tool owner's view the declared tool basis is rechecked against.
+    pub tools: &'a dyn KnownTools,
+}
+
+impl<'a> LiveSkillWorld<'a> {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        for dependency in self.current_dependencies {
+            dependency.validate()?;
+        }
+        let names: Vec<String> = self
+            .current_dependencies
+            .iter()
+            .map(|dependency| dependency.name.clone())
+            .collect();
+        check_unique(&names, "world.dependencies")?;
+        check_text(self.live_host_version, "world.host_version")?;
+        check_text(self.live_profile_version, "world.profile_version")?;
+        check_text(self.live_definition_version, "world.definition_version")?;
+        Ok(())
+    }
+}
+
 impl SkillCatalogue {
     pub fn from_snapshot(
         entries: impl IntoIterator<Item = SkillCatalogueEntry>,
@@ -960,6 +1003,94 @@ impl SkillCatalogue {
         ));
         entry.validate()?;
         Ok(true)
+    }
+
+    /// Reconciles every usable standing entry against the observed live
+    /// world (`I7.13`, issue #1882 W2/A2/A4).
+    ///
+    /// A changed host/tool/contract dependency marks the Skill stale even
+    /// when no reinstall arrives and no activation is attempted: install-time
+    /// pre-insert marks cover the reinstalled Skill, while this sweep covers
+    /// every other standing entry before the bridge activation path serves
+    /// it. Only `Current`/`Provisional` entries are visited — the usable set
+    /// whose hidden drift could otherwise reach Material use. `Stale` already
+    /// blocks use, `Quarantined` is governed state, and `Suppressed`/`Archived`
+    /// already block use under a lifecycle disposition this sweep must not
+    /// clobber. Legs run dependency, host, definition (contract), tool — the
+    /// first drift found marks the entry through the existing mark path and
+    /// later legs see the `Stale` status and report no change, so one reason
+    /// names the sweep outcome per entry. Completeness is checked against the
+    /// independent expected set (`skill_ids`): every usable standing entry is
+    /// visited. A mark changes the entry, so the catalogue digest changes
+    /// with it and Hotset receipts issued before the sweep fail closed at
+    /// activation instead of displaying a drifted body. Returns the skill ids
+    /// that became stale, in catalogue order.
+    pub fn reconcile_staleness(
+        &mut self,
+        world: &LiveSkillWorld<'_>,
+    ) -> Result<Vec<String>, SkillError> {
+        world.validate()?;
+        let mut became_stale = Vec::new();
+        for skill_id in self.skill_ids() {
+            let standing = self.entries.get(&skill_id).ok_or(SkillError::NotFound)?;
+            if !matches!(
+                standing.status,
+                SkillStatus::Current | SkillStatus::Provisional
+            ) {
+                continue;
+            }
+            let pinned = standing.dependencies.clone();
+            let host_version = standing.host_version.clone();
+            let profile_version = standing.profile_version.clone();
+            let admitted_definition_version = standing.admitted_definition_version.clone();
+            let tool_refs = standing.body.tool_refs.clone();
+            if let Some(reason) =
+                detect_dependency_staleness(&pinned, world.current_dependencies)
+            {
+                if self.note_dependency_change(
+                    &skill_id,
+                    world.current_dependencies.to_vec(),
+                    reason,
+                )? {
+                    became_stale.push(skill_id.clone());
+                }
+                continue;
+            }
+            let host_drifted = host_version != world.live_host_version
+                || profile_version != world.live_profile_version;
+            if host_drifted
+                && self.mark_host_drift_stale(
+                    &skill_id,
+                    world.live_host_version,
+                    world.live_profile_version,
+                )?
+            {
+                became_stale.push(skill_id.clone());
+                continue;
+            }
+            let definition_drifted = admitted_definition_version != world.live_definition_version;
+            if definition_drifted
+                && self.mark_definition_drift_stale(
+                    &skill_id,
+                    world.live_definition_version,
+                    &admitted_definition_version,
+                )?
+            {
+                became_stale.push(skill_id.clone());
+                continue;
+            }
+            let missing_tools: Vec<String> = tool_refs
+                .iter()
+                .filter(|tool| !world.tools.knows_tool(tool))
+                .cloned()
+                .collect();
+            if !missing_tools.is_empty()
+                && self.mark_tool_basis_stale(&skill_id, &missing_tools)?
+            {
+                became_stale.push(skill_id);
+            }
+        }
+        Ok(became_stale)
     }
 
     /// Returns a stale entry to explicitly scoped/provisional use after
