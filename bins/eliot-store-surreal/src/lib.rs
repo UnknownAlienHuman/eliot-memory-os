@@ -592,12 +592,16 @@ impl StoreComposition {
                         .map_err(|_| StoreError::Unavailable)?;
                     }
                     (InstallationProfile::UserMode, None)
-                    | (InstallationProfile::PortableDev, Some(_))
-                    | (InstallationProfile::SystemService, Some(_)) => {
+                    | (
+                        InstallationProfile::PortableDev | InstallationProfile::SystemService,
+                        Some(_),
+                    ) => {
                         return Err(StoreError::Unavailable);
                     }
-                    (InstallationProfile::PortableDev, None)
-                    | (InstallationProfile::SystemService, None) => {}
+                    (
+                        InstallationProfile::PortableDev | InstallationProfile::SystemService,
+                        None,
+                    ) => {}
                 }
                 Ok(StoreRootUseLease {
                     _profile_roots: Some(current),
@@ -1727,10 +1731,22 @@ fn validate_runtime_leases_without_profile_receipt(
 
 fn verify_runtime_root_lease(lease: &WindowsRuntimeRootLease) -> Result<(), String> {
     match lease {
-        WindowsRuntimeRootLease::Protected { lease, .. } => lease
-            .verify_stable_identity()
-            .and_then(|()| lease.verify_path_identity())
-            .map_err(|error| format!("revalidate protected runtime root: {error}")),
+        WindowsRuntimeRootLease::Protected {
+            declared_path,
+            lease,
+            ..
+        } => {
+            lease
+                .verify_stable_identity()
+                .map_err(|error| format!("revalidate protected runtime root: {error}"))?;
+            let current =
+                eliot_platform_windows::ProtectedRootLease::open_existing(Path::new(declared_path))
+                    .map_err(|error| format!("reopen protected runtime root: {error}"))?;
+            if current.identity() != lease.identity() {
+                return Err("protected runtime root path changed identity".to_owned());
+            }
+            Ok(())
+        }
         WindowsRuntimeRootLease::UserOwned { lease, .. } => lease
             .verify_stable_identity()
             .and_then(|()| lease.verify_path_identity())
