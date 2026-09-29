@@ -2015,10 +2015,14 @@ fn validate_source_commitments(
     commitments: &[SourceRecordCommitment],
 ) -> Result<(), ConflictAnalysisError> {
     let handles = position_source_handles(conflict_set);
+    // Borrowed as text so the membership test below compares like with like;
+    // `position_source_handles` returns owned handles and the commitment names
+    // its source as a borrowed slice.
+    let handles: Vec<&str> = handles.iter().map(String::as_str).collect();
     let mut seen: Vec<&str> = Vec::with_capacity(commitments.len());
     for commitment in commitments {
         let source = commitment.source();
-        if !handles.contains(source) {
+        if !handles.contains(&source) {
             return Err(ConflictAnalysisError::Binding {
                 field: "commitment.source".to_owned(),
                 detail: format!(
@@ -2645,14 +2649,13 @@ fn build_compatibility(
                 outcome: entry.outcome.clone(),
             });
         }
-        let (relation, supplement_version) =
-            match qualify_comparison(comparison, commitments) {
-                Some(pair) => (admitted_relation(&pair), SupplementVersion::OwnerBoundV2),
-                None => (
-                    CompatibilityRelation::Ambiguous,
-                    SupplementVersion::LegacyV1Unverified,
-                ),
-            };
+        let (relation, supplement_version) = match qualify_comparison(comparison, commitments) {
+            Some(pair) => (admitted_relation(&pair), SupplementVersion::OwnerBoundV2),
+            None => (
+                CompatibilityRelation::Ambiguous,
+                SupplementVersion::LegacyV1Unverified,
+            ),
+        };
         out.push(PositionCompatibility {
             other_source: other.to_owned(),
             relation,
@@ -2884,8 +2887,17 @@ fn history_disposition(
     if minority || counters.is_empty() {
         return None;
     }
+    // `defeated_refs` holds `ArtifactId`, so it is projected to its string form
+    // once and compared as text, the same way the pre-existing superseded check
+    // reads it. Comparing `&String` against the set directly would not compile,
+    // and the projection is a membership question, not a second value.
+    let defeated: Vec<&str> = conflict_set
+        .defeated_refs
+        .iter()
+        .map(eliot_contracts::ArtifactId::as_str)
+        .collect();
     for counter in counters {
-        if conflict_set.defeated_refs.contains(counter) {
+        if defeated.contains(&counter.as_str()) {
             return Some((
                 PositionDispositionKind::Refuted,
                 String::from("refuted position retained as addressable history"),
