@@ -374,27 +374,51 @@ fn bind_durable_closure_coordinates(
             "recorded revocation fields do not bind the durable closure they claim".to_owned(),
         ));
     }
-    envelope.admission_contract_set_digest = canonical_digest(&(
-        &recorded_origin,
-        &recorded_closure_id,
-        &recorded_revision,
-        &recorded_affected_digest,
-        &recorded_affected_count,
-        AUTHORITY_REVOCATION_KERNEL_FIRST_REASON,
-        &recorded_fence_digest,
-        envelope.operation_id.as_str(),
-        envelope.idempotency_key.as_str(),
-        &closure.idempotency_digest,
-        &closure.authority_receipt.snapshot_id,
-        &closure.authority_receipt.authority_epoch,
-        &closure.authority_receipt.receipt_id,
-        &closure.authority_receipt.state,
-        &closure.canonical_receipt,
-        &closure.proof_ceiling,
-        &closure.declaration.proof_ceiling,
-        &closure.declaration.preserved,
-        &bounds,
-    ))?;
+    // The durable coordinates are grouped into one serializable view so the
+    // canonical codec hashes a named shape rather than a positional tuple.
+    #[derive(serde::Serialize)]
+    struct DurableRevocationCoordinates<'a> {
+        operation_id: &'a str,
+        idempotency_key: &'a str,
+        closure_request_digest: &'a str,
+        origin_ref: &'a str,
+        closure_id: &'a str,
+        closure_revision: &'a str,
+        affected_digest: &'a str,
+        affected_count: &'a str,
+        invalidation_reason: &'a str,
+        fence_digest: &'a str,
+        snapshot_id: &'a str,
+        authority_epoch: &'a eliot_contracts::EpochId,
+        authority_receipt_id: &'a str,
+        authority_receipt_state: GrantClosureState,
+        canonical_receipt: Option<&'a ReceiptIdentity>,
+        proof_ceiling: eliot_receipts::ProofCeiling,
+        declaration_proof_ceiling: eliot_receipts::ProofCeiling,
+        preserved: &'a [eliot_receipts::GrantClosureAlternatePath],
+        bounds: &'a RevocationBounds,
+    }
+    envelope.admission_contract_set_digest = canonical_digest(&DurableRevocationCoordinates {
+        operation_id: envelope.operation_id.as_str(),
+        idempotency_key: envelope.idempotency_key.as_str(),
+        closure_request_digest: &closure.idempotency_digest,
+        origin_ref: &recorded_origin,
+        closure_id: &recorded_closure_id,
+        closure_revision: &recorded_revision,
+        affected_digest: &recorded_affected_digest,
+        affected_count: &recorded_affected_count,
+        invalidation_reason: AUTHORITY_REVOCATION_KERNEL_FIRST_REASON,
+        fence_digest: &recorded_fence_digest,
+        snapshot_id: &closure.authority_receipt.snapshot_id,
+        authority_epoch: &closure.authority_receipt.authority_epoch,
+        authority_receipt_id: &closure.authority_receipt.receipt_id,
+        authority_receipt_state: closure.authority_receipt.state,
+        canonical_receipt: closure.canonical_receipt.as_ref(),
+        proof_ceiling: closure.proof_ceiling,
+        declaration_proof_ceiling: closure.declaration.proof_ceiling,
+        preserved: &closure.declaration.preserved,
+        bounds: &bounds,
+    })?;
     envelope.security.influence_closure = Some(influence_closure);
     // The envelope was already valid once; the durable binding added fields to
     // two hash-bound surfaces, so it is re-validated rather than trusted.
