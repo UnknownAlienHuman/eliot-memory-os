@@ -36,6 +36,7 @@
 pub mod authority;
 pub mod authority_controller;
 mod authority_snapshot;
+pub mod control_reserve_rejection;
 pub mod durable_owner_bootstrap;
 pub mod error;
 pub mod governor_closure_source;
