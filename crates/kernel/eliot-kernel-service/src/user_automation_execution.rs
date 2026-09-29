@@ -2959,6 +2959,22 @@ pub trait UserAutomationWakePort: Send + Sync {
         ))
     }
 
+    /// Reconciles one exact horizon publication with its schedule owner after
+    /// an unknown handoff. An implementation must return only the owner's
+    /// retained acknowledgement for this immutable revision, fence, and
+    /// occurrence denominator; an absent or inconclusive lookup is an error,
+    /// never proof that publication did not occur. Until the Host publisher
+    /// exists, this interface reports typed unavailability and cannot turn a
+    /// retained horizon into a possible-effect or published claim.
+    async fn read_wake_horizon_publication(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "exact owner wake-horizon publication readback is unavailable".to_owned(),
+        ))
+    }
+
     /// Reads one exact persisted Pending wake from the existing owner.
     /// Implementations without a readback path fail closed.
     async fn read_pending_wake(
