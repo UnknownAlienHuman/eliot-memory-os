@@ -208,8 +208,8 @@ use eliot_installation::{
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease, ProtectedRuntimePathLease,
-    windows_paths_equal,
+    FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease,
+    ProtectedRuntimePathLease, windows_paths_equal,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3430,7 +3430,8 @@ impl OwnerEvidence {
             if !windows_paths_equal(retained.path(), &ors_path) {
                 return Err(PreparationError::UnknownState {
                     operation: OP_OWNER_EVIDENCE.to_owned(),
-                    reason: "retained ORS lease is not the approved manifest's ORS child".to_owned(),
+                    reason: "retained ORS lease is not the approved manifest's ORS child"
+                        .to_owned(),
                 });
             }
             retained
@@ -3471,9 +3472,12 @@ impl OwnerEvidence {
         })();
         match read {
             Ok(revision) => Ok(revision),
-            Err(error) => {
-                Err(note_prepare_error(OP_OWNER_EVIDENCE, "purge_revision", error, 0))
-            }
+            Err(error) => Err(note_prepare_error(
+                OP_OWNER_EVIDENCE,
+                "purge_revision",
+                error,
+                0,
+            )),
         }
     }
 

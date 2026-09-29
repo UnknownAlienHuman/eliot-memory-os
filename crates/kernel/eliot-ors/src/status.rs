@@ -742,7 +742,9 @@ pub fn read_purge_ledger_revision_read_only(
             }
             return Ok(None);
         }
-        let meta = read.open_table(PURGE_LEDGER_META).map_err(map_table_error)?;
+        let meta = read
+            .open_table(PURGE_LEDGER_META)
+            .map_err(map_table_error)?;
         let Some(value) = meta
             .get(PURGE_LEDGER_REVISION_KEY)
             .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
