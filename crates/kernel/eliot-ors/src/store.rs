@@ -103,7 +103,6 @@ use crate::{
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
-
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
@@ -114,7 +113,6 @@ use crate::{
     WriterReservationToken, is_replay_terminal_phase, parse_replay_stream_id,
     require_replay_claim_binding, signed_supervision_lease_from_verified,
     signed_terminal_supervision_lease_from_verified, validate_digest, validate_text,
-
 };
 
 /// The versioned-artifact family rides the same ORS persistence codec as every

@@ -47,10 +47,9 @@ use eliot_ors::{
     MaintenanceTriggerClaimBinding, MaintenanceTriggerDownstreamRetentionProof,
     MaintenanceTriggerGapStorageRecord, MaintenanceTriggerIntakeStorageProjection,
     MaintenanceTriggerIntakeStorageRecord, MaintenanceTriggerLifecycleCounts,
-    MaintenanceTriggerLifecyclePageProjection,
-    MaintenanceTriggerLifecyclePhase, MaintenanceTriggerLifecycleRecord,
-    OperationIdentity as OrsOperationIdentity, OperationalRecoveryStore, OrsError,
-    RecoveryPayloadEnvelope, StateFenceSnapshot,
+    MaintenanceTriggerLifecyclePageProjection, MaintenanceTriggerLifecyclePhase,
+    MaintenanceTriggerLifecycleRecord, OperationIdentity as OrsOperationIdentity,
+    OperationalRecoveryStore, OrsError, RecoveryPayloadEnvelope, StateFenceSnapshot,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 #[cfg(windows)]
@@ -337,6 +336,8 @@ impl UserAutomationHostExecutionObserver for UserAutomationCancellationCustodyOb
         }
         Ok(())
     }
+}
+
 /// Commit state carried separately from the typed cause of an intake failure.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
