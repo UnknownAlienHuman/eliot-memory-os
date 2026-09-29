@@ -19,7 +19,6 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::sha256_hex;
 use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -208,6 +207,8 @@ fn unique_texts(values: &[String], field: &'static str) -> Result<(), Evaluation
 #[serde(deny_unknown_fields)]
 pub struct ObservationCoverageManifest {
     pub fingerprint: RunFingerprint,
+    /// Allowed Tool/Facet manifest revision this denominator was built against.
+    pub allowed_manifest_digest: String,
     pub expected_event_sources_and_event_classes: Vec<String>,
     pub observable_actions: Vec<String>,
     pub unobservable_actions: Vec<String>,
@@ -230,6 +231,7 @@ impl ObservationCoverageManifest {
     /// to blind intervals so a derived trace can always name its blocker.
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         self.fingerprint.validate()?;
+        text(&self.allowed_manifest_digest, "manifest.allowed_manifest_digest")?;
         if self.expected_event_sources_and_event_classes.is_empty() {
             return Err(EvaluationContractError::EmptyCollection {
                 field: "manifest.expected_event_sources_and_event_classes",
@@ -389,15 +391,6 @@ impl ObservationCoverageManifest {
             .any(|entry| entry == source_class)
     }
 
-    /// Revision identity of this denominator: `sha256` over its JSON
-    /// encoding. The checked trace builder binds evidence to a manifest only
-    /// through this digest, so a manifest and its evidence must resolve the
-    /// same allowed Tool/Facet manifest revision before any disposition.
-    #[must_use]
-    pub fn manifest_digest(&self) -> String {
-        let bytes = serde_json::to_vec(self).unwrap_or_default();
-        sha256_hex(&bytes)
-    }
 }
 
 /// One immutable host/runtime record consumed by trace derivation.
@@ -567,9 +560,11 @@ pub struct BoundComplianceInputs<'a> {
 
 impl<'a> BoundComplianceInputs<'a> {
     /// Validates the manifest and the evidence and verifies their common
-    /// run/attempt/route/allowed-manifest binding: the manifest must be the
-    /// allowed revision (by [`ObservationCoverageManifest::manifest_digest`])
-    /// and the evidence must reference that same revision.
+    /// run/attempt/route/allowed-manifest binding: the manifest must carry
+    /// the independently resolved allowed revision in its own
+    /// `allowed_manifest_digest` field, and the evidence must reference that
+    /// same revision. A caller-supplied digest matching neither side binds
+    /// nothing and is rejected.
     pub fn bind(
         manifest: &'a ObservationCoverageManifest,
         evidence: &'a ImmutableHostEvidence,
@@ -581,16 +576,16 @@ impl<'a> BoundComplianceInputs<'a> {
             allowed_manifest_digest,
             "inputs.allowed_manifest_digest",
         )?;
-        if manifest.manifest_digest() != allowed_manifest_digest {
+        if manifest.allowed_manifest_digest != allowed_manifest_digest {
             return Err(EvaluationContractError::EvidenceState {
-                field: "inputs.allowed_manifest_digest",
-                reason: "coverage manifest is not the allowed manifest revision",
+                field: "manifest.allowed_manifest_digest",
+                reason: "coverage manifest binds a different allowed manifest revision",
             });
         }
-        if evidence.manifest_digest != allowed_manifest_digest {
+        if evidence.manifest_digest != manifest.allowed_manifest_digest {
             return Err(EvaluationContractError::EvidenceState {
                 field: "evidence.manifest_digest",
-                reason: "host evidence does not bind the allowed manifest revision",
+                reason: "host evidence does not bind the manifest allowed revision",
             });
         }
         Ok(Self {
@@ -1044,6 +1039,7 @@ mod coverage_trace_tests_1936 {
     fn complete_manifest() -> ObservationCoverageManifest {
         ObservationCoverageManifest {
             fingerprint: fingerprint(),
+            allowed_manifest_digest: "manifest-digest-1936".to_owned(),
             expected_event_sources_and_event_classes: vec![
                 "host.shell".to_owned(),
                 "host.filesystem".to_owned(),
