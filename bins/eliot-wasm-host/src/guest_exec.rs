@@ -296,13 +296,24 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
     EXIT_COMPLETED
 }
 
-/// Reads one explicit local input file into a bounded buffer: the handle is
-/// the only source of input bytes and `take` bounds allocation even if the
-/// file grows after it is opened. An over-ceiling file is denied before the
-/// bytes are validated or executed, never truncated.
+/// Reads one explicit local input file into a bounded buffer: the raw
+/// acquisition ceiling is enforced before allocation, validation, or
+/// execution — never truncated, never parsed first. This lane carries raw
+/// input bytes only; no serialized fixture is parsed here, so no outer
+/// JSON/string/tree format exists to mistake for opaque ABI input. The
+/// opened handle is the only source of bytes: its declared length denies
+/// over-ceiling files before any allocation, and `take` still bounds the
+/// read if the file grows after it is opened.
 fn read_bounded_input(path: &Path) -> Result<Vec<u8>, GuestExecRejection> {
     let file = std::fs::File::open(path)
         .map_err(|error| GuestExecRejection::BadInput(error.kind().to_string()))?;
+    let declared = file
+        .metadata()
+        .map_err(|error| GuestExecRejection::BadInput(error.kind().to_string()))?
+        .len();
+    if declared > MAX_GUEST_INPUT_BYTES {
+        return Err(GuestExecRejection::BadInput("over-ceiling".to_owned()));
+    }
     let mut bytes = Vec::new();
     file.take(MAX_GUEST_INPUT_BYTES + 1)
         .read_to_end(&mut bytes)
