@@ -61,17 +61,18 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
     /// owner-contract [`WakeIntent`](eliot_runtime_contracts::WakeIntent) and
     /// binds it to the automation, the immutable revision and its digest, the
     /// stable occurrence identity, the owner-normalized trigger basis, the exact
-    /// State Fence, and the publication operation identity the request already
-    /// carries. Every journal field is a pure function of that request plus the
-    /// live Host activation fence, so a replay of the same publication
+    /// State Fence, and the activation generation whose fence owns the journal
+    /// record. Every journal field is a pure function of that immutable content
+    /// plus the live Host activation fence, so a replay of the same publication
     /// re-derives byte-identical records.
     ///
     /// Duplicate safety is the journal's own, not a second scheme here:
     /// [`HostStateJournalService::append`] resolves a repeated
     /// [`IdempotencyIdentity`] through the reducer's `applied_operations`
     /// index and answers [`AppendDisposition::Replayed`] without writing a
-    /// second frame, so a restart or a repeated publication under the same
-    /// publication identity retains exactly the same wakes.
+    /// second frame, so a restart — and a second whole-denominator publication
+    /// of the same revision through a different parent operation, such as
+    /// `Resume` over a paused automation — retains exactly the same wakes.
     ///
     /// Any journal refusal is returned as its typed error instead of a partial
     /// acknowledgement. The owner then has no answer at all, and the caller
@@ -105,11 +106,13 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
         // The acknowledgement is read back from the journal rather than
         // assumed from the appends. An append disposition alone does not prove
         // the wake is still retained: an activation-generation change clears
-        // the wake projection while the applied-operation index survives, so a
-        // repeated identity replays onto a record this journal no longer holds.
-        // Naming that occurrence as acknowledged would report a published
-        // horizon that no wake exists for, so the exact remaining set and its
-        // retry handle are returned instead.
+        // the wake projection, so a repeated identity can replay onto a record
+        // this journal no longer holds. Naming that occurrence as acknowledged
+        // would report a published horizon that no wake exists for, so the exact
+        // remaining set and its retry handle are returned instead. The readback
+        // re-derives its identities from the snapshot's own live generation, so
+        // such an occurrence is a genuinely re-publishable one under that
+        // generation and the handle it is named with is redeemable.
         let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
         let (acknowledged, remaining) = retained_horizon_occurrences(&request, &snapshot)?;
         horizon_acknowledgement(&request, acknowledged, remaining)
@@ -119,13 +122,14 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
     /// records.
     ///
     /// The answer is only what this journal actually holds. A snapshot that was
-    /// read successfully and holds no wake published by this publication
-    /// operation is [`UserAutomationRuntimeError::NotRetained`], a complete
-    /// negative answer from the sole writer; a journal that could not be read is
+    /// read successfully and holds no wake for a requested occurrence under the
+    /// activation generation that owns it is
+    /// [`UserAutomationRuntimeError::NotRetained`], a complete negative answer
+    /// from the sole writer; a journal that could not be read is
     /// [`UserAutomationRuntimeError::Unavailable`], which proves nothing. A
-    /// retained record for a requested occurrence that belongs to another
-    /// operation identity or carries another intent is a contradiction this
-    /// publication can neither answer for nor replace, and is reported as
+    /// retained record for a requested occurrence that was published under
+    /// another operation identity or carries another intent is a contradiction
+    /// this publication can neither answer for nor replace, and is reported as
     /// [`UserAutomationRuntimeError::IdentityConflict`] rather than as an
     /// acknowledgement.
     async fn read_wake_horizon_publication(
@@ -142,12 +146,14 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
         if acknowledged.is_empty() {
             // The snapshot above was read successfully, so this is a complete
             // negative answer from the sole owner of this journal: it retains no
-            // wake published by this operation. It is deliberately not
-            // `Unavailable`, and it is not proof that a lost publication call
-            // never issued its effect — only that this owner holds nothing
-            // under the identity being reconciled.
+            // wake for any requested occurrence under the activation generation
+            // that currently owns it. It is deliberately not `Unavailable`, and
+            // it is not proof that a lost publication call never issued its
+            // effect — only that this owner holds nothing for the occurrences
+            // being reconciled. Any remainder it does name is re-publishable
+            // under that generation, so the handle it returns stays redeemable.
             return Err(UserAutomationRuntimeError::NotRetained(
-                "the Host journal retains no wake published by this horizon publication operation"
+                "the Host journal retains no wake for this horizon publication's occurrences under the live activation generation"
                     .to_owned(),
             ));
         }
@@ -420,7 +426,7 @@ fn validate_horizon_denominator(
 }
 
 /// Splits the exact requested occurrence set into what this journal actually
-/// retains under this publication identity and what it does not.
+/// retains for it and what it does not.
 ///
 /// This is the single accounting used by both publication and its readback, so
 /// the two can never disagree about what the owner holds. A requested
@@ -429,6 +435,18 @@ fn validate_horizon_denominator(
 /// another intent is a contradiction this publication can neither answer for
 /// nor replace, and is refused rather than reported as a partial success.
 ///
+/// The requested identities are derived from this snapshot's own live
+/// activation fence, which is the fence of every wake record the reducer can
+/// leave in place: it clears the whole wake projection at an activation cutover,
+/// so a retained wake and the live generation that owns it are always the same
+/// journal's fact. That is also what makes every entry in `remaining` honestly
+/// retryable — an occurrence this journal does not hold under the current
+/// generation has no `applied_operations` entry for the identity the retry would
+/// re-derive, so re-presenting it is a genuine new publication rather than a
+/// replay the reducer would refuse with `IdempotencyConflict`. A `remaining` set
+/// that named work the journal has already applied and can no longer accept
+/// would be a retry handle the owner could never keep.
+///
 /// The retained record is validated by the owner's own checksum function, which
 /// re-runs `WakeRecord::validate` on the ORIGINAL value read back from this
 /// journal. No digest is recomputed and no value is rebuilt here.
@@ -436,10 +454,10 @@ fn retained_horizon_occurrences(
     request: &UserAutomationWakeHorizonPublication,
     snapshot: &HostState,
 ) -> Result<(Vec<String>, Vec<String>), UserAutomationRuntimeError> {
+    let live_fence = live_activation_fence(snapshot).ok();
     let mut acknowledged = Vec::with_capacity(request.entries.len());
     let mut remaining = Vec::new();
     for entry in &request.entries {
-        let operation = horizon_wake_operation_identity(request, entry)?;
         let mut retained = snapshot
             .wakes
             .iter()
@@ -451,7 +469,16 @@ fn retained_horizon_occurrences(
         if retained.next().is_some() {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
-        if wake.operation != operation || wake.intent != entry.wake_intent {
+        // A retained wake with no live activation to own it is a contradiction
+        // the reducer cannot produce, and the identity it was published under
+        // cannot be re-derived from this snapshot, so this owner can neither
+        // account for it nor replace it.
+        let fence = live_fence.as_ref().ok_or_else(|| {
+            rejected("the Host journal retains a wake under no live activation generation")
+        })?;
+        if wake.operation != horizon_wake_operation_identity(request, entry, fence)?
+            || wake.intent != entry.wake_intent
+        {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
@@ -480,29 +507,49 @@ fn live_activation_fence(snapshot: &HostState) -> Result<RecordFence, UserAutoma
 
 /// Derives the Host journal operation identity of one published occurrence.
 ///
-/// The identity is a pure function of the publication operation identity, the
-/// immutable revision and its digest, and the occurrence's own compiled
-/// identity, trigger key, and source digest. A replay of the same publication
-/// therefore re-derives the same identity for the same occurrence, and the
-/// journal's `applied_operations` index resolves that repeated identity to the
-/// record it already holds. That is what makes a duplicate publication a
-/// replay of one retained wake rather than a second wake; the identity is never
-/// taken from the request unchecked, and a different occurrence, revision, or
-/// publication yields a different identity.
+/// The identity is a pure function of the immutable revision and its digest, the
+/// occurrence's own compiled identity, trigger key and source digest, and the
+/// activation generation whose fence owns the record. The parent publication
+/// operation identity is deliberately NOT an input.
+///
+/// `Pause` and `Resume` admit the same immutable revision through different
+/// operator operations, and `Resume` re-derives the same occurrence identities
+/// (I11.12: "Duplicate wake/restart events resolve to the same occurrence"). If
+/// the parent operation were an input, that second publication would derive a
+/// different identity for a wake the journal already retains, and the reducer —
+/// which locates an existing wake by `wake_id` and has no `Pending -> Pending`
+/// edge — would refuse it forever, so the documented
+/// `Create` -> `Pause` -> `Resume` path could never publish. Deriving the
+/// identity from the occurrence and the revision instead makes every
+/// whole-denominator publication of one revision the same operation, so a
+/// `Resume` is a genuine `Replayed` on the identical `WakeRecord` and creates no
+/// second wake, while a different occurrence or a different revision digest
+/// yields a different identity and is a genuinely new publication.
+///
+/// The activation generation is an input because the journal's own reducer
+/// clears its entire wake projection at an activation cutover
+/// (`eliot_host_state::journal`), while `applied_operations` survives. Binding
+/// the identity to the owning generation is what keeps that asymmetry honest:
+/// after a cutover the re-presentation is a new generation's first publication
+/// of a wake the owner has provably discarded, not a second attempt at an
+/// identity whose recorded checksum can never match again. The journal resolves
+/// a repeated identity through its own `applied_operations` index and answers
+/// `Replayed` without writing a second frame; no second dedup scheme is
+/// introduced here, and the identity is never taken from the request unchecked.
 fn horizon_wake_operation_identity(
     request: &UserAutomationWakeHorizonPublication,
     entry: &UserAutomationWakeHorizonEntry,
+    fence: &RecordFence,
 ) -> Result<IdempotencyIdentity, UserAutomationRuntimeError> {
     let bytes = canonical_json_bytes(&(
         WAKE_HORIZON_OPERATION_DOMAIN,
-        request.identity.operation_id.as_str(),
-        request.identity.idempotency_key.as_str(),
         request.automation_id.as_str(),
         request.automation_revision.as_str(),
         request.revision_digest.as_str(),
         entry.occurrence_id.as_str(),
         entry.occurrence_key.as_str(),
         entry.source_digest.as_str(),
+        fence,
     ))
     .map_err(|error| rejected(format!("Wake horizon operation identity encoding: {error}")))?;
     let digest = sha256_hex(&bytes);
@@ -548,9 +595,10 @@ fn horizon_wake_record(
         &canonical_json_bytes(&request.state_fence)
             .map_err(|error| rejected(format!("Wake State Fence encoding: {error}")))?,
     );
+    let operation = horizon_wake_operation_identity(request, entry, &fence)?;
     Ok(WakeRecord {
         fence,
-        operation: horizon_wake_operation_identity(request, entry)?,
+        operation,
         // `UserAutomationWakeHorizonPublication::validate` has already proved
         // that the entry's intent wake id is this occurrence, which is the
         // identity `WakeRecord::validate` requires the record to carry.
