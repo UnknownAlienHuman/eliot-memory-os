@@ -841,6 +841,45 @@ impl CanaryRemovalOperation {
     /// is admitted only when no `REMOVE` row is still open, which is the
     /// terminal registry record's own resolved state together with the
     /// authoritative readback of every row before it.
+    ///
+    /// Only `action == Remove` rows are counted at all, so `Retained` never
+    /// reaches the counters: the guard above `continue`s past every retained or
+    /// unsupported row, and `validate` refuses `(Remove, Retained)` before it
+    /// ever calls this function. `Retained` is the admission-time disposition
+    /// of a row this removal deliberately leaves intact, carrying that row's
+    /// ownership evidence; it is a decision this plan already made, not an
+    /// unfinished row, so it can neither keep the operation open nor count as
+    /// work this operation performed.
+    ///
+    /// The other two dispositions are the row's own postcondition read back
+    /// from the resource's own owner, and each is accounted for deliberately:
+    ///
+    /// * `Absent` is the idempotent-resume outcome. `resolve_row` writes it when
+    ///   the row was still `Pending`, meaning the reconcile-before-execute pass
+    ///   already proved the exact admitted object authoritatively absent and no
+    ///   mutation was ever issued under this operation identity. The row's
+    ///   declared postcondition (`CanaryRemovalPostcondition::Absent`) is
+    ///   therefore satisfied, so it is closed and contributes nothing to
+    ///   `open`; and because this identity never issued a mutation for it, it is
+    ///   not evidence that this operation drove work, so it contributes nothing
+    ///   to `started` either.
+    /// * `Removed` is closed for the same reason, but it *is* evidence that this
+    ///   operation executed, so it keeps the stage at `Executing` while the
+    ///   terminal registry row is still open. Counting a resolved row as open
+    ///   instead would keep `open` above zero for every plan that removes
+    ///   anything, so `Completed` would be unreachable and the terminal registry
+    ///   retirement could never be recorded as a durable outcome.
+    ///
+    /// `open == 0` therefore means "no removal row is still unresolved", which
+    /// is what authorises the terminal commit. It does not mean "every resource
+    /// was deleted": the terminal registry retirement is a record about the
+    /// approved-generation activation record for this generation, and the
+    /// independently retried idempotent path above (`recover_canary_removal`
+    /// returning an already `Completed` projection untouched) is what makes
+    /// reaching it safe. What the terminal commit asserts is that every
+    /// `Remove` row's exact postcondition was observed from its own owner and
+    /// that no `Remove` row is still open - never that a retained resource was
+    /// removed.
     fn expected_stage(&self) -> Result<(), InstallationError> {
         let mut open = 0_usize;
         let mut unknown = 0_usize;
@@ -856,18 +895,32 @@ impl CanaryRemovalOperation {
                     started += 1;
                 }
                 // A resolved row is no longer open: its exact postcondition was
-                // already read back from the resource's own owner. It still
-                // proves that this operation executed, so a `REMOVED` row keeps
-                // the stage at `EXECUTING` while the terminal registry row is
-                // still pending. Counting a resolved row as open instead would
-                // keep `open` above zero for every plan that removes anything,
-                // so `Completed` would be unreachable and the terminal registry
+                // already read back from the resource's own owner. `Removed`
+                // still proves that this operation executed, so it keeps the
+                // stage at `EXECUTING` while the terminal registry row is still
+                // pending. Counting a resolved row as open instead would keep
+                // `open` above zero for every plan that removes anything, so
+                // `Completed` would be unreachable and the terminal registry
                 // retirement could never be recorded as a durable outcome.
-                CanaryRemovalEffectState::Resolved { disposition } => {
-                    if *disposition == CanaryRemovalEffectDisposition::Removed {
-                        started += 1;
-                    }
+                CanaryRemovalEffectState::Resolved {
+                    disposition: CanaryRemovalEffectDisposition::Removed,
+                } => {
+                    started += 1;
                 }
+                // `Absent` is the idempotent-resume outcome: the resource's own
+                // owner already proved the exact admitted object absent, so this
+                // operation identity never issued a mutation for the row. It is
+                // closed and it is not evidence that this operation drove work,
+                // so it contributes to neither counter. `Retained` is listed
+                // here only for exhaustiveness: `validate` refuses
+                // `(Remove, Retained)` and the guard above already skipped
+                // every non-`Remove` row, so it cannot reach this loop. See the
+                // method documentation for why each disposition is accounted
+                // for the way it is.
+                CanaryRemovalEffectState::Resolved {
+                    disposition: CanaryRemovalEffectDisposition::Absent
+                    | CanaryRemovalEffectDisposition::Retained,
+                } => {}
                 CanaryRemovalEffectState::Unknown { .. } => {
                     open += 1;
                     unknown += 1;
