@@ -1881,6 +1881,21 @@ impl DaemonComposition {
     /// workspace selector. The Host observer supplies filesystem/VCS facts;
     /// the scanner may return only its smallest privacy-boundary question
     /// until an installation-backed disclosure owner is supplied.
+    ///
+    /// Issue #2900 W12: this is the live attach/cold-start ingress that
+    /// reaches the scan port. The pre-owner question leg runs without a
+    /// store (no lease charge, no persistence). A completed scan must arrive
+    /// through the installation-bound durable owner
+    /// (`eliot_governor::InstallationScanDisclosureStore` bound via
+    /// `GovernorComposition::bind_installation_scan_store`) before
+    /// `BootstrapScanner::scan`, and the live terminal readiness receipt
+    /// must reference that durable handle through
+    /// `GovernorComposition::compile_cold_start_at_trigger`'s `scan_receipt`.
+    /// Caller: live `bins/eliotd/src/lib.rs:1872` for the question leg;
+    /// STITCH for the owner leg — the canonical
+    /// `Arc<dyn eliot_governor::ScanDisclosureRecordOwner>` (Kernel
+    /// `RedbRecoveryStore::open`) has no live `eliotd` thread yet, so
+    /// completion fails closed with no in-memory or loose-file fallback.
     fn attach_cold_start_question(
         ticket: &AgentActivationResolutionTicket,
         now: u64,
@@ -1913,9 +1928,14 @@ impl DaemonComposition {
                     .map_err(|error| DaemonError::Lifecycle(error.to_string()))?,
                 )
                 .map_err(|error| DaemonError::Lifecycle(error.to_string())),
-            eliot_workscope::BootstrapScanOutcome::Completed { .. } => Err(DaemonError::Lifecycle(
-                "cold-start scan completion requires installation owner readback".to_owned(),
-            )),
+            eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. } => {
+                persisted
+                    .validate()
+                    .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+                Err(DaemonError::Lifecycle(
+                    "cold-start scan completion requires installation-bound InstallationScanDisclosureStore before BootstrapScanner::scan (bound via GovernorComposition::bind_installation_scan_store from Arc<dyn ScanDisclosureRecordOwner>); terminal OnboardingReadinessReceipt must reference the durable ScanReceiptHandle via GovernorComposition::compile_cold_start_at_trigger scan_receipt; missing producer: Kernel RedbRecoveryStore owner handle has no live eliotd thread (STITCH)".to_owned(),
+                ))
+            }
         }
     }
 

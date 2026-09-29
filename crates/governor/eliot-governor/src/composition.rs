@@ -33,7 +33,7 @@ use crate::owner_closure_feed::{
     synchronize_owner_feed_with_quarantine_evidence,
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
-use crate::scan_disclosure_owner::InstallationScanDisclosureStore;
+use crate::scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 use crate::scope_identity_admission::{ensure_snapshot_fresh, require_fresh_matched_binding};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
@@ -85,6 +85,7 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_ors::ScanDisclosureRecordOwner;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
 use eliot_runtime_contracts::{
@@ -6264,6 +6265,44 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<TaskBindingInput, CompositionError> {
         candidate
             .admit_exploratory()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Binds the installation-owned durable scan disclosure store (issue
+    /// #2900, defect D + W12 construction ingress).
+    ///
+    /// The installation/session owner admits the contour (installation
+    /// identity plus admitted ORS object and generation) and supplies the
+    /// canonical Store/ORS owner handle; this entry only admits the binding
+    /// and maps it into [`InstallationScanDisclosureStore`]. The adapter owns
+    /// no filesystem, takes no paths, launches no processes and makes no
+    /// model calls. The bound store is the exact port
+    /// [`Self::run_cold_start_trigger_scan`] takes before
+    /// [`BootstrapScanner::scan`]: no trigger scan completes without the
+    /// owner receipt, and the live terminal readiness receipt references the
+    /// durable scan handle through
+    /// [`Self::compile_cold_start_at_trigger`]'s `scan_receipt`.
+    ///
+    /// Caller: STITCH. The canonical owner handle lives with the Kernel
+    /// installation owner (`RedbRecoveryStore::open` in
+    /// `bins/eliot-kernel/src/composition_bootstrap.rs` implements
+    /// `ScanDisclosureRecordOwner`); no live Governor/`eliotd` producer
+    /// threads that handle to this entry yet, so no live attach ingress
+    /// constructs the store today. A malformed contour fails closed without
+    /// touching the durable owner.
+    pub fn bind_installation_scan_store(
+        installation_id: &str,
+        ors_object_ref: &str,
+        ors_generation: u64,
+        owner: std::sync::Arc<dyn ScanDisclosureRecordOwner>,
+    ) -> Result<InstallationScanDisclosureStore, CompositionError> {
+        let contour = InstallationScanContour::bind(
+            installation_id.to_owned(),
+            ors_object_ref.to_owned(),
+            ors_generation,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        InstallationScanDisclosureStore::bind(contour, owner)
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
