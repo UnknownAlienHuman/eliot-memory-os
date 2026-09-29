@@ -170,7 +170,13 @@ use approved_generation_registry::{
 
 pub(crate) use integration_discovery::WindowsPathIdentity;
 pub use integration_discovery::{
-    IntegrationCategory, IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry,
+    AcceptedCatalogueContext, AcceptedInstallationSurvey, AcceptedIntegrationCatalogue,
+    BoundedProbeInvocation, BoundedSafeProbe, CatalogueAdmissionError, DISCOVERY_CATALOGUE_SCHEMA,
+    DISCOVERY_CATALOGUE_SETTING_KEY, INTEGRATION_SEED_FAMILIES, IntegrationCategory,
+    IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry, MAX_CATALOGUE_FAMILIES,
+    ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
+    admit_installation_survey_and_compile_change, integration_seed_family_ids,
+    load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
 };
 
 pub use managed_change_plan::{
