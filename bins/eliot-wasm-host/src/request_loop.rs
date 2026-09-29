@@ -1178,7 +1178,10 @@ fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), 
 /// producer's own [`COMMAND_SEQUENCE`] handover number, and judging its
 /// magnitude would be a policy this contract does not own.
 fn validate_command_coordination(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
-    match (frame.worker_command.is_some(), frame.command_sequence.is_some()) {
+    match (
+        frame.worker_command.is_some(),
+        frame.command_sequence.is_some(),
+    ) {
         // Observed command with no token: the producer must report the
         // handover it stamped, never leave the ordering evidence absent.
         (true, false) | (false, true) => Err(invalid("command-sequence")),
@@ -1760,7 +1763,10 @@ pub trait WasmHostRequestChannel {
     /// `None` means this source never validated an owner delivery for that
     /// operation — so the result event names no delivery and none is
     /// invented. The default has no external source and reports none.
-    fn accepted_control_delivery(&self, _operation: &str) -> Option<ControlDeliveryAcknowledgement> {
+    fn accepted_control_delivery(
+        &self,
+        _operation: &str,
+    ) -> Option<ControlDeliveryAcknowledgement> {
         None
     }
 
