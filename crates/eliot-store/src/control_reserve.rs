@@ -811,6 +811,7 @@ fn validate_label(value: &str, field: &'static str) -> Result<(), StoreReserveEr
 /// reports per dimension so the private row builder stays within the argument
 /// limit; every value keeps its exact meaning (partition totals and live
 /// available amounts, never a shared pool).
+#[derive(Clone, Copy, Debug)]
 struct ClaimedCapacities {
     normal_capacity: u64,
     protected_capacity: u64,
