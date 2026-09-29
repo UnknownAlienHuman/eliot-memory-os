@@ -150,7 +150,7 @@ pub enum CurrentUserStoreCredentialProvisionOutcome {
     },
 }
 
-/// Current-token Credential Manager provider for UserMode and PortableDev Store access.
+/// Current-token Credential Manager provider for `UserMode` and `PortableDev` Store access.
 ///
 /// The provider admits only the exact Store target namespace, re-observes the
 /// current token SID for every operation, and serializes cooperating writes
@@ -195,7 +195,7 @@ impl WindowsCurrentUserStoreCredentialProvider {
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
     ) -> Result<CurrentUserStoreCredentialObservation, crate::WindowsAdapterError> {
-        self.validate_binding(target, expected_owner_sid)?;
+        Self::validate_binding(target, expected_owner_sid)?;
         match credential_read_optional(target.as_str())? {
             Some(secret) if !secret.expose().is_empty() => {
                 Ok(CurrentUserStoreCredentialObservation::Present {
@@ -224,7 +224,7 @@ impl WindowsCurrentUserStoreCredentialProvider {
         expected_owner_sid: &PlatformHandle,
         secret: CredentialSecret,
     ) -> Result<CurrentUserStoreCredentialProvisionOutcome, crate::WindowsAdapterError> {
-        self.validate_binding(target, expected_owner_sid)?;
+        Self::validate_binding(target, expected_owner_sid)?;
         if secret.expose().is_empty() || secret.expose().len() > 2560 {
             return Err(crate::WindowsAdapterError::IdentityMismatch);
         }
@@ -282,7 +282,7 @@ impl WindowsCurrentUserStoreCredentialProvider {
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
     ) -> Result<CredentialSecret, crate::WindowsAdapterError> {
-        self.validate_binding(target, expected_owner_sid)?;
+        Self::validate_binding(target, expected_owner_sid)?;
         let secret = credential_read(target.as_str())?;
         Ok(secret)
     }
@@ -299,7 +299,7 @@ impl WindowsCurrentUserStoreCredentialProvider {
         expected_owner_sid: &PlatformHandle,
         expected_digest: &PlatformHandle,
     ) -> Result<(), crate::WindowsAdapterError> {
-        self.validate_binding(target, expected_owner_sid)?;
+        Self::validate_binding(target, expected_owner_sid)?;
         if expected_digest.as_str().len() != 64
             || !expected_digest
                 .as_str()
@@ -326,7 +326,6 @@ impl WindowsCurrentUserStoreCredentialProvider {
     }
 
     fn validate_binding(
-        &self,
         target: &PlatformHandle,
         expected_owner_sid: &PlatformHandle,
     ) -> Result<(), crate::WindowsAdapterError> {
