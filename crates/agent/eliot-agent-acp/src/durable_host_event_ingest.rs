@@ -51,6 +51,12 @@ use eliot_agent_api::{
     host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, route_fingerprint_digest_for,
 };
 use eliot_contracts::sha256_hex;
+use eliot_evaluation_contracts::{
+    CoverageBlindInterval, CoverageCompleteness, DenominatorOrigin, EvaluationContractError,
+    EventCounts, MaterialActionCoverage, ObservationCoverageManifest, RunFingerprint,
+    SequenceFaults, StreamCursorRange,
+};
+use eliot_receipts::ProofCeiling;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -153,6 +159,11 @@ pub enum IngestError {
     /// Canonical JSON encoding of an envelope failed.
     #[error("envelope digest encoding failed")]
     DigestEncoding,
+    /// A constructed coverage manifest failed contract validation. The exact
+    /// denominator fault travels in the typed contract error; nothing is
+    /// retained on this path.
+    #[error("coverage manifest failed validation")]
+    Manifest(#[from] EvaluationContractError),
 }
 
 /// Key of one durable event: its stream plus its sequence within the stream.
@@ -547,6 +558,44 @@ pub struct ResolvedHostComplianceFacts {
     pub records: Vec<ResolvedHostRecord>,
 }
 
+/// Caller-declared denominator half of one coverage manifest, joined by
+/// [`DurableHostEventJournal::record_coverage_manifest`] to the
+/// journal-measured cursor, count, fault, and blind-interval facts for one
+/// product/session/attempt/route fingerprint (issue #1936 W1, I7.23).
+///
+/// Every declaration here is evidence the journal cannot mint: the expected
+/// sources/classes, the observable versus unobservable action split, the
+/// missing-source reasons, the per-material-action coverage, the denominator
+/// origin and sampling policy, the claimed completeness, and the invalidation
+/// dependencies. The journal never invents these from model output, and the
+/// joined manifest still validates fail-closed, so a declared `COMPLETE`
+/// over measured gaps or unaccounted events is rejected typed.
+#[derive(Clone, Debug)]
+pub struct CoverageManifestPlan<'a> {
+    /// Fingerprint the constructed manifest is retained under.
+    pub fingerprint: &'a RunFingerprint,
+    /// Revision-pinned allowed-manifest digest the denominator binds.
+    pub allowed_manifest_digest: &'a str,
+    /// Declared expected event sources and classes.
+    pub expected_event_sources_and_event_classes: &'a [String],
+    /// Actions host observation can see.
+    pub observable_actions: &'a [String],
+    /// Actions host observation cannot see. Unobservable host-access coverage
+    /// forces the derived trace to `UNKNOWN` or `TAINTED`, never a
+    /// self-reported `PASS`.
+    pub unobservable_actions: &'a [String],
+    /// Declared missing-source reasons.
+    pub missing_source_reasons: &'a [String],
+    /// Declared per-material-action and effect-route coverage.
+    pub coverage_by_material_action_and_effect_route: &'a [MaterialActionCoverage],
+    /// Declared denominator origin and sampling policy.
+    pub denominator_origin_and_sampling_policy: &'a DenominatorOrigin,
+    /// Claimed completeness, checked against the measured facts.
+    pub completeness: CoverageCompleteness,
+    /// Declared invalidation dependencies.
+    pub invalidation_dependencies: &'a [String],
+}
+
 /// Admissible-raw staging request: the exact transport bytes plus the
 /// normalized envelope that must bind them.
 #[derive(Clone, Debug)]
@@ -746,6 +795,11 @@ pub struct DurableHostEventJournal {
     records: BTreeMap<(String, u64), DurableHostEventRecord>,
     dropped_gaps: Vec<BestEffortDropGap>,
     stored_bytes: u64,
+    /// Retained coverage denominators by product/session/attempt/route
+    /// fingerprint (issue #1936 W1). One validated manifest per fingerprint;
+    /// re-recording supersedes without deleting, and dependent traces
+    /// revalidate through their ledger invalidation handles.
+    coverage_manifests: BTreeMap<(String, String, String, String), ObservationCoverageManifest>,
 }
 
 impl DurableHostEventJournal {
@@ -921,6 +975,157 @@ impl DurableHostEventJournal {
             stream: self.cursor(stream_id),
             records,
         })
+    }
+
+    /// Fingerprint map key for one retained coverage manifest.
+    fn coverage_manifest_key(fingerprint: &RunFingerprint) -> (String, String, String, String) {
+        (
+            fingerprint.product_id.clone(),
+            fingerprint.session_id.clone(),
+            fingerprint.attempt_id.clone(),
+            fingerprint.route_fingerprint.clone(),
+        )
+    }
+
+    /// Constructs and retains the coverage denominator for one
+    /// product/session/attempt/route fingerprint (issue #1936 W1, I7.23).
+    ///
+    /// The caller declares the denominator halves the journal cannot observe
+    /// ([`CoverageManifestPlan`]); the journal measures the halves it owns:
+    /// per-stream expected cursor ranges from the durable cursors (commits
+    /// are contiguous from one, and cursor facts are never evicted, so each
+    /// committed stream binds `1..=last_durable`), received/applied/unknown
+    /// counts from the committed records (rejections stay typed
+    /// [`IngestError`] returns, never records), sequence gaps from the
+    /// retained best-effort drop gaps with one localized blind interval per
+    /// dropped sequence, and a fixed [`ProofCeiling::Observation`] ceiling
+    /// host observation never exceeds. Exact replays need no extra pass:
+    /// storage is keyed by source-event identity, so one stored record yields
+    /// exactly one counted event.
+    ///
+    /// The joined manifest validates through
+    /// [`ObservationCoverageManifest::validate`](eliot_evaluation_contracts::ObservationCoverageManifest::validate)
+    /// before it is retained: a caller-declared `COMPLETE` over measured
+    /// blind intervals or unaccounted events fails typed
+    /// ([`IngestError::Manifest`]) and is retained nowhere. Retention is
+    /// keyed by fingerprint and re-recording supersedes the retained
+    /// manifest; dependent traces revalidate through their ledger
+    /// invalidation handles, never by silently recovering.
+    ///
+    /// Any staged-but-uncommitted record reports
+    /// [`IngestError::NotCommitted`]: uncommitted facts might contain the
+    /// prohibited action, so they are never silently treated as absent from
+    /// the denominator.
+    pub fn record_coverage_manifest(
+        &mut self,
+        plan: &CoverageManifestPlan<'_>,
+    ) -> Result<(), IngestError> {
+        if plan.allowed_manifest_digest.trim().is_empty() {
+            return Err(IngestError::InvalidInput("plan.allowed_manifest_digest"));
+        }
+        if self
+            .records
+            .values()
+            .any(|record| !record.disposition.committed)
+        {
+            return Err(IngestError::NotCommitted);
+        }
+        let mut ranges = Vec::new();
+        for (stream_id, progress) in &self.progress {
+            if progress.last_durable_sequence == 0 {
+                continue;
+            }
+            ranges.push(StreamCursorRange {
+                stream: stream_id.clone(),
+                first_expected_cursor: 1,
+                last_expected_cursor: progress.last_durable_sequence,
+            });
+        }
+        if ranges.is_empty() {
+            return Err(IngestError::InvalidInput("coverage_manifest.streams"));
+        }
+        let mut received = 0u64;
+        let mut applied = 0u64;
+        for record in self.records.values() {
+            received += 1;
+            if record.disposition.applied_count > 0 {
+                applied += 1;
+            }
+        }
+        let mut blind_cursors: Vec<(String, u64, &'static str)> = self
+            .dropped_gaps
+            .iter()
+            .map(|gap| {
+                let reason = match gap.reason {
+                    BestEffortDropReason::ConflictingDuplicate => {
+                        "best-effort-drop:CONFLICTING_DUPLICATE"
+                    }
+                    BestEffortDropReason::StaleSequence => "best-effort-drop:STALE_SEQUENCE",
+                };
+                (gap.stream_id.clone(), gap.sequence, reason)
+            })
+            .collect();
+        blind_cursors.sort();
+        blind_cursors.dedup_by(|first, second| first.0 == second.0 && first.1 == second.1);
+        let blind_intervals_and_missing_source_reasons = blind_cursors
+            .into_iter()
+            .map(|(stream, sequence, reason)| CoverageBlindInterval {
+                stream,
+                first_missing_cursor: sequence,
+                last_missing_cursor: sequence,
+                reason: reason.to_owned(),
+            })
+            .collect();
+        let manifest = ObservationCoverageManifest {
+            fingerprint: plan.fingerprint.clone(),
+            allowed_manifest_digest: plan.allowed_manifest_digest.to_owned(),
+            expected_event_sources_and_event_classes: plan
+                .expected_event_sources_and_event_classes
+                .to_vec(),
+            observable_actions: plan.observable_actions.to_vec(),
+            unobservable_actions: plan.unobservable_actions.to_vec(),
+            first_and_last_expected_cursors_by_stream: ranges,
+            counts: EventCounts {
+                received,
+                applied,
+                rejected: 0,
+                unknown: received - applied,
+            },
+            sequence_faults: SequenceFaults {
+                gaps: self.dropped_gaps.len() as u64,
+                duplicates: 0,
+                reorders: 0,
+                payload_mutations: 0,
+            },
+            blind_intervals_and_missing_source_reasons,
+            missing_source_reasons: plan.missing_source_reasons.to_vec(),
+            coverage_by_material_action_and_effect_route: plan
+                .coverage_by_material_action_and_effect_route
+                .to_vec(),
+            denominator_origin_and_sampling_policy: plan
+                .denominator_origin_and_sampling_policy
+                .clone(),
+            completeness: plan.completeness,
+            proof_ceiling: ProofCeiling::Observation,
+            invalidation_dependencies: plan.invalidation_dependencies.to_vec(),
+        };
+        manifest.validate()?;
+        self.coverage_manifests
+            .insert(Self::coverage_manifest_key(&manifest.fingerprint), manifest);
+        Ok(())
+    }
+
+    /// Returns the retained coverage manifest for `fingerprint`, if one was
+    /// recorded by [`Self::record_coverage_manifest`]. Lookup is by exact
+    /// product/session/attempt/route match: a manifest recorded for another
+    /// fingerprint never serves this one.
+    #[must_use]
+    pub fn coverage_manifest(
+        &self,
+        fingerprint: &RunFingerprint,
+    ) -> Option<&ObservationCoverageManifest> {
+        self.coverage_manifests
+            .get(&Self::coverage_manifest_key(fingerprint))
     }
 
     /// Stages admissible raw bytes plus their normalized envelope.
