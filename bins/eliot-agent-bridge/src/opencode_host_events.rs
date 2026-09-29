@@ -762,8 +762,10 @@ where
         } => (port, bound_generation),
         HostEventsStartup::Unintroduced => return Err(HostEventsServiceError::Unintroduced),
     };
-    let socket = HostEventsListener::bind_loopback(port)?;
-    let listener = HostEventsListener::from_pre_bound(socket)?;
+    // ind_loopback binds the socket AND wraps it, re-proving the loopback
+    // address and refusing a zero port. Wrapping it a second time would bind
+    // a second socket and leave the first one owned by nobody.
+    let listener = HostEventsListener::bind_loopback(port)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
