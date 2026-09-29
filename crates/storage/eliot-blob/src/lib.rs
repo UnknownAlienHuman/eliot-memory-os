@@ -50,6 +50,10 @@ pub use backup_io::{
     complete_export, export_page, open_member, run_capture, seal_associated_data, seal_member,
     seal_nonce_context, verify_capture_record, verify_destination_scope,
 };
+mod control_reserve;
+pub use control_reserve::{
+    DISK_QUEUE_BOTTLENECK, DiskPermit, DiskPermitOperation, DiskReserve, DiskReserveError,
+};
 pub mod demand;
 pub mod key_ports;
 pub mod stream_sink;
