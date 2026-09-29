@@ -49,6 +49,7 @@ fn store_recovery_observe_terminal(code: &str) {
 /// internals.
 fn store_recovery_operation_label(operation: &HostRuntimeControlOperation) -> &'static str {
     match operation {
+        HostRuntimeControlOperation::RecoveryStatus => "recovery-status",
         HostRuntimeControlOperation::RestartKernel => "restart-kernel",
         HostRuntimeControlOperation::ReconcileKernelRestart => "reconcile-kernel-restart",
         HostRuntimeControlOperation::RecoverStore => "recover-store",

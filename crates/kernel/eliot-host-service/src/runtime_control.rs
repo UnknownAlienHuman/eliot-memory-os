@@ -40,6 +40,10 @@ pub const HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY: &str =
 const WIRE: &str = HOST_RUNTIME_CONTROL_WIRE;
 const UNKNOWN_REF_TAG: &str = "unknown";
 const UNKNOWN_REF_REASONS: &[&str] = &[
+    "recovery-status-validation",
+    "recovery-status-queue-lock",
+    "recovery-status-queue-full",
+    "recovery-status-queue-response",
     "kernel-restart-validation",
     "kernel-restart-queue-lock",
     "kernel-restart-queue-full",
@@ -81,6 +85,9 @@ const UNKNOWN_REF_REASONS: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum HostRuntimeControlOperation {
+    /// Read the bounded Host-owned recovery view for a caller whose Kernel
+    /// status path is unavailable. This operation has no lifecycle effects.
+    RecoveryStatus,
     RestartKernel,
     ReconcileKernelRestart,
     RecoverStore,
@@ -92,6 +99,7 @@ pub enum HostRuntimeControlOperation {
 
 fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
     match operation {
+        HostRuntimeControlOperation::RecoveryStatus => "RecoveryStatus",
         HostRuntimeControlOperation::RestartKernel => "RestartKernel",
         HostRuntimeControlOperation::ReconcileKernelRestart => "ReconcileKernelRestart",
         HostRuntimeControlOperation::RecoverStore => "RecoverStore",
@@ -108,6 +116,7 @@ fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static
 
 fn operation_unknown_prefix(operation: &HostRuntimeControlOperation) -> &'static str {
     match operation {
+        HostRuntimeControlOperation::RecoveryStatus => "recovery-status",
         HostRuntimeControlOperation::RestartKernel
         | HostRuntimeControlOperation::ReconcileKernelRestart => "kernel-restart",
         HostRuntimeControlOperation::RecoverStore
@@ -244,6 +253,7 @@ fn parse_runtime_control_unknown_ref(
         return None;
     }
     let operation = match operation_name.as_str() {
+        "RecoveryStatus" => HostRuntimeControlOperation::RecoveryStatus,
         "RestartKernel" => HostRuntimeControlOperation::RestartKernel,
         "ReconcileKernelRestart" => HostRuntimeControlOperation::ReconcileKernelRestart,
         "RecoverStore" => HostRuntimeControlOperation::RecoverStore,
@@ -746,6 +756,11 @@ impl HostStoreRecoveryReceipt {
     deny_unknown_fields
 )]
 pub enum HostRuntimeControlResponse {
+    RecoveryViewObserved {
+        mutation_digest: PlatformHandle,
+        request_digest: PlatformHandle,
+        view: KernelUnavailableRecoveryView,
+    },
     Restarted {
         receipt: HostKernelRestartReceipt,
     },
@@ -779,6 +794,243 @@ pub enum HostRuntimeControlResponse {
     Unknown {
         pending_ref: PlatformHandle,
     },
+}
+
+/// Bounded owner observation availability in the surviving Recovery View.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryAvailability {
+    /// The named owner source was read successfully for this response.
+    Available,
+    /// The source is explicitly unavailable for the current view.
+    Unavailable,
+    /// The source could not prove a current availability state.
+    Unknown,
+}
+
+/// Owner of one Recovery View observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryObservationOwner {
+    Host,
+    Watchdog,
+}
+
+/// Source that produced one Recovery View observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryObservationSource {
+    HostStateJournal,
+    HostObservedWatchdogHeartbeat,
+}
+
+/// Typed generation carried by an owner observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum RecoveryGeneration {
+    Host { lineage_id: String, sequence: u64 },
+    Kernel { lineage_id: String, sequence: u64 },
+    Watchdog { epoch: u64 },
+}
+
+/// Competent-owner observation metadata. A retained Watchdog heartbeat is
+/// represented as historical and unknown; it never becomes current liveness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryOwnerObservation {
+    pub observer: RecoveryObservationOwner,
+    pub subject: RecoveryObservationOwner,
+    pub source: RecoveryObservationSource,
+    pub generation: Option<RecoveryGeneration>,
+    pub observed_at_unix_ms: Option<u64>,
+    pub availability: RecoveryAvailability,
+    pub stale: bool,
+}
+
+impl RecoveryOwnerObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.observer, self.subject, self.source) {
+            (
+                RecoveryObservationOwner::Host,
+                RecoveryObservationOwner::Host,
+                RecoveryObservationSource::HostStateJournal,
+            ) => {
+                if !matches!(&self.generation, Some(RecoveryGeneration::Host { .. }))
+                    || self.availability != RecoveryAvailability::Available
+                    || self.stale
+                {
+                    return Err(
+                        "Host journal observation must be current and carry a Host generation"
+                            .to_owned(),
+                    );
+                }
+            }
+            (
+                RecoveryObservationOwner::Host,
+                RecoveryObservationOwner::Watchdog,
+                RecoveryObservationSource::HostObservedWatchdogHeartbeat,
+            ) => {
+                if !matches!(
+                    &self.generation,
+                    None | Some(RecoveryGeneration::Watchdog { .. })
+                ) || self.availability != RecoveryAvailability::Unknown
+                    || !self.stale
+                {
+                    return Err(
+                        "retained Watchdog heartbeat must remain Host-observed, unknown, and stale"
+                            .to_owned(),
+                    );
+                }
+            }
+            _ => return Err("recovery observation owner/subject/source mismatch".to_owned()),
+        }
+        if let Some(generation) = &self.generation {
+            match generation {
+                RecoveryGeneration::Host {
+                    lineage_id,
+                    sequence,
+                }
+                | RecoveryGeneration::Kernel {
+                    lineage_id,
+                    sequence,
+                } if lineage_id.trim().is_empty()
+                    || lineage_id.chars().any(char::is_control)
+                    || *sequence == 0 =>
+                {
+                    return Err("recovery generation is invalid".to_owned());
+                }
+                RecoveryGeneration::Watchdog { epoch: 0 } => {
+                    return Err("Watchdog recovery epoch is invalid".to_owned());
+                }
+                _ => {}
+            }
+        }
+        if self.availability == RecoveryAvailability::Available
+            && (self.generation.is_none() || self.observed_at_unix_ms.is_none() || self.stale)
+        {
+            return Err("available recovery observation must be current and bound".to_owned());
+        }
+        if self
+            .observed_at_unix_ms
+            .is_some_and(|observed_at| observed_at == 0)
+        {
+            return Err("recovery observation time is invalid".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// A previously retained ORS summary. The frontier is required so the view
+/// cannot present a historical summary as an unbounded current snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedOrsSummary {
+    pub generation: RecoveryGeneration,
+    pub observed_at_unix_ms: u64,
+    pub frontier: String,
+}
+
+/// Build identity available from the surviving Host composition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryBuildSummary {
+    pub host_package_version: String,
+    pub host_runtime_control_wire: String,
+    pub last_approved_kernel_artifact_sha256: Option<String>,
+}
+
+/// Generation information. Kernel process termination remains unknown unless
+/// a direct termination observation exists; a failed Kernel probe is not one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryGenerationSummary {
+    pub host_observation: RecoveryOwnerObservation,
+    pub host_journal_sequence: u64,
+    pub kernel_current_availability: RecoveryAvailability,
+    pub kernel_termination: RecoveryTerminationOutcome,
+    pub retained_kernel_generation: Option<RecoveryGeneration>,
+}
+
+/// Direct termination knowledge for a process contour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryTerminationOutcome {
+    StoppedConfirmed,
+    OutcomeUnknown,
+}
+
+/// Current ORS availability and any explicitly historical summary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryOrsSummary {
+    pub current_availability: RecoveryAvailability,
+    pub retained: Option<RetainedOrsSummary>,
+}
+
+/// External enforcement knowledge. Unknown enforcement is distinct from a
+/// confirmed stop and carries no claim that a tool process is running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExternalToolEnforcement {
+    EnforcementObserved,
+    EnforcementUnobserved,
+}
+
+/// Recovery deferral and incident state limited to operational observations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryIncidentSummary {
+    pub watchdog_observation: RecoveryOwnerObservation,
+    pub host_prior_kernel_unknown: bool,
+    pub external_tool_enforcement: ExternalToolEnforcement,
+    pub external_tool_termination: RecoveryTerminationOutcome,
+    pub semantic_task_recovery_deferred: bool,
+}
+
+/// The complete surviving Recovery View. Its four fields are the only
+/// categories admitted while the Kernel's current state is unavailable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelUnavailableRecoveryView {
+    pub build: RecoveryBuildSummary,
+    pub generation: RecoveryGenerationSummary,
+    pub ors: RecoveryOrsSummary,
+    pub incident: RecoveryIncidentSummary,
+}
+
+impl KernelUnavailableRecoveryView {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.build.host_package_version.trim().is_empty()
+            || self.build.host_runtime_control_wire.trim().is_empty()
+        {
+            return Err("recovery build identity is incomplete".to_owned());
+        }
+        if let Some(digest) = &self.build.last_approved_kernel_artifact_sha256
+            && !is_sha256_text(digest)
+        {
+            return Err("historical Kernel artifact digest is invalid".to_owned());
+        }
+        self.generation.host_observation.validate()?;
+        self.incident.watchdog_observation.validate()?;
+        if self.generation.kernel_current_availability != RecoveryAvailability::Unavailable
+            || self.generation.kernel_termination != RecoveryTerminationOutcome::OutcomeUnknown
+            || self.ors.current_availability != RecoveryAvailability::Unavailable
+            || self.incident.external_tool_enforcement
+                != ExternalToolEnforcement::EnforcementUnobserved
+            || self.incident.external_tool_termination != RecoveryTerminationOutcome::OutcomeUnknown
+            || !self.incident.semantic_task_recovery_deferred
+        {
+            return Err("kernel-unavailable recovery view exceeds its evidence".to_owned());
+        }
+        if let Some(retained) = &self.ors.retained
+            && (retained.observed_at_unix_ms == 0
+                || retained.frontier.trim().is_empty()
+                || retained.frontier.chars().any(char::is_control))
+        {
+            return Err("retained ORS summary lacks a valid historical frontier".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// Exact durable Host queue observation returned for one runtime-control request.
@@ -890,6 +1142,18 @@ fn validate_user_automation_response(
 }
 
 impl HostRuntimeControlResponse {
+    /// Bind the typed Recovery View to this read-only Host status request.
+    pub fn recovery_view_observed_for(
+        request: &HostRuntimeControlRequest,
+        view: KernelUnavailableRecoveryView,
+    ) -> Self {
+        Self::RecoveryViewObserved {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            view,
+        }
+    }
+
     pub fn restarted_for(
         request: &HostRuntimeControlRequest,
         receipt: HostKernelRestartReceipt,
@@ -995,6 +1259,15 @@ impl HostRuntimeControlResponse {
 
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::RecoveryViewObserved {
+                mutation_digest,
+                request_digest,
+                view,
+            } => {
+                validate_runtime_control_digest(mutation_digest, "mutation_digest")?;
+                validate_runtime_control_digest(request_digest, "request_digest")?;
+                view.validate()
+            }
             Self::Restarted { receipt, .. } => receipt.validate(),
             Self::StoreRecovered { receipt, .. } => receipt.validate(),
             Self::UserAutomationOccurrenceAdmitted {
@@ -1085,6 +1358,15 @@ pub fn response_matches_request(
         return false;
     }
     match response {
+        HostRuntimeControlResponse::RecoveryViewObserved {
+            mutation_digest,
+            request_digest,
+            ..
+        } => {
+            request.operation == HostRuntimeControlOperation::RecoveryStatus
+                && *mutation_digest == request.mutation_digest
+                && *request_digest == request.request_digest
+        }
         HostRuntimeControlResponse::Restarted { receipt } => {
             receipt.request_digest == request.request_digest
                 && receipt.mutation_digest == request.mutation_digest
@@ -1387,6 +1669,9 @@ pub fn runtime_control_response_frame(
         .validate()
         .map_err(|_| "SessionFenced".to_owned())?;
     let digest = match response {
+        HostRuntimeControlResponse::RecoveryViewObserved { request_digest, .. } => {
+            request_digest.as_str().to_owned()
+        }
         HostRuntimeControlResponse::Restarted { receipt, .. } => {
             receipt.request_digest.as_str().to_owned()
         }
@@ -1462,6 +1747,11 @@ pub fn decode_runtime_control_response_frame(
         return Err("SessionFenced".to_owned());
     }
     match &response {
+        HostRuntimeControlResponse::RecoveryViewObserved { request_digest, .. } => {
+            if frame_request_id.as_str() != request_digest.as_str() {
+                return Err("SessionFenced".to_owned());
+            }
+        }
         HostRuntimeControlResponse::Restarted { receipt, .. } => {
             if frame_request_id.as_str() != receipt.request_digest.as_str() {
                 return Err("SessionFenced".to_owned());

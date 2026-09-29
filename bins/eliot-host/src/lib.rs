@@ -40,6 +40,8 @@ mod host_job_launch;
 #[cfg(windows)]
 mod introduction_readback;
 #[cfg(windows)]
+mod kernel_unavailable_view;
+#[cfg(windows)]
 mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
@@ -1543,9 +1545,90 @@ pub use eliot_host_control_endpoint::{
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
 pub use eliot_host_service::runtime_control::{
-    HostKernelRestartReceipt, HostRuntimeControlOperation, HostRuntimeControlRequest,
-    HostRuntimeControlResponse, HostStoreRecoveryReceipt,
+    ExternalToolEnforcement, HostKernelRestartReceipt, HostRuntimeControlOperation,
+    HostRuntimeControlRequest, HostRuntimeControlResponse, HostStoreRecoveryReceipt,
+    KernelUnavailableRecoveryView, RecoveryAvailability, RecoveryBuildSummary, RecoveryGeneration,
+    RecoveryGenerationSummary, RecoveryIncidentSummary, RecoveryObservationOwner,
+    RecoveryObservationSource, RecoveryOrsSummary, RecoveryOwnerObservation,
+    RecoveryTerminationOutcome, RetainedOrsSummary,
 };
+#[cfg(windows)]
+use eliot_host_service::runtime_control::{
+    decode_runtime_control_response_frame, response_matches_request, runtime_control_request_frame,
+};
+
+/// Requests the bounded Recovery View from the surviving Host over its
+/// authenticated runtime-control endpoint.
+///
+/// The Host process is authenticated as `LocalSystem`; request and response
+/// identities are then checked by the canonical runtime-control codec. A
+/// delivery timeout or malformed response remains an unknown status result.
+#[cfg(windows)]
+pub fn request_authenticated_kernel_unavailable_recovery_view(
+    timeout: std::time::Duration,
+) -> Result<KernelUnavailableRecoveryView, String> {
+    let request_id = PlatformHandle::new(format!("recovery-status:{}", Uuid::new_v4()))
+        .map_err(|error| error.to_string())?;
+    let request =
+        HostRuntimeControlRequest::new(HostRuntimeControlOperation::RecoveryStatus, request_id)?;
+    let connection_id = format!("recovery-status-{}", Uuid::new_v4());
+    let expectation = eliot_platform_windows::NamedPipePeerExpectation::new("S-1-5-18", 0)
+        .map_err(|error| error.to_string())?;
+    let limits = TransportLimits::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        tokio::time::timeout(timeout, async {
+            let mut transport = NamedPipeTransport::connect_authenticated(
+                HOST_RUNTIME_CONTROL_PIPE,
+                timeout,
+                &expectation,
+            )
+            .await
+            .map_err(|error| format!("connect to authenticated Host status endpoint: {error}"))?;
+            let frame = runtime_control_request_frame(connection_id, &request)?;
+            match transport
+                .send_frame(&frame, limits)
+                .await
+                .map_err(|error| format!("send authenticated Host status request: {error}"))?
+            {
+                DeliveryOutcome::Delivered => {}
+                DeliveryOutcome::UnknownOutcome => {
+                    return Err(
+                        "authenticated Host status request delivery outcome is unknown".to_owned(),
+                    );
+                }
+            }
+            let frame = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| format!("receive authenticated Host status response: {error}"))?;
+            let response = decode_runtime_control_response_frame(&frame)?;
+            if !response_matches_request(&request, &response) {
+                return Err("authenticated Host status response binding failed".to_owned());
+            }
+            match response {
+                HostRuntimeControlResponse::RecoveryViewObserved { view, .. } => Ok(view),
+                HostRuntimeControlResponse::Unknown { pending_ref, .. } => Err(format!(
+                    "Host could not produce the Recovery View: {pending_ref}"
+                )),
+                _ => Err("Host returned a non-status runtime-control response".to_owned()),
+            }
+        })
+        .await
+        .map_err(|_| "authenticated Host status request timed out; outcome is unknown".to_owned())?
+    })
+}
+
+#[cfg(not(windows))]
+pub fn request_authenticated_kernel_unavailable_recovery_view(
+    _timeout: std::time::Duration,
+) -> Result<KernelUnavailableRecoveryView, String> {
+    Err("authenticated Host runtime-control status is Windows-only".to_owned())
+}
+
 #[cfg(windows)]
 use launch_artifact::{
     LaunchLease, approved_locator, approved_phase_b_destination_locator, open_launch_lease,
@@ -8010,6 +8093,28 @@ impl HostComposition {
     /// Returns an error if the durable Host state cannot be loaded.
     pub fn snapshot(&self) -> Result<HostState, HostError> {
         self.journal.snapshot().map_err(HostError::Journal)
+    }
+
+    /// Builds the bounded Recovery View from Host-owned journal state and the
+    /// last Host-observed Watchdog heartbeat. The heartbeat remains historical
+    /// and unknown; this path neither probes Kernel ORS nor confirms Kernel or
+    /// external-tool termination.
+    #[cfg(windows)]
+    pub fn kernel_unavailable_recovery_view(
+        &self,
+    ) -> Result<KernelUnavailableRecoveryView, HostError> {
+        let state = self.snapshot()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| HostError::Platform(error.to_string()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| HostError::Platform("recovery observation time exceeds u64".to_owned()))?;
+        kernel_unavailable_view::build_kernel_unavailable_view(
+            &state,
+            self.launch_options.host_state_root(),
+            now_ms,
+        )
     }
 
     /// Returns the installation-owned approved-generation registry.

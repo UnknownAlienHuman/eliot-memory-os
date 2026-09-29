@@ -2790,16 +2790,53 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
     }
     let runtime_health = match load_authenticated_kernel_runtime_health() {
         Ok(runtime_health) => runtime_health,
-        Err(error) => {
-            let (code, detail) = match error {
-                AuthenticatedRuntimeHealthError::Unavailable(detail) => {
-                    ("KERNEL_RUNTIME_HEALTH_UNAVAILABLE", detail)
-                }
-                AuthenticatedRuntimeHealthError::Invalid(detail) => {
-                    ("KERNEL_RUNTIME_HEALTH_INVALID", detail)
-                }
+        Err(AuthenticatedRuntimeHealthError::Unavailable(kernel_detail)) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let recovery_view = if remaining.is_zero() {
+                Err("status deadline elapsed before querying the surviving Host".to_owned())
+            } else {
+                eliot_host::request_authenticated_kernel_unavailable_recovery_view(remaining)
             };
-            write_runtime_status_error(code, &detail, false);
+            match recovery_view {
+                Ok(view) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "KERNEL_CURRENT_STATE_UNAVAILABLE_RECOVERY_VIEW",
+                            "kernel_health_probe": {
+                                "availability": "UNKNOWN",
+                                "termination": "OUTCOME_UNKNOWN",
+                                "detail": kernel_detail,
+                            },
+                            "recovery_view": view,
+                            "deadline_exceeded": std::time::Instant::now() >= deadline,
+                            "completed": false,
+                            "scope": INSTALLATION_SCOPE,
+                        }))?
+                    );
+                }
+                Err(host_detail) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "RECOVERY_VIEW_UNAVAILABLE",
+                            "kernel_health_probe": {
+                                "availability": "UNKNOWN",
+                                "termination": "OUTCOME_UNKNOWN",
+                                "detail": kernel_detail,
+                            },
+                            "host_recovery_status_error": host_detail,
+                            "deadline_exceeded": std::time::Instant::now() >= deadline,
+                            "completed": false,
+                            "scope": INSTALLATION_SCOPE,
+                        }))?
+                    );
+                }
+            }
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+        Err(AuthenticatedRuntimeHealthError::Invalid(detail)) => {
+            write_runtime_status_error("KERNEL_RUNTIME_HEALTH_INVALID", &detail, false);
             return Ok(INVALID_REQUEST_EXIT);
         }
     };

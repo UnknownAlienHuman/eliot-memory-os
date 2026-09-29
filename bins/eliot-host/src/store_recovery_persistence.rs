@@ -70,6 +70,7 @@ fn store_recovery_persist_observe(detail: &str) {
 #[cfg(windows)]
 fn store_persist_operation_label(operation: &HostRuntimeControlOperation) -> &'static str {
     match operation {
+        HostRuntimeControlOperation::RecoveryStatus => "recovery-status",
         HostRuntimeControlOperation::RestartKernel => "restart-kernel",
         HostRuntimeControlOperation::ReconcileKernelRestart => "reconcile-kernel-restart",
         HostRuntimeControlOperation::RecoverStore => "recover-store",

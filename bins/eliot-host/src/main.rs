@@ -1317,6 +1317,7 @@ fn spawn_runtime_control(
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeControlDispatch {
+    RecoveryStatus,
     Kernel,
     Store,
     ReactiveContext,
@@ -1326,6 +1327,7 @@ enum RuntimeControlDispatch {
 #[cfg(windows)]
 fn runtime_control_dispatch(operation: &HostRuntimeControlOperation) -> RuntimeControlDispatch {
     match operation {
+        HostRuntimeControlOperation::RecoveryStatus => RuntimeControlDispatch::RecoveryStatus,
         HostRuntimeControlOperation::RestartKernel
         | HostRuntimeControlOperation::ReconcileKernelRestart => RuntimeControlDispatch::Kernel,
         HostRuntimeControlOperation::RecoverStore
@@ -1525,7 +1527,9 @@ fn runtime_control_trigger_class(
     operation: &HostRuntimeControlOperation,
 ) -> ActivationTriggerClass {
     match runtime_control_dispatch(operation) {
-        RuntimeControlDispatch::Kernel => ActivationTriggerClass::ApprovedMaintenanceJob,
+        RuntimeControlDispatch::RecoveryStatus | RuntimeControlDispatch::Kernel => {
+            ActivationTriggerClass::ApprovedMaintenanceJob
+        }
         RuntimeControlDispatch::Store => ActivationTriggerClass::ProtectedExternalEffect,
         RuntimeControlDispatch::ReactiveContext => ActivationTriggerClass::AgentBridgeAttach,
         RuntimeControlDispatch::UserAutomation => ActivationTriggerClass::AgentAttempt,
@@ -1553,8 +1557,25 @@ fn process_runtime_control_requests(
             Err(_) => None,
         };
         let Some(envelope) = request else { break };
-        let trigger = runtime_control_trigger_class(&envelope.request().operation);
+        let trigger = (envelope.request().operation != HostRuntimeControlOperation::RecoveryStatus)
+            .then(|| runtime_control_trigger_class(&envelope.request().operation));
         let response = match runtime_control_dispatch(&envelope.request().operation) {
+            RuntimeControlDispatch::RecoveryStatus => {
+                match host.kernel_unavailable_recovery_view() {
+                    Ok(view) => HostRuntimeControlResponse::recovery_view_observed_for(
+                        envelope.request(),
+                        view,
+                    ),
+                    Err(_) => HostRuntimeControlResponse::unknown_for(
+                        envelope.request(),
+                        eliot_host_service::runtime_control::operation_unknown_ref(
+                            &HostRuntimeControlOperation::RecoveryStatus,
+                            "validation",
+                            envelope.request(),
+                        ),
+                    ),
+                }
+            }
             RuntimeControlDispatch::Kernel => {
                 host.handle_kernel_restart_request(envelope.request())
             }
@@ -1568,7 +1589,9 @@ fn process_runtime_control_requests(
         };
         // The authenticated request digest is the durable trigger evidence; the
         // endpoint already proved the peer before queueing this envelope.
-        observed.push((trigger, envelope.request().request_digest.clone()));
+        if let Some(trigger) = trigger {
+            observed.push((trigger, envelope.request().request_digest.clone()));
+        }
         let _ = envelope.respond(response);
     }
     observed
