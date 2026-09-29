@@ -72,6 +72,7 @@ pub mod execution_metrics;
 pub mod kernel_audit;
 mod kernel_build_contract;
 mod kernel_config;
+mod operator_binding;
 /// Kernel structured diagnostics facade (F-LOG-KERNEL-0, #895): compiled
 /// once here and imported by the binary; later leaves extend through their
 /// own serialized turns, never a second copy.
@@ -650,6 +651,7 @@ pub struct KernelComposition {
     /// key yield `IDENTITY_CONFLICT` — all before any ORS/store mutation,
     /// ordering-sequence allocation, or `write_intent_id` mint.
     pre_stage_identity_cache: Mutex<eliot_kernel_service::PreStageIdentityCache>,
+    operator_bindings: Mutex<operator_binding::KernelOperatorBindings>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
     #[cfg(windows)]

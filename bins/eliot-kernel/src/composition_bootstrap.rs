@@ -1514,6 +1514,7 @@ impl KernelComposition {
             pre_stage_identity_cache: Mutex::new(
                 eliot_kernel_service::PreStageIdentityCache::default(),
             ),
+            operator_bindings: Mutex::new(super::operator_binding::KernelOperatorBindings::default()),
             daemon_runtime: Mutex::new(DaemonRuntimeState {
                 status: DaemonRuntimeStatus::NotLaunched,
                 receipt: None,
