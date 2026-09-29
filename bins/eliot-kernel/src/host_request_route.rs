@@ -7986,7 +7986,9 @@ pub(crate) fn check_retained_disclosure_permission(
         return Err(TransportError::SessionFenced);
     }
     // Existing validator, originally recorded values, no recomputation.
-    record.validate().map_err(|_| TransportError::SessionFenced)?;
+    record
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
     if !session
         .authority_epoch
         .is_same_authority(&record.authority_epoch)
