@@ -17,6 +17,10 @@
 //! Building or validating a payload performs no IO, mints no authority and
 //! proves nothing about persistence. Durable capture and readback belong to the
 //! Governor/Task Controller producer and to the Store.
+//!
+//! A retained checkpoint plus its resume-time revalidation
+//! ([`RetainedHandoffCheckpoint`]) is the Resume input the decision gate
+//! consumes instead of treating compaction as a fresh authority source.
 
 #![forbid(unsafe_code)]
 
@@ -29,7 +33,8 @@ use thiserror::Error;
 
 use crate::{
     AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCausalLink, HandoffCheckpointId,
-    HandoffContinuity, PublicReference, RevisionId, WorkItemId, validate_collection, validate_text,
+    HandoffContinuity, PublicReference, RevisionId, TargetId, WorkItemId, validate_collection,
+    validate_text,
 };
 
 /// Stable contract name of the pre-compaction handoff checkpoint payload.
@@ -46,6 +51,12 @@ pub const HANDOFF_CHECKPOINT_CONTRACT_VERSION: ContractVersion = ContractVersion
 /// The reference locates a persisted checkpoint payload; it is neither the
 /// payload itself nor a persistence proof.
 pub const HANDOFF_CHECKPOINT_REFERENCE_KIND: &str = "handoff-checkpoint";
+
+/// Required [`PublicReference::kind`] of a resume-time revalidation record.
+///
+/// The revalidation names the retained checkpoint it was computed over. It is
+/// neither a fresh authority grant nor a rebuilt View (I12.17).
+pub const HANDOFF_REVALIDATION_REFERENCE_KIND: &str = "handoff-revalidation";
 
 /// Typed disposition of a unit the checkpoint cannot present as exact.
 ///
@@ -530,6 +541,186 @@ impl HandoffCheckpoint {
     }
 }
 
+/// Resume-time revalidation of one retained checkpoint (I12.17, I7.15).
+///
+/// The record compares the generations retained at the capture boundary
+/// against the generations the resume owner observes now. A changed member
+/// fences only the dependent permissions and content, never unrelated work:
+/// the flags below name exactly which members changed, so the resume owner
+/// rebuilds a current delta View and obtains new authority for those members
+/// instead of restamping the retained fence. Recording a change is not
+/// refusing the resume; a binding or fence-shape failure is.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffResumeRevalidation {
+    /// Identity of the retained checkpoint this revalidation was computed over.
+    pub checkpoint_id: HandoffCheckpointId,
+    /// Continuity the retained transfer supports.
+    pub continuity: HandoffContinuity,
+    /// Attempt that was running at the capture boundary.
+    pub source_attempt_id: AgentAttemptId,
+    /// Generations the resume owner observes now.
+    pub current_generations: HandoffSourceGenerations,
+    /// Whether the scope generation still matches the retained boundary.
+    pub scope_changed: bool,
+    /// Whether the world generation still matches the retained boundary.
+    pub world_changed: bool,
+    /// Whether the module generation still matches the retained boundary.
+    pub module_changed: bool,
+    /// Whether the route generation still matches the retained boundary.
+    pub route_changed: bool,
+    /// Whether the current fence still equals the retained fence.
+    pub fence_changed: bool,
+    /// Fence the resume owner observes now.
+    pub current_fence: StateFence,
+}
+
+impl HandoffResumeRevalidation {
+    /// Returns whether any retained generation changed, so dependent
+    /// permissions and content must be fenced and rebuilt from canonical
+    /// state rather than resumed under the retained fence.
+    pub fn has_changed_generation(&self) -> bool {
+        self.scope_changed || self.world_changed || self.module_changed || self.route_changed
+    }
+}
+
+/// Retained checkpoint plus its resume-time revalidation (I12.17, I7.15).
+///
+/// This is the Resume input the decision gate consumes instead of treating
+/// compaction as a fresh authority source. The resume owner carries this
+/// value and feeds its references into the phase-aware lineage check
+/// (`validate_for_phase` at `Resume` via `admit_material_decision`):
+///
+/// - the lineage `handoff` slot cites [`Self::checkpoint_ref`];
+/// - already-due effect execution and outcome records that are still
+///   unreconciled stay [`HandoffEffectDisposition::OutcomeUnknown`] here,
+///   which is the evidence behind an explicit unknown lineage slot, never a
+///   silent success;
+/// - the lineage `omissions` slot cites the retained [`HandoffKnownLoss`] and
+///   [`HandoffUnavailableMember`] entries.
+///
+/// Building or checking this value performs no IO, mints no authority and
+/// reads no owner: the current generations and fence are caller-supplied
+/// observations. When the Kernel cannot read back current authority, the
+/// caller must refuse the resume instead of calling
+/// [`Self::revalidate_for_resume`] with unobserved inputs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedHandoffCheckpoint {
+    /// Retained complete payload from the capture boundary.
+    pub checkpoint: HandoffCheckpoint,
+    /// Causal link the retained payload is bound to.
+    pub link: HandoffCausalLink,
+    /// Attempt-identity evidence the link was admitted under.
+    pub attempt_identity: HandoffAttemptIdentity,
+    /// Resume-time revalidation of the retained payload.
+    pub revalidation: HandoffResumeRevalidation,
+}
+
+impl RetainedHandoffCheckpoint {
+    /// Revalidates a retained checkpoint for resume under current observations.
+    ///
+    /// Runs the full checkpoint-to-link binding (including the continuity
+    /// attempt-identity rule) and records the retained-to-current generation
+    /// and fence comparison. A changed generation is recorded, not refused:
+    /// the resume owner fences the dependent authority and rebuilds. A
+    /// binding mismatch or an ill-formed current fence fails closed.
+    pub fn revalidate_for_resume(
+        checkpoint: HandoffCheckpoint,
+        link: HandoffCausalLink,
+        attempt_identity: HandoffAttemptIdentity,
+        current_generations: HandoffSourceGenerations,
+        current_fence: StateFence,
+    ) -> Result<Self, HandoffCheckpointError> {
+        checkpoint.validate_binding(&link, &attempt_identity)?;
+        current_fence
+            .validate()
+            .map_err(|_| ContractError::StaleFence)?;
+        let retained_generations = checkpoint.source_generations;
+        let revalidation = HandoffResumeRevalidation {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            continuity: checkpoint.continuity,
+            source_attempt_id: checkpoint.source_attempt_id.clone(),
+            current_generations,
+            scope_changed: retained_generations.scope != current_generations.scope,
+            world_changed: retained_generations.world != current_generations.world,
+            module_changed: retained_generations.module != current_generations.module,
+            route_changed: retained_generations.route != current_generations.route,
+            fence_changed: checkpoint.state_fence != current_fence,
+            current_fence,
+        };
+        Ok(Self {
+            checkpoint,
+            link,
+            attempt_identity,
+            revalidation,
+        })
+    }
+
+    /// Re-checks a retained value whose fields may have been reassigned after
+    /// [`Self::revalidate_for_resume`] built it.
+    ///
+    /// Re-runs the binding, the current-fence shape and the agreement between
+    /// the revalidation record and the retained payload. A revalidation that
+    /// no longer describes its payload is refused.
+    pub fn validate(&self) -> Result<(), HandoffCheckpointError> {
+        self.checkpoint
+            .validate_binding(&self.link, &self.attempt_identity)?;
+        self.revalidation
+            .current_fence
+            .validate()
+            .map_err(|_| ContractError::StaleFence)?;
+        let retained_generations = self.checkpoint.source_generations;
+        let current_generations = self.revalidation.current_generations;
+        if self.revalidation.checkpoint_id != self.checkpoint.checkpoint_id
+            || self.revalidation.continuity != self.checkpoint.continuity
+            || self.revalidation.source_attempt_id != self.checkpoint.source_attempt_id
+            || self.revalidation.scope_changed
+                != (retained_generations.scope != current_generations.scope)
+            || self.revalidation.world_changed
+                != (retained_generations.world != current_generations.world)
+            || self.revalidation.module_changed
+                != (retained_generations.module != current_generations.module)
+            || self.revalidation.route_changed
+                != (retained_generations.route != current_generations.route)
+            || self.revalidation.fence_changed
+                != (self.checkpoint.state_fence != self.revalidation.current_fence)
+        {
+            return Err(HandoffCheckpointError::RevalidationCheckpointMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical reference the lineage `handoff` slot cites: the
+    /// checkpoint kind and identity under the retained plan revision.
+    ///
+    /// The reference locates the retained payload; like every reference here
+    /// it carries no digest of its own and proves no persistence.
+    pub fn checkpoint_ref(&self) -> Result<PublicReference, HandoffCheckpointError> {
+        let reference = PublicReference {
+            kind: HANDOFF_CHECKPOINT_REFERENCE_KIND.to_owned(),
+            id: TargetId::new(self.checkpoint.checkpoint_id.as_str())?,
+            revision: self.checkpoint.source_plan_revision.clone(),
+            digest: None,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Returns the reference that names this revalidation, for the link's
+    /// `post_resume_revalidation_ref` and the lineage evidence trail.
+    pub fn revalidation_ref(&self) -> Result<PublicReference, HandoffCheckpointError> {
+        let reference = PublicReference {
+            kind: HANDOFF_REVALIDATION_REFERENCE_KIND.to_owned(),
+            id: TargetId::new(self.revalidation.checkpoint_id.as_str())?,
+            revision: self.checkpoint.source_plan_revision.clone(),
+            digest: None,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+}
+
 /// Validates a list of public references and rejects repeated units.
 fn validate_references(
     references: &[PublicReference],
@@ -632,4 +823,7 @@ pub enum HandoffCheckpointError {
     /// The link and the payload were captured under different state fences.
     #[error("the causal link was captured under a different state fence")]
     StateFenceMismatch,
+    /// The resume revalidation no longer describes the retained payload.
+    #[error("the resume revalidation does not describe the retained checkpoint payload")]
+    RevalidationCheckpointMismatch,
 }
