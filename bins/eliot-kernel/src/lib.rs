@@ -2790,43 +2790,6 @@ impl KernelComposition {
         }
     }
 
-    /// Material/Critical authority admission for one Governance Profile.
-    /// Startup completeness is checked first with its named prerequisite;
-    /// the profile ceiling alone decides once startup is complete.
-    ///
-    /// This is the startup-gate half of the Material decision. It is not the
-    /// production Material/Critical boundary: every production effect,
-    /// including origin-control decide, goes through
-    /// [`Self::admit_material_authority_for_governor_issued_fence`], which
-    /// first requires the current Governor-issued governance profile. It
-    /// stands neither for that recorded profile nor for current independent
-    /// Watchdog coverage: a protected effect that must be admitted as
-    /// independently supervised additionally passes
-    /// [`Self::admit_material_authority_for_fence`], which verifies the live
-    /// Watchdog branch for the exact target fence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::kernel_unavailability::AdmissionDenial::KernelUnavailable`]
-    /// as a platform error when the Kernel is unavailable, otherwise the
-    /// blocking [`StartupRejection`] or the profile-ceiling rejection.
-    pub fn admit_material_authority(
-        &self,
-        profile: GovernanceProfile,
-    ) -> Result<(), KernelServiceError> {
-        crate::kernel_unavailability::admit_external_material_authority(
-            self.observed_kernel_availability(),
-        )
-        .map_err(|denial| KernelServiceError::Platform(denial.to_string()))?;
-        let coordinator = self
-            .startup_coordinator
-            .lock()
-            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
-        coordinator
-            .admit_material_authority(profile)
-            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
-    }
-
     /// Normal canonical-write admission through the startup coordinator.
     /// Inspection remains allowed; a blocked write fails with the named
     /// unmet startup prerequisite.
