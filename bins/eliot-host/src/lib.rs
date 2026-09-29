@@ -6969,21 +6969,24 @@ impl HostComposition {
         // values/env/payloads. Single terminal via guard.
         host_lifecycle_observe_scm(BOUNDARY_CREDENTIAL_CONTROL_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_CREDENTIAL_CONTROL_TERMINAL);
-        let launch = self
-            .registry
-            .pending_activation()
-            .map(|pending| &pending.manifest.runtime_launch)
-            .or_else(|| {
-                self.registry
-                    .active()
-                    .map(|active| &active.manifest.runtime_launch)
-            })
-            .ok_or_else(|| {
-                HostError::RecoveryRequired(
-                    "credential control has no selected approved generation".to_owned(),
+        let (launch, expected_transaction_id, expected_plan_digest) =
+            if let Some(pending) = self.registry.pending_activation() {
+                (
+                    pending.manifest.runtime_launch.clone(),
+                    pending.transaction_id.clone(),
+                    pending.plan_digest.clone(),
                 )
-            })?
-            .clone();
+            } else if let Some(active) = self.registry.active() {
+                (
+                    active.manifest.runtime_launch.clone(),
+                    active.approval.transaction_id().clone(),
+                    active.approval.installer_plan_digest().clone(),
+                )
+            } else {
+                return Err(HostError::RecoveryRequired(
+                    "credential control has no selected approved generation".to_owned(),
+                ));
+            };
         let capability = match launch.profile {
             InstallationProfile::SystemService => Some(
                 self.owner_lease
@@ -7001,6 +7004,8 @@ impl HostComposition {
             launch,
             selected_roots,
             capability,
+            expected_transaction_id,
+            expected_plan_digest,
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         )
         .map_err(HostError::Platform)?;
