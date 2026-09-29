@@ -106,6 +106,12 @@ pub fn read_bounded_artifact(path: &Path) -> Result<(Vec<u8>, Preflight), Prefli
     reject_reparse_components(&path)?;
     let file = open_artifact_file(&path)
         .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
+    // Post-open final-component check: the pre-open walk above is raceable,
+    // so the final component is re-inspected once the handle exists. A link
+    // swapped in after the walk is rejected here instead of being followed.
+    // Ancestor swaps stay raceable (see module docs); closing them needs
+    // retained-root handles.
+    reject_final_reparse_point(&path)?;
     let metadata = file
         .metadata()
         .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
@@ -165,6 +171,15 @@ fn reject_reparse_components(path: &Path) -> Result<(), PreflightError> {
         if metadata_is_reparse_point(&metadata) {
             return Err(PreflightError::ReparsePoint);
         }
+    }
+    Ok(())
+}
+
+fn reject_final_reparse_point(path: &Path) -> Result<(), PreflightError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| PreflightError::Unreadable(error.kind().to_string()))?;
+    if metadata_is_reparse_point(&metadata) {
+        return Err(PreflightError::ReparsePoint);
     }
     Ok(())
 }
