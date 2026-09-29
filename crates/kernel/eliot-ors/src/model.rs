@@ -6431,8 +6431,20 @@ pub struct HostRequestRetainedLineage {
     pub policy_fence: Option<PolicyFence>,
     /// References to origin-authentication evidence; presence is not itself
     /// authentication because the referenced evidence must be verified by its
-    /// owner.
+    /// owner. A reference never qualifies the record: only
+    /// [`Self::semantic_receipt_ref`] does, and only for
+    /// [`HostRequestRetainedResultClass::CanonicalWriteReceipt`].
     pub origin_evidence_refs: Option<Vec<String>>,
+    /// Exact admitted semantic receipt this record repeats. `Some` only for
+    /// [`HostRequestRetainedResultClass::CanonicalWriteReceipt`], so a retained
+    /// read, candidate or delivery row can never be read back as an admitted
+    /// semantic record.
+    pub semantic_receipt_ref: Option<String>,
+    /// Which kind of record these retained bytes are. `Unclassified` for rows
+    /// written before the field existed: an explicit unknown that ORS never
+    /// upgrades.
+    #[serde(default = "unclassified_retained_result_class")]
+    pub result_class: HostRequestRetainedResultClass,
     /// Maximum receipt interpretation, not a semantic truth/admission status.
     pub proof_ceiling: Option<ProofCeiling>,
     /// Influence is fail-closed when omitted.
@@ -6440,6 +6452,37 @@ pub struct HostRequestRetainedLineage {
     pub influence_state: InfluenceState,
     /// Instruction/data taint. `None` means unknown, not cleared.
     pub instruction_taint: Option<InstructionTaint>,
+}
+
+/// The distinct result classes a retained host-request result can actually be.
+///
+/// Field for field the same classes the wire carrier admits, mirrored rather
+/// than redefined because `eliot-ors` holds no edge to the wire crate. The
+/// meaning is identical, and `eliot-ors` interprets no field of it: a stored
+/// row keeps the class its producer claimed, and the only check is that a
+/// class is not stronger than the receipt the row carries.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestRetainedResultClass {
+    /// A stored row that predates the class field, or a producer that named
+    /// none. Unknown provenance; never an admitted class.
+    Unclassified,
+    /// A read of already-retained canonical evidence, served with its actual
+    /// revision and provenance. It creates no new semantic record.
+    ExistingEvidenceRead,
+    /// Newly produced model or untrusted output. Candidate only.
+    NewCandidate,
+    /// A verifier or reconciliation observation about a completion.
+    VerifierObservation,
+    /// A canonical `WriteReceipt`-backed semantic record.
+    CanonicalWriteReceipt,
+    /// A retained response or delivery record for an already-completed
+    /// operation. It records that bytes were sent; it admits nothing.
+    RetainedDeliveryRecord,
+}
+
+const fn unclassified_retained_result_class() -> HostRequestRetainedResultClass {
+    HostRequestRetainedResultClass::Unclassified
 }
 
 impl HostRequestRetainedLineage {
@@ -6555,6 +6598,43 @@ impl HostRequestRetainedLineage {
                         reason: "retained transformation lineage did not validate",
                     })?;
             }
+        }
+        self.validate_class()?;
+        Ok(())
+    }
+
+    /// Refuses a retained class the row's own evidence does not support.
+    ///
+    /// One-directional, exactly like the wire contract: this can only withhold
+    /// a class the record cannot prove and never mints one. `output_digest`,
+    /// the origin references and the proof ceiling are deliberately not
+    /// consulted — a matching digest proves byte identity and a reference
+    /// proves that some evidence exists, and neither is the admitted semantic
+    /// receipt (I15.19, I15.6).
+    fn validate_class(&self) -> Result<(), OrsError> {
+        let unsupported = |reason: &'static str| OrsError::InvalidField {
+            field: "host_request_retained_lineage_result_class",
+            reason,
+        };
+        if self.result_class == HostRequestRetainedResultClass::CanonicalWriteReceipt
+            && self.semantic_receipt_ref.is_none()
+        {
+            return Err(unsupported(
+                "a canonical write receipt result requires its exact admitted semantic receipt",
+            ));
+        }
+        if self.result_class != HostRequestRetainedResultClass::CanonicalWriteReceipt
+            && self.semantic_receipt_ref.is_some()
+        {
+            return Err(unsupported(
+                "only a canonical write receipt result may carry a semantic receipt reference",
+            ));
+        }
+        if let Some(receipt) = &self.semantic_receipt_ref {
+            validate_text(
+                receipt,
+                "host_request_retained_lineage_semantic_receipt_ref",
+            )?;
         }
         Ok(())
     }

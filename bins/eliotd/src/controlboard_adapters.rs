@@ -87,7 +87,8 @@ use eliot_controlboard::{
 use eliot_governor::ControlBoardGovernorSnapshot;
 use eliot_kernel_core::Notification;
 use eliot_protocol::{
-    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody,
+    HostRequestResultLineage, LocalReadAttempt,
 };
 use eliot_skill::{SkillCandidate, SkillError, SkillLifecycleView};
 use serde::{Deserialize, Serialize};
@@ -471,15 +472,39 @@ pub fn controlboard_result_body(
     let bytes = canonical_json_bytes(&response).map_err(|error| {
         ControlBoardError::Provider(format!("controlboard outcome digest: {error}"))
     })?;
+    let result_digest = sha256_hex(&bytes);
     let body = HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
         operation_id: attempt.operation_id.clone(),
         request_sha256: envelope.envelope_sha256.clone(),
-        result_digest: sha256_hex(&bytes),
+        result_digest: result_digest.clone(),
         response,
         attempt: Some(attempt.clone()),
-        lineage: None,
+        // The board owner served this view from already-retained evidence under
+        // the admitted attempt, so the bytes are a read with their actual
+        // revision, not a new record (I1.8 read path). It commits nothing, so
+        // it carries NO semantic receipt. Source revisions stay unknown: this
+        // owner projects retained rows it does not re-observe a head for, and
+        // naming the request fence would claim a revision this leg did not
+        // observe.
+        lineage: Some(HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            source_revisions: None,
+            source_state_fence: None,
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::ExistingEvidenceRead,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        }),
         // Issue #1838 residual: the board owner wires execution evidence for
         // locally served reads; until then the sealed manifest honestly lists
         // the absent evidence as missing parts.

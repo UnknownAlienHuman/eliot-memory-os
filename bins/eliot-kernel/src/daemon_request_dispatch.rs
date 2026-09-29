@@ -7280,6 +7280,13 @@ impl KernelComposition {
             closure_refs: None,
             policy_fence: None,
             origin_evidence_refs: None,
+            // This leg read already-retained canonical evidence through the
+            // named-read gateway. Under I1.8 that is a read with its actual
+            // revision and provenance, not a newly generated record, so it
+            // declares the read class and carries NO semantic receipt: it did
+            // not commit anything and admits nothing about the content.
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::ExistingEvidenceRead,
             proof_ceiling: None,
             influence_state: eliot_security_contracts::InfluenceState::Unknown,
             instruction_taint: None,

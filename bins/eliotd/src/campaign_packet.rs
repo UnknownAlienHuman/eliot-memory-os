@@ -35,8 +35,8 @@ use eliot_learning_state_view::{
 };
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestResultBody, LocalReadAttempt,
-    host_request_operation_id,
+    HostRequestInvokeReadPayload, HostRequestResultBody, HostRequestResultLineage,
+    LocalReadAttempt, host_request_operation_id,
 };
 use eliot_reactive_context_plan::RetrievalPlan;
 use eliot_store_api::{
@@ -1550,15 +1550,40 @@ fn campaign_packet_result_body(
         .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
     let response_bytes = canonical_json_bytes(&response)
         .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
+    let result_digest = sha256_hex(&response_bytes);
     let body = HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
         operation_id: attempt.operation_id.clone(),
         request_sha256: envelope.envelope_sha256.clone(),
-        result_digest: sha256_hex(&response_bytes),
+        result_digest: result_digest.clone(),
         response,
         attempt: Some(attempt.clone()),
-        lineage: None,
+        // A campaign packet is content this daemon COMPILED from owner reads
+        // during this attempt; it is not itself a stored record and it was
+        // never admitted as a semantic transition. It therefore declares the
+        // candidate class and carries no semantic receipt (I15.6: model/derived
+        // output remains candidate without an explicit governed promotion).
+        // Source revisions stay `None` — the several owner reads behind the
+        // packet have their own fences, and naming the request fence here would
+        // claim a source revision the packet did not observe. Unknown, not clean.
+        lineage: Some(HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            source_revisions: None,
+            source_state_fence: None,
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::NewCandidate,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        }),
         // Issue #1838 residual: the packet flight wires execution evidence
         // for compiled packets; until then the sealed manifest honestly lists
         // the absent evidence as missing parts.
