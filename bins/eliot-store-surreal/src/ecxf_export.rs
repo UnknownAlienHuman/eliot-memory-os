@@ -10,15 +10,16 @@
 //! and projects the exporter's terminal outcome.
 //!
 //! The `StoreOwnerEcxfSource` port implementation is the only place that reads
-//! source evidence. The fence is STORE-OBSERVED, never caller-asserted: every
-//! value it could supply comes from
+//! source evidence, and it is the only thing standing between the operator's
+//! arguments and the exporter: every value the fence could carry would have to
+//! come from
 //! [`capture_ecxf_source`](eliot_store_surreal_adapter::capture_ecxf_source),
 //! the one real coherent read in the admitted vendor edge, which reads the
 //! canonical member classes and the observed `state_fence`,
 //! `schema_generation` and sequence counters inside one fixed
-//! `BEGIN TRANSACTION`/`COMMIT` batch. This module adds no value of its own,
-//! parses no provider row into domain semantics, and passes every observed
-//! value through unchanged.
+//! `BEGIN TRANSACTION`/`COMMIT` batch. This module fabricates no fence member,
+//! parses no provider row into domain semantics, and re-derives no digest: the
+//! only thing it forwards is the owner's own verdict.
 //!
 //! The `ECXF/1` package layout, the `ExportFence` and every residency,
 //! checksum and integrity proof belong to `eliot-ecxf` and to the
@@ -140,9 +141,7 @@ fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
     match capture.missing_evidence.first() {
         Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => "scope_id",
         Some(EcxfCaptureGap::SourcePurgeLedgerUnavailable) => "purge_ledger",
-        Some(EcxfCaptureGap::BlobStoreEvidenceUnavailable) => {
-            "reachable_blob_residency_keys"
-        }
+        Some(EcxfCaptureGap::BlobStoreEvidenceUnavailable) => "reachable_blob_residency_keys",
         Some(EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable) => {
             "architecture_source_digest"
         }
@@ -210,8 +209,8 @@ fn export_request(
     let export_id = bounded_identifier(&args.export_id, "export id")?;
     let scope_id = bounded_identifier(&args.scope_id, "scope id")?;
     let canonical_request_hash = bounded_canonical_request_hash(&args.canonical_request_hash)?;
-    let operation_id =
-        OperationId::new(export_id.clone()).map_err(|error| format!("invalid export id: {error}"))?;
+    let operation_id = OperationId::new(export_id.clone())
+        .map_err(|error| format!("invalid export id: {error}"))?;
     let idempotency_key = format!("ecxf-export-{export_id}-{}", config.instance_id);
     let request_id = RequestId::new(format!(
         "ecxf-export-{export_id}-{}-{}",
@@ -229,7 +228,7 @@ fn export_request(
         source_id: SourceId::new(config.instance_id.clone())
             .map_err(|error| format!("invalid ECXF export source id: {error}"))?,
         state_fence: config.runtime_launch.authority_state_fence.clone(),
-        clock: clock.clone(),
+        clock: *clock,
     };
     Ok(EcxfExportRequest {
         context,
@@ -294,10 +293,7 @@ fn bounded_canonical_request_hash(value: &str) -> Result<String, String> {
 /// post-publication reconciliation refusal is the only outcome that says yes.
 #[allow(clippy::print_stdout, clippy::print_stderr)]
 fn project_refusal(request: &EcxfExportRequest, error: &BackupError) {
-    let published = matches!(
-        error,
-        BackupError::PublishReconciliationRequired { .. }
-    );
+    let published = matches!(error, BackupError::PublishReconciliationRequired { .. });
     let status = serde_json::json!({
         "service": SERVICE_NAME,
         "operation": "export_ecxf",

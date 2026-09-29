@@ -769,7 +769,11 @@ async fn run() -> Result<(), String> {
     if emit_bootstrap_descriptor(&mode)? {
         return Ok(());
     }
-    let prepared = prepare_launch(mode).await;
+    // The launch future carries every one-shot arm's state (including the
+    // `ECXF/1` export, issue #1871), so it is boxed rather than grown: the
+    // allocation is paid once per process launch and keeps the caller's frame
+    // independent of how many arms this router has.
+    let prepared = Box::pin(prepare_launch(mode)).await;
     report_stage_outcome(
         BridgeBoundary::LaunchConfig,
         "launch_config",

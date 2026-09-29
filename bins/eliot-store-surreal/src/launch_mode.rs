@@ -80,7 +80,9 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
             config_path,
             initialize_schema_only,
         } => {
-            let (root, config) = resolve_portable_dev_config(root, config_path)?;
+            // The lease stays bound for the whole arm; dropping it at once would
+            // release the root this launch resolved its config through.
+            let (_root_lease, config) = resolve_portable_dev_config(&root, config_path)?;
             if initialize_schema_only {
                 // Schema initialization is a provider write, so it must pass
                 // the same installation-visible compatibility gate as the
@@ -126,7 +128,7 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
         } => {
             // The lease stays bound for the whole arm; `_` would drop it at
             // once and release the root this export is reading through.
-            let (_root_lease, config) = resolve_portable_dev_config(root, config_path)?;
+            let (_root_lease, config) = resolve_portable_dev_config(&root, config_path)?;
             // The export reads the closed canonical source through this
             // process's own store owner, so it passes the same installation
             // gates the portable-dev one-shot does: the compatibility decision
@@ -165,7 +167,7 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
 /// inside the leased root, never against the process current directory.
 #[cfg(windows)]
 fn resolve_portable_dev_config(
-    root: PathBuf,
+    root: &std::path::Path,
     config_path: PathBuf,
 ) -> Result<
     (
@@ -174,7 +176,7 @@ fn resolve_portable_dev_config(
     ),
     String,
 > {
-    let root = eliot_platform_windows::UserOwnedRootLease::open_existing(&root)
+    let root = eliot_platform_windows::UserOwnedRootLease::open_existing(root)
         .map_err(|error| format!("open portable-dev root: {error}"))?;
     let config_path = if config_path.is_absolute() {
         config_path
