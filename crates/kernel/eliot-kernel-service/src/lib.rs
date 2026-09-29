@@ -107,9 +107,17 @@ pub use lifecycle_persist::{
     build_persist_transitions, handle_lifecycle_persist_request,
 };
 pub use maintenance_trigger_delivery::{
-    MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS, MaintenanceTriggerClaimRequest,
-    MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryLedger,
-    MaintenanceTriggerDeliveryRow, MaintenanceTriggerRecoveryCounts,
+    AuthenticatedMaintenanceTriggerSession, MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS,
+    MaintenanceTriggerClaimRequest, MaintenanceTriggerDeliveryError,
+    MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
+    MaintenanceTriggerRecoveryCounts, MaintenanceTriggerServiceContext,
+    handle_maintenance_trigger_ack, handle_maintenance_trigger_claim,
+    handle_maintenance_trigger_decision, handle_maintenance_trigger_expiry,
+    handle_maintenance_trigger_gap, handle_maintenance_trigger_intake,
+    handle_maintenance_trigger_mark_ambiguous, handle_maintenance_trigger_pending_page,
+    handle_maintenance_trigger_release_expired, handle_maintenance_trigger_replacement_pending_set,
+    handle_maintenance_trigger_revocation, handle_maintenance_trigger_supersession,
+    recover_maintenance_trigger_commit, replay_maintenance_trigger_after_crash,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,

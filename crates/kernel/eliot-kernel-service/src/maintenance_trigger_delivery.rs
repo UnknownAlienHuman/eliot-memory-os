@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{EpochId, StateFence};
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_CLAIM_WIRE_ID, MAINTENANCE_TRIGGER_CLAIM_WIRE_VERSION,
     MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_ID, MAINTENANCE_TRIGGER_INTAKE_RECEIPT_WIRE_VERSION,
@@ -58,6 +58,8 @@ use eliot_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::{KernelService, KernelServiceError, KernelServiceState, validate_text};
 
 /// Upper bound on one finite claim lease.
 ///
@@ -117,6 +119,9 @@ pub enum MaintenanceTriggerDeliveryError {
     /// Mirror recovery has not completed, so the pending set is not surfacing yet.
     #[error("mirror recovery must complete before the pending set is claimed reconciled")]
     MirrorRecoveryRequired,
+    /// The Kernel service boundary refused session or authority admission.
+    #[error("maintenance trigger service admission refused: {0}")]
+    Service(#[from] KernelServiceError),
 }
 
 /// Durable delivery row for one retained trigger.
@@ -1016,4 +1021,419 @@ impl MaintenanceTriggerDeliveryLedger {
         }
         Ok(())
     }
+}
+
+/// Authenticated maintenance-trigger session bound from live Kernel authority.
+///
+/// All fields come from the Kernel service lineage and its consumed
+/// activation receipt at bind time: the principal reference supplied by the
+/// authenticated composition boundary (never a request-envelope value), the
+/// live authority epoch, and the live activation generation. No trigger,
+/// claim, or acknowledgement DTO field contributes authority (A12.2:
+/// identity is established by the harness/installation boundary, never
+/// self-declared).
+#[derive(Clone, Debug)]
+pub struct AuthenticatedMaintenanceTriggerSession {
+    principal: String,
+    authority_epoch: EpochId,
+    generation: u64,
+}
+
+impl AuthenticatedMaintenanceTriggerSession {
+    /// Binds one maintenance-trigger session from live Kernel state.
+    ///
+    /// Fails closed when the generation is fenced, the service is not
+    /// `Ready`, no candidate lineage or consumed activation receipt exists,
+    /// the activation no longer agrees with the live epoch (revoked/stale
+    /// activation), or the principal reference is not bounded wire text.
+    pub fn bind(service: &KernelService, principal_ref: &str) -> Result<Self, KernelServiceError> {
+        validate_text(principal_ref, "maintenance_trigger.principal")?;
+        if service.generation_fenced() {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        let state = service.state();
+        if state != KernelServiceState::Ready {
+            return Err(KernelServiceError::AdmissionClosed(state));
+        }
+        let candidate =
+            service
+                .candidate_binding()
+                .ok_or(KernelServiceError::HandshakeMismatch {
+                    field: "missing_candidate",
+                })?;
+        let activation =
+            service
+                .activation_receipt()
+                .ok_or(KernelServiceError::HandshakeMismatch {
+                    field: "missing_activation",
+                })?;
+        let live_epoch = service.authority_epoch();
+        if !candidate.kernel_epoch.is_same_authority(&live_epoch) {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "maintenance_trigger.authority_epoch",
+            });
+        }
+        if !activation.authority_epoch.is_same_authority(&live_epoch) {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "maintenance_trigger.authority_epoch",
+            });
+        }
+        Ok(Self {
+            principal: principal_ref.to_owned(),
+            authority_epoch: live_epoch,
+            generation: activation.generation.value(),
+        })
+    }
+
+    /// Returns the authenticated principal reference.
+    #[must_use]
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// Returns the authority epoch bound at session time.
+    #[must_use]
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
+    }
+
+    /// Returns the activation generation bound at session time.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Re-validates the session against live service authority.
+    ///
+    /// A session bound before an epoch advance, a generation cutover, a
+    /// fence, or a drain is stale and fails here — before any ledger input —
+    /// so a replayed session can never smuggle old authority into a new
+    /// epoch.
+    fn live_authority(
+        &self,
+        service: &KernelService,
+    ) -> Result<(EpochId, u64), KernelServiceError> {
+        if service.generation_fenced() {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        let state = service.state();
+        if state != KernelServiceState::Ready {
+            return Err(KernelServiceError::AdmissionClosed(state));
+        }
+        let activation =
+            service
+                .activation_receipt()
+                .ok_or(KernelServiceError::HandshakeMismatch {
+                    field: "missing_activation",
+                })?;
+        let live_epoch = service.authority_epoch();
+        if !activation.authority_epoch.is_same_authority(&live_epoch) {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "maintenance_trigger.authority_epoch",
+            });
+        }
+        let live_generation = activation.generation.value();
+        if !self.authority_epoch.is_same_authority(&live_epoch) {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "maintenance_trigger.authority_epoch",
+            });
+        }
+        if self.generation != live_generation {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "maintenance_trigger.generation",
+            });
+        }
+        Ok((live_epoch, live_generation))
+    }
+
+    /// Builds the live service context; presented fences must agree with it.
+    pub fn service_context(
+        &self,
+        service: &KernelService,
+    ) -> Result<MaintenanceTriggerServiceContext, KernelServiceError> {
+        let (authority_epoch, generation) = self.live_authority(service)?;
+        Ok(MaintenanceTriggerServiceContext {
+            authority_epoch,
+            generation,
+        })
+    }
+}
+
+/// Live service authority a maintenance-trigger transition is admitted under.
+#[derive(Clone, Debug)]
+pub struct MaintenanceTriggerServiceContext {
+    /// Live authority epoch.
+    pub authority_epoch: EpochId,
+    /// Live activation generation.
+    pub generation: u64,
+}
+
+/// Re-proves a presented fence against live service authority.
+///
+/// The fence's lineage-aware epoch must be the live epoch and its resource
+/// generation must equal the live activation generation; a stale or revoked
+/// generation fails here, before any ledger transition.
+fn live_fence(
+    context: &MaintenanceTriggerServiceContext,
+    fence: &StateFence,
+) -> Result<(), KernelServiceError> {
+    if !fence
+        .authority_epoch
+        .is_same_authority(&context.authority_epoch)
+        || fence.resource_generation.value() != context.generation
+    {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "maintenance_trigger.fence",
+        });
+    }
+    Ok(())
+}
+
+/// Admits one retained trigger intake through live Kernel authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::admit_intake`]: the complete opaque
+/// input must already be staged through the ORS owner, exact identity/hash
+/// replay returns the same staging receipt, and changed content conflicts.
+/// Any failure admits nothing, so the producer keeps its retry identity.
+pub fn handle_maintenance_trigger_intake(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    record: MaintenanceTriggerRecord,
+) -> Result<MaintenanceTriggerIntakeReceipt, MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.admit_intake(record)
+}
+
+/// Issues one finite fenced claim through live Kernel authority.
+///
+/// Re-validates the session, re-proves the request's current fence against
+/// the live epoch/generation, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::issue_claim`]. Old-generation claim
+/// requests fail at the fence check, before any ledger transition.
+pub fn handle_maintenance_trigger_claim(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    request: MaintenanceTriggerClaimRequest,
+) -> Result<MaintenanceTriggerClaim, MaintenanceTriggerDeliveryError> {
+    let context = session.service_context(service)?;
+    live_fence(&context, &request.current_fence)?;
+    ledger.issue_claim(request)
+}
+
+/// Releases one expired claim through live Kernel authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::release_expired`]: a timed-out
+/// `Claimed` row returns to `Pending` under the same identity so the owner
+/// can reclaim it, never under a new trigger ID.
+pub fn handle_maintenance_trigger_release_expired(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.release_expired(trigger_id, now_unix_ms)
+}
+
+/// Enumerates the bounded pending set through live Kernel authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::pending_page`]: bounded pages with
+/// stable continuation and explicit gaps; a reconnect resumes from its
+/// cursor and never resets progress to a guessed complete-empty set.
+pub fn handle_maintenance_trigger_pending_page(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &MaintenanceTriggerDeliveryLedger,
+    continuation: Option<&str>,
+    now_unix_ms: u64,
+) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.pending_page(continuation, now_unix_ms)
+}
+
+/// Commits one daemon decision through live Kernel authority, before any ack.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::record_decision`]: the receipt must
+/// content-match the retained trigger and bind its revision plus
+/// evaluation/policy revisions and a durable downstream intent. The
+/// Governor-owned evaluator (#1688) keeps interpretation and the policy
+/// owner (#1692) keeps mode/route/session checks; this seam records the
+/// commitment the daemon submits via its `PreparedTransition`, never
+/// execution.
+pub fn handle_maintenance_trigger_decision(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+    receipt: MaintenanceTriggerDecisionReceipt,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.record_decision(trigger_id, receipt)
+}
+
+/// Acknowledges one delivery through live Kernel authority.
+///
+/// Re-validates the session, re-proves the presented current fence against
+/// the live epoch/generation, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::acknowledge`]: the ack must echo the
+/// live claim exactly and embed the committed receipt byte for byte.
+pub fn handle_maintenance_trigger_ack(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    ack: &MaintenanceTriggerAck,
+    current_fence: &StateFence,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    let context = session.service_context(service)?;
+    live_fence(&context, current_fence)?;
+    ledger.acknowledge(ack, current_fence, now_unix_ms)
+}
+
+/// Replays one retained trigger after a pre-commit crash, without minting new state.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::replay_after_crash`]: the caller
+/// re-presents the exact retained record to the evaluator under the same
+/// identity.
+pub fn replay_maintenance_trigger_after_crash(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+) -> Result<MaintenanceTriggerRecord, MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.replay_after_crash(trigger_id)
+}
+
+/// Recovers one committed decision receipt after a post-commit crash.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::recover_commit_before_ack`]: the
+/// caller acknowledges this exact receipt without a new job,
+/// recommendation, or wake.
+pub fn recover_maintenance_trigger_commit(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+) -> Result<MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.recover_commit_before_ack(trigger_id)
+}
+
+/// Marks one lost or ambiguous commit as reconciling through live authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::mark_ambiguous`]: receipt absence
+/// during an outage is not proof of non-commit, so the trigger stays open
+/// with an `AmbiguousCommit` gap until receipt lookup reconciles it.
+pub fn handle_maintenance_trigger_mark_ambiguous(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.mark_ambiguous(trigger_id, now_unix_ms)
+}
+
+/// Revokes one daemon generation/session's consumer authority through live authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::revoke_consumer`]: pending claims
+/// return under the same identity for the replacement generation, committed
+/// rows move to `Reconciling` with receipts preserved, and every later
+/// old-generation claim or ack fails.
+pub fn handle_maintenance_trigger_revocation(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    revocation: MaintenanceTriggerRevocation,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.revoke_consumer(revocation)
+}
+
+/// Surfaces the bounded pending set to a replacement generation.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::replacement_pending_set`]: after
+/// replacement authentication plus mirror recovery, the replacement sees
+/// the bounded pending set before reconciliation may be claimed complete.
+/// Ordinary pending debt acquires no runtime lease here.
+pub fn handle_maintenance_trigger_replacement_pending_set(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &MaintenanceTriggerDeliveryLedger,
+    continuation: Option<&str>,
+    mirror_recovered: bool,
+    now_unix_ms: u64,
+) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.replacement_pending_set(continuation, mirror_recovered, now_unix_ms)
+}
+
+/// Records terminal expiry for a past-window trigger through live authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::apply_expiry`]: expired eligibility
+/// blocks stale execution but never deletes the row, its record, or its
+/// evidence locators.
+pub fn handle_maintenance_trigger_expiry(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+    reason: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.apply_expiry(trigger_id, reason, now_unix_ms)
+}
+
+/// Records supersession by an explicitly linked successor through live authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::apply_supersession`]: the successor
+/// is named, both rows stay readable, and materially new evidence arrives
+/// as a new trigger rather than an overwrite.
+pub fn handle_maintenance_trigger_supersession(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+    successor_trigger_id: &str,
+    reason: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.apply_supersession(trigger_id, successor_trigger_id, reason, now_unix_ms)
+}
+
+/// Records a visible recovery gap for unrepairable damage through live authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::record_gap`]: missing keys, corrupt
+/// payloads, inaccessible sources, and incomplete enumeration produce this
+/// record — never a plaintext fallback and never silent deletion.
+pub fn handle_maintenance_trigger_gap(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+    kind: MaintenanceTriggerGapKind,
+    detail: &str,
+    now_unix_ms: u64,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.record_gap(trigger_id, kind, detail, now_unix_ms)
 }
