@@ -4686,9 +4686,11 @@ impl BridgeRunner {
         // production doors cite `observed_hot_delivery` for the recorded view
         // (private Invoke wire via `invocation_wire_result`, MCP door in the
         // evidence envelope), so the delivered completeness is cited from
-        // real bytes, never estimated. Token-measured receipt projection and
-        // the complete-evidence gate still await a route-owner attestation
-        // and a production verifier consumer; until then the evidence slot
+        // real bytes, never estimated. A large delivery the registry cannot
+        // retain never degrades to unverifiable inline bytes: both doors
+        // refuse the frame through the existing typed complete-evidence gate
+        // (`IncompleteDelivery`). Token-measured receipt projection still
+        // awaits a route-owner attestation; until then the evidence slot
         // carries the preview+handle.
         Some(view)
     }
