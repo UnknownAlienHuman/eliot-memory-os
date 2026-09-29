@@ -926,9 +926,9 @@ pub struct RollbackRouteProposal {
 /// epoch. Every in-flight operation must carry an exact disposition, one
 /// operation identity admits exactly one disposition, and state must be
 /// compatible (prior snapshot) or forward-repaired. The sealing digest
-/// binds the cutover/route/generation/epoch identities together with the
-/// committed in-flight dispositions, snapshot strategy, and compatibility
-/// flag, so the sealed decision cannot silently change after commit.
+/// binds the cutover record together with the proposed in-flight
+/// dispositions, snapshot strategy, and compatibility flag, so the sealed
+/// decision cannot silently change before the Kernel path commits it.
 ///
 /// The authority for identity and epoch lineage is the carried
 /// [`GenerationCutoverRecord`], not a pair of counters supplied here: its
