@@ -1121,6 +1121,33 @@ mod lifecycle_proof_tests {
         }
     }
 
+    /// Canonical cutover record for the rollback-route fixtures.
+    ///
+    /// `EpochId` and `ResourceGeneration` are not re-exported by
+    /// `eliot-runtime-contracts`, so the record is decoded from its own wire
+    /// form rather than assembled from a bare counter: the fixture then
+    /// travels the same lineage validation a durable ORS row travels, and a
+    /// sequence that is not the exact one-step child is refused by the owner
+    /// rather than by anything this module asserts.
+    fn cutover_record(
+        cutover_id: &str,
+        route_scope: &str,
+        old_generation: u64,
+        new_generation: u64,
+        old_sequence: u64,
+        new_sequence: u64,
+    ) -> GenerationCutoverRecord {
+        must(serde_json::from_value(json!({
+            "cutover_id": cutover_id,
+            "route_scope": route_scope,
+            "old_generation": old_generation,
+            "new_generation": new_generation,
+            "old_epoch": { "lineage_id": TEST_LINEAGE, "sequence": old_sequence },
+            "new_epoch": { "lineage_id": TEST_LINEAGE, "sequence": new_sequence },
+            "state": "ARMED",
+        })))
+    }
+
     fn must_route(result: Result<RollbackRouteProposal, LifecycleError>) -> RollbackRouteProposal {
         match result {
             Ok(route) => route,
