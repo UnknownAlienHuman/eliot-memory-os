@@ -7594,8 +7594,10 @@ impl HostRequestRecord {
                 reason: "must be non-zero",
             });
         }
-        if !matches!(self.send_claim_protocol_version, 0 | HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION)
-        {
+        if !matches!(
+            self.send_claim_protocol_version,
+            0 | HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        ) {
             return Err(OrsError::InvalidField {
                 field: "host_request_send_claim_protocol_version",
                 reason: "unsupported send-claim protocol version",
@@ -7714,10 +7716,9 @@ impl HostRequestRecord {
             self.send_claim_protocol_version,
             self.transport_channel_binding_sha256.as_deref(),
         ) {
-            (HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION, Some(digest)) => validate_digest(
-                digest,
-                "host_request_transport_channel_binding_sha256",
-            )?,
+            (HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION, Some(digest)) => {
+                validate_digest(digest, "host_request_transport_channel_binding_sha256")?
+            }
             (HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION, None) => {
                 return Err(OrsError::InvalidField {
                     field: "host_request_transport_channel_binding_sha256",
@@ -7743,9 +7744,7 @@ impl HostRequestRecord {
                     reason: "versioned send attempts require their retained claim expiry",
                 });
             }
-            if self.send_claim_protocol_version == 0
-                && attempt.claim_expires_at_unix_ms.is_some()
-            {
+            if self.send_claim_protocol_version == 0 && attempt.claim_expires_at_unix_ms.is_some() {
                 return Err(OrsError::InvalidField {
                     field: "host_request_attempt_claim_expiry",
                     reason: "legacy send attempts do not carry claim expiry",
@@ -7759,9 +7758,7 @@ impl HostRequestRecord {
                     reason: "versioned send attempts require the authenticated channel committed at claim time",
                 });
             }
-            if self.send_claim_protocol_version == 0
-                && attempt.channel_binding_sha256.is_some()
-            {
+            if self.send_claim_protocol_version == 0 && attempt.channel_binding_sha256.is_some() {
                 return Err(OrsError::InvalidField {
                     field: "host_request_attempt_channel_binding_sha256",
                     reason: "legacy send attempts do not carry versioned channel custody",
@@ -7819,9 +7816,7 @@ impl HostRequestRecord {
                     reason: "versioned send attempts require their retained claim expiry",
                 });
             }
-            if self.send_claim_protocol_version == 0
-                && attempt.claim_expires_at_unix_ms.is_some()
-            {
+            if self.send_claim_protocol_version == 0 && attempt.claim_expires_at_unix_ms.is_some() {
                 return Err(OrsError::InvalidField {
                     field: "host_request_attempt_claim_expiry",
                     reason: "legacy send attempts do not carry claim expiry",
@@ -7835,9 +7830,7 @@ impl HostRequestRecord {
                     reason: "versioned send attempts require the authenticated channel committed at claim time",
                 });
             }
-            if self.send_claim_protocol_version == 0
-                && attempt.channel_binding_sha256.is_some()
-            {
+            if self.send_claim_protocol_version == 0 && attempt.channel_binding_sha256.is_some() {
                 return Err(OrsError::InvalidField {
                     field: "host_request_attempt_channel_binding_sha256",
                     reason: "legacy send attempts do not carry versioned channel custody",
@@ -7907,7 +7900,10 @@ impl HostRequestRecord {
             if attempt.phase != HostRequestAttemptPhase::ResponseReceived
                 || attempt.transport_observations.is_empty()
                 || !matches!(
-                    attempt.transport_observations.last().map(|item| item.boundary),
+                    attempt
+                        .transport_observations
+                        .last()
+                        .map(|item| item.boundary),
                     Some(
                         HostRequestTransportBoundary::DispatchStarted
                             | HostRequestTransportBoundary::DeliveryOutcomeUnknown
@@ -7942,15 +7938,34 @@ impl HostRequestRecord {
             .collect::<Vec<_>>();
         let legal = matches!(
             boundaries.as_slice(),
-            []
-                | [HostRequestTransportBoundary::DispatchStarted]
+            [] | [HostRequestTransportBoundary::DispatchStarted]
                 | [HostRequestTransportBoundary::DefinitelyNotSent]
-                | [HostRequestTransportBoundary::DispatchStarted, HostRequestTransportBoundary::DefinitelyNotSent]
-                | [HostRequestTransportBoundary::DispatchStarted, HostRequestTransportBoundary::DeliveryOutcomeUnknown]
-                | [HostRequestTransportBoundary::DispatchStarted, HostRequestTransportBoundary::DeliveredToAuthenticatedHost]
-                | [HostRequestTransportBoundary::DispatchStarted, HostRequestTransportBoundary::ResponseReceived]
-                | [HostRequestTransportBoundary::DispatchStarted, HostRequestTransportBoundary::DeliveryOutcomeUnknown, HostRequestTransportBoundary::ResponseReceived]
-                | [HostRequestTransportBoundary::DispatchStarted, HostRequestTransportBoundary::DeliveredToAuthenticatedHost, HostRequestTransportBoundary::ResponseReceived]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::DefinitelyNotSent
+                ]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                ]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                ]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::ResponseReceived
+                ]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::DeliveryOutcomeUnknown,
+                    HostRequestTransportBoundary::ResponseReceived
+                ]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::DeliveredToAuthenticatedHost,
+                    HostRequestTransportBoundary::ResponseReceived
+                ]
         );
         if !legal {
             return Err(OrsError::InvalidField {

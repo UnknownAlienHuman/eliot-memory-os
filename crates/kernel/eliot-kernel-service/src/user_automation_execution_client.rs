@@ -22,11 +22,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    UserAutomationDurableJobPort, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
+    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobPort,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationReadback, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakeEnumerationRequest, UserAutomationWakePort, UserAutomationWakeReadRequest,
-    UserAutomationAuthenticatedWakeCancellationReadback,
-    UserAutomationWakeCancellationReadback, UserAutomationWakeReadback,
+    UserAutomationWakeReadback,
 };
 
 /// Persisted observer for the authenticated cancellation transport boundary.
@@ -735,7 +735,9 @@ impl UserAutomationHostExecutionRequest {
                     .validate()
                     .map_err(|error| rejected(format!("wake cancellation readback: {error}")))?;
                 if request.state_fence != self.channel.state_fence {
-                    return Err(rejected("wake cancellation readback channel fence mismatch"));
+                    return Err(rejected(
+                        "wake cancellation readback channel fence mismatch",
+                    ));
                 }
             }
         }
@@ -1581,7 +1583,8 @@ impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExe
                         )
                     })?;
                 return Err(UserAutomationRuntimeError::UnknownOutcome(
-                    "UserAutomation cancellation send crossed an unclassified transport error".to_owned(),
+                    "UserAutomation cancellation send crossed an unclassified transport error"
+                        .to_owned(),
                 ));
             }
         };
@@ -1597,18 +1600,13 @@ impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExe
                 "UserAutomation cancellation delivery crossed an unknown boundary".to_owned(),
             ));
         }
-        let response_frame = transport
-            .receive_frame(self.limits)
-            .await
-            .map_err(|_| {
-                UserAutomationRuntimeError::UnknownOutcome(
-                    "UserAutomation cancellation response was not received".to_owned(),
-                )
-            })?;
-        let response = decode_user_automation_host_execution_response_frame(
-            &response_frame,
-            &request,
-        )?;
+        let response_frame = transport.receive_frame(self.limits).await.map_err(|_| {
+            UserAutomationRuntimeError::UnknownOutcome(
+                "UserAutomation cancellation response was not received".to_owned(),
+            )
+        })?;
+        let response =
+            decode_user_automation_host_execution_response_frame(&response_frame, &request)?;
         observer.response_received(&request, &response)?;
         Ok(response)
     }
@@ -1707,7 +1705,8 @@ where
     pub async fn read_cancellation_batch(
         &self,
         request: impl Into<Box<UserAutomationWakeCancellation>>,
-    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError> {
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
         let carrier = UserAutomationHostExecutionRequest::read_cancellation_batch(
             self.transport.channel_binding().clone(),
             request,
@@ -1812,7 +1811,8 @@ where
     async fn read_cancellation_batch(
         &self,
         request: impl Into<Box<UserAutomationWakeCancellation>>,
-    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError> {
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
         UserAutomationHostExecutionClient::read_cancellation_batch(self, request).await
     }
 }

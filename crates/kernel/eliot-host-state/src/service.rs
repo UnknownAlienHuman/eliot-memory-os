@@ -119,10 +119,8 @@ impl<B: JournalBackend> HostStateJournalService<B> {
     pub fn query_wake_cancellation_batch(
         &self,
         query: &crate::WakeCancellationBatchQuery,
-    ) -> Result<
-        crate::WakeCancellationBatchObservation,
-        crate::WakeCancellationBatchQueryError,
-    > {
+    ) -> Result<crate::WakeCancellationBatchObservation, crate::WakeCancellationBatchQueryError>
+    {
         self.journal.query_wake_cancellation_batch(query)
     }
 

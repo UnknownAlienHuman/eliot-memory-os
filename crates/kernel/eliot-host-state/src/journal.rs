@@ -1557,8 +1557,8 @@ impl<B: JournalBackend> HostStateJournal<B> {
         }
 
         let host_record = HostStateRecord::WakeCancellationBatch(record.clone());
-        let record_checksum = record_checksum(&host_record)
-            .map_err(WakeCancellationBatchQueryError::Journal)?;
+        let record_checksum =
+            record_checksum(&host_record).map_err(WakeCancellationBatchQueryError::Journal)?;
         if header.checksum != record_checksum {
             return Err(WakeCancellationBatchQueryError::Journal(
                 JournalError::IdempotencyConflict,

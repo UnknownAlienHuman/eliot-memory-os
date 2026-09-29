@@ -30,12 +30,11 @@ use eliot_kernel_core::user_automation::{
     UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestAttemptPhase,
-    HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof, HostRequestRecord,
-    HostRequestOwnerReadbackEvidence, HostRequestResponseSource, HostRequestState,
-    HostRequestTransportBoundary,
-    HostRequestTransportObservation, OpaqueLabel, RedbRecoveryStore, ReservationRecord,
-    HOST_REQUEST_SEND_CLAIM_LEASE_MS, UnknownCommitOutcome, UnknownCommitRecord,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HOST_REQUEST_SEND_CLAIM_LEASE_MS, HostRequestAttempt,
+    HostRequestAttemptPhase, HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof,
+    HostRequestOwnerReadbackEvidence, HostRequestRecord, HostRequestResponseSource,
+    HostRequestState, HostRequestTransportBoundary, HostRequestTransportObservation, OpaqueLabel,
+    RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
     WriterReservationToken,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
@@ -67,8 +66,7 @@ use crate::store_write_reservation::{
 use crate::user_automation_execution::{
     UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationExecutionError,
     UserAutomationExecutionOutcome, UserAutomationExecutionRequest, UserAutomationRemovalResult,
-    UserAutomationWakeCancellation,
-    UserAutomationWakeCancellationTarget,
+    UserAutomationWakeCancellation, UserAutomationWakeCancellationTarget,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakePublication,
     UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
     retirement_wake_enumeration_request,
@@ -1971,16 +1969,16 @@ impl KernelStoreGateway {
         let Some(attempt) = record.attempt.clone() else {
             return retained;
         };
-        let expected_payload_digest = match runtime_obligation_payload_digest(&obligation.subject_ids)
-        {
-            Ok(digest) => digest,
-            Err(_) => return retained,
-        };
-        let expected_fence_digest = match user_automation_obligation_fence_digest(sealed, obligation)
-        {
-            Ok(digest) => digest,
-            Err(_) => return retained,
-        };
+        let expected_payload_digest =
+            match runtime_obligation_payload_digest(&obligation.subject_ids) {
+                Ok(digest) => digest,
+                Err(_) => return retained,
+            };
+        let expected_fence_digest =
+            match user_automation_obligation_fence_digest(sealed, obligation) {
+                Ok(digest) => digest,
+                Err(_) => return retained,
+            };
         let exact_request = UserAutomationWakeCancellation {
             context: sealed.context.clone(),
             authenticated_principal: sealed.authenticated_principal.clone(),
@@ -1993,22 +1991,27 @@ impl KernelStoreGateway {
             enumeration_receipt: Some(Box::new(enumeration_receipt.clone())),
         };
         let request_valid = exact_request.validate().is_ok();
-        let original_channel = enumeration_receipt.authenticated_channel_binding_sha256.as_str();
+        let original_channel = enumeration_receipt
+            .authenticated_channel_binding_sha256
+            .as_str();
         let crossed_dispatch = attempt
             .transport_observations
             .first()
             .is_some_and(|observation| {
                 observation.boundary == HostRequestTransportBoundary::DispatchStarted
             })
-            && attempt.transport_observations.last().is_some_and(|observation| {
-                matches!(
-                    observation.boundary,
-                    HostRequestTransportBoundary::DispatchStarted
-                        | HostRequestTransportBoundary::DeliveryOutcomeUnknown
-                        | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
-                        | HostRequestTransportBoundary::ResponseReceived
-                )
-            });
+            && attempt
+                .transport_observations
+                .last()
+                .is_some_and(|observation| {
+                    matches!(
+                        observation.boundary,
+                        HostRequestTransportBoundary::DispatchStarted
+                            | HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                            | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                            | HostRequestTransportBoundary::ResponseReceived
+                    )
+                });
         if !request_valid
             || !crossed_dispatch
             || record.send_claim_protocol_version
@@ -2028,13 +2031,11 @@ impl KernelStoreGateway {
         {
             return retained;
         }
-        let authenticated_readback = match runtime
-            .read_cancellation_batch(exact_request.clone())
-            .await
-        {
-            Ok(readback) => readback,
-            Err(_) => return retained,
-        };
+        let authenticated_readback =
+            match runtime.read_cancellation_batch(exact_request.clone()).await {
+                Ok(readback) => readback,
+                Err(_) => return retained,
+            };
         if authenticated_readback
             .readback
             .validate_for(&exact_request)
@@ -2091,9 +2092,9 @@ impl KernelStoreGateway {
             &result_response,
             Some(&evidence),
         ) {
-            Ok(Some(answered)) => RetainedObligationLookup::Held(
-                classify_retained_obligation(obligation, answered),
-            ),
+            Ok(Some(answered)) => {
+                RetainedObligationLookup::Held(classify_retained_obligation(obligation, answered))
+            }
             Ok(None) | Err(_) => retained,
         }
     }
@@ -2203,15 +2204,16 @@ impl KernelStoreGateway {
                         "the returned v1 cancellation answer has no exact enumeration receipt",
                     ));
                 };
-                let expected_receipt = obligation
-                    .wake_enumeration_receipt
-                    .as_deref()
-                    .ok_or_else(|| {
-                        unretained_answer_reason(
-                            obligation,
-                            "the retained v1 cancellation has no exact enumeration receipt",
-                        )
-                    })?;
+                let expected_receipt =
+                    obligation
+                        .wake_enumeration_receipt
+                        .as_deref()
+                        .ok_or_else(|| {
+                            unretained_answer_reason(
+                                obligation,
+                                "the retained v1 cancellation has no exact enumeration receipt",
+                            )
+                        })?;
                 let attempt = retained.attempt.as_ref().ok_or_else(|| {
                     unretained_answer_reason(
                         obligation,
@@ -2509,8 +2511,7 @@ impl KernelStoreGateway {
                     "the retained obligation disappeared before attempt generation lookup",
                 )
             })?;
-        if record.send_claim_protocol_version
-            != eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        if record.send_claim_protocol_version != eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
         {
             return Err(unretained_obligation_reason(
                 obligation,
@@ -2745,9 +2746,10 @@ impl KernelStoreGateway {
             ),
         )?;
         let request_label = request_id.as_str().to_owned();
-        let (send_claim_protocol_version, transport_channel_binding_sha256) =
-            if obligation.kind == UserAutomationRuntimeObligationKind::WakeCancellation {
-                let receipt = obligation
+        let (send_claim_protocol_version, transport_channel_binding_sha256) = if obligation.kind
+            == UserAutomationRuntimeObligationKind::WakeCancellation
+        {
+            let receipt = obligation
                     .wake_enumeration_receipt
                     .as_deref()
                     .ok_or_else(|| {
@@ -2756,34 +2758,34 @@ impl KernelStoreGateway {
                             "a versioned cancellation requires the retained authenticated owner enumeration receipt",
                         )
                     })?;
-                receipt.validate_integrity().map_err(|error| {
-                    unretained_obligation_reason(
-                        obligation,
-                        format!("the retained cancellation enumeration receipt is invalid: {error}"),
-                    )
-                })?;
-                let receipt_subject_ids = receipt
-                    .denominator
-                    .iter()
-                    .map(|identity| identity.occurrence_id.clone())
-                    .collect::<Vec<_>>();
-                if receipt.parent_operation_identity != sealed.identity
-                    || receipt.state_fence != sealed.context.state_fence
-                    || receipt.authenticated_owner_identity != sealed.authenticated_principal
-                    || receipt_subject_ids != obligation.subject_ids
-                {
-                    return Err(unretained_obligation_reason(
-                        obligation,
-                        "the retained cancellation receipt does not bind the exact parent, fence, owner, and denominator",
-                    ));
-                }
-                (
-                    eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION,
-                    Some(receipt.authenticated_channel_binding_sha256.clone()),
+            receipt.validate_integrity().map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the retained cancellation enumeration receipt is invalid: {error}"),
                 )
-            } else {
-                (0, None)
-            };
+            })?;
+            let receipt_subject_ids = receipt
+                .denominator
+                .iter()
+                .map(|identity| identity.occurrence_id.clone())
+                .collect::<Vec<_>>();
+            if receipt.parent_operation_identity != sealed.identity
+                || receipt.state_fence != sealed.context.state_fence
+                || receipt.authenticated_owner_identity != sealed.authenticated_principal
+                || receipt_subject_ids != obligation.subject_ids
+            {
+                return Err(unretained_obligation_reason(
+                    obligation,
+                    "the retained cancellation receipt does not bind the exact parent, fence, owner, and denominator",
+                ));
+            }
+            (
+                eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION,
+                Some(receipt.authenticated_channel_binding_sha256.clone()),
+            )
+        } else {
+            (0, None)
+        };
         Ok(HostRequestRecord {
             contract_version: ORS_CONTRACT_VERSION,
             send_claim_protocol_version,
@@ -3884,8 +3886,8 @@ impl KernelStoreGateway {
             RetainedObligationLookup::Held(
                 RetainedUserAutomationObligation::RetryAfterProvenNoSend,
             ) => {
-                let reason = "a cancellation retry claim cannot satisfy a wake-enumeration read"
-                    .to_owned();
+                let reason =
+                    "a cancellation retry claim cannot satisfy a wake-enumeration read".to_owned();
                 obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
                     reason: reason.clone(),
                 };
@@ -3934,7 +3936,7 @@ impl KernelStoreGateway {
                         obligation.disposition =
                             UserAutomationRuntimeObligationDisposition::Reconciling {
                                 reason: reason.clone(),
-                        };
+                            };
                         Err(reason)
                     }
                     RetainedObligationLookup::Held(
@@ -4141,7 +4143,8 @@ impl KernelStoreGateway {
             || enumeration_receipt.authenticated_owner_identity != sealed.authenticated_principal
             || enumeration_receipt.automation_id != revision.automation_id
             || enumeration_receipt.automation_revision != revision.revision
-            || enumeration_receipt.revision_digest != revision.digest().map_err(|e| e.to_string())?
+            || enumeration_receipt.revision_digest
+                != revision.digest().map_err(|e| e.to_string())?
         {
             return Err(unretained_obligation_reason(
                 obligation,
@@ -4188,11 +4191,19 @@ impl KernelStoreGateway {
             || record.payload_digest != expected_payload_digest
             || record.fence_digest != expected_fence_digest
             || record.transport_channel_binding_sha256.as_deref()
-                != Some(enumeration_receipt.authenticated_channel_binding_sha256.as_str())
+                != Some(
+                    enumeration_receipt
+                        .authenticated_channel_binding_sha256
+                        .as_str(),
+                )
             || attempt.phase != HostRequestAttemptPhase::Claimed
             || !attempt.transport_observations.is_empty()
             || attempt.channel_binding_sha256.as_deref()
-                != Some(enumeration_receipt.authenticated_channel_binding_sha256.as_str())
+                != Some(
+                    enumeration_receipt
+                        .authenticated_channel_binding_sha256
+                        .as_str(),
+                )
         {
             return Err(unretained_obligation_reason(
                 obligation,
@@ -4273,28 +4284,21 @@ impl KernelStoreGateway {
                 runtime,
             )
             .await;
-        let retained = classify_retained_cancellation(
-            &settled,
-            &revision.revision,
-            retained_lookup,
-        );
-        let retry_after_proven_no_send = matches!(
-            &retained,
-            RetainedCancellation::RetryAfterProvenNoSend
-        );
+        let retained =
+            classify_retained_cancellation(&settled, &revision.revision, retained_lookup);
+        let retry_after_proven_no_send =
+            matches!(&retained, RetainedCancellation::RetryAfterProvenNoSend);
         if let Some(phases) = retained_cancellation_phases(retained, &mut settled, &execution) {
             obligations.push(settled);
             return Ok(phases);
         }
-        if let Some(phases) =
-            self.claim_wake_cancellation_send(
-                sealed,
-                &mut settled,
-                obligations,
-                &execution,
-                retry_after_proven_no_send,
-            )
-        {
+        if let Some(phases) = self.claim_wake_cancellation_send(
+            sealed,
+            &mut settled,
+            obligations,
+            &execution,
+            retry_after_proven_no_send,
+        ) {
             return Ok(phases);
         }
         let observer = match self.user_automation_cancellation_custody_observer(
@@ -6388,8 +6392,8 @@ fn classify_retained_obligation(
             })
         })
         .flatten();
-    let is_current_protocol = record.send_claim_protocol_version
-        == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION;
+    let is_current_protocol =
+        record.send_claim_protocol_version == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION;
     let has_no_attempt = record.attempt.is_none();
     let retry_after_proven_no_send = is_current_protocol
         && record.state == HostRequestState::Routed

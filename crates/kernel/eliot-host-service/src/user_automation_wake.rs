@@ -22,11 +22,11 @@ use eliot_host_state::{
 };
 use eliot_kernel_service::{
     USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationCoverage,
-    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOwnerEvidence,
-    UserAutomationWakeCancellationReadback, UserAutomationWakePort,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeCancellation, UserAutomationWakeCancellationReadback,
+    UserAutomationWakeEnumerationCoverage, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeOccurrenceDisposition,
+    UserAutomationWakeOwnerEvidence, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::WakeIntentState;

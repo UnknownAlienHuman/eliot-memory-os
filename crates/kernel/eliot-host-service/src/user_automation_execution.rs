@@ -186,12 +186,14 @@ where
                     .wake
                     .read_cancellation_batch_authenticated(request, channel_binding_sha256.clone())
                     .await?;
-                Ok(UserAutomationHostExecutionResponse::WakeCancellationBatchReadback {
-                    request_sha256,
-                    state_fence,
-                    authenticated_channel_binding_sha256: channel_binding_sha256,
-                    readback: Box::new(readback),
-                })
+                Ok(
+                    UserAutomationHostExecutionResponse::WakeCancellationBatchReadback {
+                        request_sha256,
+                        state_fence,
+                        authenticated_channel_binding_sha256: channel_binding_sha256,
+                        readback: Box::new(readback),
+                    },
+                )
             }
         }
     }

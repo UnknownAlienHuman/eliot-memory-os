@@ -36,12 +36,12 @@ use super::user_automation::{
     UserAutomationStoreOutcome,
 };
 use super::user_automation_execution::{
-    UserAutomationDurableJobPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
-    UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationWakeCancellation,
-    UserAutomationAuthenticatedWakeCancellationReadback,
-    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDurableJobPort,
+    UserAutomationFailurePublication, UserAutomationFailureRecord, UserAutomationHorizonTrigger,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationRuntimePort,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback,
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionObserver,
@@ -1659,7 +1659,8 @@ where
     async fn read_cancellation_batch(
         &self,
         request: impl Into<Box<UserAutomationWakeCancellation>>,
-    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError> {
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
         UserAutomationWakePort::read_cancellation_batch(self.client, request).await
     }
 

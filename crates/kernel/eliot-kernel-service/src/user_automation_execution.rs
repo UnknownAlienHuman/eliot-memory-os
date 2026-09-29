@@ -706,9 +706,7 @@ impl UserAutomationWakeCancellation {
 
     /// Canonical commitment retained by the Host batch record for this exact
     /// typed request, including its owner-issued target and enumeration proof.
-    pub fn request_commitment_sha256(
-        &self,
-    ) -> Result<String, UserAutomationExecutionError> {
+    pub fn request_commitment_sha256(&self) -> Result<String, UserAutomationExecutionError> {
         self.validate()?;
         canonical_json_bytes(self)
             .map(|bytes| sha256_hex(&bytes))
@@ -753,9 +751,18 @@ impl UserAutomationWakeCancellationReadback {
         let expected_commitment = request.request_commitment_sha256()?;
         request.validate_cancelled_wake_ids(&self.cancelled_wake_ids)?;
         for (value, field) in [
-            (&self.batch_operation_id, "cancellation_readback.batch_operation_id"),
-            (&self.batch_idempotency_key, "cancellation_readback.batch_idempotency_key"),
-            (&self.journal_transaction_id, "cancellation_readback.journal_transaction_id"),
+            (
+                &self.batch_operation_id,
+                "cancellation_readback.batch_operation_id",
+            ),
+            (
+                &self.batch_idempotency_key,
+                "cancellation_readback.batch_idempotency_key",
+            ),
+            (
+                &self.journal_transaction_id,
+                "cancellation_readback.journal_transaction_id",
+            ),
         ] {
             validate_text(value, field)?;
         }
@@ -763,7 +770,10 @@ impl UserAutomationWakeCancellationReadback {
             &self.request_commitment_sha256,
             "cancellation_readback.request_commitment_sha256",
         )?;
-        validate_digest(&self.record_checksum, "cancellation_readback.record_checksum")?;
+        validate_digest(
+            &self.record_checksum,
+            "cancellation_readback.record_checksum",
+        )?;
         if self.journal_sequence == 0
             || self.batch_operation_id != expected_operation
             || self.batch_idempotency_key != expected_key
@@ -777,9 +787,7 @@ impl UserAutomationWakeCancellationReadback {
     }
 
     /// Computes the commitment of the exact Host batch and append receipt.
-    pub fn owner_receipt_commitment_sha256(
-        &self,
-    ) -> Result<String, UserAutomationExecutionError> {
+    pub fn owner_receipt_commitment_sha256(&self) -> Result<String, UserAutomationExecutionError> {
         canonical_json_bytes(&(
             "eliot.user_automation.wake-cancellation-owner-receipt.v1",
             &self.batch_operation_id,
@@ -2968,7 +2976,8 @@ pub trait UserAutomationWakePort: Send + Sync {
     async fn read_cancellation_batch(
         &self,
         _request: impl Into<Box<UserAutomationWakeCancellation>>,
-    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError> {
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
         Err(UserAutomationRuntimeError::Unavailable(
             "exact Host wake-cancellation batch readback is unavailable".to_owned(),
         ))
@@ -3134,11 +3143,13 @@ where
             .wake
             .cancel_pending_wakes_observed(request.clone(), observer)
             .await?;
-        request.validate_cancelled_wake_ids(&cancelled).map_err(|error| {
-            UserAutomationRuntimeError::UnknownOutcome(format!(
-                "wake owner returned a conflicting answer after observed cancellation: {error}"
-            ))
-        })?;
+        request
+            .validate_cancelled_wake_ids(&cancelled)
+            .map_err(|error| {
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "wake owner returned a conflicting answer after observed cancellation: {error}"
+                ))
+            })?;
         Ok(cancelled)
     }
 
@@ -3467,9 +3478,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 
     /// Remove cancellation routed through the durable transport-custody
     /// observer. Versioned send-claim rows use this method exclusively.
-    pub async fn remove_and_cancel_with_targets_observed<
-        R: UserAutomationRuntimePort + ?Sized,
-    >(
+    pub async fn remove_and_cancel_with_targets_observed<R: UserAutomationRuntimePort + ?Sized>(
         &self,
         request: UserAutomationServiceRequest,
         targets: Vec<UserAutomationWakeCancellationTarget>,
@@ -3549,9 +3558,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 
     /// Pause cancellation routed through the durable transport-custody
     /// observer. Versioned send-claim rows use this method exclusively.
-    pub async fn pause_and_cancel_with_targets_observed<
-        R: UserAutomationRuntimePort + ?Sized,
-    >(
+    pub async fn pause_and_cancel_with_targets_observed<R: UserAutomationRuntimePort + ?Sized>(
         &self,
         request: UserAutomationServiceRequest,
         targets: Vec<UserAutomationWakeCancellationTarget>,
@@ -3626,9 +3633,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 
     /// Superseding-edit cancellation routed through the durable
     /// transport-custody observer. Versioned send-claim rows use this method.
-    pub async fn edit_and_cancel_with_targets_observed<
-        R: UserAutomationRuntimePort + ?Sized,
-    >(
+    pub async fn edit_and_cancel_with_targets_observed<R: UserAutomationRuntimePort + ?Sized>(
         &self,
         request: UserAutomationServiceRequest,
         superseded: UserAutomationRevision,
@@ -3674,7 +3679,9 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         targets: Vec<UserAutomationWakeCancellationTarget>,
         enumeration_receipt: UserAutomationWakeEnumerationReceipt,
         runtime: &R,
-        observer: Option<&dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver>,
+        observer: Option<
+            &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+        >,
     ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
         // Wake cancellation acts on the same complete, fail-closed owner view as
         // execution admission (issue #2808). Every cancellation join is a
