@@ -56,13 +56,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
+use eliot_observability_runtime::HotPathResourceCounters;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile, host_request_operation_id,
 };
-use eliot_observability_runtime::HotPathResourceCounters;
 use eliot_runtime_contracts::{DaemonProgressChannel, HotPathAttemptDisposition};
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
 use eliotd::diagnostics::RepeatedFailureGuard;
@@ -581,7 +581,8 @@ pub(super) fn run() -> Result<(), String> {
     // collection disabled rather than failing the daemon. There is no second
     // appender, no second registry and no second writer thread: the collector
     // reuses `ObservabilityInstall`'s own handles.
-    let hot_path = match eliotd::execution_metrics::install_daemon_execution_metrics(&config, None) {
+    let hot_path = match eliotd::execution_metrics::install_daemon_execution_metrics(&config, None)
+    {
         Ok(observability) => {
             observability.publish_runtime_counters();
             tracing::info!(
@@ -3090,13 +3091,7 @@ fn start_local_read_poll(
     let kernel_clone = Arc::clone(kernel);
     Box::pin(async move {
         LocalReadCompletion::Settled(
-            run_local_read_poll(
-                &kernel_clone,
-                composition,
-                startup_readiness,
-                hot_path,
-            )
-            .await,
+            run_local_read_poll(&kernel_clone, composition, startup_readiness, hot_path).await,
         )
     })
 }

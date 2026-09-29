@@ -55,8 +55,8 @@ use eliot_observability_runtime::{
 };
 use eliot_protocol::{HostRequestEnvelope, LocalReadAttempt};
 use eliot_runtime_contracts::{
-    AdmittedHotPathManifest, HOT_PATH_PROFILE_VERSION, HotPathAllocations,
-    HotPathAllocationAttribution, HotPathAllocationCoverage, HotPathAttemptDisposition,
+    AdmittedHotPathManifest, HOT_PATH_PROFILE_VERSION, HotPathAllocationAttribution,
+    HotPathAllocationCoverage, HotPathAllocations, HotPathAttemptDisposition,
     HotPathCacheBehaviour, HotPathDurationMs, HotPathJoinKey, HotPathLockContention,
     HotPathManifest, HotPathManifestRevision, HotPathOperationResult, HotPathRequiredStages,
     HotPathStage, HotPathStageRecord, HotPathStageSet, HotPathWaitComponent, RuntimeContractError,
@@ -111,8 +111,6 @@ struct ObservedService {
     stage: HotPathStage,
     /// The terminal disposition this boundary observed.
     disposition: HotPathAttemptDisposition,
-    /// Admission-to-boundary wait, when this boundary owns the enqueue reading.
-    queue_wait: Option<HotPathDurationMs>,
     /// Service this boundary actually performed, in one declared clock domain.
     service_time: Option<HotPathDurationMs>,
     /// The resource figures this boundary's own scope observed.
@@ -188,7 +186,9 @@ impl std::fmt::Display for HotPathMeasureError {
             Self::Unreadable { reason } => {
                 write!(formatter, "hot-path declaration unreadable: {reason}")
             }
-            Self::Declaration(reason) => write!(formatter, "hot-path declaration refused: {reason}"),
+            Self::Declaration(reason) => {
+                write!(formatter, "hot-path declaration refused: {reason}")
+            }
         }
     }
 }
@@ -207,12 +207,10 @@ pub fn install_daemon_hot_path_collector(
     crate_root: &Path,
     writer: RollingLogWriter,
 ) -> Result<SharedLocalReadHotPath, HotPathMeasureError> {
-    let path =
-        hot_path_manifest_path(crate_root).map_err(HotPathMeasureError::Contract)?;
-    let bytes = std::fs::read(&path)
-        .map_err(|error| HotPathMeasureError::Unreadable {
-            reason: format!("{}: {error}", path.display()),
-        })?;
+    let path = hot_path_manifest_path(crate_root).map_err(HotPathMeasureError::Contract)?;
+    let bytes = std::fs::read(&path).map_err(|error| HotPathMeasureError::Unreadable {
+        reason: format!("{}: {error}", path.display()),
+    })?;
     let admitted: AdmittedHotPathManifest =
         eliot_runtime_contracts::admit_hot_path_manifest(&path, &bytes)
             .map_err(|error| HotPathMeasureError::Declaration(error.to_string()))?;
@@ -305,7 +303,6 @@ impl LocalReadHotPath {
             join: join.clone(),
             stage: HotPathStage::Claim,
             disposition: HotPathAttemptDisposition::Served,
-            queue_wait: None,
             service_time: None,
             counters: HotPathResourceCounters::default(),
             service_wait_components: Vec::new(),
@@ -361,9 +358,7 @@ impl LocalReadHotPath {
 
     /// The census guard every counter mutation is taken through.
     fn census(&self) -> MutexGuard<'_, HotPathObservedCensus> {
-        self.census
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.census.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Builds one bounded stage record from values this boundary observed.
@@ -400,7 +395,7 @@ impl LocalReadHotPath {
             // The enqueue instant belongs to the Kernel's queue owner, so no
             // queue wait is observable from this daemon. Carrying one would
             // subtract a reading this process did not take.
-            queue_wait: observed.queue_wait,
+            queue_wait: None,
             service_time: observed.service_time.clone(),
             allocations: observed.counters.allocations().map(observed_allocations),
             lock_contention: observed_lock_contention(&observed.counters),
@@ -445,22 +440,21 @@ impl LocalReadAttemptTrace {
     pub fn note_service_observed(&mut self, counters: HotPathResourceCounters) {
         self.counters = counters;
         let service_time = HotPathDurationMs {
-            elapsed_ms: self.collector.clock.elapsed_ms(
-                self.service_started,
-                self.collector.clock.now(),
-            ),
+            elapsed_ms: self
+                .collector
+                .clock
+                .elapsed_ms(self.service_started, self.collector.clock.now()),
             clock_domain_id: self.collector.clock_domain_id().to_owned(),
         };
         let record = self.collector.stage_record(&ObservedService {
             join: self.join.clone(),
             stage: HotPathStage::ServiceEnd,
             disposition: HotPathAttemptDisposition::Served,
-            queue_wait: None,
             service_time: Some(service_time),
             counters: self.counters.clone(),
             service_wait_components: Vec::new(),
         });
-        self.admit(record);
+        self.admit(&record);
     }
 
     /// Admits one boundary record, counting a refusal as missing coverage.
@@ -469,19 +463,20 @@ impl LocalReadAttemptTrace {
     /// diagnostic code. Nothing in this module is emitted per request id: only
     /// the bounded stage and the refusal reason, so repeated unique content
     /// cannot open unbounded output.
-    fn admit(&mut self, record: HotPathStageRecord) {
+    fn admit(&mut self, record: &HotPathStageRecord) {
+        let stage = record.join.stage;
         if let Err(refusal) = self.set.admit(record.clone()) {
             self.collector.count_dropped();
             self.collector.count_unknown();
             tracing::warn!(
                 target: HOT_PATH_MEASURE_TARGET,
                 event = "eliotd.hot_path_record_refused",
-                stage = ?record.join.stage,
+                stage = ?stage,
                 reason = %refusal,
             );
             return;
         }
-        self.collector.emit(&record);
+        self.collector.emit(record);
     }
 
     /// Correlates this attempt's boundary records and emits the correlated result.
@@ -577,9 +572,7 @@ fn declared_coverage(
 /// acquisition that did not wait contributes only the acquisition. A boundary that
 /// acquired no lock reports `None` rather than a measured zero, because an
 /// unobserved lock is not a contention-free lock.
-fn observed_lock_contention(
-    counters: &HotPathResourceCounters,
-) -> Option<HotPathLockContention> {
+fn observed_lock_contention(counters: &HotPathResourceCounters) -> Option<HotPathLockContention> {
     if counters.lock_acquisitions() == 0 {
         return None;
     }
@@ -598,9 +591,7 @@ fn observed_lock_contention(
 /// A boundary that performed no lookup reports `None`; the contract's own
 /// derivation treats a zero-lookup, zero-bypass set as unobserved, so an empty set
 /// never becomes a measured zero.
-fn observed_cache_behaviour(
-    counters: &HotPathResourceCounters,
-) -> Option<HotPathCacheBehaviour> {
+fn observed_cache_behaviour(counters: &HotPathResourceCounters) -> Option<HotPathCacheBehaviour> {
     if counters.cache_lookups() == 0 {
         return None;
     }
