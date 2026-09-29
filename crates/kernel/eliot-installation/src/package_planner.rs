@@ -13,6 +13,7 @@ use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::profile_supervision::UserModeTaskRegistrationPlan;
 use crate::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationRoots, InstallationTransaction, InstallerAclPrincipal,
@@ -27,7 +28,6 @@ use crate::{
     provider_bootstrap_credential_target_for_store_target, select_profile_roots,
     supervision_key_slot_for_scope_id,
 };
-use crate::profile_supervision::UserModeTaskRegistrationPlan;
 use eliot_contracts::{EpochId, EpochLineageId};
 
 // Canonical lineage-A for the Phase-A template fence (Implements #64).
@@ -2150,14 +2150,12 @@ impl GenerationPackagePlanner {
             });
         }
         if input.profile == InstallationProfile::UserMode {
-            let effect_id = PlatformHandle::new(format!(
-                "effect:user-mode-task:{}",
-                input.generation
-            ))
-            .map_err(|error| InstallationError::InvalidField {
-                field: "generation.user_mode_task_effect_id".to_owned(),
-                reason: error.to_string(),
-            })?;
+            let effect_id =
+                PlatformHandle::new(format!("effect:user-mode-task:{}", input.generation))
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "generation.user_mode_task_effect_id".to_owned(),
+                        reason: error.to_string(),
+                    })?;
             let registration = UserModeTaskRegistrationPlan::for_candidate(
                 input.transaction_id.clone(),
                 effect_id.clone(),

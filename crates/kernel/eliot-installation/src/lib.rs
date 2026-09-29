@@ -250,11 +250,12 @@ use plan::{
 };
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
 pub use profile_roots::{
-    INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots,
+    INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots, profile_root_request_for_launch,
     profile_selection_receipts_match_retained_roots,
 };
 pub use profile_supervision::{
     NoServiceProfileAuthorityProof, ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision,
+    UserModeTaskRegistrationPlan, complete_user_mode_task_request,
     prove_no_service_profile_authority_dependency,
 };
 pub use redb_state::{

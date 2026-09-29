@@ -6,6 +6,7 @@ use eliot_platform_windows::{FileIdentity, PackageManifest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::profile_supervision::UserModeTaskRegistrationPlan;
 use super::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, ELIOT_HOST_SERVICE_NAME,
     ELIOT_WATCHDOG_SERVICE_NAME, HostPhaseBStaticTemplate, InstallationError, InstallationProfile,
@@ -14,7 +15,6 @@ use super::{
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest, sha256_handle,
     validate_package_relative_text,
 };
-use super::profile_supervision::UserModeTaskRegistrationPlan;
 mod contract_models;
 
 pub use contract_models::{

@@ -134,10 +134,7 @@ impl UserModeTaskRegistrationPlan {
                 &self.candidate_generation,
                 "user_mode_task.candidate_generation",
             ),
-            (
-                &self.profile_component,
-                "user_mode_task.profile_component",
-            ),
+            (&self.profile_component, "user_mode_task.profile_component"),
             (&self.profile_version, "user_mode_task.profile_version"),
         ] {
             handle(value, field)?;
@@ -166,10 +163,7 @@ impl UserModeTaskRegistrationPlan {
                 &self.host_executable_path,
                 "user_mode_task.host_executable_path",
             ),
-            (
-                &self.working_directory,
-                "user_mode_task.working_directory",
-            ),
+            (&self.working_directory, "user_mode_task.working_directory"),
         ] {
             handle(value, field)?;
             if !Path::new(value.as_str()).is_absolute() {
@@ -179,10 +173,7 @@ impl UserModeTaskRegistrationPlan {
                 });
             }
         }
-        let expected_host = format!(
-            "{}\\eliot-host.exe",
-            self.profile_roots.immutable_binaries
-        );
+        let expected_host = format!("{}\\eliot-host.exe", self.profile_roots.immutable_binaries);
         let descriptor_name = Path::new(self.authority_descriptor_path.as_str())
             .file_name()
             .and_then(|name| name.to_str())
@@ -221,16 +212,14 @@ pub fn complete_user_mode_task_request(
     bootstrap_arguments: Vec<String>,
 ) -> Result<CurrentUserTaskRequest, InstallationError> {
     plan.validate()?;
-    let authority_digest = PlatformHandle::new(roots.authority_descriptor_sha256.clone()).map_err(
-        |error| InstallationError::InvalidField {
-            field: "user_mode_task.live_authority_digest".to_owned(),
-            reason: error.to_string(),
-        },
-    )?;
-    sha256_handle(
-        &authority_digest,
-        "user_mode_task.live_authority_digest",
-    )?;
+    let authority_digest =
+        PlatformHandle::new(roots.authority_descriptor_sha256.clone()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_mode_task.live_authority_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    sha256_handle(&authority_digest, "user_mode_task.live_authority_digest")?;
     if roots.profile != PlatformProfileSelection::UserMode
         || roots.installation_id != plan.installation_id.as_str()
         || roots.installation_key.as_deref() != self_handle_option(&plan.profile_installation_key)
@@ -238,8 +227,7 @@ pub fn complete_user_mode_task_request(
         || roots.version != plan.profile_version.as_str()
         || roots.generation != plan.candidate_generation.as_str()
         || roots.authority_generation != plan.authority_generation.value()
-        || roots.authority_descriptor_path
-            != PathBuf::from(plan.authority_descriptor_path.as_str())
+        || roots.authority_descriptor_path != PathBuf::from(plan.authority_descriptor_path.as_str())
         || roots.repository_root.is_some()
         || bootstrap_arguments.is_empty()
         || !same_request_roots(plan, &roots)?
@@ -267,7 +255,10 @@ fn same_request_roots(
 ) -> Result<bool, InstallationError> {
     let expected = &plan.profile_roots;
     for (left, right) in [
-        (&expected.immutable_binaries, &request.roots.immutable_binaries),
+        (
+            &expected.immutable_binaries,
+            &request.roots.immutable_binaries,
+        ),
         (&expected.durable_data, &request.roots.durable_data),
         (&expected.user_config, &request.roots.user_config),
         (&expected.user_cache, &request.roots.user_cache),
@@ -279,15 +270,42 @@ fn same_request_roots(
     }
     let runtime = &expected.runtime_state_roots;
     let expected_runtime = [
-        ("runtime_state_roots.profile_anchor_root", &runtime.profile_anchor_root),
-        ("runtime_state_roots.installation_root", &runtime.installation_root),
-        ("runtime_state_roots.host_state_root", &runtime.host_state_root),
-        ("runtime_state_roots.kernel_ors_root", &runtime.kernel_ors_root),
-        ("runtime_state_roots.kernel_work_root", &runtime.kernel_work_root),
-        ("runtime_state_roots.store_data_root", &runtime.store_data_root),
-        ("runtime_state_roots.store_work_root", &runtime.store_work_root),
-        ("runtime_state_roots.store_temp_root", &runtime.store_temp_root),
-        ("runtime_state_roots.watchdog_state_root", &runtime.watchdog_state_root),
+        (
+            "runtime_state_roots.profile_anchor_root",
+            &runtime.profile_anchor_root,
+        ),
+        (
+            "runtime_state_roots.installation_root",
+            &runtime.installation_root,
+        ),
+        (
+            "runtime_state_roots.host_state_root",
+            &runtime.host_state_root,
+        ),
+        (
+            "runtime_state_roots.kernel_ors_root",
+            &runtime.kernel_ors_root,
+        ),
+        (
+            "runtime_state_roots.kernel_work_root",
+            &runtime.kernel_work_root,
+        ),
+        (
+            "runtime_state_roots.store_data_root",
+            &runtime.store_data_root,
+        ),
+        (
+            "runtime_state_roots.store_work_root",
+            &runtime.store_work_root,
+        ),
+        (
+            "runtime_state_roots.store_temp_root",
+            &runtime.store_temp_root,
+        ),
+        (
+            "runtime_state_roots.watchdog_state_root",
+            &runtime.watchdog_state_root,
+        ),
     ];
     if request.roots.runtime_state_roots.len() != expected_runtime.len() {
         return Ok(false);
