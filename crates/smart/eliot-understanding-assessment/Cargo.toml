@@ -18,6 +18,7 @@ functional_cell = "smart.understanding.common_ground"
 freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
 source_layer = "C1"
 agent_order = 85
+proof_entrypoint = "cargo test -p eliot-understanding-assessment"
 
 [dependencies]
 eliot-contracts.workspace = true
