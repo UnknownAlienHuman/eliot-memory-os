@@ -22,6 +22,28 @@ path = "src/main.rs"
 blake3.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
+# Contract-substrate edge (issue #974). `PublicationPort` is currently declared
+# in `src/backup_capture_ports.rs`, inside this composition root, so by the
+# orphan rule no crate can implement it: only eliot-kernel or a crate that
+# depends on eliot-kernel can, and no admitted owner does. A2.3 fixes the
+# internal dependency direction as
+#   contract -> domain/pure core -> ports -> adapters -> service/lifecycle
+# so a port must be declared BELOW the adapter that implements it. This edge
+# is the substrate for relocating that port into eliot-blob-api, which is the
+# provider-neutral S-04 BlobStore contract crate (owner of `BlobStoreClient`
+# and `BlobReadyReceipt`), already a declared dependency of the artifact owner
+# `eliot-artifact`, and reachable from this root without a cycle or any
+# forbidden runtime-root reach.
+#
+# This edge deliberately does NOT add eliot-artifact: that direction would make
+# the composition root depend on the owner adapter while leaving the port
+# unreachable from it, which is the same inversion A2.3 forbids.
+#
+# The consuming source change (relocating the port and its typed error out of
+# `KernelCaptureError`, which currently maps onto eliot-backup's `BackupError`)
+# is owned by the #959 lane. Preparation does not claim that relocation has
+# happened: no symbol from eliot-blob-api is imported by this crate yet.
+eliot-blob-api.workspace = true
 eliot-contracts.workspace = true
 eliot-installation.workspace = true
 eliot-kernel-core.workspace = true

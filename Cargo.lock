@@ -2286,6 +2286,7 @@ dependencies = [
  "blake3",
  "eliot-authority",
  "eliot-backup",
+ "eliot-blob-api",
  "eliot-contracts",
  "eliot-installation",
  "eliot-ipc",
