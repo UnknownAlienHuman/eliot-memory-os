@@ -79,7 +79,10 @@ use eliot_protocol::{
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
 use eliot_runtime_contracts::RecoveryDirective;
-use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, ScopeId};
+use eliot_store_api::{
+    CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
+    ScopeId,
+};
 use std::collections::BTreeMap;
 
 mod daemon_claim_queue;
@@ -7689,6 +7692,69 @@ pub(crate) fn local_read_replay_response(
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;
     Ok(Some(host_request_admitted_response(receipt, record)))
+}
+
+/// Joins one retained result to the source revision it was derived from.
+///
+/// This is the causal boundary for a dependent result, not a final-item filter.
+/// I15.7: "If such content participated in a retrieval/scoring branch, the
+/// whole contaminated branch—including dependent synthesis/model work—is
+/// discarded and replanned under the latest grant/policy; deleting only
+/// forbidden candidates cannot sanitize the ordering or erase prior influence."
+/// So a head that advanced, or a recorded key that no longer resolves at all,
+/// invalidates the entire retained result; the check never inspects the
+/// answer's rows and never returns a narrowed one.
+///
+/// `observed_heads` is the Store's own current head observation, obtained
+/// through the catalogue-activated head read. The recorded revisions are
+/// compared exactly as recorded — nothing is recomputed here, and a
+/// self-consistent copy of the caller's own list could not satisfy this
+/// because the observed side comes from the Store, not from the presenter.
+///
+/// A lineage that records no source revision names no causal join, so it is
+/// left to the owners that already refuse an unclassified result; this
+/// function never mints a join, a revision, or a permission.
+pub(crate) fn check_retained_source_revisions(
+    record: &HostRequestRecord,
+    observed_heads: &[RevisionHead],
+) -> Result<(), TransportError> {
+    let Some(revisions) = record
+        .result_lineage
+        .as_ref()
+        .and_then(|lineage| lineage.source_revisions.as_ref())
+    else {
+        return Ok(());
+    };
+    for recorded in revisions {
+        let current = observed_heads
+            .iter()
+            .find(|head| head.key.as_str() == recorded.key.as_str());
+        if !current.is_some_and(|head| head.revision == recorded.revision) {
+            return Err(TransportError::SessionFenced);
+        }
+    }
+    Ok(())
+}
+
+/// The exact source revision keys one retained result was derived from.
+///
+/// Empty when the row records no source revision: the result then names no
+/// causal join, which [`check_retained_source_revisions`] reports as absent
+/// rather than as agreement.
+pub(crate) fn retained_source_revision_keys(
+    record: &HostRequestRecord,
+) -> Result<Vec<RevisionKey>, TransportError> {
+    let Some(revisions) = record
+        .result_lineage
+        .as_ref()
+        .and_then(|lineage| lineage.source_revisions.as_ref())
+    else {
+        return Ok(Vec::new());
+    };
+    revisions
+        .iter()
+        .map(|revision| RevisionKey::new(revision.key.clone()).map_err(|_| TransportError::SessionFenced))
+        .collect()
 }
 
 /// Decodes the exact typed admission receipt from a rehydrate payload.
