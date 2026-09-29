@@ -5681,8 +5681,7 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
         crate::backup_cutover::observe_live_cutover_dispatch(
             operation,
             Some(target),
-            HostComposition::backup_dispatch_needs_cutover_admission(operation)
-                .unwrap_or_default(),
+            HostComposition::backup_dispatch_needs_cutover_admission(operation).unwrap_or_default(),
         );
         Err(refusal(match target {
             BackupDispatchTarget::Prepare => {

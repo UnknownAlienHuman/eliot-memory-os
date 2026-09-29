@@ -1452,10 +1452,7 @@ pub fn observe_live_cutover_dispatch(
     cutover_admission_required: bool,
 ) {
     let outcome = match (operation, target) {
-        (
-            eliot_protocol::backup::BackupOperationKind::CompleteRehearsal,
-            _,
-        ) => "rehearsal_excluded",
+        (eliot_protocol::backup::BackupOperationKind::CompleteRehearsal, _) => "rehearsal_excluded",
         (_, None) => "no_registered_target",
         (_, Some(crate::BackupDispatchTarget::Cutover)) => {
             if cutover_admission_required {
