@@ -150,6 +150,10 @@ pub struct ReactiveLedgerRequest {
     pub state_fence: StateFence,
     /// Kernel-owned activation-sealed session binding.
     pub session_id: String,
+    /// Ledger-specific owner revision observed before the candidate was built
+    /// (`0` denotes absence). The Store compares this value atomically before
+    /// replacing the whole session snapshot.
+    pub expected_revision: u64,
     /// Opaque bridge ledger snapshot bytes as text.
     pub ledger_json: String,
 }
@@ -157,8 +161,12 @@ pub struct ReactiveLedgerRequest {
 /// Reactive-ledger write response.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReactiveLedgerResponse {
-    /// Owner revision after the mutation.
+    /// Exact ledger-specific owner revision after the mutation.
+    pub ledger_revision: u64,
+    /// Aggregate owner revision, retained for existing projections.
     pub revision: u64,
+    /// Exact committed ledger bytes read back from the canonical owner.
+    pub ledger_json: String,
     /// Exact store response receipt (never fabricated by the caller).
     pub receipt: ReceiptEnvelope,
     /// True when the response replays an already-admitted operation identity.
@@ -209,6 +217,9 @@ pub struct ReactiveLedgerReadRequest {
 pub struct ReactiveLedgerReadResponse {
     /// Verbatim ledger snapshot, or `None` when absent.
     pub ledger_json: Option<String>,
+    /// Exact revision of this ledger selector (`0` when absent), separate
+    /// from aggregate revision heads.
+    pub ledger_revision: u64,
     /// Owner revision the projection was read at.
     pub revision: u64,
     /// Fence the projection was admitted under.
@@ -268,6 +279,9 @@ pub enum ReactiveServiceError {
     /// The store committed no response receipt; the outcome is unknown.
     #[error("reactive response receipt is missing; outcome is unknown")]
     MissingReceiptEnvelope,
+    /// Committed Store state did not read back as the exact CAS candidate.
+    #[error("reactive ledger readback did not match the committed candidate")]
+    ReadbackMismatch,
     /// A closed store error.
     #[error("reactive store: {0}")]
     Store(#[from] StoreError),
@@ -317,14 +331,20 @@ pub async fn handle_reactive_ledger_request(
         {
             return Err(ReactiveServiceError::IdentityConflict);
         }
-        let revision =
-            read_back_ledger_revision(client, &request.session_id, &request.state_fence).await?;
+        let readback = read_back_ledger(client, &request.session_id, &request.state_fence).await?;
+        require_exact_ledger_readback(request, &readback)?;
+        let ledger_json = readback
+            .ledger_json
+            .clone()
+            .ok_or(ReactiveServiceError::ReadbackMismatch)?;
         let receipt = existing
             .require_reconciliation_envelope()
             .map_err(ReactiveServiceError::from_store)?
             .clone();
         return Ok(ReactiveLedgerResponse {
-            revision,
+            ledger_revision: readback.ledger_revision,
+            revision: readback.revision,
+            ledger_json,
             receipt,
             replayed: true,
         });
@@ -352,10 +372,16 @@ pub async fn handle_reactive_ledger_request(
     envelope
         .validate()
         .map_err(|_| ReactiveServiceError::MissingReceiptEnvelope)?;
-    let revision =
-        read_back_ledger_revision(client, &request.session_id, &request.state_fence).await?;
+    let readback = read_back_ledger(client, &request.session_id, &request.state_fence).await?;
+    require_exact_ledger_readback(request, &readback)?;
+    let ledger_json = readback
+        .ledger_json
+        .clone()
+        .ok_or(ReactiveServiceError::ReadbackMismatch)?;
     Ok(ReactiveLedgerResponse {
-        revision,
+        ledger_revision: readback.ledger_revision,
+        revision: readback.revision,
+        ledger_json,
         receipt: envelope,
         replayed: false,
     })
@@ -602,8 +628,11 @@ fn require_live_fence(
 fn build_ledger_transition(
     request: &ReactiveLedgerRequest,
 ) -> Result<(PreparedTransition, OperationManifestDigest), ReactiveServiceError> {
-    let operation =
-        reactive_ledger_mutation_request(request.session_id.clone(), request.ledger_json.clone());
+    let operation = reactive_ledger_mutation_request(
+        request.session_id.clone(),
+        request.expected_revision,
+        request.ledger_json.clone(),
+    );
     build_reactive_transition(request, operation, || {
         OrderingScopeId::new(format!("reactive-session:{}", request.session_id)).map_err(|_| {
             ReactiveServiceError::InvalidField {
@@ -781,18 +810,34 @@ impl ReactiveTransitionRequest for ResourceSnapshotRequest {
 }
 
 /// Reads back the committed ledger revision for a write response.
-async fn read_back_ledger_revision(
+async fn read_back_ledger(
     client: &impl CanonicalStoreClient,
     session_id: &str,
     fence: &StateFence,
-) -> Result<u64, ReactiveServiceError> {
+) -> Result<ReactiveLedgerReadResponse, ReactiveServiceError> {
     let query = reactive_ledger_read_request(session_id.to_owned(), fence.clone())
         .map_err(ReactiveServiceError::from_store)?;
     let payload = client
         .execute_named(query)
         .await
         .map_err(ReactiveServiceError::from_store)?;
-    Ok(decode_ledger_read_response(&payload.payload, fence)?.revision)
+    decode_ledger_read_response(&payload.payload, fence)
+}
+
+fn require_exact_ledger_readback(
+    request: &ReactiveLedgerRequest,
+    readback: &ReactiveLedgerReadResponse,
+) -> Result<(), ReactiveServiceError> {
+    let expected_after = request
+        .expected_revision
+        .checked_add(1)
+        .ok_or(ReactiveServiceError::ReadbackMismatch)?;
+    if readback.ledger_revision != expected_after
+        || readback.ledger_json.as_deref() != Some(request.ledger_json.as_str())
+    {
+        return Err(ReactiveServiceError::ReadbackMismatch);
+    }
+    Ok(())
 }
 
 /// Reads back the committed snapshot revision for a write response.
@@ -847,8 +892,16 @@ fn decode_ledger_read_response(
         .get("ledger_json")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let ledger_revision = payload
+        .get("ledger_revision")
+        .and_then(Value::as_u64)
+        .ok_or(ReactiveServiceError::InvalidField {
+            field: "reactive.ledger_revision",
+            reason: "ledger projection malformed",
+        })?;
     Ok(ReactiveLedgerReadResponse {
         ledger_json,
+        ledger_revision,
         revision,
         state_fence: fence.clone(),
     })
