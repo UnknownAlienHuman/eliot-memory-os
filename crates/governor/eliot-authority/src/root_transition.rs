@@ -751,23 +751,6 @@ impl AdmittedRootTransition {
             disposition,
         })
     }
-
-    /// The disposition the owner receipt carried when this crossing was
-    /// admitted.
-    ///
-    /// It is read from the same receipt every other coordinate in this type
-    /// is read from, and this crate derives none of it. Both admission paths
-    /// run the shared receipt proof first, and that proof refuses any
-    /// disposition but [`RootTransitionDisposition::Committed`], so a value
-    /// read here is the owner's committed answer and nothing else. A possible
-    /// commit ([`RootTransitionDisposition::UnknownOutcome`]) and a terminal
-    /// refusal never reach an admitted value at all: both leave the crossing
-    /// unadmitted, so a caller cannot read either one here as if it had
-    /// committed.
-    #[must_use]
-    pub const fn disposition(&self) -> RootTransitionDisposition {
-        self.disposition
-    }
 }
 
 /// Durable admitted-evidence row of the versioned grant-graph recovery
