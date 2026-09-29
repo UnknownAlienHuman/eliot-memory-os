@@ -220,19 +220,21 @@ fn validate_profile_selection_receipt_shape(
     {
         return Err(InstallationError::InvalidField {
             field: format!("profile_selection_receipt.{label}"),
-            reason: "owner, session, generation, and descriptor path must be live values".to_owned(),
+            reason: "owner, session, generation, and descriptor path must be live values"
+                .to_owned(),
         });
     }
     WindowsPathIdentity::parse_root(
         &receipt.authority_descriptor_path.to_string_lossy(),
         &format!("profile_selection_receipt.{label}.authority_descriptor_path"),
     )?;
-    let digest = super::PlatformHandle::new(&receipt.authority_descriptor_sha256).map_err(
-        |error| InstallationError::InvalidField {
-            field: format!("profile_selection_receipt.{label}.authority_descriptor_sha256"),
-            reason: error.to_string(),
-        },
-    )?;
+    let digest =
+        super::PlatformHandle::new(&receipt.authority_descriptor_sha256).map_err(|error| {
+            InstallationError::InvalidField {
+                field: format!("profile_selection_receipt.{label}.authority_descriptor_sha256"),
+                reason: error.to_string(),
+            }
+        })?;
     sha256_handle(
         &digest,
         &format!("profile_selection_receipt.{label}.authority_descriptor_sha256"),
@@ -450,8 +452,7 @@ impl InstallationRoots {
             InstallationProfile::PortableDev => ProfileSelection::PortableDev,
             InstallationProfile::SystemService => {
                 return Err(InstallationError::ProfileViolation(
-                    "profile-selection receipts are limited to UserMode and PortableDev"
-                        .to_owned(),
+                    "profile-selection receipts are limited to UserMode and PortableDev".to_owned(),
                 ));
             }
         };

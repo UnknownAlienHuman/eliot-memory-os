@@ -346,8 +346,10 @@ impl super::RedbInstallationRegistry {
         host_root: UserOwnedRootLease,
         profile: super::InstallationProfile,
         generation: &PlatformHandle,
-    ) -> Result<eliot_platform_windows::profile_supervision::ProfileSelectionReceipt, super::InstallationError>
-    {
+    ) -> Result<
+        eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+        super::InstallationError,
+    > {
         let registry = Self::inspect_existing_user_owned_at(host_root, profile)?.ok_or_else(|| {
             super::InstallationError::MigrationRequired {
                 reason: "current-user installation registry is absent; retained profile identity cannot be rehydrated"
@@ -377,11 +379,11 @@ impl super::RedbInstallationRegistry {
                     .to_owned(),
             }
         })?;
-        let fence = registry
-            .last_committed_activation_fence()
-            .ok_or_else(|| super::InstallationError::MigrationRequired {
+        let fence = registry.last_committed_activation_fence().ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
                 reason: "current-user registry has no committed activation fence".to_owned(),
-            })?;
+            }
+        })?;
         if &fence.generation != generation {
             return Err(super::InstallationError::IdentityConflict);
         }
@@ -415,11 +417,11 @@ impl super::RedbInstallationRegistry {
         let selection = registry
             .profile_selection_receipt_for_generation(generation)?
             .clone();
-        let fence = registry
-            .last_committed_activation_fence()
-            .ok_or_else(|| super::InstallationError::MigrationRequired {
+        let fence = registry.last_committed_activation_fence().ok_or_else(|| {
+            super::InstallationError::MigrationRequired {
                 reason: "current-user registry has no committed activation fence".to_owned(),
-            })?;
+            }
+        })?;
         if &fence.generation != generation {
             return Err(super::InstallationError::IdentityConflict);
         }
@@ -789,11 +791,12 @@ impl RedbInstallationTransactionStore {
         receipt: eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
     ) -> Result<InstallationTransaction, InstallationError> {
         let mut store = Self::open_existing_exact_path(path)?;
-        let mut transaction = store
-            .load(transaction_id)?
-            .ok_or_else(|| InstallationError::TransactionNotFound {
-                transaction_id: transaction_id.as_str().to_owned(),
-            })?;
+        let mut transaction =
+            store
+                .load(transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                })?;
         let expected = TransactionVersion::of(&transaction)?;
         transaction.record_profile_selection_receipt(receipt)?;
         if transaction.revision != expected.revision {

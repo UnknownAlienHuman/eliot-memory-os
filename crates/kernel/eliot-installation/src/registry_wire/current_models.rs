@@ -14,8 +14,8 @@
 //! `registry_wire` owns shape selection, legacy migration, and decode dispatch;
 //! the installation registry/Host owns durable mutation and authority.
 
-use serde::Deserialize;
 use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
+use serde::Deserialize;
 
 use super::super::{
     ActivationCommitFence, ActivePhaseBRebind, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,

@@ -3,11 +3,11 @@
 use std::collections::BTreeSet;
 
 use eliot_platform::GuardRevertOutcome;
+use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 use eliot_platform_windows::{
     TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
     terminal_containment_operation_digest, validate_terminal_containment_readback_for,
 };
-use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -649,8 +649,7 @@ impl InstallationTransaction {
         }
         if self.profile == InstallationProfile::SystemService {
             return Err(InstallationError::ProfileViolation(
-                "SystemService retains protected root ownership receipts instead"
-                    .to_owned(),
+                "SystemService retains protected root ownership receipts instead".to_owned(),
             ));
         }
         let roots = self.profile_governed_roots.as_ref().ok_or_else(|| {
@@ -669,12 +668,13 @@ impl InstallationTransaction {
             None => {}
         }
         self.profile_selection_receipt = Some(receipt);
-        self.revision = self.revision.checked_add(1).ok_or_else(|| {
-            InstallationError::InvalidField {
-                field: "revision".to_owned(),
-                reason: "overflow".to_owned(),
-            }
-        })?;
+        self.revision =
+            self.revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
         self.validate()
     }
 

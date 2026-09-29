@@ -2569,10 +2569,7 @@ impl ApprovedGeneration {
             self.manifest
                 .runtime_launch
                 .profile_governed_roots
-                .validate_profile_selection_receipt(
-                    &self.manifest.runtime_launch,
-                    receipt,
-                )?;
+                .validate_profile_selection_receipt(&self.manifest.runtime_launch, receipt)?;
         }
         Ok(())
     }
@@ -3300,7 +3297,9 @@ impl ApprovedGenerationRegistry {
             let generation_receipt = self
                 .generations
                 .iter()
-                .find(|generation| generation.manifest.generation == transaction.candidate_manifest.generation)
+                .find(|generation| {
+                    generation.manifest.generation == transaction.candidate_manifest.generation
+                })
                 .and_then(|generation| generation.profile_selection_receipt.as_ref());
             if generation_receipt != profile_selection_receipt.as_ref() {
                 return Err(InstallationError::IdentityConflict);
