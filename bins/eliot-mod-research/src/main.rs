@@ -22,6 +22,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use eliot_kernel_service::{RESEARCH_PROVIDER_DISPATCH_OPERATION, ResearchProviderDispatch};
+use eliot_mod_research::AdmittedResearchBridge;
 use eliot_mod_research::admission::ProviderAdmission;
 use eliot_mod_research::dispatch_authority::{AdmittedRequestPort, ProviderEvidenceRecorder};
 use eliot_mod_research::dispatched_material::{AdmittedOperation, read_admitted_material};
@@ -32,10 +33,26 @@ use eliot_mod_research::evidence::{
 use eliot_mod_research::execution::ProviderBridge;
 use eliot_mod_research::kernel_client::{ResearchKernelClient, ResearchKernelClientError};
 use eliot_mod_research::{
-    AcquisitionCoverageDegradation, BridgeIdentity, RESEARCH_SOURCE_UNAVAILABLE,
-    RawProviderEvidence, ResearchDispatchAuthority, SubmissionRecord,
+    AcquisitionCoverageDegradation, BridgeIdentity, EvidenceObservation, Obligation,
+    RESEARCH_SOURCE_UNAVAILABLE, RawProviderEvidence, ResearchDispatchAuthority, SubmissionRecord,
     acquisition_coverage_degradation, compose_admitted, project_admitted_inquiry,
 };
+
+/// Stable code prefixed to the bounded report of follow-up obligations the
+/// primary failure could not discharge.
+///
+/// This is one extra line on the same evidence stream, not a second terminal
+/// event: the receipt's own outcome and reason code are unchanged, and this
+/// names only the obligations that failed alongside the primary cause.
+const UNDISCHARGED_OBLIGATIONS: &str = "UNDISCHARGED_OBLIGATIONS";
+
+/// Returns the stable wire name of one bounded follow-up obligation.
+const fn obligation_name(obligation: Obligation) -> &'static str {
+    match obligation {
+        Obligation::Cancellation => "cancellation",
+        Obligation::StreamReadback => "stream_readback",
+    }
+}
 use eliot_process::{Generation, OperationId};
 use eliot_process_executor::WindowsProcessExecutor;
 use eliot_research_exchange_api::DisclosureClass;
@@ -120,7 +137,7 @@ enum Failure {
 fn run() -> Result<String, Failure> {
     // 1. Authenticated contract construction. A closed or unverifiable front
     //    door means no admission exists at all.
-    let client = ResearchKernelClient::load()
+    let mut client = ResearchKernelClient::load()
         .map_err(|error| Failure::NoAdmission(format!("front door unavailable: {error}")))?;
     let live_epoch = client
         .live_authority_epoch()
@@ -166,7 +183,7 @@ fn run() -> Result<String, Failure> {
     let records = sink
         .records()
         .map_err(|error| Failure::NoAdmission(format!("evidence custody: {error}")))?;
-    let (bridge, _exchange) = researcher.into_exchange().into_parts();
+    let (mut bridge, _exchange) = researcher.into_exchange().into_parts();
 
     // A `submit` that returned `Ok` proves only that the Rust call finished:
     // `ProviderBridge::execute` returns `Ok` for every terminal state it could
@@ -198,11 +215,21 @@ fn run() -> Result<String, Failure> {
         let degradation = acquisition_coverage_degradation(Some(
             &eliot_mod_research::TerminalFailure::outcome_degradation(outcome, cancellation),
         ));
+        // A classified terminal run reached `finish_terminal`, which reads the
+        // executor's captured streams back before it classifies, so the
+        // retained evidence here was genuinely observed rather than inferred.
+        let raw = bridge.last_evidence().cloned();
+        let observation = raw
+            .as_ref()
+            .map_or(EvidenceObservation::NotAttempted, |evidence| {
+                EvidenceObservation::Observed(Box::new(evidence.clone()))
+            });
         let receipt = terminal_receipt(
             &admitted,
             &client_receipt,
             &admission,
-            bridge.last_evidence().cloned(),
+            raw.as_ref(),
+            &observation,
             cancellation.cloned(),
             bridge.last_submission(),
             bridge.last_provider_job_ref().cloned(),
@@ -227,17 +254,42 @@ fn run() -> Result<String, Failure> {
             _ => Err(Failure::Degraded(degradation, Box::new(receipt))),
         };
     }
-    // The bridge retains the typed terminal classification, the raw evidence
-    // materialized before the failure, and the cancellation receipt. A failure
-    // that never reached the executor is still an acquisition gap, never a
-    // Researcher semantic failure.
-    //
-    // The conversion from that retained classification into the typed
-    // acquisition-coverage degradation is the crate's one named conversion, not
-    // an arm of this function. The outcome and the reason code the receipt
-    // carries therefore cannot be a second, privately chosen classification of
-    // the same failure, and the degraded disposition this run exits with is
-    // built from that same record.
+    report_failed_operation(
+        &mut client,
+        &admitted,
+        &client_receipt,
+        &admission,
+        &mut bridge,
+        records,
+    )
+}
+
+/// Reports the terminal receipt and governance view of an attempt that failed.
+///
+/// The bridge retains the typed terminal classification, the raw evidence
+/// materialized before the failure, and the cancellation receipt. A failure
+/// that never reached the executor is still an acquisition gap, never a
+/// Researcher semantic failure.
+///
+/// The conversion from that retained classification into the typed
+/// acquisition-coverage degradation is the crate's one named conversion, not
+/// an arm of this function. The outcome and the reason code the receipt
+/// carries therefore cannot be a second, privately chosen classification of
+/// the same failure, and the degraded disposition this run exits with is
+/// built from that same record.
+///
+/// The stream-readback state travels with the failure rather than being
+/// re-derived from the presence of an evidence record, so a readback that never
+/// answered is never reported as a stream that was read and was empty.
+#[allow(clippy::too_many_arguments)]
+fn report_failed_operation(
+    client: &mut ResearchKernelClient,
+    admitted: &AdmittedOperation,
+    client_receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
+    admission: &ProviderAdmission,
+    bridge: &mut AdmittedResearchBridge,
+    records: Vec<eliot_mod_research::ProviderEvidenceRecord>,
+) -> Result<String, Failure> {
     let failure = bridge.last_failure();
     let degradation = acquisition_coverage_degradation(failure);
     //
@@ -246,13 +298,17 @@ fn run() -> Result<String, Failure> {
     // owner-attested classification from a local guess.
     let outcome = degradation.outcome;
     let cancellation = bridge.last_cancellation();
-    let reconciliation = reconcile_with_owner(&client, &admitted, cancellation, outcome);
+    let reconciliation = reconcile_with_owner(client, admitted, cancellation, outcome);
     let reason_code = terminal_reason_code(outcome, &reconciliation, cancellation);
+    let observation = failure.map_or(EvidenceObservation::NotAttempted, |terminal| {
+        terminal.evidence_observation.clone()
+    });
     let receipt = terminal_receipt(
-        &admitted,
-        &client_receipt,
-        &admission,
-        bridge.last_evidence().cloned(),
+        admitted,
+        client_receipt,
+        admission,
+        bridge.last_evidence(),
+        &observation,
         bridge.last_cancellation().cloned(),
         bridge.last_submission(),
         bridge.last_provider_job_ref().cloned(),
@@ -262,13 +318,58 @@ fn run() -> Result<String, Failure> {
         records,
         reconciliation,
     );
-    report_admitted_inquiry(
-        &admitted.request,
-        &admission,
-        &receipt,
-        bridge.last_failure(),
-    );
+    report_admitted_inquiry(&admitted.request, admission, &receipt, failure);
+    // The bounded secondary obligations and the stream-readback state are
+    // reported so the primary cause on the receipt is never the whole story: a
+    // timeout whose cancellation or readback never answered says so.
+    report_bounded_gaps(failure, bridge.last_operation_id());
     Err(Failure::Degraded(degradation, Box::new(receipt)))
+}
+
+/// Reports the bounded follow-up gaps a primary failure left behind.
+///
+/// This adds no terminal event: the receipt already carries the primary cause
+/// and its classification, and this line only names what the primary cause
+/// could not discharge plus the exact operation identity that a possibly-started
+/// attempt must be resolved against. Nothing is emitted when there is nothing
+/// to report, so a clean run's stream is unchanged.
+fn report_bounded_gaps(
+    failure: Option<&eliot_mod_research::TerminalFailure>,
+    operation_id: Option<&str>,
+) {
+    let Some(failure) = failure else {
+        return;
+    };
+    let readback = match &failure.evidence_observation {
+        EvidenceObservation::NotAttempted => "not_attempted",
+        EvidenceObservation::Unobserved => "unobserved",
+        EvidenceObservation::Observed(_) => "observed",
+    };
+    let obligations = failure
+        .undischarged
+        .iter()
+        .copied()
+        .map(obligation_name)
+        .collect::<Vec<_>>()
+        .join(",");
+    if failure.undischarged.is_empty() && !failure.cancellation_attempted {
+        return;
+    }
+    let _ = writeln!(
+        io::stderr(),
+        "{}: operation={} reason={} readback={readback} cancel_attempted={} \
+         cancel_confirmed={} undischarged={}",
+        UNDISCHARGED_OBLIGATIONS,
+        operation_id.unwrap_or("none"),
+        failure.reason_code,
+        failure.cancellation_attempted,
+        failure.cancellation.is_some(),
+        if obligations.is_empty() {
+            "none"
+        } else {
+            &obligations
+        },
+    );
 }
 
 /// Reports the `R6` inquiry-governance view of the operation this run performed.
@@ -510,12 +611,20 @@ fn ask_control_operation(
 }
 
 /// Builds the terminal receipt for one bounded operation.
+///
+/// `observation` is the stream-readback state and `undischarged` the bounded
+/// follow-up obligations, so the receipt can state a stream gap as a gap. When
+/// the readback was never attempted or never answered, `raw` is absent and the
+/// receipt records that absence through `observation`; it must not fall back to
+/// the digest and byte count of an actually empty capture, which would report
+/// "the provider produced nothing" for a stream nobody ever read.
 #[allow(clippy::too_many_arguments)]
 fn terminal_receipt(
     admitted: &AdmittedOperation,
     client_receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
     admission: &ProviderAdmission,
-    raw: Option<RawProviderEvidence>,
+    raw: Option<&RawProviderEvidence>,
+    observation: &EvidenceObservation,
     cancellation: Option<CancellationEvidence>,
     submission: Option<&SubmissionRecord>,
     provider_job_ref: Option<String>,
@@ -526,6 +635,19 @@ fn terminal_receipt(
     reconciliation: ReconciliationEvidence,
 ) -> ProviderExecutionReceipt {
     let dispatch = &admitted.dispatch;
+    // The retained evidence is used only when the readback actually answered.
+    // A not-attempted or never-answered readback falls back to the explicit
+    // absence record, whose streams carry the `NoHandle` omission, so an
+    // unread stream is never rendered with the digest and byte count of a
+    // stream that was really read and really was empty. Those are two
+    // different observations and this receipt keeps them different.
+    let raw = match (raw, observation) {
+        (Some(evidence), EvidenceObservation::Observed(_)) => evidence.clone(),
+        _ => RawProviderEvidence::absent(
+            dispatch.operation_id.as_str(),
+            &client_receipt.request_sha256,
+        ),
+    };
     ProviderExecutionReceipt {
         operation_id: dispatch.operation_id.clone(),
         cancellation_id: admission.cancellation_id().to_owned(),
@@ -549,12 +671,7 @@ fn terminal_receipt(
             .map_or_else(String::new, |record| record.submit_binding_sha256.clone()),
         outcome,
         reason_code,
-        raw: raw.unwrap_or_else(|| {
-            RawProviderEvidence::absent(
-                dispatch.operation_id.as_str(),
-                &client_receipt.request_sha256,
-            )
-        }),
+        raw,
         cancellation,
         reconciliation,
         evidence_records: records,

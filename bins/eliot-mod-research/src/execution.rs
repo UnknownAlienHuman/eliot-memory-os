@@ -102,6 +102,92 @@ pub enum ProviderOutcome {
     Unknown,
 }
 
+/// Whether the executor's captured provider streams were read back, and what
+/// that readback produced.
+///
+/// The three states are distinct and never collapse into one another. Both
+/// `NotAttempted` and `Unobserved` carry no bytes at all, so no consumer can
+/// read the digest or the byte count of a genuinely empty stream out of them:
+/// a stream that was never asked for and a stream whose readback never
+/// answered are both unknown, and only `Observed` reports the provider's own
+/// bytes. Within `Observed` the record keeps the empty/partial/complete
+/// distinction on its own terms, so an observed empty stream and an observed
+/// partial stream stay different states there as well.
+#[derive(Clone, Debug)]
+pub enum EvidenceObservation {
+    /// Stream readback was never attempted on this path.
+    NotAttempted,
+    /// Stream readback was attempted and the executor did not answer, so what
+    /// the provider wrote is unknown rather than empty.
+    Unobserved,
+    /// The executor's captured streams were read back successfully.
+    Observed(Box<RawProviderEvidence>),
+}
+
+impl EvidenceObservation {
+    /// Returns the materialized evidence, when the readback answered.
+    #[must_use]
+    pub fn observed(&self) -> Option<&RawProviderEvidence> {
+        match self {
+            Self::Observed(evidence) => Some(evidence),
+            Self::NotAttempted | Self::Unobserved => None,
+        }
+    }
+}
+
+/// One bounded follow-up action a deadline overrun had to attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Obligation {
+    /// Stopping the operation's process tree.
+    Cancellation,
+    /// Reading the operation's captured streams back as evidence.
+    StreamReadback,
+}
+
+/// What the deadline arm's cancellation attempt actually produced.
+///
+/// The receipt is the only proof a cancellation was attempted and what it
+/// achieved, so it is retained whenever the executor answered. An
+/// unanswered cancellation is its own state: it is not a clean stop, and it
+/// never becomes the same thing as never having tried.
+#[derive(Clone, Debug)]
+pub enum CancellationOutcome {
+    /// No cancellation was attempted on this path.
+    NotAttempted,
+    /// A cancellation was issued and the executor returned a receipt.
+    Confirmed(Box<CancellationEvidence>),
+    /// A cancellation was issued and the executor did not answer, so whether it
+    /// took effect is unknown.
+    Unresolved,
+}
+
+impl CancellationOutcome {
+    /// Returns the retained receipt, when the cancellation was confirmed.
+    #[must_use]
+    pub fn receipt(&self) -> Option<&CancellationEvidence> {
+        match self {
+            Self::Confirmed(receipt) => Some(receipt),
+            Self::NotAttempted | Self::Unresolved => None,
+        }
+    }
+}
+
+/// A bounded follow-up obligation the primary failure could not discharge.
+///
+/// This is a secondary obligation attached to the one primary cause, never a
+/// second terminal event. The refusal is retained as its own typed
+/// [`BridgeError`] rather than folded into the primary cause's reason text, so
+/// nothing is collapsed into prose and no provider output reaches the error
+/// message. A deadline overrun makes at most two such attempts, so this list
+/// is bounded by construction.
+#[derive(Debug)]
+pub struct UndischargedObligation {
+    /// Which follow-up obligation was attempted.
+    pub obligation: Obligation,
+    /// The typed refusal that attempt produced, retained verbatim.
+    pub refusal: BridgeError,
+}
+
 /// One executed provider attempt: the stable job identity, the typed outcome,
 /// the immutable raw evidence, the provider-local job reference, the
 /// cancellation receipt when one was actually issued, and the terminal result
@@ -185,6 +271,22 @@ impl ProviderBridge {
             .and_then(|record| record.clone())
     }
 
+    /// Returns the stable identity of the operation this runner bound, once one
+    /// was sealed.
+    ///
+    /// This is the executor's own durable operation identity, recorded before
+    /// the start handoff precisely so a start-response loss still names the
+    /// operation that may have started. Reporting it is what lets that attempt
+    /// be resolved by identity; it is never permission to submit again.
+    pub fn last_bound_operation(&self) -> Option<String> {
+        self.bound_identity.lock().ok().and_then(|operation| {
+            operation
+                .as_ref()
+                .map(OperationId::as_str)
+                .map(str::to_owned)
+        })
+    }
+
     /// Overrides the terminal-lifecycle wait bound.
     #[must_use]
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
@@ -249,10 +351,15 @@ impl ProviderBridge {
             required_schema: request.required_schema.clone(),
             request_sha256: request_sha256.clone(),
         };
+        // These three refusals happen before the executor is contacted, so no
+        // provider output exists to retain: `NotAttempted` says exactly that,
+        // and is deliberately not the digest of an empty stream.
         let wire_bytes = envelope
             .encode()
             .map_err(|refusal| BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
+                evidence: None,
+                disposition: None,
             })?;
         // Fail-closed serializer check: the retained reconciliation record must
         // decode back to the same operation, and its delivered projection must
@@ -260,6 +367,8 @@ impl ProviderBridge {
         let round_trip = SubmitEnvelope::decode(&wire_bytes).map_err(|refusal| {
             BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
+                evidence: None,
+                disposition: None,
             }
         })?;
         if round_trip.operation_id != envelope.operation_id
@@ -269,21 +378,24 @@ impl ProviderBridge {
         {
             return Err(BridgeError::ProtocolViolation {
                 reason: "submit envelope failed its round-trip binding check",
+                evidence: None,
+                disposition: None,
             });
         }
-        let receipt = block_on(self.executor.start(process_request, self.sink.clone()))
-            .map_err(BridgeError::Process)?;
-        if receipt.operation_id() != &operation
-            || receipt.request_digest() != digest
-            || receipt.accepted_generation() != generation
-        {
-            return Err(BridgeError::EvidenceIncomplete {
-                reason: "executor start receipt does not preserve the bound request",
-            });
-        }
-        // Record the started operation identity so a later cancellation can
-        // prove ownership at cancel time, not only at start time, and record
-        // the sealed submit so any later failure is still reconcilable.
+        // The sealed submit and the exact operation binding are recorded BEFORE
+        // the executor is asked to start anything. `start` is the handoff: once
+        // it is called the operation may exist in the executor registry, so a
+        // start-response loss or a start-receipt mismatch must still leave the
+        // attempt identifiable and reconcilable by its stable operation
+        // identity. Recording them after the receipt check made a failed check
+        // indistinguishable from an attempt that was never made, which threw
+        // away the only handle on a possibly-started operation.
+        //
+        // The identity reused here is `ProcessExecutor`'s own durable operation
+        // identity, taken from the admitted process request itself. No
+        // Researcher-private execution ledger is introduced: a second record of
+        // "what this process ran" would be a second, unverifiable source of
+        // custody next to the executor's.
         *self
             .bound_identity
             .lock()
@@ -300,6 +412,21 @@ impl ProviderBridge {
             envelope_sha256: sha256_hex(&wire_bytes),
             envelope_bytes: wire_bytes.clone(),
         });
+        let receipt = block_on(self.executor.start(process_request, self.sink.clone()))
+            .map_err(BridgeError::Process)?;
+        if receipt.operation_id() != &operation
+            || receipt.request_digest() != digest
+            || receipt.accepted_generation() != generation
+        {
+            // The start response did not preserve the bound request, but the
+            // operation may still have started. The bound identity and the
+            // sealed submit recorded above are what let this attempt be
+            // resolved: a failed start-receipt check is not permission to mint a
+            // new attempt or to report that nothing ran.
+            return Err(BridgeError::EvidenceIncomplete {
+                reason: "executor start receipt does not preserve the bound request",
+            });
+        }
         Ok(BoundOperation {
             operation,
             digest,
@@ -314,6 +441,15 @@ impl ProviderBridge {
     /// captured streams back so the provider's real stdout/stderr survive as
     /// evidence, and stays explicit: the outcome is unconfirmed and
     /// reconciliation by operation identity is required before any retry.
+    ///
+    /// The deadline observation is captured FIRST, because it is the primary
+    /// cause of this failure. Cancellation and stream readback are then two
+    /// independent attempts whose typed outcomes are collected rather than
+    /// propagated: `?` on either one would replace the timeout with a
+    /// cancellation transport failure, or discard a cancellation receipt that
+    /// had already been obtained. A secondary failure is therefore recorded as
+    /// a bounded obligation on the same timeout, never as a different terminal
+    /// event and never as the loss of what was already observed.
     fn await_terminal(
         &self,
         bound: &BoundOperation,
@@ -331,16 +467,46 @@ impl ProviderBridge {
                 return Ok(view);
             }
             if started.elapsed() >= self.deadline {
-                // The cancellation receipt is the only proof a cancellation
-                // was attempted and what it achieved. Discarding it (the
-                // previous `let _ = ...`) destroyed that proof, so it is now
-                // retained and reported with the timeout.
-                let cancellation = block_on(self.executor.cancel(bound.operation.clone()))
-                    .map(|receipt| Box::new(CancellationEvidence::from_receipt(&receipt)))
-                    .map_err(BridgeError::Process)?;
+                // Cancellation and stream readback are independent: each is
+                // attempted and each keeps its own typed outcome. Neither may
+                // erase the deadline, and neither may erase a receipt the other
+                // already obtained.
+                let mut undischarged = Vec::new();
+                let cancellation = match block_on(self.executor.cancel(bound.operation.clone())) {
+                    Ok(receipt) => CancellationOutcome::Confirmed(Box::new(
+                        CancellationEvidence::from_receipt(&receipt),
+                    )),
+                    Err(refusal) => {
+                        // A cancellation that never answered is not a clean
+                        // stop and not a proof of no effect. The timeout stays
+                        // the primary cause and this is its recorded
+                        // obligation.
+                        undischarged.push(UndischargedObligation {
+                            obligation: Obligation::Cancellation,
+                            refusal: BridgeError::Process(refusal),
+                        });
+                        CancellationOutcome::Unresolved
+                    }
+                };
+                let evidence = match self.timeout_evidence(bound, &view) {
+                    Ok(evidence) => EvidenceObservation::Observed(Box::new(evidence)),
+                    Err(refusal) => {
+                        // The readback never answered, so the provider's
+                        // streams are unknown. The cancellation receipt obtained
+                        // above is retained with the timeout regardless, and the
+                        // source gap is recorded as its own obligation rather
+                        // than rendered as an empty capture.
+                        undischarged.push(UndischargedObligation {
+                            obligation: Obligation::StreamReadback,
+                            refusal,
+                        });
+                        EvidenceObservation::Unobserved
+                    }
+                };
                 return Err(BridgeError::TimedOut {
-                    cancellation,
-                    evidence: Some(Box::new(self.timeout_evidence(bound, &view)?)),
+                    cancellation: Box::new(cancellation),
+                    evidence: Box::new(evidence),
+                    undischarged,
                 });
             }
             std::thread::sleep(BOUND_RUN_POLL);
@@ -387,6 +553,15 @@ impl ProviderBridge {
     /// Materializes immutable evidence from one terminal observation and
     /// decodes the typed provider ack. Unknown terminal states stay explicit
     /// with the evidence preserved; provider output never becomes identity.
+    ///
+    /// The evidence is materialized BEFORE any provider output is decoded, and
+    /// every refusal from that decode carries it. A malformed acknowledgement or
+    /// result frame is a statement about the wire, not about the process: the
+    /// provider's stdout, stderr, exit and lineage were already observed, and
+    /// discarding them would replace real custody with an absence record. The
+    /// observed process disposition is likewise retained on the refusal, so a
+    /// protocol violation and a crashed process remain two separately readable
+    /// facts rather than one collapsed classification.
     fn finish_terminal(
         &self,
         bound: BoundOperation,
@@ -402,18 +577,20 @@ impl ProviderBridge {
             .executor
             .captured_output(&bound.operation)
             .map_err(BridgeError::Process)?;
-        let evidence = RawProviderEvidence::materialize(
+        let evidence = Box::new(RawProviderEvidence::materialize(
             bound.operation.as_str(),
             &bound.digest,
             exit,
             &stdout,
             &stderr,
             descendants_complete,
-        );
+        ));
+        // The physical disposition of the process is classified before the wire
+        // is decoded, so it is available to every refusal below.
         let outcome = classify_terminal(view.lifecycle(), exit, descendants_complete);
         if outcome == ProviderOutcome::Unknown {
             return Err(BridgeError::UnknownOutcome {
-                evidence: Some(Box::new(evidence)),
+                evidence: Some(evidence.clone()),
             });
         }
         let ack_line = stdout
@@ -421,18 +598,26 @@ impl ProviderBridge {
             .split(|byte| *byte == b'\n')
             .next()
             .unwrap_or_default();
+        // Both refusals below retain the exact evidence captured above and the
+        // provider's observed process disposition. The `reason` stays a stable
+        // code and the provider's bytes stay in the evidence record: a wire
+        // violation must never concatenate provider output into error prose.
         let ack =
             SubmitAck::decode(ack_line).map_err(|refusal| BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
+                evidence: Some(evidence.clone()),
+                disposition: Some(outcome),
             })?;
         let result_frame =
             scan_result_frame(&stdout.bytes).map_err(|refusal| BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
+                evidence: Some(evidence.clone()),
+                disposition: Some(outcome),
             })?;
         Ok(ProviderExecution {
             job_id: bound.operation.as_str().to_owned(),
             outcome,
-            evidence,
+            evidence: *evidence,
             provider_job_ref: ack.provider_job_id,
             cancellation: None,
             result_frame,
@@ -521,6 +706,8 @@ pub fn build_submit_binding(
     let request_bytes =
         serde_json::to_vec(request).map_err(|_| BridgeError::ProtocolViolation {
             reason: "research request is not canonical wire JSON",
+            evidence: None,
+            disposition: None,
         })?;
     let request_sha256 = sha256_hex(&request_bytes);
     let binding = crate::protocol::SubmitBinding {
@@ -556,6 +743,8 @@ pub fn build_submit_binding_digests(
         .digest()
         .map_err(|refusal| BridgeError::ProtocolViolation {
             reason: refusal.reason(),
+            evidence: None,
+            disposition: None,
         })?;
     Ok((request_sha256, binding_sha256))
 }
