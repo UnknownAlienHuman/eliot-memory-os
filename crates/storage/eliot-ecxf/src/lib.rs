@@ -11,6 +11,13 @@
 //! one back, checking every member against the digest the package itself
 //! recorded. Neither half is a backup or a restore decision: this crate decides
 //! nothing about cutover, revocation or the current Store generation.
+//!
+//! An emitted package also names the installation that produced it, on both the
+//! export fence and the manifest, and [`import_ecxf_package`] requires the caller
+//! to state which installation it is importing into. That requirement is the
+//! whole point of carrying the identity: a package that is only ever compared
+//! against its own recorded copy proves nothing, so the recorded value is
+//! checked against a value the importing side holds independently.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
@@ -141,6 +148,22 @@ impl EventRange {
 #[serde(deny_unknown_fields)]
 pub struct ExportFence {
     pub export_id: String,
+    /// The installation identity the export source owner observed at the bound
+    /// consistency point (issue #1141, W3/A2).
+    // ASSUMPTION: the installation identity is carried on the fence, not only on
+    // the manifest, because the fence is the export boundary record: an export
+    // that cannot be attributed to one installation is not a coherent export
+    // regardless of what the manifest beside it claims. The value is the
+    // owner-observed identity verbatim; nothing here derives, defaults or
+    // normalizes it, and a blank value is refused rather than filled in.
+    //
+    // This member is *not* an authenticity check. The fence copy and the
+    // manifest copy are one owner-observed value recorded at two positions in
+    // the same package; agreeing proves they were written from one observation,
+    // never that the observation was true. The non-circular check is
+    // `import_ecxf_package`, which refuses a package whose recorded identity is
+    // not the identity the importing side independently expects.
+    pub installation_id: String,
     pub schema_generation: String,
     pub store_generation: String,
     pub state_fence: StateFence,
@@ -165,6 +188,7 @@ pub struct ExportFence {
 impl ExportFence {
     pub fn validate(&self) -> Result<(), EcxfError> {
         text(&self.export_id, "export_id")?;
+        text(&self.installation_id, "installation_id")?;
         text(&self.schema_generation, "schema_generation")?;
         text(&self.store_generation, "store_generation")?;
         self.state_fence
@@ -505,6 +529,25 @@ fn derived_purge_ledger_revision(ledger: &[PurgeLedgerEntry]) -> Result<Option<u
 #[serde(deny_unknown_fields)]
 pub struct EcxfManifest {
     pub format: String,
+    /// The installation identity the export source owner observed at the bound
+    /// consistency point, carried into the emitted `manifest.json` so an
+    /// imported package is attributable to the installation that produced it
+    /// (issue #1141, W3/A2).
+    // ASSUMPTION: the manifest records the identity beside the fence it carries
+    // rather than only inside the fence, because `manifest.json` is the
+    // artifact an operator and a restore path read to decide whose data this is;
+    // a value reachable only by descending into a nested boundary record is not
+    // readable as an attribution.
+    //
+    // This member is *not* self-authenticating. `EcxfManifest::validate` may
+    // only check that this copy and the fence copy are the same recorded value —
+    // a copy compared against its own twin proves that one observation was
+    // written twice, which is why it is stated as a coherence check and not as
+    // proof of identity. The proof obligation belongs to
+    // `import_ecxf_package`, which compares the recorded value against the
+    // installation identity the importing side independently expects; a value
+    // that only ever agrees with itself is not accepted as an attribution.
+    pub installation_id: String,
     pub source_adapter: String,
     pub source_adapter_version: String,
     pub architecture_source_digest: String,
@@ -556,6 +599,7 @@ impl EcxfManifest {
                 reason: "unsupported ECXF format",
             });
         }
+        text(&self.installation_id, "installation_id")?;
         text(&self.source_adapter, "source_adapter")?;
         text(&self.source_adapter_version, "source_adapter_version")?;
         digest(
@@ -604,6 +648,17 @@ impl EcxfManifest {
         // package whose two records disagree is incoherent, not a choice the
         // importer may resolve by picking one.
         if self.scope_id != self.export_fence.scope_id {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+        // Issue #1141, W3/A2: the manifest and the fence it carries must name
+        // the same installation. This is a coherence check between two recorded
+        // positions, exactly like the scope check above, and it is deliberately
+        // NOT the attribution proof: two copies of one value agreeing prove only
+        // that one owner observation was written twice. A package whose two
+        // records disagree is incoherent and is refused here; whether the agreed
+        // value is the *right* installation is decided by `import_ecxf_package`
+        // against the identity the importing side independently expects.
+        if self.installation_id != self.export_fence.installation_id {
             return Err(EcxfError::InconsistentBoundary);
         }
         for (name, checksum) in &self.checksums {
@@ -1163,6 +1218,8 @@ fn section_kind_from_wire_name(wire_name: &str) -> Result<SectionKind, EcxfError
 /// ```text
 /// manifest/integrity/ledger/schema members present and well formed
 ///   → the manifest's own `validate()` runs on the recorded values
+///   → the recorded installation identity is checked against the identity the
+///     importing side independently expects
 ///   → the recorded manifest digest is checked against the manifest bytes
 ///   → the recorded purge-ledger digest is checked against the ledger bytes,
 ///     and the ledger's own validation, purge revision and state fence
@@ -1177,6 +1234,28 @@ fn section_kind_from_wire_name(wire_name: &str) -> Result<SectionKind, EcxfError
 /// filesystem, and it decides nothing about cutover, revocation or the current
 /// Store generation. It returns a validated artifact; the owner that admitted
 /// the export decides whether it may become current state.
+///
+/// # The expected installation identity
+///
+/// `expected_installation_id` is the installation identity the *importing* side
+/// independently holds for itself, and it is the only comparison that makes the
+/// manifest's recorded `installation_id` mean anything (issue #1141, W3/A2).
+///
+/// This is the check that cannot be a tautology. The manifest copy and the
+/// nested fence copy are the same owner-observed value recorded twice, so
+/// `EcxfManifest::validate` comparing them proves only that one observation was
+/// written at two positions. What the import owes the operator is the opposite
+/// direction: a package whose recorded identity is not the identity this
+/// installation expects is a package from somewhere else, and it is refused
+/// before a single payload member is decoded. `expected_installation_id` is
+/// required and has no default for exactly that reason — a caller that cannot
+/// name the installation it is importing into has no basis for admitting a
+/// package that claims one.
+///
+/// A blank expectation is refused rather than treated as "accept anything": an
+/// empty string that matched nothing would silently turn the check off, and a
+/// blank recorded value cannot reach this point anyway because
+/// `EcxfManifest::validate` already rejected it.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear admission path: members, recorded digests, ledger, schema, sections, blobs, completeness"
@@ -1184,7 +1263,12 @@ fn section_kind_from_wire_name(wire_name: &str) -> Result<SectionKind, EcxfError
 pub fn import_ecxf_package(
     files: &BTreeMap<String, Vec<u8>>,
     codec: &dyn SectionCodec,
+    expected_installation_id: &str,
 ) -> Result<EcxfImport, EcxfError> {
+    // The expectation is validated first, before the package is even parsed, so
+    // a caller that supplied nothing is refused on its own input rather than on
+    // a consequence of it.
+    text(expected_installation_id, "expected_installation_id")?;
     // Fixed package members. These four names are static, so each refusal
     // names the member it is about.
     let manifest_bytes = files.get(MANIFEST_FILE).ok_or(EcxfError::InvalidField {
@@ -1212,6 +1296,19 @@ pub fn import_ecxf_package(
     let manifest: EcxfManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|error| EcxfError::Serialization(error.to_string()))?;
     manifest.validate()?;
+    // Issue #1141, W3/A2: the package must belong to the installation the
+    // importer independently expects. `EcxfManifest::validate` has already
+    // proved the manifest copy and the fence copy are the same recorded value;
+    // this proves that value is the right one. The two sides come from different
+    // owners and different moments — the exporting installation's own durable
+    // state at the export boundary, and the importing installation's own state
+    // now — so agreement is evidence and disagreement is a refusal, not a
+    // formatting difference. It is checked here, before any payload member is
+    // decoded, because identity is the first question about a package and
+    // nothing below it can repair a wrong answer.
+    if manifest.installation_id != expected_installation_id {
+        return Err(EcxfError::InconsistentBoundary);
+    }
     let integrity: IntegrityManifest = serde_json::from_slice(integrity_bytes)
         .map_err(|error| EcxfError::Serialization(error.to_string()))?;
     integrity.validate()?;
