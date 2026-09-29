@@ -1,14 +1,13 @@
-//! The owner port that issues [`RestoreJournalAdmission`] from durable owner
-//! state (#962).
+//! The owner-issued, operation-bound issuer for [`RestoreJournalAdmission`].
 //!
 //! A supplied journal object is not an admitted durable journal. The struct
 //! declaration alone never made one, so before this module the four
-//! owner-issued fields had no producer anywhere in the tree and every consumer
-//! either refused or was handed a fixture. This module is the missing
-//! half: it names the durable owner that may issue the admission, derives
-//! every field from that owner's own state read at issue time, and binds the
-//! result to the exact operation so a well-formed admission presented for
-//! another operation or another installation is refused.
+//! owner-issued references had no producer anywhere in the tree and every
+//! consumer either refused or was handed a fixture. This module is the missing
+//! half: it names the durable owner that may issue the admission, derives every
+//! field from that owner's own state read at issue time, and binds the result
+//! to the exact operation so a well-formed admission presented for another
+//! operation or another installation is refused.
 //!
 //! What this module deliberately does not do:
 //!
@@ -17,32 +16,52 @@
 //!   `journal_identity_ref` or `admission_receipt_ref` from a caller, so there
 //!   is no way to mint an admission out of a request field, a config value, or
 //!   a self-chosen trust binding.
+//! - It does not accept an operation identity as an argument either. The
+//!   operation is the [`RestorePlan`], and both the journal identity and the
+//!   transaction are derived from that plan by the crate's own plan identity
+//!   helpers, so a caller cannot point the issuer at a stream of its own
+//!   choosing.
 //! - It does not add a second trust scheme. The binding is the existing
 //!   [`OwnerTrustBinding`], and the production test remains the existing
 //!   `require_production_admitted` in the restore owner: this module never
 //!   relaxes it and never sets `fixture_proof_only` other than to `false`, the
 //!   only value that admits a production durable-recovery claim.
-//! - It does not recompute any digest the owner recorded. The record is the
-//!   owner's own; this crate checks the recorded value, it does not replace the
-//!   proof by re-deriving a fresh checksum over what it holds.
+//! - It does not recompute any digest the owner recorded. The journal row is
+//!   read through the accepted [`RestoreJournalPort`] seam and compared field by
+//!   field; re-deriving a fresh checksum over values held in memory would
+//!   replace the proof rather than check it.
+//! - It does not create a journal. [`RestoreJournalAdmissionOwner`] is a read
+//!   seam over state the owner already committed, and the row it must agree
+//!   with is written by the existing compare-and-swap, not here.
 //!
 //! Existence and shape prove nothing. [`RestoreJournalAdmission::binds_owner_record`]
-//! re-reads the owner's durable record for the named operation and requires
-//! exact agreement on the owner binding, both roots, the generation, the
-//! journal identity and the receipt, so an admission that is well formed but
-//! borrowed from a different operation or installation fails closed.
+//! re-reads both the durable journal and the owner's record for the exact
+//! operation this plan names, and requires exact agreement on the owner
+//! binding, the database, the installation, the generation, the journal
+//! identity and the receipt, so an admission that is well formed but borrowed
+//! from a different operation or installation fails closed.
+//!
+//! This crate supplies no owner of its own. The durable owner of a restore
+//! journal is the composition that holds that journal together with the
+//! installation registry it admits against, and it answers on the real store;
+//! a port with no owner behind it issues nothing, which is why the issuer takes
+//! the owner rather than a state value and why a missing record is a refusal
+//! instead of an empty admission.
 
 use eliot_contracts::ResourceGeneration;
 
-use super::{BackupError, OwnerTrustBinding, RestoreJournalAdmission, text};
+use super::{
+    BackupError, OwnerTrustBinding, RestoreJournalAdmission, RestoreJournalPort, RestorePlan,
+    RestoreTransaction,
+};
 
 /// One durable journal record, as the owning owner read it at issue time.
 ///
-/// The owner produces this from its own persisted state: the installation
-/// registry it committed, the durable roots bound to that registry, and the
-/// journal row it wrote for this exact operation. Nothing here is
-/// caller-presented, and a value that a caller supplies for a *different*
-/// operation does not appear in this record.
+/// The owner produces this from its own persisted state: the database and the
+/// installation registry it committed, the authority generation that registry
+/// currently carries, and the admission receipt it wrote for this exact stream.
+/// Nothing here is caller-presented, and a value the caller supplies for a
+/// *different* operation does not appear in this record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableJournalRecord {
     /// The composition-boundary receipt reference of the owner that read the
@@ -63,51 +82,94 @@ pub struct DurableJournalRecord {
 /// The durable owner of the journal behind one restore operation.
 ///
 /// The only production source of a [`RestoreJournalAdmission`]. An
-/// implementation must answer from its own persisted state, read at call time;
-/// an implementation that echoes a presented value is not an owner and the
-/// binding check below will not rescue it, because there is nothing else to
-/// compare against.
+/// implementation must answer from its own persisted state, read at call time,
+/// for the journal identity the plan derives. An implementation that echoes a
+/// presented value is not an owner, and the binding check below will not rescue
+/// it: the check compares that answer against the durable journal row, so a
+/// value that was never committed to that row cannot agree with it.
 pub trait RestoreJournalAdmissionOwner {
-    /// Reads the owner's durable journal record for `operation_id`.
+    /// Reads the owner's durable journal record for `journal_key`.
     ///
     /// # Errors
     ///
     /// Returns a typed [`BackupError`] when the owner holds no durable record
-    /// for the operation, when the record is incomplete, or when the owner's
-    /// own state cannot be read. Absence of a record is never reported as an
-    /// empty record.
+    /// for that journal, when the record is incomplete, or when the owner's own
+    /// state cannot be read. Absence of a record is never reported as an empty
+    /// record, and the owner's error is never replaced with a synthesized
+    /// value.
     fn durable_journal_record(
         &self,
-        operation_id: &str,
+        journal_key: &str,
     ) -> Result<DurableJournalRecord, BackupError>;
 }
 
-impl RestoreJournalAdmission {
-    /// Issues the owner-issued admission for one operation.
+/// The exact operation one journal admission is bound to.
+///
+/// Both values are derived from the plan, never supplied: the journal key is
+/// the crate's own stream identity for this plan/bundle pair, and the
+/// transaction is the stable identity for this plan, bundle and context.
+struct AdmittedJournalOperation {
+    journal_key: String,
+    transaction: RestoreTransaction,
+}
+
+impl AdmittedJournalOperation {
+    fn of(plan: &RestorePlan) -> Result<Self, BackupError> {
+        Ok(Self {
+            journal_key: plan.journal_key()?,
+            transaction: plan.transaction()?,
+        })
+    }
+
+    /// Requires that the live journal is this operation's own durable journal.
     ///
-    /// Every field is copied from the owner's durable record for
-    /// `operation_id`; none is an argument, so no caller can select the
-    /// database, the installation, the generation, the journal identity or the
-    /// receipt. `fixture_proof_only` is `false` because the record came from a
-    /// durable owner rather than a fixture, and the result is immediately
-    /// re-proved against a fresh read of the same owner, so an owner whose
-    /// record is not stable across the issue refuses instead of issuing.
+    /// The row is read through the accepted [`RestoreJournalPort`] seam the
+    /// restore engine writes through, so the admission can only ever be issued
+    /// against a journal that really holds this exact transaction, and the
+    /// owner-reported record can only be compared against a row that exists.
+    fn is_journal_of<J>(&self, journal: &mut J) -> Result<(), BackupError>
+    where
+        J: RestoreJournalPort + ?Sized,
+    {
+        let row = journal
+            .load(&self.journal_key)?
+            .ok_or(BackupError::RestoreJournalRequired)?;
+        if row.journal_key != self.journal_key || row.transaction != self.transaction {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl RestoreJournalAdmission {
+    /// Issues the owner-issued admission for the journal behind `plan`.
+    ///
+    /// Every field is copied from the owner's durable record for the journal
+    /// identity this plan derives; none is an argument, so no caller can select
+    /// the database, the installation, the generation, the journal identity or
+    /// the receipt. `fixture_proof_only` is `false` because the record came from
+    /// a durable owner rather than a fixture, and the result is immediately
+    /// re-proved against a fresh read of both the same owner and the same live
+    /// journal, so an owner whose record is not stable across the issue refuses
+    /// instead of issuing.
     ///
     /// # Errors
     ///
-    /// Returns [`BackupError::RestoreJournalRequired`] when the owner holds no
-    /// durable record for the operation,
+    /// Returns [`BackupError::RestoreJournalRequired`] when the journal holds
+    /// no durable row for this operation,
     /// [`BackupError::RestoreJournalMismatch`] when the re-read record does not
     /// agree with the one issued, and the owner's own typed error otherwise.
-    pub fn issue_for_operation<O>(
+    pub fn issue_for_operation<O, J>(
         owner: &O,
-        operation_id: &str,
+        journal: &mut J,
+        plan: &RestorePlan,
     ) -> Result<Self, BackupError>
     where
         O: RestoreJournalAdmissionOwner + ?Sized,
+        J: RestoreJournalPort + ?Sized,
     {
-        text(operation_id, "journal.operation_id")?;
-        let record = owner.durable_journal_record(operation_id)?;
+        let operation = AdmittedJournalOperation::of(plan)?;
+        let record = owner.durable_journal_record(&operation.journal_key)?;
         let admission = Self {
             persistent_owner: record.persistent_owner,
             database_ref: record.database_ref,
@@ -118,37 +180,53 @@ impl RestoreJournalAdmission {
             fixture_proof_only: false,
         };
         admission.validate()?;
-        admission.binds_owner_record(owner, operation_id)?;
+        admission.binds_owner_record(owner, journal, plan)?;
         Ok(admission)
     }
 
-    /// Requires that this admission still agrees with the owner's durable
-    /// record for `operation_id`.
+    /// Requires that this admission still agrees with the durable journal and
+    /// the owner's record for the operation `plan` names.
     ///
-    /// This is the operation and installation binding. A structurally valid
-    /// admission whose owner binding, database, installation, generation,
-    /// journal identity or receipt differs from what the owner holds for *this*
-    /// operation fails closed, as does an admission that never admitted a
-    /// production durable journal. Both refusals are the crate's existing
-    /// typed journal errors, not a generic code.
+    /// This is the operation and installation binding. The journal identity
+    /// must be the one this plan derives, the live journal must already hold
+    /// this exact transaction, and the owner binding, database, installation,
+    /// generation and receipt must equal what the owner durably holds for that
+    /// same journal. A structurally valid admission issued for a different
+    /// operation, or one whose installation has moved under the registry, fails
+    /// closed, as does an admission that never admitted a production durable
+    /// journal. Both refusals are the crate's existing typed journal errors,
+    /// not a generic code, and the owner's own error is passed through rather
+    /// than collapsed into one.
     ///
     /// # Errors
     ///
     /// Returns [`BackupError::RestoreJournalRequired`] when the admission is
-    /// fixture-only, [`BackupError::RestoreJournalMismatch`] on any difference
-    /// from the owner's current durable record, and the owner's own typed
+    /// fixture-only or the journal holds no row for this operation,
+    /// [`BackupError::RestoreJournalMismatch`] on any difference from the
+    /// durable journal or the owner's current record, and the owner's own typed
     /// error when that record cannot be read.
-    pub fn binds_owner_record<O>(&self, owner: &O, operation_id: &str) -> Result<(), BackupError>
+    pub fn binds_owner_record<O, J>(
+        &self,
+        owner: &O,
+        journal: &mut J,
+        plan: &RestorePlan,
+    ) -> Result<(), BackupError>
     where
         O: RestoreJournalAdmissionOwner + ?Sized,
+        J: RestoreJournalPort + ?Sized,
     {
         if !self.admits_production_durable_recovery() {
             return Err(BackupError::RestoreJournalRequired);
         }
-        text(operation_id, "journal.operation_id")?;
         self.validate()?;
-        let current = owner.durable_journal_record(operation_id)?;
-        let agrees = self.persistent_owner == current.persistent_owner
+        let operation = AdmittedJournalOperation::of(plan)?;
+        if self.journal_identity_ref != operation.journal_key {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        operation.is_journal_of(journal)?;
+        let current = owner.durable_journal_record(&operation.journal_key)?;
+        let agrees = current.journal_identity_ref == operation.journal_key
+            && self.persistent_owner == current.persistent_owner
             && self.database_ref == current.database_ref
             && self.installation_ref == current.installation_ref
             && self.generation == current.generation
