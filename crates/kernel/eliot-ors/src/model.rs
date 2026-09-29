@@ -4337,6 +4337,61 @@ impl MaintenanceTriggerLifecycleRecord {
     }
 }
 
+/// Closed crash-recovery directive for one retained maintenance trigger.
+///
+/// ORS owns this phase-to-action table so every recovery caller replays,
+/// reuses, or holds the same retained handoff instead of re-implementing
+/// lifecycle matching. The authenticated Kernel recovery owner (STITCH caller)
+/// invokes [`classify_maintenance_trigger_handoff`] after a crash or an
+/// ambiguous commit response and follows exactly one directive (issue #1694,
+/// W5): replay the same retained trigger, reuse the recorded decision receipt
+/// without re-executing effects, keep an uncertain handoff reconciling, or
+/// leave a settled trigger untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceTriggerHandoffDirective {
+    /// Crash before decision commit: replay the same retained trigger under
+    /// its existing identity and revision. Never a new trigger identity.
+    ReplayRetainedTrigger,
+    /// Commit before ack: acknowledge from the recorded decision receipt and
+    /// retained downstream intent without another job, recommendation, or wake.
+    ReuseDecisionReceipt,
+    /// Lost or ambiguous commit response: the handoff stays
+    /// pending/reconciling. Receipt absence during an outage is not proof of
+    /// non-commit, so no effect may be repeated blindly.
+    RemainReconciling,
+    /// Acknowledged or terminally disposed: no replay and no further effect.
+    Settled,
+}
+
+/// Classifies one validated lifecycle row into its crash-recovery directive.
+///
+/// Validates the row first, so a corrupt or phase-inconsistent lifecycle
+/// record fails with a typed [`OrsError`] instead of yielding a recovery
+/// action. Materially new policy or source evidence may create an explicitly
+/// linked new evaluation revision through the owner path; this classifier
+/// never overwrites the old result and never authorizes repeating an
+/// uncertain downstream effect.
+pub fn classify_maintenance_trigger_handoff(
+    lifecycle: &MaintenanceTriggerLifecycleRecord,
+) -> Result<MaintenanceTriggerHandoffDirective, OrsError> {
+    lifecycle.validate()?;
+    Ok(match lifecycle.phase {
+        MaintenanceTriggerLifecyclePhase::Pending | MaintenanceTriggerLifecyclePhase::Claimed => {
+            MaintenanceTriggerHandoffDirective::ReplayRetainedTrigger
+        }
+        MaintenanceTriggerLifecyclePhase::DecisionRecorded => {
+            MaintenanceTriggerHandoffDirective::ReuseDecisionReceipt
+        }
+        MaintenanceTriggerLifecyclePhase::Reconciling => {
+            MaintenanceTriggerHandoffDirective::RemainReconciling
+        }
+        MaintenanceTriggerLifecyclePhase::Acknowledged
+        | MaintenanceTriggerLifecyclePhase::Expired
+        | MaintenanceTriggerLifecyclePhase::Superseded => MaintenanceTriggerHandoffDirective::Settled,
+    })
+}
+
 /// Explicit durable gap in bounded maintenance-trigger enumeration or
 /// recovery. Its owner-produced reason is retained as opaque canonical bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
