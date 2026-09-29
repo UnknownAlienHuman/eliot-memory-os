@@ -302,14 +302,11 @@ impl BridgeRecoverySelector {
                         field: "bridge_recovery_selector.owner_revision",
                     });
                 }
-                if *after_sequence > *upper_sequence
-                    || *retention_floor > *upper_sequence
-                    || (*upper_sequence > 0 && after_sequence.saturating_add(1) < *retention_floor)
-                {
-                    return Err(ContractError::Blank {
-                        field: "bridge_recovery_selector.after_sequence",
-                    });
-                }
+                validate_stream_retention_window(
+                    *after_sequence,
+                    *upper_sequence,
+                    *retention_floor,
+                )?;
                 if *event_limit == 0 || *event_limit > BRIDGE_RECOVERY_SELECTOR_EVENT_LIMIT {
                     return Err(ContractError::Blank {
                         field: "bridge_recovery_selector.event_limit",
@@ -525,6 +522,22 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), ContractError> 
         || value.chars().any(char::is_control)
     {
         return Err(ContractError::Blank { field });
+    }
+    Ok(())
+}
+
+fn validate_stream_retention_window(
+    after_sequence: u64,
+    upper_sequence: u64,
+    retention_floor: u64,
+) -> Result<(), ContractError> {
+    if after_sequence > upper_sequence
+        || retention_floor > upper_sequence
+        || (upper_sequence > 0 && after_sequence.saturating_add(1) < retention_floor)
+    {
+        return Err(ContractError::Blank {
+            field: "bridge_recovery_selector.after_sequence",
+        });
     }
     Ok(())
 }
