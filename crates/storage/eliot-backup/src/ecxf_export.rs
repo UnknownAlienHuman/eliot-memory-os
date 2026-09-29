@@ -61,17 +61,20 @@
 //! no process currently produces an `ECXF/1` package. Nothing here stands in
 //! for that edge: a source that returns nothing would make an export look real.
 //! I5.1 puts the coherent read behind the store bridge, and this crate depends
-//! on the neutral store contracts only, so the implementor belongs to the
-//! bridge crate and the composition call site to the process that owns the
-//! export request. Two observations bound that implementor: the neutral
-//! `SnapshotSourceIdentity::installation_id` is a request field and the neutral
-//! snapshot receipts echo no installation identity, so the source view's
-//! `installation_id` has to be read from the bridge's own durable state rather
-//! than filled in from the request; and the adapter-side
-//! `active_store_identity` in
-//! `crates/storage/eliot-store-surreal-adapter/src/backup_restore.rs` derives
-//! its installation part from adapter configuration, which is a name, not
-//! ownership evidence.
+//! on the neutral store contracts only, so the implementor belongs on the
+//! bridge that already owns the admitted coherent-capture port
+//! (`CanonicalSnapshotPort for SurrealStoreAdapter`,
+//! `crates/storage/eliot-store-surreal-adapter/src/lib.rs`) and the composition
+//! call site to the process that owns the export request. Two facts bound that
+//! implementor: the neutral `SnapshotSourceIdentity::installation_id` is a
+//! request field and the neutral snapshot receipts echo no installation
+//! identity, so the source view's `installation_id` must come from the bridge's
+//! own durable state; and the comparison the bridge does perform today,
+//! `check_active_source_identity` in
+//! `crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs`, refuses
+//! a foreign source against `active_store_identity`, which is derived from
+//! `SurrealAdapterConfig::installation_id` — a name the adapter was configured
+//! with, not an observation of the installation that owns the data.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
