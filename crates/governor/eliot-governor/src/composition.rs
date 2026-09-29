@@ -18,9 +18,7 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
-use crate::finish_attempt::{
-    GOVERNOR_SCOPE_ID, PreparedFinishDecision, PreparedKernelExchange,
-};
+use crate::finish_attempt::{GOVERNOR_SCOPE_ID, PreparedFinishDecision, PreparedKernelExchange};
 use crate::migration_inventory::PRODUCT_PROOF_PLAN;
 use crate::negative_memory_gate::{
     self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
@@ -3765,8 +3763,9 @@ impl MaintenanceTriggerDecisionCommit {
                     .to_owned(),
             ));
         }
-        let decision_bytes = canonical_json_bytes(decision)
-            .map_err(|error| CompositionError::Owner(format!("maintenance decision bytes: {error}")))?;
+        let decision_bytes = canonical_json_bytes(decision).map_err(|error| {
+            CompositionError::Owner(format!("maintenance decision bytes: {error}"))
+        })?;
         let decision_json = String::from_utf8(decision_bytes.clone()).map_err(|_| {
             CompositionError::Owner("maintenance decision bytes are not UTF-8".to_owned())
         })?;
@@ -3882,7 +3881,10 @@ impl MaintenanceTriggerDecisionCommit {
             ("wake_ref", &self.wake_ref),
         ] {
             if let Some(reference) = reference {
-                parameters.insert(name.to_owned(), serde_json::Value::String(reference.clone()));
+                parameters.insert(
+                    name.to_owned(),
+                    serde_json::Value::String(reference.clone()),
+                );
             }
         }
         let request = NamedMutationRequest {
@@ -7525,7 +7527,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             operation_manifest_set_digest(&generated_operation_manifests().map_err(|error| {
                 CompositionError::Owner(format!("operation manifest set unavailable: {error}"))
             })?)
-            .map_err(|error| CompositionError::Owner(format!("operation manifest digest: {error}")))?;
+            .map_err(|error| {
+                CompositionError::Owner(format!("operation manifest digest: {error}"))
+            })?;
         let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
         let envelope = CanonicalWriteEnvelope {
