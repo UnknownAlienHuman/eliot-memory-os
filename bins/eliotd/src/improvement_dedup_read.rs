@@ -499,6 +499,79 @@ enum Row {
     Archived(String),
 }
 
+/// Re-proves one lineage-merge receipt and returns what it merged.
+///
+/// Split out of [`classify_row`] so each row shape's re-proof reads on its own.
+/// Every check here is a content check against the surviving entry's own
+/// recorded material: the accumulated lineage is recomputed from the surviving
+/// candidate's canonical evidence refs rather than accepted from the receipt's
+/// `lineage_digest` field, so a row cannot claim an accumulation its candidate
+/// does not carry.
+fn classify_merge_receipt(
+    document: Value,
+    refused: &impl Fn(String) -> ImprovementDedupReadError,
+) -> Result<Row, ImprovementDedupReadError> {
+    let receipt: LineageMergeReceiptDocument = serde_json::from_value(document)
+        .map_err(|error| refused(format!("lineage merge receipt does not decode: {error}")))?;
+    let survivor_id = receipt
+        .merged_survivor
+        .candidate
+        .candidate_id
+        .trim()
+        .to_owned();
+    let absorbed_candidate_id = receipt.absorbed_candidate_id.trim().to_owned();
+    if survivor_id.is_empty() {
+        return Err(refused(
+            "lineage merge receipt names no surviving candidate".to_owned(),
+        ));
+    }
+    if absorbed_candidate_id.is_empty() || absorbed_candidate_id == survivor_id {
+        return Err(refused(
+            "lineage merge receipt names no distinct absorbed candidate".to_owned(),
+        ));
+    }
+    // The accumulated lineage is the merge's own result, so the receipt's
+    // `lineage_digest` is recomputed here from the surviving candidate's OWN
+    // canonical evidence lineage and compared. A digest that disagrees would
+    // let a row claim an accumulation its candidate does not carry.
+    let lineage = canonical_evidence_lineage(&receipt.merged_survivor.candidate.evidence_refs);
+    if lineage.is_empty() {
+        return Err(refused(
+            "the surviving candidate carries no canonical evidence lineage".to_owned(),
+        ));
+    }
+    if evidence_lineage_digest(&lineage) != receipt.merged_survivor.lineage_digest {
+        return Err(refused(
+            "the recorded lineage digest is not the digest of the surviving candidate's own evidence lineage"
+                .to_owned(),
+        ));
+    }
+    receipt
+        .merged_survivor
+        .candidate
+        .validate()
+        .map_err(|error| {
+            refused(format!(
+                "stored surviving candidate does not validate: {error}"
+            ))
+        })?;
+    let survivor = receipt.merged_survivor;
+    // `into_entry` re-computes the lineage digest from the candidate's own
+    // evidence refs and re-proves the candidate, so the restored entry carries
+    // the union rather than the receipt's assertion of it. The entry's retained
+    // value, owner and admission authority are the ones the merge kept, not a
+    // value re-invented here.
+    Ok(Row::Merged {
+        survivor: Box::new(DurableCandidateRecord {
+            owner: survivor.owner.clone(),
+            admitted_under_authority: survivor.admitted_under_authority.clone(),
+            admitted_value_floor: survivor.value,
+            candidate: survivor.candidate,
+        }),
+        absorbed_candidate_id,
+    })
+}
+
 /// One projected field of a served row, read verbatim.
 ///
 /// The learning owner projects each row as
@@ -566,59 +639,7 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
     // evidence lineage, or that names itself as the absorbed candidate is a
     // spliced document, and every one of those is refused rather than read.
     if document.get("merged_survivor").is_some() {
-        let receipt: LineageMergeReceiptDocument = serde_json::from_value(document)
-            .map_err(|error| refused(format!("lineage merge receipt does not decode: {error}")))?;
-        let survivor_id = receipt
-            .merged_survivor
-            .candidate
-            .candidate_id
-            .trim()
-            .to_owned();
-        let absorbed_candidate_id = receipt.absorbed_candidate_id.trim().to_owned();
-        if survivor_id.is_empty() {
-            return Err(refused("lineage merge receipt names no surviving candidate".to_owned()));
-        }
-        if absorbed_candidate_id.is_empty() || absorbed_candidate_id == survivor_id {
-            return Err(refused(
-                "lineage merge receipt names no distinct absorbed candidate".to_owned(),
-            ));
-        }
-        // The accumulated lineage is the merge's own result, so the receipt's
-        // `lineage_digest` is recomputed here from the surviving candidate's
-        // OWN canonical evidence lineage and compared. A digest that disagrees
-        // would let a row claim an accumulation its candidate does not carry.
-        let lineage = canonical_evidence_lineage(&receipt.merged_survivor.candidate.evidence_refs);
-        if lineage.is_empty() {
-            return Err(refused(
-                "the surviving candidate carries no canonical evidence lineage".to_owned(),
-            ));
-        }
-        if evidence_lineage_digest(&lineage) != receipt.merged_survivor.lineage_digest {
-            return Err(refused(
-                "the recorded lineage digest is not the digest of the surviving candidate's own evidence lineage"
-                    .to_owned(),
-            ));
-        }
-        receipt
-            .merged_survivor
-            .candidate
-            .validate()
-            .map_err(|error| refused(format!("stored surviving candidate does not validate: {error}")))?;
-        let survivor = receipt.merged_survivor;
-        // `into_entry` re-computes the lineage digest from the candidate's own
-        // evidence refs and re-proves the candidate, so the restored entry
-        // carries the union rather than the receipt's assertion of it. The
-        // entry's retained value, owner and admission authority are the ones
-        // the merge kept, not a value re-invented here.
-        return Ok(Row::Merged {
-            survivor: Box::new(DurableCandidateRecord {
-                owner: survivor.owner.clone(),
-                admitted_under_authority: survivor.admitted_under_authority.clone(),
-                admitted_value_floor: survivor.value,
-                candidate: survivor.candidate,
-            }),
-            absorbed_candidate_id,
-        });
+        return classify_merge_receipt(document, &refused);
     }
 
     let artifact: CandidateArtifactDocument =
