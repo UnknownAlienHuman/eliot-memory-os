@@ -513,8 +513,7 @@ fn compile_output_members(
                     };
                 }
             }
-            SelectionMemberDispositionKind::Retained
-            | SelectionMemberDispositionKind::Removed => {}
+            SelectionMemberDispositionKind::Retained | SelectionMemberDispositionKind::Removed => {}
         }
     }
     output
