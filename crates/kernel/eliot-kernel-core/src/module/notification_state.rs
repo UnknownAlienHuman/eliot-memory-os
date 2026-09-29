@@ -145,9 +145,26 @@ impl Acknowledgement {
 }
 
 /// Evidence-backed terminal disposition stored on the canonical record.
+///
+/// The authority is [`Self::receipt`]: the ORIGINAL receipt envelope the
+/// `resolve` leg validated, stored verbatim so that a decoded record can be
+/// re-checked against the same rules. `receipt_id` / `authority_id` /
+/// `authority_owner` are render-only projections of that receipt, kept because
+/// the inbox and board project them; they are checked against the receipt
+/// rather than trusted, so a stored string naming an authority the receipt does
+/// not carry is refused.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolutionRef {
+    /// The unchanged Kernel-issued receipt that authorized this disposition.
+    ///
+    /// `None` is a record the `resolve` leg could never have produced: it is a
+    /// terminal disposition with no receipt behind it, and it is refused. It
+    /// exists only so a row written before this field existed still decodes
+    /// into a typed [`NotificationError::ResolutionRequiresAuthorization`]
+    /// rather than an opaque deserialization failure.
+    #[serde(default)]
+    pub receipt: Option<ReceiptEnvelope>,
     /// Immutable receipt identity that authorized the disposition.
     pub receipt_id: String,
     /// Protected authority identity, derived from the receipt.
@@ -163,37 +180,56 @@ pub struct ResolutionRef {
 impl ResolutionRef {
     /// Validates a recorded disposition against the record that carries it.
     ///
-    /// These are the two rules the `resolve` leg already applies to its
-    /// [`ResolutionAuthorization`] — evidence is present, and every handle is
-    /// drawn from the record's own evidence — restated on the stored record so
-    /// the read gate accepts exactly the dispositions the write gate can
-    /// produce. Without it a decoded record carrying a disposition that names
-    /// no evidence, or evidence the record never carried, would pass
-    /// [`Notification::validate`], be counted as resolved by the canonical
-    /// inbox metrics, and drop out of the unresolved critical obligations: a
-    /// critical item would leave the board with no evidence behind it, which
-    /// is the closure I11.7:9 forbids.
+    /// Because the stored record carries the original receipt rather than a
+    /// copy of its identity strings, this read gate runs the SAME
+    /// [`validate_resolution`] the `resolve` write gate runs, over the same
+    /// value. Every rule the write gate applies is therefore decidable here and
+    /// is applied here:
     ///
-    /// `record_evidence` is the record's own `evidence_handles`, passed in
-    /// rather than re-read so this stays a pure function of its arguments.
-    fn validate(&self, record_evidence: &[String]) -> Result<(), NotificationError> {
+    /// * the receipt is re-validated by [`ReceiptEnvelope::validate`], which
+    ///   recomputes the canonical digest, so a core mutated in storage is
+    ///   refused rather than believed;
+    /// * the authority's effect class, proof ceiling and owner are checked
+    ///   against the record;
+    /// * the receipt's authority, causal, operation, request and work-scope
+    ///   fences must match the record's fence, and its scope must match the
+    ///   record's affected scope;
+    /// * the recorded receipt must be a `Success` at or above
+    ///   `ScopedVerification`;
+    /// * every evidence handle must resolve to a real artifact binding carried
+    ///   by that receipt, and be drawn from the record's own evidence.
+    ///
+    /// A receipt this leg rejects is a receipt the write gate would have
+    /// rejected, so the read gate admits no closure the write gate could not
+    /// have produced. Without it a decoded record carrying such a disposition
+    /// would pass [`Notification::validate`], be counted as resolved by the
+    /// canonical inbox metrics, and drop out of the unresolved critical
+    /// obligations: a critical item would leave the board with no evidence
+    /// behind it, which is the closure I11.7:9 forbids.
+    ///
+    /// `record` is the canonical record that carries this disposition, passed
+    /// in rather than re-read so this stays a pure function of its arguments.
+    fn validate(&self, record: &Notification) -> Result<(), NotificationError> {
         text(&self.receipt_id, "resolution.receipt_id")?;
         text(&self.authority_id, "resolution.authority_id")?;
         text(&self.authority_owner, "resolution.authority_owner")?;
         text(&self.disposition, "resolution.disposition")?;
-        if self.evidence_handles.is_empty() {
-            return Err(NotificationError::ResolutionRequiresEvidence);
-        }
-        validate_text_list(&self.evidence_handles, "resolution.evidence_handle")
-            .map_err(|_| NotificationError::ResolutionEvidenceUnbound)?;
-        if self
-            .evidence_handles
-            .iter()
-            .any(|handle| !record_evidence.contains(handle))
+        // A terminal disposition with no receipt behind it is never admissible,
+        // and no presence test stands in for the authority: the receipt below
+        // is re-validated in full before it can pass.
+        let receipt = self
+            .receipt
+            .as_ref()
+            .ok_or(NotificationError::ResolutionRequiresAuthorization)?;
+        // The projection strings must BE the receipt's own values, not text
+        // that merely resembles them.
+        if self.receipt_id != receipt.identity.receipt_id.as_str()
+            || self.authority_id != receipt.core.authority.authority_id.as_str()
+            || self.authority_owner != receipt.core.authority.authority_owner
         {
-            return Err(NotificationError::ResolutionEvidenceUnbound);
+            return Err(NotificationError::InvalidResolutionReceipt);
         }
-        Ok(())
+        validate_resolution(record, &self.disposition, receipt, &self.evidence_handles)
     }
 }
 
@@ -320,12 +356,15 @@ impl Notification {
     ///
     /// Every I11.5 field the record carries is checked here, including the
     /// two lifecycle observations: an acknowledgement must name a principal,
-    /// and a disposition must name the evidence it closes on. The two
-    /// lifecycle fields are validated, not ignored, because this is the one
-    /// gate every consumer of a decoded canonical record passes through
-    /// before treating it as an inbox row, and a record that reached the
-    /// store by any route other than these transitions must be refused here
-    /// rather than projected as a closed item.
+    /// and a terminal disposition must be backed by the original authority
+    /// receipt that passed the same gate on the way in — see
+    /// [`ResolutionRef::validate`], which re-runs the `resolve` leg's own
+    /// rules over that receipt. The two lifecycle fields are validated, not
+    /// ignored, because this is the one gate every consumer of a decoded
+    /// canonical record passes through before treating it as an inbox row, and
+    /// a record that reached the store by any route other than these
+    /// transitions must be refused here rather than projected as a closed
+    /// item.
     pub fn validate(&self) -> Result<(), NotificationError> {
         NotificationDraft {
             notification_id: self.notification_id.clone(),
@@ -350,7 +389,7 @@ impl Notification {
             acknowledgement.validate()?;
         }
         if let Some(resolution) = &self.resolution_ref {
-            resolution.validate(&self.evidence_handles)?;
+            resolution.validate(self)?;
         }
         Ok(())
     }
@@ -465,31 +504,35 @@ fn validate_text_list(values: &[String], field: &'static str) -> Result<(), Noti
     Ok(())
 }
 
-fn evidence_is_bound(auth: &ResolutionAuthorization) -> bool {
-    auth.evidence_handles.iter().all(|handle| {
-        auth.receipt.core.artifacts.iter().any(|artifact| {
+fn evidence_is_bound(receipt: &ReceiptEnvelope, evidence_handles: &[String]) -> bool {
+    evidence_handles.iter().all(|handle| {
+        receipt.core.artifacts.iter().any(|artifact| {
             artifact.role == ReceiptKind::Artifact
                 && (artifact.sha256 == *handle || artifact.artifact_id.as_str() == handle)
         })
     })
 }
 
+/// The one resolution gate. Both the `resolve` write leg and the
+/// [`ResolutionRef::validate`] read gate call this over the same
+/// [`ReceiptEnvelope`], so a decoded record cannot carry a disposition the
+/// write gate would have refused.
 fn validate_resolution(
     record: &Notification,
     disposition: &str,
-    authorization: &ResolutionAuthorization,
+    receipt: &ReceiptEnvelope,
+    evidence_handles: &[String],
 ) -> Result<(), NotificationError> {
     text(disposition, "disposition")?;
-    if authorization.evidence_handles.is_empty() {
+    if evidence_handles.is_empty() {
         return Err(NotificationError::ResolutionRequiresEvidence);
     }
-    validate_text_list(&authorization.evidence_handles, "evidence_handle")
+    validate_text_list(evidence_handles, "evidence_handle")
         .map_err(|_| NotificationError::ResolutionRequiresEvidence)?;
-    authorization
-        .receipt
+    receipt
         .validate()
         .map_err(|_| NotificationError::InvalidResolutionReceipt)?;
-    let core = &authorization.receipt.core;
+    let core = &receipt.core;
     if !matches!(
         core.authority.allowed_effect,
         EffectClass::ReversibleMutation | EffectClass::ExternalEffect
@@ -503,7 +546,7 @@ fn validate_resolution(
         core.disposition,
         ReceiptDisposition::Success { proof } if proof >= ProofCeiling::ScopedVerification
     );
-    if !valid_disposition || !evidence_is_bound(authorization) {
+    if !valid_disposition || !evidence_is_bound(receipt, evidence_handles) {
         return Err(NotificationError::ResolutionEvidenceUnbound);
     }
     if !fences_match_exact(&record.state_fence, &core.authority.state_fence) {
@@ -523,8 +566,7 @@ fn validate_resolution(
     if core.authority.authority_owner != record.owner {
         return Err(NotificationError::ResolutionAuthorityInsufficient);
     }
-    if authorization
-        .evidence_handles
+    if evidence_handles
         .iter()
         .any(|handle| !record.evidence_handles.contains(handle))
     {
@@ -705,10 +747,16 @@ impl NotificationStore {
         if existing.resolution_ref.is_some() {
             return Err(NotificationError::AlreadyResolved);
         }
-        validate_resolution(existing, disposition, authorization)?;
+        validate_resolution(
+            existing,
+            disposition,
+            &authorization.receipt,
+            &authorization.evidence_handles,
+        )?;
         self.sequence = self.sequence.saturating_add(1);
         let mut updated = existing.clone();
         updated.resolution_ref = Some(ResolutionRef {
+            receipt: Some(authorization.receipt.clone()),
             receipt_id: authorization
                 .receipt
                 .identity
