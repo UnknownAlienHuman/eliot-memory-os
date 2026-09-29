@@ -19,6 +19,7 @@ use eliot_contracts::{
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
@@ -56,6 +57,27 @@ use super::{
     KERNEL_OPERATION_TIMEOUT, KernelLaunchBinding, PRE_ADMISSION_RETRY_DELAY, SERVICE_NAME,
     unix_ms, unix_ms_i64,
 };
+
+const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCapabilityReceiptWire {
+    kind: String,
+    wire_version: String,
+    claim_id: String,
+    attempt_id: String,
+    operation_id: String,
+    proof_kind: String,
+    route_revision: String,
+    capacity_revision: String,
+    governor_route_revision: String,
+    governor_capacity_revision: String,
+    worker_generation: u64,
+    fence_digest: String,
+    verified_at_unix_ms: u64,
+    receipt_digest: String,
+}
 
 /// #791 (W4/W17): the typed detail reported when the daemon's shutdown request
 /// abandons a front-door exchange whose outcome this client cannot observe.
@@ -1425,6 +1447,113 @@ impl DaemonKernelClient {
             artifact_digest: self.snapshot.artifact_digest.clone(),
             protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
         })
+    }
+
+    /// Asks the authenticated Kernel owner to verify one exact provider
+    /// binding before daemon composition may consider constructing an
+    /// admitted capability.
+    ///
+    /// The transport handshake and correlated response are owner-authenticated;
+    /// the response seal and every field it actually echoes are checked here.
+    /// Route and capacity currentness in `material` came from serialized intake
+    /// data, not a live Governor read; the Kernel response echoes those
+    /// presented values and this method does not promote them to owner evidence.
+    /// This is only a provider-binding probe. The current Kernel/ORS claim row
+    /// does not retain an independently verified executable-binding digest,
+    /// so this response must never be treated as admitted execution capability.
+    pub(super) async fn verify_provider_binding_async(
+        &self,
+        material: &super::agent_fabric::VerifiedProviderMaterial,
+    ) -> Result<(), KernelClientError> {
+        use eliot_contracts::{canonical_json_bytes, fences_match_exact, sha256_hex};
+
+        material
+            .expectation
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let owner_session = self.owner_session_facts().ok_or_else(|| {
+            KernelClientError::Contract(
+                "provider binding requires an already validated Kernel owner session".to_owned(),
+            )
+        })?;
+        let live_fence = self.kernel_fence();
+        if !fences_match_exact(&material.presented_fence, &live_fence)
+            || !material
+                .expectation
+                .live_authority_epoch
+                .is_same_authority(&live_fence.authority_epoch)
+        {
+            return Err(KernelClientError::Contract(
+                "provider binding presentation is stale under the live Kernel fence".to_owned(),
+            ));
+        }
+        if material.expectation.revoked {
+            return Err(KernelClientError::Contract(
+                "provider binding presentation is marked revoked".to_owned(),
+            ));
+        }
+        let fence_bytes = canonical_json_bytes(&material.presented_fence)
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let fence_digest = sha256_hex(&fence_bytes);
+        let payload = serde_json::json!({
+            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "claim_id": material.claim_id,
+            "attempt_id": material.attempt_id,
+            "operation_id": material.operation_id,
+            "proof_kind": "Binding",
+            "proof_ref": owner_session.session_binding(),
+            "canonical_payload_sha256": fence_digest,
+            "binding_digest": material.binding_digest,
+            "executable_binding_digest": material.executable_digest,
+            "route_revision": material.route_revision,
+            "capacity_revision": material.capacity_revision,
+            "governor_route_revision": material.expectation.current_route_revision,
+            "governor_capacity_revision": material.expectation.current_capacity_revision,
+            "worker_generation": material.worker_generation,
+            "fence_digest": fence_digest,
+        });
+        let response = self
+            .transact_async(PROVIDER_CAPABILITY_VERIFY_OPERATION, payload)
+            .await?;
+        let mut body = response.clone();
+        let receipt_digest = body
+            .as_object_mut()
+            .and_then(|object| object.remove("receipt_digest"))
+            .and_then(|digest| digest.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                KernelClientError::Unknown(
+                    "Kernel provider capability reply has no sealed digest".to_owned(),
+                )
+            })?;
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if sha256_hex(&body_bytes) != receipt_digest {
+            return Err(KernelClientError::Unknown(
+                "Kernel provider capability reply digest is invalid".to_owned(),
+            ));
+        }
+        let receipt: ProviderCapabilityReceiptWire = serde_json::from_value(response)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if receipt.kind != "native_worker_provider_capability"
+            || receipt.wire_version != PROVIDER_CAPABILITY_WIRE_VERSION
+            || receipt.receipt_digest != receipt_digest
+            || receipt.claim_id != material.claim_id
+            || receipt.attempt_id != material.attempt_id
+            || receipt.operation_id != material.operation_id
+            || receipt.proof_kind != "Binding"
+            || receipt.route_revision != material.route_revision
+            || receipt.capacity_revision != material.capacity_revision
+            || receipt.governor_route_revision != material.expectation.current_route_revision
+            || receipt.governor_capacity_revision != material.expectation.current_capacity_revision
+            || receipt.worker_generation != material.worker_generation
+            || receipt.fence_digest != fence_digest
+            || receipt.verified_at_unix_ms == 0
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel provider capability reply does not match the presented binding".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Clones the retained validated binding string, if any. A poisoned slot

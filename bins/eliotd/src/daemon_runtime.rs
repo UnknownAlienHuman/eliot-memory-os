@@ -1490,6 +1490,11 @@ async fn run_loop(
     // attempt type (issue #1741): one authenticated claim, one Governor finish
     // evaluation, and one fenced result submit per tick.
     let mut finish_flight = FinishFlight::Idle;
+    // The solo provider-binding read is one tracked poll at a time. Its Kernel
+    // request must remain a select branch so shutdown and other cadence work
+    // keep running while the authenticated response is pending.
+    let mut solo_poll_flight = SoloPollFlight::Idle;
+    let mut solo_poll_last_refusal: Option<String> = None;
     // #2100: O1 owner-feed trigger state. The runtime retains one trigger
     // across passes so an unchanged provider performs no IO, while a
     // revision advance or a recovery re-presentation republishes through the
@@ -1577,6 +1582,8 @@ async fn run_loop(
                     &mut health_heartbeat_flight,
                     &mut supervision_progress,
                     &mut deferred_supervision_activity,
+                    &mut solo_poll_flight,
+                    &mut solo_poll_last_refusal,
                 )
                 .await?;
                 // #1862: the campaign-packet flight keeps its own queue, claim,
@@ -1618,38 +1625,10 @@ async fn run_loop(
                 // Finish uses a separate queue and attempt type; start it on the
                 // same cadence without sharing the local-read completion branch.
                 maybe_start_finish_poll(&kernel, &composition, &mut finish_flight);
-                // Issue #2567: the solo delegate slice rides the same cadence
-                // on its own bounded poll. At most one queued intake drives
-                // per tick, an empty queue idles without owner IO, and a busy
-                // live slot waits without overlap. The composition lock is
-                // only try-locked here and never held across an await, so a
-                // contended composition skips the tick instead of blocking
-                // the loop; the drive itself is synchronous and bounded.
-                if let Ok(guard) = composition.try_lock() {
-                    match guard.solo_poll_queue(&kernel) {
-                        Ok(eliotd::solo_agent_driver::SoloPollOutcome::Drove {
-                            operation_id,
-                            dispatch_id,
-                        }) => {
-                            tracing::info!(
-                                target: "eliotd::diagnostics",
-                                event = "eliotd.solo_drive_retained",
-                                operation_id
-                                    = %eliotd::diagnostics::sanitize_identity(&operation_id),
-                                dispatch_id
-                                    = %eliotd::diagnostics::sanitize_identity(&dispatch_id),
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                target: "eliotd::diagnostics",
-                                event = "eliotd.solo_poll_refused",
-                                detail = %error,
-                            );
-                        }
-                    }
-                }
+                // Issue #1108: start at most one tracked Kernel verification
+                // flight. The flight snapshots under a short composition
+                // lock and releases it before awaiting owner IO.
+                maybe_start_solo_poll(&kernel, &composition, &mut solo_poll_flight);
                 // #1688 (I14.22): the idle trigger rides this cadence branch
                 // because it is the one place that observes the activation
                 // flight, so the `idle` gate the evaluator consumes is a real
@@ -1713,6 +1692,13 @@ async fn run_loop(
                 }
             finish_completion = next_finish_completion(&mut finish_flight) => {
                 settle_finish_completion(finish_completion, &mut finish_flight)?;
+            }
+            solo_poll_completion = next_solo_poll_completion(&mut solo_poll_flight) => {
+                settle_solo_poll_completion(
+                    solo_poll_completion,
+                    &mut solo_poll_flight,
+                    &mut solo_poll_last_refusal,
+                );
             }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
@@ -2650,6 +2636,8 @@ async fn drain_flights_on_shutdown(
     health_heartbeat_flight: &mut HealthHeartbeatFlight,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     deferred_activity: &mut DeferredSupervisionActivity,
+    solo_poll_flight: &mut SoloPollFlight,
+    solo_poll_last_refusal: &mut Option<String>,
 ) -> Result<RunLoopExit, String> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -2669,6 +2657,7 @@ async fn drain_flights_on_shutdown(
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
             && matches!(improvement_intake_flight, ImprovementIntakeFlight::Idle)
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
+            && matches!(solo_poll_flight, SoloPollFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -2772,6 +2761,13 @@ async fn drain_flights_on_shutdown(
                     &mut shutdown_failure_guard,
                 );
             }
+            solo_poll_completion = next_solo_poll_completion(solo_poll_flight) => {
+                settle_solo_poll_completion(
+                    solo_poll_completion,
+                    solo_poll_flight,
+                    solo_poll_last_refusal,
+                );
+            }
             () = tokio::time::sleep_until(deadline) => {
                 // Budget exhausted with work still outstanding: drop every
                 // flight without starting anything new. Classify activation
@@ -2784,6 +2780,7 @@ async fn drain_flights_on_shutdown(
                 *maintenance_flight = MaintenanceFlight::Idle;
                 *improvement_intake_flight = ImprovementIntakeFlight::Idle;
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
+                *solo_poll_flight = SoloPollFlight::Idle;
                 *supervision_progress = None;
                 deferred_activity.clear();
                 return Ok(exit);
@@ -3856,6 +3853,91 @@ struct FinishFlightState {
 enum FinishFlight {
     Idle,
     InFlight(FinishFlightState),
+}
+
+/// Completion of one authenticated provider-binding poll. This owner read is
+/// side-effect free; refusal leaves the intake queued for a later cadence.
+enum SoloPollCompletion {
+    Settled(Result<eliotd::solo_agent_driver::SoloPollOutcome, String>),
+}
+
+struct SoloPollFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = SoloPollCompletion>>>,
+}
+
+/// Sole owner of the asynchronous solo provider-binding poll in `run_loop`.
+/// The future remains a select branch while Kernel IO is pending.
+enum SoloPollFlight {
+    Idle,
+    InFlight(SoloPollFlightState),
+}
+
+fn start_solo_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = SoloPollCompletion>>> {
+    let kernel = Arc::clone(kernel);
+    Box::pin(async move {
+        let result = eliotd::solo_poll_queue_async(&composition, &kernel)
+            .await
+            .map_err(|error| error.to_string());
+        SoloPollCompletion::Settled(result)
+    })
+}
+
+fn maybe_start_solo_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut SoloPollFlight,
+) {
+    if matches!(flight, SoloPollFlight::Idle) {
+        *flight = SoloPollFlight::InFlight(SoloPollFlightState {
+            future: start_solo_poll(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+async fn next_solo_poll_completion(flight: &mut SoloPollFlight) -> SoloPollCompletion {
+    match flight {
+        SoloPollFlight::Idle => std::future::pending::<SoloPollCompletion>().await,
+        SoloPollFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+fn settle_solo_poll_completion(
+    completion: SoloPollCompletion,
+    flight: &mut SoloPollFlight,
+    last_refusal: &mut Option<String>,
+) {
+    *flight = SoloPollFlight::Idle;
+    let result = match completion {
+        SoloPollCompletion::Settled(result) => result,
+    };
+    match result {
+        Ok(eliotd::solo_agent_driver::SoloPollOutcome::Drove {
+            operation_id,
+            dispatch_id,
+        }) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.solo_drive_retained",
+                operation_id = %eliotd::diagnostics::sanitize_identity(&operation_id),
+                dispatch_id = %eliotd::diagnostics::sanitize_identity(&dispatch_id),
+            );
+            *last_refusal = None;
+        }
+        Ok(_) => *last_refusal = None,
+        Err(error) => {
+            if last_refusal.as_deref() != Some(error.as_str()) {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.solo_poll_refused",
+                    detail = %error,
+                );
+                *last_refusal = Some(error);
+            }
+        }
+    }
 }
 
 /// Pure tick gate: the finish timer starts work only when the flight is idle.
