@@ -434,9 +434,10 @@ pub use rules::{
 pub use health_detectors::{
     AgentLoopSignal, ContextQualityBounds, ContextQualityDrift, ContextQualityObservation,
     CountDelta, CoverageGapExplanation, HealthDetection, HealthEvidenceHandles,
-    HealthNoSignalReason, HealthObservationPair, HealthSignalContext, MaintenanceDebt,
-    MaintenanceDebtInput, MemoryUtilityDeltas, MemoryUtilityDrift, ObservationCoverageGap,
-    ObservationCoverageInput, PolicyBound, StateDeltaPresence, evaluate_agent_loop,
+    HealthNoSignalReason, HealthObservationPair, HealthOutputFamily, HealthSignalContext,
+    MaintenanceDebt, MaintenanceDebtInput, MemoryUtilityDeltas, MemoryUtilityDrift,
+    ObservationCoverageGap, ObservationCoverageInput, PolicyBound, ProhibitedEffectAttempt,
+    ProhibitedEffectClass, ProhibitedEffectDenial, StateDeltaPresence, evaluate_agent_loop,
     evaluate_context_quality, evaluate_maintenance_debt, evaluate_memory_utility,
     evaluate_observation_coverage,
 };
