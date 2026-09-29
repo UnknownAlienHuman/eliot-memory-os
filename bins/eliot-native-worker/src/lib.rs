@@ -2145,15 +2145,15 @@ pub mod admitted_material {
 
         // Registration derived from admitted material plus live process
         // observables. Every identity-carrying field comes from the admitted
-        // request; only the observation-bound fields (own PID, wall-clock
-        // lease window) come from the live process, and the worker-originated
+        // request; the lease ends with the Kernel-issued grant, never with a
+        // fresh child-local window. The worker-originated
         // presentation identities derive deterministically from the proven
         // binding digest so they can never collide across claims.
         let limits = admitted_limits(request.get("budget").unwrap_or(&serde_json::Value::Null))?;
         let limits_json = serde_json::to_value(limits).map_err(|error| {
             AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
         })?;
-        let lease_expires_at = now_ms.saturating_add(60_000);
+        let lease_expires_at = grant.expires_at;
         if lease_expires_at <= now_ms {
             return Err(AdmittedMaterialError::Contract(
                 "worker lease window is not well-formed".to_owned(),
