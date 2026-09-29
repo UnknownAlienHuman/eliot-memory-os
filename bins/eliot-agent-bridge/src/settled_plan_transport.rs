@@ -40,6 +40,7 @@ use eliot_governor::{ReactiveRiskTier, assess_reactive_risk};
 use eliot_integration_coverage::GovernorCoverageDerivation;
 use eliot_reactive_context_plan::{
     BridgeAdmissionBatch, BridgeAdmissionError, BridgeAdmissionInstruction,
+    BridgeAdmissionInvalidation,
     BridgeAdmissionSeverity, PendingContextInjectionPlan, SettledPlanFeedOutcome,
     plan_bridge_admissions,
 };
@@ -62,6 +63,7 @@ pub const MAX_TRANSPORT_REPLAY_KEYS: usize = 512;
 struct ReplayIdentity {
     session_id: String,
     dedup_key: String,
+    cue_id: String,
     source: String,
     source_revision: String,
     assessed_risk: RiskTier,
@@ -272,9 +274,13 @@ impl SettledPlanAdmission {
     }
 
     /// Removes only replay entries invalidated by the exact source owner.
-    fn invalidate_source(&mut self, session_id: &str, source: &str) {
+    fn invalidate_cue(&mut self, invalidation: &BridgeAdmissionInvalidation) {
         self.seen
-            .retain(|seen| seen.session_id != session_id || seen.source != source);
+            .retain(|seen| {
+                seen.session_id != invalidation.session_id.as_str()
+                    || seen.source != invalidation.cue_source
+                    || seen.cue_id != invalidation.cue_id
+            });
     }
 
     /// Records one presented evidence tuple, rotating the oldest out at the bound.
@@ -329,12 +335,15 @@ impl SettledPlanAdmission {
             });
         }
         let mut invalidations_applied = 0;
-        for source in &batch.invalidations {
-            invalidations_applied += runner.invalidate_reactive_source(source);
-            self.invalidate_source(&live_session, source);
+        for invalidation in &batch.invalidations {
+            if invalidation.session_id.as_str() != live_session {
+                continue;
+            }
+            invalidations_applied += runner.invalidate_reactive_cue(invalidation);
+            self.invalidate_cue(invalidation);
         }
         let mut report = PlanAdmissionReport {
-            session_id: live_session,
+            session_id: live_session.clone(),
             invalidations_applied,
             admitted: Vec::with_capacity(batch.items.len()),
             replay_suppressed: 0,
@@ -360,6 +369,7 @@ impl SettledPlanAdmission {
             let replay_identity = ReplayIdentity {
                 session_id: live_session.clone(),
                 dedup_key: item.dedup_key.clone(),
+                cue_id: item.cue_id.clone(),
                 source: item.cue_source.clone(),
                 source_revision: item.cue_source_revision.clone(),
                 assessed_risk: view.risk,
@@ -859,7 +869,14 @@ mod tests {
                 BridgeAdmissionSeverity::Normal,
             )],
         );
-        reopened.invalidations.push("tool-surface-9".to_owned());
+        reopened
+            .invalidations
+            .push(BridgeAdmissionInvalidation {
+                cue_source: "tool-surface-9".to_owned(),
+                cue_id: "item-normal-1".to_owned(),
+                session_id: eliot_contracts::SessionId::new(TEST_SESSION)
+                    .expect("valid session"),
+            });
         let report = driver
             .admit_batch(&mut runner, &reopened, |item, critical| {
                 governor_assess(&derivation, item, critical)

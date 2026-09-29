@@ -198,7 +198,8 @@ pub use reactive_state::{
     ReactiveLedgerRequest, ReactiveLedgerResponse, ReactiveServiceContext, ReactiveServiceError,
     ResourceSnapshotReadRequest, ResourceSnapshotReadResponse, ResourceSnapshotRequest,
     ResourceSnapshotResponse, handle_reactive_ledger_read, handle_reactive_ledger_request,
-    handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
+    handle_reactive_ledger_request_in_context, handle_resource_snapshot_read,
+    handle_resource_snapshot_request, reconcile_reactive_state, seal_reactive_ledger_request,
 };
 pub use storage_replacement::{
     CANONICAL_STORE_CAPABILITY, CANONICAL_STORE_EFFECT_DOMAIN, CANONICAL_STORE_MODULE_ID,

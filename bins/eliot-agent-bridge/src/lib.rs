@@ -4703,6 +4703,7 @@ pub struct BridgeRunner {
     runtime: Runtime,
     core: AgentBridgeCore,
     reactive_ledger: ReactiveInjectionLedger,
+    reactive_ledger_revision: u64,
     bootstrap_session: BootstrapSession,
     bootstrap_snapshot: Option<BootstrapSnapshot>,
 }
@@ -4940,6 +4941,7 @@ impl BridgeRunner {
             runtime,
             core: AgentBridgeCore::new(readiness, host_activation, mcp_forwarding, cursor_policy),
             reactive_ledger: ReactiveInjectionLedger::new(),
+            reactive_ledger_revision: 0,
             bootstrap_session: BootstrapSession::default(),
             bootstrap_snapshot: None,
         })
@@ -5175,6 +5177,28 @@ impl BridgeRunner {
     pub fn invalidate_reactive_source(&mut self, source: &str) -> usize {
         self.reactive_ledger.invalidate_source(source)
     }
+
+    /// Invalidates one exact session/cue owner identity from a settled plan.
+    /// A foreign session or a sibling cue from the same source has no effect.
+    pub fn invalidate_reactive_cue(
+        &mut self,
+        invalidation: &eliot_reactive_context_plan::BridgeAdmissionInvalidation,
+    ) -> usize {
+        let Some(session_id) = self
+            .attach_view()
+            .map(|view| view.binding().session_id().as_str().to_owned())
+        else {
+            return 0;
+        };
+        if invalidation.session_id.as_str() != session_id {
+            return 0;
+        }
+        self.reactive_ledger.invalidate_cue(
+            &session_id,
+            invalidation.cue_source.as_str(),
+            invalidation.cue_id.as_str(),
+        )
+    }
     /// Exports the ledger bytes for durable persistence by the Store owner.
     ///
     /// The bridge holds delivery records only for the life of this process;
@@ -5186,11 +5210,47 @@ impl BridgeRunner {
             .to_json_bytes()
             .map_err(|error| reactive_ledger_error(&error))
     }
+    /// Ledger-specific owner revision established by authenticated restore
+    /// or the latest exact Store-committed mutation.
+    #[must_use]
+    pub fn reactive_ledger_revision(&self) -> u64 {
+        self.reactive_ledger_revision
+    }
+    /// Clones the owner ledger for an unpublished candidate mutation.
+    pub(crate) fn reactive_ledger_candidate(&self) -> ReactiveInjectionLedger {
+        self.reactive_ledger.clone()
+    }
+    /// Installs one exact Store-readback candidate after the mutation port has
+    /// committed it; stale candidates never replace newer local state.
+    pub(crate) fn install_committed_reactive_ledger_candidate(
+        &mut self,
+        candidate: ReactiveInjectionLedger,
+        expected_revision: u64,
+        ledger_revision: u64,
+    ) -> Result<(), BridgeError> {
+        if self.reactive_ledger_revision != expected_revision
+            || expected_revision.checked_add(1) != Some(ledger_revision)
+        {
+            return Err(BridgeError::StaleAuthority);
+        }
+        self.reactive_ledger = candidate;
+        self.reactive_ledger_revision = ledger_revision;
+        Ok(())
+    }
     /// Restores a previously exported ledger, replacing in-memory state.
     /// Fails closed on wrong contract, oversize, or undecodable bytes.
     pub fn restore_reactive_ledger(&mut self, bytes: &[u8]) -> Result<(), BridgeError> {
+        self.restore_reactive_ledger_at_revision(bytes, 0)
+    }
+    /// Restores exact canonical bytes and their Store ledger revision.
+    pub fn restore_reactive_ledger_at_revision(
+        &mut self,
+        bytes: &[u8],
+        ledger_revision: u64,
+    ) -> Result<(), BridgeError> {
         self.reactive_ledger = ReactiveInjectionLedger::from_json_bytes(bytes)
             .map_err(|error| reactive_ledger_error(&error))?;
+        self.reactive_ledger_revision = ledger_revision;
         Ok(())
     }
     /// Publishes one owner-supplied evidence snapshot and returns its bounded

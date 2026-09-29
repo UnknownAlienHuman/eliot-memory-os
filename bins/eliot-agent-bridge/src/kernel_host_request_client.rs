@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_contracts::{
     ClockReading, HostCorrelationDomain, HostCorrelationProjection, HostJsonRpcCorrelationId,
     HostRequestLogicalKind, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    SessionId,
     canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key, sha256_hex,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
@@ -41,8 +42,9 @@ use eliot_protocol::{
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
     HostRequestResultBody, HostRequestResultClass, MessageType, ProtocolPayload, ProtocolVersion,
     REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID,
-    ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity, host_request_operation_id,
-    restore_correlation,
+    REACTIVE_LEDGER_MUTATION_OPERATION, ReactiveLedgerMutationReply,
+    ReactiveLedgerMutationRequest, ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity,
+    host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -1333,6 +1335,140 @@ impl KernelHostRequestClient {
         }
         Ok(())
     }
+}
+
+fn reactive_ledger_mutation_request_id(
+    request: &ReactiveLedgerMutationRequest,
+) -> Result<RequestId, PortFailure> {
+    let bytes = canonical_json_bytes(request).map_err(|_| request_failure())?;
+    let digest = sha256_hex(&bytes);
+    RequestId::new(format!("reactive-ledger-{digest}")).map_err(|_| request_failure())
+}
+
+fn reactive_ledger_mutation_frame(
+    request: &ReactiveLedgerMutationRequest,
+    facts: &TransportFacts,
+    request_id: &RequestId,
+    now_ms: u64,
+) -> Result<Frame, PortFailure> {
+    let fence = facts.state_fence.clone();
+    if fence.task_revision.is_some()
+        || fence.policy_revision.is_some()
+        || fence.integration_revision.is_some()
+        || request.state_fence != fence
+    {
+        return Err(PortFailure::FenceMismatch);
+    }
+    let digest = request_id
+        .as_str()
+        .strip_prefix("reactive-ledger-")
+        .ok_or_else(request_failure)?;
+    let frame_fence = StateFence::new(fence.authority_epoch.clone(), fence.resource_generation);
+    let metadata = RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: Some(SessionId::new(request.session_id.clone()).map_err(|_| request_failure())?),
+        task_id: None,
+        product_id: ProductId::new("eliot-agent-bridge").map_err(|_| request_failure())?,
+        source_id: SourceId::new("agent-bridge").map_err(|_| request_failure())?,
+        state_fence: frame_fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: frame_fence,
+        },
+        idempotency_key: format!("reactive-ledger-{digest}"),
+        deadline_unix_ms: now_ms.saturating_add(DEFAULT_DEADLINE_PREFERENCE_MS),
+        cancellation_id: format!("reactive-ledger-cancel-{digest}"),
+    };
+    identity.validate().map_err(|_| request_failure())?;
+    let payload = serde_json::to_value(request).map_err(|_| request_failure())?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: facts.connection_id.clone(),
+        request_id: Some(request_id.clone()),
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: Some(identity),
+        payload: ProtocolPayload::Json(serde_json::json!({
+            "operation": REACTIVE_LEDGER_MUTATION_OPERATION,
+            "candidate": payload,
+        })),
+        trace_context: BTreeMap::new(),
+    };
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
+fn decode_reactive_ledger_mutation_reply(
+    frame: &Frame,
+    request: &ReactiveLedgerMutationRequest,
+    request_id: &RequestId,
+    request_frame: &Frame,
+    connection_id: &str,
+) -> Result<ReactiveLedgerMutationReply, PortFailure> {
+    frame.validate().map_err(|_| request_failure())?;
+    if frame.connection_id != connection_id
+        || frame.protocol_version != ProtocolVersion::CURRENT
+        || frame.encoding_profile != EncodingProfile::JsonV1
+        || frame.request_id.as_ref() != Some(request_id)
+        || frame.kind != FrameKind::Response
+        || frame.message_type != MessageType::Result
+        || frame.request_identity.is_some()
+        || !frame.trace_context.is_empty()
+    {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "reactive ledger mutation reply failed frame binding".to_owned(),
+        });
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err(request_failure());
+    };
+    let reply: ReactiveLedgerMutationReply =
+        serde_json::from_value(payload.clone()).map_err(|_| request_failure())?;
+    reply
+        .receipt
+        .validate()
+        .map_err(|_| request_failure())?;
+    let expected_revision = request
+        .expected_revision
+        .checked_add(1)
+        .ok_or_else(request_failure)?;
+    let expected_idempotency = format!(
+        "reactive-ledger-{}",
+        request_id
+            .as_str()
+            .strip_prefix("reactive-ledger-")
+            .ok_or_else(request_failure)?
+    );
+    let expected_operation_id = format!("reactive-ledger:{}", request_id.as_str());
+    let expected_session = SessionId::new(request.session_id.clone()).map_err(|_| request_failure())?;
+    let identity = request_frame
+        .request_identity
+        .as_ref()
+        .ok_or_else(request_failure)?;
+    if reply.session_id != request.session_id
+        || reply.state_fence != request.state_fence
+        || reply.ledger_revision != expected_revision
+        || reply.ledger_json != request.ledger_json
+        || reply.receipt.core.operation.request_id != *request_id
+        || reply.receipt.core.operation.idempotency_key != expected_idempotency
+        || identity.idempotency_key != expected_idempotency
+        || reply.receipt.core.operation.operation_id.as_str() != expected_operation_id
+        || reply.receipt.core.operation.state_fence != request.state_fence
+        || reply.receipt.core.request.metadata != identity.request.metadata
+        || reply.receipt.core.request.metadata.session_id.as_ref() != Some(&expected_session)
+        || reply.receipt.core.request.state_fence != request.state_fence
+        || reply.receipt.core.operation.state_fence != identity.request.state_fence
+    {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "reactive ledger mutation reply did not echo the exact committed candidate"
+                .to_owned(),
+        });
+    }
+    Ok(reply)
 }
 
 fn build_invocation_envelope(
@@ -3041,6 +3177,45 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             }
         })?;
         decode_restore_reply(&record)
+    }
+
+    fn commit_reactive_ledger(
+        &mut self,
+        request: &ReactiveLedgerMutationRequest,
+    ) -> Result<ReactiveLedgerMutationReply, PortFailure> {
+        request
+            .validate()
+            .map_err(|error| PortFailure::TransportBindingRejected {
+                reason: format!("reactive ledger candidate invalid: {error}"),
+            })?;
+        let now_ms = unix_ms()?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        if request.session_id != session {
+            return Err(PortFailure::TransportBindingRejected {
+                reason: "ledger mutation session does not match the live attach session".to_owned(),
+            });
+        }
+        if request.state_fence != facts.state_fence {
+            return Err(PortFailure::FenceMismatch);
+        }
+        let request_id = reactive_ledger_mutation_request_id(request)?;
+        let frame = reactive_ledger_mutation_frame(request, &facts, &request_id, now_ms)?;
+        let reply = self
+            .exchange(&frame)
+            .map_err(|error| retain_agent_response(error, request_failure()))?;
+        let decoded = decode_reactive_ledger_mutation_reply(
+            &reply,
+            request,
+            &request_id,
+            &frame,
+            &facts.connection_id,
+        )?;
+        Ok(decoded)
     }
 }
 
