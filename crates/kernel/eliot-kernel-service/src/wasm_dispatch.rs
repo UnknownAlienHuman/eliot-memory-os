@@ -2298,8 +2298,23 @@ fn read_slot_state(
             }
             terminal @ (WasmPublicationState::Ready { .. }
             | WasmPublicationState::Failed { .. }) => {
-                if terminal_state.replace(terminal).is_some() {
-                    return Err(WasmDispatchError::DeliveryUnavailable);
+                if let Some(previous) = terminal_state.take() {
+                    if previous.identity() != terminal.identity() {
+                        return Err(WasmDispatchError::DeliveryUnavailable);
+                    }
+                    terminal_state = Some(match (previous, terminal) {
+                        (
+                            WasmPublicationState::Ready { .. },
+                            failed @ WasmPublicationState::Failed { .. },
+                        ) => failed,
+                        (
+                            failed @ WasmPublicationState::Failed { .. },
+                            WasmPublicationState::Ready { .. },
+                        ) => failed,
+                        _ => return Err(WasmDispatchError::DeliveryUnavailable),
+                    });
+                } else {
+                    terminal_state = Some(terminal);
                 }
             }
         }
