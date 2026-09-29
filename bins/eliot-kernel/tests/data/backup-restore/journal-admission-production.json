@@ -3,10 +3,10 @@
     "owner_id": "kernel-ors-owner",
     "trust_binding_ref": "trust-binding-kernel-ors-owner-session-1"
   },
-  "database_ref": "kernel-operational-ors-db",
+  "database_ref": "kernel-operational-ors",
   "installation_ref": "installation-960",
   "generation": 1,
-  "journal_identity_ref": "kernel-restore-journal-v1",
+  "journal_identity_ref": "per-execution-stream-key-requires-a-live-restore-plan",
   "admission_receipt_ref": "admission-receipt-960-production",
   "fixture_proof_only": false
 }
