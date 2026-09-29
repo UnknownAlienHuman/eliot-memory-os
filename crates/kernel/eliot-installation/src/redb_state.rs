@@ -25,6 +25,7 @@ use super::canary_removal::{
     canary_removal_operation_id,
 };
 use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES;
+use crate::installation_registry::installation_registry_path_user_owned;
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
     InstallationError, InstallationRoots, InstallationStage, InstallationStepOutcome,
@@ -39,7 +40,8 @@ use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier, DirectoryPublicationReceipt,
     FileIdentity, OwnedDirectoryPublication, PackageFileSpec, PackageManifest, PeCoffEvidence,
-    TrustedSourceBundle, WindowsAuthenticodeVerifier, canonical_windows_path,
+    TrustedSourceBundle, UserOwnedPathLease, UserOwnedRootLease, WindowsAuthenticodeVerifier,
+    canonical_windows_path,
     delete_owned_file_handle, file_identity_for_open_handle, open_no_follow_directory,
     open_no_follow_file, validate_package_relative_path, windows_paths_equal,
 };
@@ -304,7 +306,7 @@ impl super::RedbInstallationRegistry {
                 "SystemService registry reads require the protected Host-root lease".to_owned(),
             ));
         }
-        let path = super::installation_registry_path_user_owned(&host_root, profile)?;
+        let path = installation_registry_path_user_owned(&host_root, profile)?;
         host_root
             .verify_stable_identity()
             .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
