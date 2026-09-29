@@ -313,8 +313,27 @@ impl From<PreflightError> for TypedExecutionError {
 
 /// Default governed refusal. No Kernel admission is bound in this host,
 /// so governed execution always fails closed before compile/instantiate.
+/// The refusal is enforced through [`check_governed_admission`]: the closed
+/// unadmitted record below is well-formed but carries no Kernel issuance, so
+/// the gate reaches its documented staleness denial and that typed denial
+/// propagates unchanged (`KERNEL_ADMISSION_REQUIRED`).
 pub fn execute_governed_refusal() -> Result<(), TypedExecutionError> {
-    Err(TypedExecutionError::GovernedAdmissionRequired)
+    let unadmitted = GovernedAdmission {
+        world: TypedWorld::ContextAdmission,
+        operation_id: "unadmitted-operation".to_owned(),
+        task_id: "unadmitted-task".to_owned(),
+        scope_id: "unadmitted-scope".to_owned(),
+        fence_epoch: "unadmitted-fence".to_owned(),
+        policy_id: "unadmitted-policy".to_owned(),
+        artifact_digest: Sha256Digest::of_bytes(b"unadmitted-governed-attempt"),
+        proof_ceiling: ProofCeiling::Observation,
+    };
+    check_governed_admission(
+        unadmitted.world,
+        &unadmitted.artifact_digest,
+        None,
+        Some(&unadmitted),
+    )
 }
 
 /// Governed admission bindings the default path requires: exact world,
@@ -1565,15 +1584,22 @@ impl TypedDomainResult {
 /// and the domain export is then called EXACTLY ONCE with the generated
 /// request type of the selected world. That single invocation is terminal:
 /// a staged failure or otherwise unknown outcome is returned as-is and never
-/// retried on another world or second invocation.
+/// retried on another world or second invocation. Bound #760 capsule
+/// provenance validates first, then delegates back unbound.
 pub fn execute_domain_experimental(
     world: TypedWorld,
     artifact: &[u8],
     limits: &InvocationLimits,
     request: &TypedDomainRequest,
     admitted: &TypedDomainAdmission,
+    provenance: Option<(&ModuleContractKit, &ModuleTestCapsule)>,
 ) -> Result<(TypedReceipt, TypedDomainResult), TypedExecutionError> {
     let start = Instant::now();
+    if let Some((kit, capsule)) = provenance {
+        return execute_capsule_domain_experimental(
+            kit, capsule, artifact, limits, request, admitted,
+        );
+    }
     admitted.validate()?;
     if request.world() != world {
         return Err(TypedExecutionError::WorldSelection {
@@ -1665,16 +1691,15 @@ pub fn execute_domain_experimental(
 /// typed: there is no stringly catch-all.
 fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
     match error {
-        TypedContractError::UnknownWorld(_) => TypedExecutionError::WorldSelection {
-            reason: "capsule-world".to_owned(),
-        },
+        TypedContractError::UnknownWorld(_) | TypedContractError::WorldMismatch { .. } => {
+            TypedExecutionError::WorldSelection {
+                reason: "capsule-world".to_owned(),
+            }
+        }
         TypedContractError::LegacyRejected(_) => TypedExecutionError::LegacyMismatch,
         TypedContractError::PackageMismatch { .. } => {
             TypedExecutionError::AdmissionMismatch("package".to_owned())
         }
-        TypedContractError::WorldMismatch { .. } => TypedExecutionError::WorldSelection {
-            reason: "capsule-world".to_owned(),
-        },
         TypedContractError::VersionMismatch { .. } => {
             TypedExecutionError::AdmissionMismatch("abi-version".to_owned())
         }
@@ -1788,7 +1813,8 @@ pub fn execute_capsule_domain_experimental(
             "capsule-output".to_owned(),
         ));
     }
-    execute_domain_experimental(world, artifact, limits, request, admitted)
+    // Delegation re-enters the direct lane: capsule provenance is consumed.
+    execute_domain_experimental(world, artifact, limits, request, admitted, None)
 }
 
 /// Digest of the admitted operation envelope plus the measured request bound.
