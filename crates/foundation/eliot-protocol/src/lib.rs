@@ -141,6 +141,11 @@ pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-response";
 /// Current agent-bridge activation response wire version.
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 2;
+/// Stable wire identity for an authenticated bridge-event disclosure request.
+pub const BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_ID: &str =
+    "eliot.protocol.bridge-event-disclosure-request";
+/// Current bridge-event disclosure request version.
+pub const BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_VERSION: u16 = 1;
 /// Stable denial code for a Kernel-owned activation refusal with no typed
 /// daemon semantic result (pre-ticket immediate denial or result-less expiry).
 /// It never stands in for one of the six typed disposition codes below.
@@ -848,6 +853,126 @@ impl EventEnvelope {
         } else {
             Err(ProtocolError::UnknownEventPayloadType)
         }
+    }
+}
+
+/// Exact activation- and source-bound request for the Governor disclosure owner.
+///
+/// This request carries identity and digests only. It does not itself grant
+/// persistence or recovery disclosure, and the Kernel rejects raw persistence
+/// until an authenticated owner result bound to this request is available.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventDisclosureRequest {
+    /// Stable request contract identity.
+    pub wire_id: String,
+    /// Request contract version.
+    pub wire_version: u16,
+    /// Exact canonical event-envelope digest being considered.
+    pub source_sha256: String,
+    /// Event identity carried by the exact canonical source envelope.
+    pub event_id: String,
+    /// Source stream identity carried by that envelope.
+    pub stream_id: String,
+    /// Source producer identity carried by that envelope.
+    pub producer_id: String,
+    /// Source payload discriminator carried by that envelope.
+    pub payload_type: String,
+    /// Delivery class carried by that envelope.
+    pub delivery_class: DeliveryClass,
+    /// Source sequence carried by that envelope.
+    pub sequence: u64,
+    /// ORS-derived namespace digest for this producer and stream.
+    pub source_scope_digest: String,
+    /// Principal resolved by the exact activation result.
+    pub principal_id: String,
+    /// Application session resolved by the exact activation result.
+    pub session_id: String,
+    /// WorkScope resolved by the exact activation result.
+    pub work_scope_id: String,
+    /// Task resolved by the exact activation result.
+    pub task_id: String,
+    /// TaskContract revision resolved by the exact activation result.
+    pub task_revision: u64,
+    /// Current presenting fence, which must remain within the activation epoch
+    /// and generation. The owner decision must bind its own policy revision.
+    pub state_fence: StateFence,
+    /// Exact Kernel-issued activation ticket identity.
+    pub activation_ticket_id: String,
+    /// Digest of the exact activation ticket.
+    pub activation_ticket_sha256: String,
+    /// Exact activation request identity carried by that ticket.
+    pub activation_request_id: String,
+    /// Digest of the exact activation request.
+    pub activation_request_sha256: String,
+    /// Exact peer-admission receipt digest joined by the ticket.
+    pub peer_admission_receipt_sha256: String,
+    /// Digest of the exact accepted semantic activation result.
+    pub resolution_result_sha256: String,
+}
+
+impl BridgeEventDisclosureRequest {
+    /// Validates the typed owner request without turning it into authority.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_ID
+            || self.wire_version != BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "bridge_event_disclosure_request.wire_identity",
+                reason: "unsupported request identity or version",
+            });
+        }
+        for (value, field) in [
+            (self.principal_id.as_str(), "principal_id"),
+            (self.session_id.as_str(), "session_id"),
+            (self.work_scope_id.as_str(), "work_scope_id"),
+            (self.task_id.as_str(), "task_id"),
+            (self.event_id.as_str(), "event_id"),
+            (self.stream_id.as_str(), "stream_id"),
+            (self.producer_id.as_str(), "producer_id"),
+            (self.payload_type.as_str(), "payload_type"),
+            (self.activation_ticket_id.as_str(), "activation_ticket_id"),
+            (self.activation_request_id.as_str(), "activation_request_id"),
+        ] {
+            text(value, field)?;
+        }
+        for (value, field) in [
+            (self.source_sha256.as_str(), "source_sha256"),
+            (self.source_scope_digest.as_str(), "source_scope_digest"),
+            (
+                self.activation_ticket_sha256.as_str(),
+                "activation_ticket_sha256",
+            ),
+            (
+                self.activation_request_sha256.as_str(),
+                "activation_request_sha256",
+            ),
+            (
+                self.peer_admission_receipt_sha256.as_str(),
+                "peer_admission_receipt_sha256",
+            ),
+            (
+                self.resolution_result_sha256.as_str(),
+                "resolution_result_sha256",
+            ),
+        ] {
+            lowercase_sha256(value, field)?;
+        }
+        if self.task_revision == 0
+            || self.sequence == 0
+            || self
+                .state_fence
+                .task_revision
+                .map(|revision| revision.value())
+                != Some(self.task_revision)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_revision",
+                reason: "must be nonzero and match the task fence",
+            });
+        }
+        self.state_fence.validate()?;
+        Ok(())
     }
 }
 

@@ -1789,6 +1789,79 @@ impl KernelComposition {
         })
     }
 
+    /// Returns the activation binding only while its exact retained result,
+    /// application session, and current transport still authorize this
+    /// connection. Bridge-event disclosure requests use this owner projection;
+    /// the transport peer identity is never substituted for its principal.
+    pub(super) fn bridge_event_activation_binding(
+        &self,
+        session: &Session,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<super::ActivatedApplicationBinding, TransportError> {
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(&session.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if !state.activation_completed || state.session.as_ref() != Some(session) {
+                return Err(TransportError::SessionFenced);
+            }
+            state
+                .activated_binding
+                .clone()
+                .ok_or(TransportError::SessionFenced)?
+        };
+        if retained.principal_id.trim().is_empty()
+            || retained.principal_id == AGENT_BRIDGE_MODULE_ID
+            || !retained
+                .authority_epoch
+                .is_same_authority(&state_fence.authority_epoch)
+            || retained.activation_generation != state_fence.resource_generation
+            || state_fence.task_revision != Some(retained.task_revision)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.activation_result_still_retained(&pending, &retained, &session.connection_id) {
+            return Err(TransportError::SessionFenced);
+        }
+        drop(pending);
+
+        let now = unix_ms();
+        let sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let live = sessions
+            .get(&retained.session_id)
+            .is_some_and(|application| {
+                application.session_id() == retained.session_id
+                    && application.state() == eliot_ipc::ApplicationSessionState::Active
+                    && application
+                        .authority_epoch()
+                        .is_same_authority(&state_fence.authority_epoch)
+                    && application.transport_bindings().iter().any(|binding| {
+                        binding.binding_id == session.connection_id
+                            && binding.session_epoch == session.session_epoch
+                    })
+                    && application.bound_leases().values().all(|lease| {
+                        !lease.revoked
+                            && lease.issued_at_unix_ms <= now
+                            && now < lease.expires_at_unix_ms
+                    })
+            });
+        if !live {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(retained)
+    }
+
     fn resolved_result_response_frame(
         &self,
         connection_id: &str,
