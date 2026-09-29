@@ -74,6 +74,18 @@ pub enum CacheLaneError {
     /// The assembled closure failed validation.
     #[error("cache identity is invalid: {0}")]
     InvalidIdentity(String),
+    /// A stored entry's recorded fingerprints do not reproduce the freshly
+    /// computed identity, so the entry must not be reused.
+    #[error("cached entry binding mismatch on {element}: recorded {recorded} != required {required}")]
+    EntryBindingMismatch {
+        /// Identity element that diverged (identity digest, content digest,
+        /// producer, or root).
+        element: &'static str,
+        /// Fingerprint recorded on the stored entry.
+        recorded: String,
+        /// Fingerprint required by the fresh identity.
+        required: String,
+    },
 }
 
 /// Outcome of one lane consultation with fallthrough derivation.
@@ -180,6 +192,76 @@ impl CacheLane {
             .validate()
             .map_err(|error| CacheLaneError::InvalidIdentity(error.to_string()))?;
         Ok(identity)
+    }
+
+    /// Verifies that a stored entry's recorded fingerprints still reproduce a
+    /// freshly computed identity before reuse.
+    ///
+    /// The store keys entries by identity digest, so a different
+    /// trust/source/toolchain fingerprint normally misses. This check covers
+    /// the path where a caller holds an entry out-of-band: reuse is admitted
+    /// only when the entry's recorded identity digest reproduces the fresh
+    /// identity digest — which binds every closure element including the
+    /// trust (producer/root), source, and toolchain fingerprints — and the
+    /// recorded content digest agrees, so a cache entry from a different
+    /// fingerprint is never reused. A mismatch is a typed
+    /// [`CacheLaneError::EntryBindingMismatch`], never a silent reuse.
+    pub fn verify_entry_binding(
+        artifact: &CachedArtifact,
+        identity: &DerivedCacheIdentity,
+    ) -> Result<(), CacheLaneError> {
+        let required = identity
+            .digest()
+            .map_err(|error| CacheLaneError::InvalidIdentity(error.to_string()))?;
+        if artifact.lineage.identity_digest != required {
+            return Err(CacheLaneError::EntryBindingMismatch {
+                element: "identity_digest",
+                recorded: artifact.lineage.identity_digest.clone(),
+                required,
+            });
+        }
+        if artifact.lineage.content_digest != identity.content_digest {
+            return Err(CacheLaneError::EntryBindingMismatch {
+                element: "content_digest",
+                recorded: artifact.lineage.content_digest.clone(),
+                required: identity.content_digest.clone(),
+            });
+        }
+        if artifact.lineage.producer_id != identity.producer_id {
+            return Err(CacheLaneError::EntryBindingMismatch {
+                element: "producer_id",
+                recorded: artifact.lineage.producer_id.clone(),
+                required: identity.producer_id.clone(),
+            });
+        }
+        if artifact.lineage.root_identity != identity.root_identity {
+            return Err(CacheLaneError::EntryBindingMismatch {
+                element: "root_identity",
+                recorded: artifact.lineage.root_identity.clone(),
+                required: identity.root_identity.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Looks up one identity and admits the hit only when the stored entry's
+    /// recorded fingerprints still reproduce the fresh identity.
+    ///
+    /// Returns `Ok(Some(_))` for a verified hit and `Ok(None)` for a miss
+    /// (the caller must run the genuine uncached derivation). A hit whose
+    /// recorded fingerprints diverge is a typed [`CacheLaneError`], never a
+    /// reuse.
+    pub fn reuse_verified(
+        &mut self,
+        identity: &DerivedCacheIdentity,
+    ) -> Result<Option<CachedArtifact>, CacheLaneError> {
+        match self.store.lookup(identity, &self.trust) {
+            CacheLookup::Hit(artifact) => {
+                Self::verify_entry_binding(&artifact, identity)?;
+                Ok(Some(artifact))
+            }
+            CacheLookup::Miss { .. } => Ok(None),
+        }
     }
 
     /// Consults the cache for a prebuilt identity without deriving anything.

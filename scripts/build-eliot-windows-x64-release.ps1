@@ -1489,6 +1489,36 @@ function Assert-IsolatedSourceTree([string]$Repo, [string]$SourceCommit, [string
     }
 }
 
+function Select-ReleaseIsolationFallback([string]$Boundary, [bool]$LocallyProven, [string]$Reason) {
+    # Issue #1923 W8: where the local environment cannot prove an isolation
+    # boundary, the release workflow selects and records a VM/lab fallback
+    # rather than asserting local proof.  A locally proven boundary records
+    # the local runner with its evidence; anything else records the VM/lab
+    # isolated runner.  An empty boundary or a missing reason fails closed.
+    if ([string]::IsNullOrWhiteSpace($Boundary)) {
+        throw 'release isolation fallback selection requires a non-empty boundary name'
+    }
+    if ([string]::IsNullOrWhiteSpace($Reason)) {
+        throw "release isolation fallback selection requires a recorded reason ($Boundary)"
+    }
+    if ($LocallyProven) {
+        [ordered]@{
+            boundary = $Boundary
+            locally_proven = $true
+            selected_runner = 'local'
+            reason = $Reason
+        }
+    }
+    else {
+        [ordered]@{
+            boundary = $Boundary
+            locally_proven = $false
+            selected_runner = 'VM/lab isolated runner'
+            reason = $Reason
+        }
+    }
+}
+
 function Get-ExcludedDispositionReceiptPath([string]$Repo) {
     # Issue #1811: the gate receipt is a retained build output, never a tracked
     # source file. `.eliot/` is the repository's ignored evidence root.
@@ -4234,6 +4264,17 @@ try {
     $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Issue #1923 W8: select and record the isolation fallback per boundary.
+    # Source-tree pinning is proven locally by Assert-IsolatedSourceTree
+    # (pre-build and post-build); descendant containment and
+    # filesystem/network sandboxing have no local proof in this flow (a Job
+    # Object-only check cannot claim them per I18.44), so they select the
+    # VM/lab isolated runner instead of asserting local proof.
+    $isolationFallback = @(
+        Select-ReleaseIsolationFallback 'source-tree-pinning' $true 'Assert-IsolatedSourceTree verified the pinned HEAD, a clean tree, and no local .cargo configuration pre-build and post-build'
+        Select-ReleaseIsolationFallback 'build-descendant-containment' $false 'the release build path creates no Job Object for the cargo child, so descendant removal on cancellation is not demonstrated locally'
+        Select-ReleaseIsolationFallback 'build-filesystem-network-sandbox' $false 'per I18.44 a Job Object-only check cannot claim filesystem/network sandboxing'
+    )
     $release = [ordered]@{
         component = 'eliot_windows_x64_release'
         version = $Version
@@ -4340,6 +4381,7 @@ try {
             pre_build = $preBuildIsolation
             post_build = $postBuildIsolation
         }
+        isolation_fallback = $isolationFallback
         toolchain_build = $stageToolchain
         operator_build = [ordered]@{
             receipt_sha256 = $verifiedOperator.receipt_sha256

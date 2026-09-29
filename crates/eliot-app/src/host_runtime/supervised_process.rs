@@ -745,6 +745,12 @@ fn recover_checkpoint_process_tree(
             let process_count_after = job
                 .active_process_count()
                 .context("query reopened Job Object after recovery")?;
+            if !empty || process_count_after != 0 {
+                anyhow::bail!(
+                    "reopened Job Object still holds {process_count_after} live processes \
+                     after termination; descendant removal is unproven"
+                );
+            }
             Ok(StartupProcessRecovery::JobReaped {
                 job_name,
                 process_count_before,

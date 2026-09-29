@@ -219,6 +219,7 @@ function New-ReleaseSecuritySuiteResult {
         executed_cases = 0
         cases = @()
         metadata_keys = @()
+        selected_fallbacks = $null
         receipt_component = ''
         exit_code = $null
         detail = ''
@@ -272,11 +273,54 @@ function Complete-ReleaseSecuritySuiteFromReceipt {
             'suite receipt component identity is empty' $true $ExecutedBy $ExitCode
     }
     $Result.receipt_component = $component
+    # Issue #1923 W8: a VM/lab fallback selection is evidence, not metadata.
+    # Non-boolean receipt fields otherwise collapse to key names, which drops
+    # the selected runner text.  The selected_fallbacks map (claim -> runner)
+    # is recorded verbatim below, and a receipt that declares fallback-routed
+    # claims without recording their runner text fails closed here.
+    $declaredFallbacks = 0
+    $fallbackCountField = $fields | Where-Object { [string]$_.name -ceq 'fallbacks' } | Select-Object -First 1
+    if ($null -ne $fallbackCountField) {
+        $asCount = $fallbackCountField.value -as [int]
+        if ($null -ne $asCount) {
+            $declaredFallbacks = $asCount
+        }
+    }
+    $selectedFallbacks = [ordered]@{}
+    $fallbackField = $fields | Where-Object { [string]$_.name -ceq 'selected_fallbacks' } | Select-Object -First 1
+    if ($null -ne $fallbackField -and $null -ne $fallbackField.value) {
+        $rawFallbacks = $fallbackField.value
+        if ($rawFallbacks -is [System.Collections.IDictionary]) {
+            foreach ($key in $rawFallbacks.Keys) {
+                $selectedFallbacks[[string]$key] = [string]$rawFallbacks[$key]
+            }
+        }
+        else {
+            foreach ($property in @($rawFallbacks.PSObject.Properties)) {
+                $selectedFallbacks[[string]$property.Name] = [string]$property.Value
+            }
+        }
+    }
+    $emptyFallbacks = @($selectedFallbacks.Keys | Where-Object {
+        [string]::IsNullOrWhiteSpace([string]$_) -or
+        [string]::IsNullOrWhiteSpace([string]$selectedFallbacks[$_])
+    })
+    if ($emptyFallbacks.Count -ne 0) {
+        return Set-ReleaseSecuritySuiteOutcome $Result 'FALLBACK-NOT-RECORDED' `
+            "suite receipt records $($selectedFallbacks.Count) selected fallback(s) but these entries carry no usable VM/lab runner text: $($emptyFallbacks -join ', ')" `
+            $true $ExecutedBy $ExitCode
+    }
+    if ($declaredFallbacks -gt $selectedFallbacks.Count) {
+        return Set-ReleaseSecuritySuiteOutcome $Result 'FALLBACK-NOT-RECORDED' `
+            "suite receipt declares $declaredFallbacks fallback-routed claim(s) but records only $($selectedFallbacks.Count) selected VM/lab fallback(s); the selected runner text never reached the release evidence" `
+            $true $ExecutedBy $ExitCode
+    }
+    $Result.selected_fallbacks = $selectedFallbacks
     $caseNames = New-Object System.Collections.Generic.List[string]
     $notHeld = New-Object System.Collections.Generic.List[string]
     $metadataNames = New-Object System.Collections.Generic.List[string]
     foreach ($field in $fields) {
-        if ($reservedReceiptFields -contains [string]$field.name) {
+        if ($reservedReceiptFields -contains [string]$field.name -or [string]$field.name -ceq 'selected_fallbacks') {
             continue
         }
         if ($field.value -is [bool]) {
@@ -867,6 +911,7 @@ $receipt = [ordered]@{
                 executed_cases = $_.executed_cases
                 cases = @($_.cases)
                 metadata_keys = @($_.metadata_keys)
+                selected_fallbacks = $_.selected_fallbacks
                 receipt_component = $_.receipt_component
                 exit_code = $_.exit_code
                 detail = $_.detail

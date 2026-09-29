@@ -5150,7 +5150,12 @@ _NO_SUPPORT_CLAIM = (
 _SCANNER_POLICY_FINDING_CODES = ("DEP-004", "DEP-005", "DEP-006")
 
 
-def _artifact_envelope(artifact: str, schema: str, receipt: dict) -> dict:
+def _artifact_envelope(
+    artifact: str,
+    schema: str,
+    receipt: dict,
+    release_binding: dict | None = None,
+) -> dict:
     """Stamp a run artifact with the receipt identity it derives from."""
 
     canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -5163,8 +5168,74 @@ def _artifact_envelope(artifact: str, schema: str, receipt: dict) -> dict:
         "source_sha": receipt.get("source_sha"),
         "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "receipt_digest": hashlib.sha256(canonical).hexdigest(),
+        "release_binding": (
+            {"status": "bound", "hashes": dict(release_binding)}
+            if isinstance(release_binding, dict) and release_binding
+            else {
+                "status": "not_bound",
+                "reason": "no release hashes were supplied for this run artifact",
+            }
+        ),
         "support_claim": _NO_SUPPORT_CLAIM,
     }
+
+
+@dataclass(frozen=True)
+class ArtifactHashBinding:
+    """Typed verdict binding one written artifact file to its recorded release hash."""
+
+    path: str
+    expected_sha256: str
+    actual_sha256: str
+    bound: bool
+    reason: str
+
+
+def verify_artifact_hash_binding(artifact_path: str | Path, expected_sha256: object) -> ArtifactHashBinding:
+    """Compare artifact file bytes against the recorded release hash (issue #1923 W7).
+
+    The binding is byte-level: the SHA-256 recomputed over the exact bytes on
+    disk must equal the recorded release hash. A missing, unreadable, or
+    malformed expected hash, or any byte divergence, is an unbound typed
+    verdict — never an exception and never an assumed binding.
+    """
+
+    path_text = str(artifact_path)
+    expected = expected_sha256 if isinstance(expected_sha256, str) else ""
+    if not _HEX64.fullmatch(expected or ""):
+        return ArtifactHashBinding(
+            path=path_text,
+            expected_sha256=expected,
+            actual_sha256="",
+            bound=False,
+            reason="recorded release hash is missing or malformed",
+        )
+    try:
+        raw = Path(path_text).read_bytes()
+    except OSError as exc:
+        return ArtifactHashBinding(
+            path=path_text,
+            expected_sha256=expected.lower(),
+            actual_sha256="",
+            bound=False,
+            reason=f"artifact file is unreadable: {exc}",
+        )
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected.lower():
+        return ArtifactHashBinding(
+            path=path_text,
+            expected_sha256=expected.lower(),
+            actual_sha256=actual,
+            bound=False,
+            reason="artifact bytes do not reproduce the recorded release hash",
+        )
+    return ArtifactHashBinding(
+        path=path_text,
+        expected_sha256=expected.lower(),
+        actual_sha256=actual,
+        bound=True,
+        reason="artifact bytes reproduce the recorded release hash",
+    )
 
 
 def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict | None:
@@ -5193,7 +5264,11 @@ def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict |
     return None
 
 
-def build_sbom_artifact(receipt: dict, manifest_data: dict) -> dict:
+def build_sbom_artifact(
+    receipt: dict,
+    manifest_data: dict,
+    release_binding: dict | None = None,
+) -> dict:
     """Build the SBOM run artifact from receipt denominator evidence (issue #1229 W7).
 
     The artifact enumerates observed locked components across Rust, NuGet,
@@ -5331,7 +5406,7 @@ def build_sbom_artifact(receipt: dict, manifest_data: dict) -> dict:
     for component in components:
         key = str(component.get("ecosystem", "unknown"))
         by_ecosystem[key] = by_ecosystem.get(key, 0) + 1
-    artifact = _artifact_envelope("sbom", "eliot.dependency-policy-sbom.v1", receipt)
+    artifact = _artifact_envelope("sbom", "eliot.dependency-policy-sbom.v1", receipt, release_binding)
     artifact.update(
         {
             "denominator_status": denominator.get("status"),
@@ -5352,6 +5427,7 @@ def build_license_report_artifact(
     receipt: dict,
     manifest_data: dict,
     deny_license_allow: list[str] | None,
+    release_binding: dict | None = None,
 ) -> dict:
     """Build the license run artifact from policy and scanner evidence (issue #1229 W7)."""
 
@@ -5382,7 +5458,7 @@ def build_license_report_artifact(
         license_reason = "executed licenses gate reported no errors"
     externals = manifest_data.get("external_executables", {})
     externals = externals if isinstance(externals, dict) else {}
-    artifact = _artifact_envelope("license-report", "eliot.dependency-policy-licenses.v1", receipt)
+    artifact = _artifact_envelope("license-report", "eliot.dependency-policy-licenses.v1", receipt, release_binding)
     artifact.update(
         {
             "license_status": license_status,
@@ -5416,7 +5492,11 @@ def build_license_report_artifact(
     return artifact
 
 
-def build_advisory_report_artifact(receipt: dict, manifest_data: dict) -> dict:
+def build_advisory_report_artifact(
+    receipt: dict,
+    manifest_data: dict,
+    release_binding: dict | None = None,
+) -> dict:
     """Build the advisory run artifact from snapshot and exception evidence (issue #1229 W7)."""
 
     receipt = receipt if isinstance(receipt, dict) else {}
@@ -5449,7 +5529,7 @@ def build_advisory_report_artifact(receipt: dict, manifest_data: dict) -> dict:
     surreal = surreal if isinstance(surreal, dict) else {}
     external_evidence = receipt.get("external_executable_evidence", {})
     external_evidence = external_evidence if isinstance(external_evidence, dict) else {}
-    artifact = _artifact_envelope("advisory-report", "eliot.dependency-policy-advisories.v1", receipt)
+    artifact = _artifact_envelope("advisory-report", "eliot.dependency-policy-advisories.v1", receipt, release_binding)
     artifact.update(
         {
             "rust_advisory_snapshot": snapshot,
@@ -6358,20 +6438,32 @@ def main() -> int:
 
     try:
         if args.sbom_out:
-            _write_json_artifact(args.sbom_out, build_sbom_artifact(receipt, manifest_data), "SBOM")
+            sbom_digest = _write_json_artifact(args.sbom_out, build_sbom_artifact(receipt, manifest_data), "SBOM")
+            sbom_binding = verify_artifact_hash_binding(args.sbom_out, sbom_digest)
+            if not sbom_binding.bound:
+                print(f"DEPENDENCY_POLICY_ARTIFACT_HASH_MISMATCH: SBOM {sbom_binding.reason}", file=sys.stderr)
+                return 1
         if args.license_report_out:
             deny_allow, _ = _read_deny_license_allowlist(root)
-            _write_json_artifact(
+            license_digest = _write_json_artifact(
                 args.license_report_out,
                 build_license_report_artifact(receipt, manifest_data, deny_allow),
                 "LICENSE_REPORT",
             )
+            license_binding = verify_artifact_hash_binding(args.license_report_out, license_digest)
+            if not license_binding.bound:
+                print(f"DEPENDENCY_POLICY_ARTIFACT_HASH_MISMATCH: LICENSE_REPORT {license_binding.reason}", file=sys.stderr)
+                return 1
         if args.advisory_report_out:
-            _write_json_artifact(
+            advisory_digest = _write_json_artifact(
                 args.advisory_report_out,
                 build_advisory_report_artifact(receipt, manifest_data),
                 "ADVISORY_REPORT",
             )
+            advisory_binding = verify_artifact_hash_binding(args.advisory_report_out, advisory_digest)
+            if not advisory_binding.bound:
+                print(f"DEPENDENCY_POLICY_ARTIFACT_HASH_MISMATCH: ADVISORY_REPORT {advisory_binding.reason}", file=sys.stderr)
+                return 1
     except OSError as exc:
         print(f"DEPENDENCY_POLICY_ARTIFACT_WRITE_FAILURE: {exc}", file=sys.stderr)
         return 1

@@ -884,6 +884,44 @@ fn is_process_in_job(
     }
 }
 
+/// Observed descendant-removal evidence for one terminated Job Object.
+///
+/// This value exists only after [`RecoverableJobObject::terminate_and_verify_empty`]
+/// re-enumerated the Job membership and observed zero live members, so
+/// holding it is the removal proof. It carries no filesystem or network
+/// sandbox claim (`I18.44`).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DescendantRemovalProof {
+    exit_code: u32,
+    live_before: u32,
+    live_after: u32,
+}
+
+#[cfg(windows)]
+impl DescendantRemovalProof {
+    /// Returns the exit code the termination was issued with.
+    #[must_use]
+    pub const fn exit_code(self) -> u32 {
+        self.exit_code
+    }
+
+    /// Returns the live-member count observed before termination.
+    #[must_use]
+    pub const fn live_before(self) -> u32 {
+        self.live_before
+    }
+
+    /// Returns the live-member count observed after termination.
+    ///
+    /// This is always zero: the proof is constructed only on the observed
+    /// empty re-enumeration.
+    #[must_use]
+    pub const fn live_after(self) -> u32 {
+        self.live_after
+    }
+}
+
 /// Handle to an existing named Job Object during restart reconciliation.
 ///
 /// Reopening proves only current kernel membership. Historical descendants
@@ -1013,6 +1051,41 @@ impl RecoverableJobObject {
         } else {
             Ok(())
         }
+    }
+
+    /// Terminates all current members and proves observed descendant removal.
+    ///
+    /// The proof is the re-enumerated live-member count reaching zero within
+    /// `timeout`, never the termination exit code: a `TerminateJobObject`
+    /// success with surviving members is reported as survivors, not as
+    /// removal. The returned [`DescendantRemovalProof`] exists only after the
+    /// Job was observed empty, so holding it is the removal evidence.
+    ///
+    /// This proves Job Object membership removal only. Per `I18.44` it claims
+    /// no filesystem or network sandbox boundary.
+    ///
+    /// # Errors
+    /// Returns the termination error when Windows rejects termination, and
+    /// `Timeout` when any member is still observed after the bounded wait.
+    pub fn terminate_and_verify_empty(
+        &self,
+        exit_code: u32,
+        timeout: std::time::Duration,
+    ) -> Result<DescendantRemovalProof, WindowsAdapterError> {
+        let live_before = self.active_process_count()?;
+        self.terminate(exit_code)?;
+        if !self.wait_for_empty(timeout)? {
+            return Err(WindowsAdapterError::Timeout);
+        }
+        let live_after = self.active_process_count()?;
+        if live_after != 0 {
+            return Err(WindowsAdapterError::Timeout);
+        }
+        Ok(DescendantRemovalProof {
+            exit_code,
+            live_before,
+            live_after,
+        })
     }
 
     /// Waits until no live member remains.
