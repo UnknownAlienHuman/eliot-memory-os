@@ -14,7 +14,7 @@ use crate::activation_resolution::AgentActivationResolutionDisposition;
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
     ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
-    ResourceGeneration, StateFence, canonical_json_bytes, contract_identity,
+    ResourceGeneration, StateFence, canonical_json_bytes, contract_identity, sha256_hex,
 };
 use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
@@ -141,6 +141,17 @@ pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-response";
 /// Current agent-bridge activation response wire version.
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 2;
+/// Authenticated daemon operation that attempts to publish one Governor-owned
+/// Bridge event privacy snapshot to the Kernel owner port.
+pub const BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION: &str =
+    "publish_bridge_event_privacy_owner";
+/// Authenticated daemon operation that reads the currently retained Bridge
+/// event privacy owner for one scope and fence.
+pub const BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION: &str =
+    "query_bridge_event_privacy_owner";
+/// Version of the canonical Governor owner snapshot carried by the dedicated
+/// Bridge event privacy owner publication.
+pub const BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION: u16 = 1;
 /// Stable denial code for a Kernel-owned activation refusal with no typed
 /// daemon semantic result (pre-ticket immediate denial or result-less expiry).
 /// It never stands in for one of the six typed disposition codes below.
@@ -163,6 +174,150 @@ pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
 /// Current semantic-resolution ticket wire version.
 pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION: u16 = 1;
 const FRAME_PREFIX_BYTES: usize = 4;
+
+/// Typed daemon publication of a canonical Governor Bridge event privacy
+/// snapshot. The Kernel verifies this carrier but must refuse to bind it until
+/// its dedicated durable owner port is available.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventPrivacyOwnerPublishOperation {
+    pub operation: String,
+    pub scope_ref: String,
+    pub owner_revision: u64,
+    pub policy_snapshot_id: String,
+    pub policy_revision: u64,
+    pub state_fence: StateFence,
+    pub owner_snapshot_json: String,
+    pub owner_snapshot_sha256: String,
+}
+
+impl BridgeEventPrivacyOwnerPublishOperation {
+    /// Checks canonical bytes and exact identity fields before any owner store
+    /// can be touched.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.operation != BRIDGE_EVENT_PRIVACY_OWNER_PUBLISH_OPERATION {
+            return Err(ProtocolError::InvalidField {
+                field: "operation",
+                reason: "does not name Bridge event privacy owner publication",
+            });
+        }
+        text(&self.scope_ref, "scope_ref")?;
+        text(&self.policy_snapshot_id, "policy_snapshot_id")?;
+        self.state_fence.validate()?;
+        if self.owner_revision == 0 || self.policy_revision == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "owner_revision/policy_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.owner_snapshot_json.is_empty()
+            || self.owner_snapshot_json.len() > MAX_FRAME_BYTES
+            || !is_lowercase_sha256(&self.owner_snapshot_sha256)
+            || sha256_hex(self.owner_snapshot_json.as_bytes()) != self.owner_snapshot_sha256
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "owner_snapshot_json/owner_snapshot_sha256",
+                reason: "must be bounded canonical JSON with its exact SHA-256",
+            });
+        }
+        let snapshot: Value = serde_json::from_str(&self.owner_snapshot_json)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let canonical = canonical_json_bytes(&snapshot)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if canonical.as_slice() != self.owner_snapshot_json.as_bytes() {
+            return Err(ProtocolError::InvalidField {
+                field: "owner_snapshot_json",
+                reason: "must use canonical JSON encoding",
+            });
+        }
+        let fence = serde_json::to_value(&self.state_fence)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let scope_ref = snapshot
+            .pointer("/work_scope/binding/scope/scope_ref")
+            .and_then(Value::as_str);
+        let owner_revision = snapshot
+            .pointer("/work_scope/owner_revision")
+            .and_then(Value::as_u64);
+        let policy_snapshot_id = snapshot
+            .get("policy_snapshot_id")
+            .and_then(Value::as_str);
+        let policy_revision = snapshot.get("policy_revision").and_then(Value::as_u64);
+        let schema_version = snapshot.get("schema_version").and_then(Value::as_u64);
+        if scope_ref != Some(self.scope_ref.as_str())
+            || owner_revision != Some(self.owner_revision)
+            || policy_snapshot_id != Some(self.policy_snapshot_id.as_str())
+            || policy_revision != Some(self.policy_revision)
+            || schema_version != Some(u64::from(BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION))
+            || snapshot.get("work_scope").and_then(|value| value.get("state_fence"))
+                != Some(&fence)
+            || snapshot.get("attach_receipt").and_then(|value| value.get("state_fence"))
+                != Some(&fence)
+            || snapshot.get("policy_state_fence") != Some(&fence)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "owner_snapshot_json",
+                reason: "owner scope, revision, schema or fence differs from publication",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed query for the retained Bridge event privacy owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventPrivacyOwnerQuery {
+    pub operation: String,
+    pub scope_ref: String,
+    pub state_fence: StateFence,
+}
+
+impl BridgeEventPrivacyOwnerQuery {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.operation != BRIDGE_EVENT_PRIVACY_OWNER_QUERY_OPERATION {
+            return Err(ProtocolError::InvalidField {
+                field: "operation",
+                reason: "does not name Bridge event privacy owner query",
+            });
+        }
+        text(&self.scope_ref, "scope_ref")?;
+        self.state_fence.validate()?;
+        Ok(())
+    }
+}
+
+/// Kernel receipt for an owner publish/readback. `owner_snapshot_json` is
+/// present only for a durable, exact-fence readback; the current owner port
+/// returns `OWNER_PORT_UNAVAILABLE` and never issues a grant.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventPrivacyOwnerReceipt {
+    pub disposition: BridgeEventPrivacyOwnerDisposition,
+    pub scope_ref: String,
+    pub owner_revision: Option<u64>,
+    pub policy_snapshot_id: Option<String>,
+    pub policy_revision: Option<u64>,
+    pub state_fence: StateFence,
+    pub owner_snapshot_json: Option<String>,
+    pub owner_snapshot_sha256: Option<String>,
+    pub reason_code: Option<String>,
+}
+
+/// Exact result class of the dedicated owner port.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BridgeEventPrivacyOwnerDisposition {
+    Bound,
+    Unbound,
+    Unavailable,
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// A protocol contract validation or compatibility failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
