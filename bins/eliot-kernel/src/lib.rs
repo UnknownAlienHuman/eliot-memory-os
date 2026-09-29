@@ -639,6 +639,11 @@ pub struct KernelComposition {
     wasm_host_executable_path: Option<PathBuf>,
     /// Digest bound to `wasm_host_executable_path`, validated at assembly.
     wasm_host_artifact_sha256: Option<String>,
+    /// Installer-pinned User Broker executable path. Live peer admission
+    /// revalidates its bytes and file identity before creating a profile.
+    user_broker_executable_path: Option<PathBuf>,
+    /// Digest bound to `user_broker_executable_path`.
+    user_broker_artifact_sha256: Option<String>,
     /// Retained owner-side WASM join table (#2786 step 3): the single
     /// cross-call registry of published delivery-bound joins. The
     /// dispatch operation merges each published bundle here and admits

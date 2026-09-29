@@ -165,11 +165,19 @@ pub fn authenticate_named_pipe_server(
             .map_err(|error| windows_adapter_from_io(&error))?;
         admit_named_pipe_peer_process(&identity, expectation)?;
         let (sid, session_id) = process_token_identity(process)?;
-        if sid != expectation.expected_sid() || session_id != expectation.expected_session_id() {
+        if !expectation.is_dynamic_process()
+            && (sid != expectation.expected_sid()
+                || session_id != expectation.expected_session_id())
+        {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
+        let interactive_group_enabled = if expectation.requires_interactive_group_membership() {
+            process_token_is_interactive_member(process)?
+        } else {
+            false
+        };
         let executable_file = file_identity(Path::new(&identity.image_path)).ok();
-        Ok(NamedPipePeerEvidence {
+        let mut evidence = NamedPipePeerEvidence {
             process: identity,
             sid,
             session_id,
@@ -179,7 +187,18 @@ pub fn authenticate_named_pipe_server(
                 .map(|binding| binding.job_name().to_owned()),
             builtin_administrators: false,
             interactive_session: false,
-        })
+            interactive_group_enabled,
+        };
+        if expectation.is_dynamic_process()
+            && evidence.session_id != 0
+            && expectation.matches_dynamic_observation(&evidence)
+        {
+            evidence.interactive_session = active_interactive_session(evidence.session_id)?;
+        }
+        if !expectation.matches_evidence(&evidence) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(evidence)
     })();
     // SAFETY: `process` is the live handle returned by OpenProcess and is
     // closed exactly once after every result from the observation closure.
@@ -234,8 +253,9 @@ pub fn authenticate_named_pipe_client(
                 // the retained process handle. Do not compare that primary
                 // token with an impersonation token: they are distinct token
                 // objects even when they represent the same client.
-                process_token.0 == expectation.expected_sid()
-                    && process_token.1 == expectation.expected_session_id()
+                expectation.is_dynamic_process()
+                    || process_token.0 == expectation.expected_sid()
+                        && process_token.1 == expectation.expected_session_id()
             }
             NamedPipeAuthDiscriminator::BuiltinAdministrators => {
                 let process_is_admin = process_token_is_builtin_administrator(process)?;
@@ -257,8 +277,13 @@ pub fn authenticate_named_pipe_client(
         if !principal_matches {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
+        let interactive_group_enabled = if expectation.requires_interactive_group_membership() {
+            process_token_is_interactive_member(process)?
+        } else {
+            false
+        };
         let executable_file = file_identity(Path::new(&identity.image_path)).ok();
-        Ok(NamedPipePeerEvidence {
+        let mut evidence = NamedPipePeerEvidence {
             process: identity,
             sid: process_token.0,
             session_id: process_token.1,
@@ -271,7 +296,18 @@ pub fn authenticate_named_pipe_client(
                 NamedPipeAuthDiscriminator::BuiltinAdministrators
             ),
             interactive_session: false,
-        })
+            interactive_group_enabled,
+        };
+        if expectation.is_dynamic_process()
+            && evidence.session_id != 0
+            && expectation.matches_dynamic_observation(&evidence)
+        {
+            evidence.interactive_session = active_interactive_session(evidence.session_id)?;
+        }
+        if !expectation.matches_evidence(&evidence) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(evidence)
     })();
     // SAFETY: `process` is the live handle returned by OpenProcess and is
     // closed exactly once after every result from the observation closure.
@@ -319,6 +355,11 @@ pub fn authenticate_named_pipe_server_with_peer_set(
         } else {
             false
         };
+        let interactive_group_enabled = if peers.requires_interactive_group_membership() {
+            process_token_is_interactive_member(process)?
+        } else {
+            false
+        };
         let executable_file = file_identity(Path::new(&identity.image_path)).ok();
         let job_name = observed_peer_job_name(process_id, peers)?;
         let mut evidence = NamedPipePeerEvidence {
@@ -329,6 +370,7 @@ pub fn authenticate_named_pipe_server_with_peer_set(
             job_name,
             builtin_administrators,
             interactive_session: false,
+            interactive_group_enabled,
         };
         if session_id != 0
             && peers
@@ -396,6 +438,11 @@ pub fn authenticate_named_pipe_client_with_peer_set(
         } else {
             false
         };
+        let interactive_group_enabled = if peers.requires_interactive_group_membership() {
+            process_token_is_interactive_member(process)?
+        } else {
+            false
+        };
         let executable_file = file_identity(Path::new(&identity.image_path)).ok();
         let job_name = observed_peer_job_name(process_id, peers)?;
         let mut evidence = NamedPipePeerEvidence {
@@ -406,6 +453,7 @@ pub fn authenticate_named_pipe_client_with_peer_set(
             job_name,
             builtin_administrators,
             interactive_session: false,
+            interactive_group_enabled,
         };
         if session_id != 0
             && peers
@@ -476,6 +524,91 @@ fn active_interactive_session(session_id: u32) -> Result<bool, WindowsAdapterErr
     let state = unsafe { std::ptr::read_unaligned(state_ptr.cast::<i32>()) };
     unsafe { WTSFreeMemory(state_ptr.cast()) };
     Ok(state == WTSActive)
+}
+
+#[cfg(windows)]
+fn process_token_is_interactive_member(
+    process: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<bool, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, SECURITY_MAX_SID_SIZE,
+        SID_AND_ATTRIBUTES, TOKEN_GROUPS, TokenGroups, WinInteractiveSid,
+    };
+    use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    let result = (|| {
+        let mut sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut sid_bytes = u32::try_from(sid.len()).map_err(|_| WindowsAdapterError::Failed)?;
+        if unsafe {
+            CreateWellKnownSid(
+                WinInteractiveSid,
+                std::ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &raw mut sid_bytes,
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        let mut required = 0_u32;
+        let _ = unsafe {
+            GetTokenInformation(
+                token,
+                TokenGroups,
+                std::ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        };
+        if required == 0 {
+            return Err(last_windows_adapter_error());
+        }
+        let required_bytes = usize::try_from(required).map_err(|_| WindowsAdapterError::Failed)?;
+        let words = required_bytes
+            .checked_add(std::mem::size_of::<usize>() - 1)
+            .ok_or(WindowsAdapterError::Failed)?
+            / std::mem::size_of::<usize>();
+        let mut buffer = vec![0_usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenGroups,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &raw mut required,
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
+        let group_count =
+            usize::try_from(groups.GroupCount).map_err(|_| WindowsAdapterError::Failed)?;
+        let groups_offset = std::mem::size_of::<TOKEN_GROUPS>()
+            .checked_sub(std::mem::size_of::<SID_AND_ATTRIBUTES>())
+            .ok_or(WindowsAdapterError::Failed)?;
+        let max_group_count = required_bytes
+            .checked_sub(groups_offset)
+            .ok_or(WindowsAdapterError::Failed)?
+            / std::mem::size_of::<SID_AND_ATTRIBUTES>();
+        if group_count > max_group_count {
+            return Err(WindowsAdapterError::Failed);
+        }
+        let groups = unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), group_count) };
+        Ok(groups.iter().any(|group| {
+            group.Attributes & (SE_GROUP_ENABLED as u32) != 0
+                && unsafe { EqualSid(group.Sid, sid.as_mut_ptr().cast()) != 0 }
+        }))
+    })();
+    unsafe { CloseHandle(token) };
+    result
 }
 
 /// Bounded stage at which the named-pipe impersonation guard observes a raw

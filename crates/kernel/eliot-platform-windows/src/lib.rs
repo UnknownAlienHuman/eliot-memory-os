@@ -224,7 +224,7 @@ pub use platform_security::{
     WindowsStoreCredentialTargetGenerator, converge_agent_bridge_security,
     open_agent_bridge_declaration_read_lease, open_agent_bridge_final_read_lease,
     register_interactive_watchdog_task, run_registered_watchdog_task, validate_pinned_artifact,
-    verify_agent_bridge_security,
+    validate_pinned_artifact_with_identity, verify_agent_bridge_security,
 };
 #[cfg(test)]
 use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};

@@ -160,6 +160,7 @@ pub struct NamedPipePeerExpectation {
     dynamic_image_path: Option<String>,
     dynamic_executable_file: Option<FileIdentity>,
     builtin_administrators: bool,
+    interactive_group_required: bool,
 }
 
 impl NamedPipePeerExpectation {
@@ -183,6 +184,7 @@ impl NamedPipePeerExpectation {
             dynamic_image_path: None,
             dynamic_executable_file: None,
             builtin_administrators: false,
+            interactive_group_required: false,
         })
     }
 
@@ -204,6 +206,7 @@ impl NamedPipePeerExpectation {
             dynamic_image_path: None,
             dynamic_executable_file: None,
             builtin_administrators: true,
+            interactive_group_required: false,
         })
     }
 
@@ -233,6 +236,37 @@ impl NamedPipePeerExpectation {
             dynamic_image_path: Some(image_path),
             dynamic_executable_file: Some(executable_file),
             builtin_administrators: false,
+            interactive_group_required: false,
+        })
+    }
+
+    /// Creates a User Broker expectation tied to the installer-pinned image
+    /// and file identity. The token SID, PID, start time, session, and enabled
+    /// INTERACTIVE group membership are observed from the live pipe peer for
+    /// each connection; none are supplied by Broker hello content.
+    pub fn new_for_interactive_dynamic_process(
+        image_path: impl Into<String>,
+        executable_file: FileIdentity,
+    ) -> Result<Self, WindowsAdapterError> {
+        let image_path = image_path.into();
+        if !valid_process_image_path(&image_path)
+            || executable_file.volume_serial_number == 0
+            || executable_file.file_index == 0
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            // This SID is the transport DACL principal, not the user's SID.
+            // `matches_dynamic_observation` admits the process token's actual
+            // account SID only after enabled INTERACTIVE membership is proved.
+            expected_sid: "S-1-5-4".to_owned(),
+            expected_session_id: 0,
+            approved_process: None,
+            approved_job_process: None,
+            dynamic_image_path: Some(image_path),
+            dynamic_executable_file: Some(executable_file),
+            builtin_administrators: false,
+            interactive_group_required: true,
         })
     }
 
@@ -319,6 +353,13 @@ impl NamedPipePeerExpectation {
         self.builtin_administrators
     }
 
+    /// Whether live peer authentication must prove enabled INTERACTIVE group
+    /// membership on the observed process primary token.
+    #[must_use]
+    pub const fn requires_interactive_group_membership(&self) -> bool {
+        self.interactive_group_required
+    }
+
     pub(crate) fn auth_discriminator(&self) -> NamedPipeAuthDiscriminator {
         if self.builtin_administrators {
             NamedPipeAuthDiscriminator::BuiltinAdministrators
@@ -360,7 +401,13 @@ impl NamedPipePeerExpectation {
     }
 
     pub(crate) fn matches_dynamic_observation(&self, evidence: &NamedPipePeerEvidence) -> bool {
-        if !self.is_dynamic_process() || evidence.sid != self.expected_sid {
+        let sid_matches = if self.interactive_group_required {
+            evidence.interactive_group_enabled
+                && !matches!(evidence.sid.as_str(), "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
+        } else {
+            evidence.sid == self.expected_sid
+        };
+        if !self.is_dynamic_process() || !sid_matches {
             return false;
         }
         let Some(image_path) = self.dynamic_image_path.as_deref() else {
@@ -381,6 +428,7 @@ impl NamedPipePeerExpectation {
         } else if self.is_dynamic_process() {
             if evidence.session_id == 0
                 || !evidence.interactive_session
+                || self.interactive_group_required && !evidence.interactive_group_enabled
                 || !self.matches_dynamic_observation(evidence)
             {
                 return false;
@@ -418,6 +466,7 @@ pub struct NamedPipePeerEvidence {
     pub(crate) job_name: Option<String>,
     pub(crate) builtin_administrators: bool,
     pub(crate) interactive_session: bool,
+    pub(crate) interactive_group_enabled: bool,
 }
 
 impl NamedPipePeerEvidence {
@@ -443,6 +492,7 @@ impl NamedPipePeerEvidence {
             job_name,
             builtin_administrators,
             interactive_session,
+            interactive_group_enabled: false,
         })
     }
 
@@ -483,6 +533,13 @@ impl NamedPipePeerEvidence {
     #[must_use]
     pub const fn has_active_interactive_session(&self) -> bool {
         self.interactive_session
+    }
+
+    /// Returns OS-proved enabled INTERACTIVE membership from the process
+    /// primary token. This is a transport-entry fact only.
+    #[must_use]
+    pub const fn has_interactive_group_membership(&self) -> bool {
+        self.interactive_group_enabled
     }
 }
 

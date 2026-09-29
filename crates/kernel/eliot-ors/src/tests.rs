@@ -3892,18 +3892,24 @@ fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> T
         old.clone(),
         "opaque-session-detach",
     )?)?)?;
-    store.register_user_broker(UserBrokerRegistration::new(operational_input(
-        "broker-register-1",
-        "broker-1",
-        old.clone(),
-        "opaque-broker",
-    )?)?)?;
-    store.fence_user_broker(UserBrokerFence::new(operational_input(
-        "broker-fence-1",
-        "broker-1",
-        old.clone(),
-        "opaque-broker-fence",
-    )?)?)?;
+    let broker_registered = store.register_user_broker(
+        UserBrokerRegistration::new(operational_input(
+            "broker-register-1",
+            "broker-1",
+            old.clone(),
+            "opaque-broker",
+        )?)?,
+        None,
+    )?;
+    store.fence_user_broker(
+        UserBrokerFence::new(operational_input(
+            "broker-fence-1",
+            "broker-1",
+            old.clone(),
+            "opaque-broker-fence",
+        )?)?,
+        broker_registered.receipt(),
+    )?;
 
     store.commit_authority_snapshot(KernelAuthoritySnapshot::new(operational_input(
         "authority-snapshot-1",
