@@ -550,6 +550,11 @@ impl HandoffCheckpoint {
 /// rebuilds a current delta View and obtains new authority for those members
 /// instead of restamping the retained fence. Recording a change is not
 /// refusing the resume; a binding or fence-shape failure is.
+/// The five changed-flags are the I12.17-specified orthogonal generation/fence
+/// observations, not collapsible flags, so the pedantic bool-count lint is
+/// allowed here by the same precedent used across `eliot-types` contract
+/// records.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffResumeRevalidation {
