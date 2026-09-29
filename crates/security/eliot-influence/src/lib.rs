@@ -895,7 +895,7 @@ impl BoundedRevocationOutcome {
         // precisely when its edge was never propagated, so requiring frontier
         // membership in the implied closure would refuse every honest
         // cross-scope or stale omission.
-        let implied = permitted_dependent_closure(request)?;
+        let implied = permitted_dependent_closure(request);
         let mut affected = BTreeSet::new();
         for reference in &self.affected_refs {
             // A duplicate would let one member of a rewritten set read as two
@@ -931,9 +931,7 @@ impl BoundedRevocationOutcome {
 /// can emit under any bound: bounds only ever shrink the admitted set, never
 /// widen it. A legitimately paged or truncated outcome is therefore never
 /// refused here.
-fn permitted_dependent_closure(
-    request: &BoundedRevocationRequest,
-) -> Result<BTreeSet<String>, InfluenceError> {
+fn permitted_dependent_closure(request: &BoundedRevocationRequest) -> BTreeSet<String> {
     let edges = request
         .edges
         .iter()
@@ -943,9 +941,9 @@ fn permitted_dependent_closure(
             dependent_ref: edge.dependent_ref.clone(),
         })
         .collect::<Vec<_>>();
-    Ok(traverse_dependency_closure(&request.root_ref, &edges)
+    traverse_dependency_closure(&request.root_ref, &edges)
         .into_iter()
-        .collect())
+        .collect()
 }
 
 impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
