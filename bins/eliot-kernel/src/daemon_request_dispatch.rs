@@ -4836,6 +4836,10 @@ impl KernelComposition {
     /// The final wire boundary never serializes provider, storage, or model
     /// details carried by `OrsError`.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per closed-enum variant keeps the match exhaustive under E0004; splitting would need a wildcard and destroy the closed-world guarantee"
+    )]
     fn maintenance_trigger_ors_error_code(error: &eliot_ors::OrsError) -> &'static str {
         use eliot_ors::OrsError;
 
