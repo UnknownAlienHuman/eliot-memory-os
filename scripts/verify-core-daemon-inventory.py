@@ -2,16 +2,20 @@
 """Verify the bounded core-daemon inventory projection.
 
 This is a static routing/control-plane check. It validates the inventory's
-identity, ownership references, proof requirements, and proof ceiling; it does
-not establish runtime support or Product Proof.
+identity, ownership references, proof requirements, and proof ceiling, and it
+reads back the generated daemon capability-cell block against the eliotd
+manifest; it does not establish runtime support or Product Proof.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import json
+import shutil
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +25,41 @@ from typing import Any
 INVENTORY_RELATIVE = "workstreams/core-daemons/inventory.json"
 ACTIVE_RELATIVE = "workstreams/ACTIVE.toml"
 EXPECTED_SCHEMA = "eliot.core-daemon-workstream.v4"
+REGISTRY_CONTRACT_RELATIVE = "workstreams/core-daemons/capability-cell-registry.contract.toml"
+ELIOTD_MANIFEST_RELATIVE = "bins/eliotd/Cargo.toml"
+REGISTRY_GENERATOR_RELATIVE = "scripts/gen_capability_cell_registry.py"
+REGISTRY_REGENERATE_HINT = "regenerate with python scripts/gen_capability_cell_registry.py"
+# Generator RegistryError reason -> typed finding code. Manifest-side reasons
+# point at the manifest; every other reason points at the contract.
+REGISTRY_ERROR_CODES = {
+    "MANIFEST_UNREADABLE": "registry_source_unreadable",
+    "CONTRACT_UNREADABLE": "registry_source_unreadable",
+    "MANIFEST_METADATA_MISSING": "undeclared_state_owner",
+    "FUNCTIONAL_CELL_REFS_MISSING": "undeclared_state_owner",
+    "STATE_OWNERS_MISSING": "undeclared_state_owner",
+    "STATE_OWNER_SHAPE": "undeclared_state_owner",
+    "CELL_SET_MISMATCH": "registry_cell_mismatch",
+    "DUPLICATE_CELL": "registry_cell_mismatch",
+    "DUPLICATE_STATE_OWNER": "duplicate_state_owner",
+    "CONTRACT_SHAPE": "registry_evidence_defect",
+    "DUPLICATE_ANNEX_CELL": "registry_evidence_defect",
+    "EVIDENCE_PIN_SHAPE": "registry_evidence_defect",
+    "EVIDENCE_PIN_MISSING": "registry_evidence_defect",
+    "STALE_EVIDENCE_PIN": "registry_evidence_defect",
+    "GENERATED_BLOCK_MARKERS_MISSING": "registry_stale",
+}
+REGISTRY_MANIFEST_REASONS = frozenset(
+    {
+        "MANIFEST_UNREADABLE",
+        "MANIFEST_METADATA_MISSING",
+        "FUNCTIONAL_CELL_REFS_MISSING",
+        "STATE_OWNERS_MISSING",
+        "STATE_OWNER_SHAPE",
+        "CELL_SET_MISMATCH",
+        "DUPLICATE_CELL",
+        "DUPLICATE_STATE_OWNER",
+    }
+)
 EXPECTED_NORMATIVE_PAIR = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
 EXPECTED_PRODUCT_STATUS = "NOT_ACCEPTED_UNVERIFIED"
 EXPECTED_SOURCE_IDENTITY_RULE = (
@@ -472,6 +511,60 @@ def verify_payload(payload: Any, active_registry: Any | None = None) -> list[Fin
     return sorted(findings, key=lambda item: (item.code, item.path, item.detail))
 
 
+def _load_registry_generator(root: Path) -> Any:
+    """Load the capability-cell registry generator module, or None when absent."""
+    path = root / REGISTRY_GENERATOR_RELATIVE
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("gen_capability_cell_registry", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def verify_capability_cell_registry(root: Path) -> list[Finding]:
+    """Read back the generated daemon cell block against the eliotd manifest.
+
+    Structural manifest/contract defects fail with typed codes; a committed
+    block that is not byte-identical to the generator output fails as
+    `registry_stale`. An empty list means generation, readback, and
+    enforcement agree.
+    """
+    generator = _load_registry_generator(root)
+    if generator is None:
+        return [
+            _finding(
+                "registry_generator_missing",
+                REGISTRY_GENERATOR_RELATIVE,
+                "the capability-cell registry generator is missing; "
+                "the contract block cannot be enforced",
+            )
+        ]
+    try:
+        committed, regenerated = generator.emit(root)
+    except Exception as error:
+        reason = getattr(error, "reason", "CONTRACT_UNREADABLE")
+        code = REGISTRY_ERROR_CODES.get(reason, "registry_source_unreadable")
+        path = (
+            ELIOTD_MANIFEST_RELATIVE
+            if reason in REGISTRY_MANIFEST_REASONS
+            else REGISTRY_CONTRACT_RELATIVE
+        )
+        return [_finding(code, path, str(error))]
+    if committed != regenerated:
+        return [
+            _finding(
+                "registry_stale",
+                REGISTRY_CONTRACT_RELATIVE,
+                "the committed declared_functional_cell block is not the "
+                "generator output; " + REGISTRY_REGENERATE_HINT,
+            )
+        ]
+    return []
+
+
 def load_inventory(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -500,6 +593,7 @@ def verify(root: Path) -> list[Finding]:
             findings.append(_finding("active_registry_unreadable", ACTIVE_RELATIVE, str(error)))
             active_registry = None
 
+    findings.extend(verify_capability_cell_registry(root))
     if not inventory_path.is_file():
         findings.append(_finding("inventory_missing", INVENTORY_RELATIVE, "core-daemon inventory is missing"))
         return sorted(findings, key=lambda item: (item.code, item.path, item.detail))
@@ -575,6 +669,115 @@ def _expect_active_only(registry: dict[str, Any], code: str) -> None:
         raise AssertionError(f"expected only {code}, got {sorted(codes)}: {findings}")
 
 
+_SYNTH_MANIFEST = """\
+[package]
+name = "eliotd"
+
+[package.metadata.eliot]
+layer = "C1"
+purpose = "synthetic registry fixture"
+source_maintenance_owner = "governor.daemon"
+functional_cell_refs = ["synth.one", "synth.two"]
+independent_proof_profile = "eliotd"
+contract_refs = []
+
+functional_cell_state_owners = [
+  { cell = "synth.one", state = "s-one", owner = "synth::One" },
+  { cell = "synth.two", state = "s-two", owner = "synth::Two" },
+]
+"""
+
+_SYNTH_ROW = """\
+[[declared_functional_cell]]
+cell = "{cell}"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "{owner}"
+mutable_state_owner = "{owner}"
+source_evidence = "bins/eliotd/src/lib.rs:1"
+state_evidence = "bins/eliotd/src/lib.rs:1-2"
+runtime_bundle = "eliotd"
+stateless = false
+"""
+
+
+def _synthetic_registry_root(root: Path, manifest: str, contract: str) -> None:
+    (root / "bins" / "eliotd").mkdir(parents=True, exist_ok=True)
+    (root / "workstreams" / "core-daemons").mkdir(parents=True, exist_ok=True)
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    shutil.copy(
+        Path(__file__).resolve().parent / "gen_capability_cell_registry.py",
+        root / REGISTRY_GENERATOR_RELATIVE,
+    )
+    (root / ELIOTD_MANIFEST_RELATIVE).write_text(manifest, encoding="utf-8")
+    (root / REGISTRY_CONTRACT_RELATIVE).write_text(contract, encoding="utf-8")
+
+
+def _synthetic_contract(rows: str, generator: Any) -> str:
+    return (
+        'schema = "eliot.capability-cell-registry-implementation.v1"\n'
+        + generator.BEGIN_MARKER
+        + "\n"
+        + rows
+        + "\n"
+        + generator.END_MARKER
+        + "\n"
+    )
+
+
+def _self_test_registry() -> int:
+    """Exercise registry readback/enforcement against synthetic roots. Returns case count."""
+    pinned = _load_registry_generator(Path(__file__).resolve().parents[1])
+    if pinned is None:
+        raise AssertionError("registry generator is missing from the working tree")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        rows = "\n\n".join(
+            _SYNTH_ROW.format(cell=cell, owner=owner)
+            for cell, owner in (("synth.one", "synth::One"), ("synth.two", "synth::Two"))
+        )
+        _synthetic_registry_root(root, _SYNTH_MANIFEST, _synthetic_contract(rows, pinned))
+        generator = _load_registry_generator(root)
+        if generator is None:
+            raise AssertionError("synthetic registry generator failed to load")
+        if generator.main(["--root", str(root)]) != 0:
+            raise AssertionError("synthetic registry generation failed")
+        if verify_capability_cell_registry(root):
+            raise AssertionError("valid synthetic registry failed readback")
+        print("INVENTORY_FIXTURE: generated registry readback: FAILS_AS=<none>")
+        contract_path = root / REGISTRY_CONTRACT_RELATIVE
+        manifest_path = root / ELIOTD_MANIFEST_RELATIVE
+        committed_contract = contract_path.read_text(encoding="utf-8")
+        committed_manifest = manifest_path.read_text(encoding="utf-8")
+
+        def expect_registry(code: str, label: str) -> None:
+            findings = verify_capability_cell_registry(root)
+            codes = {finding.code for finding in findings}
+            if codes != {code}:
+                raise AssertionError(
+                    f"expected only {code}, got {sorted(codes)}: {findings}"
+                )
+            print(f"INVENTORY_FIXTURE: {label}: FAILS_AS={code}")
+
+        contract_path.write_text(
+            committed_contract.replace("synth::Two", "synth::Rogue"), encoding="utf-8"
+        )
+        expect_registry("registry_stale", "tampered cell owner")
+        contract_path.write_text(committed_contract, encoding="utf-8")
+        manifest_path.write_text(
+            committed_manifest.replace('owner = "synth::Two"', 'owner = "synth::One"'),
+            encoding="utf-8",
+        )
+        expect_registry("duplicate_state_owner", "owner claimed by two cells")
+        manifest_path.write_text(
+            committed_manifest.replace(', "synth.two"', ""), encoding="utf-8"
+        )
+        expect_registry("registry_cell_mismatch", "ref without state owner")
+        manifest_path.write_text(committed_manifest, encoding="utf-8")
+        shutil.rmtree(root / "scripts")
+        expect_registry("registry_generator_missing", "absent generator")
+        return 5
+
+
 def self_test() -> None:
     cases: list[tuple[str, str, Any]] = []
 
@@ -632,7 +835,8 @@ def self_test() -> None:
     duplicate_active_registry["workstream"].append(copy.deepcopy(duplicate_active_registry["workstream"][0]))
     _expect_active_only(duplicate_active_registry, "active_registry_identity")
     print("INVENTORY_FIXTURE: duplicate ACTIVE workstream: FAILS_AS=active_registry_identity")
-    print(f"CORE_DAEMON_INVENTORY_SELF_TEST: PASS cases={len(cases) + 2}")
+    registry_cases = _self_test_registry()
+    print(f"CORE_DAEMON_INVENTORY_SELF_TEST: PASS cases={len(cases) + 2 + registry_cases}")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
