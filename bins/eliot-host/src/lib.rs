@@ -9220,24 +9220,35 @@ impl HostComposition {
             self.readiness_gate.branch_degraded();
         }
         if kernel_requires_activation {
-            let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
+            // One snapshot supplies both the authorizing record and the
+            // retained record-bound config approvals the shared restart gate
+            // joins them with, so the gate never mixes records from two
+            // different reads.
+            let journal_state = self.journal.snapshot()?;
+            let current = journal_state.kernel.ok_or_else(|| {
                 HostError::OwnerLeaseRecovery(
                     "dead Kernel branch has no durable Kernel record".to_owned(),
                 )
             })?;
+            let readiness_observations = journal_state.readiness_observations;
             // I1.9 A1: a Host-managed dependency (Kernel) restarts only when
             // the valid journal record binds this relaunch's approved
             // artifact and carries the full process lineage for it, the
-            // relaunch config is the approved config, and the record is
-            // owned by the current activation fence. The shared choke
-            // revalidates the original recorded record, refuses an artifact
-            // or config mismatch as manual recovery instead of relaunching
-            // an unapproved image or config, refuses a record without
-            // PID/Job lineage instead of reconstructing it, and refuses a
-            // stale-activation record instead of restarting from prior
-            // lineage. The snapshot above already fails a corrupt journal.
+            // journal's own record-bound approval binds the approved config
+            // to that exact record, the relaunch config is the approved
+            // config, and the record is owned by the current activation
+            // fence. The shared choke revalidates the original recorded
+            // record, refuses an artifact or config mismatch as manual
+            // recovery instead of relaunching an unapproved image or config,
+            // refuses a record without PID/Job lineage instead of
+            // reconstructing it, refuses a record whose approved config is
+            // not bound to it in the journal instead of trusting a live
+            // manifest, and refuses a stale-activation record instead of
+            // restarting from prior lineage. The snapshot above already fails
+            // a corrupt journal.
             require_journal_kernel_restart_record(
                 &current,
+                &readiness_observations,
                 kernel_artifact,
                 &active.manifest.config_digest,
                 &materialized_config_digest,
