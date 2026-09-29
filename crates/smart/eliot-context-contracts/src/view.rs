@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmittedAtom, AdmittedContextSet, AtomAvailability, AuthorityClass, ContextBinding,
-    ContextError, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, QualityScorecard,
+    ContextError, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, QualityDimension,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, QualitySuitability,
     SerializedContextMeasurement,
 };
 
@@ -238,6 +239,19 @@ impl ActiveUnderstandingView {
         if self.binding != admitted.binding {
             return Err(ContextError::InvalidFence);
         }
+        // The admitted half of the scorecard's output binding is compared
+        // against the admitted set's own canonical payload digest and its own
+        // displacement list. Both sides are independent records: the digest is
+        // recomputed by the existing admitted-set owner over the admitted
+        // records, and the expected omissions are the admitted set's, not the
+        // scorecard's copy of them. A card graded on a different admitted set
+        // therefore cannot validate against this one even when the two share a
+        // task, attempt, scope, decision and fence.
+        if self.quality.output.admitted_digest != admitted.canonical_payload_digest()?
+            || self.quality.output.omission_handles != admitted.economy.displaced
+        {
+            return Err(ContextError::SelectionIntegrityMismatch);
+        }
         let expected_omissions: BTreeSet<_> = admitted.economy.displaced.iter().cloned().collect();
         let actual_omissions: BTreeSet<_> =
             self.selection.omission_evidence.iter().cloned().collect();
@@ -306,6 +320,22 @@ impl ActiveUnderstandingView {
         }
         self.quality.validate()?;
         self.measurement.validate()?;
+        // The rendered half of the scorecard's output binding, compared against
+        // the rendered half of this view. `derived_output_digest` is the one
+        // existing canonical digest of the ordered rendered payload and it
+        // reads only `{schema_version, binding, recipe_digest, fence_digest,
+        // rendered}` — the scorecard is not an input to it, so binding the
+        // grade to the final representation is not circular. Because the
+        // recipe digest and the rendered bytes are both in that input, a card
+        // graded on a different recipe or a different membership yields a
+        // different recorded value and is rejected here even when the fence
+        // matches.
+        if self.quality.output.recipe_digest != self.recipe_digest
+            || self.quality.output.fence_digest != self.fence_digest
+            || self.quality.output.rendered_digest != self.output_digest
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
         if self.selection.binding != self.binding
             || self.quality.binding != self.binding
             || self.measurement.context != self.binding
@@ -343,5 +373,37 @@ impl ActiveUnderstandingView {
         crate::validate_digest(&self.output_digest, "view.output_digest")?;
         crate::validate_digest(&self.recipe_digest, "view.recipe_digest")?;
         crate::validate_digest(&self.fence_digest, "view.fence_digest")
+    }
+
+    /// Operation-scoped readiness for a consumer that holds only this view.
+    ///
+    /// This is the *same* rule `assemble_active_view` applies, reached through
+    /// the one owner: a direct View consumer cannot reach a weaker check than
+    /// the assembly consumer, and a deserialized view cannot smuggle an
+    /// unvalidated grade past it, because [`ActiveUnderstandingView::validate`]
+    /// runs first and its refusal is reported as
+    /// [`QualityRefusalKind::InvalidScorecard`].
+    ///
+    /// A structural failure is a refusal naming the requested operation; a
+    /// failed or unknown required dimension is a refusal naming that dimension
+    /// result and the evidence it lacks; a non-blocking informational unknown
+    /// is returned inside [`QualitySuitability`] instead of globally refusing
+    /// unrelated safe work. `additional_required` is unioned with the
+    /// operation's mandatory dimensions, so it can add a constraint and never
+    /// remove one.
+    pub fn suitability(
+        &self,
+        operation: QualityOperation,
+        additional_required: &[QualityDimension],
+    ) -> Result<QualitySuitability, QualityRefusal> {
+        if self.validate().is_err() {
+            return Err(QualityRefusal {
+                kind: QualityRefusalKind::InvalidScorecard,
+                operation,
+                blocking: Vec::new(),
+                unresolved_applicability: Vec::new(),
+            });
+        }
+        self.quality.suitability(operation, additional_required)
     }
 }

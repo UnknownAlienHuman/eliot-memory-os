@@ -11,9 +11,9 @@ use eliot_context_contracts::{
     PriorDeliveryBinding, PrivacyClass, ProofBinding, ProviderDisposition, ProviderId,
     ProviderRole, ProviderRoleDenominator, QUALITY_APPLICABILITY_INPUTS,
     QUALITY_RESULT_SCHEMA_VERSION, QualityApplicability, QualityDimension, QualityDimensionResult,
-    QualityDimensionState, QualityScorecard, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
-    SerializedContextMeasurement, SessionDeliverySnapshot, SnapshotCompleteness,
-    SnapshotDenominator, SourceSnapshot,
+    QualityDimensionState, QualityOutputBinding, QualityScorecard, ReactiveDeliveryMode,
+    SafetyFloorMember, SemanticRole, SerializedContextMeasurement, SessionDeliverySnapshot,
+    SnapshotCompleteness, SnapshotDenominator, SourceSnapshot,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractIdentity, ContractVersion, EpochId,
@@ -135,6 +135,18 @@ fn quality(binding: &ContextBinding) -> QualityScorecard {
     ];
     QualityScorecard {
         binding: binding.clone(),
+        output: QualityOutputBinding {
+            recipe_digest: digest(),
+            fence_digest: digest(),
+            admitted_digest: digest(),
+            rendered_digest: digest(),
+            serializer_id: "serde-json".to_owned(),
+            serializer_version: "1".to_owned(),
+            serializer_options_digest: digest(),
+            route_id: "route".to_owned(),
+            evidence_revisions: Vec::new(),
+            omission_handles: Vec::new(),
+        },
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()
@@ -435,9 +447,18 @@ pub fn context_view() -> (
         false_rejection_or_decomposition: None,
         valid_until: None,
     };
+    // The card grades this exact output, so it records this packet's digests.
+    let mut quality = quality(&binding);
+    quality.output.recipe_digest = recipe_digest.clone();
+    quality.output.fence_digest = fence_digest.clone();
+    quality.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("admitted payload digest");
+    quality.output.rendered_digest = output_digest.clone();
+    quality.output.omission_handles = admitted.economy.displaced.clone();
     let view = ActiveUnderstandingView::assemble(
         &admitted,
-        quality(&binding),
+        quality,
         measurement,
         output_digest,
         recipe_digest,

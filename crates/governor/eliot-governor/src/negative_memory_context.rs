@@ -1048,6 +1048,7 @@ fn negative_memory_coverage_result(
     // or degraded axis to name its failed invariant or unknown evidence.
     let mut probe = QualityScorecard {
         binding: binding.clone(),
+        output: scorecard.output.clone(),
         applicability: scorecard.applicability.clone(),
         results: scorecard.results.clone(),
     };
