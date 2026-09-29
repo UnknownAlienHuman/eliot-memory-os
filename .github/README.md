@@ -33,6 +33,18 @@ full migration of this policy surface (`AGENTS.md`, `WORKFLOW.md`, the
 `ci.yml` exception record, `scripts/verify-github-workflows.py`,
 `config/doc-code-conformance.toml`, and the #1225 allocation).
 
+The retained expected enforcement rule for that check is
+`config/merge-compile-enforcement.json`. It names the *emitted* check identity
+(job `merge-compile`, app `github-actions`, app id `15368`), never the workflow
+display name, and `scripts/verify-branch-protection.py` reads live protection
+back and compares against it. The comparison is bound in both directions: it
+reports `BP-RULE-UNBOUND` when the retained context is no longer emitted by
+`.github/workflows/ci.yml`, and `BP-APP-UNBOUND`/`BP-APP-MISMATCH` when the live
+requirement is not bound to the declared check app — a bare context can be
+satisfied by any app posting that name, which is weaker than the stated
+guarantee. The tool only ever reads protection; applying it is a separate
+governed repository setting.
+
 ### `repository-policy.yml`
 
 Manual repository-routing and authority-surface check.
@@ -74,6 +86,17 @@ dependencies, including standalone workspaces only where an accepted
 adjacent lock exists). It records materialization outcomes and never
 writes locks, receipts, or verdicts; missing or substituted inputs fail
 the offline gate with its own findings.
+
+The same step first materializes the scanner identity the offline gate
+depends on. The gate resolves its scanner through `PATH` and then admits
+only digest-matched bytes, so a clean runner must provision the exact
+version, release-archive digest and executable digest declared in
+`config/dependency-policy.toml` `[scanner]`
+(`scripts/provision-dependency-scanner.py`) rather than install a latest
+`cargo-deny`. The archive digest authenticates the download; the
+executable digest is the identity compared against the gate's receipt.
+A missing, substituted or digest-mismatched scanner fails the step and
+keeps the gate failed — it is never a PASS.
 
 Least privilege: GitHub-hosted Windows runners, `contents: read`, no
 repository/environment secrets, `persist-credentials: false`, no

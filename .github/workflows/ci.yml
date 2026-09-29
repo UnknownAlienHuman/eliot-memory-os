@@ -89,7 +89,26 @@ jobs:
         shell: pwsh
         run: |
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Dependency-policy input preparation'
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Owner interfaces only: scripts/provision-surrealdb-release.py plus locked cargo prefetch; no lock/receipt writes, no verdict'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Owner interfaces only: the exact pinned scanner provisioner, scripts/provision-surrealdb-release.py, and locked cargo prefetch; no lock/receipt writes, no verdict'
+          # The dependency-policy gate resolves its scanner through PATH and
+          # admits only digest-matched bytes, so a clean runner must
+          # materialize the exact identity declared in
+          # config/dependency-policy.toml rather than install a latest
+          # cargo-deny. A nonzero exit here keeps the gate failed; the
+          # provisioner provisions inputs and never writes a verdict.
+          $scannerJson = python scripts/provision-dependency-scanner.py --root .
+          $scannerExit = $LASTEXITCODE
+          if ($scannerExit -ne 0) {
+            Write-Host "PREPARE_SCANNER_EXACT_IDENTITY: exit=$scannerExit"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Pinned scanner provisioning exit=$scannerExit (exact identity unavailable; the offline gate keeps the failed result failed)"
+            exit $scannerExit
+          }
+          $scanner = ($scannerJson -join "`n") | ConvertFrom-Json
+          Write-Host "PREPARE_SCANNER_EXACT_IDENTITY: tool=$($scanner.tool) version=$($scanner.version) sha256=$($scanner.observed_sha256) reused=$($scanner.reused)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Pinned scanner: $($scanner.tool) $($scanner.version) sha256=$($scanner.observed_sha256) from $($scanner.release_asset)"
+          $scannerDirectory = Join-Path $env:GITHUB_WORKSPACE $scanner.install_directory
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $scannerDirectory
+          $env:PATH = $scannerDirectory + [IO.Path]::PathSeparator + $env:PATH
           python scripts/provision-surrealdb-release.py --root .
           $surrealPrepareExit = $LASTEXITCODE
           Write-Host "PREPARE_SURREAL_PROVISIONER: exit=$surrealPrepareExit"
