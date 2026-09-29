@@ -971,6 +971,50 @@ pub struct NativeWorkerExecutableExpectation {
     pub revoked: bool,
 }
 
+/// Resolves the owner-admitted facet identity governing one `Execute`
+/// dispatch (Implements #22 W2).
+///
+/// The native wire carries no per-method facet proof: method membership stays
+/// with the sealed introduced set, so dispatch additionally pins the facet
+/// identity itself to the owner-admitted executable join. A claimed start
+/// (claim echo present) must carry the v2 executable expectation: the
+/// expectation's wire version must equal
+/// [`NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION`], the join must
+/// not be revoked, and `facet_manifest_ref` must be non-blank. The returned
+/// reference is the exact admitted facet identity the dispatched method
+/// executes under. A legacy start (no claim echo) carries no facet identity
+/// and dispatches unchanged.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidRequest`] when a claimed start carries no
+/// executable expectation or a blank facet identity,
+/// [`WorkerError::UnsupportedVersion`] for an unknown executable wire
+/// version, and [`WorkerError::Revoked`] when the sealed expectation reports
+/// the join withdrawn or superseded.
+pub fn admitted_facet_ref_for_dispatch<'a>(
+    claim_binding_digest: Option<&'a str>,
+    executable_expectation: Option<&'a NativeWorkerExecutableExpectation>,
+) -> Result<Option<&'a str>, WorkerError> {
+    if claim_binding_digest.is_none() {
+        return Ok(None);
+    }
+    let expectation =
+        executable_expectation.ok_or(WorkerError::InvalidRequest("executable_binding"))?;
+    if expectation.current.executable_wire_version
+        != NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION
+    {
+        return Err(WorkerError::UnsupportedVersion);
+    }
+    if expectation.revoked {
+        return Err(WorkerError::Revoked("executable_binding".to_owned()));
+    }
+    if expectation.current.facet_manifest_ref.trim().is_empty() {
+        return Err(WorkerError::InvalidRequest("facet_manifest_ref"));
+    }
+    Ok(Some(expectation.current.facet_manifest_ref.as_str()))
+}
+
 /// Returns the default claim-wire revision for payloads that predate the
 /// executable join (wire v1, no `wire_version` key).
 fn native_claim_wire_v1() -> u16 {
