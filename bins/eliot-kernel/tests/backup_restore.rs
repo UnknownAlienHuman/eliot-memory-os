@@ -22,7 +22,7 @@ use eliot_kernel::{
     BlobOwnerClient, CanonicalOwnerClient, DESTINATION_ADMISSION_FILE, DestinationManifestEvidence,
     InvalidationKind, InvalidationOwnerClient, KernelBackupRestore, KernelIsolatedDestination,
     KernelRestoreError, PinnedDestinationAdmission, PurgeOwnerClient, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel,
+    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel,
     check_kernel_effect_fence, phase_owner, require_production_admitted,
 };
 
@@ -105,7 +105,7 @@ fn production_admission() -> RestoreJournalAdmission {
         serde_json::from_slice(&read_fixture("journal-admission-production.json"))
             .expect("production admission fixture");
     assert!(!admission.fixture_proof_only);
-    assert_eq!(admission.journal_identity_ref, RESTORE_JOURNAL_IDENTITY);
+    assert_eq!(admission.database_ref, RESTORE_JOURNAL_OWNER_LABEL);
     admission
 }
 
