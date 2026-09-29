@@ -838,16 +838,29 @@ impl SkillCatalogue {
         self.entries.keys().cloned().collect()
     }
 
+    /// Binds the exact catalogue state Hotset receipts commit to: every
+    /// entry identity, body digest, and lifecycle status. A drift mark
+    /// changes the status, so the digest rotates with it and Hotset receipts
+    /// issued before the sweep fail closed at `activation_display` instead
+    /// of displaying a drifted body (`I7.13`, issue #1882 A4).
     pub fn catalogue_digest(&self) -> Result<String, SkillError> {
-        let pairs: Vec<(&String, &String)> = {
-            let mut pairs = Vec::with_capacity(self.entries.len());
+        let rows: Vec<(&String, &String, &'static str)> = {
+            let mut rows = Vec::with_capacity(self.entries.len());
             for (skill_id, entry) in &self.entries {
                 entry.validate()?;
-                pairs.push((skill_id, &entry.body.body_digest));
+                let status = match entry.status {
+                    SkillStatus::Current => "current",
+                    SkillStatus::Provisional => "provisional",
+                    SkillStatus::Stale => "stale",
+                    SkillStatus::Suppressed => "suppressed",
+                    SkillStatus::Archived => "archived",
+                    SkillStatus::Quarantined => "quarantined",
+                };
+                rows.push((skill_id, &entry.body.body_digest, status));
             }
-            pairs
+            rows
         };
-        canonical_digest(&pairs, "catalogue.digest")
+        canonical_digest(&rows, "catalogue.digest")
     }
 
     /// Records an observed dependency set. A change marks the entry stale
