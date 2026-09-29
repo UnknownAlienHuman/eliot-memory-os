@@ -333,11 +333,9 @@ fn bind_durable_closure_coordinates(
             })
     };
     let bounds = RevocationBounds::default_bounds();
-    bounds.validate().map_err(|error| {
-        owner_refused(format!(
-            "revocation traversal bounds are invalid: {error:?}"
-        ))
-    })?;
+    bounds
+        .validate()
+        .map_err(|error| owner_refused(format!("revocation traversal bounds are invalid: {error}")))?;
     let influence_closure = InfluenceDependencyClosure {
         closure_id: closure.operation_id.clone(),
         root_ref: closure.declaration.target_grant_id.clone(),
@@ -352,7 +350,7 @@ fn bind_durable_closure_coordinates(
             "durable revocation influence closure is invalid: {error}"
         ))
     })?;
-    if influence_closure.state_fence != envelope.state_fence() {
+    if influence_closure.state_fence != envelope.request.state_fence {
         return Err(identity_refused(
             "durable closure fence disagrees with the recorded revocation request".to_owned(),
         ));
