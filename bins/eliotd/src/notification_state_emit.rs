@@ -14,11 +14,17 @@
 //! `note_maintenance_trigger_at` arm (`bins/eliotd/src/daemon_runtime.rs`). Its
 //! [`eliot_maintenance::AutomationTriggerDecision`] carries `trigger_id`,
 //! `family`, `scope_ref`, `decision`, `reason`, `admits_job` and
-//! `durable_job_ref`. `admits_job == false` is precisely "admitted automation
-//! work that cannot start", which I11.5 requires to become one persistent
-//! notification instead of a log line. Per #1693's registered family catalog
-//! every one of the fifteen families currently resolves to a start that
-//! `MaintenanceRoute::admits_start()` refuses, so the arm really fires.
+//! `durable_job_ref`.
+//!
+//! The route below is taken from the owner's own `decision`, through
+//! [`MaintenanceDispatch`] (issue #1688), not from `admits_job` as a summary.
+//! A decision whose action leaves work that admitted automation cannot start is
+//! what I11.5 requires to become one persistent notification instead of a log
+//! line; a `SUPPRESS_DUPLICATE` and a `START` the Durable Job admission owner
+//! already holds are not, and this emitter returns without touching the store
+//! for both. Per #1693's registered family catalog every one of the fifteen
+//! families currently resolves to a start that `MaintenanceRoute::admits_start()`
+//! refuses, so the retained-record arm really fires.
 //!
 //! # Deduplication is the record id, not one alert per observation
 //!
@@ -171,8 +177,8 @@ use thiserror::Error;
 
 use super::{
     DaemonKernelClient, KernelContextReadClient, SERVICE_NAME,
-    daemon_kernel_client::kernel_port_error, daemon_kernel_port_adapters::kind_value, unix_ms,
-    unix_ms_i64,
+    daemon_kernel_client::kernel_port_error, daemon_kernel_port_adapters::kind_value,
+    maintenance_dispatch::MaintenanceDispatch, unix_ms, unix_ms_i64,
 };
 
 /// Closed response `kind` of the committed canonical notification transition
@@ -331,18 +337,26 @@ pub fn automation_failure_key(
     evidence.validate_for(decision)?;
     let family_decision =
         super::maintenance_family_catalog::entry_for(decision.family).decide(decision);
-    automation_failure_key_with_family_decision(decision, &family_decision, evidence)
+    let dispatch = MaintenanceDispatch::for_decision(decision, &family_decision);
+    automation_failure_key_with_family_decision(decision, &family_decision, &dispatch, evidence)
 }
 
 fn automation_failure_key_with_family_decision(
     decision: &AutomationTriggerDecision,
     family_decision: &super::maintenance_family_catalog::MaintenanceFamilyDecision,
+    dispatch: &super::maintenance_dispatch::MaintenanceDispatch,
     evidence: &MaintenanceNotificationEvidence,
 ) -> Result<AutomationFailureKey, StoreError> {
     let family = closed_wire_name(decision.family)?;
     let reason = closed_wire_name(decision.reason)?;
     let outcome = closed_wire_name(decision.decision)?;
     let mode = closed_wire_name(evidence.policy.mode)?;
+    // The dispatch is part of the record's identity, not only of its text: a
+    // `START` retained for a missing admission route and a `BLOCK` for the same
+    // family, scope and trigger are different outcomes that must not collapse
+    // onto one record, and a duplicate suppression must not land on a record
+    // that says blocked work.
+    let dispatch_name = dispatch.wire_name();
     let requested_route = (
         family_decision.route.target(),
         family_decision.route.missing(),
@@ -362,6 +376,7 @@ fn automation_failure_key_with_family_decision(
         evidence.route.generation,
         evidence.route.credential_ref.as_deref(),
         evidence.route.unattended_suitable,
+        dispatch_name,
     );
     let fingerprint = sha256_hex(
         &canonical_json_bytes(&identity)
@@ -370,11 +385,11 @@ fn automation_failure_key_with_family_decision(
     Ok(AutomationFailureKey {
         dedup_key: format!("automation-{fingerprint}"),
         notification_id: format!("notification-automation-{fingerprint}"),
-        subject: format!("blocked maintenance automation {family}"),
+        subject: dispatch.subject(&decision.family),
         summary: format!(
             "maintenance automation {family} at {} evaluated {outcome} for reason {reason}; \
              Governor admits job: {}; catalog route admits start: {}; trigger identity {}; \
-             policy episode {}; requested route {} (missing {}); actual route {}",
+             policy episode {}; requested route {} (missing {}); actual route {}; {}",
             decision.scope_ref,
             decision.admits_job,
             family_decision.admits_start,
@@ -383,6 +398,7 @@ fn automation_failure_key_with_family_decision(
             requested_route.0,
             requested_route.1,
             actual_route_summary(evidence),
+            dispatch.detail(),
         ),
         // Preserve the Governor's closed reason above and carry the catalog's
         // exact one actionable recommendation, including its reason, evidence,
@@ -523,24 +539,41 @@ pub async fn notification_already_recorded(
 /// scope, transition class, and closed leg parameters and requires a same-fence
 /// record read-back before it reports success.
 ///
-/// A decision that admits a job is not a notification-worthy failure, and a
-/// decision whose record is already stored is I11.12's repeat rather than a
-/// new occurrence; both return `Ok(None)` without touching the store.
+/// The route this leg takes is selected by the Governor owner's own action, not
+/// by a Boolean summary of it. `MaintenanceDispatch` (issue #1688) resolves one
+/// arm per `AutomationDecision`, and this function acts on the arm:
+///
+/// * `SUPPRESS_DUPLICATE` returns `Ok(None)` without touching the store. An
+///   equivalent active request already owns the work, so a record here would
+///   report a duplicate as blocked work and would add one occurrence per
+///   observation, which I11.12 forbids. The existing job is the reference, and
+///   the decision that named it is already inspectable through the
+///   operational decision line `emit_maintenance_trigger_decision` writes.
+/// * `START` returns `Ok(None)` once the catalog route admits the start, because
+///   the Durable Job admission owner then holds the work and a notification
+///   would be a second report of one request. When the route does not admit
+///   the start, the decision is retained as a record naming the admission owner
+///   and the exact route `eliotd` does not hold, which is the retained
+///   admission request I14.22 requires — not a claim that a job was admitted.
+/// * `SUGGEST`, `DEFER`, `BLOCK` and `ESCALATE` each persist exactly one record
+///   carrying the exact missing owner and the exact observation that reopens
+///   the decision, so a deferral is not recorded as a block and a suggestion
+///   is not recorded as a failure.
+/// * A decision whose record is already stored is I11.12's repeat rather than a
+///   new occurrence, and also returns `Ok(None)` without touching the store.
 ///
 /// `Off` returns before any canonical read/write. This prevents a missing route
 /// from becoming a proactive recommendation when automation is disabled. The
 /// verified mandatory safety/recovery evidence needed for I14.22's exception is
 /// not published to this path, so it does not bypass this guard.
 ///
-/// Stated rather than implied: the second guard below,
-/// `decision.admits_job && family_decision.admits_start`, cannot short-circuit
+/// Stated rather than implied: the `START` arm's route check cannot short-circuit
 /// today. `MaintenanceRoute::admits_start` is
 /// `DURABLE_JOB_ADMISSION_BLOCKERS.is_empty()` over a shared four-element
-/// non-empty list, so it is `false` for all fifteen families and the arm is
-/// currently unreachable. It is left exactly as it is: it is the correct
-/// condition, and it becomes live when that shared list empties, which is a
-/// change to the list rather than to this function. Do not read it as a gate
-/// that is currently refusing anything.
+/// non-empty list, so it is `false` for all fifteen families and a `START`
+/// decision is always retained as a record today. The condition is left exactly
+/// as it is: it is correct, and it becomes live when that shared list empties,
+/// which is a change to the list rather than to this function.
 ///
 /// # Errors
 ///
@@ -563,10 +596,28 @@ pub async fn emit_blocked_automation_notification(
         return Ok(None);
     }
     let family_decision = family_entry.decide(decision);
-    if decision.admits_job && family_decision.admits_start {
+    // Route by the owner's own action. The duplicate arm is the one decision
+    // that must never create a record; the start arm defers to the Durable Job
+    // admission owner once its route admits the start. Every other arm owes
+    // exactly one retained record and falls through to the commit below.
+    let dispatch = MaintenanceDispatch::for_decision(decision, &family_decision);
+    let retained_record_owed = match &dispatch {
+        MaintenanceDispatch::ExistingDurableJob { .. } => false,
+        MaintenanceDispatch::StartDurableJob { .. } => !family_decision.admits_start,
+        MaintenanceDispatch::SuggestBoardItem { .. }
+        | MaintenanceDispatch::Defer { .. }
+        | MaintenanceDispatch::Block { .. }
+        | MaintenanceDispatch::Escalate { .. } => true,
+    };
+    if !retained_record_owed {
         return Ok(None);
     }
-    let key = automation_failure_key_with_family_decision(decision, &family_decision, evidence)?;
+    let key = automation_failure_key_with_family_decision(
+        decision,
+        &family_decision,
+        &dispatch,
+        evidence,
+    )?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     if notification_already_recorded(&reads, &key, &state_fence).await? {
         return Ok(None);

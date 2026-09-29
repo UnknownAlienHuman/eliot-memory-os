@@ -272,8 +272,17 @@ impl DaemonComposition {
         // where its start would have to go, and the exact unavailable
         // dependency or absent Durable Job route that stops it today. A
         // triggered family is therefore never silently ignored, and no family
-        // is ever reported as having run.
-        entry.record_start_route(&decision);
+        // is ever reported as having run. The resolved value is returned so the
+        // routing half below reads the same one.
+        let family_decision = entry.record_start_route(&decision);
+        // The routing half of the same record (issue #1688): which existing
+        // owner the owner's own decision hands this trigger to, and the exact
+        // condition that reopens it. Both halves are resolved from the one
+        // family decision, so the emitted route and the emitted dispatch cannot
+        // describe different facts about one trigger. Neither half executes
+        // anything: they name the existing owners and the conditions.
+        crate::maintenance_dispatch::MaintenanceDispatch::for_decision(&decision, &family_decision)
+            .record(&decision);
         Ok((decision, notification_evidence))
     }
 

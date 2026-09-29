@@ -890,7 +890,15 @@ impl MaintenanceFamilyEntry {
     /// and the durable decision value cannot report different facts about the
     /// same trigger. The line itself is a rotating operational log; the decision
     /// value is what a later durable record carries.
-    pub fn record_start_route(&self, decision: &AutomationTriggerDecision) {
+    ///
+    /// The resolved value is returned rather than discarded, so a caller that
+    /// needs it for its own half of the same record (issue #1688's
+    /// [`crate::maintenance_dispatch`]) reads the one value this function
+    /// already built instead of resolving the family a second time.
+    pub fn record_start_route(
+        &self,
+        decision: &AutomationTriggerDecision,
+    ) -> MaintenanceFamilyDecision {
         let recorded = self.decide(decision);
         let route = recorded.route;
         let blockers = admission_blocker_text(recorded.admission_blockers);
@@ -924,6 +932,7 @@ impl MaintenanceFamilyEntry {
             scope = %crate::diagnostics::sanitize_identity(&recorded.scope_ref),
             recommendation = %recorded.recommendation.text(),
         );
+        recorded
     }
 }
 
