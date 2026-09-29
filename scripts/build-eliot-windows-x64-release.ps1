@@ -670,8 +670,12 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 }
 
 # Issue #1719 Claude Code front door (OSP1 step 1', owner decision
-# 2026-09-25): exactly one host moves off the legacy Governor MCP entry
-# behind an explicit flag; every other host stays on legacy. The operator
+# 2026-09-25): Claude Code moved off the legacy Governor MCP entry behind an
+# explicit flag. Issue #18 extended the same flagged delegation to Claude
+# Desktop and OpenCode (crates/eliot-app/src/main.rs::BRIDGE_DELEGATED_MCP_HOSTS),
+# so three hosts delegate to the approved Bridge when
+# ELIOT_CLAUDE_FRONT_DOOR=agent-bridge; Codex and every other host/profile
+# stay on legacy. The operator
 # launch flag is ELIOT_CLAUDE_FRONT_DOOR (absent/legacy = today's
 # `eliot-governor.exe mcp stdio --host claude --instance default`;
 # agent-bridge = the staged `eliot-agent-bridge.exe` with its
@@ -2992,8 +2996,8 @@ function Get-LegacyEntrypointDispositions {
             args = @('mcp', 'stdio', '--host', 'claude-desktop', '--instance', 'default')
             configured_environment = [ordered]@{}
             effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not in env)'
-            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio; do not delegate this host to the Bridge. With an absent or legacy selection, preserve the legacy MCP path.'
-            canonical_route = $null
+            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, emit the stderr REDIRECT receipt and delegate this Claude Desktop edge (default profile) to the Bridge; success exits with the child status, and resolution/launch failure emits structured ERROR. With an absent or legacy selection, preserve the legacy MCP path.'
+            canonical_route = 'Claude Desktop agent-bridge declaration and Kernel canonical configuration route.'
         },
         [ordered]@{
             entrypoint = 'OpenCode MCP stdio --host opencode'
@@ -3003,8 +3007,8 @@ function Get-LegacyEntrypointDispositions {
             command = @('{env:ELIOT_GOVERNOR_EXE}', 'mcp', 'stdio', '--host', 'opencode', '--instance', 'default')
             configured_environment = 'No MCP env member; command resolves the executable through ELIOT_GOVERNOR_EXE.'
             effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not declared)'
-            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio; do not delegate this host to the Bridge. With an absent or legacy selection, preserve the legacy MCP path.'
-            canonical_route = $null
+            behavior = 'With ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, emit the stderr REDIRECT receipt and delegate this OpenCode edge (default profile) to the Bridge; success exits with the child status, and resolution/launch failure emits structured ERROR. With an absent or legacy selection, preserve the legacy MCP path.'
+            canonical_route = 'OpenCode agent-bridge declaration and Kernel canonical configuration route.'
         },
         [ordered]@{
             entrypoint = 'Codex MCP stdio profile codex_controller'
@@ -3149,7 +3153,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'unsigned-build-evidence (retained explicitly by #1719 step 1-prime: Codex/OpenCode/Desktop plus the legacy-Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
             gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
-            entrypoint_disposition = 'retained-legacy-entrypoints; selected agent-bridge redirects only Claude MCP stdio, returns structured ERROR for other MCP stdio hosts and non-stdio arms; absent or legacy selection preserves legacy paths'
+            entrypoint_disposition = 'retained-legacy-entrypoints; selected agent-bridge redirects Claude, Claude Desktop and OpenCode MCP stdio (default profile) to the approved Bridge, returns structured ERROR for other MCP stdio hosts/profiles and non-stdio arms; absent or legacy selection preserves legacy paths'
             cutover_behavior = 'source-declared conditional behavior; source launch configs do not select ELIOT_CLAUDE_FRONT_DOOR, and effective inherited selection is NOT_OBSERVED'
             entrypoint_behaviors = @(Get-LegacyEntrypointDispositions)
         }
@@ -4713,7 +4717,7 @@ try {
                 )
             }
             source_declared_behavior = if ($legacyGovernorPresent) {
-                'source-derived from crates/eliot-app/src/main.rs::dispatch_command: ELIOT_CLAUDE_FRONT_DOOR=agent-bridge redirects only MCP stdio --host claude to the approved Bridge; other MCP stdio hosts return structured LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER ERROR before legacy mcp stdio. Selected non-stdio arms refuse before their handlers. An absent or legacy flag preserves legacy behavior. Source consumer configs do not select the flag; effective inherited selection is NOT_OBSERVED.'
+                'source-derived from crates/eliot-app/src/main.rs::dispatch_command: ELIOT_CLAUDE_FRONT_DOOR=agent-bridge redirects MCP stdio --host claude, claude-desktop and opencode at the default profile to the approved Bridge; any other host/profile returns structured LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER ERROR before legacy mcp stdio. Selected non-stdio arms refuse before their handlers. An absent or legacy flag preserves legacy behavior. Source consumer configs do not select the flag; effective inherited selection is NOT_OBSERVED.'
             }
             else {
                 'no legacy entrypoint exists on any host under the accepted owner receipt; stage with -ClaudeCodeFrontDoor agent-bridge to provision the new stack'

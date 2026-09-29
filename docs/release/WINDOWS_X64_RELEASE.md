@@ -21,7 +21,7 @@ Governor retirement is a **two-time, owner-authorized release transition**, not 
 **The two-time workflow.**
 
 ```text
-1. freeze candidate commit/tree C            (no approval exists yet)
+1. freeze candidate commit/tree C with New-GovernorRetirementCandidateFreeze (scripts/lib/governor-retirement-approval.ps1), which writes the detached freeze record (approval=null) to an absolute path outside C only after the independent consumer closure over C is COMPLETE (no approval exists yet)
 2. run the independent consumer closure over C
 3. the owner reviews and adopts that exact closure result
 4. the owner issues the detached approval R(C) OUTSIDE C
