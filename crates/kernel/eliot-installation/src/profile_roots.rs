@@ -447,6 +447,14 @@ impl InstallationRoots {
     ) -> Result<(), InstallationError> {
         self.validate(launch.profile)?;
         validate_profile_selection_receipt_shape(receipt, "binding")?;
+        Self::validate_profile_selection_binding(launch, receipt)?;
+        self.validate_profile_selection_root_observations(launch, receipt)
+    }
+
+    fn validate_profile_selection_binding(
+        launch: &RuntimeLaunchDescriptor,
+        receipt: &ProfileSelectionReceipt,
+    ) -> Result<(), InstallationError> {
         let expected_profile = match launch.profile {
             InstallationProfile::UserMode => ProfileSelection::UserMode,
             InstallationProfile::PortableDev => ProfileSelection::PortableDev,
@@ -483,7 +491,14 @@ impl InstallationRoots {
             &authority_descriptor_digest,
             "profile_selection_receipt.authority_descriptor_sha256",
         )?;
+        Ok(())
+    }
 
+    fn validate_profile_selection_root_observations(
+        &self,
+        launch: &RuntimeLaunchDescriptor,
+        receipt: &ProfileSelectionReceipt,
+    ) -> Result<(), InstallationError> {
         let runtime = &launch.runtime_state_roots;
         let expected_roots = [
             ("immutable_binaries", self.immutable_binaries.as_str()),
@@ -624,6 +639,46 @@ impl InstallationRoots {
         &self,
         profile: InstallationProfile,
     ) -> Result<(), InstallationError> {
+        match profile {
+            InstallationProfile::SystemService => self.validate_system_service_runtime_join(),
+            InstallationProfile::UserMode => self.validate_user_mode_runtime_join(),
+            InstallationProfile::PortableDev => self.validate_portable_dev_runtime_join(),
+        }
+    }
+
+    fn validate_system_service_runtime_join(&self) -> Result<(), InstallationError> {
+        let profile_root = self.runtime_state_roots.installer_profile_root()?;
+        let profile_root = WindowsPathIdentity::parse_root(
+            profile_root.as_str(),
+            "runtime_state_roots.profile_root",
+        )?;
+        let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
+        let installation = WindowsPathIdentity::parse_root(
+            self.runtime_state_roots.installation_root.as_str(),
+            "runtime_state_roots.installation_root",
+        )?;
+        let installation_is_below_durable =
+            installation != durable && durable.contains(&installation);
+        let expected_durable = WindowsPathIdentity::parse_root(
+            &joined_windows_path(
+                self.runtime_state_roots.profile_anchor_root.as_str(),
+                "Eliot",
+            ),
+            "durable_data",
+        )?;
+        if durable != expected_durable
+            || durable != profile_root
+            || !installation_is_below_durable
+        {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService durable data must equal its I3.1 root and contain the runtime installation root strictly"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_user_mode_runtime_join(&self) -> Result<(), InstallationError> {
         let profile_root = self.runtime_state_roots.installer_profile_root()?;
         let profile_root = WindowsPathIdentity::parse_root(
             profile_root.as_str(),
@@ -636,99 +691,88 @@ impl InstallationRoots {
         )?;
         let user_config = WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
         let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
-        let installation_is_below_durable =
-            installation != durable && durable.contains(&installation);
-        match profile {
-            InstallationProfile::SystemService => {
-                let expected_durable = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(
-                        self.runtime_state_roots.profile_anchor_root.as_str(),
-                        "Eliot",
-                    ),
-                    "durable_data",
-                )?;
-                if durable != expected_durable
-                    || durable != profile_root
-                    || !installation_is_below_durable
-                {
-                    return Err(InstallationError::ProfileViolation(
-                        "SystemService durable data must equal its I3.1 root and contain the runtime installation root strictly"
-                            .to_owned(),
-                    ));
-                }
-            }
-            InstallationProfile::UserMode => {
-                let user_root = joined_windows_path(
-                    self.runtime_state_roots.profile_anchor_root.as_str(),
-                    "Eliot",
-                );
-                let expected_data = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(&user_root, "data"),
-                    "durable_data",
-                )?;
-                let expected_config = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(&user_root, "config"),
-                    "user_config",
-                )?;
-                let expected_cache = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(&user_root, "cache"),
-                    "user_cache",
-                )?;
-                if durable != expected_data
-                    || durable != profile_root
-                    || user_config != expected_config
-                    || user_cache != expected_cache
-                    || !installation_is_below_durable
-                {
-                    return Err(InstallationError::ProfileViolation(
-                        "UserMode durable data must equal its I3.1 root, preserve the config/cache siblings, and contain the runtime installation root strictly"
-                            .to_owned(),
-                    ));
-                }
-            }
-            InstallationProfile::PortableDev => {
-                let anchor = WindowsPathIdentity::parse_root(
-                    self.runtime_state_roots.profile_anchor_root.as_str(),
-                    "runtime_state_roots.profile_anchor_root",
-                )?;
-                let expected_data = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(
-                        &joined_windows_path(
-                            self.runtime_state_roots.profile_anchor_root.as_str(),
-                            ".eliot-dev",
-                        ),
-                        "state",
-                    ),
-                    "durable_data",
-                )?;
-                let expected_config = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(
-                        self.runtime_state_roots.profile_anchor_root.as_str(),
-                        ".eliot-dev\\config",
-                    ),
-                    "user_config",
-                )?;
-                let expected_cache = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(
-                        self.runtime_state_roots.profile_anchor_root.as_str(),
-                        ".eliot-dev\\cache",
-                    ),
-                    "user_cache",
-                )?;
-                if durable != expected_data
-                    || durable != profile_root
-                    || installation != durable
-                    || user_config != expected_config
-                    || user_cache != expected_cache
-                    || !anchor.contains(&durable)
-                    || anchor == durable
-                {
-                    return Err(InstallationError::ProfileViolation(
-                        "PortableDev must retain its repository anchor, state installation root, and exact config/cache siblings"
-                            .to_owned(),
-                    ));
-                }
-            }
+        let user_root = joined_windows_path(
+            self.runtime_state_roots.profile_anchor_root.as_str(),
+            "Eliot",
+        );
+        let expected_data = WindowsPathIdentity::parse_root(
+            &joined_windows_path(&user_root, "data"),
+            "durable_data",
+        )?;
+        let expected_config = WindowsPathIdentity::parse_root(
+            &joined_windows_path(&user_root, "config"),
+            "user_config",
+        )?;
+        let expected_cache = WindowsPathIdentity::parse_root(
+            &joined_windows_path(&user_root, "cache"),
+            "user_cache",
+        )?;
+        if durable != expected_data
+            || durable != profile_root
+            || user_config != expected_config
+            || user_cache != expected_cache
+            || installation == durable
+            || !durable.contains(&installation)
+        {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode durable data must equal its I3.1 root, preserve the config/cache siblings, and contain the runtime installation root strictly"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_portable_dev_runtime_join(&self) -> Result<(), InstallationError> {
+        let profile_root = self.runtime_state_roots.installer_profile_root()?;
+        let profile_root = WindowsPathIdentity::parse_root(
+            profile_root.as_str(),
+            "runtime_state_roots.profile_root",
+        )?;
+        let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
+        let installation = WindowsPathIdentity::parse_root(
+            self.runtime_state_roots.installation_root.as_str(),
+            "runtime_state_roots.installation_root",
+        )?;
+        let user_config = WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
+        let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
+        let anchor = WindowsPathIdentity::parse_root(
+            self.runtime_state_roots.profile_anchor_root.as_str(),
+            "runtime_state_roots.profile_anchor_root",
+        )?;
+        let state_root = joined_windows_path(
+            &joined_windows_path(
+                self.runtime_state_roots.profile_anchor_root.as_str(),
+                ".eliot-dev",
+            ),
+            "state",
+        );
+        let expected_data = WindowsPathIdentity::parse_root(&state_root, "durable_data")?;
+        let expected_config = WindowsPathIdentity::parse_root(
+            &joined_windows_path(
+                self.runtime_state_roots.profile_anchor_root.as_str(),
+                ".eliot-dev\\config",
+            ),
+            "user_config",
+        )?;
+        let expected_cache = WindowsPathIdentity::parse_root(
+            &joined_windows_path(
+                self.runtime_state_roots.profile_anchor_root.as_str(),
+                ".eliot-dev\\cache",
+            ),
+            "user_cache",
+        )?;
+        if durable != expected_data
+            || durable != profile_root
+            || installation != durable
+            || user_config != expected_config
+            || user_cache != expected_cache
+            || !anchor.contains(&durable)
+            || anchor == durable
+        {
+            return Err(InstallationError::ProfileViolation(
+                "PortableDev must retain its repository anchor, state installation root, and exact config/cache siblings"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
