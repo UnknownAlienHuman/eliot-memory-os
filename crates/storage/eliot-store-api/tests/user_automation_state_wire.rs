@@ -116,6 +116,7 @@ fn create_and_edit_legs_validate_positive_and_negative() {
         "r-1".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json("auto-1", "r-1"),
+        None,
     );
     assert_eq!(
         params
@@ -146,6 +147,7 @@ fn create_and_edit_legs_validate_positive_and_negative() {
         "r-2".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json("auto-1", "r-2"),
+        None,
     );
     validate_automation_mutation_params(NamedMutationOperation::ApplyUserAutomationState, &edit)
         .unwrap();
@@ -210,6 +212,7 @@ fn create_and_edit_legs_validate_positive_and_negative() {
                 "r-1".to_owned(),
                 AUTOMATION_STATE_ACTIVE.to_owned(),
                 revision_json("auto-1", "r-1"),
+                None,
             )
         ),
         Err(StoreError::UnknownOperation)
@@ -311,6 +314,7 @@ fn state_transition_and_run_now_legs_validate() {
                 "r-2".to_owned(),
                 AUTOMATION_STATE_ACTIVE.to_owned(),
                 revision_json("auto-1", "r-2"),
+                None,
             )
         )
         .is_ok_and(|decoded| matches!(

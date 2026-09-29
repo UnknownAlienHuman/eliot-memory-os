@@ -758,7 +758,16 @@ static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [Parame
 /// each leg requires) is enforced by the automation-state contract; every
 /// name here is optional at the declaration level so one closed table
 /// serves all six legs.
-static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
+///
+/// `normalization_receipt_json` is the owner-issued schedule normalization
+/// envelope a create/edit leg retains beside its immutable revision. It is
+/// declared here rather than smuggled through as an undeclared name, and it is
+/// declared optional at this level for the same reason every other leg payload
+/// is: the closed table serves all six legs. Its shape (a JSON object) and its
+/// retention are enforced by the automation-state contract and the backends,
+/// and an occurrence whose revision retained no such envelope stays unadmitted
+/// by name downstream — absence is never a synthesized receipt.
+static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 10] = [
     ParameterDeclaration {
         name: "operation",
         shape: ParameterShape::Subject,
@@ -776,6 +785,11 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
     },
     ParameterDeclaration {
         name: "revision_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "normalization_receipt_json",
         shape: ParameterShape::Subject,
         required: false,
     },
@@ -1395,9 +1409,10 @@ pub const fn declared_read_parameters(
 /// enforced by the reactive-state contract);
 /// `ApplyUserAutomationState` declares the leg discriminator, the
 /// always-present `automation_id`, and the conditionally-required leg
-/// payloads (`revision`, `revision_json`, `previous_revision`,
-/// `configuration_state`, `occurrence_id`, `invocation_json`; leg
-/// completeness is enforced by the automation-state contract);
+/// payloads (`revision`, `revision_json`, `normalization_receipt_json`,
+/// `previous_revision`, `configuration_state`, `occurrence_id`,
+/// `invocation_json`; leg completeness is enforced by the
+/// automation-state contract);
 /// `CommitExperienceBank` and `CommitAgentFeedback` declare the six
 /// required commit fields (`record_json`, `record_digest`,
 /// `record_revision` as its decimal string, `scope_digest`,

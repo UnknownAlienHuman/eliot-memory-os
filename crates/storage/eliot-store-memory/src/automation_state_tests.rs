@@ -277,6 +277,7 @@ fn full_lifecycle_persists_lineage_with_pointer_cas() {
         "r-1".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json(&first),
+        None,
     ));
     apply(&store, "create-1", request.operation, request.parameters).expect("create commits");
     let payload = read(&store, "current", Some("auto-1"), false);
@@ -299,6 +300,7 @@ fn full_lifecycle_persists_lineage_with_pointer_cas() {
         "r-2".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json(&second),
+        None,
     ));
     apply(&store, "edit-1", request.operation, request.parameters).expect("edit commits");
     let payload = read(&store, "history", Some("auto-1"), false);
@@ -386,6 +388,7 @@ fn run_now_records_invocations_by_occurrence() {
         "r-1".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json(&first),
+        None,
     ));
     apply(&store, "create-1", request.operation, request.parameters).expect("create commits");
     let (occurrence_id, invocation) = invocation_for("auto-1", "r-1", "nonce-7");
@@ -444,6 +447,7 @@ fn lineage_and_key_conflicts_fail_closed() {
             "r-1".to_owned(),
             AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            None,
         ))
     };
     let request = create();
@@ -465,6 +469,7 @@ fn lineage_and_key_conflicts_fail_closed() {
             "r-2",
             UserAutomationConfigurationState::Active,
         )),
+        None,
     ));
     assert_eq!(
         apply(&store, "edit-stale", request.operation, request.parameters),
@@ -508,6 +513,7 @@ fn automation_operations_reject_a_foreign_transition_class() {
             "r-1".to_owned(),
             AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            None,
         ),
     );
     transition.transition_class = TransitionClass::CaptureCandidate;
@@ -569,6 +575,7 @@ fn failure_leg_records_converges_and_projects_last() {
         "r-1".to_owned(),
         AUTOMATION_STATE_ACTIVE.to_owned(),
         revision_json(&first),
+        None,
     ));
     apply(&store, "create-1", request.operation, request.parameters).expect("create commits");
     let request =

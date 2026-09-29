@@ -1044,10 +1044,16 @@ fn dispatch_apply_automation_state(
                 revision,
                 revision_json,
                 configuration_state,
+                normalization_receipt_json,
             } => {
+                let normalization_receipt_json =
+                    validate_automation_normalization_envelope(normalization_receipt_json)?;
                 let key = automation_revision_key(&automation_id, &revision);
                 match state.automation_revisions.get(&key) {
-                    Some(existing) if existing.revision_json != revision_json => {
+                    Some(existing)
+                        if existing.revision_json != revision_json
+                            || existing.normalization_receipt_json != normalization_receipt_json =>
+                    {
                         return Err(StoreError::IdentityConflict);
                     }
                     Some(_) => {}
@@ -1058,6 +1064,7 @@ fn dispatch_apply_automation_state(
                                 automation_id: automation_id.clone(),
                                 revision: revision.clone(),
                                 revision_json: revision_json.clone(),
+                                normalization_receipt_json,
                                 state_fence: transition.state_fence.clone(),
                                 scope_id: transition.scope_id.to_string(),
                                 task_id: transition.task_id.clone(),
@@ -1088,7 +1095,10 @@ fn dispatch_apply_automation_state(
                 revision,
                 revision_json,
                 configuration_state,
+                normalization_receipt_json,
             } => {
+                let normalization_receipt_json =
+                    validate_automation_normalization_envelope(normalization_receipt_json)?;
                 let current = state.automation_currents.get(&automation_id).ok_or(
                     StoreError::InvalidField {
                         field: "automation.automation_id",
@@ -1103,7 +1113,10 @@ fn dispatch_apply_automation_state(
                 }
                 let key = automation_revision_key(&automation_id, &revision);
                 match state.automation_revisions.get(&key) {
-                    Some(existing) if existing.revision_json != revision_json => {
+                    Some(existing)
+                        if existing.revision_json != revision_json
+                            || existing.normalization_receipt_json != normalization_receipt_json =>
+                    {
                         return Err(StoreError::IdentityConflict);
                     }
                     Some(_) => {}
@@ -1114,6 +1127,7 @@ fn dispatch_apply_automation_state(
                                 automation_id: automation_id.clone(),
                                 revision: revision.clone(),
                                 revision_json: revision_json.clone(),
+                                normalization_receipt_json,
                                 state_fence: transition.state_fence.clone(),
                                 scope_id: transition.scope_id.to_string(),
                                 task_id: transition.task_id.clone(),
@@ -2612,6 +2626,7 @@ fn automation_history_payload(
                 "automation_id": row.automation_id,
                 "revision": row.revision,
                 "revision_json": row.revision_json,
+                "normalization_receipt_json": row.normalization_receipt_json,
             }));
         }
     } else {
@@ -2647,6 +2662,7 @@ fn automation_history_payload(
                     "automation_id": row.automation_id,
                     "revision": row.revision,
                     "revision_json": row.revision_json,
+                    "normalization_receipt_json": row.normalization_receipt_json,
                 })
             })
             .collect();
@@ -5064,14 +5080,45 @@ struct CapabilityEvidenceRow {
     scope_id: String,
 }
 
+/// Validates the owner-issued schedule normalization envelope a revision leg
+/// carried and returns the ORIGINAL canonical bytes for retention.
+///
+/// This is the same edge the notification upsert leg applies to
+/// `source_receipt_json` (`apply_notification_leg`): the envelope is decoded
+/// with the shared `ReceiptEnvelope` type and checked with its own
+/// `validate()`, and what is persisted is the bytes the owning leg submitted —
+/// never a re-derivation, a re-issue, or a digest. Absent stays absent: a
+/// revision leg that carried no envelope retains none, so its occurrences stay
+/// unadmitted by name downstream instead of passing on a self-asserted digest.
+fn validate_automation_normalization_envelope(
+    envelope: Option<Value>,
+) -> Result<Option<Value>, StoreError> {
+    let Some(envelope) = envelope else {
+        return Ok(None);
+    };
+    let decoded: eliot_store_api::ReceiptEnvelope = serde_json::from_value(envelope.clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    decoded.validate().map_err(|_| StoreError::InvalidReceipt)?;
+    Ok(Some(envelope))
+}
+
 /// One immutable automation revision row: the verbatim Kernel-owned
 /// revision document for one automation + revision with its admission
 /// fence and task-binding provenance (issue #1779).
+///
+/// The row also retains the owner-issued schedule normalization envelope the
+/// revision leg carried, exactly as the notification record retains its
+/// `source_receipt`: the backend decodes it with the shared
+/// `ReceiptEnvelope::validate()` and keeps the ORIGINAL canonical bytes on the
+/// immutable row, so a later owner read hands preflight a real content-derived
+/// envelope instead of a digest. It is never recomputed here, and the row is
+/// create-only, so a revision and its envelope are written exactly once.
 #[derive(Clone, Debug, PartialEq)]
 struct AutomationRevisionRow {
     automation_id: String,
     revision: String,
     revision_json: String,
+    normalization_receipt_json: Option<Value>,
     state_fence: StateFence,
     scope_id: String,
     task_id: Option<String>,

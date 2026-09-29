@@ -477,6 +477,7 @@ async fn lifecycle_persists_lineage_with_pointer_cas() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            None,
         ));
     let receipt = apply(adapter, "create-1", request.parameters)
         .await
@@ -504,6 +505,7 @@ async fn lifecycle_persists_lineage_with_pointer_cas() {
             "r-2".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&second),
+            None,
         ));
     apply(adapter, "edit-1", request.parameters)
         .await
@@ -613,6 +615,7 @@ async fn run_now_records_invocations_by_occurrence() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            None,
         ));
     apply(adapter, "create-1", request.parameters)
         .await
@@ -681,6 +684,7 @@ async fn lineage_and_key_conflicts_fail_closed() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            None,
         ))
         .parameters
     };
@@ -705,6 +709,7 @@ async fn lineage_and_key_conflicts_fail_closed() {
                 "r-2",
                 UserAutomationConfigurationState::Active,
             )),
+            None,
         ));
     assert_eq!(
         apply(adapter, "edit-stale", request.parameters)
@@ -771,6 +776,7 @@ async fn failure_leg_records_converges_and_projects_last() {
             "r-1".to_owned(),
             eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
             revision_json(&first),
+            None,
         ));
     apply(adapter, "create-1", request.parameters)
         .await

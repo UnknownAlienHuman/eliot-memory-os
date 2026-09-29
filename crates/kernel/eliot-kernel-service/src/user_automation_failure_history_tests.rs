@@ -418,6 +418,7 @@ async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: 
         revision_id.to_owned(),
         eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
         document,
+        None,
     );
     let context = metadata();
     let manifest_digest =

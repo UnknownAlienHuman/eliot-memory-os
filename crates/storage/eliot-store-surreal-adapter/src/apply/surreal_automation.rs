@@ -32,8 +32,8 @@ use eliot_store_api::{
     AutomationContinuationBinding, AutomationContinuationDirection, AutomationContinuationFailure,
     AutomationContinuationOrder, AutomationContinuationOrderKey, AutomationContinuationQuery,
     AutomationContinuationReadBinding, AutomationContinuationRef, DecodedAutomationMutation,
-    NamedMutationOperation, NamedReadOperation, StateFence, StoreError, TransitionClass,
-    decode_automation_mutation, verify_automation_continuation,
+    NamedMutationOperation, NamedReadOperation, ReceiptEnvelope, StateFence, StoreError,
+    TransitionClass, decode_automation_mutation, verify_automation_continuation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -59,6 +59,9 @@ pub(crate) struct AutomationRevisionWrite {
     pub revision: String,
     /// Verbatim canonical revision document.
     pub revision_json: String,
+    /// Owner-issued schedule normalization envelope retained beside the
+    /// revision, as the ORIGINAL canonical bytes the owning leg submitted.
+    pub normalization_receipt_json: Option<Value>,
     /// Admission fence of the transition.
     pub state_fence: StateFence,
     /// Scope provenance from the transition envelope.
@@ -162,6 +165,8 @@ pub(crate) struct StoredAutomationRevision {
     pub revision: String,
     /// Verbatim canonical revision document.
     pub revision_json: String,
+    /// Owner-issued schedule normalization envelope retained on the row.
+    pub normalization_receipt_json: Option<Value>,
     /// Admission fence.
     pub state_fence: StateFence,
 }
@@ -1316,6 +1321,30 @@ struct PrepareContext<'a> {
     transition: &'a eliot_store_api::PreparedTransition,
 }
 
+/// Validates the owner-issued schedule normalization envelope a revision leg
+/// carried and returns the ORIGINAL canonical bytes for retention.
+///
+/// This is the same edge the notification upsert leg applies to
+/// `source_receipt_json`: the envelope is decoded with the shared
+/// `ReceiptEnvelope` type and checked with its own `validate()`, and what is
+/// persisted is the bytes the owning leg submitted — never a re-derivation, a
+/// re-issue, or a digest. Absent stays absent, so a revision that retained no
+/// envelope leaves its occurrences unadmitted by name downstream.
+fn validate_automation_normalization_envelope(
+    envelope: Option<Value>,
+) -> Result<Option<Value>, AdapterError> {
+    let Some(envelope) = envelope else {
+        return Ok(None);
+    };
+    let decoded: ReceiptEnvelope = serde_json::from_value(envelope.clone()).map_err(|error| {
+        AdapterError::Store(StoreError::Serialization(error.to_string()))
+    })?;
+    decoded
+        .validate()
+        .map_err(|_| AdapterError::Store(StoreError::InvalidReceipt))?;
+    Ok(Some(envelope))
+}
+
 impl PrepareContext<'_> {
     /// Computes one decoded leg into row writes.
     async fn apply_leg(
@@ -1329,6 +1358,7 @@ impl PrepareContext<'_> {
                 revision,
                 revision_json,
                 configuration_state,
+                normalization_receipt_json,
             } => {
                 self.apply_create(
                     writes,
@@ -1336,6 +1366,7 @@ impl PrepareContext<'_> {
                     revision,
                     revision_json,
                     configuration_state,
+                    normalization_receipt_json,
                 )
                 .await
             }
@@ -1345,6 +1376,7 @@ impl PrepareContext<'_> {
                 revision,
                 revision_json,
                 configuration_state,
+                normalization_receipt_json,
             } => {
                 self.apply_edit(
                     writes,
@@ -1353,6 +1385,7 @@ impl PrepareContext<'_> {
                     revision,
                     revision_json,
                     configuration_state,
+                    normalization_receipt_json,
                 )
                 .await
             }
@@ -1417,7 +1450,10 @@ impl PrepareContext<'_> {
         revision: String,
         revision_json: String,
         configuration_state: String,
+        normalization_receipt_json: Option<Value>,
     ) -> Result<(), AdapterError> {
+        let normalization_receipt_json =
+            validate_automation_normalization_envelope(normalization_receipt_json)?;
         require_absent_revision(self.db, self.config, &automation_id, &revision).await?;
         require_absent_current(self.db, self.config, &automation_id).await?;
         let (state_fence, scope_id, task_id) = self.provenance();
@@ -1425,6 +1461,7 @@ impl PrepareContext<'_> {
             automation_id: automation_id.clone(),
             revision: revision.clone(),
             revision_json,
+            normalization_receipt_json,
             state_fence: state_fence.clone(),
             scope_id: scope_id.clone(),
             task_id: task_id.clone(),
@@ -1450,7 +1487,10 @@ impl PrepareContext<'_> {
         revision: String,
         revision_json: String,
         configuration_state: String,
+        normalization_receipt_json: Option<Value>,
     ) -> Result<(), AdapterError> {
+        let normalization_receipt_json =
+            validate_automation_normalization_envelope(normalization_receipt_json)?;
         let current =
             require_current_revision(self.db, self.config, &automation_id, &previous_revision)
                 .await?;
@@ -1463,6 +1503,7 @@ impl PrepareContext<'_> {
             automation_id: automation_id.clone(),
             revision: revision.clone(),
             revision_json,
+            normalization_receipt_json,
             state_fence: state_fence.clone(),
             scope_id: scope_id.clone(),
             task_id: task_id.clone(),
@@ -1844,8 +1885,25 @@ fn decode_revision_row(value: &Value) -> Result<StoredAutomationRevision, Adapte
         automation_id: text_row_field(object, "automation_id")?,
         revision: text_row_field(object, "revision")?,
         revision_json: text_row_field(object, "revision_json")?,
+        normalization_receipt_json: envelope_row_field(object),
         state_fence: fence_row_field(object)?,
     })
+}
+
+/// Reads the retained owner normalization envelope column, if the row carries
+/// one.
+///
+/// A row written before the envelope was retained has no such column and reads
+/// as absent, which is `unknown`, never an empty or synthesized envelope: the
+/// caller reports the missing owner rather than substituting a receipt. A
+/// present column is passed through verbatim — its integrity is decided once, by
+/// the consumer's own `ReceiptEnvelope::validate()`, so a malformed stored
+/// envelope fails closed there instead of being silently downgraded to absent
+/// here.
+fn envelope_row_field(object: &serde_json::Map<String, Value>) -> Option<Value> {
+    object
+        .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+        .cloned()
 }
 
 fn decode_current_row(value: &Value) -> Result<StoredAutomationCurrent, AdapterError> {
@@ -1961,6 +2019,7 @@ fn append_revision_statement(
             "automation_id": write.automation_id,
             "revision": write.revision,
             "revision_json": write.revision_json,
+            "normalization_receipt_json": write.normalization_receipt_json,
             "state_fence": write.state_fence,
             "scope_id": write.scope_id,
             "task_id": write.task_id,
