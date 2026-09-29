@@ -12,7 +12,7 @@ use eliot_process::{ExitDisposition, ExitStatus, ProcessEvidence, ProcessExecuti
 use eliot_process_executor::CapturedStream;
 use sha2::{Digest, Sha256};
 
-use crate::execution::ProviderOutcome;
+use crate::execution::{CancellationOutcome, EvidenceObservation, Obligation, ProviderOutcome};
 
 /// Length of a lowercase SHA-256 hex digest.
 pub const SHA256_HEX_LEN: usize = 64;
@@ -38,10 +38,12 @@ pub enum StreamOmission {
 /// Immutable record of one captured provider stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamRecord {
-    /// SHA-256 of the retained prefix bytes.
-    pub sha256: String,
-    /// Total bytes drained, including bytes not retained.
-    pub total_bytes: u64,
+    /// SHA-256 of the retained prefix bytes, absent when no stream handle was
+    /// observed. An observed empty stream has `Some(SHA256(empty))`.
+    pub sha256: Option<String>,
+    /// Total bytes drained, including bytes not retained, absent when no
+    /// stream handle was observed. An observed empty stream has `Some(0)`.
+    pub total_bytes: Option<u64>,
     /// Whether the retained prefix is the complete stream.
     pub complete: bool,
     /// Omission disposition when the stream is not complete evidence.
@@ -64,22 +66,22 @@ impl StreamRecord {
             None
         };
         Self {
-            sha256: sha256_hex(&stream.bytes),
-            total_bytes: stream.total_bytes,
+            sha256: stream.captured.then(|| sha256_hex(&stream.bytes)),
+            total_bytes: stream.captured.then_some(stream.total_bytes),
             complete: omission.is_none(),
             omission,
         }
     }
 
     /// Builds the explicit no-handle record for a stream that was never
-    /// captured. The digest is the digest of zero bytes, which is exact and
-    /// distinguishable from a captured empty stream only by the omission
-    /// disposition.
+    /// captured. No digest or byte count is assigned: those values describe
+    /// observed bytes and must not make missing evidence look like an empty
+    /// stream.
     #[must_use]
     pub fn absent() -> Self {
         Self {
-            sha256: sha256_hex(&[]),
-            total_bytes: 0,
+            sha256: None,
+            total_bytes: None,
             complete: false,
             omission: Some(StreamOmission::NoHandle),
         }
@@ -377,6 +379,18 @@ pub struct ProviderExecutionReceipt {
     /// Typed terminal provider outcome, or the typed failure that ended the
     /// attempt when execution did not complete.
     pub outcome: ProviderOutcome,
+    /// Physical process disposition observed independently of protocol and
+    /// evidence classification, when the executor supplied one.
+    pub observed_disposition: Option<ProviderOutcome>,
+    /// Whether stream readback was not attempted, attempted without an
+    /// observation, or observed. The raw stream records carry per-stream
+    /// empty/partial/complete details when readback answered.
+    pub stream_readback: EvidenceObservation,
+    /// Whether cancellation was not attempted, answered with a receipt, or
+    /// attempted without an answer.
+    pub cancellation_outcome: CancellationOutcome,
+    /// Bounded secondary obligations left unresolved by the primary cause.
+    pub undischarged: Vec<Obligation>,
     /// Exact I7.20 reason code for this terminal disposition.
     pub reason_code: &'static str,
     /// Immutable raw provider evidence (stdout/stderr/exit/lineage digests).
@@ -404,15 +418,22 @@ impl std::fmt::Display for ProviderExecutionReceipt {
     /// projection, and `candidate_only=true` is printed explicitly so a reader
     /// cannot mistake the line for an admitted result.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cancellation_unconfirmed =
+            matches!(&self.cancellation_outcome, CancellationOutcome::Unresolved)
+                || self
+                    .reconciliation
+                    .leaves_cancellation_unconfirmed(self.cancellation.as_ref());
         write!(
             formatter,
             "operation={} exchange={} cancellation={} dispatch={} admission_receipt={} \
              executable={} module_generation={} process_generation={} disclosure={} \
              budget_units={} deadline_ms={} inquiry={} denominator={} \
-             submit_envelope={} submit_binding={} outcome={:?} reason={} \
+             submit_envelope={} submit_binding={} outcome={:?} \
+             process_disposition={:?} stream_readback={} \
+             cancel_state={} undischarged={} reason={} \
              stdout_sha256={} stdout_bytes={} stdout_omission={} stderr_sha256={} \
              stderr_bytes={} stderr_omission={} exit={:?} exit_code={} \
-             descendants_complete={} cancelled={} cancel_status={} \
+             descendants_complete={} cancel_receipt_present={} cancel_status={} \
              no_effect_proven={} reconciliation_attempts={} \
              owner_confirmed={} cancellation_unconfirmed={} reconciliation={} \
              evidence_records={} provider_job_ref={} \
@@ -433,12 +454,16 @@ impl std::fmt::Display for ProviderExecutionReceipt {
             self.submit_envelope_sha256,
             self.submit_binding_sha256,
             self.outcome,
+            self.observed_disposition,
+            evidence_observation_name(&self.stream_readback),
+            cancellation_outcome_name(&self.cancellation_outcome),
+            obligation_names(&self.undischarged),
             self.reason_code,
-            self.raw.stdout.sha256,
-            self.raw.stdout.total_bytes,
+            self.raw.stdout.sha256.as_deref().unwrap_or("none"),
+            optional_byte_count(self.raw.stdout.total_bytes),
             omission_name(self.raw.stdout.omission),
-            self.raw.stderr.sha256,
-            self.raw.stderr.total_bytes,
+            self.raw.stderr.sha256.as_deref().unwrap_or("none"),
+            optional_byte_count(self.raw.stderr.total_bytes),
             omission_name(self.raw.stderr.omission),
             self.raw.exit_disposition,
             self.raw
@@ -454,8 +479,7 @@ impl std::fmt::Display for ProviderExecutionReceipt {
                 .is_some_and(|receipt| receipt.no_effect_proven),
             self.reconciliation.attempts.len(),
             self.reconciliation.owner_confirmed(),
-            self.reconciliation
-                .leaves_cancellation_unconfirmed(self.cancellation.as_ref()),
+            cancellation_unconfirmed,
             self.reconciliation.summary(),
             self.evidence_records.len(),
             self.provider_job_ref.as_deref().unwrap_or("none"),
@@ -463,6 +487,37 @@ impl std::fmt::Display for ProviderExecutionReceipt {
             self.candidate_only,
         )
     }
+}
+
+fn evidence_observation_name(observation: &EvidenceObservation) -> &'static str {
+    match observation {
+        EvidenceObservation::NotAttempted => "not_attempted",
+        EvidenceObservation::Unobserved => "unobserved",
+        EvidenceObservation::Observed(_) => "observed",
+    }
+}
+
+fn cancellation_outcome_name(outcome: &CancellationOutcome) -> &'static str {
+    match outcome {
+        CancellationOutcome::NotAttempted => "not_attempted",
+        CancellationOutcome::Confirmed(_) => "confirmed",
+        CancellationOutcome::Unresolved => "unresolved",
+    }
+}
+
+fn obligation_names(obligations: &[Obligation]) -> String {
+    obligations
+        .iter()
+        .map(|obligation| match obligation {
+            Obligation::Cancellation => "cancellation",
+            Obligation::StreamReadback => "stream_readback",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn optional_byte_count(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "none".to_owned(), |count| count.to_string())
 }
 
 /// Returns the stable wire name of one omission disposition.
@@ -726,8 +781,8 @@ mod tests {
     #[test]
     fn complete_streams_record_exact_digests_without_omission() {
         let record = StreamRecord::capture(&full_stream(b"raw stdout bytes"));
-        assert_eq!(record.sha256, sha256_hex(b"raw stdout bytes"));
-        assert_eq!(record.total_bytes, 16);
+        assert_eq!(record.sha256, Some(sha256_hex(b"raw stdout bytes")));
+        assert_eq!(record.total_bytes, Some(16));
         assert!(record.complete);
         assert_eq!(record.omission, None);
     }
@@ -753,7 +808,7 @@ mod tests {
         });
         assert_eq!(partial.omission, Some(StreamOmission::IncompleteCapture));
         // The retained prefix digest is still exact custody of what exists.
-        assert_eq!(partial.sha256, sha256_hex(b"prefix"));
+        assert_eq!(partial.sha256, Some(sha256_hex(b"prefix")));
 
         let truncated = StreamRecord::capture(&CapturedStream {
             bytes: b"prefix".to_vec(),
@@ -763,7 +818,7 @@ mod tests {
             captured: true,
         });
         assert_eq!(truncated.omission, Some(StreamOmission::TruncatedAtCeiling));
-        assert_eq!(truncated.total_bytes, 600_000);
+        assert_eq!(truncated.total_bytes, Some(600_000));
     }
 
     #[test]
@@ -780,9 +835,9 @@ mod tests {
         // The diagnostic stream survives the crash: digest plus byte count.
         assert_eq!(
             evidence.stderr.sha256,
-            sha256_hex(b"provider diagnostic: route denied")
+            Some(sha256_hex(b"provider diagnostic: route denied"))
         );
-        assert_eq!(evidence.stderr.total_bytes, 33);
+        assert_eq!(evidence.stderr.total_bytes, Some(33));
         assert_eq!(evidence.stderr.omission, None);
         assert_eq!(evidence.exit_disposition, ExitDisposition::Signalled);
         // A signalled exit has no meaningful numeric code: none is fabricated.

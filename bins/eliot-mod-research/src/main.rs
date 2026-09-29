@@ -33,9 +33,9 @@ use eliot_mod_research::evidence::{
 use eliot_mod_research::execution::ProviderBridge;
 use eliot_mod_research::kernel_client::{ResearchKernelClient, ResearchKernelClientError};
 use eliot_mod_research::{
-    AcquisitionCoverageDegradation, BridgeIdentity, EvidenceObservation, Obligation,
-    RESEARCH_SOURCE_UNAVAILABLE, RawProviderEvidence, ResearchDispatchAuthority, SubmissionRecord,
-    acquisition_coverage_degradation, compose_admitted, project_admitted_inquiry,
+    AcquisitionCoverageDegradation, BridgeIdentity, CancellationOutcome, EvidenceObservation,
+    Obligation, RESEARCH_SOURCE_UNAVAILABLE, RawProviderEvidence, ResearchDispatchAuthority,
+    SubmissionRecord, acquisition_coverage_degradation, compose_admitted, project_admitted_inquiry,
 };
 
 /// Stable code prefixed to the bounded report of follow-up obligations the
@@ -207,6 +207,10 @@ fn run() -> Result<String, Failure> {
             reconcile_with_owner(&client, &admitted, cancellation, outcome)
         };
         let reason_code = terminal_reason_code(outcome, &reconciliation, cancellation);
+        let cancellation_outcome = cancellation
+            .map_or(CancellationOutcome::NotAttempted, |receipt| {
+                CancellationOutcome::Confirmed(Box::new(receipt.clone()))
+            });
         // The retained terminal classification is absent on this path because
         // `execute` left no `BridgeError` behind; the crate's own typed
         // conversion still produces both the reason code the receipt carries
@@ -231,10 +235,13 @@ fn run() -> Result<String, Failure> {
             raw.as_ref(),
             &observation,
             cancellation.cloned(),
+            cancellation_outcome,
+            Vec::new(),
             bridge.last_submission(),
             bridge.last_provider_job_ref().cloned(),
             Some(job.job_id),
             outcome,
+            bridge.last_observed_disposition(),
             reason_code,
             records,
             reconciliation,
@@ -303,6 +310,10 @@ fn report_failed_operation(
     let observation = failure.map_or(EvidenceObservation::NotAttempted, |terminal| {
         terminal.evidence_observation.clone()
     });
+    let cancellation_outcome = failure.map_or(CancellationOutcome::NotAttempted, |terminal| {
+        terminal.cancellation_outcome.clone()
+    });
+    let undischarged = failure.map_or_else(Vec::new, |terminal| terminal.undischarged.clone());
     let receipt = terminal_receipt(
         admitted,
         client_receipt,
@@ -310,10 +321,13 @@ fn report_failed_operation(
         bridge.last_evidence(),
         &observation,
         bridge.last_cancellation().cloned(),
+        cancellation_outcome,
+        undischarged,
         bridge.last_submission(),
         bridge.last_provider_job_ref().cloned(),
         None,
         outcome,
+        bridge.last_observed_disposition(),
         reason_code,
         records,
         reconciliation,
@@ -352,7 +366,15 @@ fn report_bounded_gaps(
         .map(obligation_name)
         .collect::<Vec<_>>()
         .join(",");
-    if failure.undischarged.is_empty() && !failure.cancellation_attempted {
+    let cancellation_attempted = !matches!(
+        &failure.cancellation_outcome,
+        CancellationOutcome::NotAttempted
+    );
+    let cancellation_confirmed = matches!(
+        &failure.cancellation_outcome,
+        CancellationOutcome::Confirmed(_)
+    );
+    if failure.undischarged.is_empty() && !cancellation_attempted {
         return;
     }
     let _ = writeln!(
@@ -362,8 +384,8 @@ fn report_bounded_gaps(
         UNDISCHARGED_OBLIGATIONS,
         operation_id.unwrap_or("none"),
         failure.reason_code,
-        failure.cancellation_attempted,
-        failure.cancellation.is_some(),
+        cancellation_attempted,
+        cancellation_confirmed,
         if obligations.is_empty() {
             "none"
         } else {
@@ -626,10 +648,13 @@ fn terminal_receipt(
     raw: Option<&RawProviderEvidence>,
     observation: &EvidenceObservation,
     cancellation: Option<CancellationEvidence>,
+    cancellation_outcome: CancellationOutcome,
+    undischarged: Vec<Obligation>,
     submission: Option<&SubmissionRecord>,
     provider_job_ref: Option<String>,
     job_id: Option<String>,
     outcome: eliot_mod_research::ProviderOutcome,
+    observed_disposition: Option<eliot_mod_research::ProviderOutcome>,
     reason_code: &'static str,
     records: Vec<eliot_mod_research::ProviderEvidenceRecord>,
     reconciliation: ReconciliationEvidence,
@@ -670,6 +695,10 @@ fn terminal_receipt(
             .as_ref()
             .map_or_else(String::new, |record| record.submit_binding_sha256.clone()),
         outcome,
+        observed_disposition,
+        stream_readback: observation.clone(),
+        cancellation_outcome,
+        undischarged,
         reason_code,
         raw,
         cancellation,
