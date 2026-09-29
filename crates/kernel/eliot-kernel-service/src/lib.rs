@@ -36,6 +36,7 @@ mod lifecycle_persist;
 #[cfg(test)]
 mod lifecycle_persist_tests;
 mod maintenance_trigger_delivery;
+mod maintenance_trigger_startup;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
@@ -126,6 +127,10 @@ pub use maintenance_trigger_delivery::{
     handle_maintenance_trigger_release_expired, handle_maintenance_trigger_replacement_pending_set,
     handle_maintenance_trigger_revocation, handle_maintenance_trigger_supersession,
     recover_maintenance_trigger_commit, replay_maintenance_trigger_after_crash,
+};
+pub use maintenance_trigger_startup::{
+    LostMaintenanceConsumer, ReplacementMaintenanceStartup, note_maintenance_daemon_loss,
+    protected_route_pending_set, replacement_startup_pending_set,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
