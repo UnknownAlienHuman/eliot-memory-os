@@ -1782,7 +1782,7 @@ struct BridgeEventRecoveryWindowRow {
 
 impl BridgeEventRecoveryWindowRow {
     fn validate(&self) -> Result<(), OrsError> {
-        if !matches!(self.version, 1 | 2 | 3) {
+        if !matches!(self.version, 1..=3) {
             return Err(OrsError::InvalidField {
                 field: "recovery_window.version",
                 reason: "recovery window row carries a supported version",
@@ -1906,7 +1906,6 @@ impl BridgeEventRecoveryWindowRow {
 
     fn current_live_generation(&self) -> Option<u64> {
         match self.version {
-            1 => None,
             2 => Some(self.live_generation),
             3 => self.current_live_generation,
             _ => None,
@@ -1915,7 +1914,6 @@ impl BridgeEventRecoveryWindowRow {
 
     fn current_presenting_connection(&self) -> Option<&str> {
         match self.version {
-            1 => None,
             2 => Some(&self.presenting_connection),
             3 => self.current_presenting_connection.as_deref(),
             _ => None,
@@ -10921,7 +10919,7 @@ impl RedbRecoveryStore {
         window: &BridgeEventRecoveryWindowRow,
         now_ms: u64,
     ) -> Result<(), OrsError> {
-        if !matches!(window.version, 1 | 2 | 3) {
+        if !matches!(window.version, 1..=3) {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         Self::retain_bridge_recovery_expiry_evidence_in(
@@ -16827,33 +16825,8 @@ impl RedbRecoveryStore {
                 }
                 (matches.remove(0), false)
             }
-            BridgeRecoveryScopeSelector::ResumeWindow { window_key } => {
-                let Some(window) =
-                    Self::load_bridge_recovery_window_in(&write, window_key, &lineage, &principal)?
-                else {
-                    if let Some(evidence) = Self::bridge_recovery_expiry_evidence_for_owner_in(
-                        &write,
-                        &lineage,
-                        &principal,
-                        Some(window_key),
-                        now_ms,
-                    )? {
-                        drop(write);
-                        return Self::bridge_recovery_typed_reply(
-                            &evidence.window,
-                            evidence.disposition,
-                            recovery_scope,
-                            &selected_scope,
-                            None,
-                            &[],
-                            &[],
-                        );
-                    }
-                    return Err(OrsError::RecoveryOwnerMismatch);
-                };
-                (window, false)
-            }
-            BridgeRecoveryScopeSelector::Streams { window_key, .. }
+            BridgeRecoveryScopeSelector::ResumeWindow { window_key }
+            | BridgeRecoveryScopeSelector::Streams { window_key, .. }
             | BridgeRecoveryScopeSelector::Stream { window_key, .. }
             | BridgeRecoveryScopeSelector::UnscopedGaps { window_key, .. } => {
                 let Some(window) =
