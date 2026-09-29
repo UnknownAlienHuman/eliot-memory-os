@@ -120,7 +120,9 @@ pub enum CellRegistryError {
         cell: String,
     },
     /// Manifest and contract name different owners for one cell.
-    #[error("capability-cell owner mismatch for {cell}: manifest {manifest_owner}, contract {contract_owner}")]
+    #[error(
+        "capability-cell owner mismatch for {cell}: manifest {manifest_owner}, contract {contract_owner}"
+    )]
     ContractOwnerMismatch {
         /// Cell id whose owners disagree.
         cell: String,
@@ -130,7 +132,9 @@ pub enum CellRegistryError {
         contract_owner: String,
     },
     /// The compiled table disagrees with the baked manifest.
-    #[error("compiled registry drift for {cell}: table {compiled_owner}, manifest {manifest_owner}")]
+    #[error(
+        "compiled registry drift for {cell}: table {compiled_owner}, manifest {manifest_owner}"
+    )]
     CompiledTableDrift {
         /// Cell id whose records disagree.
         cell: String,
@@ -220,13 +224,11 @@ fn enforce_compiled_table(manifest: &[ManifestCell]) -> Result<(), CellRegistryE
         }
     }
     if DECLARED_CELLS.len() != manifest.len() {
-        let extra = DECLARED_CELLS
-            .iter()
-            .find(|compiled| {
-                !manifest
-                    .iter()
-                    .any(|declared| declared.cell == compiled.cell)
-            });
+        let extra = DECLARED_CELLS.iter().find(|compiled| {
+            !manifest
+                .iter()
+                .any(|declared| declared.cell == compiled.cell)
+        });
         let cell = extra.map_or("<unknown>", |compiled| compiled.cell);
         return Err(CellRegistryError::CompiledTableDrift {
             cell: cell.to_owned(),
@@ -318,10 +320,8 @@ fn manifest_section(text: &str) -> Result<Vec<&str>, CellRegistryError> {
 
 /// Quoted string entries of one manifest array key.
 fn string_array(section: &[&str], key: &str) -> Result<Vec<String>, CellRegistryError> {
-    let malformed = |detail: &str| {
-        CellRegistryError::MalformedManifest {
-            detail: format!("{key}: {detail}"),
-        }
+    let malformed = |detail: &str| CellRegistryError::MalformedManifest {
+        detail: format!("{key}: {detail}"),
     };
     let body = array_body(section, key)?;
     let mut values = Vec::new();
@@ -352,10 +352,8 @@ fn string_array(section: &[&str], key: &str) -> Result<Vec<String>, CellRegistry
 
 /// Inline-table rows of `functional_cell_state_owners`.
 fn owner_rows(section: &[&str]) -> Result<Vec<ManifestCell>, CellRegistryError> {
-    let malformed = |detail: &str| {
-        CellRegistryError::MalformedManifest {
-            detail: format!("functional_cell_state_owners: {detail}"),
-        }
+    let malformed = |detail: &str| CellRegistryError::MalformedManifest {
+        detail: format!("functional_cell_state_owners: {detail}"),
     };
     let mut rows = Vec::new();
     for line in array_body(section, "functional_cell_state_owners")? {
@@ -370,7 +368,8 @@ fn owner_rows(section: &[&str]) -> Result<Vec<ManifestCell>, CellRegistryError> 
             .ok_or_else(|| malformed("row is not one inline table"))?;
         let (mut cell, mut state, mut owner) = (None, None, None);
         for pair in split_pairs(table) {
-            let (key, value) = quoted_pair(&pair).ok_or_else(|| malformed("pair is not key = \"value\""))?;
+            let (key, value) =
+                quoted_pair(&pair).ok_or_else(|| malformed("pair is not key = \"value\""))?;
             match key {
                 "cell" if cell.is_none() => cell = Some(value),
                 "state" if state.is_none() => state = Some(value),
@@ -394,10 +393,8 @@ fn owner_rows(section: &[&str]) -> Result<Vec<ManifestCell>, CellRegistryError> 
 
 /// Raw lines between `key = [` and its closing bracket.
 fn array_body<'a>(section: &[&'a str], key: &str) -> Result<Vec<&'a str>, CellRegistryError> {
-    let malformed = || {
-        CellRegistryError::MalformedManifest {
-            detail: format!("{key}: array is missing or unterminated"),
-        }
+    let malformed = || CellRegistryError::MalformedManifest {
+        detail: format!("{key}: array is missing or unterminated"),
     };
     let mut lines = section.iter();
     let open = lines
@@ -475,10 +472,8 @@ fn quoted_pair(pair: &str) -> Option<(String, String)> {
 
 /// Parse the generated contract rows between the markers.
 fn parse_contract(text: &str) -> Result<Vec<ContractCell>, CellRegistryError> {
-    let malformed = |detail: &str| {
-        CellRegistryError::MalformedContract {
-            detail: detail.to_owned(),
-        }
+    let malformed = |detail: &str| CellRegistryError::MalformedContract {
+        detail: detail.to_owned(),
     };
     let begin = text
         .lines()
