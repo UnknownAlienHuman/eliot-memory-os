@@ -13,11 +13,11 @@
 pub mod bridge_contract;
 mod durable_host_event_ingest;
 pub use durable_host_event_ingest::{
-    BestEffortDropGap, BestEffortDropReason, DURABLE_INGEST_TRANSFORMATION_VERSION,
-    DurableHostEventJournal, DurableHostEventRecord, EventKey, IngestError,
-    REDACTED_PROJECTION_MARKER, RecordDisposition, RedactionReason, RedactionReceipt, ReplayItem,
-    StageAllowed, StageOutcome, StageRedacted, StoredPayload, StreamCursorState,
-    contains_forbidden_content, deterministic_redacted_bytes,
+    BestEffortDropGap, BestEffortDropReason, CoverageManifestPlan,
+    DURABLE_INGEST_TRANSFORMATION_VERSION, DurableHostEventJournal, DurableHostEventRecord,
+    EventKey, IngestError, REDACTED_PROJECTION_MARKER, RecordDisposition, RedactionReason,
+    RedactionReceipt, ReplayItem, StageAllowed, StageOutcome, StageRedacted, StoredPayload,
+    StreamCursorState, contains_forbidden_content, deterministic_redacted_bytes,
 };
 mod host_event_producer;
 pub use host_event_producer::{
