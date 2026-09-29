@@ -9,9 +9,9 @@ use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, EliotActivationRecord,
     EpochTransition, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
     HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend,
-    JournalError, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord, KernelRecord,
-    LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource, ReadinessEvidence,
-    ReconcileOutcome, WakeDisposition, record_checksum,
+    JournalError, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
+    KernelRecord, LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource,
+    ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -233,10 +233,8 @@ fn journal_record_binds_approved_config(
     readiness_observations: &[KernelReadinessObservationRecord],
     approved_config: &PlatformHandle,
 ) -> bool {
-    let authorizing_checksum = match record_checksum(&HostStateRecord::Kernel(current.clone()))
-    {
-        Ok(checksum) => checksum,
-        Err(_) => return false,
+    let Ok(authorizing_checksum) = record_checksum(&HostStateRecord::Kernel(current.clone())) else {
+        return false;
     };
     readiness_observations.iter().any(|observation| {
         observation
