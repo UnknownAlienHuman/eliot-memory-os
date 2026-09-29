@@ -176,6 +176,18 @@ pub enum StoreReserveError {
         /// Permit identity presented twice.
         permit_id: String,
     },
+    /// Replayed release evidence names the same permit identity but changed
+    /// content: operation, owner, generation, profile or amount bindings
+    /// differ from the live permit. The release is refused before any
+    /// partition counter moves, so a conflicting replay can never cause a
+    /// second capacity effect.
+    #[error("Store permit {permit_id} release evidence conflicts: {detail}")]
+    PermitReplayConflict {
+        /// Permit identity whose replayed evidence conflicts.
+        permit_id: String,
+        /// Which binding class differs.
+        detail: &'static str,
+    },
     /// A restart-time record contradicts live partition accounting.
     #[error("Store restart hold for permit {permit_id} contradicts live accounting: {detail}")]
     RestartReconcileContradiction {
@@ -464,9 +476,14 @@ impl StorePermitRecord {
 /// Exactly-once release evidence for one [`StorePermit`].
 ///
 /// Bound to permit identity, dimension, class, operation label/identity,
-/// owner, issuing bridge generation, profile revision and exact amount: a
-/// replayed, relabelled or profile-moved release does not match and is
-/// refused before any counter moves.
+/// owner, issuing bridge generation, requester generation, profile revision
+/// and exact amount: a replayed, relabelled, generation-moved,
+/// profile-moved or amount-changed release does not match and is refused
+/// with [`StoreReserveError::PermitReplayConflict`] before any counter moves.
+/// The typed Authority Epoch binds indirectly through the issuing bridge
+/// generation plus the exact profile revision (profile construction already
+/// binds the epoch), the same indirect binding the [`StorePermit`] carries;
+/// this crate has no `eliot-contracts` edge to name the typed epoch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreReleaseEvidence {
     permit_id: String,
@@ -476,6 +493,7 @@ pub struct StoreReleaseEvidence {
     operation_id: String,
     owner: String,
     owner_generation: Uuid,
+    requester_generation: Uuid,
     profile_revision: String,
     amount: u64,
 }
@@ -523,6 +541,12 @@ impl StoreReleaseEvidence {
         self.owner_generation
     }
 
+    /// Returns the requesting owner's generation recorded at issue.
+    #[must_use]
+    pub const fn requester_generation(&self) -> Uuid {
+        self.requester_generation
+    }
+
     /// Returns the profile revision recorded at issue.
     #[must_use]
     pub fn profile_revision(&self) -> &str {
@@ -536,19 +560,71 @@ impl StoreReleaseEvidence {
     }
 
     /// Returns `true` only when every binding matches the live permit:
-    /// same permit and operation identities, same owner, same issuing
-    /// generation, same profile revision, same dimension, class and exact
-    /// amount. Changed content never matches.
+    /// same permit and operation identities, same operation label (class and
+    /// work), same owner, same issuing and requester generations, same
+    /// profile revision (the epoch-indirect binding), same dimension, class
+    /// and exact amount. Changed content never matches.
     #[must_use]
     pub fn matches_permit(&self, permit: &StorePermit) -> bool {
         self.permit_id == permit.permit_id
             && self.operation_id == permit.operation_id
+            && self.operation_label == permit.operation.contract_label()
             && self.owner == permit.owner
             && self.owner_generation == permit.owner_generation
+            && self.requester_generation == permit.requester_generation
             && self.profile_revision == permit.profile_revision
             && self.dimension == permit.dimension
             && self.class == permit.class
             && self.amount == permit.amount
+    }
+
+    /// Typed exact-replay check reusing [`Self::matches_permit`]: an exact
+    /// replay matches and is accepted as the same release, while changed
+    /// content fails with [`StoreReserveError::PermitReplayConflict`] naming
+    /// the first differing binding class. No partition counter moves on
+    /// either path; a conflicting replay is a typed refusal, never a second
+    /// capacity effect. A replay presented after the permit already released
+    /// is not accepted here either: the live permit is gone (consumed by
+    /// [`StorePermit::release`]), so the owner answers
+    /// [`StoreReserveError::AlreadyReleased`], and the persisted record stays
+    /// [`StorePermitState::Released`] through
+    /// [`StorePermitRecord::persisted_state_after`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreReserveError::PermitReplayConflict`] when any binding
+    /// differs from the live permit.
+    pub fn verify_against(&self, permit: &StorePermit) -> Result<(), StoreReserveError> {
+        if self.matches_permit(permit) {
+            Ok(())
+        } else {
+            Err(StoreReserveError::PermitReplayConflict {
+                permit_id: self.permit_id.clone(),
+                detail: self.conflict_detail(permit),
+            })
+        }
+    }
+
+    /// Names the first binding class that differs from the live permit, so a
+    /// conflicting replay reports what changed instead of failing silently.
+    fn conflict_detail(&self, permit: &StorePermit) -> &'static str {
+        if self.permit_id != permit.permit_id || self.operation_id != permit.operation_id {
+            "permit or operation identity differs"
+        } else if self.operation_label != permit.operation.contract_label() {
+            "operation class or work label differs"
+        } else if self.owner != permit.owner {
+            "owner differs"
+        } else if self.owner_generation != permit.owner_generation
+            || self.requester_generation != permit.requester_generation
+        {
+            "owner or requester generation moved"
+        } else if self.profile_revision != permit.profile_revision {
+            "profile revision moved (epoch-bound evidence)"
+        } else if self.dimension != permit.dimension || self.class != permit.class {
+            "dimension or partition class differs"
+        } else {
+            "granted amount differs"
+        }
     }
 }
 
@@ -1391,6 +1467,7 @@ impl StorePermit {
             operation_id: self.operation_id.clone(),
             owner: self.owner.clone(),
             owner_generation: self.owner_generation,
+            requester_generation: self.requester_generation,
             profile_revision: self.profile_revision.clone(),
             amount: self.amount,
         })
