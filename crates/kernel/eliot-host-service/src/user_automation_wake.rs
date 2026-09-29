@@ -95,10 +95,24 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
                 .map_err(map_journal_error)?
                 .disposition()
             {
+                // Both dispositions are the same retained wake. `Replayed` is the
+                // journal's own answer for an identity it already applied, and
+                // it writes no second frame, which is what makes a repeated
+                // publication and a restart create no duplicate wake.
                 AppendDisposition::Applied | AppendDisposition::Replayed => {}
             }
         }
-        horizon_acknowledgement(&request, request.requested_occurrence_ids(), Vec::new())
+        // The acknowledgement is read back from the journal rather than
+        // assumed from the appends. An append disposition alone does not prove
+        // the wake is still retained: an activation-generation change clears
+        // the wake projection while the applied-operation index survives, so a
+        // repeated identity replays onto a record this journal no longer holds.
+        // Naming that occurrence as acknowledged would report a published
+        // horizon that no wake exists for, so the exact remaining set and its
+        // retry handle are returned instead.
+        let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
+        let (acknowledged, remaining) = retained_horizon_occurrences(&request, &snapshot)?;
+        horizon_acknowledgement(&request, acknowledged, remaining)
     }
 
     /// Reconciles one exact horizon publication with this owner's retained
@@ -124,30 +138,7 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
             .map_err(|error| rejected(format!("Wake horizon publication readback: {error}")))?;
         validate_horizon_denominator(&request)?;
         let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
-        let mut acknowledged = Vec::with_capacity(request.entries.len());
-        let mut remaining = Vec::new();
-        for entry in &request.entries {
-            let operation = horizon_wake_operation_identity(&request, entry)?;
-            let mut retained = snapshot
-                .wakes
-                .iter()
-                .filter(|wake| wake.wake_id.as_str() == entry.occurrence_id.as_str());
-            let Some(wake) = retained.next() else {
-                remaining.push(entry.occurrence_id.clone());
-                continue;
-            };
-            if retained.next().is_some() {
-                return Err(UserAutomationRuntimeError::IdentityConflict);
-            }
-            if wake.operation != operation || wake.intent != entry.wake_intent {
-                return Err(UserAutomationRuntimeError::IdentityConflict);
-            }
-            // The retained value is checked by the owner's own checksum
-            // function, which re-runs `WakeRecord::validate` on the ORIGINAL
-            // record read back from this journal. Nothing is recomputed here.
-            record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
-            acknowledged.push(entry.occurrence_id.clone());
-        }
+        let (acknowledged, remaining) = retained_horizon_occurrences(&request, &snapshot)?;
         if acknowledged.is_empty() {
             // The snapshot above was read successfully, so this is a complete
             // negative answer from the sole owner of this journal: it retains no
@@ -426,6 +417,47 @@ fn validate_horizon_denominator(
         }
     }
     Ok(())
+}
+
+/// Splits the exact requested occurrence set into what this journal actually
+/// retains under this publication identity and what it does not.
+///
+/// This is the single accounting used by both publication and its readback, so
+/// the two can never disagree about what the owner holds. A requested
+/// occurrence with no retained record is `remaining`, never silently
+/// acknowledged; a retained record that carries another operation identity or
+/// another intent is a contradiction this publication can neither answer for
+/// nor replace, and is refused rather than reported as a partial success.
+///
+/// The retained record is validated by the owner's own checksum function, which
+/// re-runs `WakeRecord::validate` on the ORIGINAL value read back from this
+/// journal. No digest is recomputed and no value is rebuilt here.
+fn retained_horizon_occurrences(
+    request: &UserAutomationWakeHorizonPublication,
+    snapshot: &HostState,
+) -> Result<(Vec<String>, Vec<String>), UserAutomationRuntimeError> {
+    let mut acknowledged = Vec::with_capacity(request.entries.len());
+    let mut remaining = Vec::new();
+    for entry in &request.entries {
+        let operation = horizon_wake_operation_identity(request, entry)?;
+        let mut retained = snapshot
+            .wakes
+            .iter()
+            .filter(|wake| wake.wake_id.as_str() == entry.occurrence_id.as_str());
+        let Some(wake) = retained.next() else {
+            remaining.push(entry.occurrence_id.clone());
+            continue;
+        };
+        if retained.next().is_some() {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        if wake.operation != operation || wake.intent != entry.wake_intent {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
+        acknowledged.push(entry.occurrence_id.clone());
+    }
+    Ok((acknowledged, remaining))
 }
 
 /// Returns the current Host activation fence that owns every journal record.
