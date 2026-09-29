@@ -1189,7 +1189,9 @@ pub enum UnboundOwnerOutcome {
     StillUnsettled,
     /// The outcome carries no canonical receipt, so the owner never validated it
     /// against one. Presence of an outcome is not evidence of anything.
-    #[error("improvement owner outcome carries no canonical receipt: the owner never settled the effect")]
+    #[error(
+        "improvement owner outcome carries no canonical receipt: the owner never settled the effect"
+    )]
     UnsettledEffect,
     /// The receipt is bound to a different operation than this obligation's.
     /// `side` names which part of the receipt disagrees: the authorized effect
@@ -2238,13 +2240,17 @@ pub fn retained_improvement_completion(
         ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation } => {
             obligation.settled_completion_result()
         }
-        // A bare `contract_ref` is not an owner-validated result, exactly as for
-        // the retry gate: naming the arm is what keeps that refusal explicit
-        // instead of inherited from an unexamined wildcard.
-        ImprovementTerminalDisposition::RolledBack { .. } => None,
-        // Every other disposition describes a decision about the candidate, not
-        // an observed external effect, so it retains no owner result to read.
-        ImprovementTerminalDisposition::Rejected { .. }
+        // Every remaining variant is named explicitly and carries no owner result
+        // to read. `RolledBack` is here rather than treated specially because a
+        // bare `contract_ref` is not an owner-validated result, exactly as for the
+        // retry gate, and naming it keeps that refusal explicit instead of
+        // inherited from an unexamined wildcard. The rest describe a decision
+        // about the candidate, not an observed external effect. Merging the arms
+        // does not weaken the match: every variant is still listed, so adding a
+        // disposition remains a compile error here until its retained-result
+        // answer is decided.
+        ImprovementTerminalDisposition::RolledBack { .. }
+        | ImprovementTerminalDisposition::Rejected { .. }
         | ImprovementTerminalDisposition::Inconclusive { .. }
         | ImprovementTerminalDisposition::RegressionRejected { .. }
         | ImprovementTerminalDisposition::NoProgress { .. }
