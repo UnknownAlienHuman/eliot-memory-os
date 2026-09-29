@@ -401,6 +401,14 @@ impl SourceAdmissibilityRecord {
 
     /// Whether this source is admitted to the exact evidence set named by
     /// `profile`.
+    ///
+    /// The State Fence is deliberately not compared here. It is bound
+    /// *transitively*, through `profile.integrity_digest`: since that preimage
+    /// took the fence in, a decision can only match a profile revision frozen
+    /// under the same fence, and a caller cannot pair this decision with a
+    /// differently-fenced profile that happens to share the rest of its
+    /// content. A second, hand-written fence comparison here would duplicate
+    /// that binding in a place nothing re-proves.
     #[must_use]
     pub fn is_admitted_to(&self, profile: &InquiryProtocolProfile) -> bool {
         self.eligibility == SourceEligibility::Eligible

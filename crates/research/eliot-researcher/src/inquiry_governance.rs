@@ -2046,8 +2046,40 @@ impl InquiryProtocolProfile {
         }
     }
 
+    /// Canonical digest over the whole revision.
+    ///
+    /// # What the `v1` -> `v2` bump changed
+    ///
+    /// The `v1` preimage named every field of this struct *except* one: it
+    /// published `state_fence` and no byte of the preimage covered it. A
+    /// revision read back after the fact could therefore carry a **substituted**
+    /// fence — a different authority epoch, resource generation or task
+    /// revision — and still re-prove its own `integrity_digest` unchanged.
+    ///
+    /// That is a real gap and not a theoretical one, because `integrity_digest`
+    /// is the identity every downstream binding compares against rather than
+    /// a free field printed beside the revision:
+    ///
+    /// - `SourceAdmissibilityRecord::is_admitted_to` admits a source to an
+    ///   evidence set on `profile_digest == profile.integrity_digest`, so a
+    ///   substituted fence inherited that same stale equality and kept admitting
+    ///   under a fence the run was never admitted under;
+    /// - `SourcePortfolio`, `CoverageReceipt`, `EvidenceFreeze`, the terminal
+    ///   record and `TaskGraphCompilationInputs` all bind this exact digest, so
+    ///   every one of them would carry the substitution forward consistently
+    ///   and none would notice it;
+    /// - `GovernorInquiryAdmissionRequest::state_fence` is the fence a
+    ///   receiving Governor would read, and it is populated from the same
+    ///   field, so the request crossing the boundary would present the
+    ///   substituted fence as the one the profile was frozen under.
+    ///
+    /// The fence is now bound through [`fence_preimage`], the shared canonical
+    /// serializer that every other record on this plane already uses for the
+    /// same value (the lane discipline outcome, the evidence freeze, the claim
+    /// audit and the terminal record), so its five components are bound by
+    /// their own contract spellings rather than by a field name chosen here.
     fn compute_integrity_digest(&self) -> String {
-        let mut preimage = String::from("inquiry-protocol-profile/v1;");
+        let mut preimage = String::from("inquiry-protocol-profile/v2;");
         push_field(&mut preimage, "profile_id", &self.profile_id);
         push_field(&mut preimage, "revision", &self.revision.to_string());
         if let Some(supersedes) = &self.supersedes {
@@ -2106,11 +2138,28 @@ impl InquiryProtocolProfile {
             "disclosure_ceiling",
             disclosure_wire(self.disclosure_ceiling),
         );
+        // The State Fence this revision is frozen under. Bound through the
+        // shared canonical serializer for the same reason the terminal record,
+        // the evidence freeze, the claim audit and the lane discipline outcome
+        // bind theirs: five typed components, each already carrying its own
+        // contract spelling, and a hand-written field list here would be
+        // coupled to that struct by hand rather than by the compiler.
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
         push_field(&mut preimage, "change_reason", &self.change_reason);
         freeze(&preimage)
     }
 
     /// Re-proves this revision's own digest.
+    ///
+    /// This is the readback check, and since the `v2` bump it is also the check
+    /// that a substituted State Fence cannot survive: the fence is inside the
+    /// preimage, so a revision whose fence was rewritten after the fact now
+    /// computes a different digest and is refused here instead of reporting
+    /// itself as the revision that was made.
     ///
     /// # Errors
     ///
