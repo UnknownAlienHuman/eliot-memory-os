@@ -5573,7 +5573,13 @@ impl InquiryGovernance {
         // `SourceAdmissibilityRecord` freezes `profile_digest`
         // (`source_admissibility.rs:384`), and `SourcePortfolio::assemble`
         // refuses any record whose digest is not the profile it assembles against
-        // (`portfolio.record_binding`). Revising after assessment would therefore
+        // (`portfolio.record_binding`). A second, independent check agrees on the
+        // same ordering: `SourceAdmissibilityRecord::is_admitted_to` also compares
+        // `profile_digest` against `profile.integrity_digest`
+        // (`source_admissibility.rs:413`), and a mismatch there is a silent skip
+        // rather than an error, so a revision taken after assessment would also
+        // leave the portfolio's `primary_sources` empty with the admission
+        // decision swallowed. Revising after assessment would therefore
         // leave the record holding admissibility decisions about a superseded
         // revision, and the re-assembly that a later revision needs is exactly
         // what that refusal forbids. Deciding from the observed coverage instead
@@ -6110,13 +6116,17 @@ impl InquiryGovernance {
     /// terminal record carries catches a freeze or a residue that was replaced,
     /// dropped or added between the two constructions.
     ///
-    /// There is deliberately no equivalent comparison for the claim audit: the
-    /// composite has no second claim-audit owner to compare against, because no
-    /// production path produces one (see the `None` at the `terminal_record`
-    /// call). The terminal record's own `validate_carried_artifacts` still
-    /// re-proves an audit and binds it to this inquiry, profile, manifest and
-    /// State Fence, so a `Some` cannot be a foreign or edited record, and this
-    /// domain will not invent a comparison against a second absent owner.
+    /// The claim audit is compared, but not here: the carried audit is bound
+    /// against the released roster in
+    /// [`Self::validate_claim_coverage_binding`], which requires the terminal's
+    /// carried [`ClaimAuditRecord`] to name one of the released
+    /// [`ClaimAuditRecord`]s (`terminal.claim_audit_binding`), and
+    /// `record` passes `claim_audit.records.first()` into the `terminal_record`
+    /// call so that comparison has a real production owner on the live path. This
+    /// function compares only the two owners it holds side by side; the terminal
+    /// record's own `validate_carried_artifacts` still re-proves an audit and
+    /// binds it to this inquiry, profile, manifest and State Fence, so a `Some`
+    /// cannot be a foreign or edited record.
     ///
     /// # Errors
     ///
@@ -6356,9 +6366,13 @@ fn resolve_profile(
 /// that depended on the previous protocol." I21.1 puts that revision in the
 /// Researcher's own ownership ("resolution **and revision** of the versioned
 /// inquiry profile and Evidence Grade"). Until this existed,
-/// [`InquiryProtocolProfile::revise`] had no production caller on this plane, so
-/// every run froze revision one and a selection the admitted material
-/// contradicted stayed in force for the rest of the run.
+/// [`InquiryProtocolProfile::revise`] had no caller on the live
+/// `InquiryGovernance::record` path, and the only other caller in the crate,
+/// [`revise_grade_requirement`](crate::inquiry_lanes::revise_grade_requirement)
+/// (which reaches `revise` at `inquiry_lanes.rs:3070`), is itself `pub` but
+/// uncalled, so no run reached a revision through it either: every run froze
+/// revision one and a selection the admitted material contradicted stayed in
+/// force for the rest of the run.
 ///
 /// # What decides the revision
 ///
@@ -6391,7 +6405,12 @@ fn resolve_profile(
 /// whose digest is not the profile it assembles against
 /// (`portfolio.record_binding`), so a revision taken *after* assessment would
 /// leave the record holding admissibility decisions about a superseded revision,
-/// with no way to re-derive them. Deciding from the candidate classes therefore
+/// with no way to re-derive them.
+/// [`SourceAdmissibilityRecord::is_admitted_to`](crate::source_admissibility::SourceAdmissibilityRecord::is_admitted_to)
+/// is a second, independent check on the same field, and a mismatch there is a
+/// silent skip rather than an error, so the same late revision would also leave
+/// the portfolio with an empty `primary_sources` and a swallowed admission
+/// decision. Deciding from the candidate classes therefore
 /// reads exactly the input the eligibility decision is about to be taken over,
 /// and leaves one profile revision governing one whole record.
 ///
