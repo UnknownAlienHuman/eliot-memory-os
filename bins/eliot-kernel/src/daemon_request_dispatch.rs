@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
+use eliot_kernel_service::PauseReleaseOutcome;
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
@@ -6531,14 +6532,19 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => {
+            Ok(recovered) => {
+                // Recovery returns the exact receipt together with the result of
+                // releasing the Ordering Scopes this disposition had paused. The
+                // receipt is the write's proof and stays the response value; the
+                // release is reported beside it, never folded into it.
+                let receipt = &recovered.receipt;
                 if !campaign_source_publications.is_empty() {
                     if receipt.status == WriteReceiptStatus::Committed {
                         if let Err(error) = self.p07_ors.commit_campaign_source_publications(
                             &campaign_source_operation_id,
                             &campaign_source_request_digest,
                             &campaign_source_publications,
-                            &receipt,
+                            receipt,
                         ) {
                             // Keep the source reservation. An exact replay of
                             // this same canonical operation obtains the
@@ -6559,7 +6565,11 @@ impl KernelComposition {
                         ));
                     }
                 }
-                Ok(store_apply_response(&receipt, verified_correction.as_ref()))
+                let mut response =
+                    store_apply_response(receipt, verified_correction.as_ref());
+                response["recovery"] =
+                    recovered_commit_recovery(recovered.pause_release.as_ref());
+                Ok(response)
             }
             Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
         }
@@ -6664,7 +6674,7 @@ impl KernelComposition {
             notification_state_read_selectors(&operation.transition)?;
         let state_fence = operation.transition.state_fence.clone();
         let gateway = self.retained_store_gateway()?;
-        let receipt = match gateway
+        let recovered = match gateway
             .apply(
                 &operation.context,
                 operation.transition,
@@ -6673,7 +6683,7 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => receipt,
+            Ok(recovered) => recovered,
             Err(error) => {
                 return Ok(Self::store_apply_refusal_response(
                     NOTIFICATION_STATE_RESPONSE_KIND,
@@ -6681,6 +6691,9 @@ impl KernelComposition {
                 ));
             }
         };
+        // The exact receipt is the proof that the canonical write committed at
+        // the admitted fence; the pause release is reported beside it.
+        let receipt = &recovered.receipt;
         if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
             return Ok(Self::store_error_response_text(
                 NOTIFICATION_STATE_RESPONSE_KIND,
@@ -6713,7 +6726,7 @@ impl KernelComposition {
                 "kind": NOTIFICATION_STATE_RESPONSE_KIND,
                 "value": { "receipt": receipt, "page": page },
             },
-            "recovery": null,
+            "recovery": recovered_commit_recovery(recovered.pause_release.as_ref()),
         }))
     }
 
@@ -9002,6 +9015,30 @@ fn persist_pre_stage_corrections(
     }
     let _ = std::fs::rename(&tmp, &path);
 }
+/// Projects the pause-release result of a recovered commit into a response
+/// envelope's `recovery` slot (issue #2763).
+///
+/// The exact receipt is the proof that the write happened, so a release that
+/// could not be proven is reported here as a recovery limitation on an
+/// otherwise successful commit. It is never turned into a failed write, because
+/// the terminal disposition is already durably recorded, and it is never
+/// dropped, because a caller that cannot see it would read the response as a
+/// complete release. Every other outcome leaves the slot `null`: a release that
+/// completed, or a send that resolved no open record, has no limitation to
+/// report.
+fn recovered_commit_recovery(pause_release: Option<&PauseReleaseOutcome>) -> serde_json::Value {
+    match pause_release {
+        Some(PauseReleaseOutcome::RefreshUnavailable { scopes, detail }) => serde_json::json!({
+            "kind": "pause_release_unavailable",
+            "ordering_scopes": scopes,
+            "detail": detail,
+        }),
+        Some(PauseReleaseOutcome::Released { .. })
+        | Some(PauseReleaseOutcome::NothingToRelease)
+        | None => serde_json::Value::Null,
+    }
+}
+
 fn store_apply_response(
     receipt: &WriteReceipt,
     verified_correction: Option<&eliot_kernel_service::VerifiedCorrectionLink>,
