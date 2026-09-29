@@ -218,6 +218,13 @@ pub use store_gateway::KernelStoreGateway;
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
+// Issue #1681 W3: the named-read refusal leaves the Kernel with a typed
+// `StoreError` and nothing else. These two are the missing half the transport
+// edge needs to turn that cause into the complete versioned #1679 directive
+// instead of a bare reason string, and they live beside the gateway error they
+// interpret so the cause is never re-derived from rendered text.
+#[cfg(windows)]
+pub use store_gateway::{store_read_profile_revision, store_read_unavailable_response};
 // Issue #2764 item 6: the Dreamer route's real caller must be able to
 // distinguish a proven mutation disposition from a still-open Problem State
 // and from a bare gateway refusal, so both the carrier and the recovered
