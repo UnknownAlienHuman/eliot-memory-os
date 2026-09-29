@@ -65,11 +65,11 @@
 //! level additionally REQUIRES the verifier-issued validity attestation, so a
 //! RECOGNIZED level with missing owner evidence is refused rather than
 //! downgraded to something weaker. A class ceiling that needs operational
-//! authority a read-only verify does not hold is refused by
-//! [`require_class_ceiling_reachable`]. A claim that fails any of those
-//! relations is reported as a [`BACKUP_STATE_REFUSED`] outcome naming the
-//! exact missing owner evidence, never as a verified archive and never
-//! silently dropped.
+//! authority a read-only verify does not hold is refused through
+//! [`VerifyClassCeiling::requires_operational_authority`]. A claim that fails
+//! any of those relations is reported as a [`BACKUP_STATE_REFUSED`] outcome
+//! naming the exact missing owner evidence, never as a verified archive and
+//! never silently dropped.
 //!
 //! A proof is only as good as the request it answers, so the verify path binds
 //! the NESTED result identity rather than trusting the envelope echo.
