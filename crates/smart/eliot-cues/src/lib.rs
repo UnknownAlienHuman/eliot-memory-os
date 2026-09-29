@@ -630,6 +630,15 @@ pub enum FacadeError {
         /// Exact target revision.
         revision: &'static str,
     },
+    /// A legacy index row carries the negative-memory marker, whose blocking
+    /// semantics this facade does not own and cannot represent.
+    ///
+    /// The v1 envelope has no field for the marker, so accepting the row
+    /// would discard a blocking rule and present it as an ordinary positive
+    /// cue. It is refused instead, and the negative-memory owner
+    /// (`eliot-governor`) remains the only place that rule can be resolved.
+    #[error("legacy index row carries a negative-memory rule owned by eliot-governor")]
+    NegativeMemoryRuleRefused,
     /// A nested A-10 contract rejected the input or result.
     #[error(transparent)]
     Contract(#[from] eliot_cue_contracts::CueContractError),
