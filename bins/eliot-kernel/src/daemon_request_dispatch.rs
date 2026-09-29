@@ -4933,6 +4933,7 @@ impl KernelComposition {
             OrsError::StagingNotDurable(_) => "ORS_STAGING_NOT_DURABLE",
             OrsError::StagingCommitOutcomeUnknown { .. } => "ORS_STAGING_COMMIT_OUTCOME_UNKNOWN",
             OrsError::RecoveryProblemRetained { .. } => "ORS_RECOVERY_PROBLEM_RETAINED",
+            OrsError::RecoveryProblemRecordFailed { .. } => "ORS_RECOVERY_PROBLEM_RECORD_FAILED",
             OrsError::BridgeRecoveryWindowCapacityExceeded => {
                 "ORS_BRIDGE_RECOVERY_WINDOW_CAPACITY_EXCEEDED"
             }
