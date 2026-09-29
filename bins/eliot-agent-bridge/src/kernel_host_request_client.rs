@@ -1896,7 +1896,8 @@ fn revalidate_act_dispatch(
     }
     if envelope.connection_id != facts.connection_id {
         return Err(PortFailure::TransportBindingRejected {
-            reason: "act dispatch connection does not match the live admitted connection".to_owned(),
+            reason: "act dispatch connection does not match the live admitted connection"
+                .to_owned(),
         });
     }
     let expected_payload = canonical_payload_digest(&request.tool)?;
