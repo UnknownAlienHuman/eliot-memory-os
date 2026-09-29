@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EffectCeiling, EpistemicUse, InfluenceDependencyClosure, InfluenceState, IndependenceLevel,
+    EffectCeiling, EpistemicUse, IndependenceLevel, InfluenceDependencyClosure, InfluenceState,
     InstructionTaint, QuarantineState, SecurityContractError, SourceAssurance,
     TransformationLineage,
 };
@@ -197,7 +197,10 @@ fn use_fence(value: &StateFence, field: &'static str) -> Result<(), SecurityCont
 
 fn validate_revisions(revisions: &SourceUseRevisions) -> Result<(), SecurityContractError> {
     use_text(&revisions.closure_ref, "source_use.closure_ref")?;
-    use_text(&revisions.policy_snapshot_id, "source_use.policy_snapshot_id")?;
+    use_text(
+        &revisions.policy_snapshot_id,
+        "source_use.policy_snapshot_id",
+    )?;
     use_text(&revisions.profile_revision, "source_use.profile_revision")?;
     if revisions.source_revisions.is_empty() {
         return Err(SecurityContractError::EmptyCollection {
@@ -206,7 +209,10 @@ fn validate_revisions(revisions: &SourceUseRevisions) -> Result<(), SecurityCont
     }
     let mut seen = BTreeSet::new();
     for revision in &revisions.source_revisions {
-        use_text(&revision.source_ref, "source_use.source_revision.source_ref")?;
+        use_text(
+            &revision.source_ref,
+            "source_use.source_revision.source_ref",
+        )?;
         use_text(&revision.revision, "source_use.source_revision.revision")?;
         if !seen.insert(revision.source_ref.as_str()) {
             return Err(SecurityContractError::DuplicateReference {
@@ -244,7 +250,10 @@ fn walk_lineage<'a>(
     let mut producer: BTreeMap<&'a str, &'a TransformationLineage> = BTreeMap::new();
     for derivation in derivations {
         derivation.validate()?;
-        if producer.insert(derivation.output_ref.as_str(), derivation).is_some() {
+        if producer
+            .insert(derivation.output_ref.as_str(), derivation)
+            .is_some()
+        {
             return Err(SecurityContractError::InvalidText {
                 field: "source_use.derivation.output_binding",
             });
@@ -312,8 +321,7 @@ fn propagated_taint(
 ) -> Result<InstructionTaint, SecurityContractError> {
     let mut propagated = initial;
     for derivation in order {
-        if derivation.output_taint < propagated
-            && derivation.declassification_receipt_ref.is_none()
+        if derivation.output_taint < propagated && derivation.declassification_receipt_ref.is_none()
         {
             return Err(SecurityContractError::TaintLaundering);
         }
@@ -400,7 +408,11 @@ fn validate_closure(
             field: "source_use.influence_closure.root_binding",
         });
     }
-    if !closure.dependent_refs.iter().any(|item| item == &request.subject_ref) {
+    if !closure
+        .dependent_refs
+        .iter()
+        .any(|item| item == &request.subject_ref)
+    {
         return Err(SecurityContractError::InvalidText {
             field: "source_use.influence_closure.dependent_binding",
         });
@@ -431,10 +443,18 @@ fn check_revisions(request: &SourceUseRequest, roots: &BTreeSet<String>, denials
 /// Records the per-source use, effect, quarantine, and taint denials.
 fn check_inputs(request: &SourceUseRequest, denials: &mut Denials) {
     for input in &request.inputs {
-        if !input.assurance.allowed_epistemic_use.contains(&request.requested_use) {
+        if !input
+            .assurance
+            .allowed_epistemic_use
+            .contains(&request.requested_use)
+        {
             denials.for_source(SourceUseDenialReason::UseNotPermitted, &input.source_ref);
         }
-        if !input.assurance.allowed_effects.contains(&request.requested_effect) {
+        if !input
+            .assurance
+            .allowed_effects
+            .contains(&request.requested_effect)
+        {
             denials.for_source(SourceUseDenialReason::EffectNotPermitted, &input.source_ref);
         }
         if request.target != SourceUseTarget::ProcedureOrAction {
@@ -488,7 +508,10 @@ pub fn authorize_source_use(
     let mut denials = Denials::new();
     check_revisions(request, &walk.roots, &mut denials);
     if request.target.is_authority_surface() {
-        denials.for_all_roots(SourceUseDenialReason::InstructionDataSeparation, &walk.roots);
+        denials.for_all_roots(
+            SourceUseDenialReason::InstructionDataSeparation,
+            &walk.roots,
+        );
     }
     if independence_rank(request.subject_independence_claim)
         > independence_rank(weakest_input_independence(&request.inputs))
