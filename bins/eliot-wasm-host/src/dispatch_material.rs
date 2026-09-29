@@ -466,8 +466,12 @@ pub fn stage_control_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), M
     }
     let root = path.parent().ok_or(MaterialError::Malformed)?;
     with_installation_root_lock(root, || {
-        write_atomic_locked(path, bytes, u64_ceiling_as_usize(WASM_CONTROL_MAX_FILE_BYTES))
-            .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))
+        write_atomic_locked(
+            path,
+            bytes,
+            u64_ceiling_as_usize(WASM_CONTROL_MAX_FILE_BYTES),
+        )
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))
     })
 }
 
@@ -1619,8 +1623,14 @@ fn reclaim_claimed_delivery_unlocked(
 fn read_claimed_reclamation_state_unlocked(
     claim: &DeliveryClaim,
     install_dir: &std::path::Path,
-) -> Result<(OwnerDeliveryIdentity, OwnerJoinBinding, OwnerDeliveryDisposition), ClaimedReclamation>
-{
+) -> Result<
+    (
+        OwnerDeliveryIdentity,
+        OwnerJoinBinding,
+        OwnerDeliveryDisposition,
+    ),
+    ClaimedReclamation,
+> {
     let Ok(staged) = read_claimed_dispatch_material_unlocked(install_dir) else {
         return Err(ClaimedReclamation::RetainedForRecovery {
             claimed: claim.identity().clone(),
@@ -1639,15 +1649,15 @@ fn read_claimed_reclamation_state_unlocked(
         });
     }
     let identity = claim.identity();
-    let disposition_record = match read_owner_disposition_unlocked(install_dir, staged_claim.identity())
-    {
-        Ok(record) => record,
-        Err(_) => {
-            return Err(ClaimedReclamation::RetainedForRecovery {
-                claimed: identity.clone(),
-            });
-        }
-    };
+    let disposition_record =
+        match read_owner_disposition_unlocked(install_dir, staged_claim.identity()) {
+            Ok(record) => record,
+            Err(_) => {
+                return Err(ClaimedReclamation::RetainedForRecovery {
+                    claimed: identity.clone(),
+                });
+            }
+        };
     let owner_identity = disposition_record.disposition.identity().clone();
     if !owner_identity.names(staged_claim.identity()) || !owner_identity.names(identity) {
         return Err(ClaimedReclamation::ReplacementPreserved {
@@ -1889,9 +1899,9 @@ impl OwnerDeliveryIdentity {
             && self.authority_epoch_json == claim.authority_epoch_json
             && self.envelope_digest == claim.envelope_digest.as_str()
             && self.host_artifact_digest == claim.host_artifact_digest.as_str()
-            && claim.publication_incarnation.is_none_or(|incarnation| {
-                incarnation == self.publication_incarnation
-            })
+            && claim
+                .publication_incarnation
+                .is_none_or(|incarnation| incarnation == self.publication_incarnation)
             && claim
                 .publication_revision
                 .is_none_or(|revision| revision == self.publication_revision)
@@ -2188,14 +2198,8 @@ impl OwnerDeliveryDisposition {
                 require_nonblank(claimant_incarnation, "claimant-incarnation")?;
                 require_owner_digest(runtime_request_digest, "runtime-request-digest")?;
                 match self {
-                    Self::TerminalUnacknowledged {
-                        result_digest,
-                        ..
-                    }
-                    | Self::Acknowledged {
-                        result_digest,
-                        ..
-                    } => {
+                    Self::TerminalUnacknowledged { result_digest, .. }
+                    | Self::Acknowledged { result_digest, .. } => {
                         require_owner_digest(result_digest, "delivery-result-digest")?;
                         // Sequence zero is valid and names the first result event.
                     }
@@ -2329,9 +2333,9 @@ fn read_bounded_regular_file(
     Ok(bytes)
 }
 
-/// Atomically replaces one fixed protocol record. A leftover process-scoped
-/// partial is retained as recovery evidence and blocks another write; it is
-/// never deleted merely because it is old or has the expected name.
+/// Atomically replaces one fixed protocol record. An exact, bounded partial
+/// from an interrupted write may be promoted to its target; a partial with any
+/// other contents is retained as recovery evidence and blocks another write.
 fn write_atomic_locked(
     target: &std::path::Path,
     bytes: &[u8],
@@ -2348,7 +2352,21 @@ fn write_atomic_locked(
         .ok_or_else(|| std::io::Error::other("record-name"))?;
     let partial = target.with_file_name(format!(".{file_name}.partial"));
     match std::fs::symlink_metadata(&partial) {
-        Ok(_) => return Err(std::io::Error::other("record-partial-retained")),
+        Ok(_) => {
+            let retained = read_bounded_regular_file(&partial, max_bytes)
+                .map_err(|_| std::io::Error::other("record-partial-unavailable"))?;
+            if retained != bytes {
+                return Err(std::io::Error::other("record-partial-retained"));
+            }
+            #[cfg(windows)]
+            {
+                return eliot_windows_ipc::atomic_replace_file(&partial, target);
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(std::io::Error::other("atomic-replace-unavailable"));
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -2633,9 +2651,7 @@ fn resolve_delivery_claim_unlocked(
             DeliveryClaimOutcome::RetainedResult,
         ),
         OwnerDeliveryDisposition::Ready { .. }
-        | OwnerDeliveryDisposition::RetiredNoEffect { .. } => {
-            Ok(DeliveryClaimOutcome::Conflict)
-        }
+        | OwnerDeliveryDisposition::RetiredNoEffect { .. } => Ok(DeliveryClaimOutcome::Conflict),
     }
 }
 
@@ -3134,9 +3150,7 @@ impl ServedResultRecord {
 
 /// Recomputes the result stream's commitment from the original stored JSON
 /// values, matching the request-loop writer and read-back validator.
-fn retained_result_stream_digest(
-    events: &[serde_json::Value],
-) -> Result<String, MaterialError> {
+fn retained_result_stream_digest(events: &[serde_json::Value]) -> Result<String, MaterialError> {
     let mut commitment = String::new();
     for event in events {
         let bytes = serde_json::to_vec(event).map_err(|_| MaterialError::Malformed)?;
@@ -3392,8 +3406,8 @@ fn write_served_result_unlocked(
     ) {
         return Err(std::io::Error::other("delivery-not-in-flight"));
     }
-    let result_path = delivery_slot_dir(install_dir, &claim.identity)
-        .join(WASM_DELIVERY_RESULT_FILE_NAME);
+    let result_path =
+        delivery_slot_dir(install_dir, &claim.identity).join(WASM_DELIVERY_RESULT_FILE_NAME);
     write_atomic_locked(&result_path, bytes, SERVED_RESULT_MAX_BYTES)?;
     seal_terminal_served_result_unlocked(install_dir, claim, record, bytes, &mut disposition)
 }
@@ -3404,8 +3418,8 @@ fn verify_served_result_extension_unlocked(
     record: &ServedResultRecord,
     disposition: &mut OwnerDeliveryDispositionRecord,
 ) -> std::io::Result<bool> {
-    let result_path = delivery_slot_dir(install_dir, &claim.identity)
-        .join(WASM_DELIVERY_RESULT_FILE_NAME);
+    let result_path =
+        delivery_slot_dir(install_dir, &claim.identity).join(WASM_DELIVERY_RESULT_FILE_NAME);
     match read_bounded_regular_file(&result_path, SERVED_RESULT_MAX_BYTES) {
         Ok(_) => {}
         Err(MaterialError::Missing) => return Ok(false),
