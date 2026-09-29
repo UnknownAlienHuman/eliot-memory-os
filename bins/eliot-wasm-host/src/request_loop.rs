@@ -1975,9 +1975,9 @@ enum PreviousDisposition {
     /// The declared previous-digest link was compared against the retained
     /// predecessor ack and matches (or sequence zero declares no link).
     Verified,
-    /// The predecessor ack is absent or undecodable, so the declared link
-    /// was never compared against anything. The delivery is skipped, never
-    /// admitted or attested as validated.
+    /// Neither the predecessor ack nor the staged predecessor delivery is
+    /// usable, so the declared link cannot be compared against anything.
+    /// The delivery is skipped, never admitted or attested as validated.
     AwaitingEvidence,
     /// The control-poll read budget was spent before the predecessor ack
     /// could be read. The walk stops and resumes next tick; the delivery is
@@ -2358,11 +2358,16 @@ impl KernelControlReader {
     /// Resolves the previous-delivery link against retained predecessor
     /// evidence. Sequence zero must open the stream, so only a declared
     /// absence verifies there; a later sequence must chain to its retained
-    /// predecessor ack. Absent or undecodable predecessor bytes are
-    /// [`PreviousDisposition::AwaitingEvidence`], never an admission: a
-    /// Cancel/Shutdown whose link was never compared is not validated. A
-    /// spent read budget is [`PreviousDisposition::BudgetDeferred`], never a
-    /// refusal. Only a compared-and-mismatching link is
+    /// predecessor. The predecessor ack is the primary evidence, staged once
+    /// the predecessor was admitted and enqueued. When no usable ack exists
+    /// the staged predecessor delivery is the fallback evidence: the urgent
+    /// lane preempts a head Reconcile it never enqueues, so an ack-only
+    /// check would starve every chained Cancel/Shutdown for the whole
+    /// pending window and no guest interruption would ever fire. Either way
+    /// the declared link is compared, never skipped: only a missing or
+    /// undecodable staged delivery is [`PreviousDisposition::AwaitingEvidence`].
+    /// A spent read budget is [`PreviousDisposition::BudgetDeferred`], never
+    /// a refusal. Only a compared-and-mismatching link is
     /// [`PreviousDisposition::Conflict`].
     fn check_previous(
         &self,
@@ -2382,16 +2387,36 @@ impl KernelControlReader {
             return PreviousDisposition::BudgetDeferred;
         }
         *reads += 1;
-        let path = self
+        let ack_path = self
             .directory
             .join(control_ack_name(generation, sequence - 1));
-        let Ok(bytes) = read_control_bytes(&path) else {
+        if let Ok(bytes) = read_control_bytes(&ack_path)
+            && let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes)
+        {
+            return Self::compare_previous(previous, ack.delivery_digest.as_str());
+        }
+        if *reads >= CONTROL_POLL_READ_BUDGET {
+            return PreviousDisposition::BudgetDeferred;
+        }
+        *reads += 1;
+        let delivery_path = self
+            .directory
+            .join(control_delivery_name(generation, sequence - 1));
+        let Ok(bytes) = read_control_bytes(&delivery_path) else {
             return PreviousDisposition::AwaitingEvidence;
         };
-        let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
+        let Ok(staged) = parse_control_delivery(&bytes) else {
             return PreviousDisposition::AwaitingEvidence;
         };
-        if previous.is_some_and(|digest| *digest == ack.delivery_digest) {
+        Self::compare_previous(previous, staged.delivery_digest.as_str())
+    }
+
+    /// Compares one declared previous-delivery link against retained
+    /// predecessor evidence. A later sequence with no declared link disagrees
+    /// with retained evidence exactly like a mismatching one: only sequence
+    /// zero may declare no link.
+    fn compare_previous(previous: Option<&String>, evidence: &str) -> PreviousDisposition {
+        if previous.is_some_and(|digest| digest.as_str() == evidence) {
             PreviousDisposition::Verified
         } else {
             PreviousDisposition::Conflict
