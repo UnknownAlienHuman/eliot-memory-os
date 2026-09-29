@@ -53,6 +53,12 @@ pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
+/// Issue #2857 W1/W2/W4: the live `eliot.query` `ContextReconstruction`
+/// route. This is the one production edge that resolves the closed selector set
+/// from the admitted envelope plus the authenticated Task Controller owner and
+/// calls `KernelContextReadClient::reconstruct_context_inputs`, the existing
+/// Governor composition edge over `GovernorContextInputs`.
+pub mod context_reconstruction_route;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -155,6 +161,9 @@ pub use capability_outcome::{
     DegradationScope, FallbackOutcomeRequest, GenerationChallengeOutcomeRequest,
     OutcomeDisposition, OutcomeError, SURVIVING_OPERATION_PREFIX, fallback_outcome,
     generation_challenge_outcome, project_degradation, removed_promise, surviving_operation,
+};
+pub use context_reconstruction_route::{
+    ReconstructionPrerequisite, is_context_reconstruction_query, serve_context_reconstruction,
 };
 pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,

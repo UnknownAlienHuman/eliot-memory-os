@@ -3321,6 +3321,35 @@ async fn run_local_read_poll(
         // same contract the ordinary forwarded read below settles under.
         return Ok(step(outcome, None));
     }
+    // #2857: an admitted `eliot.query` whose explicit intent mode is
+    // `context_reconstruction` is the one request that owns Context
+    // reconstruction, so it is served HERE by the selector-complete
+    // reconstruction route instead of being forwarded on the Kernel
+    // `local_read` leg. That leg answers a single `GetEvidencePack` read and
+    // cannot express the six-read closure; the reconstruction route derives
+    // every identity from this admitted pair plus the retained authenticated
+    // Kernel session, resolves the closed selector set from the authenticated
+    // Task Controller owner, and calls
+    // `KernelContextReadClient::reconstruct_context_inputs` — the existing
+    // Governor composition edge over `GovernorContextInputs`. The closure is
+    // input reconstruction, never an admitted view. A prerequisite refusal
+    // (missing owner identity, unbound attempt, moved fence) is a typed daemon
+    // step failure, exactly like a forward or submit failure, so the claimed
+    // pair is never silently dropped. Every other query shape keeps the
+    // forwarded path byte-identical.
+    if eliotd::is_context_reconstruction_query(&envelope, &tool) {
+        let body = Box::pin(eliotd::serve_context_reconstruction(
+            kernel, &envelope, &tool, &attempt,
+        ))
+        .await
+        .map_err(|error| format!("daemon context reconstruction: {error}"))?;
+        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+        };
+        return Ok(step(outcome, None));
+    }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
