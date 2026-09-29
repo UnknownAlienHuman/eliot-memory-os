@@ -1,7 +1,7 @@
 //! Governor-owned native-worker executable binding projection (T9-01, M1).
 //!
 //! M1 (`T9.md` 3.2, accepted by #22): the Governor publishes one versioned
-//! record, [`NativeWorkerExecutableBinding`] v1, through the existing canonical
+//! record, [`NativeWorkerExecutableBinding`] v2, through the existing canonical
 //! admission path (`PreparedTransition` / `KernelTransitionPort`) when the
 //! attempt is registered. The field denominator below is `T9.md` 3.2:
 //! installation/principal/session; claim and registration; admitted
@@ -10,9 +10,12 @@
 //! protocol/facet revisions; supporting introductions/grants and effective
 //! ceilings; credential/resource references without values; replay stream;
 //! nonce relationship; process invocation digest; generation/epoch/fence;
-//! deadlines and current invalidation evidence. The admitted Module Catalog
-//! revision and `FunctionalCapabilityCell` identity are explicit required
-//! owner inputs; neither is inferred from grant refs or package names.
+//! deadlines and current invalidation evidence; the validated generated
+//! capability-cell registry digest; Kernel execution manifest and
+//! process/Job Object lineage; and resource-limit, cancellation, checkpoint,
+//! drain and restart policy bindings. The admitted Module Catalog revision,
+//! `FunctionalCapabilityCell` identity and lifecycle joins are explicit
+//! required owner inputs; none is inferred from grant refs or package names.
 //!
 //! Governor hard boundary (`crates/governor/AGENTS.md`): this module composes a
 //! pure projection only. It never opens a store, constructs a provider
@@ -21,6 +24,10 @@
 //! values. The Kernel stores the digest (T9-02, separate lane). A
 //! route/adapter/config/facet/grant/epoch change makes the binding stale; this
 //! module performs no local repair.
+//!
+//! The facet identity is taken from ELIOT's shared native-worker resource
+//! facet contract. A caller may present the expected identity for correlation,
+//! but an opaque, stale, or locally invented ref is rejected.
 //!
 //! Refinements decided from the docs (underspecification per `T9.md` 4, not a
 //! contradiction):
@@ -51,7 +58,7 @@ use serde::{Deserialize, Serialize};
 pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID: &str =
     "eliot.governor.native-worker-executable-binding";
 /// Current wire revision of the Governor-owned executable binding.
-pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION: u16 = 1;
+pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION: u16 = 2;
 
 /// Maximum bounded text length, matching the Kernel claim `validate_text`.
 const MAX_TEXT_LEN: usize = 1024;
@@ -61,6 +68,16 @@ const MAX_REFS: usize = 64;
 const MIN_NONCE_LEN: usize = 16;
 /// Maximum presented launch-nonce length.
 const MAX_NONCE_LEN: usize = 256;
+
+/// Returns the canonical reference for the ELIOT-owned native-worker facet.
+///
+/// This derives the ref from the validated source contract rather than
+/// duplicating its identity/version/digest spelling in Governor.
+pub(crate) fn canonical_native_worker_facet_ref() -> Result<String, String> {
+    eliot_contracts::native_worker_resource_facet_v1()
+        .and_then(|facet| facet.canonical_ref())
+        .map_err(|error| format!("cannot derive canonical native-worker facet ref: {error}"))
+}
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -98,6 +115,33 @@ fn validate_ref_list(values: &[String], field: &'static str) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+/// Required owner-supplied lifecycle joins for a native worker generation.
+///
+/// Values are sourced from the validated generated capability-cell registry,
+/// admitted Kernel execution manifest and native worker lifecycle owners.
+/// Governor validates their bounded wire shape and carries them into the
+/// executable binding; it does not derive substitutes or assert their live
+/// currentness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWorkerLifecycleBinding {
+    /// Lowercase SHA-256 of the original validated generated #13 cell registry.
+    pub capability_cell_registry_digest: String,
+    /// Lowercase SHA-256 of the admitted Kernel execution manifest.
+    pub kernel_execution_manifest_digest: String,
+    /// Exact Job Object lineage reference for this process generation.
+    pub job_object_lineage_ref: String,
+    /// Lowercase SHA-256 of the admitted resource limits projection.
+    pub resource_limits_digest: String,
+    /// Owner reference for the admitted cancellation policy.
+    pub cancellation_policy_ref: String,
+    /// Lowercase SHA-256 of the admitted checkpoint policy.
+    pub checkpoint_policy_digest: String,
+    /// Owner reference for the admitted drain policy.
+    pub drain_policy_ref: String,
+    /// Lowercase SHA-256 of the admitted restart policy.
+    pub restart_policy_digest: String,
 }
 
 /// One versioned Governor-owned executable binding projection.
@@ -138,6 +182,8 @@ pub struct NativeWorkerExecutableBinding {
     pub worker_generation: u64,
     /// Presented provider-process tree identity.
     pub process_tree_id: String,
+    /// Exact Job Object lineage reference for this process generation.
+    pub job_object_lineage_ref: String,
     /// Presented process generation (nonzero).
     pub process_generation: u64,
     /// Presented process fence label.
@@ -168,6 +214,20 @@ pub struct NativeWorkerExecutableBinding {
     pub grant_graph_revision: u64,
     /// Admitted Module Catalog revision this generation was compiled against.
     pub module_catalog_revision: u64,
+    /// Lowercase SHA-256 of the original validated generated #13 cell registry.
+    pub capability_cell_registry_digest: String,
+    /// Lowercase SHA-256 of the admitted Kernel execution manifest.
+    pub kernel_execution_manifest_digest: String,
+    /// Lowercase SHA-256 of the admitted resource limits projection.
+    pub resource_limits_digest: String,
+    /// Owner reference for the admitted cancellation policy.
+    pub cancellation_policy_ref: String,
+    /// Lowercase SHA-256 of the admitted checkpoint policy.
+    pub checkpoint_policy_digest: String,
+    /// Owner reference for the admitted drain policy.
+    pub drain_policy_ref: String,
+    /// Lowercase SHA-256 of the admitted restart policy.
+    pub restart_policy_digest: String,
     /// Effective capability ceiling.
     pub effective_ceiling: EffectClass,
     /// Credential references (refs only, never values).
@@ -217,7 +277,14 @@ impl NativeWorkerExecutableBinding {
             );
         }
         if self.wire_version != NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION {
-            return Err("wire_version must be 1".to_owned());
+            return Err("wire_version must be 2".to_owned());
+        }
+        let canonical_facet_ref = canonical_native_worker_facet_ref()?;
+        if self.facet_manifest_ref != canonical_facet_ref {
+            return Err(
+                "facet_manifest_ref must equal the canonical ELIOT native-worker facet ref"
+                    .to_owned(),
+            );
         }
         for (value, field) in [
             (&self.claim_id, "claim_id"),
@@ -231,6 +298,7 @@ impl NativeWorkerExecutableBinding {
             (&self.principal_id, "principal_id"),
             (&self.session_id, "session_id"),
             (&self.process_tree_id, "process_tree_id"),
+            (&self.job_object_lineage_ref, "job_object_lineage_ref"),
             (&self.process_fence, "process_fence"),
             (&self.route_ref, "route_ref"),
             (&self.adapter_id, "adapter_id"),
@@ -240,20 +308,12 @@ impl NativeWorkerExecutableBinding {
             (&self.plan_id, "plan_id"),
             (&self.plan_revision, "plan_revision"),
             (&self.admission_revision_ref, "admission_revision_ref"),
+            (&self.cancellation_policy_ref, "cancellation_policy_ref"),
+            (&self.drain_policy_ref, "drain_policy_ref"),
         ] {
             validate_text(value, field)?;
         }
-        for (value, field) in [
-            (&self.canonical_request_hash, "canonical_request_hash"),
-            (&self.artifact_digest, "artifact_digest"),
-            (&self.config_digest, "config_digest"),
-            (&self.protocol_digest, "protocol_digest"),
-            (&self.process_invocation_digest, "process_invocation_digest"),
-            (&self.config_snapshot_digest, "config_snapshot_digest"),
-            (&self.binding_digest, "binding_digest"),
-        ] {
-            validate_digest(value, field)?;
-        }
+        self.validate_digests()?;
         validate_text(&self.launch_nonce, "launch_nonce")?;
         if self.launch_nonce.len() < MIN_NONCE_LEN || self.launch_nonce.len() > MAX_NONCE_LEN {
             return Err("launch_nonce must be 16..=256 characters".to_owned());
@@ -295,6 +355,32 @@ impl NativeWorkerExecutableBinding {
         let recomputed = self.compute_digest()?;
         if recomputed != self.binding_digest {
             return Err("binding_digest does not match canonical digest".to_owned());
+        }
+        Ok(())
+    }
+
+    fn validate_digests(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.canonical_request_hash, "canonical_request_hash"),
+            (&self.artifact_digest, "artifact_digest"),
+            (&self.config_digest, "config_digest"),
+            (&self.protocol_digest, "protocol_digest"),
+            (
+                &self.capability_cell_registry_digest,
+                "capability_cell_registry_digest",
+            ),
+            (
+                &self.kernel_execution_manifest_digest,
+                "kernel_execution_manifest_digest",
+            ),
+            (&self.resource_limits_digest, "resource_limits_digest"),
+            (&self.checkpoint_policy_digest, "checkpoint_policy_digest"),
+            (&self.restart_policy_digest, "restart_policy_digest"),
+            (&self.process_invocation_digest, "process_invocation_digest"),
+            (&self.config_snapshot_digest, "config_snapshot_digest"),
+            (&self.binding_digest, "binding_digest"),
+        ] {
+            validate_digest(value, field)?;
         }
         Ok(())
     }

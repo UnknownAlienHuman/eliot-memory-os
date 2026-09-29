@@ -67,7 +67,7 @@ pub const NATIVE_WORKER_CLAIM_WIRE_VERSION_V1: u16 = 1;
 /// Carried by value, never imported: this C1 crate must not depend on
 /// `eliot-governor` (I2.3 dependency direction). A binding-wire drift changes
 /// the owner digest as well, so this pin fails closed twice.
-pub const NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION: u16 = 1;
+pub const NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION: u16 = 2;
 /// Supported execution-unit schema version admitted on this wire.
 pub const NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION: u16 = 1;
 /// Native-worker protocol version admitted on this wire.
@@ -170,6 +170,22 @@ pub struct NativeWorkerExecutableBinding {
     pub grant_graph_revision: u64,
     /// Admitted Module Catalog revision from the owner record; nonzero.
     pub module_catalog_revision: u64,
+    /// SHA-256 of the original validated generated capability-cell registry.
+    pub capability_cell_registry_digest: String,
+    /// SHA-256 of the admitted Kernel execution manifest.
+    pub kernel_execution_manifest_digest: String,
+    /// Exact Job Object lineage reference for this process generation.
+    pub job_object_lineage_ref: String,
+    /// SHA-256 of the admitted resource limits projection.
+    pub resource_limits_digest: String,
+    /// Owner reference for the admitted cancellation policy.
+    pub cancellation_policy_ref: String,
+    /// SHA-256 of the admitted checkpoint policy.
+    pub checkpoint_policy_digest: String,
+    /// Owner reference for the admitted drain policy.
+    pub drain_policy_ref: String,
+    /// SHA-256 of the admitted restart policy.
+    pub restart_policy_digest: String,
     /// Replay stream identity bound to this claim.
     pub replay_stream_id: String,
     /// Claim-bound launch nonce (16..=256 chars, mirroring T9-01).
@@ -227,18 +243,7 @@ impl NativeWorkerExecutableBinding {
         ] {
             validate_wire_text(text, field)?;
         }
-        validate_wire_text(
-            &self.launch_nonce,
-            "native_worker_claim.executable_binding.launch_nonce",
-        )?;
-        if self.launch_nonce.len() < Self::MIN_NONCE_LEN
-            || self.launch_nonce.len() > Self::MAX_NONCE_LEN
-        {
-            return Err(KernelServiceError::InvalidField {
-                field: "native_worker_claim.executable_binding.launch_nonce",
-                reason: "launch nonce must be 16..=256 characters",
-            });
-        }
+        self.validate_launch_nonce()?;
         for (digest, field) in [
             (
                 &self.config_digest,
@@ -255,6 +260,7 @@ impl NativeWorkerExecutableBinding {
         ] {
             validate_wire_digest(digest, field)?;
         }
+        self.validate_lifecycle_binding()?;
         if self.adapter_revision == 0
             || self.grant_graph_revision == 0
             || self.module_catalog_revision == 0
@@ -304,6 +310,66 @@ impl NativeWorkerExecutableBinding {
         if self.generation != self.state_fence.resource_generation {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "native_worker_claim.executable_binding.state_fence",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_lifecycle_binding(&self) -> Result<(), KernelServiceError> {
+        for (value, field) in [
+            (
+                &self.job_object_lineage_ref,
+                "native_worker_claim.executable_binding.job_object_lineage_ref",
+            ),
+            (
+                &self.cancellation_policy_ref,
+                "native_worker_claim.executable_binding.cancellation_policy_ref",
+            ),
+            (
+                &self.drain_policy_ref,
+                "native_worker_claim.executable_binding.drain_policy_ref",
+            ),
+        ] {
+            validate_wire_text(value, field)?;
+        }
+        for (digest, field) in [
+            (
+                &self.capability_cell_registry_digest,
+                "native_worker_claim.executable_binding.capability_cell_registry_digest",
+            ),
+            (
+                &self.kernel_execution_manifest_digest,
+                "native_worker_claim.executable_binding.kernel_execution_manifest_digest",
+            ),
+            (
+                &self.resource_limits_digest,
+                "native_worker_claim.executable_binding.resource_limits_digest",
+            ),
+            (
+                &self.checkpoint_policy_digest,
+                "native_worker_claim.executable_binding.checkpoint_policy_digest",
+            ),
+            (
+                &self.restart_policy_digest,
+                "native_worker_claim.executable_binding.restart_policy_digest",
+            ),
+        ] {
+            validate_wire_digest(digest, field)?;
+        }
+        Ok(())
+    }
+
+    fn validate_launch_nonce(&self) -> Result<(), KernelServiceError> {
+        validate_wire_text(
+            &self.launch_nonce,
+            "native_worker_claim.executable_binding.launch_nonce",
+        )?;
+        if self.launch_nonce.len() < Self::MIN_NONCE_LEN
+            || self.launch_nonce.len() > Self::MAX_NONCE_LEN
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_claim.executable_binding.launch_nonce",
+                reason: "launch nonce must be 16..=256 characters",
             });
         }
         Ok(())
@@ -821,6 +887,7 @@ fn compare_executable_currentness(
             field: "native_worker_claim.executable_binding.module_catalog_revision",
         });
     }
+    compare_lifecycle_currentness(presented, current)?;
     if presented.replay_stream_id != current.replay_stream_id {
         return Err(KernelServiceError::HandshakeMismatch {
             field: "native_worker_claim.executable_binding.replay_stream_id",
@@ -858,6 +925,51 @@ fn compare_executable_currentness(
         return Err(KernelServiceError::HandshakeMismatch {
             field: "native_worker_claim.executable_binding.state_fence",
         });
+    }
+    Ok(())
+}
+
+fn compare_lifecycle_currentness(
+    presented: &NativeWorkerExecutableBinding,
+    current: &NativeWorkerExecutableBinding,
+) -> Result<(), KernelServiceError> {
+    for (matches, field) in [
+        (
+            presented.capability_cell_registry_digest == current.capability_cell_registry_digest,
+            "native_worker_claim.executable_binding.capability_cell_registry_digest",
+        ),
+        (
+            presented.kernel_execution_manifest_digest == current.kernel_execution_manifest_digest,
+            "native_worker_claim.executable_binding.kernel_execution_manifest_digest",
+        ),
+        (
+            presented.job_object_lineage_ref == current.job_object_lineage_ref,
+            "native_worker_claim.executable_binding.job_object_lineage_ref",
+        ),
+        (
+            presented.resource_limits_digest == current.resource_limits_digest,
+            "native_worker_claim.executable_binding.resource_limits_digest",
+        ),
+        (
+            presented.cancellation_policy_ref == current.cancellation_policy_ref,
+            "native_worker_claim.executable_binding.cancellation_policy_ref",
+        ),
+        (
+            presented.checkpoint_policy_digest == current.checkpoint_policy_digest,
+            "native_worker_claim.executable_binding.checkpoint_policy_digest",
+        ),
+        (
+            presented.drain_policy_ref == current.drain_policy_ref,
+            "native_worker_claim.executable_binding.drain_policy_ref",
+        ),
+        (
+            presented.restart_policy_digest == current.restart_policy_digest,
+            "native_worker_claim.executable_binding.restart_policy_digest",
+        ),
+    ] {
+        if !matches {
+            return Err(KernelServiceError::HandshakeMismatch { field });
+        }
     }
     Ok(())
 }
@@ -1215,6 +1327,14 @@ mod executable_binding_tests {
             capability_cell: CapabilityCellId::new("native-worker-core").expect("cell id"),
             grant_graph_revision: 5,
             module_catalog_revision: 7,
+            capability_cell_registry_digest: "e".repeat(64),
+            kernel_execution_manifest_digest: "f".repeat(64),
+            job_object_lineage_ref: "job-lineage-1".to_owned(),
+            resource_limits_digest: "1".repeat(64),
+            cancellation_policy_ref: "cancel-policy-1".to_owned(),
+            checkpoint_policy_digest: "2".repeat(64),
+            drain_policy_ref: "drain-policy-1".to_owned(),
+            restart_policy_digest: "3".repeat(64),
             replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
             launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
             process_invocation_digest: "d".repeat(64),
