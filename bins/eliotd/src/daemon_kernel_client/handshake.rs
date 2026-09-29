@@ -177,10 +177,11 @@ pub(crate) fn declared_module_contract(
 /// those exact bytes carry, so a substituted or edited manifest is refused
 /// rather than published.
 ///
-/// This is the daemon's manifest admission boundary. It is deliberately not
-/// reached from the live startup path: no build/package owner emits
-/// `module.toml` beside the artifact yet, so a live call could only fail. The
-/// wiring is blocked on that absent packaging owner.
+/// This is the daemon's manifest admission boundary. It is not yet reached from
+/// the live startup path because no build/package owner stages the manifest
+/// beside the artifact. The release bundler
+/// (`scripts/build-eliot-windows-x64-release.ps1`) is that owner and is not
+/// this issue's; the wiring is blocked on it.
 #[cfg(windows)]
 pub fn admitted_daemon_module_contract(
     accepted_artifact_sha256: &str,

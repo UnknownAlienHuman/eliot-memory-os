@@ -113,8 +113,9 @@ pub use module_graph::{
     UnresolvedCapability, resolve_required_capability_graph,
 };
 pub use module_manifest::{
-    AdmittedModuleManifest, MODULE_MANIFEST_FILE_NAME, MODULE_MANIFEST_SCHEMA_VERSION,
+    AdmittedModuleManifest, MODULE_MANIFEST_FILE_STEM, MODULE_MANIFEST_SCHEMA_VERSION,
     ModuleManifest, admit_module_manifest, admitted_manifest_path, compare_published_projection,
+    module_manifest_file_name,
 };
 pub use restart_policy::{
     AutomaticRestartDecision, RestartClass, RestartDependency, RestartDependencyKind,
