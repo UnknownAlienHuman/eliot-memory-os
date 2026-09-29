@@ -16,8 +16,8 @@ use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DependencyVersion, ExecutionOutcome, LifecycleAction, LifecycleCounters,
-    LiveSkillWorld, SkillCatalogueEntry, SkillError, SkillExecutionEvidence, SkillInteractionView,
+    DependencyVersion, ExecutionOutcome, LifecycleAction, LifecycleCounters, LiveSkillWorld,
+    SkillCatalogueEntry, SkillError, SkillExecutionEvidence, SkillInteractionView,
     SkillLifecycleView, SkillRef, SkillScope, SkillStatus, digest, text, unique,
 };
 
