@@ -50,6 +50,14 @@ mod restore_journal;
 #[path = "store/backup_snapshot.rs"]
 mod backup_snapshot;
 
+#[path = "store/external_attach.rs"]
+mod external_attach;
+pub use external_attach::{
+    ExternalAttachReceiptCursor, ExternalAttachReceiptRead, ExternalAttachReceiptReadback,
+    ExternalAttachReceiptSessionPage, ExternalAttachReceiptSessionRead,
+    ExternalAttachReceiptWrite,
+};
+
 mod recovery_projection;
 
 use crate::cutover_ownership::{
@@ -235,6 +243,11 @@ const SCAN_DISCLOSURE_RECORDS: TableDefinition<&str, &str> =
 /// admitted write attempt.
 const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_backup_verification_results_v1");
+/// Durable immutable ExternalAttach receipts bound to the authenticated
+/// Kernel server session; the session index lives in `META` and is updated in
+/// the same write transaction as each receipt row.
+const EXTERNAL_ATTACH_RECEIPTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_external_attach_receipts_v1");
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -23056,6 +23069,7 @@ impl RedbRecoveryStore {
         // every other base table, so a lookup on a store that never verified an
         // archive reads authoritatively absent. No row is backfilled or inferred.
         Self::materialize_backup_verification_table(write)?;
+        drop(write.open_table(EXTERNAL_ATTACH_RECEIPTS).map_err(storage)?);
         drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
         drop(
             write

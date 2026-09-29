@@ -102,8 +102,10 @@ pub use status_projection::{
     SupervisionStatusReason,
 };
 pub use store::{
-    CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
-    ScanDisclosureRecordOwner,
+    CanonicalEvidenceProvider, ExternalAttachReceiptCursor, ExternalAttachReceiptRead,
+    ExternalAttachReceiptReadback, ExternalAttachReceiptSessionPage,
+    ExternalAttachReceiptSessionRead, ExternalAttachReceiptWrite, OperationalRecoveryStore,
+    OrsCoordinator, RedbRecoveryStore, ScanDisclosureRecordOwner,
 };
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,

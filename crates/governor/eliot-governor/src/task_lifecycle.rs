@@ -1464,6 +1464,39 @@ mod tests {
     }
 
     impl KernelTransitionPort for TestKernel {
+        fn commit_external_attach_receipt(
+            &self,
+            _request: crate::ExternalAttachReceiptWrite,
+        ) -> crate::KernelPortFuture<'_, crate::ExternalAttachReceiptReadback> {
+            Box::pin(async {
+                Err(crate::KernelPortError::NotAdmitted(
+                    "test fixture has no ExternalAttach owner".to_owned(),
+                ))
+            })
+        }
+
+        fn read_external_attach_receipt(
+            &self,
+            _request: crate::ExternalAttachReceiptRead,
+        ) -> crate::KernelPortFuture<'_, Option<crate::ExternalAttachReceiptReadback>> {
+            Box::pin(async {
+                Err(crate::KernelPortError::NotAdmitted(
+                    "test fixture has no ExternalAttach owner".to_owned(),
+                ))
+            })
+        }
+
+        fn read_current_external_attach_receipt(
+            &self,
+            _request: crate::ExternalAttachReceiptSessionRead,
+        ) -> crate::KernelPortFuture<'_, crate::ExternalAttachReceiptSessionPage> {
+            Box::pin(async {
+                Err(crate::KernelPortError::NotAdmitted(
+                    "test fixture has no ExternalAttach owner".to_owned(),
+                ))
+            })
+        }
+
         fn apply_prepared<'a>(
             &'a self,
             identity: &RequestIdentity,

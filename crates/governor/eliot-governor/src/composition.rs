@@ -162,6 +162,31 @@ pub trait KernelTransitionPort: Send + Sync {
     /// Reconciles one operation by its exact canonical identity.
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>>;
 
+    /// Commits the complete immutable ExternalAttach receipt through its
+    /// Kernel-owned durable store path and returns the exact owner readback.
+    /// Implementations must preserve the stable claim key, fence, payload
+    /// bytes, and digest; a same-key payload conflict is never overwritten.
+    fn commit_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptWrite,
+    ) -> KernelPortFuture<'_, ExternalAttachReceiptReadback>;
+
+    /// Reads one immutable ExternalAttach receipt by its stable claim key
+    /// from the durable owner under the exact fence. Implementations must
+    /// return a fresh owner readback rather than a process-local cache.
+    fn read_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptRead,
+    ) -> KernelPortFuture<'_, Option<ExternalAttachReceiptReadback>>;
+
+    /// Reads one bounded page from the exact authenticated Kernel owner
+    /// session's immutable ExternalAttach receipt set. A stored older fence is
+    /// returned for caller validation; it must not be projected as absence.
+    fn read_current_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptSessionRead,
+    ) -> KernelPortFuture<'_, ExternalAttachReceiptSessionPage>;
+
     /// Returns a bounded Kernel-owned health observation.
     fn health(&self) -> KernelPortFuture<'_, StoreHealth>;
 
@@ -187,6 +212,107 @@ pub trait KernelTransitionPort: Send + Sync {
 pub type KernelPortFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, KernelPortError>> + Send + 'a>>;
 
+/// Reads every page of one authenticated ExternalAttach session without
+/// accumulating receipt payloads in memory. The final empty request is pinned
+/// to the same owner revision and row count as the preceding pages.
+pub async fn visit_external_attach_receipt_session_on_port<F>(
+    kernel: &dyn KernelTransitionPort,
+    mut request: ExternalAttachReceiptSessionRead,
+    mut visit: F,
+) -> Result<ExternalAttachReceiptSessionSnapshot, KernelPortError>
+where
+    F: FnMut(&ExternalAttachReceiptReadback) -> Result<(), KernelPortError>,
+{
+    request.validate()?;
+    if request.cursor.is_some() {
+        return Err(KernelPortError::Contract(
+            "complete ExternalAttach session read must begin without a cursor".to_owned(),
+        ));
+    }
+    let mut cursor = None;
+    let mut pinned_revision = None;
+    let mut pinned_count = None;
+    let mut visited_rows = 0_u64;
+    let mut last_key: Option<eliot_ors::OperationIdentity> = None;
+    loop {
+        request.cursor = cursor.clone();
+        let page = kernel
+            .read_current_external_attach_receipt(request.clone())
+            .await?;
+        page.validate_for(&request)?;
+        if pinned_revision.is_some_and(|revision| revision != page.session_revision)
+            || pinned_count.is_some_and(|count| count != page.row_count)
+        {
+            return Err(KernelPortError::Contract(
+                "ExternalAttach receipt session changed between pages".to_owned(),
+            ));
+        }
+        pinned_revision.get_or_insert(page.session_revision);
+        pinned_count.get_or_insert(page.row_count);
+        for record in &page.records {
+            validate_external_attach_payload_bound(&record.canonical_payload)?;
+            if last_key
+                .as_ref()
+                .is_some_and(|previous| previous.as_str() >= record.key.as_str())
+            {
+                return Err(KernelPortError::Contract(
+                    "ExternalAttach receipt pages are not a strict key-ordered set".to_owned(),
+                ));
+            }
+            visit(record)?;
+            visited_rows = visited_rows.checked_add(1).ok_or_else(|| {
+                KernelPortError::Contract("ExternalAttach receipt count overflow".to_owned())
+            })?;
+            last_key = Some(record.key.clone());
+        }
+        if visited_rows > page.row_count {
+            return Err(KernelPortError::Contract(
+                "ExternalAttach receipt pages exceed their owner row count".to_owned(),
+            ));
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            if visited_rows != page.row_count {
+                return Err(KernelPortError::Contract(
+                    "ExternalAttach receipt walk did not close its owner row count".to_owned(),
+                ));
+            }
+            let revision = page.session_revision;
+            let row_count = page.row_count;
+            request.cursor = Some(ExternalAttachReceiptCursor {
+                session_revision: revision,
+                after_key: last_key.clone(),
+                emitted_rows: visited_rows,
+            });
+            let final_page = kernel
+                .read_current_external_attach_receipt(request.clone())
+                .await?;
+            final_page.validate_for(&request)?;
+            if final_page.session_revision != revision
+                || final_page.row_count != row_count
+                || !final_page.records.is_empty()
+                || final_page.next_cursor.is_some()
+            {
+                return Err(KernelPortError::Contract(
+                    "ExternalAttach final empty page did not confirm the pinned session set"
+                        .to_owned(),
+                ));
+            }
+            return Ok(ExternalAttachReceiptSessionSnapshot {
+                owner_session_binding: request.owner_session_binding,
+                expected_state_fence: request.expected_state_fence,
+                session_revision: revision,
+                row_count,
+            });
+        };
+        if next_cursor.emitted_rows != visited_rows {
+            return Err(KernelPortError::Contract(
+                "ExternalAttach owner cursor does not match the visited row prefix".to_owned(),
+            ));
+        }
+        cursor = Some(next_cursor);
+    }
+}
+
 /// Typed failure at the neutral Kernel port.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum KernelPortError {
@@ -199,6 +325,44 @@ pub enum KernelPortError {
     /// The authenticated Kernel generation is not currently admitted.
     #[error("Kernel generation is not admitted: {0}")]
     NotAdmitted(String),
+}
+
+impl From<eliot_ors::OrsError> for KernelPortError {
+    fn from(error: eliot_ors::OrsError) -> Self {
+        Self::Contract(error.to_string())
+    }
+}
+
+/// Payload ceiling for the ExternalAttach receipt owner operation. The
+/// canonical receipt is carried as a JSON string in the I7.2 bounded EBP
+/// frame, where JSON string escaping can at most double the payload bytes.
+/// Keeping the canonical form to one quarter of the frame leaves the other
+/// half for escaping and the identity/operation envelope.
+pub const MAX_EXTERNAL_ATTACH_RECEIPT_PAYLOAD_BYTES: usize =
+    eliot_protocol::MAX_FRAME_BYTES / 4;
+
+fn validate_external_attach_payload_bound(payload: &str) -> Result<(), KernelPortError> {
+    if payload.is_empty() || payload.len() > MAX_EXTERNAL_ATTACH_RECEIPT_PAYLOAD_BYTES {
+        return Err(KernelPortError::Contract(
+            "ExternalAttach receipt payload exceeds its bounded EBP owner envelope".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub use eliot_ors::{
+    ExternalAttachReceiptCursor, ExternalAttachReceiptRead, ExternalAttachReceiptReadback,
+    ExternalAttachReceiptSessionPage, ExternalAttachReceiptSessionRead,
+    ExternalAttachReceiptWrite,
+};
+
+/// Complete, revision-pinned owner view used for Material admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalAttachReceiptSessionSnapshot {
+    pub owner_session_binding: String,
+    pub expected_state_fence: StateFence,
+    pub session_revision: u64,
+    pub row_count: u64,
 }
 
 /// Narrow durable boundary for the canonical second phase of a grant
@@ -4375,6 +4539,133 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self.snapshot
     }
 
+    /// Commits and reads back one exact ExternalAttach receipt through the
+    /// authenticated Kernel owner under this composition's current fence.
+    /// The owner response is accepted only when its key, fence, canonical
+    /// bytes, digest, and store-issued receipt identity all bind to the write.
+    pub async fn commit_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptWrite,
+    ) -> Result<ExternalAttachReceiptReadback, KernelPortError> {
+        request.validate()?;
+        validate_external_attach_payload_bound(&request.canonical_payload)?;
+        if self.readiness != CompositionReadiness::Ready
+            || request.state_fence != self.snapshot.state_fence()
+        {
+            return Err(KernelPortError::NotAdmitted(
+                "ExternalAttach receipt write does not match the ready Kernel fence".to_owned(),
+            ));
+        }
+        let expected_key = request.key.clone();
+        let expected_session = request.owner_session_binding.clone();
+        let expected_payload = request.canonical_payload.clone();
+        let expected_digest = request.payload_sha256.clone();
+        let expected_fence = request.state_fence.clone();
+        let readback = self.kernel.commit_external_attach_receipt(request).await?;
+        readback.validate()?;
+        validate_external_attach_payload_bound(&readback.canonical_payload)?;
+        if readback.key != expected_key
+            || readback.owner_session_binding != expected_session
+            || readback.state_fence != expected_fence
+            || readback.canonical_payload != expected_payload
+            || readback.payload_sha256 != expected_digest
+        {
+            return Err(KernelPortError::Contract(
+                "ExternalAttach durable owner readback differs from its original write".to_owned(),
+            ));
+        }
+        Ok(readback)
+    }
+
+    /// Reads one previously committed ExternalAttach receipt from the Kernel
+    /// owner under this composition's current fence. No in-process projection
+    /// is consulted or accepted as a durable read.
+    pub async fn read_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptRead,
+    ) -> Result<Option<ExternalAttachReceiptReadback>, KernelPortError> {
+        request.validate()?;
+        if self.readiness != CompositionReadiness::Ready
+            || request.state_fence != self.snapshot.state_fence()
+        {
+            return Err(KernelPortError::NotAdmitted(
+                "ExternalAttach receipt read does not match the ready Kernel fence".to_owned(),
+            ));
+        }
+        let expected_key = request.key.clone();
+        let expected_session = request.owner_session_binding.clone();
+        let expected_fence = request.state_fence.clone();
+        let Some(readback) = self.kernel.read_external_attach_receipt(request).await? else {
+            return Ok(None);
+        };
+        readback.validate()?;
+        validate_external_attach_payload_bound(&readback.canonical_payload)?;
+        if readback.key != expected_key
+            || readback.owner_session_binding != expected_session
+            || readback.state_fence != expected_fence
+        {
+            return Err(KernelPortError::Contract(
+                "ExternalAttach durable owner returned a different key or State Fence".to_owned(),
+            ));
+        }
+        Ok(Some(readback))
+    }
+
+    /// Reads one bounded page from the authenticated Kernel owner session's
+    /// durable ExternalAttach receipt set. This is the Material-gate source
+    /// used after a daemon restart; the in-process Bridge cache is never
+    /// consulted.
+    pub async fn read_current_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptSessionRead,
+    ) -> Result<ExternalAttachReceiptSessionPage, KernelPortError> {
+        request.validate()?;
+        if self.readiness != CompositionReadiness::Ready
+            || request.expected_state_fence != self.snapshot.state_fence()
+        {
+            return Err(KernelPortError::NotAdmitted(
+                "ExternalAttach session read does not match the ready Kernel fence".to_owned(),
+            ));
+        }
+        let expected_session = request.owner_session_binding.clone();
+        let expected_request = request.clone();
+        let page = self
+            .kernel
+            .read_current_external_attach_receipt(request)
+            .await?;
+        page.validate_for(&expected_request)?;
+        for readback in &page.records {
+            validate_external_attach_payload_bound(&readback.canonical_payload)?;
+        }
+        if page.owner_session_binding != expected_session {
+            return Err(KernelPortError::Contract(
+                "ExternalAttach owner returned a different session index".to_owned(),
+            ));
+        }
+        Ok(page)
+    }
+
+    /// Reads and validates every page in one exact owner-session set. The
+    /// visitor consumes each durable record before the next page is requested,
+    /// keeping the transport bounded and avoiding an in-memory authority cache.
+    pub async fn visit_external_attach_receipt_session<F>(
+        &self,
+        request: ExternalAttachReceiptSessionRead,
+        visit: F,
+    ) -> Result<ExternalAttachReceiptSessionSnapshot, KernelPortError>
+    where
+        F: FnMut(&ExternalAttachReceiptReadback) -> Result<(), KernelPortError>,
+    {
+        if self.readiness != CompositionReadiness::Ready
+            || request.expected_state_fence != self.snapshot.state_fence()
+        {
+            return Err(KernelPortError::NotAdmitted(
+                "ExternalAttach session walk does not match the ready Kernel fence".to_owned(),
+            ));
+        }
+        visit_external_attach_receipt_session_on_port(self.kernel.as_ref(), request, visit).await
+    }
+
     /// Returns the provider-owned recovery evidence retained for exact replay
     /// and diagnostics.
     #[must_use]
@@ -7931,6 +8222,39 @@ mod tests {
     }
 
     impl KernelTransitionPort for FakeKernel {
+        fn commit_external_attach_receipt(
+            &self,
+            _request: crate::ExternalAttachReceiptWrite,
+        ) -> KernelPortFuture<'_, crate::ExternalAttachReceiptReadback> {
+            Box::pin(async {
+                Err(KernelPortError::NotAdmitted(
+                    "test fixture has no ExternalAttach owner".to_owned(),
+                ))
+            })
+        }
+
+        fn read_external_attach_receipt(
+            &self,
+            _request: crate::ExternalAttachReceiptRead,
+        ) -> KernelPortFuture<'_, crate::ExternalAttachReceiptSessionPage> {
+            Box::pin(async {
+                Err(KernelPortError::NotAdmitted(
+                    "test fixture has no ExternalAttach owner".to_owned(),
+                ))
+            })
+        }
+
+        fn read_current_external_attach_receipt(
+            &self,
+            _request: crate::ExternalAttachReceiptSessionRead,
+        ) -> KernelPortFuture<'_, crate::ExternalAttachReceiptSessionPage> {
+            Box::pin(async {
+                Err(KernelPortError::NotAdmitted(
+                    "test fixture has no ExternalAttach owner".to_owned(),
+                ))
+            })
+        }
+
         fn apply_prepared<'a>(
             &'a self,
             identity: &RequestIdentity,

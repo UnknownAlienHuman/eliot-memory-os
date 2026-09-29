@@ -11,7 +11,9 @@
 
 use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
 use eliot_governor::{
-    KernelPortError, KernelPortFuture, KernelTransitionPort, TaskControllerCampaignSourceHeads,
+    ExternalAttachReceiptRead, ExternalAttachReceiptReadback, ExternalAttachReceiptSessionRead,
+    ExternalAttachReceiptSessionPage, ExternalAttachReceiptWrite, KernelPortError,
+    KernelPortFuture, KernelTransitionPort, TaskControllerCampaignSourceHeads,
 };
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignSourceRole, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
@@ -328,6 +330,116 @@ impl KernelTransitionPort for DaemonKernelClient {
             }
             .instrument(span),
         )
+    }
+
+    fn commit_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptWrite,
+    ) -> KernelPortFuture<'_, ExternalAttachReceiptReadback> {
+        Box::pin(async move {
+            request.validate()?;
+            if request.state_fence != self.kernel_binding.state_fence {
+                return Err(KernelPortError::Contract(
+                    "ExternalAttach receipt write fence differs from the authenticated Kernel fence"
+                        .to_owned(),
+                ));
+            }
+            let expected = request.clone();
+            let payload = serde_json::to_value(request)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let response = self
+                .transact_async("external_attach_receipt_commit", payload)
+                .await
+                .map_err(kernel_port_error)?;
+            let value = kind_value(&response, "external_attach_receipt")?;
+            let readback: ExternalAttachReceiptReadback = serde_json::from_value(value)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            readback.validate()?;
+            if readback.key != expected.key
+                || readback.owner_session_binding != expected.owner_session_binding
+                || readback.state_fence != expected.state_fence
+                || readback.canonical_payload != expected.canonical_payload
+                || readback.payload_sha256 != expected.payload_sha256
+            {
+                return Err(KernelPortError::Contract(
+                    "Kernel ExternalAttach commit readback differs from its exact write"
+                        .to_owned(),
+                ));
+            }
+            Ok(readback)
+        })
+    }
+
+    fn read_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptRead,
+    ) -> KernelPortFuture<'_, Option<ExternalAttachReceiptReadback>> {
+        Box::pin(async move {
+            request.validate()?;
+            if request.state_fence != self.kernel_binding.state_fence {
+                return Err(KernelPortError::Contract(
+                    "ExternalAttach receipt read fence differs from the authenticated Kernel fence"
+                        .to_owned(),
+                ));
+            }
+            let expected_key = request.key.clone();
+            let expected_session = request.owner_session_binding.clone();
+            let payload = serde_json::to_value(request)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let response = self
+                .transact_async("external_attach_receipt_read", payload)
+                .await
+                .map_err(kernel_port_error)?;
+            let value = kind_value(&response, "external_attach_receipt")?;
+            let readback = serde_json::from_value::<Option<ExternalAttachReceiptReadback>>(value)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if let Some(readback) = readback.as_ref() {
+                readback.validate()?;
+                if readback.key != expected_key
+                    || readback.owner_session_binding != expected_session
+                {
+                    return Err(KernelPortError::Contract(
+                        "Kernel ExternalAttach receipt read returned a different owner key"
+                            .to_owned(),
+                    ));
+                }
+            }
+            Ok(readback)
+        })
+    }
+
+    fn read_current_external_attach_receipt(
+        &self,
+        request: ExternalAttachReceiptSessionRead,
+    ) -> KernelPortFuture<'_, ExternalAttachReceiptSessionPage> {
+        Box::pin(async move {
+            request.validate()?;
+            if request.expected_state_fence != self.kernel_binding.state_fence {
+                return Err(KernelPortError::Contract(
+                    "ExternalAttach current-session read fence differs from the authenticated Kernel fence"
+                        .to_owned(),
+                ));
+            }
+            let expected_session = request.owner_session_binding.clone();
+            let expected_request = request.clone();
+            let payload = serde_json::to_value(request)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let response = self
+                .transact_async("external_attach_receipt_read_current", payload)
+                .await
+                .map_err(kernel_port_error)?;
+            let value = kind_value(&response, "external_attach_receipt")?;
+            let page = serde_json::from_value::<ExternalAttachReceiptSessionPage>(value)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            page.validate_for(&expected_request)?;
+            if page.owner_session_binding != expected_session {
+                return Err(KernelPortError::Contract(
+                    "Kernel ExternalAttach current-session read returned a different session"
+                        .to_owned(),
+                ));
+            }
+            Ok(page)
+        })
     }
 
     fn health(&self) -> KernelPortFuture<'_, StoreHealth> {

@@ -15,8 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
     CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
-    GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
-    KernelGenerationSnapshotProvider, PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
+    ExternalAttachReceiptRead, ExternalAttachReceiptReadback, ExternalAttachReceiptSessionRead,
+    ExternalAttachReceiptWrite, GovernorActivationOutcome, GovernorComposition,
+    GovernorLaunchConfig, KernelGenerationPort, KernelGenerationSnapshotProvider, KernelPortError,
+    PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -132,6 +134,11 @@ pub use agent_fabric::{
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
 use controlboard_adapters::SharedOperatorReplay;
+
+use crate::external_attach_reconciliation::{
+    decode_external_attach_owner_payload, encode_external_attach_owner_payload,
+    external_attach_claim_key,
+};
 
 pub use canonical_config_precedence::{
     ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
@@ -636,23 +643,6 @@ pub struct DaemonComposition {
     /// [`maintain_governor_authority_feed`](crate::maintain_governor_authority_feed);
     /// nothing is derived here and no coverage is synthesized.
     governor_authority: eliot_governor::LiveGovernorAuthority,
-    /// Retained ingress record for an attach of an already-running
-    /// external agent (issue #1782, I11.11 lines 27-42).
-    ///
-    /// `None` until an ingress installs a caller-observed receipt, which is
-    /// what an empty supply honestly means: no external agent has attached,
-    /// so there is nothing to reconcile. It is never defaulted to a
-    /// reconciled attach and never derived from this process's own
-    /// config/state directories, which are not a user `WorkScope`. The
-    /// record joins the compiled receipt to the exact Bridge
-    /// request/session/task/fence binding it was compiled under plus the
-    /// live Governor fence and Kernel-issued owner session observed at
-    /// ingest. Read by [`Self::admit_material_continuation_after_attach`]
-    /// and [`Self::admit_material_continuation_for_attach`], which refuse a
-    /// stale, substituted, or unattributed continuation, and by
-    /// [`Self::replay_bridge_external_attach`], which reads back the exact
-    /// retained binding on replay.
-    external_attach: Option<Box<ExternalAttachIngressRecord>>,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -859,6 +849,43 @@ fn blocked_port(
     }
 }
 
+fn external_attach_kernel_error(
+    error: KernelPortError,
+) -> Box<eliot_agent_bridge_core::BridgeError> {
+    Box::new(eliot_agent_bridge_core::BridgeError::ProviderContract(format!(
+        "durable ExternalAttach Kernel owner operation failed: {error}"
+    )))
+}
+
+pub(crate) fn external_attach_record_from_readback(
+    read_request: &ExternalAttachReceiptSessionRead,
+    readback: &ExternalAttachReceiptReadback,
+) -> Result<ExternalAttachIngressRecord, Box<eliot_agent_bridge_core::BridgeError>> {
+    readback
+        .validate()
+        .map_err(external_attach_kernel_error)?;
+    if readback.owner_session_binding != read_request.owner_session_binding
+        || readback.state_fence != read_request.expected_state_fence
+    {
+        return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+    }
+    let record = decode_external_attach_owner_payload(
+        &readback.canonical_payload,
+        &readback.payload_sha256,
+    )?;
+    let Some(claim) = record.claim.as_ref() else {
+        return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+    };
+    if record.owner_session_binding.as_deref()
+        != Some(read_request.owner_session_binding.as_str())
+        || record.admitted_fence != read_request.expected_state_fence
+        || external_attach_claim_key(claim)? != readback.key.as_str()
+    {
+        return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+    }
+    Ok(record)
+}
+
 impl DaemonComposition {
     /// Composes the daemon only from a Host-approved authenticated Kernel port.
     ///
@@ -923,7 +950,6 @@ impl DaemonComposition {
             capability_outcomes: std::sync::Mutex::new(CapabilityRegistryView::default()),
             learning_closure: eliot_governor::LearningClosureService::new(),
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
-            external_attach: None,
         })
     }
 
@@ -1004,6 +1030,7 @@ impl DaemonComposition {
         self.admit_material_continuation_after_attach(
             eliot_workscope::RequestedEffect::CanonicalWrite,
         )
+        .await
         .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
         let admission = crate::task_binding_admission::admit_canonical_write(
             envelope.operation_id.as_str().to_owned(),
@@ -3406,54 +3433,41 @@ impl DaemonComposition {
         }
     }
 
-    /// Compiles and retains the reconciliation receipt for one attach of an
-    /// already-running external agent (issue #1782, I11.11 lines 27-42).
-    ///
-    /// I11.11 line 27: "Attaching an already-running external agent does not
-    /// retroactively make its earlier activity observed or authorized. ELIOT
-    /// creates an `ExternalAttachReconciliationReceipt`." The composition owns
-    /// only the retention of the already-compiled receipt: it validates it
-    /// through [`ExternalAttachReconciliationReceipt::validate`] and installs
-    /// it as this composition's single retained attach state. It mints no
-    /// receipt, adopts no pre-attach effect, and derives nothing from a process
-    /// name, PID, executable path, current directory or discovery order.
-    ///
-    /// # Not yet reached by a transport caller (issue #1782)
-    ///
-    /// This method currently has zero call sites. It validates the presented
-    /// receipt through [`ExternalAttachReconciliationReceipt::validate`] and
-    /// installs it as this composition's single retained attach state together
-    /// with the live Governor fence and the noted owner session, so even the
-    /// receipt-only path carries the applicability snapshots the continuation
-    /// recheck compares. It mints no receipt, adopts no pre-attach effect,
-    /// and derives nothing from a process name, PID, executable path, current
-    /// directory or discovery order. The Bridge ingress that binds a receipt
-    /// to its exact request/session/task/fence/attempt binding is
-    /// [`Self::serve_bridge_external_attach`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from
-    /// [`ExternalAttachReconciliationReceipt::validate`] when the presented
-    /// receipt does not validate, leaving the previously retained record
-    /// untouched.
-    pub fn record_external_attach_reconciliation(
-        &mut self,
-        receipt: &ExternalAttachReconciliationReceipt,
-    ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
-        receipt.validate()?;
-        let live_fence = self.governor.kernel_snapshot().state_fence();
-        let live_session = self
+    /// Builds the durable current-session selector for ExternalAttach owner
+    /// reads. Missing authenticated Kernel session evidence is stale authority,
+    /// not proof that the session has no prior attach.
+    pub(crate) fn external_attach_session_read_request(
+        &self,
+    ) -> Result<ExternalAttachReceiptSessionRead, Box<eliot_agent_bridge_core::BridgeError>> {
+        let owner_session_binding = self
             .owner_session
             .as_ref()
-            .map(|facts| facts.session_binding().to_owned());
-        self.external_attach = Some(Box::new(ExternalAttachIngressRecord {
-            claim: None,
-            receipt: receipt.clone(),
-            admitted_fence: live_fence,
-            owner_session_binding: live_session,
-        }));
-        Ok(())
+            .map(|facts| facts.session_binding().to_owned())
+            .ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority))?;
+        Ok(ExternalAttachReceiptSessionRead {
+            owner_session_binding,
+            expected_state_fence: self.governor.kernel_snapshot().state_fence().clone(),
+            cursor: None,
+            limit: 1,
+        })
+    }
+
+    fn external_attach_key_read_request(
+        &self,
+        claim_key: &str,
+    ) -> Result<ExternalAttachReceiptRead, Box<eliot_agent_bridge_core::BridgeError>> {
+        let session = self.external_attach_session_read_request()?;
+        let key = eliot_ors::OperationIdentity::new(claim_key.to_owned()).map_err(|_| {
+            Box::new(eliot_agent_bridge_core::BridgeError::InvalidContract {
+                field: "external_attach_record.claim_key",
+                reason: "stable owner key is invalid",
+            })
+        })?;
+        Ok(ExternalAttachReceiptRead {
+            key,
+            owner_session_binding: session.owner_session_binding,
+            state_fence: session.expected_state_fence,
+        })
     }
 
     /// Serves one live Bridge external-attach request (issue #1782 audit
@@ -3468,10 +3482,10 @@ impl DaemonComposition {
     /// `WorkScope` owners actually observed for that attach. The binding
     /// claim is copied and checked first, the owner observations are fed into
     /// [`reconcile_external_attach`](crate::reconcile_external_attach)
-    /// unchanged, and the resulting record is retained before the returned
-    /// view is read back from that retention: the Bridge clears its own
-    /// reconciliation flag only after this method reports success, never
-    /// before the receipt is persisted here. A startup attach was
+    /// unchanged, and the resulting versioned record is committed and read
+    /// back from the Kernel owner before a binding view is returned: the
+    /// Bridge clears its reconciliation flag only after both exact owner
+    /// reads succeed. A startup attach was
     /// deliberately not added to manufacture a caller, and the daemon's own
     /// config/state directories were never used as a stand-in `WorkScope`.
     ///
@@ -3480,35 +3494,64 @@ impl DaemonComposition {
     /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from the
     /// binding-claim, compiler, or receipt-validation leg, leaving any
     /// previously retained record untouched.
-    pub fn serve_bridge_external_attach(
-        &mut self,
+    pub async fn serve_bridge_external_attach(
+        &self,
         binding: &eliot_agent_bridge_core::AttachBinding,
         request: &eliot_agent_bridge_core::AttachRequest,
         observation: &ExternalAttachObservation,
     ) -> Result<ExternalAttachBindingView, Box<eliot_agent_bridge_core::BridgeError>> {
         let claim = claim_bridge_attach(binding, request)?;
-        let live_fence = self.governor.kernel_snapshot().state_fence();
-        let live_session = self
-            .owner_session
-            .as_ref()
-            .map(|facts| facts.session_binding().to_owned());
-        let record =
-            serve_bridge_external_attach(claim, observation, &live_fence, live_session.as_deref())?;
-        self.external_attach = Some(Box::new(record));
-        let retained = self
-            .external_attach
-            .as_deref()
+        let session_read = self.external_attach_session_read_request()?;
+        let record = serve_bridge_external_attach(
+            claim,
+            observation,
+            &session_read.expected_state_fence,
+            Some(&session_read.owner_session_binding),
+        )?;
+        let owner_payload = encode_external_attach_owner_payload(&record)?;
+        let key = eliot_ors::OperationIdentity::new(owner_payload.claim_key.clone()).map_err(|_| {
+            Box::new(eliot_agent_bridge_core::BridgeError::InvalidContract {
+                field: "external_attach_record.claim_key",
+                reason: "stable owner key is invalid",
+            })
+        })?;
+        let write = ExternalAttachReceiptWrite {
+            key,
+            owner_session_binding: session_read.owner_session_binding.clone(),
+            state_fence: session_read.expected_state_fence.clone(),
+            canonical_payload: owner_payload.canonical_json,
+            payload_sha256: owner_payload.payload_sha256,
+        };
+        let committed = self
+            .governor
+            .commit_external_attach_receipt(write)
+            .await
+            .map_err(external_attach_kernel_error)?;
+        let key_read = self
+            .governor
+            .read_external_attach_receipt(
+                self.external_attach_key_read_request(&owner_payload.claim_key)?,
+            )
+            .await
+            .map_err(external_attach_kernel_error)?
             .ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::NotAttached))?;
-        binding_view(retained)
+        if committed != key_read {
+            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+        }
+        let retained = external_attach_record_from_readback(&session_read, &key_read)?;
+        if retained != record {
+            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+        }
+        binding_view(&retained)
     }
 
-    /// Replays the retained disposition for a lost Bridge response (issue
+    /// Replays the durable disposition for a lost Bridge response (issue
     /// #1782 audit repair).
     ///
     /// The presenting binding must equal the retained claim field for field:
     /// an exact match reads back the same disposition with the same
     /// continuation and the same attempt identity, minting nothing, while
-    /// any other binding fails closed without touching the retained record.
+    /// any other binding fails closed without changing the durable record.
     /// A lost response therefore recovers the same disposition instead of
     /// creating another continuation or silently resetting the
     /// reconciliation state.
@@ -3517,38 +3560,55 @@ impl DaemonComposition {
     ///
     /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from the
     /// binding-claim, replay-match, or receipt-validation leg.
-    pub fn replay_bridge_external_attach(
+    pub async fn replay_bridge_external_attach(
         &self,
         binding: &eliot_agent_bridge_core::AttachBinding,
         request: &eliot_agent_bridge_core::AttachRequest,
     ) -> Result<ExternalAttachBindingView, Box<eliot_agent_bridge_core::BridgeError>> {
         let presenting = claim_bridge_attach(binding, request)?;
-        let record = self.external_attach.as_deref();
-        replay_bridge_external_attach(record, &presenting)?;
-        let retained =
-            record.ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::NotAttached))?;
-        binding_view(retained)
+        let session_read = self.external_attach_session_read_request()?;
+        let claim_key = external_attach_claim_key(&presenting)?;
+        let key_read = self
+            .governor
+            .read_external_attach_receipt(self.external_attach_key_read_request(&claim_key)?)
+            .await
+            .map_err(external_attach_kernel_error)?
+            .ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::NotAttached))?;
+        let retained = external_attach_record_from_readback(&session_read, &key_read)?;
+        replay_bridge_external_attach(Some(&retained), &presenting)?;
+        binding_view(&retained)
     }
 
-    /// Borrows the retained external-attach reconciliation receipt, if any.
+    /// Reads the durable ExternalAttach receipt for the current authenticated
+    /// Kernel owner session, if any.
     ///
     /// `None` means no external agent has attached: not "reconciled", and never
     /// a synthesized read-only or attributed disposition.
-    #[must_use]
-    pub fn external_attach_reconciliation(&self) -> Option<&ExternalAttachReconciliationReceipt> {
-        self.external_attach
-            .as_deref()
-            .map(|record| &record.receipt)
+    pub async fn external_attach_reconciliation(
+        &self,
+    ) -> Result<Vec<ExternalAttachReconciliationReceipt>, Box<eliot_agent_bridge_core::BridgeError>> {
+        let session_read = self.external_attach_session_read_request()?;
+        let mut receipts = Vec::new();
+        self.governor
+            .visit_external_attach_receipt_session(session_read.clone(), |readback| {
+                let record = external_attach_record_from_readback(&session_read, readback)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                receipts.push(record.receipt);
+                Ok(())
+            })
+            .await
+            .map_err(external_attach_kernel_error)?;
+        Ok(receipts)
     }
 
-    /// Admits one requested effect against the retained external-attach
+    /// Admits one requested effect against the durable external-attach
     /// disposition (issue #1782, I11.11 line 42).
     ///
     /// I11.11 line 42: "Any request to continue Material work before that
     /// disposition returns `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED`." I14.24
     /// line 23: "read-only inspection and unrelated tasks continue". A
     /// non-Material effect is therefore always admitted, and a Material effect
-    /// is admitted only when the retained record reached an attributed
+    /// is admitted only when the owner readback reached an attributed
     /// continuation. Before that disposition gate, applicability is rechecked
     /// against the live owners: the live Governor fence must still equal the
     /// admitted fence and the live owner session must still equal the
@@ -3565,25 +3625,66 @@ impl DaemonComposition {
     /// Returns [`eliot_agent_bridge_core::BridgeError::InvalidContract`] when
     /// the retained receipt does not validate,
     /// [`eliot_agent_bridge_core::BridgeError::StaleAuthority`] when the live
-    /// fence or owner session no longer matches the retained record, and
+    /// fence or owner session no longer matches the owner readback, and
     /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`]
     /// when a Material effect is requested before an attributed continuation.
-    pub fn admit_material_continuation_after_attach(
+    pub async fn admit_material_continuation_after_attach(
         &self,
         effect: eliot_workscope::RequestedEffect,
     ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
-        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if !effect.requires_material_readiness() {
+            return Ok(());
+        }
+        let session_read = self.external_attach_session_read_request()?;
+        let mut all_continuable = true;
+        let snapshot = self
+            .governor
+            .visit_external_attach_receipt_session(session_read.clone(), |readback| {
+                let record = external_attach_record_from_readback(&session_read, readback)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                all_continuable &= record.receipt.admits_material_continuation();
+                Ok(())
+            })
+            .await
+            .map_err(external_attach_kernel_error)?;
+        self.admit_material_continuation_from_owner_snapshot(
+            effect,
+            &session_read,
+            &snapshot,
+            all_continuable,
+        )
+    }
+
+    /// Revalidates the owner session and State Fence after the revision-pinned
+    /// multi-page Kernel walk before accepting the complete owner set.
+    pub(crate) fn admit_material_continuation_from_owner_snapshot(
+        &self,
+        effect: eliot_workscope::RequestedEffect,
+        request: &ExternalAttachReceiptSessionRead,
+        snapshot: &eliot_governor::ExternalAttachReceiptSessionSnapshot,
+        all_continuable: bool,
+    ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
+        if !effect.requires_material_readiness() {
+            return Ok(());
+        }
         let live_session = self
             .owner_session
             .as_ref()
-            .map(|facts| facts.session_binding().to_owned());
-        admit_material_continuation_for_record(
-            effect,
-            self.external_attach.as_deref(),
-            None,
-            &live_fence,
-            live_session.as_deref(),
-        )
+            .map(|facts| facts.session_binding());
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if live_session != Some(request.owner_session_binding.as_str())
+            || live_fence != &request.expected_state_fence
+            || snapshot.owner_session_binding != request.owner_session_binding
+            || snapshot.expected_state_fence != request.expected_state_fence
+        {
+            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+        }
+        if snapshot.row_count == 0 || all_continuable {
+            return Ok(());
+        }
+        Err(Box::new(
+            eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired,
+        ))
     }
 
     /// Admits one requested effect for a caller presenting its live Bridge
@@ -3600,29 +3701,67 @@ impl DaemonComposition {
     /// # Errors
     ///
     /// Returns [`eliot_agent_bridge_core::BridgeError::InvalidContract`] for
-    /// a malformed presenting binding or a retained receipt that does not
+    /// a malformed presenting binding or a durable receipt that does not
     /// validate, [`eliot_agent_bridge_core::BridgeError::StaleAuthority`]
     /// for a stale or substituted binding, fence, or session, and
     /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`]
     /// when a Material effect is requested before an attributed continuation.
-    pub fn admit_material_continuation_for_attach(
+    pub async fn admit_material_continuation_for_attach(
         &self,
         effect: eliot_workscope::RequestedEffect,
         binding: &eliot_agent_bridge_core::AttachBinding,
         request: &eliot_agent_bridge_core::AttachRequest,
     ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
         let presenting = claim_bridge_attach(binding, request)?;
-        let live_fence = self.governor.kernel_snapshot().state_fence();
-        let live_session = self
-            .owner_session
-            .as_ref()
-            .map(|facts| facts.session_binding().to_owned());
+        let session_read = self.external_attach_session_read_request()?;
+        if !effect.requires_material_readiness() {
+            return admit_material_continuation_for_record(
+                effect,
+                None,
+                Some(&presenting),
+                &session_read.expected_state_fence,
+                Some(&session_read.owner_session_binding),
+            );
+        }
+        let claim_key = external_attach_claim_key(&presenting)?;
+        let key_read = self
+            .governor
+            .read_external_attach_receipt(self.external_attach_key_read_request(&claim_key)?)
+            .await
+            .map_err(external_attach_kernel_error)?
+            .ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::NotAttached))?;
+        let retained = external_attach_record_from_readback(&session_read, &key_read)?;
+        replay_bridge_external_attach(Some(&retained), &presenting)?;
+        let mut all_continuable = true;
+        let mut exact_key_in_session = false;
+        let snapshot = self
+            .governor
+            .visit_external_attach_receipt_session(session_read.clone(), |readback| {
+                let record = external_attach_record_from_readback(&session_read, readback)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                if readback.key == key_read.key {
+                    exact_key_in_session = readback == &key_read;
+                }
+                all_continuable &= record.receipt.admits_material_continuation();
+                Ok(())
+            })
+            .await
+            .map_err(external_attach_kernel_error)?;
+        if !exact_key_in_session {
+            return Err(Box::new(eliot_agent_bridge_core::BridgeError::StaleAuthority));
+        }
+        self.admit_material_continuation_from_owner_snapshot(
+            effect,
+            &session_read,
+            &snapshot,
+            all_continuable,
+        )?;
         admit_material_continuation_for_record(
             effect,
-            self.external_attach.as_deref(),
+            Some(&retained),
             Some(&presenting),
-            &live_fence,
-            live_session.as_deref(),
+            &session_read.expected_state_fence,
+            Some(&session_read.owner_session_binding),
         )
     }
 

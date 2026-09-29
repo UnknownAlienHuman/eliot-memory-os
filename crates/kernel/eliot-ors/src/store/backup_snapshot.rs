@@ -95,8 +95,8 @@
 //! declares — by referencing `store.rs`'s own constants, so a renamed table
 //! cannot drift from its entry — and compares that set with the tables redb
 //! reports for the file being read, under the same transaction as the pages.
-//! Counted at the time of writing: 59 declared tables, 39 backing a dispositioned
-//! row family and 20 carrying an explicit source-bound nonrestorable/forensic
+//! Counted at the time of writing: 60 declared tables, 39 backing a dispositioned
+//! row family and 21 carrying an explicit source-bound nonrestorable/forensic
 //! exclusion with the reason written next to it; 42 dispositioned families, of
 //! which 3 (the restore-journal families) are table-less by design and named as
 //! such. A table with no disposition is refused with
@@ -898,13 +898,13 @@ struct DispositionedTable {
 /// [`check_row_family_census`] is the only place a literal name appears at all —
 /// and there it comes from redb, not from this file.
 ///
-/// Counted against `store.rs` at the time of writing: 59 declared tables, of
-/// which 39 back a dispositioned row family and 20 are explicit source-bound
+/// Counted against `store.rs` at the time of writing: 60 declared tables, of
+/// which 39 back a dispositioned row family and 21 are explicit source-bound
 /// exclusions. `row_family_denominator` carries 42 families; the three that are
 /// not table-backed are named in [`table_less_families`].
 ///
 /// Split in two so neither half can grow past the point where a reader stops
-/// checking it: 39 table-backed families and 20 source-bound exclusions.
+/// checking it: 39 table-backed families and 21 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -1073,8 +1073,9 @@ fn source_bound_exclusions() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The five exclusions that are owner state: three re-established by the
-/// receiving owner, two superseded or already-committed facts.
+/// The six exclusions that are owner state: three re-established by the
+/// receiving owner, two superseded or already-committed facts, and one bound
+/// to a source OS session that cannot survive restore.
 fn owner_state_exclusions() -> Vec<DispositionedTable> {
     vec![
         // ---- Owner-re-established state, not historical evidence ------------
@@ -1119,6 +1120,17 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             super::GRANT_CLOSURE_SECOND_PHASE_CURRENT,
             RowDisposition::ForensicOnly,
             "committed second-phase closure links are evidence that an order was placed; no import path re-authorizes one and the owner re-derives them at its own write time",
+        ),
+        // ExternalAttach receipt rows retain a live-gate observation for the
+        // exact authenticated Kernel OS session that created them. A restore
+        // changes the installation/session authority boundary, and A13.7
+        // invalidates prior sessions, leases, and approvals; therefore an old
+        // receipt remains historical evidence and must never become the new
+        // daemon session's current attach state.
+        excluded(
+            super::EXTERNAL_ATTACH_RECEIPTS,
+            RowDisposition::NonrestorableHistorical,
+            "ExternalAttach receipts are indexed by the source Kernel OS session; A13.7 invalidates old sessions, leases, and approvals on restore, so these rows remain historical and cannot reanimate a prior session",
         ),
     ]
 }
@@ -1297,7 +1309,7 @@ fn table_less_families() -> &'static [RowFamilyKind] {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 59-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 60-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 fn check_row_family_census(read: &ReadTransaction) -> Result<(), OrsError> {

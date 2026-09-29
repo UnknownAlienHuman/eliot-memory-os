@@ -10,7 +10,10 @@
 //! strict draft decode and never reach the service.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_governor::{CompositionError, FinishAttemptError};
+use eliot_governor::{
+    CompositionError, FinishAttemptError, KernelPortError, KernelTransitionPort,
+    visit_external_attach_receipt_session_on_port,
+};
 use eliot_protocol::{AgentResponseDisposition, FinishResultBody};
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
@@ -215,14 +218,41 @@ pub async fn serve_finish_claim(
     // refusal is the submitted typed result body the lane already uses, so the
     // claimed candidate is consumed instead of stalling the queue, and it
     // carries the stable I7.20 route/integration reason code verbatim.
-    let attach_refusal = {
+    let attach_request = {
         let guard = composition.lock().await;
-        guard
-            .admit_material_continuation_after_attach(
-                eliot_workscope::RequestedEffect::MaterialEffect,
+        guard.external_attach_session_read_request()
+    };
+    let attach_refusal = match attach_request {
+        Err(error) => Some(error.to_string()),
+        Ok(read_request) => {
+            let mut all_continuable = true;
+            match visit_external_attach_receipt_session_on_port(
+                kernel,
+                read_request.clone(),
+                |readback| {
+                    let record = crate::external_attach_record_from_readback(&read_request, readback)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                    all_continuable &= record.receipt.admits_material_continuation();
+                    Ok(())
+                },
             )
-            .err()
-            .map(|error| error.to_string())
+            .await
+            {
+                Err(error) => Some(error.to_string()),
+                Ok(snapshot) => {
+                    let guard = composition.lock().await;
+                    guard
+                        .admit_material_continuation_from_owner_snapshot(
+                            eliot_workscope::RequestedEffect::MaterialEffect,
+                            &read_request,
+                            &snapshot,
+                            all_continuable,
+                        )
+                        .err()
+                        .map(|error| error.to_string())
+                }
+            }
+        }
     };
     if let Some(detail) = attach_refusal {
         return rejected_finish_result_with_detail(

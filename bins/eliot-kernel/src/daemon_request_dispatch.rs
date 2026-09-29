@@ -491,6 +491,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "store_named" => "store_named",
         NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
         NOTIFICATION_STATE_READ_OPERATION => NOTIFICATION_STATE_READ_OPERATION,
+        "external_attach_receipt_commit" => "external_attach_receipt_commit",
+        "external_attach_receipt_read" => "external_attach_receipt_read",
+        "external_attach_receipt_read_current" => "external_attach_receipt_read_current",
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -2171,6 +2174,93 @@ impl KernelComposition {
             }
             "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
             "store_named" => self.store_named_operation(session, payload.clone()).await,
+            "external_attach_receipt_commit" => {
+                #[cfg(windows)]
+                {
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let request: eliot_ors::ExternalAttachReceiptWrite =
+                        serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    let expected_binding = super::runtime_identity::observed_session_principal_binding()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if request.owner_session_binding != expected_binding
+                        || request.state_fence != session.module_generation.state_fence
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let readback = self
+                        .p07_ors
+                        .commit_external_attach_receipt(request)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Ok(serde_json::json!({
+                        "kind": "external_attach_receipt",
+                        "value": readback,
+                    }))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (payload, request_identity);
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "external_attach_receipt_read" => {
+                #[cfg(windows)]
+                {
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let request: eliot_ors::ExternalAttachReceiptRead =
+                        serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    let expected_binding = super::runtime_identity::observed_session_principal_binding()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if request.owner_session_binding != expected_binding
+                        || request.state_fence != session.module_generation.state_fence
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let readback = self
+                        .p07_ors
+                        .read_external_attach_receipt(request)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Ok(serde_json::json!({
+                        "kind": "external_attach_receipt",
+                        "value": readback,
+                    }))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (payload, request_identity);
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "external_attach_receipt_read_current" => {
+                #[cfg(windows)]
+                {
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let request: eliot_ors::ExternalAttachReceiptSessionRead =
+                        serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    let expected_binding = super::runtime_identity::observed_session_principal_binding()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if request.owner_session_binding != expected_binding
+                        || request.expected_state_fence != session.module_generation.state_fence
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let page = self
+                        .p07_ors
+                        .read_external_attach_receipt_session_page(request)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Ok(serde_json::json!({
+                        "kind": "external_attach_receipt",
+                        "value": page,
+                    }))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (payload, request_identity);
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "local_read" => self.local_read_operation(session, payload.clone()).await,
             "daemon_degraded" => {
                 let reason = payload

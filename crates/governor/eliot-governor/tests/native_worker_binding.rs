@@ -55,6 +55,39 @@ impl KernelGenerationSnapshotProvider for TestKernel {
 }
 
 impl KernelTransitionPort for TestKernel {
+    fn commit_external_attach_receipt(
+        &self,
+        _request: eliot_governor::ExternalAttachReceiptWrite,
+    ) -> KernelPortFuture<'_, eliot_governor::ExternalAttachReceiptReadback> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "test fixture has no ExternalAttach owner".to_owned(),
+            ))
+        })
+    }
+
+    fn read_external_attach_receipt(
+        &self,
+        _request: eliot_governor::ExternalAttachReceiptRead,
+    ) -> KernelPortFuture<'_, Option<eliot_governor::ExternalAttachReceiptReadback>> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "test fixture has no ExternalAttach owner".to_owned(),
+            ))
+        })
+    }
+
+    fn read_current_external_attach_receipt(
+        &self,
+        _request: eliot_governor::ExternalAttachReceiptSessionRead,
+    ) -> KernelPortFuture<'_, eliot_governor::ExternalAttachReceiptSessionPage> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "test fixture has no ExternalAttach owner".to_owned(),
+            ))
+        })
+    }
+
     fn apply_prepared<'a>(
         &'a self,
         _identity: &RequestIdentity,

@@ -1427,6 +1427,13 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "daemon_degraded"
             | "daemon_fatal"
             | super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
+            // Issue #1782: immutable ExternalAttach receipt publication and
+            // exact-key/session-page readback. The daemon dispatcher binds
+            // each operation to the authenticated Kernel server SID/session,
+            // live daemon module identity and exact State Fence before ORS IO.
+            | "external_attach_receipt_commit"
+            | "external_attach_receipt_read"
+            | "external_attach_receipt_read_current"
             | "agent_activation_claim"
             | "agent_activation_submit"
             | "agent_activation_reconcile"

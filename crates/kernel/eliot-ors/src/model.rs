@@ -4229,6 +4229,15 @@ pub enum OrsError {
         expected_revision: u64,
         observed_revision: u64,
     },
+    /// ExternalAttach receipt set changed after a session-page cursor was
+    /// issued. The caller must restart enumeration from the beginning.
+    #[error(
+        "ExternalAttach receipt session moved from revision {expected_revision} to {observed_revision}"
+    )]
+    ExternalAttachSessionMoved {
+        expected_revision: u64,
+        observed_revision: u64,
+    },
     #[error("duplicate identity conflicts with durable ORS state")]
     DuplicateConflict,
     #[error("idempotent write already has terminal ORS state")]

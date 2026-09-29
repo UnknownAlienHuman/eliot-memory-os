@@ -70,12 +70,13 @@
 //! it takes the exact [`AttachBinding`](eliot_agent_bridge_core::AttachBinding)
 //! the trusted host activation boundary sealed, checks it against the live
 //! owners, compiles the receipt through this compiler, and retains the
-//! resulting record before reporting any gate-clearing view. Replay and the
-//! Material-continuation recheck read the same retained record back, so a lost
+//! resulting versioned record is committed through the authenticated Kernel
+//! owner and independently read back by exact claim key and current owner
+//! session before reporting any gate-clearing view. Replay and the
+//! Material-continuation recheck consume those durable readbacks, so a lost
 //! response replays the same disposition and a stale or substituted binding
-//! fails closed. The retained record is composition-held: a durable
-//! ORS/Store row for cross-restart survival lives with the Governor/Kernel
-//! owners outside this crate and is not synthesized here.
+//! fails closed. This module remains a pure DTO/compiler; Governor/Kernel/ORS
+//! own the durable row and its store-issued integrity validation.
 //!
 //! [`admit_automatic_agent_launch`] has no production call site yet: no
 //! `Start work` surface exists in this crate, and no second launcher is added
@@ -84,13 +85,15 @@
 #![forbid(unsafe_code)]
 
 use eliot_agent_bridge_core::{AttachBinding, AttachKind, AttachRequest, BridgeError};
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_governor::MAX_EXTERNAL_ATTACH_RECEIPT_PAYLOAD_BYTES;
 use eliot_process::{FencingToken, Generation};
 use eliot_workscope::{
     CandidateDisposition, OnboardingReadinessReceipt, ReadinessLifecycle, RequestedEffect,
     ScopeBinding, ScopeBindingDisposition, ScopeBindingGuardReceipt, ScopeResolutionState,
     TaskBindingState, WorkScopeCandidateSet,
 };
+use serde::{Deserialize, Serialize};
 
 /// Stable I7.20 reason code for a Material continuation refused before the
 /// external-attach disposition exists (I11.11 line 42).
@@ -135,7 +138,8 @@ fn references(field: &'static str, values: &[String]) -> Result<(), Box<BridgeEr
 /// last observation boundary the caller actually held. An attach time at or
 /// before that boundary cannot describe an unobserved interval and fails
 /// closed rather than clamping to a fabricated zero.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreAttachBlindInterval {
     /// Last observation boundary ELIOT itself held, in unix milliseconds.
     pub last_observation_boundary_unix_ms: u64,
@@ -178,7 +182,8 @@ impl PreAttachBlindInterval {
 /// The external process/session/route and the identity actually established
 /// for it (I11.11 receipt field
 /// `external_process_session_route_and_actual_identity`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAgentIdentity {
     /// Observed external process reference the attach named.
     pub external_process_ref: String,
@@ -230,7 +235,8 @@ impl ExternalAgentIdentity {
 /// [`WorkScopeCandidateSet`]; it is carried, never resolved. Task candidates
 /// are the handles the caller observed, and an ambiguous handle set is kept
 /// as-is: this module has no authority to prefer one candidate over another.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedAttachCandidates {
     /// Owner-issued observed scope candidate set, carried unchanged.
     pub candidate_set: WorkScopeCandidateSet,
@@ -254,7 +260,8 @@ impl ObservedAttachCandidates {
 /// The last known base and the current workspace artifact delta (I11.11
 /// receipt field
 /// `last_known_base_and_current_workspace_artifact_delta`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceArtifactDelta {
     /// The last known base the caller held before the attach.
     pub last_known_base_ref: String,
@@ -286,7 +293,8 @@ impl WorkspaceArtifactDelta {
 /// `Candidate` is the only standing that exists: pre-attach changes are
 /// candidate artifacts/observations. The three predicates below are the exact
 /// negative claims the fragment makes, so no caller has to restate them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum PreAttachStanding {
     /// Candidate artifact/observation: not proof, not task completion, not
     /// agent-attributed experience.
@@ -315,7 +323,8 @@ impl PreAttachStanding {
 
 /// Transcript, event and tool coverage imported from the external agent
 /// (I11.11 receipt field `imported_transcript_event_and_tool_coverage`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportedPreAttachCoverage {
     /// Imported transcript and event references, as observed.
     pub transcript_event_refs: Vec<String>,
@@ -352,7 +361,8 @@ impl ImportedPreAttachCoverage {
 /// `unknown_effects_present` is an observation, not a default: `false` means the
 /// caller observed the effect set closed, `true` means the caller could not
 /// enumerate it. An unenumerable effect set is never presented as empty.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalEffectDisposition {
     /// Effects observed to exist but not attributable to this agent.
     pub known_unattributed_effect_refs: Vec<String>,
@@ -370,7 +380,8 @@ impl ExternalEffectDisposition {
 }
 
 /// What happens to credentials the external process may hold.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum CredentialDisposition {
     /// The caller observed no credential in the attach.
     NoneObserved,
@@ -388,7 +399,8 @@ pub enum CredentialDisposition {
 /// Workspace ownership is read from the owner-issued
 /// [`ScopeBindingGuardReceipt`]: only a `Matched` disposition establishes it.
 /// This module does not run the guard and does not re-derive the receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeAuthorityDisposition {
     /// The observed scope binding the attach was admitted against.
     pub scope_binding: ScopeBinding,
@@ -423,7 +435,8 @@ impl ScopeAuthorityDisposition {
 /// Verification, cleanup or Human decision the attach still requires (I11.11
 /// receipt field
 /// `required_verification_cleanup_or_human_decision`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum PendingAttachAction {
     /// Nothing beyond the continuation disposition itself is outstanding.
     NoneRequired,
@@ -457,7 +470,8 @@ impl PendingAttachAction {
 }
 
 /// How the attached route continues (I11.11 line 42).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum ContinuationKind {
     /// Ownership was established: the route continues and its activity is
     /// attributed normally.
@@ -472,7 +486,8 @@ pub enum ContinuationKind {
 
 /// The continuation kind and the new attempt identity (I11.11 receipt field
 /// `continuation_kind_and_new_attempt_identity`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContinuationDisposition {
     /// How the route continues.
     pub kind: ContinuationKind,
@@ -515,7 +530,8 @@ impl ContinuationDisposition {
 /// The nine fields are exactly the nine documented receipt fields, in the
 /// documented order and under the documented names. The only producer is
 /// [`reconcile_external_attach`], which validates every supplied observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAttachReconciliationReceipt {
     /// External process, session, route and the identity actually established.
     pub external_process_session_route_and_actual_identity: ExternalAgentIdentity,
@@ -643,7 +659,8 @@ impl ExternalAttachReconciliationReceipt {
 }
 
 /// The continuation choice available when ownership was not established.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum UnownedContinuation {
     /// Attach read-only.
     ReadOnly,
@@ -656,7 +673,8 @@ pub enum UnownedContinuation {
 /// The caller supplies these from what it actually observed. This module adds
 /// no value of its own beyond the computed blind interval and the derived
 /// continuation disposition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAttachObservation {
     /// External process/session/route and the identity actually established.
     pub identity: ExternalAgentIdentity,
@@ -843,7 +861,8 @@ pub fn admit_material_continuation(
 /// Replay and the Material-continuation recheck compare a presenting claim
 /// against the retained one field for field: a stale or substituted binding
 /// fails closed with [`BridgeError::StaleAuthority`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAttachBridgeClaim {
     /// Demand the attach was presented under.
     pub demand_ref: String,
@@ -869,6 +888,234 @@ pub struct ExternalAttachBridgeClaim {
     pub plan_ref: String,
     /// Admitted plan revision.
     pub plan_revision: String,
+}
+
+impl ExternalAttachBridgeClaim {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
+        for (field, value) in [
+            ("external_attach_binding.demand_ref", self.demand_ref.as_str()),
+            (
+                "external_attach_binding.connection_ref",
+                self.connection_ref.as_str(),
+            ),
+            (
+                "external_attach_binding.principal_ref",
+                self.principal_ref.as_str(),
+            ),
+            (
+                "external_attach_binding.session_ref",
+                self.session_ref.as_str(),
+            ),
+            ("external_attach_binding.task_ref", self.task_ref.as_str()),
+            (
+                "external_attach_binding.work_unit_ref",
+                self.work_unit_ref.as_str(),
+            ),
+            (
+                "external_attach_binding.work_scope_ref",
+                self.work_scope_ref.as_str(),
+            ),
+            (
+                "external_attach_binding.task_revision",
+                self.task_revision.as_str(),
+            ),
+            ("external_attach_binding.plan_ref", self.plan_ref.as_str()),
+            (
+                "external_attach_binding.plan_revision",
+                self.plan_revision.as_str(),
+            ),
+        ] {
+            reference(field, value)?;
+        }
+        if self.activation_generation.get() == 0
+            || self.state_fence.generation().get() == 0
+            || self.state_fence.canonical_epoch_digest().is_none()
+        {
+            return Err(Box::new(BridgeError::InvalidContract {
+                field: "external_attach_binding.generation_and_fence",
+                reason: "activation generation and state-fence evidence must be valid",
+            }));
+        }
+        reference(
+            "external_attach_binding.state_fence_nonce",
+            self.state_fence.nonce(),
+        )?;
+        Ok(())
+    }
+}
+
+/// Maximum canonical payload accepted for one durable ExternalAttach record.
+/// I7.2 bounds an EBP frame at four MiB. The payload is carried as UTF-8 JSON
+/// inside a JSON string, which can at most double its canonical byte length;
+/// one quarter of the frame limit therefore leaves the other half for string
+/// escaping and the bounded identity/operation envelope.
+pub(crate) const MAX_EXTERNAL_ATTACH_RECORD_BYTES: usize =
+    MAX_EXTERNAL_ATTACH_RECEIPT_PAYLOAD_BYTES;
+
+const EXTERNAL_ATTACH_RECORD_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalAttachRecordEnvelope {
+    schema_version: u16,
+    record: ExternalAttachIngressRecord,
+}
+
+/// Exact canonical owner payload prepared from a validated original record.
+/// `canonical_json` and its digest are retained together across the owner
+/// write/readback; a new serialization cannot replace the original bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExternalAttachOwnerPayload {
+    pub claim_key: String,
+    pub canonical_json: String,
+    pub payload_sha256: String,
+}
+
+/// Validates the original record, seals its complete closed DTO graph as
+/// versioned canonical JSON, and derives the stable owner key from the full
+/// exact Bridge claim. The receipt itself has no embedded digest field; the
+/// returned payload digest binds its complete original serialized bytes.
+pub(crate) fn encode_external_attach_owner_payload(
+    record: &ExternalAttachIngressRecord,
+) -> Result<ExternalAttachOwnerPayload, Box<BridgeError>> {
+    validate_external_attach_durable_record(record)?;
+    let Some(claim) = record.claim.as_ref() else {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record.claim",
+            reason: "durable Bridge receipt requires its exact attach claim",
+        }));
+    };
+    let claim_key = external_attach_claim_key(claim)?;
+    let envelope = ExternalAttachRecordEnvelope {
+        schema_version: EXTERNAL_ATTACH_RECORD_SCHEMA_VERSION,
+        record: record.clone(),
+    };
+    let bytes = canonical_json_bytes(&envelope).map_err(|_| {
+        Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record",
+            reason: "receipt record could not be canonically encoded",
+        })
+    })?;
+    if bytes.is_empty() || bytes.len() > MAX_EXTERNAL_ATTACH_RECORD_BYTES {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record",
+            reason: "canonical receipt record exceeds its durable payload bound",
+        }));
+    }
+    let canonical_json = String::from_utf8(bytes.clone()).map_err(|_| {
+        Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record",
+            reason: "canonical receipt record is not UTF-8 JSON",
+        })
+    })?;
+    Ok(ExternalAttachOwnerPayload {
+        claim_key,
+        payload_sha256: sha256_hex(&bytes),
+        canonical_json,
+    })
+}
+
+/// Computes the stable owner key from the complete validated Bridge claim.
+pub(crate) fn external_attach_claim_key(
+    claim: &ExternalAttachBridgeClaim,
+) -> Result<String, Box<BridgeError>> {
+    claim.validate()?;
+    let claim_bytes = canonical_json_bytes(claim).map_err(|_| {
+        Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record.claim",
+            reason: "Bridge claim could not be canonically encoded",
+        })
+    })?;
+    Ok(format!("external_attach:{}", sha256_hex(&claim_bytes)))
+}
+
+/// Decodes an owner readback only when its bytes and digest are the exact
+/// canonical versioned representation, then revalidates the original receipt
+/// and Bridge claim before returning it to the caller.
+pub(crate) fn decode_external_attach_owner_payload(
+    canonical_json: &str,
+    expected_sha256: &str,
+) -> Result<ExternalAttachIngressRecord, Box<BridgeError>> {
+    let bytes = canonical_json.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_EXTERNAL_ATTACH_RECORD_BYTES
+        || sha256_hex(bytes) != expected_sha256
+    {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record.payload_sha256",
+            reason: "durable owner payload is outside bounds or its digest does not match",
+        }));
+    }
+    let envelope: ExternalAttachRecordEnvelope = serde_json::from_slice(bytes).map_err(|_| {
+        Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record",
+            reason: "durable owner payload is not a valid versioned record",
+        })
+    })?;
+    if envelope.schema_version != EXTERNAL_ATTACH_RECORD_SCHEMA_VERSION {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record.schema_version",
+            reason: "durable owner payload uses an unsupported schema version",
+        }));
+    }
+    validate_external_attach_durable_record(&envelope.record)?;
+    let canonical = canonical_json_bytes(&envelope).map_err(|_| {
+        Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record",
+            reason: "durable owner payload could not be canonically re-encoded",
+        })
+    })?;
+    if canonical != bytes {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record",
+            reason: "durable owner payload is not in canonical form",
+        }));
+    }
+    Ok(envelope.record)
+}
+
+fn validate_external_attach_record(
+    record: &ExternalAttachIngressRecord,
+) -> Result<(), Box<BridgeError>> {
+    record.receipt.validate()?;
+    record.admitted_fence.validate().map_err(|_| {
+        Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record.admitted_fence",
+            reason: "admitted State Fence is invalid",
+        })
+    })?;
+    let Some(claim) = record.claim.as_ref() else {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record.claim",
+            reason: "durable Bridge receipt requires its exact attach claim",
+        }));
+    };
+    claim.validate()?;
+    if let Some(session) = record.owner_session_binding.as_deref() {
+        reference("external_attach_record.owner_session_binding", session)?;
+    }
+    Ok(())
+}
+
+/// Durable records must retain the authenticated Kernel owner session that
+/// indexes their post-restart readback. The in-memory/diagnostic DTO remains
+/// optionally bound for legacy callers, but it cannot cross the durable
+/// publication boundary without that owner-issued binding.
+fn validate_external_attach_durable_record(
+    record: &ExternalAttachIngressRecord,
+) -> Result<(), Box<BridgeError>> {
+    validate_external_attach_record(record)?;
+    let Some(owner_session_binding) = record.owner_session_binding.as_deref() else {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "external_attach_record.owner_session_binding",
+            reason: "durable receipt requires the authenticated Kernel owner session",
+        }));
+    };
+    reference(
+        "external_attach_record.owner_session_binding",
+        owner_session_binding,
+    )?;
+    Ok(())
 }
 
 /// Copies the exact binding content of one Bridge external-attach request.
@@ -971,7 +1218,8 @@ pub fn claim_bridge_attach(
 /// workspace movement, source/task revision drift, logout, or session
 /// replacement invalidates dependent use with
 /// [`BridgeError::StaleAuthority`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAttachIngressRecord {
     /// Exact Bridge binding the receipt was compiled under, when the attach
     /// arrived through the Bridge ingress.
@@ -1053,7 +1301,8 @@ pub fn replay_bridge_external_attach<'a>(
 /// record. The Bridge verifies the returned request/session/task/fence/attempt
 /// relation against its live attach instead of trusting a nonblank receipt
 /// reference.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAttachBindingView {
     /// Demand the retained attach was presented under.
     pub demand_ref: String,
@@ -1191,7 +1440,8 @@ pub fn admit_material_continuation_for_record(
 
 /// Why `Start work` may not hide the presented state behind an automatic agent
 /// launch (I11.11 line 25).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum AutomaticLaunchRefusal {
     /// The observed candidate set is ambiguous, or resolves to more than one
     /// candidate, or the compiled scope resolution is ambiguous: an ambiguous
