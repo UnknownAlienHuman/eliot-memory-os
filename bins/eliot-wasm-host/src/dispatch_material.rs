@@ -1825,11 +1825,7 @@ fn read_verified_claimed_asides_unlocked(
     let owner_copy = read_retained_owner_material_unlocked(install_dir, claim)?;
     let mut aside_bytes: [Option<Vec<u8>>; 3] = std::array::from_fn(|_| None);
     for (index, ((aside, is_present), retained)) in
-        paths
-            .iter()
-            .zip(present)
-            .zip(owner_copy.iter())
-            .enumerate()
+        paths.iter().zip(present).zip(owner_copy.iter()).enumerate()
     {
         if !is_present {
             continue;
@@ -3440,9 +3436,7 @@ fn validate_served_result_readback(
     expected_digest: Option<&str>,
     expected_sequence: Option<u64>,
 ) -> Result<(), MaterialError> {
-    if record.retained_at_unix_ms == 0
-        || !record.names(claim)
-        || &record.identity != owner_identity
+    if record.retained_at_unix_ms == 0 || !record.names(claim) || &record.identity != owner_identity
     {
         return Err(MaterialError::Malformed);
     }
