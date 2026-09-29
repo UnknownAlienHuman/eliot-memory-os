@@ -6,8 +6,12 @@
 //! inspects expected file hashes, active registration state, observed hook
 //! events, and a handshake result, then reports installation separately from
 //! runtime liveness. A successful config installation with no handshake is
-//! reported as installed but not live. This module executes no repair, mints
-//! no authority, and mutates no store.
+//! reported as installed but not live. When the expectation is the install
+//! receipt, the installation status the delivery itself recorded
+//! (`status`/`code`/`completed`) is reported under its own `installation` key
+//! and gates `installed`: an install the record says did not complete is
+//! `NOT_INSTALLED` even when every target byte matches. This module executes
+//! no repair, mints no authority, and mutates no store.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -29,6 +33,47 @@ pub struct IntegrationExpectation {
     /// Hook events expected to have been observed.
     #[serde(default)]
     pub expected_hook_events: Vec<String>,
+}
+
+/// Installation status as the delivery itself recorded it in the install
+/// receipt (`status`, `code`, `completed`).
+///
+/// This is a fact about the install *attempt* — whether the delivery says it
+/// ran the installation — and is deliberately a separate fact from the
+/// runtime-liveness and capability evidence this crate gathers by readback.
+/// Installation success is not runtime liveness (I3.7), and an install that
+/// never ran is not an installation whose bytes happen to be on disk.
+///
+/// The values are the receipt's own fields, read and compared. Nothing here
+/// is recomputed, re-derived, or synthesised: a record that carries no
+/// install status yields no `InstallStatus` at all, never a filled-in one.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct InstallStatus {
+    /// Receipt `status`, verbatim (e.g. `INSTALL_NOT_ATTEMPTED`).
+    pub status: String,
+    /// Receipt `code`, verbatim (e.g. `PLAN_GAP`).
+    pub code: String,
+    /// Receipt `completed`: the delivery's own completion flag. This is the
+    /// value the `installed` verdict is gated on.
+    pub completed: bool,
+}
+
+/// An expectation together with the installation status its own source record
+/// carried.
+///
+/// `install_status` is `Some` only for a record carrying the
+/// [`INSTALL_RECEIPT_CONTRACT`], and `None` for a plain
+/// [`IntegrationExpectation`] record, which states no install status of its
+/// own. Absence is carried through to the report as absence
+/// (`"installation": null`); it is never filled in with a synthesised status,
+/// and it is never read as a failed or a successful installation.
+#[derive(Clone, Debug)]
+pub struct LoadedExpectation {
+    /// The verified expectation the report is computed against.
+    pub expectation: IntegrationExpectation,
+    /// Installation status read from the install receipt, when the record is
+    /// one. `None` when the record states no installation status.
+    pub install_status: Option<InstallStatus>,
 }
 
 /// Observed integration state supplied by the caller for verification.
@@ -81,7 +126,20 @@ pub struct IntegrationReport {
     pub hook_event_gaps: Vec<String>,
     /// The runtime handshake was observed.
     pub handshake_ok: bool,
+    /// Installation status recorded by the expectation's own source record, or
+    /// `None` when that record states none.
+    ///
+    /// This is reported beside, and separately from, the read-back evidence
+    /// above: it is the delivery's own statement about whether the
+    /// installation ran, never this crate's verdict. `installed` is gated on
+    /// it, so a receipt recording an install that did not complete can never
+    /// yield `installed: true` however well the target bytes happen to match.
+    pub installation: Option<InstallStatus>,
     /// Static install surface is complete.
+    ///
+    /// Requires, in addition to the read-back evidence above, that the
+    /// expectation's source record either states no installation status (a
+    /// plain expectation) or records a completed installation.
     pub installed: bool,
     /// Install surface plus live handshake.
     pub live: bool,
@@ -150,9 +208,12 @@ const INSTALL_RECEIPT_CONTRACT: &str = "eliot.plugin.install";
 /// Two shapes are admitted: a plain expectation record (the
 /// [`IntegrationExpectation`] contract), or the install receipt minted by
 /// `eliot plugin install`, whose embedded preview record becomes the
-/// expectation after its digest binding is verified. Verification mismatches
-/// stay data inside the report either way; only malformed inputs are `Err`.
-pub fn load_expectation(path: &Path) -> Result<IntegrationExpectation, IntegrationError> {
+/// expectation after its digest binding is verified. The receipt additionally
+/// supplies the installation status it recorded
+/// ([`LoadedExpectation::install_status`]); a plain expectation record supplies
+/// none, and none is invented for it. Verification mismatches stay data inside
+/// the report either way; only malformed inputs are `Err`.
+pub fn load_expectation(path: &Path) -> Result<LoadedExpectation, IntegrationError> {
     if !path.is_absolute() {
         return Err(IntegrationError::InputInvalid(
             "expectation path must be absolute".to_owned(),
@@ -176,7 +237,14 @@ pub fn load_expectation(path: &Path) -> Result<IntegrationExpectation, Integrati
             "expectation profile must be non-empty".to_owned(),
         ));
     }
-    Ok(expectation)
+    // A plain expectation record states no installation status, so none is
+    // carried. Absence is not read as success and not read as failure: the
+    // record makes no claim about whether an install ran, and this front door
+    // does not invent one on its behalf.
+    Ok(LoadedExpectation {
+        expectation,
+        install_status: None,
+    })
 }
 
 /// Extracts the verification expectation from an install receipt, binding
@@ -195,7 +263,7 @@ pub fn load_expectation(path: &Path) -> Result<IntegrationExpectation, Integrati
 /// installed claim.
 fn expectation_from_install_receipt(
     document: &serde_json::Value,
-) -> Result<IntegrationExpectation, IntegrationError> {
+) -> Result<LoadedExpectation, IntegrationError> {
     let profile = document
         .get("profile")
         .and_then(serde_json::Value::as_str)
@@ -242,7 +310,59 @@ fn expectation_from_install_receipt(
                 .to_owned(),
         ));
     }
-    Ok(expectation)
+    Ok(LoadedExpectation {
+        expectation,
+        install_status: Some(install_status_from_receipt(document)?),
+    })
+}
+
+/// Reads the installation status the delivery itself recorded in the install
+/// receipt: `status`, `code`, and `completed`.
+///
+/// These are the receipt's own values, read as recorded — never recomputed
+/// from what the read side holds, and never derived from the preview-digest
+/// check, which proves only that the embedded preview is un-drifted and says
+/// nothing about whether an install ran. A receipt that omits `completed` is
+/// a typed input error rather than an assumed success: the one field that
+/// decides whether an installation happened cannot be filled in by this front
+/// door. `status` and `code` are carried verbatim for reporting, so a
+/// `completed: true` receipt whose `status` still says the install was not
+/// attempted is reported with both facts visible rather than reconciled away.
+fn install_status_from_receipt(
+    document: &serde_json::Value,
+) -> Result<InstallStatus, IntegrationError> {
+    let status = document
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no installation status; refusing to report an installation whose outcome the record does not state"
+                    .to_owned(),
+            )
+        })?;
+    let code = document
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no installation code; refusing to report an installation whose outcome the record does not state"
+                    .to_owned(),
+            )
+        })?;
+    let completed = document
+        .get("completed")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            IntegrationError::InputInvalid(
+                "install receipt carries no boolean completed flag; refusing to assume an installation happened"
+                    .to_owned(),
+            )
+        })?;
+    Ok(InstallStatus {
+        status: status.to_owned(),
+        code: code.to_owned(),
+        completed,
+    })
 }
 
 /// Loads an observation document. The path must be absolute.
@@ -317,6 +437,7 @@ pub fn evaluate(
         hook_events_ok,
         hook_event_gaps,
         handshake_ok: observation.handshake_ok,
+        installation: None,
         installed,
         live,
         disposition: disposition.to_owned(),
@@ -334,7 +455,11 @@ pub fn evaluate(
 /// The expectation may be the install receipt minted by `eliot plugin
 /// install`: its digest-bound embedded preview then becomes the expectation,
 /// so verification checks the installation against the record it was
-/// previewed with rather than a retyped copy.
+/// previewed with rather than a retyped copy, and the installation status it
+/// recorded is reported separately as `installation` and withholds
+/// `installed` when the receipt says the install did not complete. A receipt
+/// that omits `status`/`code`/`completed` is a typed input error, never an
+/// assumed install.
 ///
 /// Authority rule: file hashes come from real readback — every named target
 /// is re-hashed here and the caller-supplied `actual_file_hashes` map never
@@ -354,13 +479,14 @@ pub fn verify_profile(
     if profile.trim().is_empty() {
         return Err(IntegrationError::EmptyProfile);
     }
-    let expected = load_expectation(expectation_path)?;
-    if expected.profile != profile {
+    let loaded = load_expectation(expectation_path)?;
+    if loaded.expectation.profile != profile {
         return Err(IntegrationError::ProfileMismatch {
             requested: profile.to_owned(),
-            carried: expected.profile,
+            carried: loaded.expectation.profile,
         });
     }
+    let expected = &loaded.expectation;
     // Loaded for shape validation only; none of its claims are authority.
     let _supplied = load_observation(observation_path)?;
     // Real readback. Non-absolute targets cannot be observed without
@@ -382,7 +508,10 @@ pub fn verify_profile(
         observed_hook_events: Vec::new(),
         handshake_ok: false,
     };
-    let mut report = evaluate(profile, &expected, &capped);
+    let mut report = evaluate(profile, expected, &capped);
+    // The record's own installation status is reported beside the evidence,
+    // never in place of it, and it gates `installed` on its own.
+    report.installation.clone_from(&loaded.install_status);
     // Authority cap, scoped to the axes this front door cannot observe.
     // File hashes come from real readback above. Registrations and hook
     // events have no observation port, so any expectation naming them stays
@@ -393,9 +522,21 @@ pub fn verify_profile(
     report.live = false;
     let static_unverifiable =
         !expected.expected_registrations.is_empty() || !expected.expected_hook_events.is_empty();
-    if static_unverifiable || !report.file_hash_ok {
+    // An install that the delivery itself recorded as not completed is not an
+    // installation, whatever the bytes on disk happen to say. The receipt's
+    // `completed` is the delivery's own claim about the install, and it
+    // withholds `installed` on its own: a receipt recording a not-attempted,
+    // failed, or incomplete install cannot be reported as installed, because
+    // matching target bytes are evidence about files, not about an install
+    // having run. No disposition is invented for this — an install the record
+    // says did not complete is `NOT_INSTALLED`, which is exactly what it is.
+    let install_not_completed = loaded
+        .install_status
+        .as_ref()
+        .is_some_and(|status| !status.completed);
+    if install_not_completed || static_unverifiable || !report.file_hash_ok {
         report.installed = false;
-        if report.file_hash_ok {
+        if report.file_hash_ok && !install_not_completed {
             "UNVERIFIED_PLAN_GAP".clone_into(&mut report.disposition);
         } else {
             "NOT_INSTALLED".clone_into(&mut report.disposition);
@@ -427,10 +568,20 @@ pub fn report_json(report: &IntegrationReport) -> serde_json::Value {
         "handshake": {
             "ok": report.handshake_ok,
         },
+        // `null` when the record stated no installation status: absence is
+        // reported as absence, never as an assumed or default status.
+        "installation": report.installation.as_ref().map_or(
+            serde_json::Value::Null,
+            |status| serde_json::json!({
+                "status": status.status,
+                "code": status.code,
+                "completed": status.completed,
+            }),
+        ),
         "installed": report.installed,
         "live": report.live,
         "disposition": report.disposition,
-        "note": "file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06): installed is granted only when every expected hash matches and nothing unverifiable is expected, live is never granted here",
+        "note": "installation is the status the install receipt itself recorded (null when the expectation record carries none), reported separately from the evidence below: file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06). installed is granted only when every expected hash matches, nothing unverifiable is expected, and the record does not state an incomplete install; live is never granted here",
     })
 }
 

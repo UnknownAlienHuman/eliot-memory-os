@@ -25,7 +25,7 @@ use eliot_process::{
     OperationId, ProcessExecutionView, ProcessLifecycle, ProcessStartReceipt, ProcessTreeId,
     ResourceLimits, SecretRef, SessionId,
 };
-use eliot_protocol::ProtocolVersion;
+use eliot_protocol::{ProtocolVersion, RequestIdentity};
 use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::EffectCeiling;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,14 @@ pub const OPERATOR_ROLE: &str = "human_operator";
 pub const OPERATOR_CAPABILITIES: [&str; 2] = ["controlboard.read", "operator.command"];
 pub const OPERATOR_HANDOFF_TTL_MS: u64 = 5_000;
 pub const OPERATOR_PIPE_NAME: &str = r"\\.\pipe\eliot\operator\one-shot";
+/// Current durable identity-row shape. Version 1 rows remain spent-ID
+/// tombstones because they did not retain the original `RequestIdentity`.
+pub const ISSUED_OPERATION_IDENTITY_VERSION: u16 = 2;
+const LEGACY_ISSUED_OPERATION_IDENTITY_VERSION: u16 = 1;
+
+fn legacy_issued_operation_identity_version() -> u16 {
+    LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
+}
 
 /// Upper bound for the one-shot standard-input bytes one admitted launch may
 /// carry.
@@ -1073,6 +1081,10 @@ pub struct OperationPermit {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuedOperationIdentity {
+    /// Explicit row schema version. Missing on pre-#74 snapshots and read as
+    /// version 1, whose identity is reserved but cannot be replayed.
+    #[serde(default = "legacy_issued_operation_identity_version")]
+    pub schema_version: u16,
     /// Closed Kernel operation selector this identity was minted for.
     pub operation: String,
     /// Lowercase SHA-256 of the canonical payload bytes the identity binds.
@@ -1085,10 +1097,24 @@ pub struct IssuedOperationIdentity {
     pub cancellation_id: String,
     /// Absolute transport deadline the identity was minted with.
     pub deadline_unix_ms: u64,
+    /// Exact registration generation that admitted this request identity.
+    /// Both values are absent only for a registration request issued before a
+    /// registration exists, or on an explicit legacy row.
+    #[serde(default)]
+    pub registration_digest: Option<String>,
+    #[serde(default)]
+    pub user_broker_epoch: Option<u64>,
+    /// Original typed Kernel identity. It is never reconstructed against a
+    /// later fence; a missing value is a legacy/local-operation tombstone.
+    #[serde(default)]
+    pub request_identity: Option<RequestIdentity>,
     /// Observation instant the identity was minted at.
     pub issued_at_ms: u64,
     /// Caller request id when a launch caller link owned this issuance.
     pub caller_request_id: Option<String>,
+    /// Caller launch idempotency key, distinct from the transport key above.
+    #[serde(default)]
+    pub caller_idempotency_key: Option<String>,
 }
 
 impl IssuedOperationIdentity {
@@ -1110,20 +1136,119 @@ impl IssuedOperationIdentity {
         if let Some(caller) = self.caller_request_id.as_deref() {
             text(caller, "operation_identity.caller_request_id")?;
         }
+        if let Some(caller_key) = self.caller_idempotency_key.as_deref() {
+            text(caller_key, "operation_identity.caller_idempotency_key")?;
+        }
+        match (self.registration_digest.as_deref(), self.user_broker_epoch) {
+            (Some(digest), Some(epoch)) if epoch > 0 => {
+                hex_digest(digest, "operation_identity.registration_digest")?;
+            }
+            (None, None) => {}
+            _ => return Err(BrokerError::InvalidField("operation_identity.registration")),
+        }
+        let kernel_request = matches!(
+            self.operation.as_str(),
+            "eliot.user-broker.register"
+                | "eliot.user-broker.heartbeat"
+                | "eliot.user-broker.authorize-launch"
+                | "eliot.user-broker.fence"
+        );
+        let broker_control = matches!(
+            self.operation.as_str(),
+            "eliot.user-broker.cancel" | "eliot.user-broker.reconcile"
+        );
+        let is_authorize_launch = self.operation == "eliot.user-broker.authorize-launch";
+        match self.schema_version {
+            LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
+                if (kernel_request || broker_control)
+                    && self.request_identity.is_none()
+                    && self.registration_digest.is_none()
+                    && self.user_broker_epoch.is_none()
+                    && self.caller_idempotency_key.is_none()
+                    && self.caller_request_id.is_some() == is_authorize_launch => {}
+            ISSUED_OPERATION_IDENTITY_VERSION if kernel_request => {
+                self.validate_kernel_request_identity(is_authorize_launch)?;
+            }
+            ISSUED_OPERATION_IDENTITY_VERSION if broker_control => {
+                if self.request_identity.is_some()
+                    || self.registration_digest.is_none()
+                    || self.user_broker_epoch.is_none()
+                    || self.caller_request_id.is_some()
+                    || self.caller_idempotency_key.is_some()
+                {
+                    return Err(BrokerError::InvalidField(
+                        "operation_identity.control_binding",
+                    ));
+                }
+            }
+            _ => {
+                return Err(BrokerError::InvalidField(
+                    "operation_identity.schema_version",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_kernel_request_identity(
+        &self,
+        is_authorize_launch: bool,
+    ) -> Result<(), BrokerError> {
+        if self.operation != "eliot.user-broker.register"
+            && (self.registration_digest.is_none() || self.user_broker_epoch.is_none())
+        {
+            return Err(BrokerError::InvalidField("operation_identity.registration"));
+        }
+        let request_identity = self
+            .request_identity
+            .as_ref()
+            .ok_or(BrokerError::InvalidField(
+                "operation_identity.request_identity",
+            ))?;
+        request_identity
+            .validate()
+            .map_err(|_| BrokerError::InvalidField("operation_identity.request_identity"))?;
+        let issued_at = i64::try_from(self.issued_at_ms)
+            .map_err(|_| BrokerError::InvalidField("operation_identity.clock"))?;
+        if request_identity.request.metadata.request_id.as_str() != self.request_id
+            || request_identity.idempotency_key != self.idempotency_key
+            || request_identity.cancellation_id != self.cancellation_id
+            || request_identity.deadline_unix_ms != self.deadline_unix_ms
+            || request_identity.request.metadata.state_fence != request_identity.request.state_fence
+            || request_identity.request.metadata.product_id.as_str() != "eliot-user-broker"
+            || request_identity.request.metadata.source_id.as_str() != "user-broker-transport"
+            || request_identity.request.metadata.session_id.is_some()
+            || request_identity.request.metadata.task_id.is_some()
+            || request_identity.request.metadata.clock.valid_time_ms != Some(issued_at)
+            || request_identity.request.metadata.clock.known_time_ms != Some(issued_at)
+        {
+            return Err(BrokerError::InvalidField(
+                "operation_identity.request_identity_binding",
+            ));
+        }
+        if self.caller_request_id.is_some() != self.caller_idempotency_key.is_some()
+            || (is_authorize_launch && self.caller_request_id.is_none())
+            || (!is_authorize_launch && self.caller_request_id.is_some())
+        {
+            return Err(BrokerError::InvalidField(
+                "operation_identity.caller_binding",
+            ));
+        }
         Ok(())
     }
 }
 
 /// Live per-operation identity ledger supplied by the composition.
 ///
-/// The broker core never mints an identity: it only projects whatever the
-/// composed issuer holds into the durable snapshot, so the identity ledger
-/// and the durable registration state are written in one atomic publication.
+/// The broker core never mints a Kernel request identity: it only projects
+/// whatever the composed issuer holds into the durable snapshot, so the
+/// identity ledger and the durable registration state are written in one
+/// atomic publication. A broken ledger is an error; it must not erase
+/// recovered identities from the next snapshot.
 pub trait IssuedOperationIdentityLedger: Send {
     /// Returns every operation identity this process has issued, in a
-    /// deterministic order. A poisoned ledger returns an empty projection and
-    /// the caller fails closed on the next issuance.
-    fn issued_operation_identities(&self) -> Vec<IssuedOperationIdentity>;
+    /// deterministic order, or an error when the projection is unavailable.
+    fn issued_operation_identities(&self) -> Result<Vec<IssuedOperationIdentity>, String>;
 }
 
 /// Durable restart cursor owned by the injected registration provider.
@@ -2577,11 +2702,15 @@ impl UserBroker {
         }
         let namespace = operation.namespace();
         let identity = IssuedOperationIdentity {
+            schema_version: ISSUED_OPERATION_IDENTITY_VERSION,
             operation: operation.selector().to_owned(),
             // The registration lease is the control operation's deadline: a
             // cancellation or reconciliation is authorized no longer than the
             // lease that admitted it.
             deadline_unix_ms: current.expires_at,
+            registration_digest: Some(current.registration_digest.clone()),
+            user_broker_epoch: Some(current.user_broker_epoch),
+            request_identity: None,
             request_id: format!("ub-ctl-{namespace}-{}", &canonical_digest[..32]),
             idempotency_key: format!("ub-ctl/{namespace}/{canonical_digest}"),
             cancellation_id: format!("ub-ctl-end-{namespace}-{}", &canonical_digest[..32]),
@@ -2590,6 +2719,7 @@ impl UserBroker {
             // and a reconcile identity, so a single-valued caller link would
             // make the second one look like a conflicting reuse.
             caller_request_id: None,
+            caller_idempotency_key: None,
             canonical_digest,
         };
         identity.validate()?;
@@ -2895,7 +3025,9 @@ impl UserBroker {
                 self.registration = Some(desired);
                 let reconciled = match self.durable.as_mut() {
                     Some(durable) => match durable.load() {
-                        Ok(Some(snapshot)) => snapshot == self.snapshot(),
+                        Ok(Some(snapshot)) => {
+                            matches!(self.snapshot(), Ok(expected) if expected == snapshot)
+                        }
                         Ok(None) | Err(_) => false,
                     },
                     None => false,
@@ -3042,8 +3174,8 @@ impl UserBroker {
         Ok(durable.clone())
     }
 
-    fn snapshot(&self) -> BrokerSnapshot {
-        BrokerSnapshot {
+    fn snapshot(&self) -> Result<BrokerSnapshot, BrokerError> {
+        Ok(BrokerSnapshot {
             registration: self.registration.clone(),
             user_broker_epoch: self.broker_epoch,
             operation_cursors: self
@@ -3051,11 +3183,11 @@ impl UserBroker {
                 .values()
                 .map(|record| record.cursor.clone())
                 .collect(),
-            operation_identities: self.projected_operation_identities(),
+            operation_identities: self.projected_operation_identities()?,
             retired_operations: self.retired_operations.values().cloned().collect(),
             predecessor_registration: self.predecessor_registration.clone(),
             cutover_receipt: self.cutover_receipt.clone(),
-        }
+        })
     }
 
     /// Projects the durable identity ledger: everything recovered from the
@@ -3066,18 +3198,29 @@ impl UserBroker {
     /// carries byte-identical transport fields, so the live row is the same
     /// row. The recovered row is still kept when the composed ledger does not
     /// carry it, so attaching no ledger never erases durable history.
-    fn projected_operation_identities(&self) -> Vec<IssuedOperationIdentity> {
+    fn projected_operation_identities(&self) -> Result<Vec<IssuedOperationIdentity>, BrokerError> {
         let mut projected = self.issued_operations.clone();
         if let Some(ledger) = self.identity_ledger.as_ref() {
-            for identity in ledger.issued_operation_identities() {
-                projected.insert(identity.request_id.clone(), identity);
+            for identity in ledger.issued_operation_identities().map_err(|error| {
+                BrokerError::Provider(format!("operation identity ledger unavailable: {error}"))
+            })? {
+                identity.validate()?;
+                if let Some(retained) = projected.get(&identity.request_id) {
+                    if retained != &identity {
+                        return Err(BrokerError::InvalidField(
+                            "operation_identity.duplicate_request_id_binding",
+                        ));
+                    }
+                } else {
+                    projected.insert(identity.request_id.clone(), identity);
+                }
             }
         }
-        projected.into_values().collect()
+        Ok(projected.into_values().collect())
     }
 
     fn persist(&mut self) -> Result<(), BrokerError> {
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot()?;
         self.durable
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::DurableRegistration))?
@@ -6373,7 +6516,9 @@ mod tests {
                 .values()
                 .map(|record| record.cursor.clone())
                 .collect(),
-            operation_identities: broker.projected_operation_identities(),
+            operation_identities: broker
+                .projected_operation_identities()
+                .expect("identity projection"),
             retired_operations: broker.retired_operations.values().cloned().collect(),
             predecessor_registration: broker.predecessor_registration.clone(),
             cutover_receipt: broker.cutover_receipt.clone(),
@@ -6482,7 +6627,7 @@ mod tests {
         assert!(decoded.authority_epoch.is_same_authority(&test_epoch(7)));
 
         // Wrong-lineage cursor with equal sequence must fail closed.
-        let mut snapshot = broker.snapshot();
+        let mut snapshot = broker.snapshot().expect("snapshot");
         let mut wrong = snapshot.operation_cursors.first().expect("cursor").clone();
         wrong.authority_epoch = test_epoch_b(7);
         assert!(
