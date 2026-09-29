@@ -28,11 +28,10 @@ use eliot_process::{
 use eliot_protocol::{ProtocolVersion, RequestIdentity};
 use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::{
-    EffectCeiling, NativeResourceDevicePolicy, NativeResourceKind,
-    NativeResourceLease, NativeResourceLeaseBinding, NativeResourceLeaseConsumptionReceipt,
-    NativeResourceLeaseError, NativeResourceMeasurement, NativeResourceNetworkPolicy,
-    NativeResourceReparsePolicy, NativeResourceSelection, NativeResourceSelectionCandidate,
-    NativeResourceSelectionError,
+    EffectCeiling, NativeResourceDevicePolicy, NativeResourceKind, NativeResourceLease,
+    NativeResourceLeaseBinding, NativeResourceLeaseConsumptionReceipt, NativeResourceLeaseError,
+    NativeResourceMeasurement, NativeResourceNetworkPolicy, NativeResourceReparsePolicy,
+    NativeResourceSelection, NativeResourceSelectionCandidate, NativeResourceSelectionError,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -868,7 +867,10 @@ pub struct OperatorNativeResourceSelectionInput {
 impl OperatorNativeResourceSelectionInput {
     fn validate(&self) -> Result<(), BrokerError> {
         for (path, field) in [
-            (&self.selected_root_path, "resource_selection.selected_root_path"),
+            (
+                &self.selected_root_path,
+                "resource_selection.selected_root_path",
+            ),
             (
                 &self.selected_object_path,
                 "resource_selection.selected_object_path",
@@ -889,7 +891,7 @@ impl OperatorNativeResourceSelectionInput {
 /// Broker-owned observation of one explicitly selected native object.
 ///
 /// The platform owner produces this from retained, no-follow root/object
-/// handles. It contains no path and no StateFence: only the Kernel grant may
+/// handles. It contains no path and no `StateFence`: only the Kernel grant may
 /// issue the latter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeResourceObjectMeasurement {
@@ -1752,12 +1754,8 @@ fn validate_retained_native_resource_lease(
             .map_err(BrokerError::NativeResourceLease)?,
         _ => return Err(BrokerError::InvalidField(field)),
     }
-    let candidate = owner
-        .candidate
-        .ok_or(BrokerError::InvalidField(field))?;
-    let introduction = owner
-        .introduction
-        .ok_or(BrokerError::InvalidField(field))?;
+    let candidate = owner.candidate.ok_or(BrokerError::InvalidField(field))?;
+    let introduction = owner.introduction.ok_or(BrokerError::InvalidField(field))?;
     if lease.operation_ref != owner.operation_id
         || lease.registration_ref != owner.registration_digest
         || lease.broker_epoch != owner.user_broker_epoch
@@ -2548,10 +2546,7 @@ impl UserBroker {
                 selection_input_digest: record.cursor.selection_input_digest.clone(),
                 native_resource_lease: record.cursor.native_resource_lease.clone(),
                 native_resource_lease_use_state: record.cursor.native_resource_lease_use_state,
-                native_resource_lease_receipt: record
-                    .cursor
-                    .native_resource_lease_receipt
-                    .clone(),
+                native_resource_lease_receipt: record.cursor.native_resource_lease_receipt.clone(),
                 state: record.cursor.state,
             };
             self.retired_operations
@@ -2803,7 +2798,9 @@ impl UserBroker {
         let now = self
             .native_resource_resolver
             .as_mut()
-            .ok_or(BrokerError::PlanGap(RequiredProvider::NativeResourceResolver))?
+            .ok_or(BrokerError::PlanGap(
+                RequiredProvider::NativeResourceResolver,
+            ))?
             .owner_now_unix_ms()
             .map_err(map_native_resource_resolution)?;
         if now == 0 {
@@ -2922,7 +2919,7 @@ impl UserBroker {
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?
             .validate_native_resource_selection_current(&current, selection, now);
-        result.map_err(map_native_resource_selection_currentness)?;
+        result.map_err(|error| map_native_resource_selection_currentness(&error))?;
         Ok(now)
     }
 
@@ -2948,7 +2945,9 @@ impl UserBroker {
         let measured = self
             .native_resource_resolver
             .as_mut()
-            .ok_or(BrokerError::PlanGap(RequiredProvider::NativeResourceResolver))?
+            .ok_or(BrokerError::PlanGap(
+                RequiredProvider::NativeResourceResolver,
+            ))?
             .remeasure_for_use(candidate, lease.issued_at)
             .map_err(map_native_resource_resolution)?;
         let measured_at = measured
@@ -3007,42 +3006,16 @@ impl UserBroker {
                 NativeResourceLeaseError::Revoked,
             ));
         }
-        let receipt = NativeResourceLeaseConsumptionReceipt {
-            receipt_id: Uuid::new_v4().simple().to_string(),
-            lease_id: lease.lease_id.clone(),
-            lease_digest: lease
-                .canonical_digest()
-                .map_err(BrokerError::NativeResourceLease)?,
-            principal_ref: lease.principal_ref.clone(),
-            issuer_process_ref: lease.issuer_process_ref.clone(),
-            attempt_ref: lease.attempt_ref.clone(),
-            request_ref: lease.request_ref.clone(),
-            operation_ref: lease.operation_ref.clone(),
-            candidate_ref: lease.candidate_ref.clone(),
-            resource_ref: lease.resource_ref.clone(),
-            scope_digest: lease.scope_digest.clone(),
-            canonical_root_identity_digest: lease.canonical_root_identity_digest.clone(),
-            registration_ref: lease.registration_ref.clone(),
-            broker_epoch: lease.broker_epoch,
-            consumer_generation: lease.consumer_generation,
-            // This is the exact grant fence whose live currentness the Kernel
-            // just revalidated; it is not copied into physical measurement.
-            state_fence: selection.state_fence.clone(),
-            resource_identity_digest: measurement.resource_identity_digest.clone(),
-            measurement_digest: measurement.measurement_digest.clone(),
-            resource_kind: measurement.resource_kind,
-            reparse_policy: measurement.reparse_policy,
-            network_policy: measurement.network_policy,
-            device_policy: measurement.device_policy,
-            consumed_at: live_at,
-        };
+        let receipt = native_resource_consumption_receipt(lease, selection, &measurement, live_at)?;
         receipt
             .validate_for(lease)
             .map_err(BrokerError::NativeResourceLease)?;
-        let record = self
-            .operations
-            .get_mut(&reservation_key)
-            .ok_or(BrokerError::NativeResourceLease(NativeResourceLeaseError::Replay))?;
+        let record =
+            self.operations
+                .get_mut(&reservation_key)
+                .ok_or(BrokerError::NativeResourceLease(
+                    NativeResourceLeaseError::Replay,
+                ))?;
         record.cursor.native_resource_lease_receipt = Some(receipt.clone());
         record.cursor.native_resource_lease_use_state = Some(NativeResourceLeaseUseState::Consumed);
         self.persist()?;
@@ -3079,12 +3052,16 @@ impl UserBroker {
             replay = true;
         }
         let Some(reservation_key) = reservation_key.filter(|_| !replay) else {
-            return Err(BrokerError::NativeResourceLease(NativeResourceLeaseError::Replay));
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Replay,
+            ));
         };
-        let record = self
-            .operations
-            .get_mut(&reservation_key)
-            .ok_or(BrokerError::NativeResourceLease(NativeResourceLeaseError::Replay))?;
+        let record =
+            self.operations
+                .get_mut(&reservation_key)
+                .ok_or(BrokerError::NativeResourceLease(
+                    NativeResourceLeaseError::Replay,
+                ))?;
         record.cursor.native_resource_lease_use_state =
             Some(NativeResourceLeaseUseState::ResolutionInFlight);
         self.persist()?;
@@ -3142,13 +3119,15 @@ impl UserBroker {
             .retired_operations
             .get(request.approved.operation_id.as_str())
         {
-            return Err(if retired.selection_input_digest.as_deref()
-                == Some(selection_input_digest.as_str())
-            {
-                BrokerError::RetiredOperation(retired.operation_id.clone())
-            } else {
-                BrokerError::OperationIdRetired(retired.operation_id.clone())
-            });
+            return Err(
+                if retired.selection_input_digest.as_deref()
+                    == Some(selection_input_digest.as_str())
+                {
+                    BrokerError::RetiredOperation(retired.operation_id.clone())
+                } else {
+                    BrokerError::OperationIdRetired(retired.operation_id.clone())
+                },
+            );
         }
 
         let current = self.active_registration(request.observed_at)?.clone();
@@ -3157,7 +3136,9 @@ impl UserBroker {
             let resolver = self
                 .native_resource_resolver
                 .as_mut()
-                .ok_or(BrokerError::PlanGap(RequiredProvider::NativeResourceResolver))?;
+                .ok_or(BrokerError::PlanGap(
+                    RequiredProvider::NativeResourceResolver,
+                ))?;
             let owner_now = resolver
                 .owner_now_unix_ms()
                 .map_err(map_native_resource_resolution)?;
@@ -3253,11 +3234,7 @@ impl UserBroker {
             (None, None) => (None, None),
             (Some(candidate), Some(selection)) => {
                 let (binding, lease) = self.issue_native_resource_lease(
-                    &current,
-                    &request,
-                    &grant,
-                    selection,
-                    candidate,
+                    &current, &request, &grant, selection, candidate,
                 )?;
                 (Some(binding), Some(lease))
             }
@@ -3284,8 +3261,10 @@ impl UserBroker {
             &request_digest,
             &expected_process_request_digest,
             &request,
-            selection_input_digest.clone(),
-            resource_lease.as_ref(),
+            NativeResourceCursorInput {
+                selection_input_digest: selection_input_digest.as_deref(),
+                lease: resource_lease.as_ref(),
+            },
             OperationState::Unknown,
         );
         let pending_record = OperationRecord {
@@ -3307,16 +3286,16 @@ impl UserBroker {
             selection.as_ref(),
             candidate.as_ref(),
         ) {
-            (Some(lease), Some(binding), Some(selection), Some(candidate)) => Some(
-                self.consume_native_resource_lease(
+            (Some(lease), Some(binding), Some(selection), Some(candidate)) => {
+                Some(self.consume_native_resource_lease(
                     &request.approved.idempotency_key,
                     &current,
                     selection,
                     candidate,
                     lease,
                     binding,
-                )?,
-            ),
+                )?)
+            }
             (None, None, None, None) => None,
             _ => return Err(BrokerError::NativeResourceSelectionBindingMismatch),
         };
@@ -3337,7 +3316,9 @@ impl UserBroker {
             .operations
             .get(&request.approved.idempotency_key)
             .cloned()
-            .ok_or(BrokerError::NativeResourceLease(NativeResourceLeaseError::Replay))?;
+            .ok_or(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Replay,
+            ))?;
         let (start_result, lineage_status) = {
             let process = self
                 .process
@@ -4413,7 +4394,9 @@ fn native_resource_lease_binding(
         || selection.registration_ref != registration.registration_digest
         || selection.broker_epoch != registration.user_broker_epoch
         || selection.fence_id != registration.fence_id
-        || !selection.authority_epoch.is_same_authority(&registration.authority_epoch)
+        || !selection
+            .authority_epoch
+            .is_same_authority(&registration.authority_epoch)
     {
         return Err(BrokerError::NativeResourceSelectionBindingMismatch);
     }
@@ -4473,7 +4456,9 @@ fn validate_resource_selection_binding(
                 || selection.interactive_session_id != request.approved.session_id.as_str()
                 || selection.registration_ref != current.registration_digest
                 || selection.broker_epoch != current.user_broker_epoch
-                || !selection.authority_epoch.is_same_authority(&current.authority_epoch)
+                || !selection
+                    .authority_epoch
+                    .is_same_authority(&current.authority_epoch)
                 || selection.fence_id != current.fence_id
                 || selection.consumer_generation != request.approved.generation.get()
                 || selection.expires_at < grant.expires_at
@@ -4502,14 +4487,56 @@ fn permit_from_grant(
     }
 }
 
+fn native_resource_consumption_receipt(
+    lease: &NativeResourceLease,
+    selection: &NativeResourceSelection,
+    measurement: &NativeResourceMeasurement,
+    consumed_at: u64,
+) -> Result<NativeResourceLeaseConsumptionReceipt, BrokerError> {
+    Ok(NativeResourceLeaseConsumptionReceipt {
+        receipt_id: Uuid::new_v4().simple().to_string(),
+        lease_id: lease.lease_id.clone(),
+        lease_digest: lease
+            .canonical_digest()
+            .map_err(BrokerError::NativeResourceLease)?,
+        principal_ref: lease.principal_ref.clone(),
+        issuer_process_ref: lease.issuer_process_ref.clone(),
+        attempt_ref: lease.attempt_ref.clone(),
+        request_ref: lease.request_ref.clone(),
+        operation_ref: lease.operation_ref.clone(),
+        candidate_ref: lease.candidate_ref.clone(),
+        resource_ref: lease.resource_ref.clone(),
+        scope_digest: lease.scope_digest.clone(),
+        canonical_root_identity_digest: lease.canonical_root_identity_digest.clone(),
+        registration_ref: lease.registration_ref.clone(),
+        broker_epoch: lease.broker_epoch,
+        consumer_generation: lease.consumer_generation,
+        // The Kernel just revalidated this grant fence; it is not copied into
+        // the physical measurement.
+        state_fence: selection.state_fence.clone(),
+        resource_identity_digest: measurement.resource_identity_digest.clone(),
+        measurement_digest: measurement.measurement_digest.clone(),
+        resource_kind: measurement.resource_kind,
+        reparse_policy: measurement.reparse_policy,
+        network_policy: measurement.network_policy,
+        device_policy: measurement.device_policy,
+        consumed_at,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct NativeResourceCursorInput<'a> {
+    selection_input_digest: Option<&'a str>,
+    lease: Option<&'a NativeResourceLease>,
+}
+
 fn cursor_from_grant(
     grant: &LaunchGrant,
     registration: &RegistrationReceipt,
     request_digest: &str,
     process_request_digest: &str,
     request: &LaunchRequest,
-    selection_input_digest: Option<String>,
-    native_resource_lease: Option<&NativeResourceLease>,
+    native_resource: NativeResourceCursorInput<'_>,
     state: OperationState,
 ) -> OperationCursor {
     OperationCursor {
@@ -4530,9 +4557,10 @@ fn cursor_from_grant(
         // exact thing that was introduced, instead of only the child id.
         introduction: Some(grant.approved.introduction.clone()),
         native_resource_selection_candidate: request.resource_selection_candidate.clone(),
-        selection_input_digest,
-        native_resource_lease: native_resource_lease.cloned(),
-        native_resource_lease_use_state: native_resource_lease
+        selection_input_digest: native_resource.selection_input_digest.map(str::to_owned),
+        native_resource_lease: native_resource.lease.cloned(),
+        native_resource_lease_use_state: native_resource
+            .lease
             .map(|_| NativeResourceLeaseUseState::Reserved),
         native_resource_lease_receipt: None,
         // Published with the Unknown cursor before physical start. It is
@@ -4803,7 +4831,7 @@ fn map_native_resource_currentness(error: BrokerError) -> BrokerError {
     }
 }
 
-fn map_native_resource_selection_currentness(error: PortError) -> BrokerError {
+fn map_native_resource_selection_currentness(error: &PortError) -> BrokerError {
     match error {
         PortError::Denied => BrokerError::NativeResourceSelectionCurrentnessDenied,
         PortError::Unavailable => BrokerError::NativeResourceSelectionCurrentnessUnavailable,

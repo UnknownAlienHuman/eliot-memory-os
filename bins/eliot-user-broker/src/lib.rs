@@ -40,8 +40,8 @@ use eliot_user_broker_core::{
     AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
     CutoverReceipt, DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest,
     IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest,
-    LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest, PortError,
-    OperatorNativeResourceSelectionInput, ProcessEffectLineage, ProcessPort,
+    LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
+    OperatorNativeResourceSelectionInput, PortError, ProcessEffectLineage, ProcessPort,
     ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
 };
 use serde::{Deserialize, Serialize};
@@ -50,11 +50,11 @@ use thiserror::Error;
 
 mod bridge_contract;
 mod kernel_authority_port;
+#[cfg(windows)]
+mod native_resource_resolver;
 mod notify_fallback_ensure;
 pub mod notify_launch_callin;
 mod operation_identity;
-#[cfg(windows)]
-mod native_resource_resolver;
 #[cfg(windows)]
 mod own_generation_job;
 mod protected_launch_config;

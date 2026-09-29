@@ -77,7 +77,7 @@ pub struct NativeResourceSelectionCandidate {
     pub request_ref: String,
     /// Exact effect operation identity.
     pub operation_ref: String,
-    /// Opaque ResourceRef from the request's introduction; it never selects a
+    /// Opaque `ResourceRef` from the request's introduction; it never selects a
     /// path and is checked against the Kernel-admitted introduction.
     pub resource_ref: String,
     /// Digest of the explicitly selected root object identity.
@@ -108,11 +108,12 @@ impl NativeResourceSelectionCandidate {
     /// Rejects incomplete or malformed Broker evidence before authorization.
     pub fn validate(&self) -> Result<(), NativeResourceSelectionError> {
         if self.version != NATIVE_RESOURCE_SELECTION_CANDIDATE_VERSION {
-            return Err(NativeResourceSelectionError::InvalidField("candidate.version"));
+            return Err(NativeResourceSelectionError::InvalidField(
+                "candidate.version",
+            ));
         }
-        opaque_ref(&self.candidate_ref).map_err(|_| {
-            NativeResourceSelectionError::InvalidField("candidate.candidate_ref")
-        })?;
+        opaque_ref(&self.candidate_ref)
+            .map_err(|_| NativeResourceSelectionError::InvalidField("candidate.candidate_ref"))?;
         bounded_text(
             &self.principal_ref,
             MAX_SELECTION_REF_BYTES,
@@ -133,9 +134,8 @@ impl NativeResourceSelectionCandidate {
             MAX_SELECTION_REF_BYTES,
             "candidate.operation_ref",
         )?;
-        opaque_ref(&self.resource_ref).map_err(|_| {
-            NativeResourceSelectionError::InvalidField("candidate.resource_ref")
-        })?;
+        opaque_ref(&self.resource_ref)
+            .map_err(|_| NativeResourceSelectionError::InvalidField("candidate.resource_ref"))?;
         digest(
             &self.canonical_root_identity_digest,
             "candidate.canonical_root_identity_digest",
@@ -150,7 +150,11 @@ impl NativeResourceSelectionCandidate {
             MAX_SELECTION_REF_BYTES,
             "candidate.registration_ref",
         )?;
-        bounded_text(&self.fence_id, MAX_SELECTION_REF_BYTES, "candidate.fence_id")?;
+        bounded_text(
+            &self.fence_id,
+            MAX_SELECTION_REF_BYTES,
+            "candidate.fence_id",
+        )?;
         if self.broker_epoch == 0 || self.measured_at == 0 {
             return Err(NativeResourceSelectionError::InvalidField(
                 "candidate.owner_epoch_or_time",
@@ -250,9 +254,8 @@ impl NativeResourceSelection {
         if self.version != NATIVE_RESOURCE_SELECTION_VERSION {
             return Err(NativeResourceSelectionError::InvalidField("version"));
         }
-        opaque_ref(&self.candidate_ref).map_err(|_| {
-            NativeResourceSelectionError::InvalidField("candidate_ref")
-        })?;
+        opaque_ref(&self.candidate_ref)
+            .map_err(|_| NativeResourceSelectionError::InvalidField("candidate_ref"))?;
         bounded_text(
             &self.principal_ref,
             MAX_SELECTION_REF_BYTES,
@@ -265,7 +268,11 @@ impl NativeResourceSelection {
         )?;
         bounded_text(&self.attempt_ref, MAX_SELECTION_REF_BYTES, "attempt_ref")?;
         bounded_text(&self.request_ref, MAX_SELECTION_REF_BYTES, "request_ref")?;
-        bounded_text(&self.operation_ref, MAX_SELECTION_REF_BYTES, "operation_ref")?;
+        bounded_text(
+            &self.operation_ref,
+            MAX_SELECTION_REF_BYTES,
+            "operation_ref",
+        )?;
         if self.attempt_ref == self.request_ref || self.attempt_ref == self.operation_ref {
             return Err(NativeResourceSelectionError::InvalidField(
                 "attempt_ref_owner_identity",
@@ -317,7 +324,9 @@ impl NativeResourceSelection {
             ));
         }
         if self.issued_at == 0 || self.expires_at <= self.issued_at {
-            return Err(NativeResourceSelectionError::InvalidField("selection_window"));
+            return Err(NativeResourceSelectionError::InvalidField(
+                "selection_window",
+            ));
         }
         Ok(())
     }
@@ -328,10 +337,7 @@ fn bounded_text(
     max_bytes: usize,
     field: &'static str,
 ) -> Result<(), NativeResourceSelectionError> {
-    if value.trim().is_empty()
-        || value.len() > max_bytes
-        || value.chars().any(char::is_control)
-    {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
         return Err(NativeResourceSelectionError::InvalidField(field));
     }
     Ok(())

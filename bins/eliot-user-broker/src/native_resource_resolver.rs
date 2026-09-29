@@ -13,11 +13,13 @@ use eliot_platform_windows::{
     UserSelectedResourceError, UserSelectedResourceKind, UserSelectedResourceLease,
     UserSelectedResourceMeasurement,
 };
-use eliot_security_contracts::{NativeResourceDevicePolicy, NativeResourceKind,
-    NativeResourceNetworkPolicy, NativeResourceReparsePolicy};
+use eliot_security_contracts::{
+    NativeResourceDevicePolicy, NativeResourceKind, NativeResourceNetworkPolicy,
+    NativeResourceReparsePolicy, NativeResourceSelectionCandidate,
+};
 use eliot_user_broker_core::{
     NativeResourceObjectMeasurement, NativeResourceResolutionError, NativeResourceResolverPort,
-    NativeResourceSelectionCandidate, OperatorNativeResourceSelectionInput,
+    OperatorNativeResourceSelectionInput,
 };
 use serde::Serialize;
 
@@ -197,9 +199,7 @@ fn digest<T: Serialize>(value: &T) -> Result<String, NativeResourceResolutionErr
     Ok(sha256_hex(&bytes))
 }
 
-fn map_selected_resource_error(
-    error: UserSelectedResourceError,
-) -> NativeResourceResolutionError {
+fn map_selected_resource_error(error: UserSelectedResourceError) -> NativeResourceResolutionError {
     match error {
         UserSelectedResourceError::InvalidPath
         | UserSelectedResourceError::NetworkPath

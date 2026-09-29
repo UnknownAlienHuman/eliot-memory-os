@@ -4,11 +4,11 @@
 //! resolve and measure the current resource again at the point of use, then
 //! retain the returned consumption receipt with the admitted operation.
 
-use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use crate::{
     NativeResourceDevicePolicy, NativeResourceKind, NativeResourceNetworkPolicy,
     NativeResourceReparsePolicy,
 };
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -114,10 +114,14 @@ impl NativeResourceLeaseBinding {
             &self.measurement_digest,
             NativeResourceLeaseField::MeasurementDigest,
         )?;
-        self.state_fence
-            .validate()
-            .map_err(|_| NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence))?;
-        if !self.state_fence.authority_epoch.is_same_authority(&self.authority_epoch) {
+        self.state_fence.validate().map_err(|_| {
+            NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence)
+        })?;
+        if !self
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&self.authority_epoch)
+        {
             return Err(NativeResourceLeaseError::Revoked);
         }
         validate_digest(
@@ -271,9 +275,9 @@ impl NativeResourceLease {
             &self.measurement_digest,
             NativeResourceLeaseField::MeasurementDigest,
         )?;
-        self.state_fence
-            .validate()
-            .map_err(|_| NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence))?;
+        self.state_fence.validate().map_err(|_| {
+            NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence)
+        })?;
         if !self
             .state_fence
             .authority_epoch
@@ -455,9 +459,9 @@ impl NativeResourceLeaseConsumptionReceipt {
         {
             return Err(NativeResourceLeaseError::ReceiptBindingMismatch);
         }
-        self.state_fence
-            .validate()
-            .map_err(|_| NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence))?;
+        self.state_fence.validate().map_err(|_| {
+            NativeResourceLeaseError::InvalidField(NativeResourceLeaseField::StateFence)
+        })?;
         if self.consumed_at < lease.issued_at || self.consumed_at >= lease.expires_at {
             return Err(NativeResourceLeaseError::Expired);
         }
