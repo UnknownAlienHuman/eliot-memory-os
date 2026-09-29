@@ -3638,7 +3638,7 @@ mod tests {
               "host_service_registration":{"registration":"Matching","state":"Running","observed_process":null,"observed_runtime":{"process_id":1,"start_time_100ns":2,"image_path":image,"runtime_identity_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"gap":""},
               "watchdog_service_registration":{"registration":"Matching","state":"Running","observed_process":null,"observed_runtime":{"process_id":2,"start_time_100ns":3,"image_path":image,"runtime_identity_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"gap":""}
             },
-            "readiness":{"proof_status":"Healthy","age_gap":""},"recovery_command":"","gaps":[],
+            "readiness":{"proof_status":"Healthy","age_gap":""},"installation_profile":{"selected_profile":null,"selected_supervision_type":null,"root_binding_version":null,"resolved_root_roles":null,"enforced_guarantees":[],"unsupported_guarantees":["selected_active_manifest_unavailable; profile selection is unproven"]},"recovery_command":"","gaps":[],
             "components":{"installation_registry":"Healthy","host_journal":"Healthy","ors_supervision":"Healthy","kernel":"Healthy","store":"Healthy","eliotd":"Healthy","watchdog":"Healthy"},"deadline_exceeded":false
         }))
         .unwrap_or_else(|_| unreachable!())

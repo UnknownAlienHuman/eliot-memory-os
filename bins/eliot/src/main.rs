@@ -11,12 +11,15 @@ use eliot_cli::{
 };
 use eliot_doctor::integration;
 use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
+#[cfg(windows)]
+use eliot_host::{HostComposition, HostLaunchOptions};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass, ProfileRootAnchors,
-    ProfileSelectionInput, RedbInstallationRegistry, RedbInstallationTransactionStore,
+    ProfileSelectionInput, ProfileSelectionResolution, RedbInstallationRegistry,
+    RedbInstallationTransactionStore, UserModePhaseBCall, UserModePhaseBOutcome,
     WindowsInstallationCoordinator, parse_installation_transaction_id,
     post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
     validate_installation_transaction_json,
@@ -2463,6 +2466,7 @@ fn write_generation_output_reconciliation(reconciliation: &GenerationOutputRecon
 fn run_installation_generate(
     source_root: PathBuf,
     profile_selection: ProfileSelectionInput,
+    profile_resolution: ProfileSelectionResolution,
     installation: String,
     lineage_id: String,
     sequence: u64,
@@ -2498,6 +2502,7 @@ fn run_installation_generate(
         store_path,
         source_publication,
         profile_selection,
+        profile_resolution,
         write_transaction_artifact,
     )
 }
@@ -2508,6 +2513,7 @@ fn run_installation_generate_with_output_writer<F>(
     store_path: PathBuf,
     source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
     profile_selection: ProfileSelectionInput,
+    profile_resolution: ProfileSelectionResolution,
     write_output: F,
 ) -> Result<InstallationGenerationOutcome>
 where
@@ -2516,6 +2522,7 @@ where
     let transaction = match GenerationPackagePlanner::plan_with_published_profile_binding(
         input,
         &profile_selection,
+        &profile_resolution,
         source_publication.profile_governed_roots,
         source_publication.source_identity,
         source_publication.files,
@@ -2732,6 +2739,8 @@ fn run_installation_materialize_source_bundle(
         source_root: output_bundle.clone(),
         staging_root: staging_root.clone(),
     })?;
+    let profile_resolution =
+        GenerationPackagePlanner::resolve_profile_selection(&profile_selection)?;
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
         eliot_watchdog_exe: eliot_watchdog,
@@ -2755,6 +2764,7 @@ fn run_installation_materialize_source_bundle(
             sequence,
         },
         profile_selection: profile_selection.clone(),
+        profile_resolution: profile_resolution.clone(),
         transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
     };
     let receipt =
@@ -2799,6 +2809,7 @@ fn run_installation_materialize_source_bundle(
     let generated = run_installation_generate(
         output_bundle,
         profile_selection,
+        profile_resolution,
         installation,
         lineage_id,
         sequence,
@@ -2931,6 +2942,7 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
                         "gap": report.readiness.age_gap,
                     },
                     "runtime_health": report.runtime_health,
+                    "installation_profile": report.installation_profile,
                     "recovery_command": report.recovery_command,
                     "gaps": report.gaps,
                     "components": report.components,
@@ -3439,7 +3451,23 @@ fn run_installation_effect(
         }
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
-    let outcome = if recover {
+    let outcome = if preflight_transaction.profile == InstallationProfile::UserMode {
+        #[cfg(windows)]
+        {
+            run_user_mode_installation_effect(
+                &mut coordinator,
+                &transaction_id,
+                &preflight_transaction,
+                recover,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            Err(InstallationError::Platform(
+                "UserMode installation effects require Windows profile supervision".to_owned(),
+            ))
+        }
+    } else if recover {
         if preflight_transaction.has_activation_projection_intent() {
             rollback_with_activation_owner(
                 &mut coordinator,
@@ -3761,6 +3789,192 @@ fn run_installation_effect(
     Ok(installation_command_exit_code(overall_status))
 }
 
+#[cfg(windows)]
+fn run_user_mode_installation_effect(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction_id: &PlatformHandle,
+    transaction: &InstallationTransaction,
+    recover: bool,
+) -> Result<InstallationStepOutcome, InstallationError> {
+    if recover {
+        let phase_b_progress = transaction
+            .installer_effects
+            .iter()
+            .zip(transaction.effect_progress())
+            .find_map(|(effect, progress)| {
+                matches!(
+                    effect,
+                    eliot_installation::InstallerEffectPlan::MaterializeUserModePhaseB { .. }
+                )
+                .then_some(&progress.state)
+            })
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "UserMode transaction has no Host phase-B effect to reconcile".to_owned(),
+                )
+            })?;
+        let phase_b_may_have_run = matches!(
+            phase_b_progress,
+            eliot_installation::InstallationEffectProgressState::IntentCommitted { .. }
+                | eliot_installation::InstallationEffectProgressState::Unknown { .. }
+                | eliot_installation::InstallationEffectProgressState::Applied { .. }
+        );
+        if phase_b_may_have_run {
+            let current = coordinator
+                .store()
+                .load(transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                })?;
+            let phase_b = reconcile_user_mode_phase_b(
+                coordinator,
+                transaction_id,
+                &current,
+            )?;
+            if let UserModePhaseBProgress::Outcome(outcome) = phase_b
+                && !matches!(outcome, InstallationStepOutcome::Applied { .. })
+            {
+                return Ok(outcome);
+            }
+            return coordinator.drive_until_user_mode_task(transaction_id);
+        }
+        if transaction.has_activation_projection_intent() {
+            return rollback_user_mode_with_activation_owner(
+                coordinator,
+                transaction,
+                transaction_id,
+            );
+        }
+        return coordinator.rollback(transaction_id);
+    }
+
+    let prefix_outcome = coordinator.drive_until_user_mode_phase_b(transaction_id)?;
+    if !matches!(prefix_outcome, InstallationStepOutcome::Applied { .. }) {
+        return Ok(prefix_outcome);
+    }
+    let current = coordinator
+        .store()
+        .load(transaction_id)?
+        .ok_or_else(|| InstallationError::TransactionNotFound {
+            transaction_id: transaction_id.as_str().to_owned(),
+        })?;
+    let host_state_root = Path::new(
+        current
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let host_root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let registry = RedbInstallationRegistry::open_at(host_root)?;
+    let expected_registry_revision = registry.load()?.revision();
+    coordinator.stage_user_mode_pending_activation(
+        &registry,
+        transaction_id,
+        expected_registry_revision,
+    )?;
+    let call = coordinator.begin_user_mode_phase_b(&registry, transaction_id)?;
+    drop(registry);
+    if let UserModePhaseBProgress::Outcome(outcome) = perform_user_mode_phase_b_call(
+        coordinator,
+        transaction_id,
+        &current,
+        call,
+    )? && !matches!(outcome, InstallationStepOutcome::Applied { .. })
+    {
+        return Ok(outcome);
+    }
+    coordinator.drive_until_user_mode_task(transaction_id)
+}
+
+#[cfg(windows)]
+enum UserModePhaseBProgress {
+    AlreadyApplied,
+    Outcome(InstallationStepOutcome),
+}
+
+#[cfg(windows)]
+fn reconcile_user_mode_phase_b(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction_id: &PlatformHandle,
+    transaction: &InstallationTransaction,
+) -> Result<UserModePhaseBProgress, InstallationError> {
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let host_root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let registry = RedbInstallationRegistry::open_at(host_root)?;
+    let call = coordinator.begin_user_mode_phase_b(&registry, transaction_id)?;
+    drop(registry);
+    perform_user_mode_phase_b_call(coordinator, transaction_id, transaction, call)
+}
+
+#[cfg(windows)]
+fn perform_user_mode_phase_b_call(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction_id: &PlatformHandle,
+    transaction: &InstallationTransaction,
+    call: UserModePhaseBCall,
+) -> Result<UserModePhaseBProgress, InstallationError> {
+    let (request, authority_receipt, reconcile_only) = match call {
+        UserModePhaseBCall::AlreadyApplied { .. } => {
+            return Ok(UserModePhaseBProgress::AlreadyApplied);
+        }
+        UserModePhaseBCall::Materialize {
+            request,
+            authority_receipt,
+        } => (request, authority_receipt, false),
+        UserModePhaseBCall::Reconcile {
+            request,
+            authority_receipt,
+        } => (request, authority_receipt, true),
+    };
+    let options = HostLaunchOptions::for_user_mode_phase_b(
+        &transaction.candidate_manifest.runtime_launch,
+    )
+    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let mut host = HostComposition::open_for_profile(options, InstallationProfile::UserMode)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let outcome = if reconcile_only {
+        host.reconcile_user_mode_phase_b(&request, &authority_receipt)
+    } else {
+        host.materialize_user_mode_phase_b(&request, &authority_receipt)
+    }
+    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    drop(host);
+    coordinator
+        .record_user_mode_phase_b_outcome(transaction_id, outcome)
+        .map(UserModePhaseBProgress::Outcome)
+}
+
+#[cfg(windows)]
+fn rollback_user_mode_with_activation_owner(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction: &InstallationTransaction,
+    transaction_id: &PlatformHandle,
+) -> Result<InstallationStepOutcome, InstallationError> {
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let owner = HostOwnerLease::acquire(&transaction.installation_epoch.installation)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let host = owner.activation_capability();
+    coordinator.rollback_with_activation_owner(host_state_root, &host, transaction_id)
+}
+
 /// Re-enters the installation owner's pre-no-return rollback seam for a
 /// durable activation intent.  The CLI only wires already-owned capabilities:
 /// the protected Host root bounds the registry opens while the
@@ -3947,6 +4161,11 @@ fn installation_command_status(
             ..
         }
         | InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
+        InstallationStepOutcome::Applied { .. }
+            if recover && profile == InstallationProfile::UserMode && all_effects_applied =>
+        {
+            "EFFECTS_APPLIED"
+        }
         InstallationStepOutcome::Applied { .. } if recover => "ERROR",
         InstallationStepOutcome::Applied { .. } if !all_effects_applied => "ERROR",
         InstallationStepOutcome::Applied {
