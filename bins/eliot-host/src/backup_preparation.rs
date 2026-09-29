@@ -850,7 +850,7 @@ pub trait PreparationJournal {
 /// JSON shape the in-memory sink stores, from the fields the record actually
 /// retains. It does not invent the fields the record does not carry (the
 /// presented `source_root`, `staging_parent`, build/profile names, nonce and
-/// state fence), so [`conflict_field`] is documented to skip absent recorded
+/// state fence), so `conflict_field` is documented to skip absent recorded
 /// fields rather than blame one. The admission digest - which is what actually
 /// decides a repeated request - is retained in full, and a repeat is compared
 /// against that **recorded** value, never against a freshly recomputed one.
@@ -1104,7 +1104,7 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
     /// conflict before any append, so a mismatched result never reaches the
     /// journal as a re-scoped preparation.
     ///
-    /// The receipt is read back through [`destination_from_result`], the same
+    /// The receipt is read back through `destination_from_result`, the same
     /// reader the in-memory path reconciles through, rather than decoded
     /// structurally: `result_json` renders `root` and `root_identity` as plain
     /// strings, so a structural decode of [`PreparedDestination`] would reject
