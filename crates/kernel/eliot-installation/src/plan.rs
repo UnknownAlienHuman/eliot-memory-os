@@ -18,7 +18,7 @@ mod contract_models;
 
 pub use contract_models::{
     InstallerAclPrincipal, InstallerServiceAccount, InstallerServiceRole, PackageArtifactDigest,
-    PlannedChange, SupervisionAuthorityProvisionPlan,
+    PlannedChange, SupervisionAuthorityProvisionPlan, UserModeSupervisionAuthorityProvisionPlan,
 };
 
 /// One immutable installer effect owned by the enclosing
@@ -110,6 +110,15 @@ pub enum InstallerEffectPlan {
         /// Secret-free immutable provision plan.
         provision: StoreCredentialProvisionPlan,
     },
+    /// Provision one current-user UserMode supervision key after package
+    /// publication. The durable coordinator retains the original key receipt
+    /// before the provider performs its create-only write.
+    ProvisionUserModeSupervisionAuthority {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Secret-free immutable current-user provision plan.
+        provision: Box<UserModeSupervisionAuthorityProvisionPlan>,
+    },
     /// Publish the Host-owned Phase-B overlay and hand the exact pending
     /// activation to Host after the credential effect has been durably read
     /// back. This is a separate effect so materialization has its own
@@ -145,6 +154,7 @@ impl InstallerEffectPlan {
             | Self::RegisterService { effect_id, .. }
             | Self::StartService { effect_id, .. }
             | Self::ProvisionStoreCredential { effect_id, .. }
+            | Self::ProvisionUserModeSupervisionAuthority { effect_id, .. }
             | Self::MaterializePhaseB { effect_id, .. } => effect_id,
         }
     }
@@ -269,6 +279,13 @@ impl InstallerEffectPlan {
                 Ok(())
             }
             Self::ProvisionStoreCredential { provision, .. } => provision.validate(),
+            Self::ProvisionUserModeSupervisionAuthority { effect_id, provision } => {
+                provision.validate()?;
+                if provision.effect_id != *effect_id {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(())
+            }
             Self::MaterializePhaseB {
                 candidate_manifest_digest,
                 static_template,
@@ -351,6 +368,17 @@ pub(super) fn validate_effect_profile(
                 "Store credential provisioning requires SystemService profile".to_owned(),
             ))
         }
+        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+            if profile == InstallationProfile::UserMode =>
+        {
+            Ok(())
+        }
+        InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+            Err(InstallationError::ProfileViolation(
+                "current-user supervision authority provisioning requires UserMode profile"
+                    .to_owned(),
+            ))
+        }
         InstallerEffectPlan::MaterializePhaseB { .. } => Err(InstallationError::ProfileViolation(
             "Phase-B materialization requires SystemService profile".to_owned(),
         )),
@@ -393,6 +421,51 @@ pub(super) fn validate_phase_b_effect_bindings(
     Ok(())
 }
 
+pub(super) fn validate_user_mode_authority_effect_bindings(
+    transaction_id: &PlatformHandle,
+    candidate: &CandidateManifest,
+    roots: &super::InstallationRoots,
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    let mut matched = 0_usize;
+    for effect in effects {
+        let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+            effect_id,
+            provision,
+        } = effect
+        else {
+            continue;
+        };
+        matched += 1;
+        if candidate.runtime_launch.profile != InstallationProfile::UserMode
+            || provision.transaction_id != *transaction_id
+            || provision.effect_id != *effect_id
+            || provision.installation_id != candidate.runtime_launch.installation_epoch.installation
+            || provision.candidate_generation != candidate.generation
+            || provision.authority_generation != candidate.runtime_launch.authority_generation
+            || provision.supervision_lease_scope_id.as_str()
+                != candidate.runtime_launch.supervision_lease_scope_id()
+            || provision.profile_roots != *roots
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    match (candidate.runtime_launch.profile, matched) {
+        (InstallationProfile::UserMode, 1) => Ok(()),
+        (InstallationProfile::UserMode, 0) => Err(InstallationError::IncompleteObservation(
+            "UserMode candidate is missing its current-user authority effect".to_owned(),
+        )),
+        (InstallationProfile::UserMode, _) => Err(InstallationError::Duplicate {
+            kind: "UserMode supervision authority effect".to_owned(),
+            identity: transaction_id.as_str().to_owned(),
+        }),
+        (_, 0) => Ok(()),
+        (_, _) => Err(InstallationError::ProfileViolation(
+            "UserMode authority effect is inconsistent with the candidate profile".to_owned(),
+        )),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "ordered fail-closed installer validation is kept in one auditable boundary"
@@ -432,6 +505,7 @@ pub(super) fn validate_installer_effects(
     let mut credential_index = None;
     let mut phase_b_index = None;
     let mut package_index = None;
+    let mut user_mode_authority_index = None;
     for (index, effect) in effects.iter().enumerate() {
         effect.validate()?;
         if !effect_ids.insert(effect.effect_id().as_str()) {
@@ -646,6 +720,25 @@ pub(super) fn validate_installer_effects(
                     });
                 }
             }
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { provision, .. } => {
+                if profile != InstallationProfile::UserMode {
+                    return Err(InstallationError::ProfileViolation(
+                        "current-user authority provisioning is UserMode-only".to_owned(),
+                    ));
+                }
+                if user_mode_authority_index.replace(index).is_some() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "UserMode supervision authority effect".to_owned(),
+                        identity: provision.effect_id.as_str().to_owned(),
+                    });
+                }
+                if package_index.is_none_or(|package| index != package + 1) {
+                    return Err(InstallationError::IncompleteObservation(
+                        "UserMode authority provisioning must immediately follow package publication"
+                            .to_owned(),
+                    ));
+                }
+            }
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 if phase_b_index.replace(index).is_some() {
                     return Err(InstallationError::Duplicate {
@@ -785,6 +878,17 @@ pub(super) fn validate_installer_effects(
     } else if !start_roles.is_empty() {
         return Err(InstallationError::ProfileViolation(
             "non-service profiles must not start SCM services".to_owned(),
+        ));
+    }
+    if profile == InstallationProfile::UserMode && user_mode_authority_index.is_none() {
+        return Err(InstallationError::IncompleteObservation(
+            "UserMode transaction requires its current-user supervision authority effect"
+                .to_owned(),
+        ));
+    }
+    if profile != InstallationProfile::UserMode && user_mode_authority_index.is_some() {
+        return Err(InstallationError::ProfileViolation(
+            "current-user supervision authority effect is admitted only for UserMode".to_owned(),
         ));
     }
     if profile == InstallationProfile::SystemService
