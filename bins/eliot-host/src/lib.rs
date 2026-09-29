@@ -659,10 +659,10 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
     },
     HostLifecycleBoundary {
         name: "start.requested",
-        source_item: "HostComposition::start_approved_contour",
+        source_item: "HostComposition::start_approved_contour; start_approved_manifest_contour",
         owner_state: "approved generation/launch descriptor",
         event: "host.start requested",
-        caller: "none (exported API; no in-repo caller)",
+        caller: "HostComposition::open; HostComposition::reconcile_pending_activation; exported API (no in-repo caller)",
         test: "891/case-2",
     },
     HostLifecycleBoundary {
@@ -5450,6 +5450,9 @@ fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
     let (_, store_artifact) = manifest
         .host_child_artifact_digests()
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    // F-LOG-HOST-1: the approved start is requested here on the live startup
+    // path; manifest launch, process start, and readiness stay distinct.
+    host_lifecycle_observe_requested(BOUNDARY_START_REQUESTED);
     port.start_approved_manifest(
         manifest,
         branch,
