@@ -147,6 +147,10 @@ impl MaintenanceResultObligation {
     /// caller's own field list: a no-attempt decision is refused any execution
     /// evidence, and an attempted outcome is refused without the job and attempt
     /// identities that make it checkable.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fail-closed clause per obligation invariant, checked together so none can be reordered past another"
+    )]
     pub fn validate(&self) -> Result<(), MaintenanceError> {
         if self.contract_version != MAINTENANCE_OBLIGATION_CONTRACT_VERSION {
             return Err(MaintenanceError::InvalidField(
@@ -445,6 +449,10 @@ pub(crate) fn latest_obligation(job: &MaintenanceJob) -> Option<&MaintenanceResu
 /// follow-up window has not elapsed says so explicitly instead of reporting a
 /// zero, and a completion is `PENDING` rather than `BENEFICIAL`: work performed
 /// is not utility, and a completion is not a benefit.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the whole observation projection is built in one place so each outcome class stays next to the evidence it names"
+)]
 pub fn maintenance_observation_record(
     obligation: &MaintenanceResultObligation,
     observed_at_unix_ms: u64,
