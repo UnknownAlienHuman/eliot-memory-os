@@ -653,6 +653,53 @@ pub fn deny_unleased_effect_replay(
     }
 }
 
+/// Refuses one replay that has no recorded execution manifest at all.
+///
+/// A caller that did find a manifest does not come here; it continues into
+/// [`authorize_effect_replay`], which applies every lease, binding, currency and
+/// liveness check and validates the manifest through its own `validate()`.
+/// Nothing is recomputed here, and no manifest is inspected here, because this
+/// function answers only the one condition a request built from the durable rows
+/// cannot express.
+///
+/// An absent manifest contributes no accepted Module Catalog revision, so
+/// `EffectAuthorizationView::validate` refuses a request built from it with a
+/// bare `InvalidField` on the revision field. The caller would then see an
+/// opaque field error, with no typed disposition, no preserved evidence and no
+/// durable reconciliation item — exactly the discarded refusal I1.9 forbids.
+/// This is the denial the same query reaches for an absent lease in
+/// [`deny_unleased_effect_replay`], applied to the manifest instead.
+///
+/// The escalation is built from the lease's own recorded values, so it names the
+/// exact operation and the exact manifest binding the lease was issued against
+/// rather than a reconstructed pair, and `recorded_manifest_sha256` stays absent
+/// because no row was found. The returned authority is the shadow/no-effect one:
+/// it carries no lease, so the refused replay can produce no external effect and
+/// no canonical write admission.
+#[must_use]
+pub fn deny_effect_replay_without_manifest(
+    lease: &EffectOperationLease,
+    observed_at_ms: i64,
+) -> EffectReplayDecision {
+    EffectReplayDecision {
+        authority: EffectDispatchAuthority::shadow_only(ShadowEffectDiagnostics {
+            module_id: lease.manifest_module_id.clone(),
+            generation: lease.manifest_generation,
+            bound_manifest_sha256: lease.bound_manifest_sha256.clone(),
+        }),
+        reconciliation: Some(KernelReconciliationItem {
+            kind: KernelReconciliationKind::ManifestAbsent,
+            module_id: lease.manifest_module_id.clone(),
+            generation: lease.manifest_generation,
+            bound_manifest_sha256: Some(lease.bound_manifest_sha256.clone()),
+            recorded_manifest_sha256: None,
+            lease_id: Some(lease.lease_id.clone()),
+            operation_id: Some(lease.operation_id.clone()),
+            observed_at_ms,
+        }),
+    }
+}
+
 /// Builds the reconciliation item for one replay-side defect.
 fn effect_reconciliation_item(
     kind: KernelReconciliationKind,
