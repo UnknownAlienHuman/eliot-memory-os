@@ -8055,7 +8055,10 @@ impl HostComposition {
     /// caller observation) and reaches this journal as the
     /// `proof.supervision_lease` snapshot the readiness owner persists as
     /// `active_supervision_lease`; binding any other mirror entry would
-    /// promote an unadmitted renewal into a live state. When the mirror
+    /// promote an unadmitted renewal into a live state. The admitting
+    /// observation itself must be fresh evidence for this generation —
+    /// same activation identity and generation, carrying evidence — so a
+    /// stale predecessor can never renew a new live state. When the mirror
     /// proves no live obligation, the held reference lapses to empty
     /// instead of blocking drain or retirement on a dead lease; terminal
     /// coverage stays in the `DrainCommitRecord` snapshot taken at
@@ -8071,12 +8074,24 @@ impl HostComposition {
             next.supervision_lease_refs = Vec::new();
             return Ok(());
         };
-        let admitted = self
-            .journal
-            .snapshot()?
-            .readiness_observations
-            .last()
-            .and_then(|observation| observation.active_supervision_lease.clone())
+        let snapshot = self.journal.snapshot()?;
+        let observation = snapshot.readiness_observations.last().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "live supervision binding has no admitted readiness predecessor".to_owned(),
+            )
+        })?;
+        if observation.fence.activation_id != next.activation_id
+            || observation.fence.activation_generation != next.fence.activation_generation
+            || observation.evidence_refs.is_empty()
+        {
+            return Err(HostError::RecoveryRequired(
+                "admitted supervision predecessor is not fresh evidence for this generation"
+                    .to_owned(),
+            ));
+        }
+        let admitted = observation
+            .active_supervision_lease
+            .clone()
             .ok_or_else(|| {
                 HostError::RecoveryRequired(
                     "live supervision binding has no admitted readiness predecessor".to_owned(),
