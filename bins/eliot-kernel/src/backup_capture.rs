@@ -71,6 +71,7 @@ use eliot_backup::{
     ExportFence, HostStateAuditFence, OrsSnapshotFence, RestoreEvidenceLevel, WatchdogSpoolFence,
 };
 use eliot_contracts::{EpochRelation, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ors::RedbRecoveryStore;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
@@ -536,18 +537,52 @@ pub struct CaptureReport {
 
 /// Kernel-owned cross-owner backup capture coordinator.
 ///
-/// Binds the Kernel work root the capture operates under. The coordinator
-/// owns no live owner channel: every capture consumes already-accepted owner
-/// evidence through `CaptureRequest`, builds and verifies through the accepted
-/// `BackupBundle` API, and publishes once through the admitted `PublicationPort`.
+/// Binds the Kernel work root the capture operates under, and the canonical
+/// ORS owner the purge-ledger revision is read from. Every other capture input
+/// consumes already-accepted owner evidence through `CaptureRequest`, builds
+/// and verifies through the accepted `BackupBundle` API, and publishes once
+/// through the admitted `PublicationPort`. The purge revision is the one field
+/// that cannot be presented, because the value that matters is the state the
+/// owner was in, not the one the caller supplied.
 pub struct KernelBackupCapture {
     work_root: PathBuf,
+    /// The canonical ORS owner this capture may read the purge-ledger revision
+    /// from.
+    ///
+    /// `None` is an ABSENCE, never a fallback: it is what [`Self::bind`] leaves
+    /// behind. `assemble_input` then refuses a capture that carries a purge
+    /// ledger instead of writing a revision it did not read from the owner.
+    /// [`Self::bind_with_purge_owner`] is the production binding.
+    ors: Option<std::sync::Arc<RedbRecoveryStore>>,
 }
 
 impl KernelBackupCapture {
-    /// Binds the capture owner to the Kernel work root.
+    /// Binds the capture owner to the Kernel work root with NO purge owner.
+    ///
+    /// A capture bound this way can only produce an archive whose purge-ledger
+    /// revision is genuinely zero, i.e. one that carries no purge ledger. It is
+    /// not a weaker owner: the ledger-bearing case refuses.
     pub fn bind(work_root: PathBuf) -> Self {
-        Self { work_root }
+        Self {
+            work_root,
+            ors: None,
+        }
+    }
+
+    /// Binds the capture owner to the Kernel work root and the canonical ORS
+    /// owner that allocates purge-ledger revisions.
+    ///
+    /// This is the production binding: the handle is the very store the
+    /// composition already opened, so the recorded revision is one the owner
+    /// read, not one derived from the carried entry list.
+    pub fn bind_with_purge_owner(
+        work_root: PathBuf,
+        ors: std::sync::Arc<RedbRecoveryStore>,
+    ) -> Self {
+        Self {
+            work_root,
+            ors: Some(ors),
+        }
     }
 
     /// Returns the bound work root.
@@ -611,7 +646,7 @@ impl KernelBackupCapture {
         let member_dispositions = check_denominator(request)?;
         check_budgets(request)?;
         duration.check()?;
-        let bundle = BackupBundle::build(assemble_input(request))
+        let bundle = BackupBundle::build(assemble_input(request, self.ors.as_ref())?)
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
         duration.check()?;
         bundle
@@ -1815,22 +1850,29 @@ fn check_budgets(request: &CaptureRequest) -> Result<(), KernelCaptureError> {
 /// Assembles the exact `BackupInput` from validated request fields: the
 /// archive identity binds the canonical export identity (nothing invented),
 /// class, source, and schema come from the frozen plan, and every evidence
-/// section crosses byte-identical. The purge revision binds the carried
-/// ledger: zero with an empty ledger, the entry count otherwise.
+/// section crosses byte-identical.
 ///
-/// ASSUMPTION (purge-ledger revision). I5.13:44 requires the manifest to bind
-/// the "purge-ledger revision", and `eliot-backup` leaves that value to the
-/// producer: it only refuses a nonzero revision with no ledger and a zero
-/// revision with a non-empty one (`BackupBundle::validate`, "the purge revision
-/// binds the purge ledger carried here"). No accepted owner-neutral purge API
-/// reachable from this owner publishes a ledger-wide revision — the closest
-/// thing, Host's `BackupConfigProjection::purge_ledger_revision`, lives in
-/// `bins/eliot-host`, which this composition root may not depend on. The
-/// carried entry count is therefore used as the binding over the ledger this
-/// owner actually validated, and it is stated here rather than presented as the
-/// purge owner's own declared revision.
-fn assemble_input(request: &CaptureRequest) -> BackupInput {
-    BackupInput {
+/// The purge revision is READ from the ORS owner, never computed. The owner
+/// allocates that revision inside the write transaction that makes a ledger row
+/// durable, so it is the only value that can state which purge state the
+/// archive was taken under. An empty ledger is the owner's own revision-zero
+/// answer and needs no handle; a non-empty ledger without an owner REFUSES,
+/// because recording a count of the carried entries would durably state a
+/// revision this owner never allocated.
+fn assemble_input(
+    request: &CaptureRequest,
+    ors: Option<&std::sync::Arc<RedbRecoveryStore>>,
+) -> Result<BackupInput, KernelCaptureError> {
+    let purge_ledger_revision = if request.purge_ledger.is_empty() {
+        0
+    } else {
+        let ors = ors.ok_or(KernelCaptureError::Unsupported {
+            reason: "purge-owner-channel",
+        })?;
+        ors.purge_ledger_revision()
+            .map_err(|error| KernelCaptureError::OwnerEvidenceInvalid(error.to_string()))?
+    };
+    Ok(BackupInput {
         backup_id: request.export_fence.export_id.clone(),
         class: request.plan.class,
         source_adapter: request.plan.source_adapter.clone(),
@@ -1846,10 +1888,6 @@ fn assemble_input(request: &CaptureRequest) -> BackupInput {
         watchdog_spool: request.watchdog_spool.clone(),
         host_audit: request.host_audit.clone(),
         missing_features: Vec::new(),
-        purge_ledger_revision: if request.purge_ledger.is_empty() {
-            0
-        } else {
-            request.purge_ledger.len() as u64
-        },
-    }
+        purge_ledger_revision,
+    })
 }

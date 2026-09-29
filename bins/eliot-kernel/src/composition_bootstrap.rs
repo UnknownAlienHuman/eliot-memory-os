@@ -1432,10 +1432,16 @@ impl KernelComposition {
         let backup_owner_clients = BackupOwnerClients::bind_production()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         // Issue #959: hold the Kernel-owned cross-owner backup capture
-        // coordinator on the composition. It binds the work root only;
-        // captures consume already-accepted owner evidence per execution,
-        // so no live owner channel is opened here.
-        let backup_capture = KernelBackupCapture::bind(work_root.clone());
+        // coordinator on the composition. It binds the work root plus the
+        // canonical ORS purge owner, so the purge-ledger revision the archive
+        // manifest binds is READ from the owner that allocates it rather than
+        // derived from the carried entry list. Every other evidence section
+        // still crosses already-accepted per-execution owner evidence through
+        // `CaptureRequest`.
+        let backup_capture = KernelBackupCapture::bind_with_purge_owner(
+            work_root.clone(),
+            std::sync::Arc::clone(&ors),
+        );
         // Issue #1837: open the single durable audit chain below the
         // canonical work root and seal the restart boundary. A corrupt
         // retained chain fails construction closed: the Kernel never runs
