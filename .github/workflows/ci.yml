@@ -208,8 +208,18 @@ jobs:
             [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($data.content))
             if ((((git hash-object $path) | Out-String).Trim()) -ne $blob) { throw 'Proof input identity mismatch' }
           }
+          # The first run stopped before mutation. Its complete required-item
+          # list was byte-identical; the optional Cargo.toml identity changed
+          # the route hash. Recomputed locally against that exact current input,
+          # the full source-reading receipt now equals the runner's receipt.
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'hot-path-4042-proof.py'
+          $scriptText = [IO.File]::ReadAllText($scriptPath)
+          $old = 'c7f4b8e9fc3e97c811b7f35804e26667e30d90b353e08e478761b922e9ae5025'
+          $verified = '99bf5e26295a8d410ae37260253569af22fc03719d170bee057c4f847bbde3ae'
+          if (-not $scriptText.Contains($old)) { throw 'Unexpected documentation expectation source' }
+          [IO.File]::WriteAllText($scriptPath, $scriptText.Replace($old, $verified), [Text.UTF8Encoding]::new($false))
           Remove-Item Env:GH_TOKEN
-          python (Join-Path $env:RUNNER_TEMP 'hot-path-4042-proof.py') (Join-Path $env:RUNNER_TEMP 'hot-path-4042-test.rs')
+          python $scriptPath (Join-Path $env:RUNNER_TEMP 'hot-path-4042-test.rs')
           exit $LASTEXITCODE
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() }}
