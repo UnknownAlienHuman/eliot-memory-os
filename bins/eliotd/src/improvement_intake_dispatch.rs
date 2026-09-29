@@ -360,31 +360,19 @@ pub fn assemble_improvement_artifact(
 ) -> Result<ImprovementArtifact, ImprovementDispatchError> {
     // Evidence lineage: the decision's own stable identity, never a fresh
     // per-observation value, so a repeat deduplicates.
-    let evidence_refs = vec![
-        format!("maintenance-trigger:{}", decision.trigger_id),
-        format!("maintenance-scope:{}", decision.scope_ref),
-    ];
+    let evidence_refs = maintenance_evidence_refs(decision);
     let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
     // `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
     // spelling); `AutomationDecision` and `DecisionReason` are `Debug`-only
     // closed owner enums and gain no `Display` here, so they are named by
     // their derived variant spelling instead.
-    let trigger = format!(
-        "maintenance automation {} evaluated {:?} for reason {:?}",
-        decision.family, decision.decision, decision.reason
-    );
+    let trigger = maintenance_trigger_text(decision);
     // The replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
     // holdout and transfer legs are the decision's own canonical refs, and the
     // counter metrics name what must not regress. Promotion is separately
     // refused by the intake's budget gate, which this advisory path does not
     // attempt to satisfy.
-    let replay_plan = ReplayPlan {
-        fixed_replay_refs: evidence_refs.clone(),
-        holdout_refs: vec![format!("maintenance-holdout:{}", decision.trigger_id)],
-        transfer_refs: vec![format!("maintenance-transfer:{}", decision.scope_ref)],
-        counter_metric_names: vec!["blocked_maintenance_runs".to_owned()],
-        verifier_refs: vec![format!("maintenance-evaluator:{}", decision.family)],
-    };
+    let replay_plan = maintenance_replay_plan(decision, &evidence_refs);
     let admitted_scope = admitted_fence_ref(state_fence)?;
     // The evidence bundle is selected by the DERIVED source, not asserted
     // (issue #1867 W2). Every source but one is the maintenance occurrence
@@ -500,18 +488,16 @@ pub fn assemble_improvement_artifact(
     // read by inference and through the record's own accessors. An unreadable
     // or empty image is the same typed `UnsafeBoundary` refusal the boundary
     // constructor returns for the same condition, never a substituted value.
-    let (observed_records, _observed_version) = observed_closures
-        .load()
-        .map_err(|_| ImprovementError::UnsafeBoundary)?;
-    let observed = observed_records
-        .last()
-        .ok_or(ImprovementError::UnsafeBoundary)?;
+    let observed = newest_observed_closure(observed_closures)?;
     // The durable lineage handle and canonical digest the record itself
     // committed, so the owner can read exactly this closure without searching.
-    let (observed_artifact, observed_digest) = observed.lineage_ref();
+    let (observed_artifact, observed_digest) = (
+        observed.lineage_artifact.clone(),
+        observed.lineage_digest.clone(),
+    );
     // What the observed closure actually concluded about behaviour, read
     // through the record's own predicates rather than re-spelled here.
-    let observed_effect = if observed.carries_behavioural_proposal() {
+    let observed_effect = if observed.carries_behavioural_proposal {
         "and proposes a next-behaviour change for the next attempt"
     } else {
         "and closed with no next-behaviour change proposed"
@@ -521,69 +507,11 @@ pub fn assemble_improvement_artifact(
     // literally the same value.
     let principal = boundary.observed_principal_ref();
     let boundary_ref = boundary.observed_boundary_ref();
-    // Unknowns are the states the record could NOT resolve, plus the one the
-    // closure cannot speak to at all. The maintenance start-route question is
-    // kept: it is real and no closure record answers it. `require_refs` in
-    // `ImprovementBrief::validate` still hard-requires a non-empty list.
-    let mut unknowns = vec![format!(
-        "unknown whether maintenance family {} has a start route",
-        decision.family
-    )];
-    if observed.lineage_for_retry().is_none() {
-        unknowns.push(format!(
-            "the observed closure of campaign {} records no prior-attempt lineage, so it \
-             establishes no repeated-strategy comparison",
-            observed.campaign_id.as_str()
-        ));
-    }
+    let unknowns = observed_unknowns(&observed, decision.family);
 
-    // ONE principal, named once. `proposed_owner` is the observed
-    // `active_main_agent_or_human_ref`, so the brief proposes that the actor
-    // which executed the observed consequential attempt decides — I12.24:64
-    // ("to active Main Agent or Human at a safe boundary") and I12.24:74
-    // ("proposed owner") describe the same decision and are now filled from the
-    // same observation. It was `IMPROVEMENT_OWNER` before the boundary became
-    // observed, which put a compile-time constant beside a real observed
-    // principal in adjacent fields with nothing to reconcile them.
-    //
-    // `ASSUMPTION:` the principal that EXECUTED the observed consequential
-    // attempt is the one proposed to decide, rather than the maintenance
-    // admission authority. I12.24:64 sends the brief "to active Main Agent or
-    // Human at a safe boundary" and I12.24:74 asks the same brief for a
-    // "proposed owner", so one reading satisfies both; the alternative reading
-    // (deliver to the actor, but let a governance constant decide) is not
-    // stated anywhere in I12.24 and would make the brief's own proposed owner
-    // unobserved by its own gate. The closure seam records no Human identity,
-    // so no observed alternative principal exists to name instead.
-    //
-    // This is a decision owner, NOT the candidate's admission authority, and the
-    // admission authority is not lost by moving it out of the brief:
-    // `IMPROVEMENT_OWNER` is what `sourced_evidence` recorded on the candidate
-    // above, so it is durably carried as
-    // `ImprovementCandidate::owner_and_decision_authority` and is what
-    // `CandidateBoundPolicy::validate_governed` is checked against inside the
-    // governed admission. The two names are different roles and are recorded on
-    // different artifacts: this one is who should decide, that one is who may
-    // admit.
-    //
-    // What the closure CANNOT supply, stated so no field is invented to fill the
-    // gap. `StoredLearningDelta` carries campaign, attempt, State Fence,
-    // actor/route/overlay identity, the derived boundary, the strategy
-    // fingerprint, observed evidence refs, the retry relation, the disposition
-    // and the admission receipt id. It carries no cost, compute, tool, test-time
-    // or Human-attention field — that material is the I18.47
-    // `BudgetEquivalenceLedger` / `ComplexityEconomicsDelta`, which belongs to
-    // the promotion path this advisory pass deliberately does not enter — and it
-    // carries no risk and no proposed next action. So `cost`, `risk` and
-    // `next_reversible_step` keep the honest values this pass can state and are
-    // not dressed up as observations: `cost` is the cost of the decision itself,
-    // `risk` is the advisory class's actual no-effect statement, and
-    // `next_reversible_step` is a triage action that NAMES the observed
-    // boundary so the owner starts from the record rather than from a search.
-    // `evidence_refs` is not listed here either: `brief_at_safe_boundary` takes
-    // the candidate's own evidence lineage by value, and the observed closure's
-    // evidence is quoted in `problem` as the durable delta artifact and digest
-    // instead of being spliced into a second ref list.
+    // Why the brief names the OBSERVED principal, and which brief fields the
+    // closure record cannot supply, is stated in the module documentation
+    // above under "One principal, two roles".
     let brief = brief_at_safe_boundary(
         &candidate,
         &format!(
@@ -591,10 +519,10 @@ pub fn assemble_improvement_artifact(
              {observed_artifact} (digest {observed_digest}) for attempt {} of campaign {} on \
              route {}, at consequential boundary {boundary_ref} by principal {principal}, over {} \
              observed evidence ref(s)",
-            observed.attempt_id.as_str(),
-            observed.campaign_id.as_str(),
+            observed.attempt_id,
+            observed.campaign_id,
             observed.route_id,
-            observed.evidence_refs.len(),
+            observed.evidence_ref_count,
         ),
         &format!(
             "the blocked family {} is evaluated on every cadence and cannot start, and the \
@@ -649,6 +577,132 @@ pub fn assemble_improvement_artifact(
         brief,
         decision: decision_record,
     })
+}
+
+/// The evidence lineage this observation raises, over the decision's own
+/// stable identity.
+///
+/// Never a fresh per-observation value: the refs are the decision's own
+/// `trigger_id` and `scope_ref`, so two evaluations of the same occurrence
+/// under the same admitted fence carry the same lineage and deduplicate.
+fn maintenance_evidence_refs(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> Vec<String> {
+    vec![
+        format!("maintenance-trigger:{}", decision.trigger_id),
+        format!("maintenance-scope:{}", decision.scope_ref),
+    ]
+}
+
+/// The trigger statement the decision's own closed fields make.
+///
+/// `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
+/// spelling); `AutomationDecision` and `DecisionReason` are `Debug`-only
+/// closed owner enums and gain no `Display` here, so they are named by their
+/// derived variant spelling instead.
+fn maintenance_trigger_text(decision: &eliot_maintenance::AutomationTriggerDecision) -> String {
+    format!(
+        "maintenance automation {} evaluated {:?} for reason {:?}",
+        decision.family, decision.decision, decision.reason
+    )
+}
+
+/// The diagnostic-only replay plan for this observation (I12.24:76-77).
+///
+/// The fixed replay, holdout and transfer legs are the decision's own canonical
+/// refs, and the counter metric names what must not regress. Promotion is
+/// separately refused by the budget gate, which this advisory path does not
+/// attempt to satisfy.
+fn maintenance_replay_plan(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    evidence_refs: &[String],
+) -> ReplayPlan {
+    ReplayPlan {
+        fixed_replay_refs: evidence_refs.to_vec(),
+        holdout_refs: vec![format!("maintenance-holdout:{}", decision.trigger_id)],
+        transfer_refs: vec![format!("maintenance-transfer:{}", decision.scope_ref)],
+        counter_metric_names: vec!["blocked_maintenance_runs".to_owned()],
+        verifier_refs: vec![format!("maintenance-evaluator:{}", decision.family)],
+    }
+}
+
+/// The material one observed closure contributes to the brief.
+///
+/// Owned, not borrowed: the record TYPE cannot be named here — neither `eliotd`
+/// nor `eliot-improvement` has an `eliot-learning-delta` edge, and adding one for
+/// a value the brief only quotes would be a new dependency. The closure's
+/// accessors are read through inference and their results carried by value, so
+/// nothing in this module depends on the record's concrete type.
+struct ObservedClosure {
+    /// Durable lineage handle and canonical digest the record committed.
+    lineage_artifact: String,
+    lineage_digest: String,
+    /// The closed attempt this observation belongs to.
+    attempt_id: String,
+    /// The campaign that attempt belonged to.
+    campaign_id: String,
+    /// The route the closed attempt ran.
+    route_id: String,
+    /// How many evidence refs the record itself observed.
+    evidence_ref_count: usize,
+    /// The record's own predicate on whether it proposed a behaviour change.
+    carries_behavioural_proposal: bool,
+    /// Whether the record names a prior-attempt lineage to retry against.
+    has_retry_lineage: bool,
+}
+
+/// Reads the newest committed closure record, refusing when there is none.
+///
+/// The same mutex-guarded read [`SafeBoundary::from_observed_closure`] performs
+/// on the same image, under the composition guard the caller already holds, so
+/// both see the same newest record. An unreadable or empty image is the same
+/// typed [`ImprovementError::UnsafeBoundary`] refusal, never a substituted
+/// value.
+fn newest_observed_closure(
+    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
+) -> Result<ObservedClosure, ImprovementError> {
+    let (observed_records, _observed_version) = observed_closures
+        .load()
+        .map_err(|_| ImprovementError::UnsafeBoundary)?;
+    let observed = observed_records
+        .last()
+        .ok_or(ImprovementError::UnsafeBoundary)?;
+    let (lineage_artifact, lineage_digest) = observed.lineage_ref();
+    Ok(ObservedClosure {
+        lineage_artifact: lineage_artifact.to_string(),
+        lineage_digest: lineage_digest.to_owned(),
+        attempt_id: observed.attempt_id.as_str().to_owned(),
+        campaign_id: observed.campaign_id.as_str().to_owned(),
+        route_id: observed.route_id.clone(),
+        evidence_ref_count: observed.evidence_refs.len(),
+        carries_behavioural_proposal: observed.carries_behavioural_proposal(),
+        has_retry_lineage: observed.lineage_for_retry().is_some(),
+    })
+}
+
+/// The unknowns the observed closure could not resolve, plus the one it cannot
+/// speak to at all.
+///
+/// Unknowns are the states the record could NOT resolve. The maintenance
+/// start-route question is kept because it is real and no closure record answers
+/// it. `require_refs` in [`eliot_improvement::ImprovementBrief::validate`]
+/// still hard-requires a non-empty list.
+fn observed_unknowns(
+    observed: &ObservedClosure,
+    family: eliot_maintenance::MaintenanceFamily,
+) -> Vec<String> {
+    let mut unknowns = vec![format!(
+        "unknown whether maintenance family {} has a start route",
+        family
+    )];
+    if !observed.has_retry_lineage {
+        unknowns.push(format!(
+            "the observed closure of campaign {} records no prior-attempt lineage, so it \
+             establishes no repeated-strategy comparison",
+            observed.campaign_id
+        ));
+    }
+    unknowns
 }
 
 /// Enforces the I12.24 application-class boundary over a real candidate
