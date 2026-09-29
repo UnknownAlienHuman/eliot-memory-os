@@ -664,6 +664,10 @@ pub struct SourceBundlePublicationJournal {
     pub generation: PlatformHandle,
     /// Exact I3.1 root binding used to materialize this source bundle.
     pub profile_governed_roots: InstallationRoots,
+    /// Canonical profile anchor path selected before source materialization.
+    pub selected_profile_anchor_path: PlatformHandle,
+    /// Original file-object identity selected for the profile anchor.
+    pub selected_profile_anchor_identity: FileIdentity,
     /// Canonical package manifest digest.
     pub manifest_digest: PlatformHandle,
     /// Complete twelve-role artifact evidence digest.
@@ -714,7 +718,7 @@ pub struct SourceBundlePublicationRole {
 }
 
 /// Current source-bundle publication journal wire version.
-pub const SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION: u32 = 4;
+pub const SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION: u32 = 5;
 
 /// Derive the stable operation key for one exact source-bundle publication.
 pub fn source_bundle_publication_operation_id(
@@ -2776,6 +2780,8 @@ fn validate_publication_journal(
         || journal.parent_identity.file_index == 0
         || journal.source_identity.volume_serial_number == 0
         || journal.source_identity.file_index == 0
+        || journal.selected_profile_anchor_identity.volume_serial_number == 0
+        || journal.selected_profile_anchor_identity.file_index == 0
     {
         return Err(InstallationError::InvalidField {
             field: "publication.journal".to_owned(),
@@ -2785,6 +2791,18 @@ fn validate_publication_journal(
     journal
         .profile_governed_roots
         .validate(journal.profile_governed_roots.runtime_state_roots.profile)?;
+    if !windows_paths_equal(
+        Path::new(journal.selected_profile_anchor_path.as_str()),
+        Path::new(
+            journal
+                .profile_governed_roots
+                .runtime_state_roots
+                .profile_anchor_root
+                .as_str(),
+        ),
+    ) {
+        return Err(InstallationError::IdentityConflict);
+    }
     for (value, field) in [
         (&journal.operation_id, "publication.operation_id"),
         (&journal.transaction_id, "publication.transaction_id"),
@@ -3246,6 +3264,8 @@ fn publication_journal_identity_matches(
         && left.parent_identity == right.parent_identity
         && left.generation == right.generation
         && left.profile_governed_roots == right.profile_governed_roots
+        && left.selected_profile_anchor_path == right.selected_profile_anchor_path
+        && left.selected_profile_anchor_identity == right.selected_profile_anchor_identity
         && left.manifest_digest == right.manifest_digest
         && left.evidence_digest == right.evidence_digest
         && left.precommit_digest == right.precommit_digest
@@ -3418,18 +3438,20 @@ fn decode_publication_journal(
     let journal_wire = journal_value
         .and_then(|journal| journal.get("wire_version"))
         .and_then(serde_json::Value::as_u64);
-    let has_v4_profile_and_restart_authority = journal_value.is_some_and(|journal| {
+    let has_v5_profile_anchor_identity = journal_value.is_some_and(|journal| {
         journal.get("temporary_path").is_some()
             && journal.get("temporary_name").is_some()
             && journal.get("parent_identity").is_some()
             && journal.get("profile_governed_roots").is_some()
+            && journal.get("selected_profile_anchor_path").is_some()
+            && journal.get("selected_profile_anchor_identity").is_some()
     });
     if envelope_wire != Some(u64::from(SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION))
         || journal_wire != Some(u64::from(SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION))
-        || !has_v4_profile_and_restart_authority
+        || !has_v5_profile_anchor_identity
     {
         return Err(InstallationError::MigrationRequired {
-            reason: "source publication journal predates the mandatory v4 I3.1 binding and temporary publication authority"
+            reason: "source publication journal predates the mandatory v5 retained profile-anchor identity"
                 .to_owned(),
         });
     }
@@ -3496,6 +3518,17 @@ pub fn require_published_source_bundle_journal(
         .ok_or_else(|| InstallationError::MigrationRequired {
             reason: "planned transaction requires a durable source publication journal".to_owned(),
         })?;
+    let retained_profile_anchor = transaction
+        .retained_profile_anchor()
+        .ok_or_else(|| InstallationError::MigrationRequired {
+            reason: "planned transaction has no retained profile-anchor identity".to_owned(),
+        })?;
+    retained_profile_anchor.validate()?;
+    if journal.selected_profile_anchor_path != retained_profile_anchor.canonical_path
+        || journal.selected_profile_anchor_identity != retained_profile_anchor.identity
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
     verify_published_source_bundle_journal_live(&journal)?;
     if journal.state != SourceBundlePublicationJournalState::Published
         || journal.destination_identity.is_none()
@@ -3786,6 +3819,11 @@ mod tests {
             .parent()
             .expect("output parent")
             .join(&temporary_name);
+        let profile_governed_roots = publication_profile_binding();
+        let selected_profile_anchor_path = profile_governed_roots
+            .runtime_state_roots
+            .profile_anchor_root
+            .clone();
         SourceBundlePublicationJournal {
             wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
             operation_id: source_bundle_publication_operation_id(
@@ -3803,7 +3841,12 @@ mod tests {
                 file_index: 303,
             },
             generation,
-            profile_governed_roots: publication_profile_binding(),
+            profile_governed_roots,
+            selected_profile_anchor_path,
+            selected_profile_anchor_identity: FileIdentity {
+                volume_serial_number: 11,
+                file_index: 404,
+            },
             manifest_digest: PlatformHandle::new(manifest.canonical_digest())
                 .expect("manifest digest"),
             evidence_digest,
@@ -3922,6 +3965,11 @@ mod tests {
         let operation_id =
             source_bundle_publication_operation_id(&transaction_id, output_bundle, &generation)
                 .expect("operation");
+        let profile_governed_roots = publication_profile_binding();
+        let selected_profile_anchor_path = profile_governed_roots
+            .runtime_state_roots
+            .profile_anchor_root
+            .clone();
         let journal = SourceBundlePublicationJournal {
             wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
             operation_id,
@@ -3931,7 +3979,12 @@ mod tests {
             temporary_name: publication.temporary_name().to_owned(),
             parent_identity: publication.parent_identity(),
             generation,
-            profile_governed_roots: publication_profile_binding(),
+            profile_governed_roots,
+            selected_profile_anchor_path,
+            selected_profile_anchor_identity: FileIdentity {
+                volume_serial_number: 11,
+                file_index: 404,
+            },
             manifest_digest: PlatformHandle::new(manifest.canonical_digest()).expect("manifest"),
             evidence_digest,
             precommit_digest,

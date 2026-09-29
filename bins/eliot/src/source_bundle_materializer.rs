@@ -1817,6 +1817,11 @@ fn reconcile_existing_publication(
         || journal.generation != input.generation
         || journal.profile_governed_roots != selection.roots
         || !eliot_platform_windows::windows_paths_equal(
+            Path::new(journal.selected_profile_anchor_path.as_str()),
+            &selected_profile_anchor.canonical_path,
+        )
+        || journal.selected_profile_anchor_identity != selected_profile_anchor.identity
+        || !eliot_platform_windows::windows_paths_equal(
             &journal.output_bundle,
             &input.output_bundle,
         )
@@ -2111,6 +2116,13 @@ fn materialize_with_resolved_selection(
         parent_identity: publication.parent_identity(),
         generation: input.generation.clone(),
         profile_governed_roots: typed.profile_governed_roots.clone(),
+        selected_profile_anchor_path: PlatformHandle::new(
+            selected_profile_anchor.path_string(),
+        )
+        .map_err(|error| {
+            MaterializeError::Contract(format!("selected profile anchor path: {error}"))
+        })?,
+        selected_profile_anchor_identity: selected_profile_anchor.identity,
         manifest_digest: PlatformHandle::new(typed.manifest.canonical_digest())
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
         evidence_digest: typed.evidence_digest.clone(),
