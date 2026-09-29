@@ -100,8 +100,8 @@ use eliot_observation::{
     ObservationSubmission, PrivacyRetentionDisclosure, ProducerTrace, RejectionDisposition,
 };
 use eliot_problem::{
-    DeliveryState, OwnerRef, Problem, ProblemId, ProblemState, Signal, SignalAttribution,
-    SignalDisposition, SignalId, SignalProcessingState, SignalSeverity,
+    DeliveryState, DiagnosticBrief, OwnerRef, Problem, ProblemClass, ProblemId, ProblemState,
+    Signal, SignalAttribution, SignalDisposition, SignalId, SignalProcessingState, SignalSeverity,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -351,15 +351,24 @@ fn check_problem_transition(
                 .map_err(|error| owner_refused(error.to_string()))?,
         ],
         title: format!("verified doctor repair for {problem_id}"),
+        class: ProblemClass::Operational,
+        severity: SignalSeverity::Blocking,
         scope_id: GOVERNOR_SCOPE_ID.to_owned(),
-        owner: OwnerRef {
+        affected_dependencies: vec![GOVERNOR_SCOPE_ID.to_owned()],
+        symptom: format!("doctor attempt {attempt_digest} required a verified repair"),
+        evidence_refs: evidence,
+        hypotheses: Vec::new(),
+        owner: Some(OwnerRef {
             principal: GOVERNOR_SCOPE_ID.to_owned(),
             generation: fence.resource_generation.value().to_string(),
-        },
-        state: ProblemState::Verifying,
-        evidence_refs: evidence,
+        }),
+        containment: None,
+        repair_history: Vec::new(),
+        next_probe: Some(format!("independent verification of effect {effect_digest}")),
         resolution_condition: format!("independent verification of effect {effect_digest}"),
+        state: ProblemState::Verifying,
         acknowledged_by: None,
+        reopen_history: Vec::new(),
         state_fence: fence.clone(),
         revision: expected_revision,
         reopen_count: 0,
@@ -369,6 +378,31 @@ fn check_problem_transition(
             "verified problem scratch state is not admissible: {error}"
         ))
     })?;
+    // Compile the I13.11 brief from the same scratch record the resolution is
+    // decided on, and check the brief against the caller's exact evidence
+    // handles and the still-unmet resolution condition. A brief that dropped an
+    // evidence handle, or that failed to name the unmet condition, cannot
+    // authorise the resolution, so the resolution is never taken on a title
+    // and a log dump.
+    let brief = DiagnosticBrief::compile(&scratch).map_err(|error| {
+        owner_refused(format!(
+            "verified problem brief is not compilable: {error}"
+        ))
+    })?;
+    if brief.evidence_handles != scratch.evidence_refs {
+        return Err(owner_refused(
+            "verified problem brief does not expose the exact evidence handles".to_owned(),
+        ));
+    }
+    if !brief
+        .unknowns
+        .iter()
+        .any(|unknown| unknown.contains(&scratch.resolution_condition))
+    {
+        return Err(owner_refused(
+            "verified problem brief does not expose the unmet resolution condition".to_owned(),
+        ));
+    }
     scratch
         .transition(fence, ProblemState::Resolved)
         .map_err(|error| {
@@ -1185,15 +1219,27 @@ fn check_watchdog_gap_candidate(
             "watchdog coverage gap candidate batch {batch_id} sequence {}",
             entry.sequence
         ),
+        class: ProblemClass::Cognitive,
+        severity: SignalSeverity::Warning,
         scope_id: GOVERNOR_SCOPE_ID.to_owned(),
-        owner: OwnerRef {
+        affected_dependencies: vec![GOVERNOR_SCOPE_ID.to_owned()],
+        symptom: format!("watchdog coverage gap at sequence {}", entry.sequence),
+        owner: Some(OwnerRef {
             principal: GOVERNOR_SCOPE_ID.to_owned(),
             generation: fence.resource_generation.value().to_string(),
-        },
+        }),
         state: ProblemState::Open,
         evidence_refs: vec![evidence],
+        hypotheses: Vec::new(),
+        containment: None,
+        repair_history: Vec::new(),
+        next_probe: Some(format!(
+            "watchdog recovery observed for sequence {}",
+            entry.sequence
+        )),
         resolution_condition: format!("watchdog recovery observed for sequence {}", entry.sequence),
         acknowledged_by: None,
+        reopen_history: Vec::new(),
         state_fence: fence.clone(),
         revision: 1,
         reopen_count: 0,
