@@ -1751,7 +1751,7 @@ use eliot_platform_windows::{
 // `ELIOT_RUNTIME_STATE_ROOTS_DIGEST` as the receipt and ORS roots, so the
 // Kernel cannot receive a digest that does not cover the anchor sink.
 #[cfg(windows)]
-const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 8] = [
+const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 11] = [
     "ELIOT_KERNEL_CONTROL_PIPE",
     "ELIOT_HOST_PROCESS_ID",
     "ELIOT_HOST_PROCESS_START",
@@ -1760,6 +1760,9 @@ const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 8] = [
     "ELIOT_KERNEL_ORS_ROOT",
     "ELIOT_KERNEL_WATCHDOG_STATE_ROOT",
     "ELIOT_RUNTIME_STATE_ROOTS_DIGEST",
+    "ELIOT_INSTALLATION_PROFILE",
+    "ELIOT_PROFILE_ROOT_REQUEST",
+    "ELIOT_PROFILE_ROOT_SELECTION",
 ];
 
 #[cfg(windows)]
@@ -4349,6 +4352,21 @@ impl HostJobBranches {
         // binding is rebuilt from the same installer-owned root rather than
         // left to a same-directory default.
         let watchdog_anchor_root = Self::watchdog_anchor_root(launch)?;
+        let profile_root_binding = if matches!(
+            launch.profile,
+            eliot_installation::InstallationProfile::UserMode
+                | eliot_installation::InstallationProfile::PortableDev
+        ) {
+            let request = host_job_launch::profile_root_request(launch)?;
+            let leases =
+                eliot_platform_windows::profile_supervision::open_profile_root_leases(&request)
+                    .map_err(|error| {
+                        HostError::ProcessContour(format!("reopen Kernel profile roots: {error}"))
+                    })?;
+            Some((request, leases))
+        } else {
+            None
+        };
         // T6-D2 front-door anchor (issue #461): the stored 22-value contour
         // gains the sealed digest-bound Doctor path so the relaunched Kernel
         // receives the exact 24-value launch options. Missing anchors fail
@@ -4379,6 +4397,10 @@ impl HostJobBranches {
                 watchdog_anchor_root,
                 &launch.runtime_state_roots.roots_digest,
             )),
+            Some(launch.profile),
+            profile_root_binding
+                .as_ref()
+                .map(|(request, leases)| (request, leases.selection())),
         )?;
         Ok(child)
     }
@@ -4486,6 +4508,8 @@ impl HostJobBranches {
             host,
             &launch.store_bridge_arguments,
             &store_working_directory,
+            None,
+            None,
             None,
             None,
         )?;
