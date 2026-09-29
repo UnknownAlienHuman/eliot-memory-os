@@ -2477,7 +2477,7 @@ impl KernelComposition {
     /// ARMS ONLY, NOT ALL SIX ARMS OF THIS FUNCTION. This function has six refusal
     /// call sites, and they answer with TWO different sentences:
     /// - the three AUTHORIZATION call sites — the scope/lineage join, the separate
-    ///   principal compare, and the presented-digest + presented-archive compare —
+    ///   principal compare, and the presented-digest + owner re-proof compare —
     ///   all answer with the ONE [`successor_not_observed_reply`], whose reason is a
     ///   single static sentence naming no principal, no session, no scope, no
     ///   lineage, no digest, no archive identity, no count and no store error;
