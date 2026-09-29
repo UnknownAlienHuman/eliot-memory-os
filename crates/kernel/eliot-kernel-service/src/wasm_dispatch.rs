@@ -93,12 +93,20 @@ const MAX_SLOT_SCAN_ENTRIES: usize = 64;
 /// The slot history remains bounded even when reclaimed payloads leave a
 /// compact per-delivery disposition tombstone behind.
 const MAX_DELIVERY_HISTORY: usize = MAX_SLOT_SCAN_ENTRIES;
+/// At most one aside for each of the three fixed delivery files can remain
+/// for every retained delivery identity.
+const MAX_DELIVERY_ASIDE_SCAN_ENTRIES: usize = MAX_DELIVERY_HISTORY * 3;
+/// Bounds the complete installation-root walk used to discover claim asides,
+/// including unrelated entries that must be stepped over to prove completeness.
+const MAX_DELIVERY_ROOT_SCAN_ENTRIES: usize =
+    MAX_DELIVERY_HISTORY + MAX_DELIVERY_ASIDE_SCAN_ENTRIES + 16;
+const DELIVERY_RECLAIM_ASIDE_SUFFIX: &str = ".reclaiming";
 /// A disposition contains identities and receipt digests only, never a
 /// result body or guest payload.
 const MAX_DELIVERY_DISPOSITION_BYTES: u64 = 64 * 1024;
-/// Bound on all retained payload/material bytes and compact slot receipts.
-/// Each active slot reserves room for the result stream in addition to the
-/// artifact, input, and envelope; spent history retains only its three small
+/// Bound on retained payload/material bytes and compact slot receipts. The
+/// pre-stage reservation covers four payload files in a slot plus the next
+/// three fixed-name root files; spent history retains only compact
 /// publication/disposition records.
 pub const MAX_DELIVERY_RETAINED_BYTES: u64 = (MAX_DELIVERY_SLOTS as u64)
     * ((MAX_DELIVERY_PAYLOAD_BYTES as u64) * 4 + MAX_DELIVERY_DISPOSITION_BYTES * 4)
@@ -2427,6 +2435,340 @@ fn read_publication_snapshot(
     })
 }
 
+struct DeliveryReclaimAsideName<'a> {
+    file_name: &'static str,
+    generation: u64,
+    publication_incarnation: u64,
+    publication_revision: u64,
+    claim_fragment: &'a str,
+    envelope_digest: &'a str,
+}
+
+fn parse_reclaim_aside_number<'a>(
+    value: &'a str,
+    delimiter: &str,
+) -> Result<(u64, &'a str), WasmDispatchError> {
+    let (number, remainder) = value
+        .split_once(delimiter)
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    if number.len() != 20 || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    let parsed = number
+        .parse::<u64>()
+        .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+    if format!("{parsed:020}") != number {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    Ok((parsed, remainder))
+}
+
+fn looks_like_reclaiming_suffix(file_name: &str) -> bool {
+    let file_name = file_name.as_bytes();
+    file_name
+        .get(file_name.len().saturating_sub(DELIVERY_RECLAIM_ASIDE_SUFFIX.len())..)
+        .is_some_and(|suffix| {
+            suffix.eq_ignore_ascii_case(DELIVERY_RECLAIM_ASIDE_SUFFIX.as_bytes())
+        })
+}
+
+/// Parses the claim-bound host aside spelling. Its readable claim fragment is
+/// checked against the owner identity below; only the full digest and owner
+/// revision fields join it to a retained delivery.
+fn parse_reclaim_aside_name(
+    file_name: &str,
+) -> Result<Option<DeliveryReclaimAsideName<'_>>, WasmDispatchError> {
+    if !looks_like_reclaiming_suffix(file_name) {
+        return Ok(None);
+    }
+    if !file_name.ends_with(DELIVERY_RECLAIM_ASIDE_SUFFIX) {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    let suffix_start = file_name
+        .len()
+        .checked_sub(DELIVERY_RECLAIM_ASIDE_SUFFIX.len())
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    let mut stem = file_name
+        .get(..suffix_start)
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    let mut matched_file_name = None;
+    for candidate in [
+        WASM_HOST_MATERIAL_FILE_NAME,
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+        WASM_HOST_GUEST_INPUT_FILE_NAME,
+    ] {
+        let prefix = format!(".{candidate}.g");
+        if let Some(remainder) = stem.strip_prefix(&prefix) {
+            matched_file_name = Some(candidate);
+            stem = remainder;
+            break;
+        }
+    }
+    let file_name = matched_file_name.ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    let (generation, remainder) = parse_reclaim_aside_number(stem, ".p")?;
+    let (publication_incarnation, remainder) = parse_reclaim_aside_number(remainder, ".r")?;
+    let (publication_revision, remainder) = parse_reclaim_aside_number(remainder, ".")?;
+    let (claim_fragment, envelope_digest) = remainder
+        .rsplit_once('.')
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    if generation == 0
+        || publication_incarnation == 0
+        || publication_revision == 0
+        || claim_fragment.is_empty()
+        || claim_fragment.len() > 48
+        || !claim_fragment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    require_disposition_digest(envelope_digest)?;
+    Ok(Some(DeliveryReclaimAsideName {
+        file_name,
+        generation,
+        publication_incarnation,
+        publication_revision,
+        claim_fragment,
+        envelope_digest,
+    }))
+}
+
+fn delivery_claim_fragment(claim_id: &str) -> String {
+    claim_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect()
+}
+
+fn unique_delivery_row_index(
+    rows: &[(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    matches_identity: impl Fn(&WasmDeliveryIdentity) -> bool,
+) -> Result<usize, WasmDispatchError> {
+    let mut matched = None;
+    for (index, (_, _, snapshot, _)) in rows.iter().enumerate() {
+        if matches_identity(snapshot.disposition.identity()) {
+            if matched.replace(index).is_some() {
+                return Err(WasmDispatchError::DeliveryUnavailable);
+            }
+        }
+    }
+    matched.ok_or(WasmDispatchError::DeliveryUnavailable)
+}
+
+fn account_delivery_root_bytes(
+    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    retained_bytes: &mut u64,
+    row_index: usize,
+    bytes: u64,
+) -> Result<(), WasmDispatchError> {
+    let row = rows
+        .get_mut(row_index)
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    row.3 = row
+        .3
+        .checked_add(bytes)
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    *retained_bytes = (*retained_bytes)
+        .checked_add(bytes)
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    Ok(())
+}
+
+fn read_delivery_root_file(
+    path: &std::path::Path,
+) -> Result<(u64, Vec<u8>), WasmDispatchError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_DELIVERY_PAYLOAD_BYTES as u64
+    {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    let bytes = std::fs::read(path).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    Ok((metadata.len(), bytes))
+}
+
+fn account_reclaim_aside(
+    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    retained_bytes: &mut u64,
+    path: &std::path::Path,
+    aside: DeliveryReclaimAsideName<'_>,
+) -> Result<(), WasmDispatchError> {
+    let row_index = unique_delivery_row_index(rows, |identity| {
+        identity.generation == aside.generation
+            && identity.publication_incarnation == aside.publication_incarnation
+            && identity.publication_revision == aside.publication_revision
+            && identity.envelope_digest == aside.envelope_digest
+            && delivery_claim_fragment(&identity.claim_id) == aside.claim_fragment
+    })?;
+    let identity = rows[row_index].2.disposition.identity().clone();
+    if !matches!(
+        &rows[row_index].2.disposition.disposition,
+        WasmDeliveryDisposition::Acknowledged { .. }
+            | WasmDeliveryDisposition::RetiredNoEffect { .. }
+    ) {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    let expected_digest = match aside.file_name {
+        WASM_HOST_MATERIAL_FILE_NAME => &identity.envelope_digest,
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME => &identity.artifact_digest,
+        WASM_HOST_GUEST_INPUT_FILE_NAME => &identity.input_digest,
+        _ => return Err(WasmDispatchError::DeliveryUnavailable),
+    };
+    let (aside_bytes, bytes) = read_delivery_root_file(path)?;
+    if sha256_hex(&bytes) != *expected_digest {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    account_delivery_root_bytes(rows, retained_bytes, row_index, aside_bytes)
+}
+
+fn fixed_delivery_root_name(
+    name: &str,
+) -> Result<Option<&'static str>, WasmDispatchError> {
+    for candidate in [
+        WASM_HOST_MATERIAL_FILE_NAME,
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+        WASM_HOST_GUEST_INPUT_FILE_NAME,
+    ] {
+        if name.eq_ignore_ascii_case(candidate) {
+            if name != candidate {
+                return Err(WasmDispatchError::DeliveryUnavailable);
+            }
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn is_delivery_partial_root_name(name: &str) -> bool {
+    let partial_suffix = name
+        .get(name.len().saturating_sub(".partial".len())..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".partial"));
+    partial_suffix
+        && [
+            WASM_HOST_MATERIAL_FILE_NAME,
+            WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+            WASM_HOST_GUEST_INPUT_FILE_NAME,
+        ]
+        .iter()
+        .any(|candidate| {
+            let prefix = format!(".{candidate}.");
+            name.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(&prefix))
+        })
+}
+
+fn account_fixed_delivery_files(
+    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    retained_bytes: &mut u64,
+    fixed_files: &[(&'static str, std::path::PathBuf)],
+) -> Result<(), WasmDispatchError> {
+    if fixed_files.is_empty() {
+        return Ok(());
+    }
+    if fixed_files.len() != 3 {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    let fixed_material = fixed_files
+        .iter()
+        .find(|(name, _)| *name == WASM_HOST_MATERIAL_FILE_NAME);
+    let (_, material_path) = fixed_material.ok_or(WasmDispatchError::DeliveryUnavailable)?;
+    let (material_bytes_len, material_bytes_on_disk) = read_delivery_root_file(material_path)?;
+    let material: WasmDispatchMaterial = serde_json::from_slice(&material_bytes_on_disk)
+        .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+    if material_bytes(&material)? != material_bytes_on_disk {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    let material_row_index =
+        unique_delivery_row_index(rows, |identity| identity.matches_material(&material))?;
+    let fixed_identity = rows[material_row_index].2.disposition.identity().clone();
+    account_delivery_root_bytes(
+        rows,
+        retained_bytes,
+        material_row_index,
+        material_bytes_len,
+    )?;
+
+    for (file_name, path) in fixed_files.iter().filter(|(name, _)| {
+        *name == WASM_HOST_GUEST_ARTIFACT_FILE_NAME || *name == WASM_HOST_GUEST_INPUT_FILE_NAME
+    }) {
+        let (bytes_len, bytes) = read_delivery_root_file(path)?;
+        let digest = sha256_hex(&bytes);
+        let row_index = unique_delivery_row_index(rows, |identity| {
+            let payload_digest_matches = if *file_name == WASM_HOST_GUEST_ARTIFACT_FILE_NAME {
+                identity.artifact_digest == digest
+            } else {
+                identity.input_digest == digest
+            };
+            identity == &fixed_identity && payload_digest_matches
+        })?;
+        account_delivery_root_bytes(rows, retained_bytes, row_index, bytes_len)?;
+    }
+    Ok(())
+}
+
+fn account_delivery_root_files(
+    install_dir: &std::path::Path,
+    rows: &mut [(String, std::path::PathBuf, WasmDeliveryPublicationSnapshot, u64)],
+    retained_bytes: &mut u64,
+) -> Result<(), WasmDispatchError> {
+    let directory_metadata = std::fs::symlink_metadata(install_dir)
+        .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+    let entries =
+        std::fs::read_dir(install_dir).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+    let mut scanned_entries = 0_usize;
+    let mut aside_entries = 0_usize;
+    let mut fixed_files = Vec::with_capacity(3);
+    for entry in entries {
+        if scanned_entries >= MAX_DELIVERY_ROOT_SCAN_ENTRIES {
+            return Err(WasmDispatchError::DeliveryUnavailable);
+        }
+        scanned_entries += 1;
+        let entry = entry.map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+        let path = entry.path();
+        let raw_name = entry.file_name();
+        let name = raw_name.to_string_lossy();
+        if let Some(file_name) = fixed_delivery_root_name(&name)? {
+            if fixed_files.iter().any(|(existing, _)| *existing == file_name) {
+                return Err(WasmDispatchError::DeliveryUnavailable);
+            }
+            fixed_files.push((file_name, path));
+            continue;
+        }
+        if is_delivery_partial_root_name(&name) {
+            return Err(WasmDispatchError::DeliveryUnavailable);
+        }
+        if !looks_like_reclaiming_suffix(&name) {
+            continue;
+        }
+        aside_entries += 1;
+        if aside_entries > MAX_DELIVERY_ASIDE_SCAN_ENTRIES {
+            return Err(WasmDispatchError::DeliveryUnavailable);
+        }
+        let name = raw_name
+            .to_str()
+            .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+        let aside = parse_reclaim_aside_name(name)?
+            .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+        account_reclaim_aside(rows, retained_bytes, &path, aside)?;
+    }
+    account_fixed_delivery_files(rows, retained_bytes, &fixed_files)
+}
+
 fn scan_publication_snapshots(
     slots: &std::path::Path,
 ) -> Result<
@@ -2438,78 +2780,86 @@ fn scan_publication_snapshots(
     )>,
     WasmDispatchError,
 > {
+    let install_dir = slots
+        .parent()
+        .ok_or(WasmDispatchError::DeliveryUnavailable)?;
     let directory_metadata = match std::fs::symlink_metadata(slots) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(WasmDispatchError::DeliveryUnavailable),
     };
-    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+    if directory_metadata.as_ref().is_some_and(|metadata| {
+        metadata.file_type().is_symlink() || !metadata.is_dir()
+    }) {
         return Err(WasmDispatchError::DeliveryUnavailable);
     }
-    let Ok(entries) = std::fs::read_dir(slots) else {
-        return Err(WasmDispatchError::DeliveryUnavailable);
-    };
     let mut rows = Vec::new();
     let mut retained_bytes = 0_u64;
-    for entry in entries {
-        let entry = entry.map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-        if rows.len() >= MAX_DELIVERY_HISTORY {
-            return Err(WasmDispatchError::DeliveryUnavailable);
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-        let path = entry.path();
-        let metadata =
-            std::fs::symlink_metadata(&path).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(WasmDispatchError::DeliveryUnavailable);
-        }
-        let snapshot = read_publication_snapshot(&path)?;
-        let slot_entries =
-            std::fs::read_dir(&path).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-        let mut slot_bytes = 0_u64;
-        for slot_entry in slot_entries {
-            let slot_entry = slot_entry.map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-            let slot_path = slot_entry.path();
-            let file_metadata = std::fs::symlink_metadata(&slot_path)
-                .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-            if file_metadata.file_type().is_symlink() || !file_metadata.is_file() {
+    if directory_metadata.is_some() {
+        let entries =
+            std::fs::read_dir(slots).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+            if rows.len() >= MAX_DELIVERY_HISTORY {
                 return Err(WasmDispatchError::DeliveryUnavailable);
             }
-            let file_name = slot_entry
+            let name = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-            if file_name.ends_with(".partial")
-                || ![
-                    WASM_DELIVERY_PENDING_FILE_NAME,
-                    WASM_DELIVERY_READY_FILE_NAME,
-                    WASM_DELIVERY_FAILED_FILE_NAME,
-                    WASM_DELIVERY_DISPOSITION_FILE_NAME,
-                    WASM_DELIVERY_RESULT_FILE_NAME,
-                    WASM_HOST_MATERIAL_FILE_NAME,
-                    WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
-                    WASM_HOST_GUEST_INPUT_FILE_NAME,
-                ]
-                .contains(&file_name.as_str())
-            {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(WasmDispatchError::DeliveryUnavailable);
             }
-            if file_name == WASM_DELIVERY_RESULT_FILE_NAME
-                && file_metadata.len() > MAX_DELIVERY_PAYLOAD_BYTES as u64
-            {
-                return Err(WasmDispatchError::DeliveryUnavailable);
+            let snapshot = read_publication_snapshot(&path)?;
+            let slot_entries =
+                std::fs::read_dir(&path).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+            let mut slot_bytes = 0_u64;
+            for slot_entry in slot_entries {
+                let slot_entry = slot_entry.map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+                let slot_path = slot_entry.path();
+                let file_metadata = std::fs::symlink_metadata(&slot_path)
+                    .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+                if file_metadata.file_type().is_symlink() || !file_metadata.is_file() {
+                    return Err(WasmDispatchError::DeliveryUnavailable);
+                }
+                let file_name = slot_entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
+                if file_name.ends_with(".partial")
+                    || ![
+                        WASM_DELIVERY_PENDING_FILE_NAME,
+                        WASM_DELIVERY_READY_FILE_NAME,
+                        WASM_DELIVERY_FAILED_FILE_NAME,
+                        WASM_DELIVERY_DISPOSITION_FILE_NAME,
+                        WASM_DELIVERY_RESULT_FILE_NAME,
+                        WASM_HOST_MATERIAL_FILE_NAME,
+                        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+                        WASM_HOST_GUEST_INPUT_FILE_NAME,
+                    ]
+                    .contains(&file_name.as_str())
+                {
+                    return Err(WasmDispatchError::DeliveryUnavailable);
+                }
+                if file_name == WASM_DELIVERY_RESULT_FILE_NAME
+                    && file_metadata.len() > MAX_DELIVERY_PAYLOAD_BYTES as u64
+                {
+                    return Err(WasmDispatchError::DeliveryUnavailable);
+                }
+                slot_bytes = slot_bytes
+                    .checked_add(file_metadata.len())
+                    .ok_or(WasmDispatchError::DeliveryUnavailable)?;
             }
-            slot_bytes = slot_bytes.saturating_add(file_metadata.len());
+            retained_bytes = retained_bytes
+                .checked_add(slot_bytes)
+                .ok_or(WasmDispatchError::DeliveryUnavailable)?;
+            rows.push((name, path, snapshot, slot_bytes));
         }
-        retained_bytes = retained_bytes.saturating_add(slot_bytes);
-        if retained_bytes > MAX_DELIVERY_RETAINED_BYTES {
-            return Err(WasmDispatchError::DeliveryUnavailable);
-        }
-        rows.push((name, path, snapshot, slot_bytes));
     }
+    account_delivery_root_files(install_dir, &mut rows, &mut retained_bytes)?;
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(rows)
 }
@@ -3512,7 +3862,7 @@ pub fn publish_wasm_dispatch_bundle(
         total.saturating_add(*bytes)
     });
     let reservation_bytes = (MAX_DELIVERY_PAYLOAD_BYTES as u64)
-        .saturating_mul(4)
+        .saturating_mul(7)
         .saturating_add(MAX_DELIVERY_DISPOSITION_BYTES.saturating_mul(4));
     if retained_bytes.saturating_add(reservation_bytes) > MAX_DELIVERY_RETAINED_BYTES {
         return Err(delivery_capacity_backpressure(
