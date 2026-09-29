@@ -55,7 +55,7 @@ pub const CAPABILITY_CELL_REGISTRY_VERSION: u32 = 1;
 ///
 /// Any registry bound to another pair key is stale and fails closed.
 pub const EXPECTED_NORMATIVE_PAIR_KEY: &str =
-    "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b";
+    "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1";
 /// Closed replacement-class vocabulary admitted by registry validation.
 ///
 /// The spellings follow the `CrateExtractionDecision` disposition set (`I2.23`)
@@ -556,6 +556,99 @@ pub struct CapabilityCellRegistry {
     pub cells: Vec<CapabilityCellRecord>,
 }
 
+/// Source-only declaration projection emitted beside the capsule index.
+///
+/// This projection is intentionally weaker than CapabilityCellRegistry: it
+/// reports exact owner declarations and proof gaps but cannot satisfy
+/// executable-registry validation or claim runtime support.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityCellDeclarationProjection {
+    /// Schema identity emitted by the capsule generator.
+    pub schema_version: String,
+    /// Fixed marker that this is source declaration evidence only.
+    pub authority: DeclarationProjectionAuthority,
+    /// Exact adopted pair key from the normative-pair receipt.
+    pub normative_pair_key: NormativePairKey,
+    /// Reference to the pair receipt used by the generator.
+    pub normative_pair_ref: DigestSourceRef,
+    /// One source-derived declaration per functional capability cell.
+    pub cells: Vec<CellOwnerDeclaration>,
+    /// Typed completeness/proof diagnostics; MISSING_PROOF remains data and
+    /// does not turn this projection into a validated registry.
+    pub diagnostics: Vec<CellDeclarationDiagnostic>,
+    /// Digest of all preceding fields in canonical JSON form.
+    pub projection_digest: ContractDigest,
+}
+
+/// The declaration projection has no runtime or support authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DeclarationProjectionAuthority {
+    /// Exact source declarations only; never an executable registry.
+    DeclaredSourceOnlyNotExecutableRegistry,
+}
+
+/// One package-declared cell and its exact mutable-state owner declarations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CellOwnerDeclaration {
+    /// Declared functional cell identity.
+    pub cell_id: CapabilityCellId,
+    /// Package hosting the declaration; not an owner claim.
+    pub source_package: SourceCrateRef,
+    /// Repository-relative package manifest path.
+    pub source_manifest: String,
+    /// SHA-256 of the exact source manifest bytes.
+    pub source_manifest_sha256: ContractDigest,
+    /// Exact state-to-owner rows in package metadata.
+    pub state_owners: Vec<StateOwnershipEntry>,
+    /// Proof metadata identity from the generated ModuleTestCapsule.
+    pub proof_identity: CellProofIdentity,
+}
+
+/// Proof metadata identity without promoting declared proof to executed proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CellProofIdentity {
+    /// A package explicitly declares an executable proof entrypoint.
+    Declared {
+        /// Exact declared command/profile reference.
+        entrypoint: ProofEntrypointRef,
+        /// Source field that declared the entrypoint.
+        source: String,
+        /// Generated ModuleTestCapsule path.
+        capsule_path: String,
+        /// Exact generated capsule digest.
+        capsule_digest: ContractDigest,
+    },
+    /// No executable proof entrypoint is declared for this cell.
+    MissingProof {
+        /// Source field checked by the generator.
+        source: String,
+        /// Generated ModuleTestCapsule path carrying the gap.
+        capsule_path: String,
+        /// Exact generated capsule digest carrying the gap.
+        capsule_digest: ContractDigest,
+    },
+}
+
+/// Typed issue in a source-only cell declaration projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CellDeclarationDiagnostic {
+    /// A state owner names a cell absent from the package declaration.
+    OwnerForUndeclaredCell { cell: String, source: String },
+    /// A declared cell has no mutable-state owner row.
+    MissingStateOwner { cell: String, source: String },
+    /// A state row is malformed and cannot be represented as an owner claim.
+    MalformedStateOwner { cell: String, source: String },
+    /// A state name has more than one owner declaration.
+    DuplicateStateOwner { cell: String, source: String },
+    /// No executable proof entrypoint is declared for the cell.
+    MissingProof { cell: String, source: String },
+}
+
 /// One fail-closed registry defect. Any diagnostic fails the whole registry;
 /// diagnostics are never promoted, downgraded, or silently dropped.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -726,6 +819,42 @@ impl std::error::Error for CellClassificationError {}
 struct RegistryDigestInput<'a> {
     namespace: &'static str,
     registry: &'a CapabilityCellRegistry,
+}
+
+#[derive(Serialize)]
+struct CellDeclarationProjectionDigestInput<'a> {
+    schema_version: &'a str,
+    authority: DeclarationProjectionAuthority,
+    normative_pair_key: &'a NormativePairKey,
+    normative_pair_ref: &'a DigestSourceRef,
+    cells: &'a [CellOwnerDeclaration],
+    diagnostics: &'a [CellDeclarationDiagnostic],
+}
+
+impl CapabilityCellDeclarationProjection {
+    /// Returns whether this source-only projection is bound to the exact
+    /// current normative pair and its declared canonical digest.
+    pub fn verifies_current_identity(&self) -> bool {
+        if self.schema_version != "eliot.capability-cell-declaration-projection.v1"
+            || self.authority
+                != DeclarationProjectionAuthority::DeclaredSourceOnlyNotExecutableRegistry
+            || !self.normative_pair_key.is_current()
+            || self.normative_pair_ref.as_str() != "docs/normative-pair.toml"
+        {
+            return false;
+        }
+        let input = CellDeclarationProjectionDigestInput {
+            schema_version: &self.schema_version,
+            authority: self.authority,
+            normative_pair_key: &self.normative_pair_key,
+            normative_pair_ref: &self.normative_pair_ref,
+            cells: &self.cells,
+            diagnostics: &self.diagnostics,
+        };
+        canonical_json_bytes(&input)
+            .map(|bytes| sha256_hex(&bytes) == self.projection_digest.as_str())
+            .unwrap_or(false)
+    }
 }
 
 impl CapabilityCellRegistry {

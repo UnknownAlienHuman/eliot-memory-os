@@ -527,6 +527,127 @@ def _declared_cells(record: dict[str, Any]) -> list[str]:
     return sorted(cells)
 
 
+def _cell_declaration_projection(
+    root: Path,
+    packages: dict[str, dict[str, Any]],
+    artifacts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Project exact cell/state-owner declarations without claiming proof.
+
+    This is a narrow readback input for consumers that need declared ownership
+    while the executable CapabilityCellRegistry is incomplete. It deliberately
+    preserves missing proof as a typed diagnostic; a Cargo package or test
+    profile name never becomes an executable proof entrypoint by inference.
+    """
+    pair_path = "docs/normative-pair.toml"
+    pair = _text(read_toml(root / pair_path).get("pair_key"))
+    if not pair.startswith("sha256:") or len(pair) != 71:
+        raise NavigationError(f"accepted normative pair key is unavailable: {pair_path}")
+
+    cells: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, str]] = []
+    for package_root, record in sorted(packages.items()):
+        declared = _declared_cells(record)
+        if not declared:
+            continue
+        metadata = record["metadata"]
+        raw_owners = metadata.get("functional_cell_state_owners")
+        owner_rows = raw_owners if isinstance(raw_owners, list) else []
+        owners_by_cell: dict[str, list[dict[str, Any]]] = {}
+        for row in owner_rows:
+            if not isinstance(row, dict):
+                continue
+            cell = _text(row.get("cell"))
+            if cell:
+                owners_by_cell.setdefault(cell, []).append(row)
+                if cell not in declared:
+                    diagnostics.append(
+                        {
+                            "kind": "OWNER_FOR_UNDECLARED_CELL",
+                            "cell": cell,
+                            "source": record["manifest_path"],
+                        }
+                    )
+
+        manifest_path = record["manifest_path"]
+        manifest_digest = sha256_file(root / manifest_path)
+        for cell in declared:
+            state_owners: list[dict[str, str]] = []
+            for row in owners_by_cell.get(cell, []):
+                state = _text(row.get("state"))
+                owner = _text(row.get("owner"))
+                if not state or not owner:
+                    diagnostics.append(
+                        {"kind": "MALFORMED_STATE_OWNER", "cell": cell, "source": manifest_path}
+                    )
+                    continue
+                state_owners.append({"state": state, "owner": owner})
+            state_owners.sort(key=lambda item: (item["state"], item["owner"]))
+            if not state_owners:
+                diagnostics.append(
+                    {"kind": "MISSING_STATE_OWNER", "cell": cell, "source": manifest_path}
+                )
+            if len({row["state"] for row in state_owners}) != len(state_owners):
+                diagnostics.append(
+                    {"kind": "DUPLICATE_STATE_OWNER", "cell": cell, "source": manifest_path}
+                )
+
+            capsule = artifacts.get(cell, {}).get("test_capsule", {})
+            proof = capsule.get("independent_proof_entrypoint", {})
+            entrypoint = proof.get("entrypoint", {}) if isinstance(proof, dict) else {}
+            entrypoint_value = entrypoint.get("value") if isinstance(entrypoint, dict) else None
+            proof_declared = (
+                isinstance(entrypoint_value, str)
+                and bool(entrypoint_value.strip())
+                and proof.get("executable") is True
+            )
+            capsule_path = f"{CAPSULE_ROOT}/{cell}/test_capsule.json"
+            capsule_digest = _text(capsule.get("artifact_digest"))
+            if proof_declared:
+                proof_identity: dict[str, Any] = {
+                    "state": "DECLARED",
+                    "entrypoint": entrypoint_value,
+                    "source": "[package.metadata.eliot].proof_entrypoint",
+                    "capsule_path": capsule_path,
+                    "capsule_digest": capsule_digest,
+                }
+            else:
+                proof_identity = {
+                    "state": "MISSING_PROOF",
+                    "entrypoint": None,
+                    "source": "[package.metadata.eliot].proof_entrypoint",
+                    "capsule_path": capsule_path,
+                    "capsule_digest": capsule_digest,
+                }
+                diagnostics.append(
+                    {"kind": "MISSING_PROOF", "cell": cell, "source": capsule_path}
+                )
+
+            cells.append(
+                {
+                    "cell_id": cell,
+                    "source_package": record["package"],
+                    "source_manifest": manifest_path,
+                    "source_manifest_sha256": manifest_digest,
+                    "state_owners": state_owners,
+                    "proof_identity": proof_identity,
+                }
+            )
+
+    cells.sort(key=lambda item: item["cell_id"])
+    diagnostics.sort(key=lambda item: (item["cell"], item["kind"], item["source"]))
+    projection: dict[str, Any] = {
+        "schema_version": "eliot.capability-cell-declaration-projection.v1",
+        "authority": "DECLARED_SOURCE_ONLY_NOT_EXECUTABLE_REGISTRY",
+        "normative_pair_ref": pair_path,
+        "normative_pair_key": pair,
+        "cells": cells,
+        "diagnostics": diagnostics,
+    }
+    projection["projection_digest"] = _sha256(_canonical(projection))
+    return projection
+
+
 def _source_selection(
     root: Path, record: dict[str, Any], consumer_names: list[str]
 ) -> dict[str, Any]:
@@ -1394,6 +1515,9 @@ def build_capsules(root: Path) -> dict[str, Any]:
         "registry_defects": registry_defects,
         "capabilities": capabilities,
         "cells": cells,
+        "cell_declaration_projection": _cell_declaration_projection(
+            root, packages, artifacts
+        ),
     }
     registry["registry_digest"] = _sha256(_canonical(registry))
     return {"registry": registry, "artifacts": artifacts}

@@ -20,8 +20,10 @@
 //!   never derived from `Debug` formatting.
 
 use eliot_contracts::{
-    CapabilityCellRegistry, CapsuleDisposition, EXPECTED_NORMATIVE_PAIR_KEY, ProductPulse,
-    ProofCeiling, RegistryDiagnostic, RegistryValidationError,
+    CapabilityCellDeclarationProjection, CapabilityCellRegistry, CapsuleDisposition,
+    CellDeclarationDiagnostic, CellOwnerDeclaration, CellProofIdentity,
+    EXPECTED_NORMATIVE_PAIR_KEY, ProductPulse, ProofCeiling, RegistryDiagnostic,
+    RegistryValidationError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +104,68 @@ pub enum CellReadbackError {
     },
 }
 
+/// Readback of declared cell/state ownership from the source-only projection.
+///
+/// This result is suitable for #18 W1 owner discovery only. The proof identity
+/// is returned as declared, including MISSING_PROOF; it does not claim a
+/// validated executable registry or runtime generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellOwnerDeclarationReadback {
+    /// Exact capability-cell identity.
+    pub cell_id: String,
+    /// Package that declares the cell; not an authority owner.
+    pub source_package: String,
+    /// Repository-relative source manifest.
+    pub source_manifest: String,
+    /// Digest of the source manifest bytes.
+    pub source_manifest_sha256: String,
+    /// Exact mutable-state owner declarations.
+    pub state_owners: Vec<(String, String)>,
+    /// Declared proof identity or explicit missing-proof status.
+    pub proof_identity: CellProofIdentity,
+    /// Exact accepted normative pair key.
+    pub normative_pair_key: String,
+    /// Digest of the declaration projection.
+    pub projection_digest: String,
+}
+
+/// Failure while reading declared ownership. Missing proof is intentionally
+/// not an error: it is preserved on a successful declaration readback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CellOwnerDeclarationReadbackError {
+    /// Projection pair is stale.
+    StalePair { expected: String, found: String },
+    /// Projection digest/schema/authority marker is invalid.
+    InvalidProjection,
+    /// No declaration exists for the requested cell.
+    UnknownCell { cell: String },
+    /// The selected cell has no valid state-owner declaration.
+    InvalidStateOwnerDeclaration { cell: String, detail: String },
+}
+
+impl std::fmt::Display for CellOwnerDeclarationReadbackError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StalePair { expected, found } => write!(
+                formatter,
+                "stale declaration projection: expected pair '{expected}', found '{found}'"
+            ),
+            Self::InvalidProjection => {
+                formatter.write_str("cell declaration projection identity or digest is invalid")
+            }
+            Self::UnknownCell { cell } => {
+                write!(formatter, "cell declaration projection has no cell '{cell}'")
+            }
+            Self::InvalidStateOwnerDeclaration { cell, detail } => write!(
+                formatter,
+                "cell '{cell}' has an invalid state-owner declaration: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CellOwnerDeclarationReadbackError {}
+
 impl std::fmt::Display for CellReadbackError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -151,6 +215,87 @@ fn capsule_disposition_name(disposition: CapsuleDisposition) -> &'static str {
         CapsuleDisposition::TestToolingOnly => "TEST_TOOLING_ONLY",
         CapsuleDisposition::Excluded => "EXCLUDED",
         CapsuleDisposition::Unresolved => "UNRESOLVED",
+    }
+}
+
+/// Reads one exact cell's source-declared state owners from a current-pair
+/// declaration projection. Missing proof remains visible in the result and
+/// does not promote the projection to the executable registry contract.
+pub fn read_cell_owner_declaration(
+    requested_cell: &str,
+    projection: &CapabilityCellDeclarationProjection,
+) -> Result<CellOwnerDeclarationReadback, CellOwnerDeclarationReadbackError> {
+    if !projection.normative_pair_key.is_current() {
+        return Err(CellOwnerDeclarationReadbackError::StalePair {
+            expected: EXPECTED_NORMATIVE_PAIR_KEY.to_owned(),
+            found: projection.normative_pair_key.as_str().to_owned(),
+        });
+    }
+    if !projection.verifies_current_identity() {
+        return Err(CellOwnerDeclarationReadbackError::InvalidProjection);
+    }
+    let record = projection
+        .cells
+        .iter()
+        .find(|record| record.cell_id.as_str() == requested_cell)
+        .ok_or_else(|| CellOwnerDeclarationReadbackError::UnknownCell {
+            cell: requested_cell.to_owned(),
+        })?;
+    for diagnostic in &projection.diagnostics {
+        let (diagnostic_cell, detail) = match diagnostic {
+            CellDeclarationDiagnostic::MissingStateOwner { cell, .. }
+                if cell == requested_cell =>
+            {
+                (cell, "missing state owner")
+            }
+            CellDeclarationDiagnostic::MalformedStateOwner { cell, .. }
+                if cell == requested_cell =>
+            {
+                (cell, "malformed state owner")
+            }
+            CellDeclarationDiagnostic::DuplicateStateOwner { cell, .. }
+                if cell == requested_cell =>
+            {
+                (cell, "duplicate state owner")
+            }
+            CellDeclarationDiagnostic::MissingProof { .. } => continue,
+            _ => continue,
+        };
+        return Err(
+            CellOwnerDeclarationReadbackError::InvalidStateOwnerDeclaration {
+                cell: diagnostic_cell.clone(),
+                detail: detail.to_owned(),
+            },
+        );
+    }
+    if record.state_owners.is_empty() {
+        return Err(
+            CellOwnerDeclarationReadbackError::InvalidStateOwnerDeclaration {
+                cell: requested_cell.to_owned(),
+                detail: "no owner rows".to_owned(),
+            },
+        );
+    }
+    Ok(owner_declaration_readback(record, projection))
+}
+
+fn owner_declaration_readback(
+    record: &CellOwnerDeclaration,
+    projection: &CapabilityCellDeclarationProjection,
+) -> CellOwnerDeclarationReadback {
+    CellOwnerDeclarationReadback {
+        cell_id: record.cell_id.as_str().to_owned(),
+        source_package: record.source_package.as_str().to_owned(),
+        source_manifest: record.source_manifest.clone(),
+        source_manifest_sha256: record.source_manifest_sha256.as_str().to_owned(),
+        state_owners: record
+            .state_owners
+            .iter()
+            .map(|owner| (owner.state.as_str().to_owned(), owner.owner.as_str().to_owned()))
+            .collect(),
+        proof_identity: record.proof_identity.clone(),
+        normative_pair_key: projection.normative_pair_key.as_str().to_owned(),
+        projection_digest: projection.projection_digest.as_str().to_owned(),
     }
 }
 
