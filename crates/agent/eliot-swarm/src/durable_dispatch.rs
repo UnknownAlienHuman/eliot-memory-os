@@ -32,7 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AdmittedSwarmPlan, ProviderBinding, ProviderRequest, ReceiptEnvelope, ReceiptVerificationPort,
-    SwarmError, digest,
+    SwarmError, derive_child_attempt_id, derive_child_cancellation_id,
+    derive_child_operation_id, digest,
     durable_work::{ChildDisposition, LaunchIntent, RouteGrant, TerminalKind, WorkUnitId},
     validate_receipt, validate_text,
 };
@@ -550,6 +551,28 @@ pub fn assert_single_attachment(
     Err(SwarmError::OwnershipConflict)
 }
 
+/// Admitted-work projection of one child operation identity.
+///
+/// Frozen envelope format: existing persisted intents and exact-replay
+/// digests depend on the `job:revision:slot` spelling, so it never gains the
+/// fence. The fence travels alongside in the intent and lineage, and the
+/// fence-qualified canonical key is derived separately by
+/// [`super::derive_child_operation_id`].
+fn dispatch_operation_id(
+    job_handle: &str,
+    plan_revision: &RevisionId,
+    child_slot: &WorkItemId,
+) -> Result<String, SwarmError> {
+    let operation_id = format!(
+        "{}:{}:{}",
+        job_handle,
+        plan_revision.as_str(),
+        child_slot.as_str()
+    );
+    validate_text(&operation_id, "operation_id")?;
+    Ok(operation_id)
+}
+
 /// Derives one child dispatch from the job attachment, plan item, and
 /// admitted route grant.
 ///
@@ -578,13 +601,11 @@ pub fn dispatch_child(
     validate_text(&grant.fingerprint, "route_fingerprint")?;
     validate_text(&grant.evidence_digest, "route_evidence_digest")?;
     validate_text(route_class, "route_class")?;
-    let operation_id = format!(
-        "{}:{}:{}",
+    let operation_id = dispatch_operation_id(
         attachment.job_handle(),
-        attachment.plan_revision().as_str(),
-        item.work_item_id.as_str()
-    );
-    validate_text(&operation_id, "operation_id")?;
+        attachment.plan_revision(),
+        &item.work_item_id,
+    )?;
     let attempt_id =
         AgentAttemptId::new(format!("{operation_id}-attempt")).map_err(|_| SwarmError::Contract)?;
     let intent = LaunchIntent {
@@ -641,6 +662,99 @@ pub fn verify_exact_replay(
         return Ok(ReplayVerdict::Idempotent);
     }
     Err(SwarmError::PayloadConflict)
+}
+
+/// Fence-qualified canonical identities for one sealed child dispatch.
+///
+/// The dispatch envelope carries the admitted-work projection
+/// (`job:revision:slot` operation id with the fence digest alongside); these
+/// keys additionally bind the State Fence into the identity itself, so a
+/// fence change always changes the cancellation and reconciliation key and a
+/// stale cancel can never address a new generation. Built only by
+/// [`verify_sealed_dispatch`].
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedChildIdentities {
+    /// `job:revision:slot:fence` lineage key.
+    pub lineage_key: String,
+    /// Fence-qualified attempt identity.
+    pub attempt_id: AgentAttemptId,
+    /// Fence-qualified cancellation identity.
+    pub cancellation_id: String,
+}
+
+/// Verifies one dispatch against its sealed plan denominator and durable-job
+/// attachment, then binds the fence-qualified identities.
+///
+/// The caller runs this after building the dispatch and before persisting the
+/// intent or requesting execution, so no launched child can be omitted from
+/// restart/reconciliation accounting: membership in the frozen denominator,
+/// the Governor owner binding, and the full parent/plan/attempt/fence/
+/// route lineage are all re-proved here. DAG acyclicity and denominator
+/// finiteness were proven once at admission
+/// ([`super::admit_plan`]); this re-checks membership plus binding, never a
+/// widened plan.
+///
+/// Fail-closed: a slot outside the frozen work graph is
+/// [`SwarmError::WrongPartition`]; a plan revision or fence digest that
+/// drifted from the attachment is [`SwarmError::StaleLineage`]; a lineage or
+/// envelope field that disagrees with the attachment, slot, or stored launch
+/// digest is [`SwarmError::Contract`].
+pub fn verify_sealed_dispatch(
+    plan: &AdmittedSwarmPlan,
+    attachment: &DurableJobAttachment,
+    launch: &DispatchedLaunch,
+) -> Result<SealedChildIdentities, SwarmError> {
+    plan.check_child_slot(&launch.lineage.child_slot)?;
+    if plan.revision() != attachment.plan_revision()
+        || plan.provider_binding().state_fence_digest.as_str() != attachment.state_fence_digest()
+    {
+        return Err(SwarmError::StaleLineage);
+    }
+    if launch.lineage.job_handle.as_str() != attachment.job_handle()
+        || launch.lineage.plan_revision != *attachment.plan_revision()
+        || launch.lineage.state_fence_digest.as_str() != attachment.state_fence_digest()
+    {
+        return Err(SwarmError::StaleLineage);
+    }
+    let expected_operation = dispatch_operation_id(
+        attachment.job_handle(),
+        attachment.plan_revision(),
+        &launch.lineage.child_slot,
+    )?;
+    let expected_attempt = AgentAttemptId::new(format!("{expected_operation}-attempt"))
+        .map_err(|_| SwarmError::Contract)?;
+    if launch.intent.operation_id != expected_operation
+        || launch.intent.attempt_id != expected_attempt
+        || launch.intent.fence_digest.as_str() != attachment.state_fence_digest()
+        || launch.intent.route_id != launch.lineage.route_id
+        || launch.intent.route_fingerprint != launch.lineage.route_fingerprint
+    {
+        return Err(SwarmError::Contract);
+    }
+    if digest(&launch.intent)? != launch.lineage.launch_digest {
+        return Err(SwarmError::Contract);
+    }
+    Ok(SealedChildIdentities {
+        lineage_key: derive_child_operation_id(
+            attachment.job_handle(),
+            attachment.plan_revision(),
+            &launch.lineage.child_slot,
+            attachment.state_fence_digest(),
+        )?,
+        attempt_id: derive_child_attempt_id(
+            attachment.job_handle(),
+            attachment.plan_revision(),
+            &launch.lineage.child_slot,
+            attachment.state_fence_digest(),
+        )?,
+        cancellation_id: derive_child_cancellation_id(
+            attachment.job_handle(),
+            attachment.plan_revision(),
+            &launch.lineage.child_slot,
+            attachment.state_fence_digest(),
+        )?,
+    })
 }
 
 #[cfg(test)]
