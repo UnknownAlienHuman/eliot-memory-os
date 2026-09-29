@@ -387,6 +387,7 @@ pub fn unix_timestamp(now: SystemTime) -> u64 {
 }
 
 mod health_detectors;
+mod publication;
 mod reconciliation;
 mod risk;
 mod rules;
@@ -421,6 +422,11 @@ pub use reconciliation::{
     WatchdogSpoolReconciliationError, WatchdogSpoolSinkDisposition,
     acknowledgement_advances_cursor, export_retry_identity_equal, is_duplicate_ack,
     validate_acknowledgement, validate_batch, validate_batch_freshness, validate_cursor,
+};
+
+pub use publication::{
+    AttentionPolicy, PublicationClass, PublicationDecision, PublicationIntent,
+    evaluate_publication_intent,
 };
 
 pub use rules::{

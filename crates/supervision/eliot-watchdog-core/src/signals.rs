@@ -478,7 +478,7 @@ pub enum SignalValidationError {
     UnexpectedRevision { expected: u64, actual: u64 },
 }
 
-fn text(value: &str, field: &'static str) -> Result<(), SignalValidationError> {
+pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SignalValidationError> {
     if value.trim().is_empty() {
         return Err(SignalValidationError::EmptyField(field));
     }
@@ -488,7 +488,7 @@ fn text(value: &str, field: &'static str) -> Result<(), SignalValidationError> {
     Ok(())
 }
 
-fn positive(value: u64, field: &'static str) -> Result<(), SignalValidationError> {
+pub(crate) fn positive(value: u64, field: &'static str) -> Result<(), SignalValidationError> {
     if value == 0 {
         Err(SignalValidationError::ZeroValue(field))
     } else {
