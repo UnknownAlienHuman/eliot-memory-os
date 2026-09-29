@@ -6430,8 +6430,9 @@ impl KernelComposition {
                 &campaign_source_publications,
             )
         {
-            return Ok(Self::store_error_response_text(
+            return Ok(Self::store_staging_refusal_response(
                 "write_receipt",
+                campaign_source_operation_id.as_str(),
                 &error.to_string(),
             ));
         }
@@ -8294,6 +8295,48 @@ impl KernelComposition {
             }),
             None => Self::store_error_response_text(kind, &error.to_string()),
         }
+    }
+
+    /// Renders one refused pre-call durable staging attempt as the operation's
+    /// error response (issue #1681 W4, I5.6, I14.4).
+    ///
+    /// This refusal is reached only BEFORE any possible Store call: the ORS
+    /// reservation above is the durable intent record that must precede every
+    /// canonical send on this route, so its failure means the complete opaque
+    /// operation was not durably staged. `I5.2` therefore forbids
+    /// `ACCEPTED_PENDING` here, and this response does not claim it: it reports
+    /// `STORAGE_BACKPRESSURE` (the `I14.4` name for "no durable staging was
+    /// available") and carries no stage receipt, no poll handle, and no
+    /// resubmission instruction, because nothing was staged to poll.
+    ///
+    /// The exact admitted operation identity is preserved verbatim so the caller
+    /// retries THIS operation rather than a fresh one, and the ORS refusal text
+    /// is carried through unchanged instead of being replaced with a generic
+    /// error string. It is not read from the absence of a receipt: this arm is
+    /// entered only on a real `reserve_campaign_source_publications` error, so
+    /// the durable staging attempt is known to have failed rather than inferred
+    /// from a later check being absent.
+    #[cfg(windows)]
+    fn store_staging_refusal_response(
+        kind: &str,
+        operation_id: &str,
+        refusal: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "error",
+            "code": "STORAGE_BACKPRESSURE",
+            "reason": refusal,
+            "value": { "kind": kind, "value": null },
+            "recovery": {
+                "staging": {
+                    "operation_id": operation_id,
+                    "preserve_operation_id": true,
+                    "accepted_pending": false,
+                    "stage_receipt": serde_json::Value::Null,
+                    "poll_handle": serde_json::Value::Null,
+                },
+            },
+        })
     }
 
     #[cfg(windows)]
