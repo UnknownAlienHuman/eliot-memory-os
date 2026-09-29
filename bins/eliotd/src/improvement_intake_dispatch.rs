@@ -167,7 +167,8 @@ use eliot_governor::{
     issue_learning_admission, verify_learning_admission,
 };
 use eliot_improvement::candidate_bounds::{
-    AdmitReport, ArchivedCandidate, BoundedBacklog, CandidateBoundPolicy, CrossTaskCarryover,
+    AdmitOutcome, AdmitReport, ArchivedCandidate, BoundedBacklog, CandidateBoundPolicy,
+    CrossTaskCarryover, TrackedCandidate,
 };
 use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
@@ -966,6 +967,27 @@ pub struct GovernedImprovementAdmission {
     /// durable record, so the persisted artifact names the admission it was
     /// admitted under rather than only that some admission happened.
     pub admission_digest: String,
+    /// The surviving backlog entry exactly as
+    /// [`BoundedBacklog::admit_reporting_pressure`] left it, when this
+    /// admission deduplicated by evidence lineage; `None` when the candidate
+    /// was admitted as a new active entry.
+    ///
+    /// This is the merge RESULT, not the merge event. `report.outcome` already
+    /// states that a merge happened and names both candidates; this carries
+    /// what the merge produced — the unioned evidence and source lineage, the
+    /// `merged_from` absorbed-id list, the retained assessed value and owner,
+    /// the retained admission authority, and the advanced candidate revision.
+    /// Without it the commit path holds only the INCOMING candidate and the
+    /// accumulated lineage a merge built is lost when the pass ends
+    /// (I12.24:297: "Duplicates merge by evidence lineage").
+    ///
+    /// It is captured HERE, inside the only place that still holds the
+    /// backlog: `BoundedBacklog` owns its entries privately and the commit
+    /// function receives no backlog, so this is the one seam from which the
+    /// post-merge entry is reachable. `None` is never reachable for a
+    /// [`AdmitOutcome::Merged`] outcome — a merge whose surviving entry could
+    /// not be read back is refused, not reported as an admission without one.
+    pub merged_survivor: Option<TrackedCandidate>,
 }
 
 /// Admit one assembled improvement artifact into the bounded backlog through
@@ -996,6 +1018,11 @@ pub struct GovernedImprovementAdmission {
 ///    constant), and then enforces the bound, merging by evidence lineage or
 ///    relieving a full bound through the explicit summarized archive
 ///    transition (W3).
+/// 5. [`merged_survivor_entry`] reads the surviving entry back out of the
+///    backlog on the merge branch. This is the only seam that still holds the
+///    backlog, so the post-merge state is carried out on
+///    [`GovernedImprovementAdmission::merged_survivor`] rather than recomputed
+///    later from a value the commit path does not hold.
 ///
 /// The `ArchivedCandidate` receipts travel back in the returned
 /// [`AdmitReport`] for the caller to make durable; nothing is dropped here.
@@ -1019,11 +1046,53 @@ pub fn admit_improvement_artifact(
             &verified,
         )
         .map_err(|error| ImprovementDispatchError::Backlog(error.to_string()))?;
+    let merged_survivor = merged_survivor_entry(&report, backlog)?;
     Ok(GovernedImprovementAdmission {
         report,
         bound,
         admission_digest: permit.digest().to_owned(),
+        merged_survivor,
     })
+}
+
+/// Reads the SURVIVING backlog entry out of the registry on the merge branch
+/// (W3, I12.24:297).
+///
+/// [`AdmitOutcome::Merged`] states that an incoming candidate deduplicated into
+/// an existing one and names both ids, but the state the merge BUILT — the
+/// unioned `evidence_refs`/`source_trace_refs`, the `merged_from` absorbed-id
+/// list, the retained assessed value and owner, the retained admission
+/// authority and the advanced candidate revision, all written by
+/// [`BoundedBacklog`]'s own merge transition — lives on the entry, and the
+/// entry is the only place it exists. So it is read here, while the backlog is
+/// still in hand, and travels back on
+/// [`GovernedImprovementAdmission::merged_survivor`] for the commit path to
+/// make durable.
+///
+/// `None` means the outcome was [`AdmitOutcome::Admitted`]: nothing merged, so
+/// there is no surviving entry to record. The opposite disagreement — a merge
+/// whose surviving entry is not retrievable from the registry that just
+/// performed it — is a REFUSAL, not a `None`. Returning `None` there would
+/// drop the merge result silently and commit only the event, which is exactly
+/// the loss this read closes.
+fn merged_survivor_entry(
+    report: &AdmitReport,
+    backlog: &BoundedBacklog,
+) -> Result<Option<TrackedCandidate>, ImprovementDispatchError> {
+    let AdmitOutcome::Merged {
+        surviving_candidate_id,
+        absorbed_candidate_id,
+    } = &report.outcome
+    else {
+        return Ok(None);
+    };
+    let survivor = backlog.entry_for(surviving_candidate_id).ok_or_else(|| {
+        ImprovementDispatchError::Backlog(format!(
+            "candidate {absorbed_candidate_id} was merged into {surviving_candidate_id}, \
+             but the merged entry is not an active entry of the registry that performed the merge"
+        ))
+    })?;
+    Ok(Some(survivor.clone()))
 }
 
 /// The closed learning-admission claim this daemon admits its own improvement
@@ -1328,6 +1397,16 @@ fn improvement_commit_identity(
 /// a process-local receipt that disappears with the backlog (W3; I12.24:291
 /// "Silence is not a disposition, because it hides lost learning").
 ///
+/// `admitted.merged_survivor` is committed, between the candidate's own commit
+/// and the archive receipts, as ONE additional `Candidate` record whenever the
+/// admission deduplicated by evidence lineage. Without it the daemon durably
+/// records THAT a merge happened but never WHAT was merged: the record above
+/// carries the INCOMING candidate, while the surviving entry — enriched by the
+/// merge with the unioned lineage and the absorbed-id list — exists only in the
+/// registry, so the next pass rebuilds from the incoming candidate and the
+/// unioned lineage is gone. [`commit_lineage_merge_receipt`] states the shape;
+/// `improvement_dedup_read::restored_registry` reads it back.
+///
 /// Receipt commits are sequenced after the candidate commit and are
 /// individually idempotent under their own key, so a receipt committed on one
 /// pass converges on a later pass instead of duplicating. A refused receipt
@@ -1384,10 +1463,155 @@ pub async fn commit_improvement_artifact(
         )
         .await
         .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
+    // The merge result, before the archive receipts: the surviving entry is
+    // what the NEXT pass rebuilds its registry from, so it is made durable
+    // before any relief disposition is.
+    match (&admitted.report.outcome, admitted.merged_survivor.as_ref()) {
+        (AdmitOutcome::Admitted { .. }, None) => {}
+        (
+            AdmitOutcome::Merged {
+                absorbed_candidate_id, ..
+            },
+            Some(survivor),
+        ) => {
+            commit_lineage_merge_receipt(
+                composition,
+                survivor,
+                absorbed_candidate_id,
+                &scope,
+                state_fence,
+            )
+            .await?;
+        }
+        (outcome, _) => {
+            // `admit_improvement_artifact` refuses to produce this pair, so it
+            // is unreachable in practice; committing the candidate and silently
+            // skipping a merge result it cannot describe is not an option, so
+            // the disagreement is a typed refusal.
+            return Err(ImprovementDispatchError::Backlog(format!(
+                "the admission outcome {outcome:?} does not agree with the merge state this commit must record"
+            )));
+        }
+    }
     for archived in &admitted.report.archived {
         commit_archive_receipt(composition, archived, &scope, state_fence).await?;
     }
     Ok((receipt, effective))
+}
+
+/// Commits the SURVIVING entry of one evidence-lineage merge as a durable
+/// learning record (W3, I12.24:297).
+///
+/// # What this record is for, and what a record without it would be
+///
+/// The candidate's own record commits the INCOMING candidate. When the
+/// admission deduplicated by evidence lineage, the state that makes the
+/// deduplication durable is the SURVIVOR: the entry the merge unioned the
+/// incoming lineage into, with its absorbed-id bookkeeping, its retained
+/// assessed value, owner and admission authority, and its advanced candidate
+/// revision. Committing only the event would leave the daemon asserting that a
+/// merge happened while the next pass rebuilt its registry from the pre-merge
+/// candidate row — so the unioned lineage a merge produced is lost, and the
+/// merge is indistinguishable from two independent candidates that merely
+/// co-exist. I12.24:297 says "Duplicates merge by evidence lineage", so the
+/// lineage a merge accumulated is the merge's own result and it is committed
+/// here.
+///
+/// # The committed document
+///
+/// `{merged_survivor, absorbed_candidate_id}` where `merged_survivor` is the
+/// surviving [`TrackedCandidate`] verbatim. It is committed verbatim rather
+/// than projected onto a narrower shape because it IS the registry entry:
+/// `ImprovementCandidate`, the unioned `evidence_refs` and
+/// `source_trace_refs`, the `merged_from` absorbed-id list, the retained
+/// `value`/`owner`/`admitted_under_authority`, the `lineage_digest` the merge
+/// recomputed over the union, and the advanced `revision`. A projection would
+/// have to restate which of those the merge produced, and every field omitted
+/// would be a field a merge could accumulate and lose.
+///
+/// No extra digest is added: the record's own `lineage_digest` is the digest of
+/// the union, and `admitted_under_authority` is the Governor authority the
+/// merge was admitted under. The owner-issued admission digest for the same
+/// admission is already durable on the candidate's own record.
+///
+/// `Candidate` is the same closed kind the candidate and the archive receipts
+/// use and no new kind is added. The handle and idempotency key are derived
+/// from the surviving entry's OWN identity — its candidate id plus the revision
+/// the merge advanced it to — so re-observing the same merge converges on one
+/// record instead of appending a duplicate, and a later merge of the same
+/// surviving candidate is a distinct, additional record rather than an
+/// overwrite of the earlier accumulated state.
+///
+/// A refused commit is a typed `Commit` error naming the surviving candidate
+/// and the one it absorbed, and the candidate's own commit stays committed:
+/// this is the same partial-commit behaviour the archive receipts already
+/// document, not a rollback.
+async fn commit_lineage_merge_receipt(
+    composition: &mut DaemonComposition,
+    survivor: &TrackedCandidate,
+    absorbed_candidate_id: &str,
+    scope: &ScopeId,
+    state_fence: &StateFence,
+) -> Result<eliot_store_api::WriteReceipt, ImprovementDispatchError> {
+    let record = serde_json::json!({
+        "merged_survivor": survivor,
+        "absorbed_candidate_id": absorbed_candidate_id,
+    });
+    let record_bytes = canonical_json_bytes(&record)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let record_json = String::from_utf8(record_bytes)
+        .map_err(|_| ImprovementDispatchError::Contract("record is not utf-8".to_owned()))?;
+    let record_digest = eliot_contracts::sha256_hex(record_json.as_bytes());
+    let scope_digest = eliot_contracts::sha256_hex(IMPROVEMENT_SCOPE.as_bytes());
+    let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
+    let record_key = lineage_merge_record_key(survivor);
+    let request = learning_record_mutation_request(learning_record_commit_params(
+        LearningRecordKind::Candidate,
+        record_key.clone(),
+        record_json,
+        record_digest,
+        scope_digest,
+        fence_digest,
+        record_key.clone(),
+    ));
+    let identity = improvement_commit_identity(&record_key, state_fence)?;
+    // Proof refs: the SURVIVING entry's own evidence refs, which are the union
+    // the merge produced, so the receipt cites the accumulated lineage rather
+    // than the incoming candidate's.
+    let (receipt, _effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope.clone(),
+            survivor.candidate.evidence_refs.clone(),
+            None,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| {
+            ImprovementDispatchError::Commit(format!(
+                "the merge of {} into surviving candidate {} at revision {} could not be made durable: {error}",
+                absorbed_candidate_id, survivor.candidate.candidate_id, survivor.candidate.revision
+            ))
+        })?;
+    Ok(receipt)
+}
+
+/// The closed store handle and idempotency key of one lineage-merge receipt.
+///
+/// Derived from the surviving entry's own `candidate_id` and the
+/// `candidate.revision` the merge advanced it to, both of which the merge
+/// transition produced, so the key is a function of the merge rather than of
+/// the pass that observed it. An identical replay of the same merge converges
+/// on one record instead of appending a duplicate accumulated state.
+fn lineage_merge_record_key(survivor: &TrackedCandidate) -> String {
+    format!(
+        "improvement-merge:{}@{}",
+        survivor.candidate.candidate_id, survivor.candidate.revision
+    )
 }
 
 /// Commits one [`ArchivedCandidate`] receipt as a durable learning record.

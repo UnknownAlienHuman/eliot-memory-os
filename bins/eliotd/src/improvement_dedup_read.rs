@@ -107,16 +107,44 @@
 //! active set and let it re-merge. Every candidate id named by a receipt in
 //! the same exhaustive read is therefore excluded from the restored set.
 //!
+//! # The MERGE RESULT is a row too, and it is what makes the merge durable
+//!
+//! The commit path records a lineage merge as `{merged_survivor,
+//! absorbed_candidate_id}` under the same closed `candidate` kind: the
+//! surviving [`TrackedCandidate`] exactly as the merge left it — the unioned
+//! `evidence_refs` and `source_trace_refs`, the `merged_from` absorbed-id
+//! list, the retained `value`/`owner`/`admitted_under_authority`, the
+//! recomputed `lineage_digest`, and the advanced `candidate.revision`.
+//!
+//! Without that row the daemon commits only the INCOMING candidate, so the
+//! surviving entry's pre-merge revision is the newest revision the store holds
+//! for it and the unioned lineage is gone by the next pass. The row is read
+//! for the same two reasons the archive receipt is:
+//!
+//! 1. its `merged_survivor` becomes the restored entry, carrying the entry's
+//!    OWN accumulated lineage rather than a lineage re-derived from one
+//!    candidate's evidence list, and
+//! 2. the `absorbed_candidate_id` it names is excluded from the active set,
+//!    because a merge absorbed that candidate — it is not a second active
+//!    entry and restoring it as one would let the same lineage occupy two
+//!    slots of the bound.
+//!
+//! Both rows then reach [`BoundedBacklog::restored`], which resolves two
+//! records naming ONE candidate by taking the highest candidate REVISION —
+//! and the merge advanced the survivor's revision, so the accumulated entry
+//! is the one that survives the restore.
+//!
 //! # What is NOT claimed
 //!
-//! Restoring the registry makes the merge decision real and durable-adjacent;
-//! it does not make the MERGE RESULT durable. The daemon commits
-//! `artifact.candidate` — the incoming candidate — so the surviving entry's
-//! unioned lineage and its `merged_from` bookkeeping live in the registry, not
-//! in the store. Across a restart the restored lineage is the union the
-//! commits recorded, and the id list of absorbed candidates is not. That is
-//! stated here rather than papered over; re-committing the surviving entry
-//! would mean editing the commit path, which this module does not touch.
+//! Restoring the registry makes the merge decision real and durable-adjacent.
+//! It does not re-populate [`TrackedCandidate::merged_from`] on a restored
+//! entry: the entry the merge built carries that absorbed-id list, and the
+//! record this module reads carries it durably, but the backlog's own restore
+//! builds its entries through a constructor that accepts no absorbed-id input.
+//! So the absorbed ids are durable and re-proved here, and the registry's own
+//! `merged_from` bookkeeping is empty on a restored entry. What is NOT lost is
+//! the thing the merge is FOR: the unioned lineage, which is inside the
+//! restored entry's candidate and is what the next admission is matched on.
 //!
 //! # Scope
 //!
@@ -135,6 +163,7 @@ use std::collections::BTreeSet;
 use eliot_contracts::StateFence;
 use eliot_improvement::candidate_bounds::{
     ArchivedCandidate, BoundedBacklog, BoundsError, CandidateBoundPolicy, DurableCandidateRecord,
+    TrackedCandidate, canonical_evidence_lineage, evidence_lineage_digest,
 };
 use eliot_improvement::{
     ImprovementBrief, ImprovementCandidate, ImprovementLifecycle, OwnerDecision,
@@ -236,6 +265,23 @@ struct CandidateArtifactDocument {
 struct ArchiveReceiptDocument {
     archived_candidate: ArchivedCandidate,
     disposition: ImprovementLifecycle,
+}
+
+/// A committed lineage-merge receipt.
+///
+/// Exactly the shape `commit_lineage_merge_receipt` writes:
+/// `{merged_survivor, absorbed_candidate_id}`. `merged_survivor` is the
+/// surviving [`TrackedCandidate`] verbatim — the registry entry as the merge
+/// left it — and is read for the accumulated state it carries, not for the fact
+/// that a merge was recorded. `absorbed_candidate_id` is the candidate the
+/// merge consumed, which must not come back as a second active entry.
+///
+/// Unknown fields are DENIED, as on the other two document shapes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LineageMergeReceiptDocument {
+    merged_survivor: TrackedCandidate,
+    absorbed_candidate_id: String,
 }
 
 /// One served page of the bounded candidate read.
@@ -408,15 +454,29 @@ pub fn restored_registry(
     // admitted into the registry, so a receipt on a later page still governs a
     // candidate row from an earlier one.
     let mut archived: BTreeSet<String> = BTreeSet::new();
+    // Candidate ids a committed lineage-merge receipt consumed. Same whole-read
+    // rule, and the same direction: a merged candidate is not an active entry,
+    // it is lineage the survivor carries.
+    let mut absorbed: BTreeSet<String> = BTreeSet::new();
     for row in rows {
         match classify_row(row)? {
             Row::Candidate(record) => records.push(*record),
+            Row::Merged {
+                survivor,
+                absorbed_candidate_id,
+            } => {
+                absorbed.insert(absorbed_candidate_id);
+                records.push(*survivor);
+            }
             Row::Archived(candidate_id) => {
                 archived.insert(candidate_id);
             }
         }
     }
-    records.retain(|record| !archived.contains(&record.candidate.candidate_id));
+    records.retain(|record| {
+        let candidate_id = &record.candidate.candidate_id;
+        !archived.contains(candidate_id) && !absorbed.contains(candidate_id)
+    });
     Ok(BoundedBacklog::restored(vec![bound], records)?)
 }
 
@@ -428,6 +488,12 @@ pub fn restored_registry(
 enum Row {
     /// A committed candidate artifact that qualifies as a prior candidate.
     Candidate(Box<DurableCandidateRecord>),
+    /// A committed lineage-merge receipt: the surviving entry with the
+    /// accumulated state the merge produced, plus the candidate id it consumed.
+    Merged {
+        survivor: Box<DurableCandidateRecord>,
+        absorbed_candidate_id: String,
+    },
     /// A committed archive receipt naming the candidate id it removed from the
     /// active set.
     Archived(String),
@@ -493,10 +559,72 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
         return Ok(Row::Archived(candidate_id));
     }
 
+    // A lineage-merge receipt is the second legitimate row of the same closed
+    // kind, and it is read for WHAT it merged, not for the fact that a merge
+    // was recorded. A receipt whose surviving entry names no lineage, whose
+    // recorded lineage digest is not the digest of that entry's OWN canonical
+    // evidence lineage, or that names itself as the absorbed candidate is a
+    // spliced document, and every one of those is refused rather than read.
+    if document.get("merged_survivor").is_some() {
+        let receipt: LineageMergeReceiptDocument = serde_json::from_value(document)
+            .map_err(|error| refused(format!("lineage merge receipt does not decode: {error}")))?;
+        let survivor_id = receipt
+            .merged_survivor
+            .candidate
+            .candidate_id
+            .trim()
+            .to_owned();
+        let absorbed_candidate_id = receipt.absorbed_candidate_id.trim().to_owned();
+        if survivor_id.is_empty() {
+            return Err(refused("lineage merge receipt names no surviving candidate".to_owned()));
+        }
+        if absorbed_candidate_id.is_empty() || absorbed_candidate_id == survivor_id {
+            return Err(refused(
+                "lineage merge receipt names no distinct absorbed candidate".to_owned(),
+            ));
+        }
+        // The accumulated lineage is the merge's own result, so the receipt's
+        // `lineage_digest` is recomputed here from the surviving candidate's
+        // OWN canonical evidence lineage and compared. A digest that disagrees
+        // would let a row claim an accumulation its candidate does not carry.
+        let lineage = canonical_evidence_lineage(&receipt.merged_survivor.candidate.evidence_refs);
+        if lineage.is_empty() {
+            return Err(refused(
+                "the surviving candidate carries no canonical evidence lineage".to_owned(),
+            ));
+        }
+        if evidence_lineage_digest(&lineage) != receipt.merged_survivor.lineage_digest {
+            return Err(refused(
+                "the recorded lineage digest is not the digest of the surviving candidate's own evidence lineage"
+                    .to_owned(),
+            ));
+        }
+        receipt
+            .merged_survivor
+            .candidate
+            .validate()
+            .map_err(|error| refused(format!("stored surviving candidate does not validate: {error}")))?;
+        let survivor = receipt.merged_survivor;
+        // `into_entry` re-computes the lineage digest from the candidate's own
+        // evidence refs and re-proves the candidate, so the restored entry
+        // carries the union rather than the receipt's assertion of it. The
+        // entry's retained value, owner and admission authority are the ones
+        // the merge kept, not a value re-invented here.
+        return Ok(Row::Merged {
+            survivor: Box::new(DurableCandidateRecord {
+                owner: survivor.owner.clone(),
+                admitted_under_authority: survivor.admitted_under_authority.clone(),
+                admitted_value_floor: survivor.value,
+                candidate: survivor.candidate,
+            }),
+            absorbed_candidate_id,
+        });
+    }
+
     let artifact: CandidateArtifactDocument =
         serde_json::from_value(document).map_err(|error| {
             refused(format!(
-                "record is neither a committed candidate artifact nor an archive receipt: {error}"
+                "record is neither a committed candidate artifact, nor an archive receipt, nor a lineage merge receipt: {error}"
             ))
         })?;
     // The document must bind ITSELF. A brief or an owner decision that names
