@@ -1666,6 +1666,20 @@ impl AssessmentLog {
         &self.revisions
     }
 
+    /// Host evidence this correlation has already accepted, read back from its
+    /// own retained revision chain.
+    ///
+    /// This is the correlation's own record, never a caller assertion: the
+    /// bridge join compares a later host event against the evidence recorded
+    /// here, so a caller cannot present an empty expected set and have a
+    /// correlation close once per event.
+    pub(crate) fn latest_host_evidence(&self) -> Option<&HostObservationEvidence> {
+        self.revisions
+            .iter()
+            .rev()
+            .find_map(|revision| revision.assessment.evidence.host_event.as_ref())
+    }
+
     /// Latest revision, when one exists.
     pub(crate) fn latest(&self) -> Option<&AssessmentRevision> {
         self.revisions.last()
