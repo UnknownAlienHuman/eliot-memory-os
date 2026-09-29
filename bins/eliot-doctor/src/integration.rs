@@ -511,7 +511,7 @@ pub fn verify_profile(
     let mut report = evaluate(profile, expected, &capped);
     // The record's own installation status is reported beside the evidence,
     // never in place of it, and it gates `installed` on its own.
-    report.installation = loaded.install_status.clone();
+    report.installation.clone_from(&loaded.install_status);
     // Authority cap, scoped to the axes this front door cannot observe.
     // File hashes come from real readback above. Registrations and hook
     // events have no observation port, so any expectation naming them stays
