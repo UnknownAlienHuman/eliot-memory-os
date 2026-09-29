@@ -30104,7 +30104,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         expected: &UserBrokerRegistrationReceipt,
     ) -> Result<UserBrokerRegistrationSnapshot, OrsError> {
         self.mutate_user_broker_registration(
-            heartbeat.0,
+            heartbeat.into_record(),
             Some(expected),
             &[OperationalPhase::Active],
             false,
