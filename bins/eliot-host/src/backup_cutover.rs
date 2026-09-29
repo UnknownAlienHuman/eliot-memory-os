@@ -2968,28 +2968,31 @@ fn activate_cutover_contour(
 /// this function exists to remove.
 pub fn read_cutover_disposition(
     host: &HostComposition,
-    request: &CutoverRequest,
+    op: &'static str,
+    readback: &CutoverReadback,
     retirement_receipt: Option<&AppendReceipt>,
 ) -> Result<CutoverOutcome, HostError> {
     let mut attempt = 0_u8;
     let (snapshot, registry, retirement, coherence) = loop {
         attempt = attempt.saturating_add(1);
-        let first = host.journal.snapshot().map_err(|error| {
-            note_cutover_read_error(READ_DISPOSITION_OP, super::HostError::from(error))
-        })?;
+        let first = host
+            .journal
+            .snapshot()
+            .map_err(|error| note_cutover_read_error(op, super::HostError::from(error)))?;
         let loaded = host
             .open_registry_store()
-            .map_err(|error| note_cutover_read_error(READ_DISPOSITION_OP, error))?
+            .map_err(|error| note_cutover_read_error(op, error))?
             .load()
             .map_err(|error| HostError::Platform(error.to_string()))
-            .map_err(|error| note_cutover_read_error(READ_DISPOSITION_OP, error))?;
+            .map_err(|error| note_cutover_read_error(op, error))?;
         // The cutover-relevant projection is the binding axis. The journal's
         // global sequence/last_checksum are deliberately NOT used: they advance
         // for every applied record of any kind, so they would report ordinary
         // Host traffic as owner movement.
-        let second = host.journal.snapshot().map_err(|error| {
-            note_cutover_read_error(READ_DISPOSITION_OP, super::HostError::from(error))
-        })?;
+        let second = host
+            .journal
+            .snapshot()
+            .map_err(|error| note_cutover_read_error(op, super::HostError::from(error)))?;
         // The retirement is resolved by the SAME journal owner through a third
         // read, so it is bracketed on its far side too. Resolving it outside the
         // compared interval would let a record that landed after the second
@@ -2999,11 +3002,13 @@ pub fn read_cutover_disposition(
         // `second`, and the third sample exists only to prove that `second` is
         // still current; the mapper therefore receives both journal-derived
         // inputs from one read.
-        let retirement = resolve_cutover_retirement(host, &second, request, retirement_receipt)
-            .map_err(|error| note_cutover_read_error(READ_DISPOSITION_OP, error))?;
-        let third = host.journal.snapshot().map_err(|error| {
-            note_cutover_read_error(READ_DISPOSITION_OP, super::HostError::from(error))
-        })?;
+        let retirement =
+            resolve_cutover_retirement(host, &second, readback, retirement_receipt)
+                .map_err(|error| note_cutover_read_error(op, error))?;
+        let third = host
+            .journal
+            .snapshot()
+            .map_err(|error| note_cutover_read_error(op, super::HostError::from(error)))?;
         if cutover_observation_unchanged(&first, &second)
             && cutover_observation_unchanged(&second, &third)
         {
