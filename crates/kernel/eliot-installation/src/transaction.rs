@@ -7,7 +7,11 @@ use eliot_platform_windows::{
     TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
     terminal_containment_operation_digest, validate_terminal_containment_readback_for,
 };
-use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
+use eliot_platform_windows::profile_supervision::{
+    CurrentUserTaskReceipt, CurrentUserTaskRegistrationError, CurrentUserTaskRequest,
+    ProfileSelectionReceipt,
+};
+use eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +31,9 @@ use super::{
     prove_no_service_profile_authority_dependency, sha256_handle, sha256_hex,
     validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
     validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
-    validate_user_mode_authority_effect_bindings,
+    validate_current_user_store_credential_effect_bindings,
+    validate_portable_dev_authority_effect_bindings,
+    validate_user_mode_authority_effect_bindings, validate_user_mode_task_effect_bindings,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -375,6 +381,219 @@ pub enum InstallationEffectProgressState {
     },
 }
 
+/// Failure class retained when current-user task registration committed
+/// externally but did not produce a clean Applied result.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CurrentUserTaskUnknownKind {
+    /// Task creation may have committed, but exact post-registration readback
+    /// or cleanup could not be confirmed.
+    CommittedUnknown,
+    /// Exact task receipt exists, but removal after failed validation could
+    /// not be confirmed.
+    CleanupRequired,
+}
+
+/// Durable reconciliation carrier for a current-user task registration whose
+/// platform effect may already have committed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentUserTaskUnknownProgress {
+    /// Exact platform failure class; neither class permits blind retry.
+    pub kind: CurrentUserTaskUnknownKind,
+    /// Exact request persisted before Task Scheduler mutation.
+    pub request: CurrentUserTaskRequest,
+    /// Descriptor-derived Task Scheduler identity.
+    pub task_name: String,
+    /// XML digest requested for the one permitted registration attempt.
+    pub requested_xml_sha256: PlatformHandle,
+    /// XML digest observed after the attempt, when available.
+    pub observed_xml_sha256: Option<PlatformHandle>,
+    /// Canonical digest of the exact retained request.
+    pub request_digest: PlatformHandle,
+    /// Stable serialized provider error evidence.
+    pub cause: String,
+    /// Stable serialized cleanup error evidence.
+    pub cleanup_error: String,
+}
+
+impl CurrentUserTaskUnknownProgress {
+    /// Converts a platform result that may have committed the exact task into
+    /// a serializable reconciliation carrier. Rejected/no-effect outcomes are
+    /// returned to the caller for its typed rejection path.
+    pub(crate) fn from_registration_error(
+        error: &CurrentUserTaskRegistrationError,
+    ) -> Result<(Self, Option<CurrentUserTaskReceipt>), InstallationError> {
+        let (kind, request, task_name, requested_xml_sha256, observed_xml_sha256, request_digest,
+            cause, cleanup_error, receipt) = match error {
+            CurrentUserTaskRegistrationError::CommittedUnknown {
+                request,
+                task_name,
+                requested_xml_sha256,
+                observed_xml_sha256,
+                request_digest,
+                cause,
+                cleanup_error,
+            } => (
+                CurrentUserTaskUnknownKind::CommittedUnknown,
+                request.as_ref().clone(),
+                task_name.clone(),
+                requested_xml_sha256.clone(),
+                observed_xml_sha256.clone(),
+                request_digest.clone(),
+                cause.to_string(),
+                cleanup_error.to_string(),
+                None,
+            ),
+            CurrentUserTaskRegistrationError::CleanupRequired {
+                receipt, cause, cleanup_error,
+            } => (
+                CurrentUserTaskUnknownKind::CleanupRequired,
+                receipt.request.clone(),
+                receipt.task_name.clone(),
+                receipt.task_xml_sha256.clone(),
+                Some(receipt.task_xml_sha256.clone()),
+                receipt.request_digest.clone(),
+                cause.to_string(),
+                cleanup_error.to_string(),
+                Some(receipt.as_ref().clone()),
+            ),
+            CurrentUserTaskRegistrationError::Rejected(error) => {
+                return Err(InstallationError::ProfileViolation(format!(
+                    "current-user task registration was rejected without a committed task: {error}"
+                )));
+            }
+        };
+        let requested_xml_sha256 = task_digest_handle(
+            &requested_xml_sha256,
+            "effect_progress.current_user_task_unknown.requested_xml_sha256",
+        )?;
+        let observed_xml_sha256 = observed_xml_sha256
+            .as_deref()
+            .map(|value| {
+                task_digest_handle(
+                    value,
+                    "effect_progress.current_user_task_unknown.observed_xml_sha256",
+                )
+            })
+            .transpose()?;
+        let request_digest = task_digest_handle(
+            &request_digest,
+            "effect_progress.current_user_task_unknown.request_digest",
+        )?;
+        let progress = Self {
+            kind,
+            request,
+            task_name,
+            requested_xml_sha256,
+            observed_xml_sha256,
+            request_digest,
+            cause,
+            cleanup_error,
+        };
+        progress.validate()?;
+        Ok((progress, receipt))
+    }
+
+    fn validate(&self) -> Result<(), InstallationError> {
+        let request_transaction_id =
+            PlatformHandle::new(&self.request.transaction_id).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "effect_progress.current_user_task_unknown.request.transaction_id"
+                        .to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        let request_effect_id = PlatformHandle::new(&self.request.effect_id).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "effect_progress.current_user_task_unknown.request.effect_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        handle(
+            &request_transaction_id,
+            "effect_progress.current_user_task_unknown.request.transaction_id",
+        )?;
+        handle(
+            &request_effect_id,
+            "effect_progress.current_user_task_unknown.request.effect_id",
+        )?;
+        text(
+            &self.task_name,
+            "effect_progress.current_user_task_unknown.task_name",
+        )?;
+        text(
+            &self.cause,
+            "effect_progress.current_user_task_unknown.cause",
+        )?;
+        text(
+            &self.cleanup_error,
+            "effect_progress.current_user_task_unknown.cleanup_error",
+        )?;
+        sha256_handle(
+            &self.requested_xml_sha256,
+            "effect_progress.current_user_task_unknown.requested_xml_sha256",
+        )?;
+        if let Some(observed) = &self.observed_xml_sha256 {
+            sha256_handle(
+                observed,
+                "effect_progress.current_user_task_unknown.observed_xml_sha256",
+            )?;
+        }
+        sha256_handle(
+            &self.request_digest,
+            "effect_progress.current_user_task_unknown.request_digest",
+        )?;
+        let computed_request_digest = self.request.request_digest().map_err(|error| {
+            InstallationError::InvalidField {
+                field: "effect_progress.current_user_task_unknown.request".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        if computed_request_digest != self.request_digest.as_str() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+fn task_digest_handle(value: &str, field: &str) -> Result<PlatformHandle, InstallationError> {
+    let handle = PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+        field: field.to_owned(),
+        reason: error.to_string(),
+    })?;
+    sha256_handle(&handle, field)?;
+    Ok(handle)
+}
+
+fn user_mode_task_bootstrap_matches(
+    arguments: &[String],
+    launch: &super::RuntimeLaunchDescriptor,
+    authority_digest: &PlatformHandle,
+    authority_generation: u64,
+) -> bool {
+    arguments.len() == 10
+        && arguments[0] == "--config-descriptor"
+        && eliot_platform_windows::windows_paths_equal(
+            std::path::Path::new(&arguments[1]),
+            std::path::Path::new(launch.authority_descriptor_path.as_str()),
+        )
+        && arguments[2] == "--config-descriptor-sha256"
+        && arguments[3] == authority_digest.as_str()
+        && arguments[4] == "--installation-id"
+        && arguments[5] == launch.installation_epoch.installation.as_str()
+        && arguments[6] == "--tx-plan-generation"
+        && arguments[7] == authority_generation.to_string()
+        && arguments[8] == "--host-state-root"
+        && eliot_platform_windows::windows_paths_equal(
+            std::path::Path::new(&arguments[9]),
+            std::path::Path::new(launch.runtime_state_roots.host_state_root.as_str()),
+        )
+        && arguments.iter().all(|argument| {
+            argument != "--eliot-profile-supervisor" && argument != "--registration-nonce"
+        })
+}
+
 /// One-to-one durable progress entry bound to an installer effect identity.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -416,8 +635,29 @@ pub struct InstallationEffectProgress {
     /// Credential Manager observation.
     pub user_mode_authority_receipt:
         Option<eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt>,
+    /// Original pre-write `PortableDev` repository-key receipt. It retains
+    /// the exact repository-root file identity across restart and readback.
+    pub portable_dev_authority_receipt: Option<PortableDevSupervisionAuthorityKeyReceipt>,
+    /// Exact Phase-B-bound request committed before current-user Task
+    /// Scheduler mutation; retained through Applied and reconciliation states.
+    pub current_user_task_request: Option<CurrentUserTaskRequest>,
+    /// Exact current-user task registration receipt, present only for the
+    /// `RegisterCurrentUserTask` effect after task readback.
+    pub current_user_task_receipt: Option<CurrentUserTaskReceipt>,
+    /// Request and provider evidence retained when current-user task
+    /// registration requires reconciliation.
+    pub current_user_task_unknown: Option<CurrentUserTaskUnknownProgress>,
     /// Current durable effect state.
     pub state: InstallationEffectProgressState,
+}
+
+struct UserModeActivationEffectPositions {
+    phase_b: usize,
+    task: usize,
+}
+
+struct PortableDevActivationEffectPositions {
+    phase_b: usize,
 }
 
 /// Durable installation/update transaction and its recovery projection.
@@ -901,6 +1141,23 @@ impl InstallationTransaction {
             &planned_changes,
             &installer_effects,
         )?;
+        validate_user_mode_task_effect_bindings(
+            &transaction_id,
+            &candidate_manifest,
+            &candidate_manifest.runtime_launch.profile_governed_roots,
+            &installer_effects,
+        )?;
+        validate_portable_dev_authority_effect_bindings(
+            &transaction_id,
+            &candidate_manifest,
+            &installer_effects,
+        )?;
+        validate_current_user_store_credential_effect_bindings(
+            &candidate_manifest,
+            &candidate_manifest.runtime_launch.profile_governed_roots,
+            &candidate_manifest.store_credential_target,
+            &installer_effects,
+        )?;
         if profile.is_disposable() && staging_root.as_str().contains("..") {
             return Err(InstallationError::ProfileViolation(
                 "portable staging root must remain repository-local".to_owned(),
@@ -936,6 +1193,10 @@ impl InstallationTransaction {
                 staging_receipt: None,
                 phase_b_receipt: None,
                 user_mode_authority_receipt: None,
+                portable_dev_authority_receipt: None,
+                current_user_task_request: None,
+                current_user_task_receipt: None,
+                current_user_task_unknown: None,
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
@@ -1021,6 +1282,24 @@ impl InstallationTransaction {
     /// merely planned effect must not become an approved generation.
     pub fn require_all_effects_applied(&self) -> Result<(), InstallationError> {
         self.validate()?;
+        if matches!(
+            self.profile,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev
+        ) {
+            let selection = self.profile_selection_receipt.as_ref().ok_or_else(|| {
+                InstallationError::MigrationRequired {
+                    reason: "registry approval requires the original retained profile selection receipt"
+                        .to_owned(),
+                }
+            })?;
+            self.profile_governed_roots
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?
+                .validate_profile_selection_receipt(
+                    &self.candidate_manifest.runtime_launch,
+                    selection,
+                )?;
+        }
         if self.effect_progress.iter().any(|progress| {
             !matches!(
                 progress.state,
@@ -1300,6 +1579,15 @@ impl InstallationTransaction {
         expected_stage: InstallationStage,
     ) -> Result<(), InstallationError> {
         self.validate()?;
+        match self.profile {
+            InstallationProfile::UserMode => {
+                return self.require_user_mode_pre_activation_effects_at(expected_stage);
+            }
+            InstallationProfile::PortableDev => {
+                return self.require_portable_dev_pre_activation_effects_at(expected_stage);
+            }
+            InstallationProfile::SystemService => {}
+        }
         if self.stage != expected_stage {
             return Err(InstallationError::IncompleteObservation(format!(
                 "signed pending activation requires the {expected_stage:?} transaction boundary"
@@ -1395,6 +1683,645 @@ impl InstallationTransaction {
             }
         }
         Ok(())
+    }
+
+    fn require_user_mode_pre_activation_effects_at(
+        &self,
+        expected_stage: InstallationStage,
+    ) -> Result<(), InstallationError> {
+        if self.stage != expected_stage {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "UserMode signed pending activation requires the {expected_stage:?} transaction boundary"
+            )));
+        }
+        let selection = self
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "UserMode transaction reached activation without its original profile selection receipt"
+                    .to_owned(),
+            })?;
+        self.profile_governed_roots
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?
+            .validate_profile_selection_receipt(&self.candidate_manifest.runtime_launch, selection)?;
+        self.require_profile_root_creation_complete()?;
+
+        if self.installer_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                InstallerEffectPlan::RegisterService { .. }
+                    | InstallerEffectPlan::StartService { .. }
+            )
+        }) {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode activation cannot include SCM service effects".to_owned(),
+            ));
+        }
+
+        let positions = self.user_mode_activation_effect_positions()?;
+        let phase_b = positions.phase_b;
+        if !self.service_registration_approvals_unchecked()?.is_empty() {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode activation cannot produce SCM service approvals".to_owned(),
+            ));
+        }
+        for (index, progress) in self.effect_progress.iter().enumerate() {
+            let expected_applied = index < phase_b;
+            let state_matches = match (&progress.state, expected_applied) {
+                (InstallationEffectProgressState::Applied { .. }, true)
+                | (InstallationEffectProgressState::Pending, false) => true,
+                _ => false,
+            };
+            if !state_matches {
+                return Err(InstallationError::IncompleteObservation(
+                    "UserMode activation requires its root, package, authority, and current-user credential prefix Applied while PhaseB/task remain Pending"
+                        .to_owned(),
+                ));
+            }
+            if index >= phase_b
+                && (progress.phase_b_receipt.is_some() || progress.staging_receipt.is_some())
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "pending UserMode PhaseB/task suffix must not carry synthetic receipts"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Requires the committed Phase-B binding and original root identities
+    /// before the final current-user Task Scheduler effect may run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::IncompleteObservation`] when Phase-B or
+    /// the preceding effects are unsettled, and a profile or identity error
+    /// when the transaction is not the retained UserMode installation.
+    pub fn require_user_mode_task_registration_ready(
+        &self,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        if self.profile != InstallationProfile::UserMode
+            || self.stage != InstallationStage::Activating
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "current-user task registration requires the activating UserMode transaction"
+                    .to_owned(),
+            ));
+        }
+        let selection = self
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "UserMode task registration requires its original profile selection receipt"
+                    .to_owned(),
+            })?;
+        self.profile_governed_roots
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?
+            .validate_profile_selection_receipt(&self.candidate_manifest.runtime_launch, selection)?;
+        self.require_profile_root_creation_complete()?;
+        if self.installer_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                InstallerEffectPlan::RegisterService { .. }
+                    | InstallerEffectPlan::StartService { .. }
+            )
+        }) || !self.service_registration_approvals_unchecked()?.is_empty()
+        {
+            return Err(InstallationError::ProfileViolation(
+                "UserMode task registration cannot depend on SCM service effects or approvals"
+                    .to_owned(),
+            ));
+        }
+        let positions = self.user_mode_activation_effect_positions()?;
+        for (index, progress) in self.effect_progress.iter().enumerate() {
+            let expected_applied = index <= positions.phase_b;
+            let state_matches = match (&progress.state, expected_applied) {
+                (InstallationEffectProgressState::Applied { .. }, true)
+                | (InstallationEffectProgressState::Pending, false) => true,
+                _ => false,
+            };
+            if !state_matches {
+                return Err(InstallationError::IncompleteObservation(
+                    "UserMode task registration requires the complete prefix through Phase-B Applied and the task effect Pending"
+                        .to_owned(),
+                ));
+            }
+            if index > positions.phase_b
+                && (progress.phase_b_receipt.is_some()
+                    || progress.staging_receipt.is_some()
+                    || progress.current_user_task_receipt.is_some()
+                    || progress.current_user_task_unknown.is_some())
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "pending UserMode task effect must not carry a synthetic receipt or unknown result"
+                        .to_owned(),
+                ));
+            }
+        }
+        if positions.task + 1 != self.installer_effects.len() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Retains the exact live Phase-B request before the current-user task
+    /// adapter is allowed to mutate Task Scheduler.
+    ///
+    /// The caller must persist the revised transaction before invoking the
+    /// external adapter. A replay with the same request is harmless; a
+    /// different request or any attempt after intent/unknown/applied progress
+    /// is refused.
+    pub fn record_current_user_task_request(
+        &mut self,
+        request: CurrentUserTaskRequest,
+    ) -> Result<(), InstallationError> {
+        self.require_user_mode_task_registration_ready()?;
+        self.validate_current_user_task_request(&request)?;
+        let task_index = self.user_mode_activation_effect_positions()?.task;
+        let progress = self
+            .effect_progress
+            .get_mut(task_index)
+            .ok_or(InstallationError::IdentityConflict)?;
+        if !matches!(progress.state, InstallationEffectProgressState::Pending) {
+            return Err(InstallationError::IncompleteObservation(
+                "a current-user task request may be recorded only before its effect intent"
+                    .to_owned(),
+            ));
+        }
+        match progress.current_user_task_request.as_ref() {
+            Some(existing) if existing == &request => return Ok(()),
+            Some(_) => return Err(InstallationError::IdentityConflict),
+            None => {}
+        }
+        progress.current_user_task_request = Some(request);
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            InstallationError::InvalidField {
+                field: "revision".to_owned(),
+                reason: "overflow".to_owned(),
+            }
+        })?;
+        self.validate()
+    }
+
+    fn validate_current_user_task_request(
+        &self,
+        request: &CurrentUserTaskRequest,
+    ) -> Result<(), InstallationError> {
+        if self.profile != InstallationProfile::UserMode {
+            return Err(InstallationError::ProfileViolation(
+                "current-user task requests are limited to UserMode".to_owned(),
+            ));
+        }
+        let task_index = self.required_effect_position("RegisterCurrentUserTask", |effect| {
+            matches!(effect, InstallerEffectPlan::RegisterCurrentUserTask { .. })
+        })?;
+        let InstallerEffectPlan::RegisterCurrentUserTask {
+            registration, ..
+        } = &self.installer_effects[task_index]
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        registration.validate()?;
+        let expected_manifest_digest = candidate_manifest_digest(&self.candidate_manifest)?;
+        if registration.transaction_id != self.transaction_id
+            || registration.effect_id != self.effect_progress[task_index].effect_id
+            || registration.installation_id
+                != self.candidate_manifest.runtime_launch.installation_epoch.installation
+            || registration.candidate_generation != self.candidate_manifest.generation
+            || registration.candidate_manifest_digest != expected_manifest_digest
+            || request.transaction_id != self.transaction_id.as_str()
+            || request.effect_id != registration.effect_id.as_str()
+            || !eliot_platform_windows::windows_paths_equal(
+                &request.executable,
+                std::path::Path::new(registration.host_executable_path.as_str()),
+            )
+            || request.executable_sha256 != registration.host_executable_sha256.as_str()
+            || !eliot_platform_windows::windows_paths_equal(
+                &request.working_directory,
+                std::path::Path::new(registration.working_directory.as_str()),
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let phase_b_index = self.required_effect_position("MaterializePhaseB", |effect| {
+            matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. })
+        })?;
+        let phase_b = self.effect_progress[phase_b_index]
+            .phase_b_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "task request requires the committed live Phase-B receipt".to_owned(),
+            ))?;
+        phase_b.validate()?;
+        if phase_b.provisioned_supervision_authority.authority_generation
+            != registration.authority_generation
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let live_authority_digest = PlatformHandle::new(
+            phase_b.authority_descriptor_digest.as_str(),
+        )
+        .map_err(|error| InstallationError::InvalidField {
+            field: "effect_progress.current_user_task_request.authority_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let expected_roots = super::profile_roots::profile_root_request_for_live_launch(
+            &self.candidate_manifest.runtime_launch,
+            &live_authority_digest,
+            registration.authority_generation.value(),
+        )?;
+        if request.roots != expected_roots
+            || !user_mode_task_bootstrap_matches(
+                &request.bootstrap_arguments,
+                &self.candidate_manifest.runtime_launch,
+                &live_authority_digest,
+                registration.authority_generation.value(),
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_current_user_task_receipt(
+        &self,
+        request: &CurrentUserTaskRequest,
+        receipt: &CurrentUserTaskReceipt,
+    ) -> Result<(), InstallationError> {
+        self.validate_current_user_task_request(request)?;
+        let original_selection = self
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "task receipt validation requires the original UserMode root selection"
+                    .to_owned(),
+            })?;
+        super::profile_roots::validate_profile_selection_receipt_shape(
+            &receipt.selection,
+            "current_user_task",
+        )?;
+        if !super::profile_roots::profile_selection_receipts_match_retained_roots(
+            original_selection,
+            &receipt.selection,
+        )? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let phase_b_index = self.required_effect_position("MaterializePhaseB", |effect| {
+            matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. })
+        })?;
+        let phase_b = self.effect_progress[phase_b_index]
+            .phase_b_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "task receipt requires the committed live Phase-B receipt".to_owned(),
+            ))?;
+        let expected_request_digest = request.request_digest().map_err(|error| {
+            InstallationError::InvalidField {
+                field: "effect_progress.current_user_task_receipt.request".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        text(&receipt.task_name, "current_user_task_receipt.task_name")?;
+        text(&receipt.sid, "current_user_task_receipt.sid")?;
+        sha256_handle(
+            &PlatformHandle::new(&receipt.executable_sha256).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "current_user_task_receipt.executable_sha256".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            "current_user_task_receipt.executable_sha256",
+        )?;
+        sha256_handle(
+            &PlatformHandle::new(&receipt.task_xml_sha256).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "current_user_task_receipt.task_xml_sha256".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            "current_user_task_receipt.task_xml_sha256",
+        )?;
+        if receipt.request != *request
+            || receipt.request_digest != expected_request_digest
+            || receipt.selection.profile != eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+            || receipt.selection.authority_descriptor_sha256
+                != phase_b.authority_descriptor_digest.as_str()
+            || receipt.selection.authority_generation
+                != match &self.installer_effects[self.user_mode_activation_effect_positions()?.task] {
+                    InstallerEffectPlan::RegisterCurrentUserTask { registration, .. } => {
+                        registration.authority_generation.value()
+                    }
+                    _ => return Err(InstallationError::IdentityConflict),
+                }
+            || receipt.sid != receipt.selection.owner_sid
+            || receipt.session_id == 0
+            || receipt.session_id != receipt.selection.session_id
+            || receipt.executable_sha256 != request.executable_sha256
+            || !eliot_platform_windows::windows_paths_equal(
+                &receipt.executable,
+                &request.executable,
+            )
+            || !eliot_platform_windows::windows_paths_equal(
+                &receipt.working_directory,
+                &request.working_directory,
+            )
+            || receipt.arguments != request.bootstrap_arguments
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_current_user_task_unknown(
+        &self,
+        progress: &InstallationEffectProgress,
+        unknown: &CurrentUserTaskUnknownProgress,
+    ) -> Result<(), InstallationError> {
+        unknown.validate()?;
+        self.validate_current_user_task_request(&unknown.request)?;
+        if progress.current_user_task_request.as_ref() != Some(&unknown.request) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        match (&unknown.kind, &progress.current_user_task_receipt) {
+            (CurrentUserTaskUnknownKind::CommittedUnknown, None) => {}
+            (CurrentUserTaskUnknownKind::CleanupRequired, Some(receipt)) => {
+                self.validate_current_user_task_receipt(&unknown.request, receipt)?;
+                if receipt.task_name != unknown.task_name
+                    || receipt.task_xml_sha256 != unknown.requested_xml_sha256.as_str()
+                    || unknown.observed_xml_sha256.as_deref()
+                        != Some(receipt.task_xml_sha256.as_str())
+                    || unknown.request_digest.as_str() != receipt.request_digest
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            _ => return Err(InstallationError::IdentityConflict),
+        }
+        Ok(())
+    }
+
+    fn validate_portable_dev_authority_receipt(
+        &self,
+        receipt: &PortableDevSupervisionAuthorityKeyReceipt,
+    ) -> Result<(), InstallationError> {
+        let effect_index = self.required_effect_position(
+            "ProvisionPortableDevSupervisionAuthority",
+            |effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+                )
+            },
+        )?;
+        let InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority {
+            provision, ..
+        } = &self.installer_effects[effect_index]
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        receipt
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "effect_progress.portable_dev_authority_receipt".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let launch = &self.candidate_manifest.runtime_launch;
+        let selection = self
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "PortableDev authority receipt requires the original repository-root selection"
+                    .to_owned(),
+            })?;
+        super::profile_roots::validate_profile_selection_receipt_shape(
+            selection,
+            "portable_dev_authority",
+        )?;
+        let repo_anchor = selection
+            .roots
+            .iter()
+            .find(|root| root.role == "runtime_state_roots.profile_anchor_root")
+            .ok_or(InstallationError::IdentityConflict)?;
+        if self.profile != InstallationProfile::PortableDev
+            || launch.profile != InstallationProfile::PortableDev
+            || receipt.request != **provision
+            || receipt.request.transaction_id != self.transaction_id.as_str()
+            || receipt.request.effect_id != self.effect_progress[effect_index].effect_id.as_str()
+            || receipt.request.installation_id != launch.installation_epoch.installation.as_str()
+            || receipt.request.candidate_generation != self.candidate_manifest.generation.as_str()
+            || receipt.request.authority_generation != launch.authority_generation
+            || receipt.request.supervision_lease_scope_id
+                != launch.supervision_lease_scope_id()
+            || receipt.request.repository_root_identity != repo_anchor.identity
+            || !eliot_platform_windows::windows_paths_equal(
+                &receipt.request.repository_root,
+                &repo_anchor.canonical_path,
+            )
+            || launch.portable_root.as_ref().is_none_or(|root| {
+                !eliot_platform_windows::windows_paths_equal(
+                    std::path::Path::new(root.as_str()),
+                    &receipt.request.repository_root,
+                )
+            })
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let precondition = self.effect_progress[effect_index]
+            .admitted_precondition
+            .as_ref()
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "PortableDev authority receipt requires its durable pre-write absence observation"
+                    .to_owned(),
+            ))?;
+        let snapshot = precondition
+            .portable_dev_authority_snapshot
+            .as_ref()
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "PortableDev authority intent requires its typed repository-root absence snapshot"
+                    .to_owned(),
+            ))?;
+        if snapshot.repository_root_identity != receipt.request.repository_root_identity
+            || snapshot.relative_path != receipt.request.relative_path
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn user_mode_activation_effect_positions(
+        &self,
+    ) -> Result<UserModeActivationEffectPositions, InstallationError> {
+        let stage_package = self.required_effect_position("StagePackage", |effect| {
+            matches!(effect, InstallerEffectPlan::StagePackage { .. })
+        })?;
+        let authority = self.required_effect_position(
+            "ProvisionUserModeSupervisionAuthority",
+            |effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                )
+            },
+        )?;
+        let store_credential = self.required_effect_position(
+            "ProvisionCurrentUserStoreCredential",
+            |effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                )
+            },
+        )?;
+        let phase_b = self.required_effect_position("MaterializePhaseB", |effect| {
+            matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. })
+        })?;
+        let task = self.required_effect_position("RegisterCurrentUserTask", |effect| {
+            matches!(effect, InstallerEffectPlan::RegisterCurrentUserTask { .. })
+        })?;
+        if stage_package + 1 != authority
+            || authority + 1 != store_credential
+            || store_credential + 1 != phase_b
+            || phase_b + 1 != task
+            || task + 1 != self.installer_effects.len()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "UserMode effects must follow StagePackage, supervision authority, current-user Store credential, PhaseB, and task registration order"
+                    .to_owned(),
+            ));
+        }
+        Ok(UserModeActivationEffectPositions { phase_b, task })
+    }
+
+    fn require_portable_dev_pre_activation_effects_at(
+        &self,
+        expected_stage: InstallationStage,
+    ) -> Result<(), InstallationError> {
+        if self.stage != expected_stage {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "PortableDev signed pending activation requires the {expected_stage:?} transaction boundary"
+            )));
+        }
+        let selection = self
+            .profile_selection_receipt
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "PortableDev transaction reached activation without its original profile selection receipt"
+                    .to_owned(),
+            })?;
+        self.profile_governed_roots
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?
+            .validate_profile_selection_receipt(&self.candidate_manifest.runtime_launch, selection)?;
+        self.require_profile_root_creation_complete()?;
+        if self.installer_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                InstallerEffectPlan::RegisterService { .. }
+                    | InstallerEffectPlan::StartService { .. }
+                    | InstallerEffectPlan::RegisterCurrentUserTask { .. }
+            )
+        }) || !self.service_registration_approvals_unchecked()?.is_empty()
+        {
+            return Err(InstallationError::ProfileViolation(
+                "PortableDev activation cannot include SCM effects, approvals, or a UserMode task"
+                    .to_owned(),
+            ));
+        }
+        let positions = self.portable_dev_activation_effect_positions()?;
+        for (index, progress) in self.effect_progress.iter().enumerate() {
+            let expected_applied = index < positions.phase_b;
+            let state_matches = match (&progress.state, expected_applied) {
+                (InstallationEffectProgressState::Applied { .. }, true)
+                | (InstallationEffectProgressState::Pending, false) => true,
+                _ => false,
+            };
+            if !state_matches {
+                return Err(InstallationError::IncompleteObservation(
+                    "PortableDev activation requires roots, package, authority, and current-user Store credential Applied while PhaseB remains Pending"
+                        .to_owned(),
+                ));
+            }
+            if index >= positions.phase_b
+                && (progress.phase_b_receipt.is_some()
+                    || progress.staging_receipt.is_some()
+                    || progress.current_user_task_receipt.is_some()
+                    || progress.current_user_task_unknown.is_some())
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "pending PortableDev PhaseB effect must not carry synthetic task or Phase-B receipts"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn portable_dev_activation_effect_positions(
+        &self,
+    ) -> Result<PortableDevActivationEffectPositions, InstallationError> {
+        let stage_package = self.required_effect_position("StagePackage", |effect| {
+            matches!(effect, InstallerEffectPlan::StagePackage { .. })
+        })?;
+        let authority = self.required_effect_position(
+            "ProvisionPortableDevSupervisionAuthority",
+            |effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+                )
+            },
+        )?;
+        let store_credential = self.required_effect_position(
+            "ProvisionCurrentUserStoreCredential",
+            |effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                )
+            },
+        )?;
+        let phase_b = self.required_effect_position("MaterializePhaseB", |effect| {
+            matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. })
+        })?;
+        if stage_package + 1 != authority
+            || authority + 1 != store_credential
+            || store_credential + 1 != phase_b
+            || phase_b + 1 != self.installer_effects.len()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "PortableDev effects must follow StagePackage, supervision authority, current-user Store credential, then PhaseB"
+                    .to_owned(),
+            ));
+        }
+        Ok(PortableDevActivationEffectPositions { phase_b })
+    }
+
+    fn required_effect_position(
+        &self,
+        label: &str,
+        matches: impl Fn(&InstallerEffectPlan) -> bool,
+    ) -> Result<usize, InstallationError> {
+        let mut positions = self
+            .installer_effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| matches(effect).then_some(index));
+        let position = positions.next().ok_or_else(|| {
+            InstallationError::IncompleteObservation(format!(
+                "UserMode plan has no {label} effect"
+            ))
+        })?;
+        if positions.next().is_some() {
+            return Err(InstallationError::Duplicate {
+                kind: "UserMode installer effect".to_owned(),
+                identity: label.to_owned(),
+            });
+        }
+        Ok(position)
     }
 
     /// Projects the two installer-owned SCM approvals from authoritative
@@ -1631,6 +2558,27 @@ impl InstallationTransaction {
                 .ok_or(InstallationError::IdentityConflict)?,
             &self.installer_effects,
         )?;
+        validate_user_mode_task_effect_bindings(
+            &self.transaction_id,
+            &self.candidate_manifest,
+            self.profile_governed_roots
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?,
+            &self.installer_effects,
+        )?;
+        validate_portable_dev_authority_effect_bindings(
+            &self.transaction_id,
+            &self.candidate_manifest,
+            &self.installer_effects,
+        )?;
+        validate_current_user_store_credential_effect_bindings(
+            &self.candidate_manifest,
+            self.profile_governed_roots
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?,
+            &self.candidate_manifest.store_credential_target,
+            &self.installer_effects,
+        )?;
         validate_package_binding(
             &self.candidate_manifest,
             &self.staging_root,
@@ -1773,12 +2721,21 @@ impl InstallationTransaction {
             if let Some(precondition) = &progress.admitted_precondition {
                 precondition.validate()?;
                 let snapshot_matches = match effect {
-                    InstallerEffectPlan::ProvisionStoreCredential { .. } => {
+                    InstallerEffectPlan::ProvisionStoreCredential { .. }
+                    | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. } => {
                         precondition.credential_snapshot.is_some()
                             && precondition.os_snapshot.is_none()
                     }
                     InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
                         precondition.user_mode_authority_snapshot.is_some()
+                            && precondition.portable_dev_authority_snapshot.is_none()
+                            && precondition.os_snapshot.is_none()
+                            && precondition.credential_snapshot.is_none()
+                            && precondition.package_snapshot.is_none()
+                    }
+                    InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. } => {
+                        precondition.portable_dev_authority_snapshot.is_some()
+                            && precondition.user_mode_authority_snapshot.is_none()
                             && precondition.os_snapshot.is_none()
                             && precondition.credential_snapshot.is_none()
                             && precondition.package_snapshot.is_none()
@@ -1833,6 +2790,73 @@ impl InstallationTransaction {
                     }
                 }
             }
+            let task_effect = matches!(effect, InstallerEffectPlan::RegisterCurrentUserTask { .. });
+            if !task_effect
+                && (progress.current_user_task_request.is_some()
+                    || progress.current_user_task_receipt.is_some()
+                    || progress.current_user_task_unknown.is_some())
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if task_effect {
+                match (
+                    &progress.state,
+                    progress.current_user_task_request.as_ref(),
+                    progress.current_user_task_receipt.as_ref(),
+                    progress.current_user_task_unknown.as_ref(),
+                ) {
+                    (InstallationEffectProgressState::Pending, None, None, None) => {}
+                    (InstallationEffectProgressState::Pending, Some(request), None, None) => {
+                        self.validate_current_user_task_request(request)?;
+                    }
+                    (
+                        InstallationEffectProgressState::IntentCommitted { .. },
+                        Some(request),
+                        None,
+                        None,
+                    ) => self.validate_current_user_task_request(request)?,
+                    (
+                        InstallationEffectProgressState::Unknown { .. },
+                        Some(request),
+                        receipt,
+                        Some(unknown),
+                    ) => {
+                        if let Some(receipt) = receipt {
+                            self.validate_current_user_task_receipt(request, receipt)?;
+                        }
+                        self.validate_current_user_task_unknown(progress, unknown)?;
+                    }
+                    (
+                        InstallationEffectProgressState::Applied { .. },
+                        Some(request),
+                        Some(receipt),
+                        None,
+                    ) => self.validate_current_user_task_receipt(request, receipt)?,
+                    _ => {
+                        return Err(InstallationError::IncompleteObservation(
+                            "current-user task progress must retain its exact pre-write request and matching Applied or reconciliation receipt"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+            let portable_authority_effect = matches!(
+                effect,
+                InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+            );
+            if let Some(receipt) = &progress.portable_dev_authority_receipt {
+                if !portable_authority_effect {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                self.validate_portable_dev_authority_receipt(receipt)?;
+            } else if portable_authority_effect
+                && !matches!(progress.state, InstallationEffectProgressState::Pending)
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "committed PortableDev authority effect requires its original pre-write root receipt"
+                        .to_owned(),
+                ));
+            }
             if let Some(receipt) = &progress.user_mode_authority_receipt {
                 let InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
                     provision, ..
@@ -1858,6 +2882,14 @@ impl InstallationTransaction {
                     || receipt.request.signer_id != provision.signer_id.as_str()
                     || receipt.request.key_id != provision.key_id.as_str()
                     || receipt.request.owner_sid != provision.owner_sid.as_str()
+                    || self
+                        .profile_selection_receipt
+                        .as_ref()
+                        .is_none_or(|selection| {
+                            selection.profile
+                                != eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+                                || selection.owner_sid != receipt.request.owner_sid
+                        })
                     || progress
                         .admitted_precondition
                         .as_ref()
@@ -2081,12 +3113,18 @@ impl InstallationTransaction {
             }
             if let Some(credential) = &progress.store_credential {
                 credential.validate()?;
-                let InstallerEffectPlan::ProvisionStoreCredential { provision, .. } = effect else {
-                    return Err(InstallationError::InvalidField {
-                        field: "effect_progress.store_credential".to_owned(),
-                        reason: "credential progress belongs only to its provision effect"
-                            .to_owned(),
-                    });
+                let provision = match effect {
+                    InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
+                    | InstallerEffectPlan::ProvisionCurrentUserStoreCredential {
+                        provision, ..
+                    } => provision,
+                    _ => {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.store_credential".to_owned(),
+                            reason: "credential progress belongs only to its provision effect"
+                                .to_owned(),
+                        });
+                    }
                 };
                 match credential.lifecycle {
                     StoreCredentialLifecycle::Active
@@ -2122,7 +3160,11 @@ impl InstallationTransaction {
                 {
                     return Err(InstallationError::IdentityConflict);
                 }
-            } else if matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+            } else if matches!(
+                effect,
+                InstallerEffectPlan::ProvisionStoreCredential { .. }
+                    | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+            )
                 && !matches!(progress.state, InstallationEffectProgressState::Pending)
             {
                 return Err(InstallationError::InvalidField {
@@ -2269,6 +3311,19 @@ impl InstallationTransaction {
                 ) if precondition.user_mode_authority_snapshot.is_some()
                     && progress.user_mode_authority_receipt.is_some() => {}
                 (
+                    InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Unknown { .. }
+                    | InstallationEffectProgressState::NoEffectAborted { .. }
+                    | InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    },
+                    InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. },
+                    Some(precondition),
+                    None,
+                ) if precondition.portable_dev_authority_snapshot.is_some()
+                    && progress.portable_dev_authority_receipt.is_some() => {}
+                (
                     InstallationEffectProgressState::Applied {
                         disposition: InstallationEffectDisposition::PreexistingMatching,
                         ..
@@ -2284,6 +3339,7 @@ impl InstallationTransaction {
                     InstallerEffectPlan::ApplyAcl { .. }
                     | InstallerEffectPlan::RegisterService { .. }
                     | InstallerEffectPlan::StartService { .. }
+                    | InstallerEffectPlan::RegisterCurrentUserTask { .. }
                     | InstallerEffectPlan::MaterializePhaseB { .. },
                     _,
                     None,
@@ -2296,6 +3352,17 @@ impl InstallationTransaction {
                     }
                     | InstallationEffectProgressState::Unknown { .. },
                     InstallerEffectPlan::ProvisionStoreCredential { .. },
+                    Some(_),
+                    Some(_),
+                ) if progress.store_credential.is_some() => {}
+                (
+                    InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    }
+                    | InstallationEffectProgressState::Unknown { .. },
+                    InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. },
                     Some(_),
                     Some(_),
                 ) if progress.store_credential.is_some() => {}
@@ -2322,6 +3389,9 @@ impl InstallationTransaction {
                                 | InstallerEffectPlan::StagePackage { .. }
                                 | InstallerEffectPlan::MaterializePhaseB { .. }
                                 | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                                | InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+                                | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                                | InstallerEffectPlan::RegisterCurrentUserTask { .. }
                         )
                         && progress.ownership_secret.as_ref().is_none_or(|ownership| {
                             ownership.create_disposition != InstallationCreateDisposition::Created
@@ -2360,7 +3430,11 @@ impl InstallationTransaction {
                     handle(external_identity, "effect_progress.external_identity")?;
                     handles(evidence, "effect_progress.evidence", true)?;
                     sha256_handle(postcondition_digest, "effect_progress.postcondition_digest")?;
-                    if matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+                    if matches!(
+                        effect,
+                        InstallerEffectPlan::ProvisionStoreCredential { .. }
+                            | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { .. }
+                    )
                         && progress
                             .store_credential
                             .as_ref()
@@ -2387,6 +3461,16 @@ impl InstallationTransaction {
                     {
                         return Err(InstallationError::IncompleteObservation(
                             "applied UserMode authority effect requires the original key receipt"
+                            .to_owned(),
+                        ));
+                    }
+                    if matches!(
+                        effect,
+                        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
+                    ) && progress.portable_dev_authority_receipt.is_none()
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "applied PortableDev authority effect requires its original root-bound key receipt"
                                 .to_owned(),
                         ));
                     }
@@ -2418,6 +3502,7 @@ impl InstallationTransaction {
                     if !matches!(
                         effect,
                         InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
+                            | InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
                     ) {
                         return Err(InstallationError::IdentityConflict);
                     }
@@ -3120,7 +4205,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v27 records are
+/// transaction authority object to another crate. Pre-v28 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -3172,6 +4257,20 @@ fn validate_current_transaction_progress(
                     "installation transaction effect progress entry {index} is not an object"
                 ),
             })?;
+        for field in [
+            "portable_dev_authority_receipt",
+            "current_user_task_request",
+            "current_user_task_receipt",
+            "current_user_task_unknown",
+        ] {
+            if !progress.contains_key(field) {
+                return Err(InstallationError::MigrationRequired {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} is missing the v28 {field} member"
+                    ),
+                });
+            }
+        }
         for (field, label) in [
             ("service_control_grant", "service control grant"),
             ("registration_nonce", "registration nonce"),
@@ -3255,7 +4354,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v27 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v28 is required"
                         ),
                     });
                 }
@@ -3294,7 +4393,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v27 discriminator".to_owned(),
+            reason: "installation transaction predates the required v28 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -3323,7 +4422,7 @@ fn decode_installation_transaction_json_with_policy(
         .is_some_and(|object| object.contains_key("profile_selection_receipt"))
     {
         return Err(InstallationError::MigrationRequired {
-            reason: "installation transaction wire is missing mandatory original profile selection receipt member; explicit migration to v27 is required"
+            reason: "installation transaction wire is missing mandatory original profile selection receipt member; explicit migration to v28 is required"
                 .to_owned(),
         });
     }
