@@ -122,8 +122,9 @@ pub use restart_policy::{
     RestartDecisionRecord, RestartDenial, RestartDependency, RestartDependencyKind,
     RestartFailureEvidence, RestartGroupStrategy, RestartIdentityEvidence, RestartIntensityLedger,
     RestartIntensityPolicy, RestartInvalidationTrigger, RestartOperationIdentity,
-    RestartOwnerLifecycle, RestartPolicyAdmissionBinding, RestartPolicyError, RestartPolicyV1,
-    RestartReservation, decide_automatic_restart,
+    RestartOwnerLifecycle, RestartPolicyAdmissionBinding, RestartPolicyDisposition,
+    RestartPolicyError, RestartPolicyV1, RestartReservation, decide_automatic_restart,
+    dispose_restart_policy,
 };
 pub use runtime_live::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,

@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{
     ContractVersion, OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_runtime_contracts::{RestartPolicyDisposition, RestartPolicyV1, dispose_restart_policy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -226,6 +227,15 @@ impl CapabilityIntent {
 
 /// Desired execution description. It carries references and hashes, never
 /// secret values, process handles, or a mutable route.
+///
+/// `restart_policy` is the one versioned restart contract the catalog owns
+/// (I14.10 / I8.12). It sits beside `effect_ceiling` and
+/// `restart_authorization` rather than replacing either: the policy bounds
+/// *whether* a child restarts and how often, while those two keep constraining
+/// *what* an admitted child may do. `None` is not a permissive default — a
+/// manifest that declares no versioned policy is recorded as an explicit
+/// withheld disposition on [`ModuleCatalogEntry`], which permits no automatic
+/// restart at all.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleManifest {
@@ -238,6 +248,7 @@ pub struct ModuleManifest {
     pub capability_intents: Vec<CapabilityIntent>,
     pub effect_ceiling: EffectCeiling,
     pub restart_authorization: RestartAuthorization,
+    pub restart_policy: Option<RestartPolicyV1>,
     pub approved_scope_refs: Vec<String>,
     pub manifest_digest: String,
 }
@@ -258,6 +269,7 @@ impl ModuleManifest {
         capability_intents: Vec<CapabilityIntent>,
         effect_ceiling: EffectCeiling,
         restart_authorization: RestartAuthorization,
+        restart_policy: Option<RestartPolicyV1>,
         approved_scope_refs: Vec<String>,
     ) -> Result<Self, ModuleError> {
         let mut value = Self {
@@ -270,6 +282,7 @@ impl ModuleManifest {
             capability_intents,
             effect_ceiling,
             restart_authorization,
+            restart_policy,
             approved_scope_refs,
             manifest_digest: String::new(),
         };
@@ -290,6 +303,7 @@ impl ModuleManifest {
             capability_intents: &'a [CapabilityIntent],
             effect_ceiling: EffectCeiling,
             restart_authorization: RestartAuthorization,
+            restart_policy: &'a Option<RestartPolicyV1>,
             approved_scope_refs: &'a [String],
         }
 
@@ -303,6 +317,7 @@ impl ModuleManifest {
             capability_intents: &self.capability_intents,
             effect_ceiling: self.effect_ceiling,
             restart_authorization: self.restart_authorization,
+            restart_policy: &self.restart_policy,
             approved_scope_refs: &self.approved_scope_refs,
         })
     }
@@ -330,6 +345,14 @@ impl ModuleManifest {
         )?;
         for intent in &self.capability_intents {
             intent.validate()?;
+        }
+        // A declared policy is admitted only when the shared contract admits
+        // it. An absent or unsupported declaration is carried to the catalog
+        // entry and dispositioned there; it never becomes an implicit policy.
+        if let Some(policy) = &self.restart_policy {
+            policy
+                .validate()
+                .map_err(|error| ModuleError::Contract(error.to_string()))?;
         }
         unique(
             self.approved_scope_refs.iter().cloned(),
@@ -435,6 +458,11 @@ pub struct KernelExecutionManifest {
     pub health_contract_ref: String,
     pub effect_ceiling: EffectCeiling,
     pub restart_authorization: RestartAuthorization,
+    /// Digest of the versioned restart policy this generation is admitted
+    /// under. It travels with the projection so the accepted generation cannot
+    /// be supervised under a policy revision other than the one the catalog
+    /// admitted.
+    pub restart_policy_digest: String,
     pub accepted_catalog_revision: u64,
     pub accepted_catalog_receipt: CatalogReceiptId,
     pub manifest_digest: String,
@@ -452,6 +480,7 @@ impl KernelExecutionManifest {
         health_contract_ref: String,
         effect_ceiling: EffectCeiling,
         restart_authorization: RestartAuthorization,
+        restart_policy_digest: String,
         accepted_catalog_revision: u64,
         accepted_catalog_receipt: CatalogReceiptId,
     ) -> Result<Self, ModuleError> {
@@ -465,6 +494,7 @@ impl KernelExecutionManifest {
             health_contract_ref,
             effect_ceiling,
             restart_authorization,
+            restart_policy_digest,
             accepted_catalog_revision,
             accepted_catalog_receipt,
             manifest_digest: String::new(),
@@ -485,6 +515,7 @@ impl KernelExecutionManifest {
             &self.health_contract_ref,
             self.effect_ceiling,
             self.restart_authorization,
+            &self.restart_policy_digest,
             self.accepted_catalog_revision,
             &self.accepted_catalog_receipt,
         ))
@@ -509,6 +540,10 @@ impl KernelExecutionManifest {
         digest(&self.protocol_digest, "execution.protocol_digest")?;
         text(&self.command_ref, "execution.command_ref")?;
         text(&self.health_contract_ref, "execution.health_contract_ref")?;
+        digest(
+            &self.restart_policy_digest,
+            "execution.restart_policy_digest",
+        )?;
         digest(&self.manifest_digest, "execution.manifest_digest")?;
         if self.identity_digest()? != self.manifest_digest {
             return Err(ModuleError::IdentityConflict);
@@ -555,6 +590,14 @@ pub struct ModuleCatalogEntry {
     pub module_id: ModuleId,
     pub desired_state: DesiredModuleState,
     pub manifest: ModuleManifest,
+    /// Explicit disposition of this entry's declared restart policy.
+    ///
+    /// It is recomputed from the manifest on every validation and compared with
+    /// the stored value, so a recorded `Admitted`/`Withheld` cannot drift from
+    /// the declaration it claims to describe. A manifest with no versioned
+    /// policy is recorded as `Withheld`, which permits no automatic restart:
+    /// the gap is named instead of defaulting to an unlimited budget.
+    pub restart_policy_disposition: RestartPolicyDisposition,
     pub catalog_revision: u64,
     pub state_fence: StateFence,
     pub accepted_generation: Option<GenerationAdmission>,
@@ -564,6 +607,14 @@ pub struct ModuleCatalogEntry {
 impl ModuleCatalogEntry {
     pub fn validate(&self) -> Result<(), ModuleError> {
         self.manifest.validate()?;
+        self.restart_policy_disposition
+            .validate()
+            .map_err(|error| ModuleError::Contract(error.to_string()))?;
+        let declared = dispose_restart_policy(self.manifest.restart_policy.as_ref())
+            .map_err(|error| ModuleError::Contract(error.to_string()))?;
+        if declared != self.restart_policy_disposition {
+            return Err(ModuleError::IdentityConflict);
+        }
         self.state_fence
             .validate()
             .map_err(|error| ModuleError::Contract(error.to_string()))?;
@@ -860,6 +911,9 @@ impl ModuleCatalog {
                     module_id: request.module_id.clone(),
                     desired_state: *desired_state,
                     manifest: manifest.clone(),
+                    restart_policy_disposition:
+                        dispose_restart_policy(manifest.restart_policy.as_ref())
+                            .map_err(|error| ModuleError::Contract(error.to_string()))?,
                     catalog_revision: self.revision + 1,
                     state_fence: self.state_fence.clone(),
                     accepted_generation: entry
@@ -884,6 +938,20 @@ impl ModuleCatalog {
             }
             CatalogMutation::AcceptGeneration { admission } => {
                 let mut current = entry.ok_or(ModuleError::NotFound)?;
+                // The accepted generation is bound to the admitted policy
+                // digest. A withheld disposition permits no automatic restart
+                // and names no policy at all, so no generation is admitted
+                // under it: accepting one would put a running child under an
+                // unadmitted restart policy, which is precisely the wider
+                // authority the disposition refuses.
+                if !current.restart_policy_disposition.permits_automatic_restart() {
+                    return Err(ModuleError::IdentityConflict);
+                }
+                let expected_policy_digest = current
+                    .restart_policy_disposition
+                    .policy_digest()
+                    .map(str::to_owned)
+                    .ok_or(ModuleError::IdentityConflict)?;
                 if admission.candidate.module_id != request.module_id
                     || admission.state_fence != self.state_fence
                     || admission.catalog_revision != self.revision
@@ -899,6 +967,7 @@ impl ModuleCatalog {
                     || admission.execution.effect_ceiling != current.manifest.effect_ceiling
                     || admission.execution.restart_authorization
                         != current.manifest.restart_authorization
+                    || admission.execution.restart_policy_digest != expected_policy_digest
                 {
                     return Err(ModuleError::IdentityConflict);
                 }
