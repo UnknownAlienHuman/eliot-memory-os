@@ -2115,18 +2115,30 @@ struct BridgeEventRecoveryCutRow {
     expected_revision: u64,
     upper_sequence: u64,
     retention_floor: u64,
+    /// Set transactionally when a later mutation changes required facts
+    /// inside this finite cut. Appends strictly above `upper_sequence` do
+    /// not invalidate an already-issued page walk.
+    #[serde(default)]
+    required_interval_moved: bool,
     durable_cursor: u64,
     acked_cursor: u64,
     last_staging_connection: String,
     last_producer_generation: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BridgeRecoveryMutationImpact {
+    Sequence(u64),
+    Interval { start: u64, end: u64 },
+    WholeOwner,
+}
+
 impl BridgeEventRecoveryCutRow {
     fn validate(&self) -> Result<(), OrsError> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             return Err(OrsError::InvalidField {
                 field: "recovery_cut.version",
-                reason: "recovery cut row carries the current version",
+                reason: "recovery cut row carries a supported version",
             });
         }
         crate::model::validate_digest(&self.window_key, "window_key")?;
@@ -11245,33 +11257,6 @@ impl RedbRecoveryStore {
         }
     }
 
-    fn bridge_recovery_source_revision_for(
-        read: &redb::ReadTransaction,
-        scope: &str,
-        read_budget: &mut BridgeRecoveryReadBudget,
-    ) -> Result<u64, OrsError> {
-        crate::model::validate_digest(scope, "owner_scope_digest")?;
-        let key = Self::bridge_recovery_source_revision_key(scope);
-        let meta = read.open_table(META).map_err(storage)?;
-        let Some(value) = meta.get(key.as_str()).map_err(storage)? else {
-            read_budget.charge_reference()?;
-            return Err(OrsError::IntegrityProblem {
-                record_type: "bridge_recovery_source_revision",
-                reason: "v2 window has no persisted source revision".to_owned(),
-            });
-        };
-        read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
-        value
-            .value()
-            .parse::<u64>()
-            .ok()
-            .filter(|revision| *revision > 0)
-            .ok_or(OrsError::IntegrityProblem {
-                record_type: "bridge_recovery_source_revision",
-                reason: "source revision must be a nonzero unsigned integer".to_owned(),
-            })
-    }
-
     #[allow(
         clippy::too_many_lines,
         reason = "window cleanup, identity issuance, and cutoff commit share one transaction"
@@ -11910,7 +11895,7 @@ impl RedbRecoveryStore {
         let expected_revision =
             Self::bridge_recovery_revision_for_in_budgeted(write, &owner.namespace, read_budget)?;
         let cut = BridgeEventRecoveryCutRow {
-            version: 1,
+            version: 2,
             window_key: window_key.to_owned(),
             namespace: owner.namespace.clone(),
             owner_kind: owner.kind.clone(),
@@ -11921,6 +11906,7 @@ impl RedbRecoveryStore {
             expected_revision,
             upper_sequence,
             retention_floor,
+            required_interval_moved: false,
             durable_cursor,
             acked_cursor,
             last_staging_connection: stager,
@@ -11947,6 +11933,7 @@ impl RedbRecoveryStore {
     fn bridge_recovery_gap_page(
         database: &redb::ReadTransaction,
         namespace: &str,
+        required_interval: Option<(u64, u64)>,
         offset: usize,
         limit: usize,
         byte_limit: usize,
@@ -11977,6 +11964,11 @@ impl RedbRecoveryStore {
                         reason: "gap key or owner does not match its indexed scope".to_owned(),
                     });
                 }
+                if required_interval.is_some_and(|(floor, upper)| {
+                    row.end_sequence < floor || row.start_sequence > upper
+                }) {
+                    continue;
+                }
                 if rows.len() >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
                     return Err(OrsError::ProjectionLimitExceeded);
                 }
@@ -11989,11 +11981,15 @@ impl RedbRecoveryStore {
         let mut page = Vec::with_capacity(end_offset.saturating_sub(start));
         let mut page_bytes = 0_usize;
         for row in &rows[start..end_offset] {
+            let (start_sequence, end_sequence) = required_interval
+                .map_or((row.start_sequence, row.end_sequence), |(floor, upper)| {
+                    (row.start_sequence.max(floor), row.end_sequence.min(upper))
+                });
             let item = json!({
                 "gap_id": row.gap_id,
                 "stream_id": row.stream_id,
-                "start_sequence": row.start_sequence,
-                "end_sequence": row.end_sequence,
+                "start_sequence": start_sequence,
+                "end_sequence": end_sequence,
                 "reason_ref": row.reason_ref,
             });
             let item_bytes = serde_json::to_vec(&item)
@@ -12208,6 +12204,7 @@ impl RedbRecoveryStore {
         let (gaps, gap_continuation) = Self::bridge_recovery_gap_page(
             database,
             &owner.namespace,
+            Some((cut.retention_floor, cut.upper_sequence)),
             gap_offset,
             gap_limit,
             gap_byte_limit,
@@ -12874,11 +12871,64 @@ impl RedbRecoveryStore {
         Ok(response)
     }
 
+    fn mark_bridge_recovery_cuts_moved_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        impact: BridgeRecoveryMutationImpact,
+    ) -> Result<(), OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let mut changed_cuts = Vec::new();
+        {
+            let cuts = write
+                .open_table(BRIDGE_EVENT_RECOVERY_CUTS)
+                .map_err(storage)?;
+            if cuts.len().map_err(storage)? > MAX_BRIDGE_RECOVERY_CUTS as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            for entry in cuts.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let cut: BridgeEventRecoveryCutRow = decode(value.value())?;
+                cut.validate()?;
+                if cut.namespace != namespace || cut.required_interval_moved {
+                    continue;
+                }
+                let intersects = if cut.owner_kind == BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP {
+                    true
+                } else {
+                    match impact {
+                        BridgeRecoveryMutationImpact::Sequence(sequence) => {
+                            sequence >= cut.retention_floor && sequence <= cut.upper_sequence
+                        }
+                        BridgeRecoveryMutationImpact::Interval { start, end } => {
+                            start <= cut.upper_sequence && end >= cut.retention_floor
+                        }
+                        BridgeRecoveryMutationImpact::WholeOwner => true,
+                    }
+                };
+                if intersects {
+                    changed_cuts.push((key.value().to_owned(), cut));
+                }
+            }
+        }
+        if !changed_cuts.is_empty() {
+            let mut cuts = write
+                .open_table(BRIDGE_EVENT_RECOVERY_CUTS)
+                .map_err(storage)?;
+            for (key, mut cut) in changed_cuts {
+                cut.required_interval_moved = true;
+                cuts.insert(key.as_str(), encode(&cut)?.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        Ok(())
+    }
+
     fn bump_bridge_recovery_revision_in(
         write: &redb::WriteTransaction,
         namespace: &str,
+        impact: BridgeRecoveryMutationImpact,
     ) -> Result<u64, OrsError> {
-        crate::model::validate_digest(namespace, "owner_namespace")?;
+        Self::mark_bridge_recovery_cuts_moved_in(write, namespace, impact)?;
         let owner = Self::load_bridge_owner_row_in(write, namespace)?;
         let scope = Self::bridge_owner_scope_digest(&owner.authority_lineage, &owner.principal)?;
         let key = Self::bridge_recovery_source_revision_key(&scope);
@@ -14473,7 +14523,11 @@ impl RedbRecoveryStore {
         let outcome = Self::insert_bridge_event_row_checked(
             write, access, stage, staging, provenance, now_ms,
         )?;
-        Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
+        Self::bump_bridge_recovery_revision_in(
+            write,
+            &access.namespace,
+            BridgeRecoveryMutationImpact::Sequence(stage.sequence),
+        )?;
         Ok(outcome)
     }
 
@@ -15312,7 +15366,14 @@ impl RedbRecoveryStore {
             }
             let pruned = 0_u64;
             if acked > prior_acked {
-                Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
+                Self::bump_bridge_recovery_revision_in(
+                    &write,
+                    &access.namespace,
+                    BridgeRecoveryMutationImpact::Interval {
+                        start: prior_acked.saturating_add(1),
+                        end: acked,
+                    },
+                )?;
             }
             outcomes.push(json!({
                 "namespace": access.namespace,
@@ -15847,7 +15908,14 @@ impl RedbRecoveryStore {
             gaps.insert(key.as_str(), encode(&row)?.as_str())
                 .map_err(storage)?;
         }
-        Self::bump_bridge_recovery_revision_in(&write, &row.owner_namespace)?;
+        Self::bump_bridge_recovery_revision_in(
+            &write,
+            &row.owner_namespace,
+            BridgeRecoveryMutationImpact::Interval {
+                start: row.start_sequence,
+                end: row.end_sequence,
+            },
+        )?;
         write.commit().map_err(storage)?;
         Ok(json!({ "gap_id": parsed.gap_id, "accepted": true, "fresh": true }))
     }
@@ -16042,7 +16110,11 @@ impl RedbRecoveryStore {
                         .insert(key.as_str(), encode(&row)?.as_str())
                         .map_err(storage)?;
                 }
-                Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
+                Self::bump_bridge_recovery_revision_in(
+                    &write,
+                    &access.namespace,
+                    BridgeRecoveryMutationImpact::Sequence(sequence),
+                )?;
                 json!({
                     "event_id": event_id,
                     "sequence": sequence,
@@ -16111,34 +16183,14 @@ impl RedbRecoveryStore {
         Err(OrsError::InvalidTransition)
     }
 
-    /// Binds owner-checked handed-off events to one reconciliation key
-    /// once the consumed frontier covers their sequences (issue #2729,
-    /// item 4). Only handoffs carrying the verified namespace reconcile;
-    /// legacy ownerless rows and foreign namespaces are untouched. No
-    /// cross-store atomicity with the Governor intake is claimed: this
-    /// step is idempotent, so a lost answer replays safely.
-    pub fn reconcile_bridge_event_handoffs_checked(
-        &self,
-        namespace: &str,
+    fn reconcile_bridge_event_handoff_rows_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
         acked_sequence: u64,
         reconcile_key: &str,
-    ) -> Result<serde_json::Value, OrsError> {
-        let owner = Self::load_bridge_owner_row_for(&self.database, namespace)?;
-        let access = Self::check_bridge_stream_access(
-            &owner,
-            owner.revision,
-            owner.incarnation,
-            BridgeStreamRight::Acknowledge,
-        )?;
-        if acked_sequence == 0 {
-            return Err(OrsError::InvalidField {
-                field: "acked_sequence",
-                reason: "handoff reconcile sequence must be nonzero",
-            });
-        }
-        crate::model::validate_digest(reconcile_key, "reconcile_key")?;
-        let now_ms = current_unix_ms_u64()?;
-        let write = self.database.begin_write().map_err(storage)?;
+        now_ms: u64,
+    ) -> Result<u64, OrsError> {
         let mut reconciled = 0_u64;
         {
             let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
@@ -16172,10 +16224,7 @@ impl RedbRecoveryStore {
                         reason: "handoff key, owner, and stream identity disagree".to_owned(),
                     });
                 }
-                if row.owner_namespace == access.namespace
-                    && row.sequence <= acked_sequence
-                    && row.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF
-                {
+                if row.sequence <= acked_sequence && row.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF {
                     due.push(key.to_owned());
                 }
             }
@@ -16201,10 +16250,8 @@ impl RedbRecoveryStore {
                     BRIDGE_EVENT_HANDOFF_RECONCILED.clone_into(&mut row.state);
                     reconcile_key.clone_into(&mut row.reconcile_key);
                     row.reconciled_at_ms = now_ms;
-                    // Preserve the presenting stream owner's consumed
-                    // frontier and owner snapshot as reconcile metadata. This
-                    // does not prove receiving-owner acceptance and cannot
-                    // authorize retirement or claim downstream application.
+                    // This is producer-presented cursor metadata only; it
+                    // proves neither receiving-owner acceptance nor apply.
                     row.reconcile_acked_sequence = acked_sequence;
                     row.reconcile_owner_revision = owner.revision;
                     row.reconcile_owner_incarnation = owner.incarnation;
@@ -16216,12 +16263,58 @@ impl RedbRecoveryStore {
                 }
             }
         }
+        Ok(reconciled)
+    }
+
+    /// Binds owner-checked handed-off events to one reconciliation key
+    /// once the consumed frontier covers their sequences (issue #2729,
+    /// item 4). Only handoffs carrying the verified namespace reconcile;
+    /// legacy ownerless rows and foreign namespaces are untouched. No
+    /// cross-store atomicity with the Governor intake is claimed: this
+    /// step is idempotent, so a lost answer replays safely.
+    pub fn reconcile_bridge_event_handoffs_checked(
+        &self,
+        namespace: &str,
+        acked_sequence: u64,
+        reconcile_key: &str,
+    ) -> Result<serde_json::Value, OrsError> {
+        let owner = Self::load_bridge_owner_row_for(&self.database, namespace)?;
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            owner.revision,
+            owner.incarnation,
+            BridgeStreamRight::Acknowledge,
+        )?;
+        if acked_sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "acked_sequence",
+                reason: "handoff reconcile sequence must be nonzero",
+            });
+        }
+        crate::model::validate_digest(reconcile_key, "reconcile_key")?;
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let reconciled = Self::reconcile_bridge_event_handoff_rows_in(
+            &write,
+            &access,
+            &owner,
+            acked_sequence,
+            reconcile_key,
+            now_ms,
+        )?;
         if reconciled > 0 {
             // Handoff state and its accounted bytes are visible in a finite
             // recovery page. Move the same view revision in this transaction
             // so a page cannot stitch old capacity with a newly reconciled
             // handoff row.
-            Self::bump_bridge_recovery_revision_in(&write, &access.namespace)?;
+            Self::bump_bridge_recovery_revision_in(
+                &write,
+                &access.namespace,
+                BridgeRecoveryMutationImpact::Interval {
+                    start: 1,
+                    end: acked_sequence,
+                },
+            )?;
         }
         write.commit().map_err(storage)?;
         Ok(json!({
@@ -16647,7 +16740,11 @@ impl RedbRecoveryStore {
         }
         cursor.handoff_repair_scan = next_scan.take();
         if repaired > 0 {
-            let updated_revision = Self::bump_bridge_recovery_revision_in(write, namespace)?;
+            let updated_revision = Self::bump_bridge_recovery_revision_in(
+                write,
+                namespace,
+                BridgeRecoveryMutationImpact::WholeOwner,
+            )?;
             if let Some(scan) = &mut cursor.handoff_repair_scan {
                 scan.recovery_revision = updated_revision;
             }
@@ -16906,8 +17003,14 @@ impl RedbRecoveryStore {
             None
         };
         if terminalized > 0 {
-            let updated_revision =
-                Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
+            let updated_revision = Self::bump_bridge_recovery_revision_in(
+                write,
+                &access.namespace,
+                BridgeRecoveryMutationImpact::Interval {
+                    start: 1,
+                    end: terminalized_boundary,
+                },
+            )?;
             if let Some(scan) = &mut next_scan {
                 scan.recovery_revision = updated_revision;
             }
@@ -17293,23 +17396,6 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if Self::bridge_recovery_source_revision_in(
-            &write,
-            &window.owner_scope_digest,
-            &mut read_budget,
-        )? != window.source_revision
-        {
-            drop(write);
-            return Self::bridge_recovery_typed_reply(
-                &window,
-                BridgeRecoveryWindowDisposition::Moved,
-                recovery_scope,
-                &selected_scope,
-                None,
-                &[],
-                &[],
-            );
-        }
         if !window.current_presentation_matches(live_generation, &presenting_connection) {
             if is_resume {
                 // Rebinding changes only the current authenticated presenter.
@@ -17566,12 +17652,6 @@ impl RedbRecoveryStore {
             );
         }
         if !matches!(read_window.version, 2 | 3)
-            || read_window.source_revision
-                != Self::bridge_recovery_source_revision_for(
-                    &read,
-                    &read_window.owner_scope_digest,
-                    &mut read_budget,
-                )?
             || !read_window.current_presentation_matches(live_generation, &presenting_connection)
         {
             return Self::bridge_recovery_typed_reply(
@@ -17657,8 +17737,26 @@ impl RedbRecoveryStore {
                 &mut read_budget,
             )?
             .ok_or(OrsError::RecoveryOwnerMismatch)?;
-            if Self::bridge_recovery_revision_for(&read, &owner.namespace, &mut read_budget)?
-                != cut.expected_revision
+            let compacted_through_required = if cut.retention_floor == 0 {
+                false
+            } else {
+                let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+                match cursors.get(owner.namespace.as_str()).map_err(storage)? {
+                    Some(value) => {
+                        read_budget.charge(owner.namespace.as_bytes(), value.value().as_bytes())?;
+                        let cursor: BridgeEventCursorRow = decode(value.value())?;
+                        cursor.validate()?;
+                        cursor.last_compacted_sequence >= cut.retention_floor
+                    }
+                    None => false,
+                }
+            };
+            let legacy_revision_moved = cut.version == 1
+                && Self::bridge_recovery_revision_for(&read, &owner.namespace, &mut read_budget)?
+                    != cut.expected_revision;
+            if cut.required_interval_moved
+                || compacted_through_required
+                || legacy_revision_moved
                 || cut.owner_revision != owner.revision
                 || cut.owner_incarnation != owner.incarnation
             {
@@ -17784,14 +17882,16 @@ impl RedbRecoveryStore {
                 &mut read_budget,
             )?
             .ok_or(OrsError::RecoveryOwnerMismatch)?;
-            if Self::bridge_recovery_revision_for(&read, &owner.namespace, &mut read_budget)?
-                == cut.expected_revision
+            if !cut.required_interval_moved
+                && Self::bridge_recovery_revision_for(&read, &owner.namespace, &mut read_budget)?
+                    == cut.expected_revision
             {
                 let (offset, limit) =
                     requested_gap.unwrap_or((0, MAX_BRIDGE_EVENT_GAPS_PER_STREAM));
                 let (mut page, next_offset) = Self::bridge_recovery_gap_page(
                     &read,
                     &owner.namespace,
+                    None,
                     offset,
                     limit,
                     10 * 1024,
@@ -17835,14 +17935,6 @@ impl RedbRecoveryStore {
 
         let unproven_scope_present =
             Self::bridge_recovery_unproven_scope_present(&read, &read_window, &mut read_budget)?;
-        if Self::bridge_recovery_source_revision_for(
-            &read,
-            &read_window.owner_scope_digest,
-            &mut read_budget,
-        )? != read_window.source_revision
-        {
-            moved = true;
-        }
         if moved {
             // A moved window never returns half a stitched page: the typed
             // Moved disposition is the whole answer, and its commitment still
