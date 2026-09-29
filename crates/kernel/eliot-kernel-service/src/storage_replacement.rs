@@ -68,11 +68,23 @@
 //!
 //! Established by this module:
 //!
-//! - The route scope is pinned. [`canonical_store_route_scope`] is the only
-//!   scope a replacement is ever bound to; it is declared once through
-//!   [`CapabilityRouteScope::declare`] and is never supplied by a caller, so no
-//!   other four-tuple carrying the `canonical_store` capability string is
-//!   reachable.
+//! - The route scope is pinned *to the live Store route*. [`canonical_store_route_scope`]
+//!   is the only scope a replacement is ever bound to; it is declared once
+//!   through [`CapabilityRouteScope::declare`] and is never supplied by a
+//!   caller, so no other four-tuple carrying the `canonical_store` capability
+//!   string is reachable. Its module coordinate is
+//!   [`CANONICAL_STORE_MODULE_ID`], which is [`crate::STORE_ROUTE_IDENTITY`] —
+//!   the one route identity the Store bridge is registered and routed under —
+//!   and not a literal. That matters because `declare` validates the *shape* of
+//!   a four-tuple, never that the route is one anything uses: a scope pinned to
+//!   a module id no live route carries still declares cleanly, but its
+//!   `route_scope_hash` is then a key no committed cutover row could ever carry,
+//!   [`committed_canonical_store_cutovers`] drops every real store cutover when
+//!   filtering on it, [`active_canonical_store_generation`] answers `None` even
+//!   after a genuine cutover committed, and the gateway's route gate admits the
+//!   incumbent unchanged. Pinning the coordinate to the real route identity is
+//!   what makes the gate below bind to the route rather than to a scope of this
+//!   module's own invention.
 //! - The cutover receipt is re-derived from ORS rather than asserted by a
 //!   caller. [`StorageReplacement::commit_canonical_store_route_cutover`] loads
 //!   the `GenerationCutoverOwnership` from the durable [`RedbRecoveryStore`] by
@@ -195,10 +207,24 @@ pub const CANONICAL_STORE_CAPABILITY: &str = "canonical_store";
 
 /// The pinned owning module identity of the canonical store capability route.
 ///
-/// It names the store bridge whose generation this coordinator switches; it is
-/// one of the four coordinates of [`canonical_store_route_scope`] and is fixed
-/// here rather than chosen by a caller.
-pub const CANONICAL_STORE_MODULE_ID: &str = "mod-store";
+/// It names the store bridge whose generation this coordinator switches, and it
+/// is the crate's existing [`crate::STORE_ROUTE_IDENTITY`] rather than a literal
+/// declared here. That is the whole point of reusing it: this coordinate is
+/// compared against `record.scope.module_id` of the committed ORS
+/// `GenerationCutoverOwnership` row and its value is what
+/// [`CapabilityRouteScope::declare`] hashes into `route_scope_hash`, which is
+/// the key every committed row is filtered on by
+/// [`committed_canonical_store_cutovers`]. A literal here that no live route
+/// uses would still declare a scope successfully — `declare` validates shape,
+/// not that the route exists — while producing a `route_scope_hash` that no
+/// committed cutover could ever carry. The listing would then drop every real
+/// store cutover, [`active_canonical_store_generation`] would answer `None`
+/// even after a real cutover committed, and
+/// `KernelStoreGateway::require_active_store_generation` would admit the
+/// incumbent unchanged. Binding the coordinate to the one route identity the
+/// Store bridge is actually registered and routed under is what makes the
+/// negative hold rather than merely compile.
+pub const CANONICAL_STORE_MODULE_ID: &str = crate::STORE_ROUTE_IDENTITY;
 
 /// The pinned work scope of the canonical store capability route.
 ///
