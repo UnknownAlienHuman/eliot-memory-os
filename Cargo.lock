@@ -2122,6 +2122,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-evaluation-contracts",
  "eliot-evidence",
  "eliot-governor",
  "eliot-learning-contracts",
