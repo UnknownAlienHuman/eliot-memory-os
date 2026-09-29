@@ -4402,6 +4402,61 @@ pub struct MaintenanceTriggerLifecyclePageProjection {
     pub replayed: bool,
 }
 
+/// Closed per-state tally over the durable maintenance-trigger lifecycle set.
+///
+/// ORS counts validated lifecycle rows only: an undecodable row, an invalid
+/// row, or a row whose key does not match its trigger identity fails the
+/// count instead of being skipped, so damage stays visible instead of
+/// silently shrinking a denominator. The tally never resolves, deletes, or
+/// advances any trigger; it is a read-only report behind the same recovery
+/// surface that pages pending work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceTriggerLifecycleCounts {
+    /// Retained and available for a fenced delivery claim.
+    pub pending: u64,
+    /// Bound to one current daemon delivery claim.
+    pub claimed: u64,
+    /// The committed decision and downstream intent are durably recorded.
+    pub decision_recorded: u64,
+    /// The exact decision receipt has been acknowledged by its owner.
+    pub acknowledged: u64,
+    /// The downstream outcome is uncertain and must be reconciled by identity.
+    pub reconciling: u64,
+    /// Explicitly expired with a retained terminal disposition.
+    pub expired: u64,
+    /// Explicitly superseded with a retained terminal disposition.
+    pub superseded: u64,
+}
+
+impl MaintenanceTriggerLifecycleCounts {
+    /// Tallies one validated lifecycle row into its closed phase bucket.
+    pub fn record(&mut self, phase: MaintenanceTriggerLifecyclePhase) {
+        let bucket = match phase {
+            MaintenanceTriggerLifecyclePhase::Pending => &mut self.pending,
+            MaintenanceTriggerLifecyclePhase::Claimed => &mut self.claimed,
+            MaintenanceTriggerLifecyclePhase::DecisionRecorded => &mut self.decision_recorded,
+            MaintenanceTriggerLifecyclePhase::Acknowledged => &mut self.acknowledged,
+            MaintenanceTriggerLifecyclePhase::Reconciling => &mut self.reconciling,
+            MaintenanceTriggerLifecyclePhase::Expired => &mut self.expired,
+            MaintenanceTriggerLifecyclePhase::Superseded => &mut self.superseded,
+        };
+        *bucket = bucket.saturating_add(1);
+    }
+
+    /// Exact number of retained lifecycle rows across all closed phases.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.pending
+            .saturating_add(self.claimed)
+            .saturating_add(self.decision_recorded)
+            .saturating_add(self.acknowledged)
+            .saturating_add(self.reconciling)
+            .saturating_add(self.expired)
+            .saturating_add(self.superseded)
+    }
+}
+
 /// Durable cause for one staged opaque operation that cannot be decoded or
 /// trusted (issue #1925, I5.2/I5.6).
 ///

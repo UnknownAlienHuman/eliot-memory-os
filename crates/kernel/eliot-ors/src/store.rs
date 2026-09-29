@@ -6859,6 +6859,12 @@ pub trait OperationalRecoveryStore: Send + Sync {
         after_identity: Option<&str>,
         limit: u16,
     ) -> Result<Vec<MaintenanceTriggerGapStorageRecord>, OrsError>;
+    /// Tallies validated lifecycle rows by closed phase. An undecodable or
+    /// invalid row fails the count instead of being skipped, so damage stays
+    /// visible. The tally never mutates, resolves, or deletes any trigger.
+    fn count_maintenance_trigger_lifecycles(
+        &self,
+    ) -> Result<crate::MaintenanceTriggerLifecycleCounts, OrsError>;
     /// Rejects downstream retention proof admission until ORS can verify its
     /// owner binding. The opaque proof shape and deadline alone cannot
     /// authorize payload compaction; acknowledgement and terminalization
@@ -35277,6 +35283,29 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         Ok(result)
     }
 
+    fn count_maintenance_trigger_lifecycles(
+        &self,
+    ) -> Result<crate::MaintenanceTriggerLifecycleCounts, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let lifecycles = read
+            .open_table(MAINTENANCE_TRIGGER_LIFECYCLES)
+            .map_err(storage)?;
+        let mut counts = crate::MaintenanceTriggerLifecycleCounts::default();
+        for entry in lifecycles.range::<&str>(..).map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let lifecycle: MaintenanceTriggerLifecycleRecord = decode(value.value())?;
+            lifecycle.validate()?;
+            if key.value() != lifecycle.trigger_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "maintenance_trigger_lifecycle",
+                    reason: "lifecycle trigger identity does not match its row key".to_owned(),
+                });
+            }
+            counts.record(lifecycle.phase);
+        }
+        Ok(counts)
+    }
+
     fn record_maintenance_trigger_retention(
         &self,
         trigger_id: &str,
@@ -36429,6 +36458,14 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Vec<MaintenanceTriggerGapStorageRecord>, OrsError> {
         self.store
             .list_maintenance_trigger_gaps(after_identity, limit)
+    }
+
+    /// Tallies validated lifecycle rows by closed phase without mutating,
+    /// resolving, or deleting any trigger.
+    pub fn count_maintenance_trigger_lifecycles(
+        &self,
+    ) -> Result<crate::MaintenanceTriggerLifecycleCounts, OrsError> {
+        self.store.count_maintenance_trigger_lifecycles()
     }
 
     /// Retains one validated downstream owner proof and finite retention horizon.

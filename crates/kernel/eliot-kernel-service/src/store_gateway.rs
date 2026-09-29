@@ -46,7 +46,8 @@ use eliot_ors::{
     MAX_MAINTENANCE_TRIGGER_PAGE, MaintenanceTriggerCanonicalRecord,
     MaintenanceTriggerClaimBinding, MaintenanceTriggerDownstreamRetentionProof,
     MaintenanceTriggerGapStorageRecord, MaintenanceTriggerIntakeStorageProjection,
-    MaintenanceTriggerIntakeStorageRecord, MaintenanceTriggerLifecyclePageProjection,
+    MaintenanceTriggerIntakeStorageRecord, MaintenanceTriggerLifecycleCounts,
+    MaintenanceTriggerLifecyclePageProjection,
     MaintenanceTriggerLifecyclePhase, MaintenanceTriggerLifecycleRecord,
     OperationIdentity as OrsOperationIdentity, OperationalRecoveryStore, OrsError,
     RecoveryPayloadEnvelope, StateFenceSnapshot,
@@ -4236,6 +4237,38 @@ impl KernelStoreGateway {
             .iter()
             .map(maintenance_trigger_protocol_gap)
             .collect()
+    }
+
+    /// Returns the closed per-state tally over the durable retained trigger
+    /// set: pending, claimed, decision-recorded, acknowledged, reconciling,
+    /// expired, and superseded.
+    ///
+    /// Read-only behind the live route: rows are validated but never mutated,
+    /// resolved, or deleted, and an undecodable or invalid row fails the
+    /// count instead of silently shrinking the denominator. Gated by the
+    /// same flight, fence, and active-route checks as the bounded gap list,
+    /// so the tally always describes the current Kernel route's ORS owner.
+    /// Role filtering stays with the daemon front-door caller (STITCH).
+    #[cfg(windows)]
+    pub fn maintenance_trigger_recovery_counts(
+        &self,
+        active_state_fence: &StateFence,
+    ) -> Result<MaintenanceTriggerLifecycleCounts, MaintenanceTriggerLifecycleFailure> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::GatewayFenced)?;
+        if self.is_fenced() {
+            return Err(MaintenanceTriggerLifecycleFailure::GatewayFenced);
+        }
+        self.validate_active_route(active_state_fence)
+            .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
+        let ors = self
+            .commit_ors
+            .as_deref()
+            .ok_or(MaintenanceTriggerLifecycleFailure::OrsUnavailable)?;
+        ors.count_maintenance_trigger_lifecycles()
+            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_read_error)
     }
 
     /// Fails closed until a downstream owner can authenticate and bind
