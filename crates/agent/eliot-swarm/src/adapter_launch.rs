@@ -32,13 +32,14 @@
 //!   result is projected into [`RegistryRouteAdjudication`] by the caller that
 //!   owns the registry. This module constructs no provider clients, no SDK
 //!   handles, no credentials, and no shell paths.
-//! - A supplied prior dispatch is always checked through the existing
-//!   [`verify_exact_replay`](super::durable_dispatch::verify_exact_replay),
-//!   even when the registry entry digest matches the grant fingerprint. A
-//!   same-identity changed payload is `PayloadConflict`; a different identity
-//!   is `ForeignIdentity` (not a replay: the candidate proceeds); only a
-//!   validated exact replay with matching complete dispatch lineage is
-//!   idempotent. Entry/grant drift without a prior blocks a new launch.
+//! - A supplied prior dispatch is always checked through
+//!   [`verify_exact_replay_full`](super::durable_dispatch::verify_exact_replay_full)
+//!   (intent plus complete dispatch lineage), even when the registry entry
+//!   digest matches the grant fingerprint. A same-identity changed payload is
+//!   `PayloadConflict`; a different identity is `ForeignIdentity` (not a
+//!   replay: the candidate proceeds); only a validated exact replay with
+//!   matching intent and complete dispatch lineage is idempotent. Entry/grant
+//!   drift without a prior blocks a new launch.
 //! - I09-09: every launch passes the admission gate; a revoked or stale route
 //!   blocks with no local fallback. I10-15: no silent mid-attempt failover —
 //!   a replaced route never relaunches silently under an old identity.
@@ -49,9 +50,11 @@ use eliot_agent_contracts::{RevisionId, WorkItem, WorkItemId};
 use super::{
     SwarmError,
     durable_dispatch::{
-        DispatchedLaunch, DurableJobAttachment, ReplayVerdict, dispatch_child, verify_exact_replay,
+        DispatchedLaunch, DurableJobAttachment, dispatch_child, verify_exact_replay_full,
     },
-    durable_work::{DurableWorkStore, RouteGrant, WorkExecutor, WorkUnitId},
+    durable_work::{
+        ChildHandle, DurableWorkStore, LaunchOutcome, RouteGrant, WorkExecutor, WorkUnitId,
+    },
     validate_text,
 };
 
@@ -163,11 +166,12 @@ fn hex_digest(bytes: &[u8; 32]) -> String {
 /// generation, generation fingerprint, or adapter-entry digest is
 /// `RouteBlocked`; request lineage that disagrees with the attachment or item
 /// is `StaleLineage`; the remaining dispatch rules are `dispatch_child`'s
-/// own. Any supplied prior dispatch is checked for exact replay regardless of
-/// registry digest equality (`PayloadConflict` propagates; `Idempotent`
-/// requires the complete dispatch lineage to match before re-observation;
-/// `ForeignIdentity` is not a replay and proceeds). Registry drift without a
-/// prior blocks a new launch rather than silently relaunching on a stale route.
+/// own. Any supplied prior dispatch is checked for exact replay over intent
+/// plus complete dispatch lineage regardless of registry digest equality
+/// (`PayloadConflict` propagates; `Idempotent` requires intent and lineage to
+/// match before re-observation; `ForeignIdentity` is not a replay and
+/// proceeds). Registry drift without a prior blocks a new launch rather than
+/// silently relaunching on a stale route.
 pub fn launch_admitted_child(
     _store: &dyn DurableWorkStore,
     _executor: &dyn WorkExecutor,
@@ -214,12 +218,9 @@ pub fn launch_admitted_child(
     let entry_matches_grant =
         hex_digest(&registry.adapter_entry_digest) == launch.lineage.route_fingerprint;
     match prior {
-        Some(prior) => match verify_exact_replay(prior, &launch.intent)? {
-            ReplayVerdict::Idempotent if prior.lineage != launch.lineage => {
-                return Err(SwarmError::PayloadConflict);
-            }
-            ReplayVerdict::Idempotent | ReplayVerdict::ForeignIdentity => {}
-        },
+        Some(prior) => {
+            verify_exact_replay_full(prior, &launch)?;
+        }
         None if !entry_matches_grant => return Err(SwarmError::RouteBlocked),
         None => {}
     }
@@ -228,6 +229,49 @@ pub fn launch_admitted_child(
         adapter_digest: registry.adapter_entry_digest,
         generation: registry.generation,
     })
+}
+
+/// One admitted launch with its executor-observed process receipt attached after execution.
+///
+/// The stable operation/attempt identity stays the reconciliation key: the
+/// attached [`ChildHandle`] is the executor-minted process/session identity
+/// observed at the boundary, and it is always read back through the dispatch
+/// lineage it is packaged with, never as a guessed handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachedProcessReceipt {
+    /// Registry-admitted launch this receipt was observed for.
+    pub launch: AdmittedChildLaunch,
+    /// Process/session identity the executor reported for that launch.
+    pub child: ChildHandle,
+}
+
+/// Attaches the executor-observed process receipt to one admitted launch after native-worker execution.
+///
+/// The caller persists `launch.launch.intent` through the existing owner-side
+/// persist-before-launch path, executes it with exactly one
+/// [`WorkExecutor::launch`](super::durable_work::WorkExecutor::launch) call,
+/// and presents that call's outcome here. This cell performs no executor call
+/// itself: it only seals the observed receipt to the stable dispatch identity.
+///
+/// Typed mapping, with no silent substitution:
+/// - [`LaunchOutcome::Started`] binds the observed child and returns it;
+/// - [`LaunchOutcome::Refused`] is [`SwarmError::RouteBlocked`] with no local
+///   fallback (the route was refused at execution; the parent must revise);
+/// - [`LaunchOutcome::Unknown`] is [`SwarmError::EffectUnresolved`] so an
+///   unknown effect stays blocked for reconcile and can never become absent,
+///   failed, or safe-to-repeat by timeout alone.
+pub fn attach_process_receipt(
+    launch: AdmittedChildLaunch,
+    outcome: &LaunchOutcome,
+) -> Result<AttachedProcessReceipt, SwarmError> {
+    match outcome {
+        LaunchOutcome::Started { child } => Ok(AttachedProcessReceipt {
+            launch,
+            child: child.clone(),
+        }),
+        LaunchOutcome::Refused { .. } => Err(SwarmError::RouteBlocked),
+        LaunchOutcome::Unknown => Err(SwarmError::EffectUnresolved),
+    }
 }
 
 #[cfg(test)]
