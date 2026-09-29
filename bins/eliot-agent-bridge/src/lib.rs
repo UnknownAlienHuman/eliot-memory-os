@@ -1973,6 +1973,36 @@ fn decode_reconciliation_identity<'a>(
     })
 }
 
+/// Checks owner window identity and the no-facts rule for terminal replies.
+fn validate_recovery_window_identity_and_reply_shape(
+    value: &serde_json::Value,
+    reconciliation: &serde_json::Value,
+    identity: &DecodedReconciliationIdentity<'_>,
+    disposition: BridgeRecoveryWindowDisposition,
+    window_status: RecoveryWindowStatus,
+    unresolved: &BridgeRecoveryUnresolvedFrontier,
+    expected: Option<&RecoveryReadRequest>,
+) -> Result<Option<ReconciliationPortOutcome>, ProviderFailure> {
+    let legacy_denial = decode_recovery_window_identity_version(
+        reconciliation,
+        identity.window_identity_version,
+        disposition,
+        identity.live_generation,
+        identity.connection_echo,
+    )?;
+    ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
+        value,
+        reconciliation,
+        window_status,
+        unresolved,
+    )?;
+    if let Some(legacy_denial) = legacy_denial {
+        check_expected_continuation(reconciliation, &[], expected)?;
+        return Ok(Some(legacy_denial));
+    }
+    Ok(None)
+}
+
 /// Decodes the owner's reconciliation answer into a port outcome, refusing any
 /// answer that does not belong to the presenting attach. The continuation
 /// checks live in [`check_expected_continuation`]: a required stream scope must
@@ -2011,28 +2041,17 @@ fn decode_reconciliation_outcome(
         disposition,
         &unresolved,
     )?;
-    if let Some(legacy_denial) = decode_recovery_window_identity_version(
-        reconciliation,
-        identity.window_identity_version,
-        disposition,
-        identity.live_generation,
-        identity.connection_echo,
-    )? {
-        ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
-            value,
-            reconciliation,
-            window_status,
-            &unresolved,
-        )?;
-        check_expected_continuation(reconciliation, &[], expected)?;
-        return Ok(legacy_denial);
-    }
-    ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
+    if let Some(legacy_denial) = validate_recovery_window_identity_and_reply_shape(
         value,
         reconciliation,
+        &identity,
+        disposition,
         window_status,
         &unresolved,
-    )?;
+        expected,
+    )? {
+        return Ok(legacy_denial);
+    }
 
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
     let stream_facts = decode_reconciliation_streams(
@@ -3237,6 +3256,35 @@ impl KernelMcpForwardingPort {
                 })
         })
     }
+
+    fn validate_reconciliation_window_response(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<RecoveryWindowStatus, ProviderFailure> {
+        let window_status = match value
+            .get("reconciliation")
+            .ok_or_else(event_transport_failure)
+            .and_then(|reconciliation| {
+                decode_recovery_window_state(reconciliation).map(|(_, status)| status)
+            }) {
+            Ok(status) => status,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        if window_status != RecoveryWindowStatus::Active
+            && value
+                .get("acknowledgement")
+                .is_some_and(|receipt| !receipt.is_null())
+        {
+            self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+            return Err(event_shape_failure(
+                "reconciliation refused: moved or expired window cannot confirm a consumed frontier",
+            ));
+        }
+        Ok(window_status)
+    }
 }
 
 impl McpForwardingPort for KernelMcpForwardingPort {
@@ -3441,28 +3489,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 }
             };
         }
-        let window_status = match value
-            .get("reconciliation")
-            .ok_or_else(event_transport_failure)
-            .and_then(|reconciliation| {
-                decode_recovery_window_state(reconciliation).map(|(_, status)| status)
-            }) {
-            Ok(status) => status,
-            Err(error) => {
-                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
-                return Err(error);
-            }
-        };
-        if window_status != RecoveryWindowStatus::Active
-            && value
-                .get("acknowledgement")
-                .is_some_and(|receipt| !receipt.is_null())
-        {
-            self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
-            return Err(event_shape_failure(
-                "reconciliation refused: moved or expired window cannot confirm a consumed frontier",
-            ));
-        }
+        let window_status = self.validate_reconciliation_window_response(&value)?;
         match has_unresolved_handoff_mutation(&value) {
             Ok(true) => {
                 return match self.retain_acknowledgement_receipt(&value, false) {
