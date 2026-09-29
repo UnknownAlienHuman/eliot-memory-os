@@ -699,6 +699,118 @@ pub enum IncidentState {
     Superseded,
 }
 
+/// The seven closed I13.10 reasons a Problem becomes an Incident.
+///
+/// The set is closed: the document enumerates exactly these findings, so an
+/// unlisted reason cannot be spelled and a listed reason cannot be renamed.
+/// `StructuralCorruption` names canonical ordering, receipts, provenance,
+/// schema/storage integrity or authority state being untrusted; a wrong
+/// interpretation is a different reason, never a corruption claim.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IncidentReason {
+    /// Canonical integrity or authority is compromised.
+    IntegrityOrAuthorityCompromised,
+    /// A secret, privacy or security boundary was breached.
+    SecurityPrivacyBreach,
+    /// A critical telemetry or control path is lost.
+    CriticalTelemetryOrControlPathLost,
+    /// An external effect of unknown Material or Critical materiality occurred.
+    UnknownMaterialOrCriticalExternalEffect,
+    /// A blocking condition persists while continuation stays unsafe.
+    PersistentUnsafeBlocking,
+    /// Canonical ordering, receipts, provenance or schema integrity is untrusted.
+    StructuralCorruption,
+    /// The Control Reserve or last-resort path is exhausted.
+    ControlReserveExhausted,
+}
+
+/// The authority under which an Incident Open is committed (I13.10 S1).
+///
+/// The document admits exactly two: "Problem becomes Incident when
+/// deterministic policy or authorized Human finds" the reason. A
+/// `ModelRecommendation` is deliberately NOT a variant, so a Signal labelled
+/// `IncidentCandidate` or a model confidence score has no way to name itself
+/// as the opening authority at all.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum PromotionAuthority {
+    /// A deterministic policy evaluation, bound to its exact rule identity.
+    DeterministicPolicy {
+        /// The policy rule that decided this promotion.
+        rule_id: String,
+    },
+    /// An authorized Human decision, bound to its exact decision reference.
+    AuthorizedHuman {
+        /// The admitted Human decision record that authorized this promotion.
+        decision_ref: String,
+    },
+}
+
+impl PromotionAuthority {
+    /// Validates that the authority names a real admitting record.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        match self {
+            Self::DeterministicPolicy { rule_id } => text(rule_id, "promotion.rule_id"),
+            Self::AuthorizedHuman { decision_ref } => {
+                text(decision_ref, "promotion.decision_ref")
+            }
+        }
+    }
+}
+
+/// A closed request to review a candidate as an Incident.
+///
+/// A request is not a decision. It records the reason, the source Problem and
+/// the requesting Signal so a review can consider them, and it never changes
+/// `Incident::state`: only [`Incident::promote`] moves `Candidate` to `Open`,
+/// and only on a [`PromotionAuthority`].
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentReviewRequest {
+    /// The closed I13.10 reason the requester observed.
+    pub reason: IncidentReason,
+    /// The Problem this Incident was promoted from; the link is never dropped.
+    pub source_problem: ProblemId,
+    /// The Signal whose severity/attribution asked for the review.
+    pub signal_id: SignalId,
+    /// The evidence the requesting Signal actually carried.
+    pub evidence_refs: Vec<ArtifactId>,
+    /// The requesting Signal's severity, read from the Signal itself.
+    pub signal_severity: SignalSeverity,
+}
+
+impl IncidentReviewRequest {
+    /// Validates the request's identity and its bound evidence.
+    ///
+    /// `source` is the Signal the request claims to come from. The evidence
+    /// list is compared with `source.evidence_handles` and the severity with
+    /// `source.severity`, so a request cannot restate another Signal's severity
+    /// or borrow unrelated evidence.
+    pub fn validate(&self, source: &Signal) -> Result<(), ProblemError> {
+        if self.signal_id != source.signal_id {
+            return Err(ProblemError::InvalidField {
+                field: "review_request.signal_id",
+                reason: "must name the signal the request was derived from",
+            });
+        }
+        if self.signal_severity != source.severity {
+            return Err(ProblemError::InvalidField {
+                field: "review_request.signal_severity",
+                reason: "must restate the source signal's own severity",
+            });
+        }
+        nonempty(&self.evidence_refs, "review_request.evidence_refs")?;
+        if self.evidence_refs != source.evidence_handles {
+            return Err(ProblemError::InvalidField {
+                field: "review_request.evidence_refs",
+                reason: "must be the source signal's own evidence handles",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Heavy Problem State with an independent incident lifecycle.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -709,14 +821,46 @@ pub struct Incident {
     pub owner: OwnerRef,
     pub state: IncidentState,
     pub evidence_refs: Vec<ArtifactId>,
+    /// The Problem this Incident was promoted from, once promotion is decided.
+    pub source_problem: Option<ProblemId>,
+    /// The reason and admitting authority of the committed promotion, once one
+    /// exists. A `None` value is an unpromoted `Candidate`, never an Incident
+    /// that merely forgot its reason.
+    pub promotion: Option<IncidentPromotion>,
+    /// Retained review requests; a request is evidence that review was asked
+    /// for, and it is never a decision.
+    pub review_requests: Vec<IncidentReviewRequest>,
     pub acknowledged_by: Option<String>,
     pub state_fence: StateFence,
     pub revision: u64,
     pub reopen_count: u32,
 }
 
+/// The committed promotion decision: reason plus the admitting authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentPromotion {
+    /// The closed I13.10 reason that was found.
+    pub reason: IncidentReason,
+    /// The authority that admitted the promotion.
+    pub authority: PromotionAuthority,
+    /// The Signal the promotion was requested from, when it came from one.
+    pub request_signal: Option<SignalId>,
+}
+
+impl IncidentPromotion {
+    /// Validates the reason/authority pair.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        self.authority.validate()
+    }
+}
+
 impl Incident {
     /// Validates incident identity, ownership and evidence.
+    ///
+    /// A committed promotion must name the Problem it came from and carry a
+    /// validated reason/authority pair, so an `Open` Incident can never be
+    /// reconstructed from a state alone.
     pub fn validate(&self) -> Result<(), ProblemError> {
         text(&self.title, "title")?;
         text(&self.scope_id, "scope_id")?;
@@ -729,6 +873,131 @@ impl Incident {
                 reason: "must be non-zero",
             });
         }
+        match (&self.promotion, &self.source_problem) {
+            (None, None) => {}
+            (Some(promotion), Some(problem_id)) => {
+                promotion.validate()?;
+                text(problem_id.as_str(), "source_problem")?;
+                if matches!(self.state, IncidentState::Candidate) {
+                    return Err(ProblemError::InvalidField {
+                        field: "promotion",
+                        reason: "a candidate incident carries no committed promotion",
+                    });
+                }
+            }
+            (Some(_), None) => {
+                return Err(ProblemError::InvalidField {
+                    field: "source_problem",
+                    reason: "a promoted incident must retain its source problem",
+                });
+            }
+            (None, Some(_)) => {
+                return Err(ProblemError::InvalidField {
+                    field: "promotion",
+                    reason: "a source problem requires a committed promotion",
+                });
+            }
+        }
+        let reviews = self
+            .review_requests
+            .iter()
+            .map(|request| request.signal_id.to_string())
+            .collect::<Vec<_>>();
+        unique_text(&reviews, "review_requests")?;
+        for request in &self.review_requests {
+            nonempty(&request.evidence_refs, "review_requests.evidence_refs")?;
+        }
+        Ok(())
+    }
+
+    /// Records that review was requested, without deciding anything.
+    ///
+    /// The requesting Signal is the evidence: the request is refused unless it
+    /// restates that Signal's own severity and evidence handles exactly, so a
+    /// caller cannot request review under a severity the Signal never carried.
+    /// `state` is untouched — a request is not a decision, and a model-only
+    /// request never reaches `Open`.
+    pub fn request_review(
+        &mut self,
+        expected_fence: &StateFence,
+        source: &Signal,
+        request: IncidentReviewRequest,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        request.validate(source)?;
+        if self
+            .review_requests
+            .iter()
+            .any(|existing| existing.signal_id == request.signal_id)
+        {
+            return Err(ProblemError::Duplicate {
+                field: "review_requests",
+                value: request.signal_id.to_string(),
+            });
+        }
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.review_requests.push(request);
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Commits `Candidate -> Open` on a real I13.10 authority.
+    ///
+    /// Promotion is a separate governed decision: it requires one of the seven
+    /// closed reasons, a named deterministic policy rule or authorized Human
+    /// decision, and the source Problem link. A model-only request cannot reach
+    /// this entry at all, because [`PromotionAuthority`] has no model variant.
+    ///
+    /// The request must already be retained by [`Self::request_review`], so
+    /// promotion decides on a request that a Signal actually made rather than
+    /// one a caller assembles at the moment of opening. The candidate is built
+    /// and validated before it is committed, so a refused promotion leaves the
+    /// record exactly as it was.
+    pub fn promote(
+        &mut self,
+        expected_fence: &StateFence,
+        request: &IncidentReviewRequest,
+        authority: PromotionAuthority,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        authority.validate()?;
+        if self.state != IncidentState::Candidate {
+            return Err(ProblemError::IllegalTransition {
+                from: format!("{:?}", self.state),
+                to: "OPEN".to_owned(),
+            });
+        }
+        if !self
+            .review_requests
+            .iter()
+            .any(|retained| retained == request)
+        {
+            return Err(ProblemError::InvalidField {
+                field: "promotion",
+                reason: "promotion must decide on a retained review request",
+            });
+        }
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        for evidence in &request.evidence_refs {
+            if !candidate.evidence_refs.contains(evidence) {
+                candidate.evidence_refs.push(evidence.clone());
+            }
+        }
+        candidate.source_problem = Some(request.source_problem.clone());
+        candidate.promotion = Some(IncidentPromotion {
+            reason: request.reason,
+            authority,
+            request_signal: Some(request.signal_id.clone()),
+        });
+        candidate.state = IncidentState::Open;
+        candidate.acknowledged_by = None;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
@@ -1576,6 +1845,10 @@ pub fn contract_identity() -> Result<eliot_contracts::ContractIdentity, ProblemE
             "signal": schemars::schema_for!(Signal),
             "problem": schemars::schema_for!(Problem),
             "incident": schemars::schema_for!(Incident),
+            "incident_reason": schemars::schema_for!(IncidentReason),
+            "incident_promotion": schemars::schema_for!(IncidentPromotion),
+            "incident_promotion_authority": schemars::schema_for!(PromotionAuthority),
+            "incident_review_request": schemars::schema_for!(IncidentReviewRequest),
             "conflict": schemars::schema_for!(Conflict),
             "concilium": schemars::schema_for!(ConciliumRun),
             "attention": schemars::schema_for!(CriticalAttention),
