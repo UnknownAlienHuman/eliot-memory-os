@@ -25,8 +25,9 @@ use eliot_kernel_service::{
     UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
     UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
-    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
+    UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationRequest,
     UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
     UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
     horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
@@ -5000,7 +5001,41 @@ impl KernelComposition {
         // Durable Job owner's own operation identity is the at-most-once
         // boundary; the revalidation above already refused any occurrence that
         // the complete owner projection shows as already admitted.
-        let execution = match client.admit_occurrence(request.clone()).await {
+        //
+        // The admission is assembled from what the owners proved on this very
+        // delivery rather than forwarded from the caller's asserted carrier: the
+        // current canonical revision, the invocation `scheduled_invocation`
+        // re-derived from that revision for this occurrence, and the WakeIntent
+        // the schedule owner read back from its own journal. Nothing here is
+        // recomputed or re-derived by spelling.
+        //
+        // It is then submitted through the existing runtime execution join,
+        // `UserAutomationOperatorRuntime` — the production
+        // `UserAutomationRuntimePort` over this already-authenticated Host
+        // channel, the same join `run-now` composes in
+        // `dispatch_user_automation_operator_transition`. That join revalidates
+        // the exact admission, resolves the complete owner-issued
+        // `UserAutomationDurableJobMaterial` through
+        // `UserAutomationDurableJobMaterial::from_admitted_occurrence` when this
+        // ingress carries none, and validates the owner's answer. Calling
+        // `UserAutomationDurableJobPort::admit_occurrence` on the bare client,
+        // as this contour did, reached the Durable Job owner with no
+        // `UserAutomationDurableJobMaterial` at all and so could never reach
+        // `HostDurableJobOwner::dreamer_job`.
+        let runtime = UserAutomationOperatorRuntime::new(client);
+        let execution = match runtime
+            .admit_occurrence(UserAutomationRuntimeAdmission {
+                context: request.context.clone(),
+                authenticated_principal: request.authenticated_principal.clone(),
+                identity: request.identity.clone(),
+                revision: resolution.revision.clone(),
+                invocation: resolution.invocation.clone(),
+                preflight: request.preflight.clone(),
+                wake_intent: readback.intent.clone(),
+                durable_job: request.durable_job.clone(),
+            })
+            .await
+        {
             Ok(execution) => execution,
             Err(error) => {
                 // No owner acknowledged a disposition, so the recurring horizon
