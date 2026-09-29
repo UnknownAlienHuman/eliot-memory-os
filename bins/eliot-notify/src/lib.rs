@@ -19,7 +19,7 @@ use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, CanonicalObligation, DeliveryConfidence,
     DeliveryObservation, DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort,
     G08NotificationPort, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
-    LedgerReserveOutcome, NotificationEnvelope, NotificationSeverity, NotificationStateMutation,
+    LedgerReserveOutcome, NotificationSeverity, NotificationStateMutation,
     NotificationStatePort, NotificationStateReadRequest, NotificationStateReadResponse,
     NotificationStateRequest, NotificationStateResponse, NotifyCore, OneShotLedgerPort,
     ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
@@ -155,6 +155,25 @@ pub fn render_acknowledge_request(
         parent: parent.clone(),
         notification_id,
         principal: principal.to_owned(),
+    })
+}
+
+/// Renders the exact one-line delivery request a spawner writes to the
+/// one-shot's stdin.
+///
+/// The bytes are the compact JSON of [`NotifyStdinRequest::Deliver`]: the
+/// spawner writes them as one stdin line and the binary parses them with
+/// [`parse_notify_stdin_request`], so writer and reader share one schema by
+/// construction. The envelope carries the canonical notification the adapter
+/// must project; authority over the delivery stays with the admitted
+/// Kernel-backed route inside the adapter, not with this line.
+pub fn render_deliver_request(
+    envelope: &NotificationEnvelope,
+    request: &NotificationRequest,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&NotifyStdinRequest::Deliver {
+        envelope: envelope.clone(),
+        request: request.clone(),
     })
 }
 
@@ -1767,6 +1786,7 @@ use fallback_verification::{
     FallbackMaterial, FallbackVerificationDeclaration, decode_hex, fallback_provider_error,
     load_fallback_material,
 };
+pub use eliot_notify_core::NotificationEnvelope;
 pub use installed_binary::{
     InstalledNotifyBinary, NOTIFY_IMAGE_FILE_NAME, NotifyBinaryBinding, NotifyBinaryError,
     NotifyDigest, notify_binding_from_declaration, resolve_notify_binary,
