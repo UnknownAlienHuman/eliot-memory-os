@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use eliot_host_state::HostInstallationEpoch;
 #[cfg(windows)]
 use eliot_installation::{
-    InstallationProfile, RuntimeLaunchDescriptor, verify_file_digest_with_lease,
-    verify_file_digest_with_user_lease,
+    InstallationProfile, PhaseBDigestState, RuntimeLaunchDescriptor,
+    phase_b_scm_selector, profile_selection_receipts_match_retained_roots,
+    verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 #[cfg(windows)]
 use eliot_kernel_service::semantic_store_config_hash_from_json;
@@ -21,13 +22,17 @@ use eliot_kernel_service::semantic_store_config_hash_from_json;
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
+    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, ProcessIdentity, RunningJobChild,
+    RunningJobObservation, SuspendedJobChild, SuspendedLaunchSpec, TcpListenerOwnerError,
+    TerminatedJobChild, UserOwnedRootLease, windows_paths_equal,
     observe_loopback_tcp_listener_owner,
     profile_supervision::{
-        ProfileRootPaths, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
+        ProfileRootLeaseSet, ProfileRootPaths, ProfileRootRequest, ProfileSelection,
+        ProfileSelectionReceipt, USER_MODE_SUPERVISOR_SWITCH,
     },
 };
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
 use super::{
@@ -80,6 +85,387 @@ fn host_launch_observe(detail: &str) {
 fn host_launch_observe_terminal(code: &str) {
     host_launch_note_event_log_unavailable();
     crate::host_diagnostics::observe_terminal_error(code);
+}
+
+/// One nonce-free current-user Host supervisor retained in a fresh kill-on-close Job.
+///
+/// This launcher admits only UserMode and PortableDev, retains the exact
+/// descriptor-selected roots and Host executable, and never routes through
+/// SCM. The same bounded owner is used for the pending Phase-A Host handoff
+/// and a live PortableDev repository-local supervisor.
+#[cfg(windows)]
+pub struct ProfileSupervisorJob {
+    child: RunningJobChild<PlatformHandle>,
+    executable_lease: LaunchLease,
+    user_owned_root: UserOwnedRootLease,
+    profile_roots: ProfileRootLeaseSet,
+    profile_root_request: ProfileRootRequest,
+    executable_digest: PlatformHandle,
+    job_identity: JobObjectIdentity,
+}
+
+#[cfg(windows)]
+impl ProfileSupervisorJob {
+    /// Starts one approved profile Host in a fresh kill-on-close Job.
+    ///
+    /// original_selection must be the durable selection receipt captured for
+    /// the activation. The fresh descriptor-derived selection may differ in
+    /// session and Phase-B digest only; installation, owner, roles, paths, and
+    /// file identities must still match that retained receipt.
+    ///
+    /// # Errors
+    /// Returns an error when the descriptor, original root proof, retained
+    /// roots, Host artifact, suspended process identity, or Job containment
+    /// cannot be verified before resume.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded suspended launch keeps every authority binding visible"
+    )]
+    pub fn launch(
+        launch: &RuntimeLaunchDescriptor,
+        original_selection: &ProfileSelectionReceipt,
+    ) -> Result<Self, HostError> {
+        let (profile, supervisor_name, root_path, root_role) = match launch.profile {
+            InstallationProfile::UserMode => (
+                ProfileSelection::UserMode,
+                "user_mode",
+                PathBuf::from(launch.profile_governed_roots.immutable_binaries.as_str()),
+                "immutable_binaries",
+            ),
+            InstallationProfile::PortableDev => (
+                ProfileSelection::PortableDev,
+                "portable_dev",
+                PathBuf::from(
+                    launch
+                        .portable_root
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostError::ProcessContour(
+                                "PortableDev supervisor has no retained repository root"
+                                    .to_owned(),
+                            )
+                        })?
+                        .as_str(),
+                ),
+                "runtime_state_roots.profile_anchor_root",
+            ),
+            InstallationProfile::SystemService => {
+                return Err(HostError::ProcessContour(
+                    "current-user supervisor launch admits only UserMode or PortableDev"
+                        .to_owned(),
+                ));
+            }
+        };
+        launch
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        match launch
+            .phase_b_digest_state()
+            .map_err(HostError::Installation)?
+        {
+            (PhaseBDigestState::Pending, PhaseBDigestState::Pending) => {}
+            (PhaseBDigestState::Live, PhaseBDigestState::Live) => {
+                launch
+                    .require_phase_b_live()
+                    .map_err(HostError::Installation)?;
+            }
+            _ => {
+                return Err(HostError::ProcessContour(
+                    "profile supervisor requires both Phase-B digests pending or live".to_owned(),
+                ));
+            }
+        }
+
+        let profile_root_request = Self::profile_root_request_for(launch)?;
+        if profile_root_request.profile != profile {
+            return Err(HostError::ProcessContour(
+                "profile supervisor selector differs from its root request".to_owned(),
+            ));
+        }
+        let profile_roots =
+            eliot_platform_windows::profile_supervision::open_profile_root_leases(
+                &profile_root_request,
+            )
+            .map_err(|error| {
+                HostError::ProcessContour(format!(
+                    "profile supervisor roots could not be retained: {error}"
+                ))
+            })?;
+        let retained_selection = profile_roots.selection();
+        if !profile_selection_receipts_match_retained_roots(
+            original_selection,
+            retained_selection,
+        )
+        .map_err(HostError::Installation)?
+        {
+            return Err(HostError::ProcessContour(
+                "profile supervisor roots differ from the durable original selection".to_owned(),
+            ));
+        }
+
+        let user_owned_root = UserOwnedRootLease::open_existing(&root_path)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        user_owned_root
+            .verify_stable_identity()
+            .and_then(|()| user_owned_root.verify_path_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let root_observation = retained_selection
+            .roots
+            .iter()
+            .find(|root| root.role == root_role)
+            .ok_or_else(|| {
+                HostError::ProcessContour(format!(
+                    "profile supervisor selection is missing {root_role}"
+                ))
+            })?;
+        let root_canonical = user_owned_root
+            .canonical_path()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if root_observation.identity != user_owned_root.identity()
+            || !windows_paths_equal(&root_observation.canonical_path, &root_canonical)
+        {
+            return Err(HostError::ProcessContour(
+                "profile supervisor root identity differs from its retained role".to_owned(),
+            ));
+        }
+
+        let executable_path = PathBuf::from(launch.host_executable_path.as_str());
+        let executable_lease =
+            open_launch_lease(launch.profile, Some(&user_owned_root), &executable_path)?;
+        verify_launch_digest(
+            &executable_lease,
+            &launch.host_artifact_digest,
+            "runtime.host_artifact",
+        )?;
+        let bootstrap_arguments = Self::bootstrap_arguments(launch)?;
+        let mut arguments = vec![
+            OsString::from(USER_MODE_SUPERVISOR_SWITCH),
+            OsString::from(supervisor_name),
+        ];
+        arguments.extend(
+            bootstrap_arguments
+                .iter()
+                .map(|argument| OsString::from(argument.as_str())),
+        );
+        let working_directory =
+            PathBuf::from(launch.profile_governed_roots.immutable_binaries.as_str());
+        let job_identity = Self::job_identity(launch)?;
+        let expected_arguments = arguments.clone();
+        let spec = SuspendedLaunchSpec::new(
+            executable_path.clone(),
+            arguments,
+            working_directory.clone(),
+            Vec::new(),
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let suspended = SuspendedJobChild::spawn_named(spec, job_identity.clone())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let expected_generation = launch.generation.clone();
+        let expected_digest = launch.host_artifact_digest.clone();
+        let validated = suspended
+            .validate(|evidence| {
+                if evidence.enforced_limits() != Some(JobObjectLimits::default())
+                    || evidence.job_identity() != &job_identity
+                    || evidence.arguments() != expected_arguments.as_slice()
+                    || evidence.working_directory() != working_directory.as_path()
+                {
+                    return Err(
+                        "profile supervisor launch bindings changed while suspended".to_owned()
+                    );
+                }
+                let expected_image = std::fs::canonicalize(&executable_path)
+                    .map_err(|error| error.to_string())?;
+                let observed_image = std::fs::canonicalize(&evidence.process().image_path)
+                    .map_err(|error| error.to_string())?;
+                if !windows_paths_equal(&expected_image, &executable_path)
+                    || !windows_paths_equal(&observed_image, &expected_image)
+                    || !windows_paths_equal(
+                        Path::new(launch.host_executable_path.as_str()),
+                        &observed_image,
+                    )
+                {
+                    return Err(
+                        "profile supervisor image path changed while suspended".to_owned()
+                    );
+                }
+                profile_roots
+                    .verify_stable_identity()
+                    .map_err(|error| error.to_string())?;
+                user_owned_root
+                    .verify_stable_identity()
+                    .and_then(|()| user_owned_root.verify_path_identity())
+                    .map_err(|error| error.to_string())?;
+                executable_lease.verify()?;
+                match &executable_lease {
+                    LaunchLease::Protected(lease) => verify_file_digest_with_lease(
+                        lease,
+                        &expected_digest,
+                        "runtime.host_artifact",
+                    ),
+                    LaunchLease::Portable(lease) => verify_file_digest_with_user_lease(
+                        lease,
+                        &expected_digest,
+                        "runtime.host_artifact",
+                    ),
+                }
+                .map_err(|error| error.to_string())?;
+                Ok(expected_generation.clone())
+            })
+            .map_err(|error| {
+                HostError::ProcessContour(format!(
+                    "profile supervisor validation failed: {error:?}"
+                ))
+            })?;
+        let child = validated
+            .resume()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        Ok(Self {
+            child,
+            executable_lease,
+            user_owned_root,
+            profile_roots,
+            profile_root_request,
+            executable_digest: launch.host_artifact_digest.clone(),
+            job_identity,
+        })
+    }
+
+    /// Builds the nonce-free Host argv tail from one validated launch descriptor.
+    ///
+    /// # Errors
+    /// Returns an error when the descriptor or Phase-B selector is malformed.
+    pub fn bootstrap_arguments(
+        launch: &RuntimeLaunchDescriptor,
+    ) -> Result<Vec<String>, HostError> {
+        if !matches!(
+            launch.profile,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev
+        ) {
+            return Err(HostError::ProcessContour(
+                "profile supervisor bootstrap admits only UserMode or PortableDev".to_owned(),
+            ));
+        }
+        launch
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let digest = phase_b_scm_selector(&launch.authority_descriptor_digest)
+            .map_err(HostError::Installation)?;
+        Ok(vec![
+            "--config-descriptor".to_owned(),
+            launch.authority_descriptor_path.as_str().to_owned(),
+            "--config-descriptor-sha256".to_owned(),
+            digest.as_str().to_owned(),
+            "--installation-id".to_owned(),
+            launch.installation_epoch.installation.as_str().to_owned(),
+            "--tx-plan-generation".to_owned(),
+            launch.authority_generation.value().to_string(),
+            "--host-state-root".to_owned(),
+            launch.runtime_state_roots.host_state_root.as_str().to_owned(),
+        ])
+    }
+
+    /// Builds the exact descriptor-bound root request for task registration or Host bootstrap.
+    ///
+    /// # Errors
+    /// Returns an error when the profile, root projection, or descriptor is invalid.
+    pub fn profile_root_request_for(
+        launch: &RuntimeLaunchDescriptor,
+    ) -> Result<ProfileRootRequest, HostError> {
+        profile_root_request(launch)
+    }
+
+    /// Returns the admitted current-user process identity.
+    #[must_use]
+    pub fn process_identity(&self) -> &ProcessIdentity {
+        self.child.evidence().process()
+    }
+
+    /// Returns the digest of the exact retained Host executable.
+    #[must_use]
+    pub const fn host_artifact_digest(&self) -> &PlatformHandle {
+        &self.executable_digest
+    }
+
+    /// Returns the exact root request used to admit this Host process.
+    #[must_use]
+    pub const fn profile_root_request(&self) -> &ProfileRootRequest {
+        &self.profile_root_request
+    }
+
+    /// Returns the latest retained profile root selection, after identity recheck.
+    ///
+    /// # Errors
+    /// Returns an error if a retained root changed after launch admission.
+    pub fn profile_selection(&self) -> Result<&ProfileSelectionReceipt, HostError> {
+        self.profile_roots
+            .verify_stable_identity()
+            .and_then(|()| self.user_owned_root.verify_stable_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        Ok(self.profile_roots.selection())
+    }
+
+    /// Observes the retained Host Job without changing ownership or state.
+    ///
+    /// # Errors
+    /// Returns an error if root/image proof or Job observation is unavailable.
+    pub fn observe(&self) -> Result<RunningJobObservation, HostError> {
+        self.profile_roots
+            .verify_stable_identity()
+            .and_then(|()| self.user_owned_root.verify_stable_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.executable_lease
+            .verify()
+            .map_err(HostError::ProcessContour)?;
+        if self.child.job_identity() != &self.job_identity {
+            return Err(HostError::ProcessContour(
+                "profile supervisor Job identity changed after launch".to_owned(),
+            ));
+        }
+        self.child
+            .observe()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))
+    }
+
+    /// Stops the complete fresh Job and returns its exact terminal process receipt.
+    ///
+    /// The method is consuming and the adapter uses bounded terminate/reap;
+    /// the caller must not start the UserMode Task until this returns Ok.
+    ///
+    /// # Errors
+    /// Returns an error when the retained roots/image changed or Job shutdown
+    /// cannot be authoritatively completed.
+    pub fn stop(mut self) -> Result<TerminatedJobChild, HostError> {
+        self.profile_roots
+            .verify_stable_identity()
+            .and_then(|()| self.user_owned_root.verify_stable_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.executable_lease
+            .verify()
+            .map_err(HostError::ProcessContour)?;
+        self.child
+            .terminate_in_place(0xE017_1771)
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))
+    }
+
+    fn job_identity(launch: &RuntimeLaunchDescriptor) -> Result<JobObjectIdentity, HostError> {
+        let profile = match launch.profile {
+            InstallationProfile::UserMode => "user-mode",
+            InstallationProfile::PortableDev => "portable-dev",
+            InstallationProfile::SystemService => {
+                return Err(HostError::ProcessContour(
+                    "profile supervisor Job cannot own SystemService".to_owned(),
+                ));
+            }
+        };
+        let material = format!(
+            "eliot.profile-supervisor-job.v1\0{profile}\0{}\0{}",
+            launch.installation_epoch.installation,
+            launch.generation,
+        );
+        let digest = format!("{:x}", Sha256::digest(material.as_bytes()));
+        JobObjectIdentity::new(format!("Eliot-ProfileSupervisor-{profile}-{digest}"))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))
+    }
 }
 
 /// Single-terminal guard for one physical launch operation.
@@ -862,30 +1248,93 @@ impl HostJobBranches {
         } else {
             None
         };
-        let portable_root = if launch.profile == InstallationProfile::PortableDev {
-            let root = PathBuf::from(
-                launch
-                    .portable_root
-                    .as_ref()
-                    .ok_or_else(|| {
-                        // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                        host_launch_observe("host.launch typed rejection");
-                        HostError::ProcessContour("portable root is missing".to_owned())
-                    })?
-                    .as_str(),
-            );
-            Some(UserOwnedRootLease::open_existing(&root).map_err(|error| {
-                // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                host_launch_observe("host.launch typed rejection");
-                HostError::ProcessContour(error.to_string())
-            })?)
-        } else {
-            None
+        let user_owned_root = match launch.profile {
+            InstallationProfile::UserMode => {
+                let root = PathBuf::from(
+                    launch
+                        .profile_governed_roots
+                        .immutable_binaries
+                        .as_str(),
+                );
+                Some(UserOwnedRootLease::open_existing(&root).map_err(|error| {
+                    // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+                    host_launch_observe("host.launch typed rejection");
+                    HostError::ProcessContour(error.to_string())
+                })?)
+            }
+            InstallationProfile::PortableDev => {
+                let root = PathBuf::from(
+                    launch
+                        .portable_root
+                        .as_ref()
+                        .ok_or_else(|| {
+                            // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+                            host_launch_observe("host.launch typed rejection");
+                            HostError::ProcessContour("portable root is missing".to_owned())
+                        })?
+                        .as_str(),
+                );
+                Some(UserOwnedRootLease::open_existing(&root).map_err(|error| {
+                    // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+                    host_launch_observe("host.launch typed rejection");
+                    HostError::ProcessContour(error.to_string())
+                })?)
+            }
+            InstallationProfile::SystemService => None,
         };
+        if let Some(root) = user_owned_root.as_ref() {
+            root.verify_stable_identity()
+                .and_then(|()| root.verify_path_identity())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let (request, leases) = profile_root_binding.as_ref().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "current-user launch is missing its retained profile root set".to_owned(),
+                )
+            })?;
+            let expected_role = match launch.profile {
+                InstallationProfile::UserMode => "immutable_binaries",
+                InstallationProfile::PortableDev => "runtime_state_roots.profile_anchor_root",
+                InstallationProfile::SystemService => {
+                    return Err(HostError::ProcessContour(
+                        "SystemService cannot receive a current-user root lease".to_owned(),
+                    ));
+                }
+            };
+            let expected_root = leases
+                .selection()
+                .roots
+                .iter()
+                .find(|observation| observation.role == expected_role)
+                .ok_or_else(|| {
+                    HostError::ProcessContour(format!(
+                        "retained profile selection is missing {expected_role}"
+                    ))
+                })?;
+            let canonical_root = root
+                .canonical_path()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            if expected_root.identity != root.identity()
+                || !windows_paths_equal(&expected_root.canonical_path, &canonical_root)
+                || !matches!(
+                    (launch.profile, request.profile),
+                    (
+                        InstallationProfile::UserMode,
+                        ProfileSelection::UserMode
+                    ) | (
+                        InstallationProfile::PortableDev,
+                        ProfileSelection::PortableDev
+                    )
+                )
+            {
+                return Err(HostError::ProcessContour(
+                    "current-user root lease differs from its retained profile role".to_owned(),
+                ));
+            }
+        }
         let kernel_executable =
             approved_locator(kernel_executable, approved_kernel_path, launch.profile)?;
         let kernel_lease =
-            open_launch_lease(launch.profile, portable_root.as_ref(), &kernel_executable)?;
+            open_launch_lease(launch.profile, user_owned_root.as_ref(), &kernel_executable)?;
         verify_launch_digest(&kernel_lease, kernel_artifact, "runtime.kernel_artifact")?;
         let store_bridge_executable = approved_locator(
             store_bridge_executable,
@@ -894,14 +1343,15 @@ impl HostJobBranches {
         )?;
         let store_lease = open_launch_lease(
             launch.profile,
-            portable_root.as_ref(),
+            user_owned_root.as_ref(),
             &store_bridge_executable,
         )?;
         verify_launch_digest(&store_lease, store_artifact, "runtime.store_artifact")?;
         let config_path = approved_locator(config_path, approved_config_path, launch.profile)?;
         let config_pin = PinnedRuntimeFile::open(&config_path)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let config_lease = open_launch_lease(launch.profile, portable_root.as_ref(), &config_path)?;
+        let config_lease =
+            open_launch_lease(launch.profile, user_owned_root.as_ref(), &config_path)?;
         verify_launch_digest(&config_lease, config_digest, "runtime.config")?;
         let semantic_config_hash = semantic_store_config_hash_from_json(
             &config_lease.read_bounded(1024 * 1024).map_err(|error| {
@@ -916,7 +1366,7 @@ impl HostJobBranches {
         )?;
         let store_bootstrap_lease = open_launch_lease(
             launch.profile,
-            portable_root.as_ref(),
+            user_owned_root.as_ref(),
             &store_bootstrap_path,
         )?;
         let store_bootstrap_requirement = validate_store_bootstrap_descriptor(
@@ -932,7 +1382,7 @@ impl HostJobBranches {
             launch.profile,
         )?;
         let eliotd_config_lease =
-            open_launch_lease(launch.profile, portable_root.as_ref(), &eliotd_config_path)?;
+            open_launch_lease(launch.profile, user_owned_root.as_ref(), &eliotd_config_path)?;
         verify_launch_digest(
             &eliotd_config_lease,
             &launch.eliotd_config_digest,
@@ -945,7 +1395,7 @@ impl HostJobBranches {
         )?;
         let eliotd_descriptor_lease = open_launch_lease(
             launch.profile,
-            portable_root.as_ref(),
+            user_owned_root.as_ref(),
             &eliotd_descriptor_path,
         )?;
         verify_launch_digest(
@@ -969,7 +1419,7 @@ impl HostJobBranches {
             ));
         }
         let (kernel_working_directory, store_working_directory) =
-            Self::approved_working_directories(launch, portable_root.as_ref(), &config_path)?;
+            Self::approved_working_directories(launch, user_owned_root.as_ref(), &config_path)?;
         // I16.10 (issue #1837): bind the periodic digest-anchor sink to the
         // Watchdog failure domain on this launch. Resolved from the validated
         // `RuntimeStateRoots`, so it is derived from the real installer-owned
@@ -1084,7 +1534,7 @@ impl HostJobBranches {
                 self.eliotd_descriptor_lease = Some(eliotd_descriptor_lease);
                 self.store_bootstrap_requirement = Some(store_bootstrap_requirement);
                 self.config_pin = Some(config_pin);
-                self.portable_root = portable_root;
+                self.portable_root = user_owned_root;
                 self.launch = Some(launch.clone());
                 self.kernel_artifact_digest = Some(kernel_artifact.clone());
                 self.store_artifact_digest = Some(store_artifact.clone());
@@ -1151,7 +1601,7 @@ impl HostJobBranches {
                 self.eliotd_descriptor_lease = Some(eliotd_descriptor_lease);
                 self.store_bootstrap_requirement = Some(store_bootstrap_requirement);
                 self.config_pin = Some(config_pin);
-                self.portable_root = portable_root;
+                self.portable_root = user_owned_root;
                 self.launch = Some(launch.clone());
                 self.kernel_artifact_digest = Some(kernel_artifact.clone());
                 self.store_artifact_digest = Some(store_artifact.clone());
@@ -1243,7 +1693,10 @@ pub(super) fn profile_root_request(
         version: launch.profile_version.as_str().to_owned(),
         generation: launch.generation.as_str().to_owned(),
         authority_descriptor_path: PathBuf::from(launch.authority_descriptor_path.as_str()),
-        authority_descriptor_sha256: launch.authority_descriptor_digest.as_str().to_owned(),
+        authority_descriptor_sha256: phase_b_scm_selector(&launch.authority_descriptor_digest)
+            .map_err(HostError::Installation)?
+            .as_str()
+            .to_owned(),
         authority_generation: launch.authority_generation.value(),
         roots: ProfileRootPaths {
             immutable_binaries: PathBuf::from(governed.immutable_binaries.as_str()),
