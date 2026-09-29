@@ -2361,7 +2361,26 @@ where
     // retry after a crash between the registry commit and this operation's
     // final save observes the record already absent and only re-commits the
     // terminal evidence.
-    if resolve_approved_generation(&registry.load()?, &operation.plan.generation).is_ok() {
+    let current = registry.load()?;
+    if resolve_approved_generation(&current, &operation.plan.generation).is_ok() {
+        // The terminal registry retirement is the one mutating call left in
+        // this operation, and it is issued after the per-row readback loop, not
+        // at the entry fence. Both the bounded reconcile deadline and the
+        // admission fence are therefore re-observed here against a projection
+        // read after that loop: a deadline that expires mid-readback, or a
+        // canary admission or a return to production/last-known-good staged
+        // after the last row, refuses this call instead of being inherited
+        // from a stale entry-point observation. Neither refusal writes
+        // anything, so the durable incomplete recovery survives unchanged.
+        if reconcile_budget_exhausted(operation) {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "the bounded reconcile wait for removal {} expired before the terminal registry retirement of generation {}; the exact blocking effect {} keeps this operation in incomplete recovery and no terminal commit is admitted under this operation identity",
+                operation.removal_transaction_id.as_str(),
+                operation.plan.generation.as_str(),
+                operation.plan.effects[registry_row].effect_id.as_str()
+            )));
+        }
+        observe_admission_fence(&current, &operation.plan)?;
         let terminal = registry.mutate_atomic(operation.plan.registry_revision, |projection| {
             projection.retire_retired_generation(&operation.plan.generation)
         });
