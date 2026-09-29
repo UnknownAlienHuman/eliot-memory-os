@@ -7961,20 +7961,49 @@ impl HostComposition {
     /// I1.5 W4 (`SupervisionLease` issuance/renewal, Host leg): a transition
     /// into a live state holds exactly the supervision lease the mirror
     /// proves live for this activation generation right now — no synthesised
-    /// identity, no carried predecessor. When the mirror proves no live
-    /// obligation, the held reference lapses to empty instead of blocking
-    /// drain or retirement on a dead lease; terminal coverage stays in the
-    /// `DrainCommitRecord` snapshot taken at linearization. A mirror read
-    /// failure fails the transition closed rather than entering a live
-    /// state on uncertain supervision.
+    /// identity, no carried predecessor — and only when the latest durable
+    /// readiness observation already admitted that same lease identity. I1.5:
+    /// "A `SupervisionLease` is issued automatically only for an observable
+    /// active obligation" and "A lease renewal ... must carry fresh observed
+    /// evidence". The admission arrives Kernel-side through the existing
+    /// renewal owner (`KernelSupervisionLeaseAuthority` refuses without
+    /// caller observation) and reaches this journal as the
+    /// `proof.supervision_lease` snapshot the readiness owner persists as
+    /// `active_supervision_lease`; binding any other mirror entry would
+    /// promote an unadmitted renewal into a live state. When the mirror
+    /// proves no live obligation, the held reference lapses to empty
+    /// instead of blocking drain or retirement on a dead lease; terminal
+    /// coverage stays in the `DrainCommitRecord` snapshot taken at
+    /// linearization. A mirror read failure, a missing admitted
+    /// predecessor, or a mirror entry the readiness owner never admitted
+    /// fails the transition closed rather than entering a live state on
+    /// uncertain supervision.
     fn refresh_supervision_lease_binding(
         &self,
         next: &mut eliot_host_state::EliotActivationRecord,
     ) -> Result<(), HostError> {
-        next.supervision_lease_refs = self
-            .live_supervision_obligation_for(next)?
-            .into_iter()
-            .collect();
+        let Some(lease_ref) = self.live_supervision_obligation_for(next)? else {
+            next.supervision_lease_refs = Vec::new();
+            return Ok(());
+        };
+        let admitted = self
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .last()
+            .and_then(|observation| observation.active_supervision_lease.clone())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "live supervision binding has no admitted readiness predecessor".to_owned(),
+                )
+            })?;
+        if admitted.supervision_lease_id.as_str() != lease_ref.as_str() {
+            return Err(HostError::RecoveryRequired(
+                "published supervision lease was not admitted by fresh readiness evidence"
+                    .to_owned(),
+            ));
+        }
+        next.supervision_lease_refs = vec![lease_ref];
         Ok(())
     }
 
