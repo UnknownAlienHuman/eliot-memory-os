@@ -37,12 +37,12 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
-    AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
-    CutoverReceipt, DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest,
-    IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest,
-    LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest, PortError,
-    ProcessEffectLineage, ProcessPort, ProcessStartOutcome, RegistrationReceipt,
-    RegistrationStatus, RequiredProvider, UserBroker,
+    AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError,
+    BrokerRegistrationObservation, BrokerSnapshot, CutoverReceipt, DurableRegistrationPort,
+    HeartbeatReceipt, HeartbeatRequest, IssuedOperationIdentity, IssuedOperationIdentityLedger,
+    LaunchGrant, LaunchRequest, LostOperation, OperatorArtifact, OperatorEndpoint,
+    OperatorHandoffRequest, PortError, ProcessEffectLineage, ProcessPort, ProcessStartOutcome,
+    RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2106,6 +2106,28 @@ impl BrokerComposition {
                 .with_platform("broker Kernel registration is not live"));
         }
         Ok(live)
+    }
+
+    /// Reports the registration state observed by the User Broker owner.
+    ///
+    /// This is read-only and uses the broker's retained Kernel-issued receipt;
+    /// a missing, fenced, or expired registration is reported as unavailable
+    /// with its original binding preserved when one exists. Transport
+    /// failures remain unknown to the caller because they do not produce this
+    /// owner response.
+    pub fn registration_observation(
+        &self,
+    ) -> Result<BrokerRegistrationObservation, CompositionError> {
+        self.verify_launch_lease()?;
+        let observed_at = now_unix_ms()?;
+        let generation = self.broker.broker_epoch();
+        let registration = self.broker.registration().cloned();
+        BrokerRegistrationObservation::observed_by_user_broker(
+            registration,
+            generation,
+            observed_at,
+        )
+        .map_err(CompositionError::Recovery)
     }
 
     /// Proves the redeeming `WinUI` client process from OS evidence: the

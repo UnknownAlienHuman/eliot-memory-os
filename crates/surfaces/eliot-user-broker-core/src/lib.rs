@@ -512,6 +512,128 @@ pub enum RegistrationStatus {
     Closed,
 }
 
+/// Availability of the User Broker registration at one owner observation.
+///
+/// This is intentionally distinct from transport reachability: a caller that
+/// cannot reach the broker has no observation to serialize and must retain an
+/// unknown result. A broker that answers with no live Kernel registration is
+/// observed as unavailable for its bound interactive route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BrokerRegistrationAvailability {
+    Available,
+    Unavailable,
+}
+
+/// Closed source vocabulary for an owner-issued broker registration view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BrokerRegistrationObservationSource {
+    UserBrokerComposition,
+}
+
+/// Bounded current observation of the broker's Kernel-issued registration.
+///
+/// The optional receipt is retained verbatim so its Kernel-issued SID/session,
+/// epoch, fence and expiry remain bound together. An expired receipt is
+/// historical input to route reconciliation only; it cannot be made live by a
+/// new observation or by deserializing this projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerRegistrationObservation {
+    pub source: BrokerRegistrationObservationSource,
+    pub generation: u64,
+    pub observed_at: u64,
+    pub availability: BrokerRegistrationAvailability,
+    pub stale: bool,
+    pub registration: Option<RegistrationReceipt>,
+}
+
+impl BrokerRegistrationObservation {
+    /// Projects the registration retained by the User Broker owner at its
+    /// observed wall-clock time. No caller-supplied SID, generation, or
+    /// availability value enters this constructor.
+    pub fn observed_by_user_broker(
+        registration: Option<RegistrationReceipt>,
+        generation: u64,
+        observed_at: u64,
+    ) -> Result<Self, BrokerError> {
+        if observed_at == 0 || (generation == 0 && registration.is_some()) {
+            return Err(BrokerError::InvalidField(
+                "broker_registration_observation.owner_contour",
+            ));
+        }
+        if let Some(registration) = registration.as_ref() {
+            registration.validate_shape()?;
+        }
+
+        let stale = registration.as_ref().is_some_and(|registration| {
+            registration.user_broker_epoch != generation || observed_at >= registration.expires_at
+        });
+        let availability = registration.as_ref().map_or(
+            BrokerRegistrationAvailability::Unavailable,
+            |registration| {
+                if registration.status == RegistrationStatus::Active
+                    && registration.user_broker_epoch == generation
+                    && !stale
+                {
+                    BrokerRegistrationAvailability::Available
+                } else {
+                    BrokerRegistrationAvailability::Unavailable
+                }
+            },
+        );
+        let observation = Self {
+            source: BrokerRegistrationObservationSource::UserBrokerComposition,
+            generation,
+            observed_at,
+            availability,
+            stale,
+            registration,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    /// Validates that the projection still agrees with its retained
+    /// Kernel-issued registration. This is a consistency check, not proof of
+    /// transport authenticity; callers must obtain the value over an
+    /// authenticated owner route.
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        if self.observed_at == 0 || (self.generation == 0 && self.registration.is_some()) {
+            return Err(BrokerError::InvalidField(
+                "broker_registration_observation.owner_contour",
+            ));
+        }
+        let (stale, availability) = match self.registration.as_ref() {
+            Some(registration) => {
+                registration.validate_shape()?;
+                let stale = registration.user_broker_epoch != self.generation
+                    || self.observed_at >= registration.expires_at;
+                let availability = if registration.status == RegistrationStatus::Active
+                    && registration.user_broker_epoch == self.generation
+                    && !stale
+                {
+                    BrokerRegistrationAvailability::Available
+                } else {
+                    BrokerRegistrationAvailability::Unavailable
+                };
+                (stale, availability)
+            }
+            None => (false, BrokerRegistrationAvailability::Unavailable),
+        };
+        if self.source != BrokerRegistrationObservationSource::UserBrokerComposition
+            || self.stale != stale
+            || self.availability != availability
+        {
+            return Err(BrokerError::InvalidField(
+                "broker_registration_observation.binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Exact heartbeat context; it cannot mint or widen a registration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
