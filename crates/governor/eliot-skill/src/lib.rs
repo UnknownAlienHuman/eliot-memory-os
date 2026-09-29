@@ -1077,23 +1077,36 @@ impl SkillRegistry {
     /// Records one window of execution evidence through this lifecycle owner
     /// and returns only after the owner accepted it (issue #2663, I7.25).
     ///
-    /// The daemon previously persisted only the outer host-response body and
-    /// returned "accepted" on that basis, discarding the very evidence the
-    /// ingest was admitted to carry. This entry is the existing owner write
-    /// path: the evidence is appended to the stored view's own
-    /// `execution_evidence` and the view is RE-DERIVED from the retained
-    /// records, so no counter can outrun the evidence behind it.
+    /// This is the existing owner write path: the evidence is appended to the
+    /// stored view's own `execution_evidence` and the resulting view is
+    /// RE-RECORDED through [`record_view`](Self::record_view), so the owner
+    /// actually retains what the ingest carried. The returned view is the
+    /// owner's result verbatim: a claim never outruns persistence, and the
+    /// same-identity conflict branch below is reachable in production because
+    /// the next ingest seeds from the retained set, not from a stale copy.
     ///
-    /// Evidence is HISTORICAL and stays historical: it is bound to the exact
-    /// Skill revision and package digest the caller presented, and a record
-    /// that disagrees with the stored view is refused rather than merged, so
-    /// ingesting evidence now can never reactivate a superseded Skill. Exact
-    /// replay under the same execution identity is idempotent; a CHANGED
-    /// record under that identity is a conflict, never a silent rewrite.
+    /// Evidence is HISTORICAL and stays historical. The ingest is bound to the
+    /// exact Skill revision and package digest the caller presented:
     ///
-    /// The caller supplies the retained catalogue entry the view is derived
-    /// against, because the registry does not own the catalogue; the identity
-    /// legs it names are still compared against the stored view.
+    /// * when the presented identity equals the stored view's identity, the
+    ///   view is re-derived for that identity as before;
+    /// * when it differs, the caller must supply the retained catalogue entry
+    ///   for the PRESENTED identity — resolved from retained install history,
+    ///   never reconstructed from payload fields (issue #2663 item 1: a
+    ///   current collector reports an older attempt only through an explicit
+    ///   permitted historical binding). The observation is then filed as a
+    ///   linked revision: the new records are appended, the lifecycle revision
+    ///   advances, and the stored view keeps its current Skill
+    ///   revision/package, scope, fence, dependencies and status, so ingesting
+    ///   historical evidence now can never reactivate a superseded Skill nor
+    ///   re-stamp it with today's fence.
+    ///
+    /// A presented identity matching neither the stored view nor the supplied
+    /// retained entry is refused with [`SkillError::IdentityMismatch`]: a
+    /// substituted revision or package cannot be filed under any identity.
+    /// Exact replay under the same execution identity is idempotent and
+    /// returns the stored view unchanged; a CHANGED record under that identity
+    /// is a [`SkillError::RevisionConflict`], never a silent rewrite.
     ///
     /// Usefulness is never established here: the derived counters consult each
     /// receipt's [`SkillUsefulness`], which only
@@ -1112,16 +1125,24 @@ impl SkillRegistry {
         for evidence in executions {
             evidence.validate()?;
         }
+        // The supplied entry is the caller's explicit binding for the
+        // presented identity: it must name the presented Skill revision under
+        // the presented Skill id. On the current path this is the live entry;
+        // on the historical path it is the retained entry for the presented
+        // (older) revision. A caller-supplied entry naming any other identity
+        // cannot file evidence here.
+        if entry.index.skill_id != skill_id || entry.body.body_version != skill_revision {
+            return Err(SkillError::IdentityMismatch);
+        }
         let key = skill_id.to_owned();
         let previous = self.views.get(&key).ok_or(SkillError::NotFound)?.clone();
         // The evidence is bound to the exact Skill identity it was observed
-        // under: a substituted revision or package cannot be filed under the
-        // stored view's identity.
-        if previous.skill_ref.registration.revision != skill_revision
-            || previous.skill_ref.package_digest != package_digest
-        {
-            return Err(SkillError::IdentityMismatch);
-        }
+        // under. A presented identity equal to the stored view is the current
+        // path; a differing presented identity is accepted only as a
+        // historical linked observation against the caller-supplied retained
+        // entry above — never merged as current, never a reactivation.
+        let historical = previous.skill_ref.registration.revision != skill_revision
+            || previous.skill_ref.package_digest != package_digest;
         let mut retained = previous.execution_evidence.clone();
         let mut changed = false;
         for evidence in executions {
@@ -1142,11 +1163,50 @@ impl SkillRegistry {
                 }
             }
         }
-        // Exact replay is a read of the same owner position, not a new
-        // revision. In particular, an empty or duplicate-only page cannot
-        // advance the lifecycle frontier.
-        if !changed {
+        if retained == previous.execution_evidence {
+            // Nothing new was presented: the ingest replays the retained set
+            // exactly, so the stored view is returned unchanged — no revision
+            // inflation, no silent rewrite.
             return Ok(previous);
+        }
+        if historical {
+            // Later evidence is a LINKED revision, never a silent rewrite: the
+            // historical observation is appended to the retained set, the
+            // revision advances so the owner can order the observations, and
+            // every other view field — Skill revision/package, scope, fence,
+            // dependencies, status, applicability — stays exactly as stored.
+            // The derivation fold is deliberately not reused here: it would
+            // project the supplied (historical) entry's dependencies and
+            // applicability into the current view.
+            let mut view = previous.clone();
+            view.execution_evidence = retained;
+            view.counters.executed = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| evidence.outcome == ExecutionOutcome::Observed)
+                .count() as u64;
+            view.counters.failed = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| evidence.outcome == ExecutionOutcome::Failed)
+                .count() as u64;
+            view.counters.uncertain = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| evidence.outcome == ExecutionOutcome::Uncertain)
+                .count() as u64;
+            view.counters.verified = view
+                .execution_evidence
+                .iter()
+                .filter(|evidence| {
+                    evidence.outcome == ExecutionOutcome::Observed
+                        && !evidence.verifier_refs.is_empty()
+                })
+                .count() as u64;
+            view.lifecycle_revision = previous.lifecycle_revision.saturating_add(1);
+            view.validate()?;
+            self.record_view(view.clone())?;
+            return Ok(view);
         }
         let mut view = derive_lifecycle_view(LifecycleEvidence {
             skill_ref: previous.skill_ref.clone(),

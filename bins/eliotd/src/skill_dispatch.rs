@@ -149,6 +149,92 @@ pub enum CapabilityRecordRead {
     Unavailable(String),
 }
 
+/// What the bounded evidence-owner activation-receipt read established about
+/// one presented receipt's subject identity (issue #2663, audit 5856960648).
+///
+/// The rows come from the existing finite named read
+/// (`GetLearningRecordRange`, closed `activation_receipt` kind); the verdict
+/// below only compares the presented subject legs against those served owner
+/// documents by content. It never invents a record and never treats the
+/// receipt's own shape as provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationSubject {
+    /// An owner row binds this exact subject: same Skill identity, same
+    /// subject attempt, same route, same packet digest/position, same fence.
+    OwnerBound,
+    /// An owner row names this Skill and subject attempt but contradicts at
+    /// least one presented subject leg: a foreign or substituted record under
+    /// a real identity, never a silent pass.
+    Contradicted,
+    /// No owner row names this subject. Unresolved absence of evidence: never
+    /// a negative fact, and on its own never a positive claim either.
+    Unresolved,
+}
+
+/// Resolves one presented receipt's subject identity against the served
+/// evidence-owner activation-receipt rows by content.
+///
+/// A row can name a subject only when it carries the owner projection shape
+/// (`record_kind`, `handle`, `record_json`, `record_digest`) and its document
+/// decodes to a self-validating harness receipt. A row naming this Skill and
+/// subject attempt must then agree on every subject leg (Skill
+/// revision/package, route, packet digest/position, fence); anything else is a
+/// contradiction under a real identity. Rows of any other record shape —
+/// including execution-evidence documents sharing the same closed kind — are
+/// skipped, never half-parsed.
+fn resolve_activation_subject(
+    receipt: &eliot_skill::SkillHarnessActivationReceipt,
+    rows: &[Value],
+) -> ActivationSubject {
+    let mut contradicted = false;
+    for row in rows {
+        if row
+            .get("record_kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            || row
+                .get("record_digest")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || row
+                .get("handle")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            continue;
+        }
+        let Some(document) = row.get("record_json") else {
+            continue;
+        };
+        let Ok(record) =
+            serde_json::from_value::<eliot_skill::SkillHarnessActivationReceipt>(document.clone())
+        else {
+            continue;
+        };
+        if record.validate().is_err() {
+            continue;
+        }
+        if record.skill_id != receipt.skill_id || record.attempt_ref != receipt.attempt_ref {
+            continue;
+        }
+        if record.skill_revision == receipt.skill_revision
+            && record.package_digest == receipt.package_digest
+            && record.route_ref == receipt.route_ref
+            && record.packet_digest == receipt.packet_digest
+            && record.packet_position == receipt.packet_position
+            && record.state_fence == receipt.state_fence
+        {
+            return ActivationSubject::OwnerBound;
+        }
+        contradicted = true;
+    }
+    if contradicted {
+        ActivationSubject::Contradicted
+    } else {
+        ActivationSubject::Unresolved
+    }
+}
+
 /// Activation ingest plan: the presented harness receipt kept DISTINCT from
 /// the authenticated ingest that carried it, plus the owner binding resolved
 /// for it without the composition lock.
@@ -170,6 +256,11 @@ pub struct ActivationCandidate {
     resolved_outcomes: Vec<eliot_skill::ResolvedOutcome>,
     /// How completely the backing reads were served.
     coverage: eliot_skill::EvidenceCoverage,
+    /// What the evidence-owner activation-receipt rows said about the
+    /// presented subject identity: owner-bound, contradicted, or unresolved.
+    /// The commit leg rechecks the lifecycle-owner view before publishing, so
+    /// a subject the rows contradict can never become a qualified claim.
+    subject: ActivationSubject,
 }
 
 impl ActivationCandidate {
@@ -216,6 +307,21 @@ pub enum OwnerPositionRead {
     /// The read failed or the profile is not wired; the assessment must be
     /// unavailable rather than a self-comparison of the submitted page.
     Unavailable(String),
+}
+
+/// Reads the lifecycle owner's stored view for one subject Skill without
+/// holding the daemon composition mutex across the read.
+///
+/// Borrowed directly from the composition for the duration of the single
+/// non-awaiting lookup, exactly like [`read_execution_owner_position`]: the
+/// caller takes it under a short borrow and drops the borrow before any
+/// canonical I/O. `None` means the owner holds no view for this Skill —
+/// absence of a row, never an empty-but-complete record.
+fn read_activation_owner_view(
+    composition: &DaemonComposition,
+    skill_id: &str,
+) -> Option<eliot_skill::SkillLifecycleView> {
+    composition.skill_lifecycle_owner().view(skill_id).cloned()
 }
 
 /// Reads the owner-retained execution position for one subject Skill without
@@ -359,10 +465,13 @@ fn commit_execution_candidate(
         });
     }
     match composition.skill_publish_execution_evidence(payload) {
-        // The in-process owner retained the evidence: the assessment is only
-        // reported after the owner view contains it. Durable restart storage
-        // remains a separate owner path.
-        Ok(_published) => {
+        // The owner accepted the evidence: the assessment is only reported
+        // after the owner took it, so a claim never outruns persistence. The
+        // returned view IS the owner's result — the commit must observe it,
+        // not discard it — and the owner is then re-read to prove the result
+        // survived: a re-read that lost the published ingest refuses instead
+        // of yielding a qualified positive summary.
+        Ok(published) => {
             let committed = match read_execution_owner_position(composition, &payload.skill_id) {
                 OwnerPositionRead::Read(position) => position,
                 OwnerPositionRead::Absent => {
@@ -374,6 +483,17 @@ fn commit_execution_candidate(
                     ));
                 }
             };
+            if committed.revision < published.lifecycle_revision
+                || payload
+                    .executions
+                    .iter()
+                    .any(|presented| !committed.retained.contains(presented))
+            {
+                return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
+                    "execution evidence owner did not retain the published ingest; the assessment stays unqualified"
+                        .to_owned(),
+                ));
+            }
             match build_execution_assessment(candidate, &committed) {
                 Ok(assessment) => SkillResultEnvelope::assessment(assessment),
                 Err(error) => SkillResultEnvelope::refused(error.as_ref()),
@@ -681,15 +801,21 @@ async fn read_capability_evidence_records(
 /// Revalidates every load-bearing owner binding before publishing: the plan's
 /// reads ran WITHOUT the composition lock, so a Skill row or lifecycle
 /// position that moved in between is caught here rather than published from a
-/// stale observation. The admission re-validates the receipt against its
-/// ORIGINAL recorded value and binds it to the stored view's exact revision
-/// and package.
+/// stale observation. The subject legs are resolved against owner records,
+/// never against the receipt's own shape: the evidence-owner rows the plan
+/// read contradict a foreign or substituted subject outright, and the
+/// lifecycle owner's stored view binds the fence and the route. A candidate
+/// whose backing reads never settled, whose subject the owner rows
+/// contradict, or whose retained receipt contradicts the presented bytes
+/// never publishes a settled claim: loss of a required read, or a
+/// contradicted subject, refuses instead of yielding a positive summary. A
+/// subject no owner row names stays unresolved — never a negative fact — and
+/// still faces every remaining owner leg below. The admission re-validates
+/// the receipt against its ORIGINAL recorded value and binds it to the stored
+/// view's exact revision and package.
 ///
-/// A candidate whose backing reads were partial, truncated or blocked never
-/// publishes a settled claim: it reports the unresolved coverage instead, so
-/// absence of evidence is never read as a finding. A candidate that cannot
-/// name the ingest it arrived on, or that carries a broken owner revision
-/// binding, is refused outright.
+/// A candidate that cannot name the ingest it arrived on, or that carries a
+/// broken owner revision binding, is refused outright.
 fn commit_activation_candidate(
     composition: &mut DaemonComposition,
     candidate: &ActivationCandidate,
@@ -713,26 +839,66 @@ fn commit_activation_candidate(
             },
         ))
     } else if !candidate.coverage.is_settled() {
-        Some(SkillResultEnvelope::attempt(
-            eliot_skill::derive_attempt_summary(&candidate.receipt),
+        // Loss of a required read cannot yield a qualified positive summary:
+        // an unsettled backing read refuses instead of publishing the
+        // receipt's self-declared stages as a finding.
+        Some(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::Surface(format!(
+                "activation backing reads did not settle ({:?}); the candidate remains unqualified",
+                candidate.coverage
+            )),
+        ))
+    } else if candidate.subject == ActivationSubject::Contradicted {
+        // The evidence owner names this Skill and subject attempt but
+        // contradicts a presented subject leg: a foreign or substituted record
+        // under a real identity can never become a qualified claim.
+        Some(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::RevisionConflict,
         ))
     } else {
         None
     };
-    match unpublished {
-        Some(outcome) => outcome,
-        None => match composition.skill_admit_material_attempt(&candidate.receipt) {
-            Ok(_) => {
-                // The stage claims come from the admitted summary; usefulness
-                // is re-decided here from the owner records the plan actually
-                // resolved, never from the admission result and never from the
-                // presented string set. The resolved records stay in the
-                // private candidate, so a receiver sees the qualified verdict
-                // rather than a raw flag.
-                SkillResultEnvelope::attempt(candidate.qualified_summary())
-            }
-            Err(error) => SkillResultEnvelope::refused(&error),
-        },
+    if let Some(outcome) = unpublished {
+        return outcome;
+    }
+    // Subject legs against the lifecycle owner's stored view, under this
+    // fresh borrow: the view binds the Skill identity, the task scope, the
+    // route and the fence the owner actually retains. A receipt naming a
+    // foreign fence or a route the owner never bound the Skill to is refused
+    // here even though its shape validates.
+    let view = match read_activation_owner_view(composition, &candidate.receipt.skill_id) {
+        Some(view) => view,
+        None => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::NotFound);
+        }
+    };
+    if candidate.receipt.state_fence != view.state_fence {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch);
+    }
+    if candidate.receipt.route_ref != view.scope.route {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::IdentityMismatch);
+    }
+    for held in &view.attempt_receipts {
+        // Exact replay under a retained receipt identity is idempotent; a
+        // changed record under that identity is a conflict, never a rewrite.
+        if (held.receipt_id == candidate.receipt.receipt_id
+            || held.attempt_ref == candidate.receipt.attempt_ref)
+            && *held != *candidate.receipt
+        {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::RevisionConflict);
+        }
+    }
+    match composition.skill_admit_material_attempt(&candidate.receipt) {
+        Ok(_) => {
+            // The stage claims come from the admitted summary; usefulness
+            // is re-decided here from the owner records the plan actually
+            // resolved, never from the admission result and never from the
+            // presented string set. The resolved records stay in the
+            // private candidate, so a receiver sees the qualified verdict
+            // rather than a raw flag.
+            SkillResultEnvelope::attempt(candidate.qualified_summary())
+        }
+        Err(error) => SkillResultEnvelope::refused(&error),
     }
 }
 
@@ -1018,7 +1184,14 @@ fn decode_activation(
 ///    `verified_outcome_refs` are resolved by CONTENT against those rows --
 ///    each resolved record must name the deciding acceptance row's verifier
 ///    in its own `verifier_refs` (I12.24 verifier competence), so a
-///    nonexistent verifier or a real-but-unrelated outcome cannot qualify.
+///    nonexistent verifier or a real-but-unrelated outcome cannot qualify;
+/// 3. the same served rows resolve the presented SUBJECT identity by content:
+///    a row naming this Skill and subject attempt must agree on Skill
+///    revision/package, route, packet digest/position and fence, or the
+///    subject travels as contradicted and the commit refuses it. The fence,
+///    route and retained-receipt legs are then rechecked against the
+///    lifecycle owner's stored view under the commit's fresh borrow, so no
+///    caller-carried reference qualifies structurally.
 ///
 /// The result is a private plan: nothing is published here, and no
 /// composition state is borrowed. A refused or failed read is an error the
@@ -1108,6 +1281,12 @@ async fn plan_qualified_activation(
         super::skill_evidence_read::OutcomeResolution::Resolved { records } => records,
         super::skill_evidence_read::OutcomeResolution::NoOwnerRecord => Vec::new(),
     };
+    // 3. Subject-identity read over the SAME served rows: the presented
+    //    Skill/attempt/route/packet/fence legs are compared against the owner
+    //    documents by content. A contradicted subject travels with the
+    //    candidate so the commit refuses it; an unresolved subject travels as
+    //    unresolved, never as a structural pass.
+    let subject = resolve_activation_subject(&receipt, &rows);
     let mut source_revisions = revisions;
     source_revisions.push(super::skill_evidence_read::activation_receipt_revision());
     PlannedSkillPair::Activation(ActivationCandidate {
@@ -1116,6 +1295,7 @@ async fn plan_qualified_activation(
         source_revisions,
         resolved_outcomes,
         coverage,
+        subject,
     })
 }
 
