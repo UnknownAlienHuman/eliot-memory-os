@@ -3943,7 +3943,15 @@ impl ClaimAuditRecord {
         // rather than from the profile. A `v1` record could not be re-derived from
         // its own bytes under one name, so the domain says so rather than letting
         // one name cover two field sets.
-        let mut preimage = String::from("claim-audit-record/v2;");
+        //
+        // `v2` -> `v3`: the preimage now names the evidence behind the verdict —
+        // the frozen claim identity digest, the opposition relation digests, one
+        // disposition per alleged counterclaim, one standing per handle, every
+        // audit dimension with its recorded status, and the public class. A `v2`
+        // record bound the outcome word and the residue prose and nothing else, so
+        // a verdict whose evidence changed kept its binding. The domain says so
+        // rather than letting one name cover two field sets.
+        let mut preimage = String::from("claim-audit-record/v3;");
         push_field(&mut preimage, "claim_id", &self.claim_id);
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(
@@ -4001,6 +4009,87 @@ impl ClaimAuditRecord {
                 push_field(&mut preimage, tag, value);
             }
         }
+        // I21.8: the binding must commit to the EVIDENCE behind the class, not
+        // only to the class. A `claim-audit-record/v2` preimage named the word
+        // `CONTRADICTED` and nothing that established it, so changing the frozen
+        // claim identity, the opposition relation's evaluator result, a
+        // counterclaim's disposition or any audit dimension left this record
+        // byte-for-byte identical. That is the exact opposite of what a release
+        // binding is for: the verdict's evidence is the part that can change
+        // under a later run, and it is the part a reader has to be able to see
+        // move.
+        push_field(
+            &mut preimage,
+            "verdict_claim_identity_digest",
+            &self.verdict.claim_identity_digest,
+        );
+        push_count(
+            &mut preimage,
+            "verdict_relation_digests",
+            self.verdict.relation_digests.len(),
+        );
+        for digest in &self.verdict.relation_digests {
+            push_field(&mut preimage, "verdict_relation_digest", digest);
+        }
+        push_count(
+            &mut preimage,
+            "verdict_counterclaim_resolutions",
+            self.verdict.counterclaim_resolutions.len(),
+        );
+        for entry in &self.verdict.counterclaim_resolutions {
+            push_field(
+                &mut preimage,
+                "verdict_counterclaim_id",
+                &entry.counterclaim_id,
+            );
+            push_field(
+                &mut preimage,
+                "verdict_counterclaim_disposition",
+                entry.disposition.wire_name(),
+            );
+        }
+        push_count(
+            &mut preimage,
+            "verdict_handle_resolutions",
+            self.verdict.handle_resolutions.len(),
+        );
+        for resolution in &self.verdict.handle_resolutions {
+            push_field(
+                &mut preimage,
+                "verdict_handle",
+                &resolution.handle,
+            );
+            push_field(
+                &mut preimage,
+                "verdict_handle_standing",
+                resolution.standing.wire_name(),
+            );
+        }
+        // Every dimension and its recorded status, not only the ones that failed:
+        // a binding that named only the failures could not tell a dimension that
+        // was examined and passed from one that was never examined at all.
+        push_count(
+            &mut preimage,
+            "verdict_dimensions",
+            self.verdict.dimension_results.len(),
+        );
+        for result in &self.verdict.dimension_results {
+            push_field(
+                &mut preimage,
+                "verdict_dimension",
+                result.dimension.wire_name(),
+            );
+            push_field(
+                &mut preimage,
+                "verdict_dimension_status",
+                result.status.wire_name(),
+            );
+        }
+        push_field(
+            &mut preimage,
+            "verdict_public_class",
+            self.verdict.public_class().wire_name(),
+        );
         // I21.7: the over-precision residue is bound as the typed items it is,
         // so a binding that covers this record cannot be re-pointed at a
         // different asserted coordinate by changing only the rendered prose.

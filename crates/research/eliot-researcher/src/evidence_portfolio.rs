@@ -5496,6 +5496,51 @@ impl CounterclaimDisposition {
     pub const fn establishes_opposition(self) -> bool {
         matches!(self, Self::Contradicts)
     }
+
+    /// Whether this disposition leaves the opposition *unestablished* — the
+    /// audit could not decide whether the source contests the claim.
+    ///
+    /// The distinction is load-bearing for the public class. A cell that refuses
+    /// the handle outright (revoked, outside the manifest, no lineage) is a
+    /// negative finding about that handle: the audit reached it and it could not
+    /// be counterevidence. A cell that reports the opposition was eligible but
+    /// not established is the *absence* of a finding, and absence is what the
+    /// fail-closed public class is for. Reading either as support is the
+    /// inference `#2874` removes.
+    pub const fn leaves_opposition_unestablished(self) -> bool {
+        matches!(
+            self,
+            Self::NotVerifiableInScope
+                | Self::RelationClaimMismatch
+                | Self::RelationStatementChanged
+                | Self::NoFrozenClaimIdentity
+                | Self::RelationDigestMismatch
+                | Self::SpanNotAdmitted
+                | Self::RelationSourceRevisionChanged
+                | Self::EvaluationInsufficient
+                | Self::NoEvaluationRoute
+                | Self::PartiallyOverlappingConditions
+                | Self::PartialCoverage
+        )
+    }
+
+    /// Whether this disposition refused the handle before the opposition could
+    /// be examined at all.
+    ///
+    /// A handle in one of these cells was never read as evidence, so the audit
+    /// has no finding about whether it contests the claim. That is different
+    /// from a handle that was examined and found eligible: the first is a gap in
+    /// the examination, the second is a completed one.
+    pub const fn refuses_examination(self) -> bool {
+        matches!(
+            self,
+            Self::Revoked
+                | Self::OutsideManifest
+                | Self::UnadmittedByRunManifest
+                | Self::UnresolvedLineage
+                | Self::AlsoACitation
+        )
+    }
 }
 
 /// The standing one handle holds inside one claim audit, decided once.
@@ -5541,13 +5586,34 @@ pub enum HandleStanding {
     /// Admitted with a bound record, and also a citation of this same claim.
     ///
     /// The opposition partition reads this as one input asserting both support
-    /// and opposition. The citation partition reads it as the ordinary admitted
-    /// case, because a handle it is looking at is by construction one of the
-    /// claim's citations — which is exactly why the two can no longer answer
-    /// differently about it.
+    /// and opposition, and `standing_decision` settles it as
+    /// [`CounterclaimDisposition::AlsoACitation`]. The citation partition reads
+    /// it as the ordinary admitted case, because a handle it is looking at is by
+    /// construction one of the claim's citations — which is why the two can no
+    /// longer answer differently about it: they read the same value and the same
+    /// table over it.
     AdmittedCitation,
     /// Admitted with a bound record, and not a citation of this claim.
     Admitted,
+}
+
+impl HandleStanding {
+    /// Stable wire spelling of this standing.
+    ///
+    /// Named rather than derived from the `Debug` spelling because this value is
+    /// bound into the release binding digest: the standing a handle holds is
+    /// part of what a later run has to be able to see change.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Revoked => "REVOKED",
+            Self::OutsideManifest => "OUTSIDE_MANIFEST",
+            Self::UnadmittedByRunManifest => "UNADMITTED_BY_RUN_MANIFEST",
+            Self::Unresolved => "UNRESOLVED",
+            Self::SubstitutedRecord => "SUBSTITUTED_RECORD",
+            Self::AdmittedCitation => "ADMITTED_CITATION",
+            Self::Admitted => "ADMITTED",
+        }
+    }
 }
 
 /// One handle this audit examined, with the one standing both partitions read.
@@ -5630,14 +5696,22 @@ pub struct ClaimVerdict {
     pub grade_ceiling: Option<u8>,
     /// Evidence handles behind the verdict, sorted.
     pub evidence_map: Vec<String>,
-    /// Every dimension the audit examined, whether or not it found a failure.
+    /// What the audit decided about every dimension it examined, whether or not
+    /// that decision went the claim's way.
     ///
-    /// This is the record that makes the public projection lossless in the other
-    /// direction. A verdict that kept only its terminal outcome would force a
-    /// consumer to recover "was this also outside the manifest, and also stale?"
-    /// by matching residue prose — the exact mistake the `#1765` repair already
-    /// had to undo once. The dimensions are named, not rendered.
-    pub dimensions: Vec<AuditDimension>,
+    /// One entry per [`AuditDimension`], each carrying a tri-state
+    /// [`AuditDimensionStatus`]. This is the record that makes the public
+    /// projection lossless in both directions: a verdict that kept only its
+    /// terminal outcome would force a consumer to recover "was this also outside
+    /// the manifest, and also stale?" by matching residue prose — the exact
+    /// mistake the `#1765` repair already had to undo once — and a bare list of
+    /// dimension *names* would be worse, because a name cannot say whether the
+    /// dimension was checked and passed, checked and failed, or never decidable
+    /// at all. The three states are distinguished because they are three
+    /// different facts and the public class treats them differently: a failed
+    /// dimension is a negative finding, an unestablished one is an absence of a
+    /// finding, and only the second is `NOT_VERIFIABLE_IN_SCOPE` by itself.
+    pub dimension_results: Vec<AuditDimensionResult>,
     /// Digests of the relations the audit relied on, sorted.
     ///
     /// A verdict is bound to the exact relations that produced it, so a later
@@ -5703,6 +5777,25 @@ pub enum AuditDimension {
 }
 
 impl AuditDimension {
+    /// Every dimension the release gate examines, in canonical order.
+    ///
+    /// Declared so the audit records the same vocabulary on every run and a
+    /// consumer can enumerate the whole set from one owner instead of
+    /// reconstructing it from the dimensions it happens to have seen. A
+    /// dimension absent from a verdict was not examined, and
+    /// [`ClaimVerdict::dimension_results`] treats an absent dimension as
+    /// unestablished rather than as passed.
+    pub const ALL: [Self; 8] = [
+        Self::ReferenceVerification,
+        Self::ValueVerification,
+        Self::SpecificationCompliance,
+        Self::MethodArtifactAlignment,
+        Self::ClaimIdentityCurrent,
+        Self::CounterevidenceExamined,
+        Self::AccountingComplete,
+        Self::PartitionCoherence,
+    ];
+
     /// Stable wire spelling of this dimension.
     pub const fn wire_name(self) -> &'static str {
         match self {
@@ -5715,6 +5808,65 @@ impl AuditDimension {
             Self::AccountingComplete => "ACCOUNTING_COMPLETE",
             Self::PartitionCoherence => "PARTITION_COHERENCE",
         }
+    }
+}
+
+/// What the audit decided about one dimension.
+///
+/// Three states rather than a boolean, because a boolean here would conflate
+/// two different facts and the public projection depends on the difference: a
+/// dimension that was checked and *failed* is a negative finding about the
+/// claim, while a dimension that could not be *decided* is the absence of a
+/// finding. Collapsing them is how an unknown becomes support, which is the one
+/// inference `#2874` exists to remove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuditDimensionStatus {
+    /// The dimension was examined and every check under it held.
+    Established,
+    /// The dimension was examined and at least one check under it did not hold.
+    Failed,
+    /// The dimension could not be decided, so nothing is known about it.
+    ///
+    /// The fail-closed state. It is not `Failed`: nothing was disproved, but
+    /// nothing was established either, and a release may not read it as either
+    /// support or its opposite.
+    Unestablished,
+}
+
+impl AuditDimensionStatus {
+    /// Stable wire spelling of this status.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Established => "ESTABLISHED",
+            Self::Failed => "FAILED",
+            Self::Unestablished => "UNESTABLISHED",
+        }
+    }
+}
+
+/// One dimension and what the audit decided about it.
+///
+/// The pairing is what makes [`ClaimVerdict::dimension_results`] informative.
+/// The previous shape was a bare `Vec<AuditDimension>`: the same eight names for
+/// every verdict, whatever the audit found, so the field could not distinguish
+/// "checked and passed" from "never checked" while its own doc comment claimed it
+/// could. Here the status is part of the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuditDimensionResult {
+    /// The dimension examined.
+    pub dimension: AuditDimension,
+    /// What the audit decided about it.
+    pub status: AuditDimensionStatus,
+}
+
+impl AuditDimensionResult {
+    /// Whether this dimension was established.
+    ///
+    /// The one query a consumer needs over a single entry; a caller holding the
+    /// whole record should ask [`ClaimVerdict::dimensions_complete`] or read
+    /// [`ClaimVerdict::dimension_status`] by name instead of scanning.
+    pub const fn is_established(self) -> bool {
+        matches!(self.status, AuditDimensionStatus::Established)
     }
 }
 
@@ -5737,110 +5889,86 @@ impl ClaimVerdict {
 
     /// The public release class for this verdict.
     ///
-    /// Lossless by construction: every internal outcome maps to exactly one public
-    /// class, and no dimension is discarded to reach it. `OutsideManifest`,
+    /// # Derived from the dimensions, not from the terminal outcome
+    ///
+    /// This used to be a projection of [`Self::outcome`], which made it a second
+    /// reading of the same precedence chain rather than an independent one: a
+    /// claim with two independent defects reported only the first, so its public
+    /// class was decided by which defect the chain happened to test earlier. The
+    /// class is now derived from [`Self::dimension_results`], which records every
+    /// dimension the audit examined, so two defects produce a class that accounts
+    /// for both.
+    ///
+    /// The order below is a total function over the three recorded statuses, not
+    /// a precedence chain over findings, and it is stated here once:
+    ///
+    /// * a verified contradiction is [`PublicAuditClass::Contradicted`] whatever
+    ///   else is also true of the claim, because a proven refutation is not
+    ///   softened by an unrelated gap;
+    /// * any dimension [`AuditDimensionStatus::Unestablished`] is
+    ///   [`PublicAuditClass::NotVerifiableInScope`], the fail-closed class: a
+    ///   dimension nobody could decide is not support and is not a negative
+    ///   finding;
+    /// * otherwise any failed dimension with no support behind it is
+    ///   [`PublicAuditClass::Unsupported`], and a failed dimension alongside some
+    ///   support is [`PublicAuditClass::PartiallySupported`];
+    /// * and only a verdict whose every dimension is
+    ///   [`AuditDimensionStatus::Established`] is
+    ///   [`PublicAuditClass::Supported`].
+    ///
+    /// Losslessness runs in both directions and is checkable: the dimension
+    /// record names every finding, and this class names what a release consumer
+    /// may do with the claim. `OutsideManifest`, `RevokedEvidence`,
     /// `StaleLimited` and `IncompleteAccounting` are not public classes — I21.8
-    /// names five — so they project onto the class that describes what a release
-    /// consumer may do with the claim: an outside-manifest or stale claim is not
-    /// `Supported`, and an incompletely accounted one is not verifiable.
+    /// names five — so they are carried as dimension statuses rather than as
+    /// competing terminal classes.
     #[must_use]
     pub fn public_class(&self) -> PublicAuditClass {
-        match self.outcome {
-            ClaimOutcome::Contradicted => PublicAuditClass::Contradicted,
-            ClaimOutcome::Supported => PublicAuditClass::Supported,
-            ClaimOutcome::PartiallySupported => PublicAuditClass::PartiallySupported,
-            ClaimOutcome::Unsupported | ClaimOutcome::StaleLimited => PublicAuditClass::Unsupported,
-            ClaimOutcome::OutsideManifest
-            | ClaimOutcome::RevokedEvidence
-            | ClaimOutcome::NotVerifiableInScope
-            | ClaimOutcome::IncompleteAccounting => PublicAuditClass::NotVerifiableInScope,
+        if self
+            .counterclaim_resolutions
+            .iter()
+            .any(|entry| entry.disposition.establishes_opposition())
+        {
+            return PublicAuditClass::Contradicted;
         }
+        if AuditDimension::ALL.iter().any(|dimension| {
+            self.dimension_status(*dimension) == AuditDimensionStatus::Unestablished
+        }) {
+            return PublicAuditClass::NotVerifiableInScope;
+        }
+        if self.evidence_map.is_empty() {
+            return PublicAuditClass::Unsupported;
+        }
+        if self.dimensions_complete() {
+            return PublicAuditClass::Supported;
+        }
+        PublicAuditClass::PartiallySupported
     }
 
     /// Whether every dimension the release gate requires was established.
     ///
     /// This is the "no `SUPPORTED` promotion while a required dimension fails or
     /// is unknown" rule expressed as a question a consumer can ask, rather than
-    /// as a precedence chain that decides it silently.
+    /// as a precedence chain that decides it silently. A dimension absent from
+    /// [`Self::dimension_results`] was not examined and therefore did not pass, so
+    /// the answer is `false` for a verdict that examined nothing.
     #[must_use]
     pub fn dimensions_complete(&self) -> bool {
-        !self.dimensions.is_empty()
-            && self
-                .dimensions
-                .iter()
-                .all(|dimension| self.dimension_passed(*dimension))
+        self.dimension_results.len() == AuditDimension::ALL.len()
+            && self.dimension_results.iter().all(|result| result.is_established())
     }
 
-    /// Whether one named dimension passed. An absent dimension did not pass.
-    fn dimension_passed(&self, dimension: AuditDimension) -> bool {
-        let failed = match dimension {
-            AuditDimension::ReferenceVerification => {
-                self.outcome == ClaimOutcome::OutsideManifest
-                    || self.outcome == ClaimOutcome::RevokedEvidence
-                    || self.evidence_map.is_empty()
-            }
-            AuditDimension::ValueVerification => {
-                self.outcome == ClaimOutcome::Unsupported
-                    || self.outcome == ClaimOutcome::StaleLimited
-                    || self.outcome == ClaimOutcome::PartiallySupported
-            }
-            AuditDimension::SpecificationCompliance => {
-                self.counterclaim_resolutions.iter().any(|entry| {
-                    matches!(
-                        entry.disposition,
-                        CounterclaimDisposition::IncompatibleConditions
-                            | CounterclaimDisposition::PartiallyOverlappingConditions
-                            | CounterclaimDisposition::OutsideDomain
-                    )
-                })
-            }
-            AuditDimension::MethodArtifactAlignment => self.claim_identity_digest.is_empty(),
-            AuditDimension::ClaimIdentityCurrent => {
-                self.counterclaim_resolutions.iter().any(|entry| {
-                    matches!(
-                        entry.disposition,
-                        CounterclaimDisposition::RelationStatementChanged
-                            | CounterclaimDisposition::RelationClaimMismatch
-                            | CounterclaimDisposition::NoFrozenClaimIdentity
-                            | CounterclaimDisposition::RelationDigestMismatch
-                    )
-                })
-            }
-            AuditDimension::CounterevidenceExamined => {
-                self.counterevidence.is_empty()
-                    || self.counterclaim_resolutions.iter().any(|entry| {
-                        !matches!(
-                            entry.disposition,
-                            CounterclaimDisposition::Contradicts
-                                | CounterclaimDisposition::AlsoACitation
-                        )
-                    })
-            }
-            AuditDimension::AccountingComplete => {
-                self.outcome == ClaimOutcome::IncompleteAccounting || !self.unknowns.is_empty()
-            }
-            // Coherence is the property that the two partitions read one
-            // classification instead of deciding their own. It is checked, not
-            // asserted: a standing that forces a disposition must be reported
-            // under that disposition on the opposition side, and a handle cannot
-            // appear twice in the resolution list. The two-partition code this
-            // replaced could fail neither half — a revoked citation was
-            // `OutsideManifest` on one side and `AlsoACitation` on the other —
-            // because the two sides never compared anything.
-            AuditDimension::PartitionCoherence => {
-                let mut seen: BTreeSet<&str> = BTreeSet::new();
-                self.counterclaim_resolutions.iter().any(|entry| {
-                    !seen.insert(entry.counterclaim_id.as_str())
-                        || self
-                            .handle_resolutions
-                            .iter()
-                            .find(|resolution| resolution.handle == entry.counterclaim_id)
-                            .and_then(|resolution| forced_disposition(resolution.standing))
-                            .is_some_and(|forced| forced != entry.disposition)
-                })
-            }
-        };
-        !failed
+    /// What the audit decided about one named dimension.
+    ///
+    /// An absent dimension is [`AuditDimensionStatus::Unestablished`]: a
+    /// dimension that was not examined is not one that passed, and reading it as
+    /// passed is how an unexamined claim becomes a supported one.
+    #[must_use]
+    pub fn dimension_status(&self, dimension: AuditDimension) -> AuditDimensionStatus {
+        self.dimension_results
+            .iter()
+            .find(|result| result.dimension == dimension)
+            .map_or(AuditDimensionStatus::Unestablished, |result| result.status)
     }
 }
 
@@ -6485,37 +6613,247 @@ fn classify_handle(
     HandleStanding::Admitted
 }
 
-/// The disposition a standing forces, for the standings that force one.
+/// What one classified handle's standing settles about its disposition.
 ///
-/// Five of the seven standings are decided from the manifests and the record
-/// alone, so what the opposition partition reports for them is not a judgement
-/// it is free to make: a revoked handle reports `Revoked` whether or not it is
-/// also a citation, and a handle with no provable record reports
-/// `UnresolvedLineage` whether the record is absent or merely substituted. The
-/// two admitted standings force nothing, because whether an admitted handle
-/// contradicts is a question about the evidence attached to it, and answering it
-/// is what the remaining dispositions are for.
-fn forced_disposition(standing: HandleStanding) -> Option<CounterclaimDisposition> {
+/// Total by construction: every [`HandleStanding`] maps to exactly one value
+/// here, so a caller never has to decide what an unrecognised standing means and
+/// there is no fall-through branch that could quietly skip the check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandingDecision {
+    /// The standing alone settles the disposition; no evidence question remains.
+    Settled(CounterclaimDisposition),
+    /// The handle is admitted with a bound record and is not a citation of this
+    /// claim, so whether it contests the claim is a question about the evidence
+    /// attached to it.
+    AdmittedStandalone,
+}
+
+/// Decides what a classified handle's standing settles about its disposition.
+///
+/// Six of the seven standings are decided from the manifests, the record and the
+/// claim's own citation list alone, so what the opposition partition reports for
+/// them is not a judgement it is free to make: a revoked handle reports
+/// `Revoked` whether or not it is also a citation, a handle with no provable
+/// record reports `UnresolvedLineage` whether the record is absent or merely
+/// substituted, and a handle that is also a citation of this claim reports
+/// `AlsoACitation` because one input cannot both support and contest a claim.
+/// Only `Admitted` leaves the question open, and that is what
+/// [`StandingDecision::AdmittedStandalone`] names.
+///
+/// This is the single table both partitions read. The citation loop matches on
+/// [`HandleStanding`] and the opposition loop calls this function, so a new
+/// standing cannot be added with one side updated and the other not: the
+/// compiler requires the citation loop to name the new variant, and the
+/// compiler requires this function to decide what it settles. That is the whole
+/// repair — the previous code let each side carry its own `if` chain over the
+/// same facts, and they disagreed about a revoked citation.
+fn standing_decision(standing: HandleStanding) -> StandingDecision {
     match standing {
-        HandleStanding::Revoked => Some(CounterclaimDisposition::Revoked),
-        HandleStanding::OutsideManifest => Some(CounterclaimDisposition::OutsideManifest),
+        HandleStanding::Revoked => StandingDecision::Settled(CounterclaimDisposition::Revoked),
+        HandleStanding::OutsideManifest => {
+            StandingDecision::Settled(CounterclaimDisposition::OutsideManifest)
+        }
         HandleStanding::UnadmittedByRunManifest => {
-            Some(CounterclaimDisposition::UnadmittedByRunManifest)
+            StandingDecision::Settled(CounterclaimDisposition::UnadmittedByRunManifest)
         }
         HandleStanding::Unresolved | HandleStanding::SubstitutedRecord => {
-            Some(CounterclaimDisposition::UnresolvedLineage)
+            StandingDecision::Settled(CounterclaimDisposition::UnresolvedLineage)
         }
-        HandleStanding::Admitted | HandleStanding::AdmittedCitation => None,
+        HandleStanding::AdmittedCitation => {
+            StandingDecision::Settled(CounterclaimDisposition::AlsoACitation)
+        }
+        HandleStanding::Admitted => StandingDecision::AdmittedStandalone,
     }
+}
+
+/// The findings one claim audit recorded, as the input the dimension
+/// classifier reads.
+///
+/// Grouped into a record rather than passed as eight parameters because the
+/// alternative is a signature nobody can read, and because the grouping is what
+/// makes the dimension record honest: each status below is derived from a
+/// condition the audit actually evaluated, not from the terminal outcome it went
+/// on to choose. Deriving them from the outcome is what made three of the four
+/// original dimensions a restatement of the precedence chain they were supposed
+/// to replace.
+struct ClaimAuditFindings<'a> {
+    /// The authorization this claim was judged under re-proves itself.
+    manifest_intact: bool,
+    /// A citation was decided and did not hold: outside, revoked, or unprovable.
+    citation_defect: bool,
+    /// A citing record carried no evidentiary weight.
+    support_gap: bool,
+    /// The claim asserted more precision than the evidence carries.
+    precision_gap: bool,
+    /// A cited record was past its frozen freshness boundary.
+    stale_hit: bool,
+    /// Every relation that names this claim still names its current wording.
+    identity_current: bool,
+    /// The claim carries a frozen identity that re-proves against its wording.
+    claim_identity_verified: bool,
+    /// A material claim is released with no citation and no alleged counterclaim.
+    material_without_accounting: bool,
+    /// Unknown references remain open on this claim.
+    has_unknowns: bool,
+    /// One disposition per alleged counterclaim identity, in canonical order.
+    resolutions: &'a [CounterclaimResolution],
+    /// The one standing derived for every handle this audit examined.
+    handle_resolutions: &'a [HandleResolution],
+}
+
+/// What the two partitions of one audit agree about every handle.
+///
+/// This is checked, not asserted. For every alleged counterclaim, the standing
+/// the single classification gave its handle is compared against the disposition
+/// the opposition partition actually reported, and a handle that reached two
+/// answers under one identity is a failure. A handle with no recorded standing is
+/// [`AuditDimensionStatus::Unestablished`] rather than established, because a
+/// value that was never classified cannot be compared against anything.
+///
+/// The two-partition code this replaced could fail neither check: a revoked
+/// citation was `OutsideManifest` on the citation side and `AlsoACitation` on the
+/// opposition side, because the two sides never compared anything.
+fn partition_coherence(findings: &ClaimAuditFindings<'_>) -> AuditDimensionStatus {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut status = AuditDimensionStatus::Established;
+    for entry in findings.resolutions {
+        if !seen.insert(entry.counterclaim_id.as_str()) {
+            return AuditDimensionStatus::Failed;
+        }
+        let Some(resolution) = findings
+            .handle_resolutions
+            .iter()
+            .find(|candidate| candidate.handle == entry.counterclaim_id)
+        else {
+            status = AuditDimensionStatus::Unestablished;
+            continue;
+        };
+        if let StandingDecision::Settled(settled) = standing_decision(resolution.standing)
+            && settled != entry.disposition
+        {
+            return AuditDimensionStatus::Failed;
+        }
+    }
+    status
+}
+
+/// The recorded outcome of every dimension the release gate examines.
+///
+/// Returns all of [`AuditDimension::ALL`] in canonical order, so a consumer can
+/// tell a dimension that was examined and failed from one that was never
+/// examined: an absent dimension would read as "nothing to report", and that is
+/// exactly how an unexamined claim becomes a supported one.
+fn dimension_results(findings: &ClaimAuditFindings<'_>) -> Vec<AuditDimensionResult> {
+    let status = |failed: bool, unestablished: bool| {
+        if unestablished {
+            AuditDimensionStatus::Unestablished
+        } else if failed {
+            AuditDimensionStatus::Failed
+        } else {
+            AuditDimensionStatus::Established
+        }
+    };
+    // A disposition that leaves the opposition unestablished in a way that is an
+    // absence of a finding rather than a negative one. These are the cells in
+    // which the audit could not decide whether the claim holds, so they belong to
+    // the fail-closed public class rather than to `UNSUPPORTED`.
+    let undecided = |disposition: &CounterclaimResolution| {
+        disposition.disposition.leaves_opposition_unestablished()
+    };
+    let incompatible = |disposition: &CounterclaimResolution| {
+        matches!(
+            disposition.disposition,
+            CounterclaimDisposition::OutsideDomain
+                | CounterclaimDisposition::IncompatibleConditions
+                | CounterclaimDisposition::PartiallyOverlappingConditions
+        )
+    };
+    // Coherence is the property that the two partitions read ONE classification
+    // of a handle rather than each deriving its own.
+    let coherence = partition_coherence(findings);
+    let results = [
+        (
+            AuditDimension::ReferenceVerification,
+            // Every cited handle resolved inside the frozen manifest and bound a
+            // record that still hashes to the commitment frozen for it.
+            status(findings.citation_defect, !findings.manifest_intact),
+        ),
+        (
+            AuditDimension::ValueVerification,
+            // The citing records carry weight, assert nothing wider than the
+            // evidence supports, and are inside their freshness boundary.
+            status(
+                findings.support_gap || findings.precision_gap || findings.stale_hit,
+                false,
+            ),
+        ),
+        (
+            AuditDimension::SpecificationCompliance,
+            // The opposition that was examined stayed inside the claim's scope
+            // and under its conditions, and nothing about it was left undecided.
+            status(
+                findings.resolutions.iter().any(incompatible),
+                !findings.manifest_intact
+                    || findings.resolutions.iter().any(undecided),
+            ),
+        ),
+        (
+            AuditDimension::MethodArtifactAlignment,
+            // A material claim can only be released as supported against a frozen
+            // identity that re-proves against the wording actually under audit.
+            status(false, !findings.claim_identity_verified),
+        ),
+        (
+            AuditDimension::ClaimIdentityCurrent,
+            // No relation names this claim under wording or a revision it no
+            // longer has.
+            status(!findings.identity_current, false),
+        ),
+        (
+            AuditDimension::CounterevidenceExamined,
+            // Every alleged counterclaim was reached by an examination that could
+            // actually read its evidence. A handle that was never classified
+            // cannot have been examined, so it is unestablished rather than
+            // established, and a handle that was refused before examination is a
+            // finding about the handle rather than an absence of one.
+            status(
+                findings
+                    .resolutions
+                    .iter()
+                    .any(|entry| entry.disposition.refuses_examination()),
+                !findings.manifest_intact,
+            ),
+        ),
+        (
+            AuditDimension::AccountingComplete,
+            // No unknown reference is open and no material claim is released with
+            // nothing released behind it.
+            status(
+                findings.has_unknowns || findings.material_without_accounting,
+                false,
+            ),
+        ),
+        (AuditDimension::PartitionCoherence, coherence),
+    ];
+    results
+        .into_iter()
+        .map(|(dimension, status)| AuditDimensionResult { dimension, status })
+        .collect()
 }
 
 /// Classifies one attached counterclaim identity against this claim.
 ///
-/// The standing is read from [`classify_handle`] first, and the same function
-/// answers for the citation loop, so revocation and unavailable evidence are
-/// decided in exactly one place before any opposition-specific question is
-/// asked. The remaining checks are eligibility plus one verified relation, and
-/// each records its own typed residue line, so the reason an identity did not
+/// `standing` is the value [`classify_handle`] already returned for this handle
+/// when the audit classified it, passed in rather than recomputed. That is the
+/// point of the parameter: the two partitions now read one classification of one
+/// handle instead of each deriving its own, so a handle cannot be "outside" on
+/// the citation side and "also a citation" on the opposition side. The
+/// dispositions below are read out of [`standing_decision`], which is the single
+/// table that says what a standing settles, so the two sides cannot drift even
+/// if a new standing is added.
+///
+/// The remaining checks are eligibility plus one verified relation, and each
+/// records its own typed residue line, so the reason an identity did not
 /// contradict is never lost:
 ///
 /// * a handle the manifest revoked is withdrawn evidence and can be neither
@@ -6527,52 +6865,28 @@ fn forced_disposition(standing: HandleStanding) -> Option<CounterclaimDispositio
 ///   compatible conditions, even though a time-stale record may still support.
 fn resolve_counterclaim(
     counterclaim_id: &str,
+    standing: HandleStanding,
     claim: &AuditedClaim,
     portfolio: &EvidencePortfolio,
-    binding: &AuditReferenceBinding,
     now_ms: i64,
     residue: &mut Vec<String>,
 ) -> CounterclaimDisposition {
-    match classify_handle(counterclaim_id, claim, portfolio, binding) {
-        HandleStanding::Revoked => {
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} is revoked and cannot be verified"
-            ));
-            return CounterclaimDisposition::Revoked;
-        }
-        HandleStanding::OutsideManifest => {
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} outside frozen manifest"
-            ));
-            return CounterclaimDisposition::OutsideManifest;
-        }
-        HandleStanding::UnadmittedByRunManifest => {
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} is not admitted by this run's reference \
-                 manifest and cannot be verified"
-            ));
-            return CounterclaimDisposition::UnadmittedByRunManifest;
-        }
-        HandleStanding::Unresolved | HandleStanding::SubstitutedRecord => {
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} has no authoritative lineage"
-            ));
-            return CounterclaimDisposition::UnresolvedLineage;
-        }
-        HandleStanding::AdmittedCitation => {
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} is also a citation and cannot contest the claim"
-            ));
-            return CounterclaimDisposition::AlsoACitation;
-        }
-        // The two standing values that reach the eligibility checks below. The
-        // record is re-read here rather than carried out of `classify_handle` so
-        // that the classification stays a single closed enum rather than an enum
-        // plus a record; `Admitted` is only returned when a bound record exists,
-        // so this lookup cannot fail on this path, and it is written as a typed
-        // refusal rather than an unwrap so that a future change to the standing
-        // degrades to `UnresolvedLineage` instead of panicking.
-        HandleStanding::Admitted => {}
+    // Six of the seven standings settle the disposition on their own, and
+    // `standing_decision` is the one table that says which. The seventh — an
+    // admitted, non-cited handle — leaves the question open, because whether it
+    // contests the claim depends on the evidence attached to it and that is what
+    // the checks below read. The record is re-read here rather than carried out
+    // of `classify_handle` so the classification stays a single closed enum
+    // rather than an enum plus a record; `AdmittedStandalone` is only returned
+    // when a bound record exists, so this lookup cannot fail on this path, and it
+    // is written as a typed refusal rather than an unwrap so that a future change
+    // degrades to `UnresolvedLineage` instead of panicking.
+    if let StandingDecision::Settled(disposition) = standing_decision(standing) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is {} and cannot contest the claim",
+            disposition.wire_name()
+        ));
+        return disposition;
     }
     let Some(record) = portfolio.records.get(counterclaim_id) else {
         residue.push(format!(
@@ -6846,25 +7160,41 @@ pub fn audit_claim(
     if claim.material && claim.citations.is_empty() {
         residue.push("claim: material claim records no citations".to_owned());
     }
-    // One standing per distinct handle, derived once through the same function
-    // the opposition partition calls. This is the de-duplicated record of it in
-    // sorted handle order, so a consumer reads each handle's standing from a
-    // typed field rather than from the residue prose of whichever partition
-    // happened to look at it first.
-    let handle_resolutions: Vec<HandleResolution> = claim
+    // One standing per distinct handle, derived ONCE. The map is the single
+    // classification both partitions read: the citation loop below looks its
+    // handle up here, `resolve_counterclaim` is handed the same value, and the
+    // de-duplicated record published as `handle_resolutions` is built from the
+    // same map. Nothing recomputes a standing, so the two partitions cannot
+    // answer differently about one handle, and a consumer reads each handle's
+    // standing from a typed field rather than from the residue prose of whichever
+    // partition happened to look at it first.
+    let standings: BTreeMap<&str, HandleStanding> = claim
         .citations
         .iter()
         .chain(claim.counterclaim_ids.iter())
         .map(String::as_str)
         .collect::<BTreeSet<&str>>()
         .into_iter()
-        .map(|handle| HandleResolution {
-            handle: handle.to_owned(),
-            standing: classify_handle(handle, claim, portfolio, binding),
+        .map(|handle| (handle, classify_handle(handle, claim, portfolio, binding)))
+        .collect();
+    let handle_resolutions: Vec<HandleResolution> = standings
+        .iter()
+        .map(|(handle, standing)| HandleResolution {
+            handle: (*handle).to_owned(),
+            standing: *standing,
         })
         .collect();
     for handle in &claim.citations {
-        match classify_handle(handle, claim, portfolio, binding) {
+        // The map is keyed by this claim's own citation list, so every handle
+        // below is in it by construction. The fallback is written as a typed
+        // standing rather than an `expect` so that a future change to the key set
+        // degrades to "no authoritative lineage" — the same answer an unclassified
+        // handle gets — instead of panicking inside an audit.
+        let standing = standings
+            .get(handle.as_str())
+            .copied()
+            .unwrap_or(HandleStanding::Unresolved);
+        match standing {
             HandleStanding::Revoked => {
                 revoked_citation = true;
                 residue.push(format!(
@@ -6974,14 +7304,14 @@ pub fn audit_claim(
     // silently dropped. Absence of contradiction is never read as support.
     let mut resolutions: Vec<CounterclaimResolution> = Vec::new();
     for counterclaim_id in &claim.counterclaim_ids {
-        let disposition = resolve_counterclaim(
-            counterclaim_id,
-            claim,
-            portfolio,
-            binding,
-            now_ms,
-            &mut residue,
-        );
+        // The same standing the citation loop read for this handle, taken from
+        // the one classification above. Nothing on this side re-derives it.
+        let standing = standings
+            .get(counterclaim_id.as_str())
+            .copied()
+            .unwrap_or(HandleStanding::Unresolved);
+        let disposition =
+            resolve_counterclaim(counterclaim_id, standing, claim, portfolio, now_ms, &mut residue);
         resolutions.push(CounterclaimResolution {
             counterclaim_id: counterclaim_id.clone(),
             disposition,
@@ -7049,18 +7379,30 @@ pub fn audit_claim(
     // release, and both still project onto `NOT_VERIFIABLE_IN_SCOPE`.
     let unfrozen_material_claim =
         claim.material && !claim_identity_verified && !outside_citation && !revoked_citation;
-    let mut dimensions = vec![
-        AuditDimension::ReferenceVerification,
-        AuditDimension::ValueVerification,
-        AuditDimension::SpecificationCompliance,
-        AuditDimension::MethodArtifactAlignment,
-        AuditDimension::ClaimIdentityCurrent,
-        AuditDimension::CounterevidenceExamined,
-        AuditDimension::AccountingComplete,
-        AuditDimension::PartitionCoherence,
-    ];
-    dimensions.sort();
-    dimensions.dedup();
+    // The dimension record is derived from the conditions this audit actually
+    // evaluated, before the terminal outcome is chosen, and every dimension is
+    // recorded. This is the fix for the previous shape, which listed the same
+    // eight names for every verdict and therefore could not distinguish "checked
+    // and passed" from "never checked" while its doc comment claimed it could.
+    let audited_dimensions = dimension_results(&ClaimAuditFindings {
+        manifest_intact,
+        citation_defect: outside_citation || revoked_citation || lineage_gap,
+        support_gap,
+        precision_gap,
+        stale_hit,
+        identity_current,
+        claim_identity_verified,
+        // Accounting, not identity: an unfrozen claim is already
+        // `MethodArtifactAlignment`'s finding, and counting it here too would
+        // make one defect show up as two dimensions and hide a real accounting
+        // gap behind it.
+        material_without_accounting: claim.material
+            && claim.citations.is_empty()
+            && counterevidence.is_empty(),
+        has_unknowns: !unknowns.is_empty(),
+        resolutions: &resolutions,
+        handle_resolutions: &handle_resolutions,
+    });
     let outcome = if !identity_current {
         // A claim whose wording moved after the opposition was frozen cannot be
         // released as supported, and a verdict reached through a stale claim
@@ -7135,7 +7477,7 @@ pub fn audit_claim(
         unknowns: unknowns_sorted,
         grade_ceiling,
         evidence_map,
-        dimensions,
+        dimension_results: audited_dimensions,
         relation_digests,
         claim_identity_digest,
         run_id: binding.run_id().to_owned(),
