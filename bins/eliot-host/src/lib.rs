@@ -1533,6 +1533,8 @@ fn host_lifecycle_frozen_event(boundary: &'static HostLifecycleBoundary) -> &'st
 }
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
+#[cfg(windows)]
+pub use host_job_launch::ProfileSupervisorJob;
 pub use eliot_host_control_endpoint::{
     AcceptedOwnerMethod, BackupDispatchRefusal, HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner,
     HostBackupOwnerRegistration, HostRuntimeControl, HostRuntimeControlQueue,
