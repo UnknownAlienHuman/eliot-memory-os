@@ -35,7 +35,7 @@ pub use effects::{
     ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord, CompiledEffect,
     ContestedEffectAnnotation, DependentEffectState, EFFECT_AUTHORIZER_RECOVERY_SCHEMA,
     EFFECT_AUTHORIZER_RECOVERY_VERSION, EffectAuthorizer, EffectAuthorizerRecoverySnapshot,
-    EffectOutcome, EffectReceipt, ImpactClass, ProposedEffect,
+    EffectOutcome, EffectReceipt, ImpactClass, ProposedEffect, SealedEffectDispatch,
 };
 pub use grants::{
     AuthoritySet, AuthorizedCrossRootMember, CapabilityGrant, CapabilityIntroduction,
@@ -102,6 +102,11 @@ pub enum AuthorityError {
     /// field says which readback clause refused, so a stale quarantine is
     /// distinguishable from a malformed one.
     StaleQuarantineEvidence(&'static str),
+    /// A stored effect authorization no longer matches the dispatch presented
+    /// at the effect boundary, or its current standing was withdrawn. The
+    /// named field says which join refused, so an absent or substituted
+    /// authorization is distinguishable from a contested one.
+    StaleEffectAuthority(&'static str),
     InvalidLifecycleTransition,
     ReceiptMismatch,
     P07Unavailable,
@@ -141,6 +146,9 @@ impl fmt::Display for AuthorityError {
             ),
             Self::StaleQuarantineEvidence(field) => {
                 write!(formatter, "stale or unproven quarantine evidence: {field}")
+            }
+            Self::StaleEffectAuthority(field) => {
+                write!(formatter, "stale effect authority: {field}")
             }
             Self::InvalidLifecycleTransition => formatter.write_str("invalid lifecycle transition"),
             Self::ReceiptMismatch => {

@@ -88,6 +88,7 @@ fn map_bounded_history_error(error: AuthorityError) -> RevocationHistoryError {
         | AuthorityError::IdentityConflict
         | AuthorityError::StaleTransitionEvidence(_)
         | AuthorityError::StaleQuarantineEvidence(_)
+        | AuthorityError::StaleEffectAuthority(_)
         | AuthorityError::InvalidLifecycleTransition
         | AuthorityError::ReceiptMismatch
         | AuthorityError::P07Unavailable => RevocationHistoryError::UnknownHistory,
