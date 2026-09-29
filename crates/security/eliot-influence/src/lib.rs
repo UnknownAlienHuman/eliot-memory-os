@@ -3128,6 +3128,106 @@ pub enum InfluenceRuntimeError {
     Canonicalization,
 }
 
+/// Mandated boundary route for a refused runtime use.
+///
+/// The gate never silently drops a refused use: every policy refusal
+/// ([`InfluenceRuntimeError::Denied`] / `Degraded`) maps to exactly one route
+/// the boundary caller must apply to its own outcome type — an Unknown
+/// record, a conflict, an inquiry, or a degraded completion. Non-policy
+/// failures (malformed fields, binding mismatches, stage misuse) are caller
+/// bugs, not policy refusals, and map to no route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DenialRoute {
+    Unknown,
+    Conflict,
+    Inquiry,
+    DegradedCompletion,
+}
+
+/// Digest-bound routing receipt for one refused runtime use.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DenialRouting {
+    pub subject_ref: String,
+    pub stage: RuntimeStage,
+    pub route: DenialRoute,
+    pub reasons: Vec<RuntimeReason>,
+    pub fallback: Option<RuntimeUse>,
+}
+
+impl DenialRouting {
+    pub fn digest(&self) -> Result<String, InfluenceRuntimeError> {
+        canonical_json_bytes(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| InfluenceRuntimeError::Canonicalization)
+    }
+}
+
+/// Route a refused runtime use to its mandated boundary outcome.
+///
+/// Total over policy refusals: `Degraded` with a stated fallback routes to
+/// `DegradedCompletion` (the caller may proceed only at the fallback use); a
+/// degraded refusal without a fallback is routed by reason like a denial.
+/// `Denied` routes by reason: unretrievable records and unknown influence
+/// state route to `Unknown`; revoked or quarantined influence and
+/// allowance/scope caps route to `Conflict`; refusals resolvable by an
+/// explicit qualifying transition (verifier or confirmatory use without
+/// qualification) route to `Inquiry`. Returns `None` for non-policy failures,
+/// which must fail closed as errors rather than routed outcomes.
+#[must_use]
+pub fn route_denial(error: &InfluenceRuntimeError) -> Option<DenialRouting> {
+    let (stage, subject, reasons, fallback) = match error {
+        InfluenceRuntimeError::Denied {
+            stage,
+            subject,
+            reasons,
+        } => (*stage, subject.clone(), reasons.clone(), None),
+        InfluenceRuntimeError::Degraded {
+            stage,
+            subject,
+            reasons,
+            fallback,
+        } => (*stage, subject.clone(), reasons.clone(), *fallback),
+        InfluenceRuntimeError::InvalidField(_)
+        | InfluenceRuntimeError::BindingMismatch { .. }
+        | InfluenceRuntimeError::InvalidUseForStage { .. }
+        | InfluenceRuntimeError::Canonicalization => return None,
+    };
+    let route = if fallback.is_some() {
+        DenialRoute::DegradedCompletion
+    } else if reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            RuntimeReason::RecordNotRetrievable
+                | RuntimeReason::InfluenceNotActive {
+                    state: InfluenceState::Unknown,
+                }
+        )
+    }) {
+        DenialRoute::Unknown
+    } else if reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            RuntimeReason::ExploratoryOnlyCannotSatisfyVerifier
+                | RuntimeReason::ExploratoryOnlyCannotSatisfyConfirmatory
+                | RuntimeReason::VerifierRequiresVerificationInput
+                | RuntimeReason::ConfirmatoryRequiresQualification
+        )
+    }) {
+        DenialRoute::Inquiry
+    } else {
+        DenialRoute::Conflict
+    };
+    Some(DenialRouting {
+        subject_ref: subject,
+        stage,
+        route,
+        reasons,
+        fallback,
+    })
+}
+
 fn text(value: &str, field: &'static str) -> Result<(), InfluenceError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         Err(InfluenceError::InvalidField(field))
