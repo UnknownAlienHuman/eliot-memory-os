@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import fnmatch
 import json
 from pathlib import Path
 import re
@@ -1083,6 +1084,175 @@ def check_cache_key_fingerprints(root: Path) -> list[Finding]:
     return findings
 
 
+# Issue #1923 (I18.44): the source-manifest coverage a cache key must reach.
+# `CACHE_KEY_REQUIRED_BINDINGS` only asks whether the key mentions a
+# `Cargo.toml` at all, which any glob satisfies. That is a copy of the caller's
+# own shape: it cannot tell a glob that reaches every workspace member from one
+# that reaches most of them, so a member root the glob misses stays invisible
+# and its manifest edits are served from a cache entry acquired under the old
+# manifest. The expected set here is read from the root manifest's own
+# `[workspace] members` table, never from the glob under test, so a new member
+# root added to the workspace is a finding until the key reaches it.
+
+
+def _hashfiles_manifest_globs(key_value: str) -> list[str]:
+    """Manifest glob patterns a cache key hashes, in the order written.
+
+    Every quoted argument of every `hashFiles(...)` in the key is collected; a
+    pattern is returned only when it names a `Cargo.toml`, because the other
+    hashed inputs (`Cargo.lock`, `rust-toolchain.toml`) are not workspace member
+    manifests and are already bound by their own GWF-020 dimension.
+    """
+    globs: list[str] = []
+    for call in re.finditer(r"hashFiles\(([^)]*)\)", key_value):
+        for argument in re.findall(r"'([^']*)'", call.group(1)):
+            if not argument.endswith("Cargo.toml"):
+                continue
+            if argument not in globs:
+                globs.append(argument)
+    return globs
+
+
+def _glob_matches_path(pattern: str, path: str) -> bool:
+    """Whether an `@actions/glob` pattern selects a repository-relative path.
+
+    Mirrors the subset GitHub's `hashFiles` uses: `**` spans any number of
+    directories, `*` and `?` stop at one, and `[...]` is a character class. The
+    member root is a directory, so coverage is asked of `<root>/Cargo.toml`,
+    which is the manifest that actually carries the member's dependencies.
+    """
+    return fnmatch.fnmatchcase(path, pattern) or fnmatch.fnmatchcase(path, pattern.replace("**/", ""))
+
+
+def workspace_member_manifests(root: Path) -> list[str]:
+    """Repository-relative manifests of every root `[workspace] members` names.
+
+    The root manifest is the authority: a member it lists is a workspace input
+    whether or not any cache key hashes it. `exclude` is not consulted, so a
+    member later moved to `exclude` is still required until the table says
+    otherwise — an excluded path simply stops being a member and stops being
+    required on the next pass.
+    """
+    manifest = root / "Cargo.toml"
+    if not manifest.is_file():
+        return []
+    try:
+        content = manifest.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    members: list[str] = []
+
+    def add_member(entry: str) -> None:
+        """Records one member root as the manifest that carries its inputs."""
+        candidate = f"{entry.rstrip('/')}/Cargo.toml"
+        if candidate not in members:
+            members.append(candidate)
+
+    in_workspace = False
+    in_members = False
+    for raw in content.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            # Either spelling is accepted: the dotted `[workspace.members]`
+            # table and the `members = [...]` key inside `[workspace]` that
+            # this repository actually writes.
+            normalized = line.replace(" ", "")
+            in_workspace = normalized == "[workspace]"
+            in_members = normalized == "[workspace.members]"
+            continue
+        if in_members:
+            if line.startswith("]"):
+                in_members = False
+                continue
+            entry = line.rstrip(",").strip().strip("\"'")
+            if entry:
+                add_member(entry)
+            continue
+        if not in_workspace:
+            continue
+        key, separator, tail = line.partition("=")
+        if separator and key.strip() == "members":
+            opening = tail.strip()
+            if opening in ("[", ""):
+                in_members = True
+                continue
+            # The whole array on one line: every quoted entry is a member.
+            for entry in re.findall(r"[\"']([^\"']+)[\"']", opening):
+                add_member(entry)
+            if "]" not in opening:
+                in_members = True
+    return members
+
+
+def check_cache_key_manifest_coverage(root: Path) -> list[Finding]:
+    """Every cache key must hash every workspace member manifest.
+
+    A key that names a `Cargo.toml` but whose globs stop short of a member
+    root reuses one cache entry across two different resolutions of the
+    workspace. The expected set is the root manifest's own member list, so
+    this rule is independent of the globs it judges: it cannot be satisfied by
+    restating the same pattern the workflows already use.
+    """
+    expected = workspace_member_manifests(root)
+    if not expected:
+        return [
+            Finding(
+                "GWF-021",
+                "Cargo.toml",
+                0,
+                "no workspace members could be read from the root manifest, so cache key manifest coverage cannot be judged",
+            )
+        ]
+    findings: list[Finding] = []
+    for wf_path in iter_workflow_files(root):
+        rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
+        try:
+            content = wf_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        lines = content.splitlines()
+        for cache_line, line in enumerate(lines):
+            if "actions/cache@" not in workflow_code_line(line):
+                continue
+            step_indent = len(line) - len(line.lstrip(" "))
+            key_line = next(
+                (
+                    i
+                    for i in range(cache_line + 1, len(lines))
+                    if _yaml_key(lines[i]) == "key"
+                    or (
+                        _is_step_entry(lines[i])
+                        and len(lines[i]) - len(lines[i].lstrip(" ")) <= step_indent
+                    )
+                ),
+                None,
+            )
+            if key_line is None or _yaml_key(lines[key_line]) != "key":
+                # GWF-020 already reports a key-less cache step; do not
+                # restate it as a coverage gap.
+                continue
+            globs = _hashfiles_manifest_globs(_yaml_value(lines[key_line]))
+            uncovered = [
+                manifest
+                for manifest in expected
+                if not any(_glob_matches_path(pattern, manifest) for pattern in globs)
+            ]
+            if uncovered:
+                findings.append(
+                    Finding(
+                        "GWF-021",
+                        rel_path,
+                        key_line + 1,
+                        f"cache key hashes {len(globs)} manifest pattern(s) but misses "
+                        f"{len(uncovered)} workspace member manifest(s): "
+                        f"{', '.join(sorted(uncovered))}",
+                    )
+                )
+    return findings
+
+
 def iter_workflow_files(root: Path) -> list[Path]:
     """Every workflow file in the one closed directory, deterministically ordered."""
     workflows_dir = root / ".github" / "workflows"
@@ -1668,6 +1838,7 @@ def verify_all(root: Path) -> list[Finding]:
     findings.extend(check_fail_closed_privilege(root))
     findings.extend(check_action_pin_divergence(root))
     findings.extend(check_cache_key_fingerprints(root))
+    findings.extend(check_cache_key_manifest_coverage(root))
     findings.extend(check_python_requirements(root))
     findings.extend(check_nuget_lock(root))
     findings.extend(check_dotnet_sdk_identity(root))
@@ -1973,6 +2144,70 @@ def run_self_tests() -> int:
                 )
                 return 1
 
+    # Cache-key manifest COVERAGE (issue #1923). The expected set is the root
+    # manifest's own member list, so a key that reaches `crates/**` and
+    # `bins/**` but not `workspace/**` is a finding even though it names a
+    # Cargo.toml and passes every GWF-020 dimension. The fixture workspace is
+    # written with exactly that three-root shape, which is the real one.
+    three_root_workspace = (
+        "[workspace]\nmembers = [\n"
+        '  "bins/eliot",\n'
+        '  "crates/eliot-app",\n'
+        '  "workspace/tools/eliot-runtime-compiler",\n'
+        "]\nexclude = []\n"
+    )
+    covering_key = bound_key.replace(
+        "${{ hashFiles('Cargo.toml') }}",
+        "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml',"
+        " 'workspace/**/Cargo.toml') }}",
+    )
+    # The pre-fix shape: it names a Cargo.toml and satisfies every GWF-020
+    # dimension, yet misses the workspace/tools member root entirely.
+    partial_key = bound_key.replace(
+        "${{ hashFiles('Cargo.toml') }}",
+        "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml') }}",
+    )
+    coverage_cases = [
+        ("cache_manifest_coverage_complete_accepted", covering_key, False),
+        ("cache_manifest_coverage_missing_member_rejected", partial_key, True),
+    ]
+    for name, key_line, expect_finding in coverage_cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            (tmp_root / "Cargo.toml").write_text(three_root_workspace, encoding="utf-8")
+            wf_dir = tmp_root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "test.yml").write_text(cache_workflow(key_line), encoding="utf-8")
+            findings = check_cache_key_manifest_coverage(tmp_root)
+            has_finding = any(f.code == "GWF-021" for f in findings)
+            if expect_finding and not has_finding:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: expected GWF-021, got {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not expect_finding and findings:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: complete coverage produced unexpected findings: {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+
+    # A workspace whose members cannot be read is a coverage gap, never a
+    # silent pass: an unreadable expected set must not make the rule vacuous.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        wf_dir = tmp_root / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "test.yml").write_text(cache_workflow(covering_key), encoding="utf-8")
+        findings = check_cache_key_manifest_coverage(tmp_root)
+        if not any(f.code == "GWF-021" for f in findings):
+            print(
+                f"SELF_TEST_FAILURE in cache_manifest_coverage_without_workspace_manifest_rejected: {findings}",
+                file=sys.stderr,
+            )
+            return 1
+
     # The identity record is derived from the files and deterministic: the same
     # tree yields the same sorted records, and every third-party ref is present
     # including the job-level (no dash) form.
@@ -2136,6 +2371,8 @@ def run_self_tests() -> int:
         + 7
         + len(cache_cases)
         + len(second_step_cases)
+        + len(coverage_cases)
+        + 1
     )
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")
     return 0
