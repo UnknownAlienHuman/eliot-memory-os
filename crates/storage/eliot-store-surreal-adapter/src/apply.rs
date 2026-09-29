@@ -2565,7 +2565,10 @@ mod admitted_operation_gate_tests {
                 ("subject".to_owned(), json!("subject-gate")),
                 ("payload_ref".to_owned(), json!("payload:blob-gate")),
                 ("encryption_key_ref".to_owned(), json!("key:erasure-gate")),
-                ("erasure_deadline_unix_ms".to_owned(), json!("1700000000000")),
+                (
+                    "erasure_deadline_unix_ms".to_owned(),
+                    json!("1700000000000"),
+                ),
                 ("surfaces".to_owned(), json!("CanonicalPayload,Index")),
                 ("reason".to_owned(), json!("user requested deletion")),
                 ("requester".to_owned(), json!("user:test")),

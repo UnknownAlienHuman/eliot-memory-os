@@ -158,10 +158,7 @@ impl ErasureAdmissionRequest {
         self.identity.validate()?;
         super::validate_text(&self.subject, "erasure.subject")?;
         super::validate_text(&self.payload_ref, "erasure.payload_ref")?;
-        super::validate_text(
-            &self.encryption_key_ref,
-            "erasure.encryption_key_ref",
-        )?;
+        super::validate_text(&self.encryption_key_ref, "erasure.encryption_key_ref")?;
         if self.deadline_unix_ms == 0 {
             return Err(StoreError::InvalidField {
                 field: "erasure.deadline_unix_ms",
