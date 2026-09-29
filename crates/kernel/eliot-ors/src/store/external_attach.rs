@@ -7,7 +7,7 @@
 //! restores an old OS session as live authority (A13.7).
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use crate::{OperationIdentity, OperationalMutationReceipt, OperationalPhase, OrsError};
@@ -498,7 +498,7 @@ impl super::RedbRecoveryStore {
 }
 
 fn read_session_index(
-    meta: &redb::ReadOnlyTable<&str, &str>,
+    meta: &impl ReadableTable<&'static str, &'static str>,
     key: &str,
     binding: &str,
 ) -> Result<ExternalAttachSessionIndex, OrsError> {
