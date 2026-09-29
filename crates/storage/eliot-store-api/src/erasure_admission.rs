@@ -26,9 +26,9 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::{
-    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OperationManifestDigest, OrderingScopeId, PreparedTransition, ScopeId,
-    SecurityContext, StoreError, TransitionClass,
+    CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+    NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+    PreparedTransition, ScopeId, SecurityContext, StoreError, TransitionClass,
 };
 use eliot_contracts::StateFence;
 
