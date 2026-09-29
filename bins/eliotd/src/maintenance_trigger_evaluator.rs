@@ -292,7 +292,9 @@ impl DaemonComposition {
             observed_refs: input.evidence_refs.clone(),
             policy_revision: notification_evidence.policy.revision,
         };
-        entry.record_start_route(&decision, observed);
+        let family_decision = entry.record_start_route(&decision, observed);
+        crate::maintenance_dispatch::MaintenanceDispatch::for_decision(&decision, &family_decision)
+            .record(&decision);
         Ok((decision, notification_evidence))
     }
 

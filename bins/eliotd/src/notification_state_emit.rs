@@ -172,7 +172,7 @@ use thiserror::Error;
 use super::{
     DaemonKernelClient, KernelContextReadClient, SERVICE_NAME,
     daemon_kernel_client::kernel_port_error, daemon_kernel_port_adapters::kind_value, unix_ms,
-    unix_ms_i64,
+    maintenance_dispatch::MaintenanceDispatch, unix_ms_i64,
 };
 
 /// Closed response `kind` of the committed canonical notification transition
@@ -331,18 +331,21 @@ pub fn automation_failure_key(
     evidence.validate_for(decision)?;
     let family_decision =
         super::maintenance_family_catalog::entry_for(decision.family).decide(decision);
-    automation_failure_key_with_family_decision(decision, &family_decision, evidence)
+    let dispatch = MaintenanceDispatch::for_decision(decision, &family_decision);
+    automation_failure_key_with_family_decision(decision, &family_decision, &dispatch, evidence)
 }
 
 fn automation_failure_key_with_family_decision(
     decision: &AutomationTriggerDecision,
     family_decision: &super::maintenance_family_catalog::MaintenanceFamilyDecision,
+    dispatch: &MaintenanceDispatch,
     evidence: &MaintenanceNotificationEvidence,
 ) -> Result<AutomationFailureKey, StoreError> {
     let family = closed_wire_name(decision.family)?;
     let reason = closed_wire_name(decision.reason)?;
     let outcome = closed_wire_name(decision.decision)?;
     let mode = closed_wire_name(evidence.policy.mode)?;
+    let dispatch_name = dispatch.wire_name();
     let requested_route = (
         family_decision.route.target(),
         family_decision.route.missing(),
@@ -362,6 +365,7 @@ fn automation_failure_key_with_family_decision(
         evidence.route.generation,
         evidence.route.credential_ref.as_deref(),
         evidence.route.unattended_suitable,
+        dispatch_name,
     );
     let fingerprint = sha256_hex(
         &canonical_json_bytes(&identity)
@@ -370,12 +374,12 @@ fn automation_failure_key_with_family_decision(
     Ok(AutomationFailureKey {
         dedup_key: format!("automation-{fingerprint}"),
         notification_id: format!("notification-automation-{fingerprint}"),
-        subject: format!("blocked maintenance automation {family}"),
+        subject: dispatch.subject(&decision.family),
         summary: format!(
             "maintenance automation {family} at {} evaluated {outcome} for reason {reason}; \
              Governor admits job: {}; catalog route admits start: {}; trigger identity {}; \
              policy episode {}; requested route {} (missing {}); actual route {}; \
-             board/job receipt {}",
+             board/job receipt {}; {}",
             decision.scope_ref,
             decision.admits_job,
             family_decision.admits_start,
@@ -385,6 +389,7 @@ fn automation_failure_key_with_family_decision(
             requested_route.1,
             actual_route_summary(evidence),
             decision.durable_job_ref.as_deref().unwrap_or("unrecorded"),
+            dispatch.detail(),
         ),
         // Preserve the Governor's closed reason above and carry the catalog's
         // exact one actionable recommendation, including its reason, evidence,
@@ -542,16 +547,12 @@ pub async fn notification_already_recorded(
 /// the same failure fingerprint, so a repeat coalesces onto the one stored
 /// record instead of notifying again.
 ///
-/// Stated rather than implied: the second guard below,
-/// `decision.admits_job && family_decision.admits_start`, cannot short-circuit
-/// today. `MaintenanceRoute::admits_start` requires an implemented family
-/// route on top of the shared wiring state, and
-/// `DURABLE_JOB_ADMISSION_BLOCKERS` is a shared four-element non-empty list,
-/// so the arm is `false` for all fifteen families and currently unreachable.
-/// It is left exactly as it is: it is the correct condition, and it becomes
-/// live only when the Governor admits a job for an implemented route whose
-/// shared wiring is clear. Do not read it as a gate that is currently
-/// refusing anything.
+/// Stated rather than implied: the start arm is currently unreachable because
+/// `MaintenanceRoute::admits_start` requires an implemented family route on
+/// top of clear shared wiring, and the three owner blockers remain present for
+/// every registered family. If those owners later publish the missing route,
+/// the notification is suppressed only after the decision carries the
+/// Durable Job reference that proves the existing admission owner accepted it.
 ///
 /// # Errors
 ///
@@ -582,10 +583,20 @@ pub async fn emit_blocked_automation_notification(
         return Ok(None);
     }
     let family_decision = family_entry.decide(decision);
-    if decision.admits_job && family_decision.admits_start {
+    let dispatch = MaintenanceDispatch::for_decision(decision, &family_decision);
+    let retained_record_owed = match &dispatch {
+        MaintenanceDispatch::ExistingDurableJob { .. } => false,
+        MaintenanceDispatch::StartDurableJob { .. } => decision.durable_job_ref.is_none(),
+        MaintenanceDispatch::SuggestBoardItem { .. }
+        | MaintenanceDispatch::Defer { .. }
+        | MaintenanceDispatch::Block { .. }
+        | MaintenanceDispatch::Escalate { .. } => true,
+    };
+    if !retained_record_owed {
         return Ok(None);
     }
-    let key = automation_failure_key_with_family_decision(decision, &family_decision, evidence)?;
+    let key =
+        automation_failure_key_with_family_decision(decision, &family_decision, &dispatch, evidence)?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     if notification_already_recorded(&reads, &key, &state_fence).await? {
         return Ok(None);
