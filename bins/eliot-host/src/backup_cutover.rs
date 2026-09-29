@@ -1321,6 +1321,35 @@ fn cutover_disposition_token(disposition: CutoverDisposition) -> &'static str {
     }
 }
 
+/// Whether one owner [`CutoverDisposition`] reports this cutover operation
+/// itself as terminally failed, so the caller boundary that owns this
+/// operation's single terminal record still owes that record even though the
+/// operation returned `Ok`.
+///
+/// Exhaustive and closed on purpose. A cutover that fails BY DISPOSITION
+/// rather than by `Err` is a real, owner-observed failure of the operation,
+/// not an absent or incomplete channel: the durable intent for this exact
+/// operation reached the terminal `Failed` state, and that is the only thing
+/// this predicate reports. `Unknown` is deliberately NOT one of them — it is
+/// the preserved uncertainty of a lost response or a torn owner pair
+/// (I14.21), and reading it as a failure would manufacture a terminal the
+/// owners never proved. Every other variant is progress or a settlement, so
+/// each is named rather than defaulted, and a disposition added later cannot
+/// compile without being classified here.
+#[must_use]
+pub fn cutover_disposition_reports_failure(disposition: CutoverDisposition) -> bool {
+    match disposition {
+        CutoverDisposition::Failed => true,
+        CutoverDisposition::Requested
+        | CutoverDisposition::Validated
+        | CutoverDisposition::Prepared
+        | CutoverDisposition::Committed
+        | CutoverDisposition::Reconciled
+        | CutoverDisposition::RetirementPending
+        | CutoverDisposition::Unknown => false,
+    }
+}
+
 /// Observes the live disposition the Host journal owner currently retains for
 /// one outstanding installation cutover, on the Host's existing approved
 /// contour reconcile (`HostComposition::reconcile_approved_contour`).
