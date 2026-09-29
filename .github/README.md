@@ -67,6 +67,14 @@ ref/SHA for manual reruns — through:
 - hash-locked Python verification dependencies
   (`scripts/requirements-verification.txt` with `--require-hashes`).
 
+Before the profile, a preparation step materializes the approved
+dependency-policy inputs through their existing owner (the project-local
+Surreal provisioner plus locked prefetch of exactly the pinned
+dependencies, including standalone workspaces only where an accepted
+adjacent lock exists). It records materialization outcomes and never
+writes locks, receipts, or verdicts; missing or substituted inputs fail
+the offline gate with its own findings.
+
 Least privilege: GitHub-hosted Windows runners, `contents: read`, no
 repository/environment secrets, `persist-credentials: false`, no
 `pull_request_target`, no writes to issues, PRs, releases, repository contents,
