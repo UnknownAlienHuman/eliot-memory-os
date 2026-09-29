@@ -8555,110 +8555,7 @@ impl NativeWorkerClaimRecord {
         ] {
             validate_digest(value, field)?;
         }
-        match (
-            &self.executable_binding_digest,
-            &self.executable_binding_record_json,
-            &self.executable_binding_projection,
-        ) {
-            (None, None, None) => {}
-            (Some(digest), Some(record_json), Some(projection)) => {
-                validate_digest(digest, "native_worker_claim_executable_binding_digest")?;
-                let mut record: Value =
-                    serde_json::from_str(record_json).map_err(|_| OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_record_json",
-                        reason: "owner record is not JSON",
-                    })?;
-                let full_record = record.clone();
-                let full_canonical =
-                    canonical_json_bytes(&full_record).map_err(|_| OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_record_json",
-                        reason: "owner record cannot be canonicalized",
-                    })?;
-                if String::from_utf8(full_canonical).ok().as_deref() != Some(record_json.as_str()) {
-                    return Err(OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_record_json",
-                        reason: "owner record must retain its canonical JSON bytes",
-                    });
-                }
-                let object = record.as_object_mut().ok_or(OrsError::InvalidField {
-                    field: "native_worker_claim_executable_binding_record_json",
-                    reason: "owner record must be a JSON object",
-                })?;
-                let recorded_digest = object
-                    .remove("binding_digest")
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .ok_or(OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_record_json",
-                        reason: "owner record has no original binding_digest",
-                    })?;
-                let expected_digest = sha256_hex(&canonical_json_bytes(&record).map_err(|_| {
-                    OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_record_json",
-                        reason: "owner record cannot be canonicalized",
-                    }
-                })?);
-                if recorded_digest != *digest || expected_digest != *digest {
-                    return Err(OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_digest",
-                        reason: "original owner digest does not match retained full record",
-                    });
-                }
-                projection.validate()?;
-                let projected =
-                    serde_json::to_value(projection).map_err(|_| OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_projection",
-                        reason: "projection cannot be encoded",
-                    })?;
-                let projected_fields = projected.as_object().ok_or(OrsError::InvalidField {
-                    field: "native_worker_claim_executable_binding_projection",
-                    reason: "projection must be a JSON object",
-                })?;
-                let full_fields = full_record.as_object().ok_or(OrsError::InvalidField {
-                    field: "native_worker_claim_executable_binding_record_json",
-                    reason: "owner record must be a JSON object",
-                })?;
-                for (field, projected_value) in projected_fields {
-                    let original_field = match field.as_str() {
-                        "executable_binding_digest" => "binding_digest",
-                        "executable_wire_version" => "wire_version",
-                        other => other,
-                    };
-                    if full_fields.get(original_field) != Some(projected_value) {
-                        return Err(OrsError::InvalidField {
-                            field: "native_worker_claim_executable_binding_projection",
-                            reason: "projection fields must equal the full owner record",
-                        });
-                    }
-                }
-                if projection.executable_binding_digest != *digest
-                    || projection.claim_id != self.claim_id.as_str()
-                    || projection.registration_id != self.registration_id.as_str()
-                    || projection.task_id != self.task_id.as_str()
-                    || projection.work_scope_id != self.work_scope_id.as_str()
-                    || projection.operation_id != self.operation_id.as_str()
-                    || projection.worker_generation != self.worker_generation
-                    || projection.authority_epoch.sequence.get() != self.authority_epoch
-                    || projection.deadline_unix_ms != self.deadline_unix_ms
-                    || sha256_hex(&canonical_json_bytes(&projection.state_fence).map_err(|_| {
-                        OrsError::InvalidField {
-                            field: "native_worker_claim_executable_binding_projection",
-                            reason: "state fence cannot be canonicalized",
-                        }
-                    })?) != self.fence_digest
-                {
-                    return Err(OrsError::InvalidField {
-                        field: "native_worker_claim_executable_binding_projection",
-                        reason: "projection must agree with the original digest and claim identity",
-                    });
-                }
-            }
-            _ => {
-                return Err(OrsError::InvalidField {
-                    field: "native_worker_claim_executable_binding_projection",
-                    reason: "owner digest, full record, and projection must be retained together",
-                });
-            }
-        }
+        self.validate_executable_binding()?;
         if self.worker_generation == 0
             || self.deadline_unix_ms == 0
             || self.authority_epoch == 0
@@ -8698,6 +8595,123 @@ impl NativeWorkerClaimRecord {
                 field: "native_worker_claim_commit_order",
                 reason: "non-terminal states must not carry a commit order",
             });
+        }
+        Ok(())
+    }
+
+    fn validate_executable_binding(&self) -> Result<(), OrsError> {
+        match (
+            &self.executable_binding_digest,
+            &self.executable_binding_record_json,
+            &self.executable_binding_projection,
+        ) {
+            (None, None, None) => {}
+            (Some(digest), Some(record_json), Some(projection)) => {
+                Self::validate_executable_binding_full(digest, record_json, projection)?;
+                if projection.executable_binding_digest != *digest
+                    || projection.claim_id != self.claim_id.as_str()
+                    || projection.registration_id != self.registration_id.as_str()
+                    || projection.task_id != self.task_id.as_str()
+                    || projection.work_scope_id != self.work_scope_id.as_str()
+                    || projection.operation_id != self.operation_id.as_str()
+                    || projection.worker_generation != self.worker_generation
+                    || projection.authority_epoch.sequence.get() != self.authority_epoch
+                    || projection.deadline_unix_ms != self.deadline_unix_ms
+                    || sha256_hex(&canonical_json_bytes(&projection.state_fence).map_err(|_| {
+                        OrsError::InvalidField {
+                            field: "native_worker_claim_executable_binding_projection",
+                            reason: "state fence cannot be canonicalized",
+                        }
+                    })?) != self.fence_digest
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_executable_binding_projection",
+                        reason: "projection must agree with the original digest and claim identity",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_projection",
+                    reason: "owner digest, full record, and projection must be retained together",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_executable_binding_full(
+        digest: &str,
+        record_json: &str,
+        projection: &NativeWorkerClaimExecutableBindingProjection,
+    ) -> Result<(), OrsError> {
+        validate_digest(digest, "native_worker_claim_executable_binding_digest")?;
+        let mut record: Value =
+            serde_json::from_str(record_json).map_err(|_| OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record_json",
+                reason: "owner record is not JSON",
+            })?;
+        let full_record = record.clone();
+        let full_canonical =
+            canonical_json_bytes(&full_record).map_err(|_| OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record_json",
+                reason: "owner record cannot be canonicalized",
+            })?;
+        if String::from_utf8(full_canonical).ok().as_deref() != Some(record_json) {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record_json",
+                reason: "owner record must retain its canonical JSON bytes",
+            });
+        }
+        let object = record.as_object_mut().ok_or(OrsError::InvalidField {
+            field: "native_worker_claim_executable_binding_record_json",
+            reason: "owner record must be a JSON object",
+        })?;
+        let recorded_digest = object
+            .remove("binding_digest")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or(OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record_json",
+                reason: "owner record has no original binding_digest",
+            })?;
+        let expected_digest =
+            sha256_hex(
+                &canonical_json_bytes(&record).map_err(|_| OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_record_json",
+                    reason: "owner record cannot be canonicalized",
+                })?,
+            );
+        if recorded_digest != digest || expected_digest != digest {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_digest",
+                reason: "original owner digest does not match retained full record",
+            });
+        }
+        projection.validate()?;
+        let projected = serde_json::to_value(projection).map_err(|_| OrsError::InvalidField {
+            field: "native_worker_claim_executable_binding_projection",
+            reason: "projection cannot be encoded",
+        })?;
+        let projected_fields = projected.as_object().ok_or(OrsError::InvalidField {
+            field: "native_worker_claim_executable_binding_projection",
+            reason: "projection must be a JSON object",
+        })?;
+        let full_fields = full_record.as_object().ok_or(OrsError::InvalidField {
+            field: "native_worker_claim_executable_binding_record_json",
+            reason: "owner record must be a JSON object",
+        })?;
+        for (field, projected_value) in projected_fields {
+            let original_field = match field.as_str() {
+                "executable_binding_digest" => "binding_digest",
+                "executable_wire_version" => "wire_version",
+                other => other,
+            };
+            if full_fields.get(original_field) != Some(projected_value) {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_projection",
+                    reason: "projection fields must equal the full owner record",
+                });
+            }
         }
         Ok(())
     }
@@ -8799,10 +8813,12 @@ impl NativeWorkerClaimExecutableBindingProjection {
         ] {
             validate_digest(value, field)?;
         }
-        self.state_fence.validate().map_err(|_| OrsError::InvalidField {
-            field: "native_worker_claim_executable_binding_projection",
-            reason: "state fence is invalid",
-        })?;
+        self.state_fence
+            .validate()
+            .map_err(|_| OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_projection",
+                reason: "state fence is invalid",
+            })?;
         if self.worker_generation == 0
             || self.adapter_revision == 0
             || self.grant_graph_revision == 0
