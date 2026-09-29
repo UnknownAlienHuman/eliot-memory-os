@@ -479,7 +479,7 @@ impl RuntimeStateRoots {
                     "profiled roots require a deterministic packages root".to_owned(),
                 )
             })?;
-            hierarchy.push(("profile_root", profile_root));
+            hierarchy.push(("profile_root", profile_root.clone()));
             hierarchy.push(("packages_root", packages_root));
             if self.profile == InstallationProfile::SystemService {
                 let installations_root = PlatformHandle::new(joined_windows_path(
