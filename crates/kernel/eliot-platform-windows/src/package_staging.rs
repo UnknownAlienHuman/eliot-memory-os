@@ -3925,15 +3925,6 @@ fn retain_destination_parent_for_profile(
     })
 }
 
-fn retain_exact_destination_parent(
-    destination_root: &Path,
-) -> Result<(RetainedDestinationParent, PathBuf), PackageStagingError> {
-    retain_exact_destination_parent_for_profile(
-        destination_root,
-        super::InstallerRootProfile::SystemService,
-    )
-}
-
 fn retain_exact_destination_parent_for_profile(
     destination_root: &Path,
     profile: super::InstallerRootProfile,
@@ -4642,7 +4633,7 @@ fn delete_created_directory_object(file: &std::fs::File) {
 /// This is the entry point for callers that hold no retained parent handle.
 /// Production creates with a retained parent use the handle-relative
 /// publication primitive instead; both converge on the same post-create
-/// proof in [`finish_created_directory`].
+/// proof in [`finish_created_directory_for_profile`].
 #[cfg(windows)]
 #[cfg(test)]
 fn nt_create_directory_object(
@@ -4786,18 +4777,6 @@ fn created_parent_handle<'a>(
 /// handle identity, exact final-path binding, installer security descriptor,
 /// and durability flush. Failures delete through the exact created handle.
 #[cfg(windows)]
-fn finish_created_directory(
-    directory: std::fs::File,
-    expected: &Path,
-) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
-    finish_created_directory_for_profile(
-        directory,
-        expected,
-        super::InstallerRootProfile::SystemService,
-    )
-}
-
-#[cfg(windows)]
 fn finish_created_directory_for_profile(
     directory: std::fs::File,
     expected: &Path,
@@ -4836,7 +4815,8 @@ fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingEr
             map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
         })?;
     let root = nt_create_directory_object(&name, &descriptor)?;
-    finish_created_directory(root, path).map(|(file, _, _)| file)
+    finish_created_directory_for_profile(root, path, super::InstallerRootProfile::SystemService)
+        .map(|(file, _, _)| file)
 }
 
 /// Create one generation root as a child of an already-retained destination
@@ -4880,13 +4860,6 @@ fn is_create_new_collision(code: u32) -> bool {
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
 
     code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS
-}
-
-#[cfg(windows)]
-fn create_destination_file(
-    path: &Path,
-) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
-    create_destination_file_for_profile(path, super::InstallerRootProfile::SystemService)
 }
 
 #[cfg(windows)]
@@ -5022,7 +4995,7 @@ fn staging_apply_file_security(
 /// carries DELETE access without delete sharing, so reopening it by path
 /// would fail with a sharing violation while it is live; the relative create
 /// traverses the live handle instead. No delete sharing is added: the child
-/// keeps `FILE_SHARE_READ` only, matching [`create_destination_file`], so the
+/// keeps `FILE_SHARE_READ` only, matching [`create_destination_file_for_profile`], so the
 /// substitution fence is unchanged. A colliding name reports
 /// `GenerationExists` and is never adopted.
 #[cfg(windows)]
@@ -5140,7 +5113,7 @@ fn nt_create_file_relative(
 /// Create one destination file below an already-retained destination parent
 /// handle. The retained parent is pinned through its live handle and never
 /// reopened by path; the byte create then runs the same create-only proof as
-/// [`create_destination_file`].
+/// [`create_destination_file_for_profile`].
 #[cfg(windows)]
 fn create_destination_file_at(
     parent: &std::fs::File,
@@ -5160,13 +5133,6 @@ fn create_destination_file_at(
     _parent: &std::fs::File,
     _path: &Path,
     _profile: super::InstallerRootProfile,
-) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
-    Err(PackageStagingError::UnsupportedPlatform)
-}
-
-#[cfg(not(windows))]
-fn create_destination_file(
-    _path: &Path,
 ) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
 }
@@ -5194,7 +5160,11 @@ fn create_destination_directory(
             map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
         })?;
     let directory = nt_create_directory_object(&name, &descriptor)?;
-    finish_created_directory(directory, path)
+    finish_created_directory_for_profile(
+        directory,
+        path,
+        super::InstallerRootProfile::SystemService,
+    )
 }
 
 /// Create one destination directory as a child of an already-retained
@@ -5651,11 +5621,6 @@ fn read_file_prefix_handle(
 }
 
 #[cfg(windows)]
-fn rollback_created_tree(created: CreatedTree) -> Result<(), PackageStagingError> {
-    rollback_created_tree_for_profile(created, super::InstallerRootProfile::SystemService)
-}
-
-#[cfg(windows)]
 fn rollback_created_tree_for_profile(
     mut created: CreatedTree,
     profile: super::InstallerRootProfile,
@@ -5677,11 +5642,6 @@ fn rollback_created_tree_for_profile(
     }
     let _ = verify_profile_security(profile, &root, true)?;
     delete_open_handle(root, actual)
-}
-
-#[cfg(not(windows))]
-fn rollback_created_tree(_created: CreatedTree) -> Result<(), PackageStagingError> {
-    Err(PackageStagingError::UnsupportedPlatform)
 }
 
 #[cfg(not(windows))]
@@ -7541,7 +7501,10 @@ mod tests {
         ));
         std::fs::create_dir(&root)?;
         let path = root.join("immutable.bin");
-        let (mut first, _) = match create_destination_file(&path) {
+        let (mut first, _) = match create_destination_file_for_profile(
+            &path,
+            super::super::InstallerRootProfile::SystemService,
+        ) {
             Ok(file) => file,
             Err(error) if security_fixture_unavailable(&error) => {
                 // The fixture needs a token able to apply the production
@@ -7556,7 +7519,10 @@ mod tests {
         flush_file_buffers(&first)?;
         drop(first);
         assert!(matches!(
-            create_destination_file(&path),
+            create_destination_file_for_profile(
+                &path,
+                super::super::InstallerRootProfile::SystemService,
+            ),
             Err(PackageStagingError::GenerationExists)
         ));
         assert_eq!(std::fs::read(&path)?, b"sentinel");
@@ -7771,7 +7737,10 @@ mod tests {
         };
         let root_identity = file_identity_from_open_handle(&root_file)?;
         let owned_path = generation.join("owned.bin");
-        let (mut owned_file, owned_identity) = match create_destination_file(&owned_path) {
+        let (mut owned_file, owned_identity) = match create_destination_file_for_profile(
+            &owned_path,
+            super::super::InstallerRootProfile::SystemService,
+        ) {
             Ok(file) => file,
             Err(error) if security_fixture_unavailable(&error) => {
                 delete_open_handle(root_file, root_identity)?;
@@ -7795,7 +7764,10 @@ mod tests {
             }],
         };
         assert_eq!(
-            rollback_created_tree(created),
+            rollback_created_tree_for_profile(
+                created,
+                super::super::InstallerRootProfile::SystemService,
+            ),
             Err(PackageStagingError::RollbackRefused)
         );
         assert!(!owned_path.exists(), "owned file should be removed first");
