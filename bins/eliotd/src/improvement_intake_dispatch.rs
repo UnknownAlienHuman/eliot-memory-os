@@ -172,8 +172,8 @@ use eliot_improvement::candidate_bounds::{
 use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
     ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
-    SafeBoundary, brief_at_safe_boundary, candidate_from_evidence, check_class_gate, classify,
-    is_prohibited_tuning_surface, sourced_evidence,
+    SafeBoundary, SourcedEvidence, brief_at_safe_boundary, candidate_from_evidence, check_class_gate,
+    classify, is_prohibited_tuning_surface, sourced_evidence,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
@@ -293,6 +293,14 @@ pub enum ImprovementDispatchError {
     /// [`CrossTaskAdmissionError`] travels unchanged.
     #[error("improvement cross-task admission: {0}")]
     CrossTask(#[from] CrossTaskAdmissionError),
+    /// The Self-Quality conformance contract refused the diagnosis this
+    /// observation would have produced, or the finding had no usable refs for
+    /// the improvement funnel. The typed [`eliot_self_quality::SelfQualityError`]
+    /// travels unchanged, so a #971 contract rejection and a missing
+    /// improvement-mapping ref stay distinguishable here rather than collapsing
+    /// into one opaque string.
+    #[error("improvement self-quality conformance diagnosis: {0}")]
+    SelfQuality(#[from] eliot_self_quality::SelfQualityError),
     /// The durable learning-record commit was refused.
     #[error("improvement learning-record commit: {0}")]
     Commit(String),
@@ -369,18 +377,35 @@ pub fn assemble_improvement_artifact(
         verifier_refs: vec![format!("maintenance-evaluator:{}", decision.family)],
     };
     let admitted_scope = admitted_fence_ref(state_fence)?;
-    let evidence = sourced_evidence(
-        maintenance_evidence_source(decision),
-        &evidence_refs,
-        &trace_refs,
-        &trigger,
-        &[format!(
-            "unproven-blocked-automation:{}",
-            decision.trigger_id
-        )],
-        &admitted_scope,
-        IMPROVEMENT_OWNER,
-    )?;
+    // The evidence bundle is selected by the DERIVED source, not asserted
+    // (issue #1867 W2). Every source but one is the maintenance occurrence
+    // itself, and is assembled by the funnel's own validated constructor. The
+    // conformance-audit source is different in kind: I12.24:50 names the
+    // trigger "Architecture/Implementation/runtime conformance gap", so that
+    // evidence enters the funnel through the Self-Quality conformance
+    // diagnosis contract, which owns the finding's inert owner handoff
+    // (`eliot_self_quality::conformance_evidence`), rather than being labelled
+    // as a maintenance occurrence and losing the conformance owner, the
+    // priority axis and the invalidation set the finding recorded. Both arms
+    // terminate in the same `eliot_improvement::sourced_evidence` validation,
+    // so neither can bypass it.
+    let evidence = match maintenance_evidence_source(decision) {
+        EvidenceSource::ConformanceDiagnosis => {
+            conformance_diagnosis_evidence(decision, &trigger, &admitted_scope)?
+        }
+        source => sourced_evidence(
+            source,
+            &evidence_refs,
+            &trace_refs,
+            &trigger,
+            &[format!(
+                "unproven-blocked-automation:{}",
+                decision.trigger_id
+            )],
+            &admitted_scope,
+            IMPROVEMENT_OWNER,
+        )?,
+    };
 
     let mut candidate = candidate_from_evidence(
         SERVICE_NAME,
@@ -607,6 +632,100 @@ fn refused_by_evaluator(
                 | DecisionReason::UserSessionRequired
         )
     )
+}
+
+/// Projects one conformance-audit observation into the Self-Quality
+/// conformance-diagnosis evidence bundle the improvement funnel takes
+/// (issue #1867 W2/A1, I12.24:50).
+///
+/// # Why the Self-Quality contract and not a label
+///
+/// [`maintenance_evidence_source`] classifies the observation; this function
+/// is what the classification MEANS. A conformance-audit occurrence is not a
+/// maintenance occurrence with a different tag, so the evidence that enters
+/// the funnel is the finding the conformance owner recorded: the routed owner,
+/// the priority axis, the constraint refs and the invalidation set all come
+/// from the decision's own closed fields, and the finding is assembled and
+/// validated by `eliot_self_quality::conformance_evidence` through the
+/// normative `validate_handoff` and then the funnel's own `sourced_evidence`.
+/// Nothing here fabricates a cause: every symptom ref is projected as an
+/// `unproven-symptom:{ref}` hypothesis, so a diagnosis never states a proven
+/// cause it did not observe.
+///
+/// # Every ref is a decision field, never a literal
+///
+/// * `handoff_ref` is the Governor owner's own `trigger_id`;
+/// * symptom and evidence refs are that same `trigger_id` and the decision's
+///   own `scope_ref`, so two evaluations of the same occurrence converge on one
+///   finding rather than minting a new one per cadence tick;
+/// * the problem ref is the decision's own `family`;
+/// * the constraint ref names the family's own evaluator, the same identity
+///   `ReplayPlan::verifier_refs` binds;
+/// * the invalidation set is the admitted fence ref
+///   ([`admitted_fence_ref`]), so the finding is explicitly invalidated when
+///   the authority epoch or resource generation it was observed under moves.
+///
+/// Each ref set is unique by construction, which `validate_handoff` requires
+/// (`make_handoff` sorts but does not de-duplicate).
+fn conformance_diagnosis_evidence(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    trigger_problem_or_metric: &str,
+    validity_scope: &str,
+) -> Result<SourcedEvidence, ImprovementDispatchError> {
+    use eliot_self_quality::{ConformanceDiagnosis, SelfQualityHandoffOwner};
+    let finding = ConformanceDiagnosis {
+        handoff_ref: format!("self-quality-handoff:{}", decision.trigger_id),
+        // The routing table's own default owner for a conformance-dimension
+        // finding with no counterevidence and no special family
+        // (`routing.rs::route_owner`, rules 1-9 miss, rule 10 default), i.e.
+        // the owner a real conformance finding reaches. `route_owner` itself is
+        // not called here because it takes a `SelfQualityObservation` and this
+        // daemon holds no frozen #820 observation snapshot; the same default is
+        // named rather than re-derived.
+        owner: SelfQualityHandoffOwner::DevelopmentDiagnosis675,
+        priority: conformance_priority(decision),
+        symptom_refs: vec![format!("maintenance-trigger:{}", decision.trigger_id)],
+        problem_refs: vec![format!("maintenance-family:{}", decision.family)],
+        evidence_refs: vec![
+            format!("maintenance-trigger:{}", decision.trigger_id),
+            format!("maintenance-scope:{}", decision.scope_ref),
+        ],
+        missing_evidence_refs: Vec::new(),
+        applicability_refs: vec![format!("maintenance-scope:{}", decision.scope_ref)],
+        constraint_refs: vec![format!("maintenance-evaluator:{}", decision.family)],
+        invalidation_set: vec![validity_scope.to_owned()],
+        trigger_problem_or_metric: trigger_problem_or_metric.to_owned(),
+        validity_scope: validity_scope.to_owned(),
+    };
+    Ok(eliot_self_quality::sourced_evidence_from_conformance_diagnosis(
+        &finding,
+    )?)
+}
+
+/// The priority axis this daemon assigns a conformance finding, DERIVED from
+/// the Governor owner's own closed decision rather than spelled.
+///
+/// `ASSUMPTION:` the maintenance `AutomationDecision` names the urgency the
+/// owner itself assigned: `Escalate` is documented as "Escalate to a Human or
+/// recovery owner" (`eliot-maintenance/src/lib.rs:194`) and `Block` as
+/// "Policy, route, budget or session requirements deny execution" (`:192`), so
+/// those two map to `Urgent` and `High` and every remaining decision
+/// (`Start`, `Suggest`, `Defer`, `SuppressDuplicate`, none of which hands the
+/// occurrence to a Human or a recovery owner) maps to `Medium`. I12.24 does
+/// not name a priority for conformance evidence, and priority is an independent
+/// axis that never substitutes for status or severity
+/// (`self_quality.rs:176-177`), so this derives the owner's escalation and
+/// claims nothing about severity.
+fn conformance_priority(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> eliot_self_quality::Priority {
+    use eliot_maintenance::AutomationDecision;
+    use eliot_self_quality::Priority;
+    match decision.decision {
+        AutomationDecision::Escalate => Priority::Urgent,
+        AutomationDecision::Block => Priority::High,
+        _ => Priority::Medium,
+    }
 }
 
 /// The bound the maintenance (`G-19`) owner decides for this surface, read

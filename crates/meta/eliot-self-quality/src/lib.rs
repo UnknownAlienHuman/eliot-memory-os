@@ -13,12 +13,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod conformance_evidence;
 pub mod diagnose;
 pub mod error;
 pub mod identity;
 pub mod improvement_handoff;
 pub mod routing;
 
+pub use conformance_evidence::{ConformanceDiagnosis, sourced_evidence_from_conformance_diagnosis};
 pub use diagnose::{SelfQualityOutcome, diagnose_self_quality};
 pub use error::SelfQualityError;
 pub use identity::{
