@@ -22,19 +22,21 @@ Closed classifications (exactly one per candidate row):
   append-only durable segmented retention | unbounded long-lived candidate |
   ownership/lifetime unknown | unrelated false positive
 
-Classification rules (RULE_REVISION 885.1, first match wins, evidence kept):
+Classification rules (RULE_REVISION 885.2, first match wins, evidence kept):
   1. test-only signals (tests/ path, test file name, cfg(test)) -> test-only
   2. function-local `let` binding (grown or not) -> request-local
   3. TTL/lease/expiry signal + production scheduled bounded cleanup owner -> TTL/lease
   4. append/segment/rotation signal + production retention evidence -> append-only retention
   5. production compaction callsite outside the declaring file -> external compaction
-  6. versioned policy/config bound evidence -> versioned-policy-bounded
-  7. literal with_capacity bound + production same-slice removal -> long-lived hard-bounded
-  8. production same-slice removal/retain/clear/drain without hard bound -> lifecycle-removal
-  9. static/global item with growth -> unbounded long-lived candidate
-  10. long-lived struct field with growth, no bound/removal -> unbounded candidate
-  11. collection-typed field with no observable owner/growth -> ownership unknown
-  12. otherwise -> unrelated false positive (with evidence, never silent)
+  6. preallocation (with_capacity), policy-like names, and bare removal-method
+     presence are discovery evidence only: never a hard/configured bound and
+     never none-required by themselves (audit 5885377544; with_capacity is not
+     a maximum length, an unscheduled cleanup proves no cardinality limit)
+  7. static/global item with growth -> unbounded long-lived candidate
+  8. long-lived struct field with growth, no proven guard/eviction/cleanup
+     obligation on every growth path -> unbounded candidate
+  9. collection-typed field with no observable owner/growth -> ownership unknown
+  10. otherwise -> unrelated false positive (with evidence, never silent)
 
 Test-only removal proves no production bound; cfg-gated removal has unknown
 production reachability and stays unknown (matrix-14/15). Unbounded/unknown
@@ -61,7 +63,7 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.long-lived-collection-inventory.v1"
-RULE_REVISION = "885.1"
+RULE_REVISION = "885.2"
 TOOL_VERSION = "0.1.0"
 OWNED_TOML = Path(".github/work-units/long-lived-collection-inventory.toml")
 PROOF_CEILING = "STATIC_SOURCE_CLASSIFICATION_ONLY"
@@ -421,15 +423,30 @@ def _toml_str_list(values: list[str]) -> str:
 def _callsites_for(
     masked_lines: list[str], ident: str, methods: tuple[str, ...], rel: str
 ) -> list[str]:
-    """Associate `ident.method(` callsites on lines mentioning the identifier."""
-    ident_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(ident) + r"(?![A-Za-z0-9_])")
+    """Associate `ident.method(` callsites where `ident` is the call receiver.
+
+    A callsite counts only when the identifier is the direct receiver of the
+    method call (``ident.method(`` up to whitespace), not when the identifier
+    and a growth/removal method merely share a line. Same-line coincidence,
+    other-owner receivers, and unattributed file-wide signals are not
+    attributed here; downstream classification keeps such rows explicitly
+    unresolved while retaining the observed details in row evidence.
+    """
+    ordered_methods = sorted(methods, key=len, reverse=True)
+    call_re = re.compile(
+        r"(?<![A-Za-z0-9_])"
+        + re.escape(ident)
+        + r"\s*\.\s*("
+        + "|".join(re.escape(method) for method in ordered_methods)
+        + r")\s*(?:::|<|\()"
+    )
     found: list[str] = []
     for lineno, line in enumerate(masked_lines, start=1):
-        if not ident_re.search(line):
+        if call_re.search(line) is None:
             continue
-        for method in methods:
-            if re.search(r"\.\s*" + re.escape(method) + r"\s*(?:::|<|\()", line):
-                found.append(f"{rel}:{lineno}:{method}")
+        for match in call_re.finditer(line):
+            found.append(f"{rel}:{lineno}:{match.group(1)}")
+        # Same-line coincidence without an ident.receiver match is ignored here.
     # Preserve first-seen order, drop exact duplicates.
     seen: set[str] = set()
     ordered: list[str] = []
@@ -683,6 +700,30 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
     )
     with_cap = re.search(r"with_capacity\s*\(\s*(\d+)\s*\)", "\n".join(masked_lines))
     scheduled = _has_scheduled_cleanup(prod_lines)
+    # Audit 5885377544: preallocation (with_capacity), policy-like names, and
+    # bare removal-method presence are discovery evidence only. They never by
+    # themselves produce a hard/configured bound or none-required; only exactly
+    # attributed receiver-matched evidence on the owner/field growth path may
+    # support a positive bounded classification. Uncertain rows stay explicitly
+    # unresolved while retaining the observed details below.
+    discovery_notes: list[str] = []
+    if with_cap:
+        discovery_notes.append(
+            f"observed preallocation with_capacity({with_cap.group(1)}) in file"
+            " slice: discovery evidence only, not a maximum length"
+        )
+    if policy_signal:
+        discovery_notes.append(
+            "policy-like name signal without an enforced limit:"
+            " discovery evidence only, not a configured bound"
+        )
+    if production:
+        discovery_notes.append(
+            f"observed production receiver-matched removal {production} without"
+            " a proven guard/eviction/cleanup obligation on every growth path:"
+            " discovery evidence only, not boundedness proof"
+        )
+    discovery = ("; " + "; ".join(discovery_notes)) if discovery_notes else ""
 
     if bool(item["test_signal"]):
         return (
@@ -747,40 +788,52 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             + excluded_note,
         )
 
-    if policy_signal and (growth or production):
+    if policy_signal and growth:
         return (
-            "versioned-policy-bounded",
-            "policy/config bound reference in slice",
-            "configured",
-            "policy-defined",
-            "none-required",
-            "versioned policy/config bound signal; empirical status preserved, not proven here",
+            "unbounded long-lived candidate",
+            "none-observed",
+            "none",
+            "policy-name signal only; no enforced limit proven",
+            "UNRESOLVED",
+            "policy-like name with long-lived growth but no enforced limit proven;"
+            + discovery
+            + excluded_note
+            + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
 
-    if with_cap and production:
+    if with_cap and production and growth:
         return (
-            "long-lived hard-bounded",
-            f"with_capacity({with_cap.group(1)})",
-            "hard",
-            "in-memory-only (no persistence signal in slice)"
-            if not item["serde_signal"]
-            else "persisted/restart-amplified (serde derive signal in slice)",
-            "none-required",
-            f"literal with_capacity({with_cap.group(1)}) with production same-slice removal"
-            f" {production}" + excluded_note,
-        )
-
-    if production and growth:
-        return (
-            "lifecycle-removal",
+            "unbounded long-lived candidate",
             "none-observed",
             "none",
             "in-memory-only (no persistence signal in slice)"
             if not item["serde_signal"]
             else "persisted/restart-amplified (serde derive signal in slice)",
-            "none-required",
-            f"production same-slice removal/retain/clear/drain {production} bounds growth"
-            f" {growth}" + excluded_note,
+            "UNRESOLVED",
+            f"long-lived growth {growth} with observed preallocation"
+            f" with_capacity({with_cap.group(1)}) and production removal {production},"
+            " neither of which proves a maximum length or a scheduled cardinality"
+            " limit (audit 5885377544)"
+            + discovery
+            + excluded_note
+            + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
+        )
+
+    if production and growth:
+        return (
+            "unbounded long-lived candidate",
+            "none-observed",
+            "none",
+            "in-memory-only (no persistence signal in slice)"
+            if not item["serde_signal"]
+            else "persisted/restart-amplified (serde derive signal in slice)",
+            "UNRESOLVED",
+            f"long-lived growth {growth} with observed production removal {production}"
+            " that proves no guard/eviction/cleanup obligation on every growth"
+            " path (audit 5885377544)"
+            + discovery
+            + excluded_note
+            + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
 
     if item["kind"] == "static" and growth:
@@ -790,7 +843,7 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "none",
             "process-global; restart amplification unknown from this slice",
             "UNRESOLVED",
-            f"static/global growth {growth} with no production bound or removal in scanned slice"
+            f"static/global growth {growth} with no proven bound in scanned slice" + discovery
             + excluded_note
             + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
@@ -807,8 +860,8 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "none",
             detail,
             "UNRESOLVED",
-            f"long-lived growth {growth} with no production bound, removal, TTL, compaction,"
-            " or policy evidence in scanned slice"
+            f"long-lived growth {growth} with no proven bound in scanned slice" + discovery
+            + " (any ttl/compaction/retention signal proved no guard obligation)"
             + excluded_note
             + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
@@ -820,8 +873,8 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "unknown",
             "unknown from this slice",
             "UNRESOLVED",
-            "collection-typed owner with no growth callsite in scanned slice; "
-            "cross-impl/cross-module growth possible; static uncertainty stays explicit"
+            "collection-typed owner with no receiver-matched growth callsite in scanned slice; "
+            "cross-impl/cross-module growth possible; static uncertainty stays explicit" + discovery
             + excluded_note
             + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
@@ -896,6 +949,14 @@ def _cross_file_removal(
             continue
         owner_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(owner_token) + r"(?![A-Za-z0-9_])")
         field_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(field_token) + r"(?![A-Za-z0-9_])")
+        cross_methods = sorted(REMOVAL_METHODS, key=len, reverse=True)
+        cross_re = re.compile(
+            r"(?<![A-Za-z0-9_])"
+            + re.escape(field_token)
+            + r"\s*\.\s*("
+            + "|".join(re.escape(method) for method in cross_methods)
+            + r")\s*(?:::|<|\()"
+        )
         hits = item["removal_callsites"]
         assert isinstance(hits, list)
         prod = item["production_removal"]
@@ -910,8 +971,8 @@ def _cross_file_removal(
             for lineno, line in enumerate(other_lines, start=1):
                 if not owner_re.search(line) or not field_re.search(line):
                     continue
-                for method in REMOVAL_METHODS:
-                    if re.search(r"\.\s*" + re.escape(method) + r"\s*(?:::|<|\()", line):
+                for match in cross_re.finditer(line):
+                    for method in (match.group(1),):
                         hit = f"{other}:{lineno}:{method} (cross-file)"
                         if hit not in hits:
                             hits.append(hit)
