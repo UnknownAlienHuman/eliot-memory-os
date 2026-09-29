@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 
-use super::{DependencyVersion, SkillError, SkillScope, SkillStatus};
+use super::{DependencyVersion, PromotionGate, SkillCandidate, SkillError, SkillScope, SkillStatus};
 
 /// Maximum visible characters for one index trigger line (`I7.12`).
 pub const MAX_TRIGGER_CHARS: usize = 140;
@@ -1070,6 +1070,32 @@ impl SkillCatalogue {
         }
     }
 
+    /// Promotes a provisional entry through the validated promotion gate
+    /// (`I7.13`, issue #1882 W2): the bridge activation path reaches Material
+    /// use only past `eliot-skill` validation, so catalogue promotion binds
+    /// the same [`PromotionGate`] the lifecycle owner enforces. The candidate
+    /// and gate are validated together ([`PromotionGate::validate_for`]:
+    /// candidate shape, gate↔candidate digest binding, fence, reversibility,
+    /// and route-proportional depth), the candidate must name this exact
+    /// entry, and the bound evidence then promotes through
+    /// [`promote`](Self::promote). A promotion that never passed the gate
+    /// cannot mint `Current`: without this binding the entry stays
+    /// provisional and its delivery carries the provisional ceiling.
+    pub fn promote_gated(
+        &mut self,
+        skill_id: &str,
+        candidate: &SkillCandidate,
+        gate: &PromotionGate,
+        evidence: &PromotionEvidence,
+    ) -> Result<(), SkillError> {
+        candidate.validate()?;
+        gate.validate_for(candidate)?;
+        if candidate.base_skill_ref.skill_id() != skill_id {
+            return Err(SkillError::IdentityMismatch);
+        }
+        self.promote(skill_id, evidence)
+    }
+
     /// Fail-closed use gate: unknown, invalid, or non-current/provisional
     /// entries are blocked. A stale entry stays blocked until its dependency
     /// drift is reviewed and re-admitted as a new validated revision.
@@ -1102,6 +1128,20 @@ impl SkillCatalogue {
             return Err(SkillError::InvalidField {
                 field: "entry.status",
                 reason: "stale or retired Skills are blocked from use",
+            });
+        }
+        // Promotion-gate binding on the bridge activation entry (issue #1882
+        // W2/A4): `Current` is earned only through the evidence path
+        // (`promote`/`promote_gated` persist the bound promotion record while
+        // install and stale revalidation land on `Provisional`). A `Current`
+        // entry carrying no promotion evidence never passed promotion
+        // validation, so it is unvalidated and cannot reach Material use;
+        // bounded use stays `Provisional` with its provisional delivery
+        // ceiling.
+        if entry.status == SkillStatus::Current && entry.promotion_evidence.is_none() {
+            return Err(SkillError::InvalidField {
+                field: "entry.promotion_evidence",
+                reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
             });
         }
         receipt.validate()?;
