@@ -5734,7 +5734,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// a cleared projection never means a cleared owner.
     pub fn install_admitted_work_scope_owner(
         &mut self,
-        owner: WorkScopeBindingOwner,
+        owner: &WorkScopeBindingOwner,
     ) -> Result<WorkScopeBindingSnapshot, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -5847,8 +5847,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::ScopeQuarantineUnresolved {
                 scope_ref: scope_ref.to_owned(),
-                unresolved: usize::try_from(snapshot.unresolved_quarantine.len())
-                    .unwrap_or(usize::MAX),
+                unresolved: snapshot.unresolved_quarantine.len(),
                 triggers: snapshot
                     .unresolved_quarantine
                     .iter()
