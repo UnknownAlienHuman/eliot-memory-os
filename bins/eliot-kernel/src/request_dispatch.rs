@@ -2515,23 +2515,35 @@ impl KernelComposition {
     /// caller is admitted for the front door, by [`admit_backup_caller`] and by
     /// `verify_only`'s own `require_capture_admitted`, before this function runs;
     /// (b) the caller is in the same `WorkScope` and on the same authority LINEAGE as
-    /// the named predecessor; and (c) the named predecessor is a real stored
+    /// the named predecessor; (c) the named predecessor is a real stored
     /// `backup.verify` row in this ORS file, whose canonical request hash — which
     /// covers its PRINCIPAL, `WorkScope`, operation id and archive provenance, and
-    /// provably NOT its session — is exactly the one presented, and whose archive is
-    /// exactly the one presented. The predecessor's own SESSION is deliberately not
+    /// provably NOT its session — is exactly the one presented; and (d) the capture
+    /// owner, re-deciding the bytes this call presented, re-proves that this is the
+    /// SAME operation the row holds, over the whole archive content rather than over
+    /// one correlation value — see [`owner_reproves_predecessor_operation`]. The
+    /// predecessor's own SESSION is deliberately not
     /// required to match and is deliberately not covered by the hash, and the
     /// justification is not a claim that the hash names it: a new session inheriting
     /// a prior session's operation is the ENTIRE POINT of a succession, so requiring
     /// session equality would make every reconciliation impossible.
     ///
-    /// What it does NOT prove is that the owner would authorise THIS caller to
-    /// reconcile THAT operation, because no owner issues a backup-verify succession
-    /// or reconciliation receipt on this product. That owner is
-    /// `backup-capture-owner (#959)`, which is OPEN. Instruction 4's
-    /// "owner-authorized" half is therefore NOT met on this product, and it cannot
-    /// be met here without inventing a capability, a receipt type, or an owner value
-    /// that does not exist.
+    /// (d) is what separates this from a successor that is merely ACCEPTED because
+    /// the pair it presented is well formed. The pair is a pointer: both halves were
+    /// on the wire in the predecessor's own `ok` reply, so nothing about their shape
+    /// or their value authorizes anything. What authorizes the read is that the OWNER
+    /// re-decided this archive and reached the same archive identity, declared
+    /// source and owner contract, export and archived fence digests, evidenced
+    /// class, evidence level and class ceiling, publication receipt and independent
+    /// member denominators the row recorded.
+    ///
+    /// What it still does NOT prove is that the owner would authorise a REPEAT
+    /// reconciliation by the same caller: no owner issues a one-shot backup-verify
+    /// succession or reconciliation receipt on this product, so the pair may be
+    /// replayed for as long as the row lives. That residual belongs to
+    /// `backup-capture-owner (#959)`, which is OPEN, and closing it would mean
+    /// inventing a capability, a receipt type or an owner value that does not exist
+    /// — not something this issue's own scope may add.
     ///
     /// # OPEN POINT FOR THE OWNER — the issue's clause-1 phrase. Clause 1 says "two
     /// authenticated principals OR SESSIONS" may use the same human idempotency text
