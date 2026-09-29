@@ -5011,6 +5011,27 @@ pub enum OrdinaryDriveError {
     Drive(DriveError),
     /// The bounded request loop failed closed.
     Loop(LoopError),
+    /// The bounded request loop failed after producing an observation report.
+    /// The report crosses the ordinary-driver boundary intact so the process
+    /// caller can recover the exact sequence even if stdout delivery and the
+    /// claim-bound result write both failed. This carries the existing report;
+    /// it does not create another owner record or acknowledge the delivery.
+    LoopFailed(RequestLoopReport),
+}
+
+impl OrdinaryDriveError {
+    /// Returns the full process-level report when a request-loop failure
+    /// crosses the ordinary-driver boundary.
+    #[must_use]
+    pub fn request_loop_report(&self) -> Option<&RequestLoopReport> {
+        match self {
+            Self::LoopFailed(report) => Some(report),
+            Self::NoDeliverySet
+            | Self::DeliveryInProgress { .. }
+            | Self::Drive(_)
+            | Self::Loop(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for OrdinaryDriveError {
@@ -5020,6 +5041,12 @@ impl fmt::Display for OrdinaryDriveError {
             Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
             Self::Drive(error) => write!(formatter, "{error}"),
             Self::Loop(error) => write!(formatter, "{error}"),
+            Self::LoopFailed(report) => match report.completion() {
+                LoopCompletion::Failed { failure } => write!(formatter, "{failure}"),
+                LoopCompletion::Served => {
+                    formatter.write_str("ORDINARY_LOOP_FAILURE_REPORT_INVALID")
+                }
+            },
         }
     }
 }
@@ -5362,9 +5389,14 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
             seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
             Ok(terminal.clone())
         }
-        LoopCompletion::Failed { failure } => {
+        LoopCompletion::Failed { .. } => {
             hand_off_observed_sequence(&directory, &claim, report.retained());
-            Err(OrdinaryDriveError::Loop(*failure))
+            // Preserve the complete in-memory report across the process
+            // caller boundary. The best-effort write above may fail for the
+            // same reason the loop's result persistence failed, so returning
+            // only `failure` here would discard the last copy of the exact
+            // observed sequence when this function unwinds.
+            Err(OrdinaryDriveError::LoopFailed(report))
         }
     }
 }
