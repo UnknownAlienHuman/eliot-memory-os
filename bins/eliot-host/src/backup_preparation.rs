@@ -84,27 +84,27 @@
 //! [`PreparationError::InvalidRequest`] with the `owner_lease_ref` field when it
 //! differs, so a stale or foreign lease cannot reach a receipt.
 //!
-//! The projection still **refuses** a presented purge-ledger revision or
-//! forensic audit note, and both refusals are backed by a proved **producer**
-//! absence rather than by a value this module declined to read:
+//! The projection still **refuses** a presented purge-ledger revision, and that
+//! refusal is backed by a proved **producer** absence rather than by a value
+//! this module declined to read: the purge revision belongs to the ORS owner
+//! (`RedbRecoveryStore::purge_ledger_revision`). This module holds no ORS
+//! handle, and it must not open one: `crates/storage/AGENTS.md` forbids a
+//! second *mutable* root owner, so the composition reads the installation
+//! registry and nothing else. The unblocking seam is named in
+//! [`crate::backup_config_projection::project_backup_config_owner_bound`].
 //!
-//! - the purge revision belongs to the ORS owner
-//!   (`RedbRecoveryStore::purge_ledger_revision`). This module holds no ORS
-//!   handle, and it must not open one: `crates/storage/AGENTS.md` forbids a
-//!   second *mutable* root owner, so the composition reads the installation
-//!   registry and nothing else. The unblocking seam is named in
-//!   [`crate::backup_config_projection::project_backup_config_owner_bound`];
-//!
-//! - a forensic note has no producer to read one from:
-//!   `eliot_backup::HostStateAuditFence` is built only in `#[cfg(test)]`
-//!   fixtures, and in production the fence is a caller-presented optional field
-//!   of `eliot_kernel::backup_capture::CaptureRequest`.
-//!
-//! This module passes those presented values through so the refusal is real, and
-//! it never renders a caller-authored forensic note into a receipt:
+//! The forensic audit note is no longer refused, because it no longer has to be:
+//! [`OwnerEvidence::owner_audit_note`] derives it from the validated
+//! installation lineage this owner actually read, so a presented note is a
+//! **claim** checked against the owner's rather than the only candidate, and
+//! caller-authored disposition text cannot reach a receipt. The owner-issued
+//! note is bound into the projection digest only; this module passes the
+//! presented value through so the comparison is real, and it never renders a
+//! forensic note into a receipt:
 //! [`DestinationAdmission::audit_fence_note`] and
 //! [`PreparedDestination::audit_fence_note`] are therefore always absent here.
-//! I5.13 keeps the HostStateAuditFence optional for exactly this reason. No
+//! I5.13 keeps the HostStateAuditFence forensic and optional for exactly this
+//! reason. No
 //! credential or secret material is read or projected: the committed fence's
 //! `credential_receipt_digest` and `host_process_nonce_digest` are visible on a
 //! record this module reads and are deliberately not extracted.
@@ -2474,13 +2474,16 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
 /// profile token or the preparation is refused. A presented owner lease
 /// reference is a claim that must equal [`OwnerEvidence::owner_lease_ref`] or
 /// the preparation is refused as stale evidence; the projected lease reference
-/// is always the owner-issued one. A presented purge-ledger revision or forensic
-/// audit note is **refused outright**, because no owner reachable from Host
-/// issues or corroborates either — purge-ledger authority belongs to the ORS
-/// purge-ledger owner, which this module does not open, and #954 (merged,
-/// `5e71386a`) supplies neither an owner lease nor a purge revision: its
-/// `BackupAdmissionRef` is a per-operation admission reference, not a standing
-/// owner lease. The presented
+/// is always the owner-issued one. A presented purge-ledger revision is
+/// **refused outright**, because no owner reachable from Host issues one —
+/// purge-ledger authority belongs to the ORS purge-ledger owner, which this
+/// module does not open — and #954 (merged, `5e71386a`) supplies neither an
+/// owner lease nor a purge revision: its `BackupAdmissionRef` is a
+/// per-operation admission reference, not a standing owner lease. A presented
+/// forensic audit note is a **claim** that must equal
+/// [`OwnerEvidence::owner_audit_note`] or the preparation is refused as stale
+/// evidence, and the owner-issued note is what the projection digest binds. The
+/// presented
 /// `authority_generation` is read nowhere on this path: this lane grants it
 /// nothing, and the admission carries the owner-issued one instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2549,14 +2552,16 @@ pub struct PresentedPreparationRequest {
     pub build_digests: Vec<String>,
     /// Optional forensic Host state audit note.
     ///
-    /// Presenting one is **refused** by the owner-bound configuration projection:
-    /// nothing here compares its digest or observed dispositions to Host state,
-    /// so it is never bound into a projection digest nor rendered into a
-    /// prepared-destination receipt. I5.13 keeps that fence optional, and this
-    /// refusal is stronger than the note's own typed non-authoritative ceiling
-    /// (`crate::backup_config_projection::AuditFenceNote::validate`): a
-    /// lease/grant/current-state assertion is unreachable here rather than
-    /// merely refused when asserted.
+    /// A **claim** on the delegated path, never the source of the note: the
+    /// owner-bound configuration projection compares it against
+    /// [`OwnerEvidence::owner_audit_note`] and refuses a note that differs from
+    /// the owner's as stale evidence, so caller-authored disposition text can
+    /// never reach a receipt. It is still never *rendered* into a
+    /// prepared-destination receipt — the owner-issued note is bound into the
+    /// projection digest only — and I5.13's ceiling that the fence is forensic
+    /// and never a lease, grant or current-state assertion is enforced on both
+    /// sides by
+    /// `crate::backup_config_projection::AuditFenceNote::validate`.
     pub audit_fence_note: Option<AuditFenceNote>,
     /// Opaque caller-presented entropy text.
     ///
@@ -2713,11 +2718,14 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
             authority_generation: evidence.authority_generation(),
             manifest_digest: projection.manifest_digest.clone(),
             config_projection_digest: projection.projection_digest.clone(),
-            // No caller-authored forensic note can reach a receipt: a presented
-            // one was refused by the projection above, and `validate_admission`
-            // refuses it independently. `describe_audit_fence` is therefore not
-            // called from this path — an unverified disposition claim must not
-            // be published under a forensic label.
+            // Still no forensic note in a receipt. The projection bound an
+            // OWNER-ISSUED note into `config_projection_digest`, but its text is
+            // not restated here, and a presented note that differed from the
+            // owner's was already refused by the projection above;
+            // `validate_admission` refuses one independently.
+            // `describe_audit_fence` is therefore not called from this path — a
+            // digest commits to the note without publishing its wording, which
+            // is what keeps forensic text out of a receipt and out of the log.
             audit_fence_note: None,
             authority_nonce: request.authority_nonce.clone(),
             state_fence_digest: request.state_fence_digest.clone(),
@@ -3151,6 +3159,152 @@ impl OwnerEvidence {
         }
     }
 
+    /// Returns the **owner-issued** forensic audit note for this installation
+    /// lineage (I5.13:44, A13.7).
+    ///
+    /// The note is derived here, at issue time, from the records this bundle
+    /// already holds and proved: the registry projection read through the
+    /// read-only owner query, its active approved generation, the committed
+    /// activation fence, and the registry CAS revision
+    /// ([`OwnerEvidence::revision`]). Every one of those is owner-observed
+    /// durable state, so the note **describes** owner evidence instead of
+    /// claiming it — which is the distinction that was missing when this
+    /// function did not exist and every presented note had to be refused.
+    ///
+    /// Deliberately NOT `eliot_backup::HostStateAuditFence`: that type and
+    /// `eliot_protocol::backup::HostAuditRef` are built only in `#[cfg(test)]`
+    /// fixtures, and in production that fence is a caller-presented optional
+    /// field of `eliot_kernel::backup_capture::CaptureRequest`. Copying its
+    /// shape here would reproduce a caller-authored note under an owner-issued
+    /// name, which is the fabrication I5.13 forbids. The lineage digest below
+    /// is a **new** domain-separated digest over owner-observed facts, not a
+    /// value copied from any record, and nothing here recomputes a digest an
+    /// owner recorded: each fact is either a handle the registry validated or a
+    /// counter it maintains.
+    ///
+    /// That digest is not an added layer. `AuditFenceNote::note_digest` is an
+    /// existing required field of the existing note type, so a note cannot exist
+    /// without a value in it, and the three choices are "caller's text", "a
+    /// constant", or "a digest over what the owner read". This is the third, and
+    /// it is built with the module's existing `hash_field` canonical encoding and
+    /// its own disjoint domain separator, so no new hashing scheme, key, MAC or
+    /// nonce is introduced and no existing one is reused for a second purpose.
+    ///
+    /// The observed dispositions are bounded, non-secret descriptions of what
+    /// the registry actually shows. They are labels over owner-read facts, not
+    /// claims a reader must trust: the note carries no lease, grant, generation,
+    /// epoch or state field, so it cannot be read as one.
+    /// [`AuditFenceNote::active_authority_restored`] is left `false`, which is
+    /// the ceiling I5.13 requires and the value
+    /// [`AuditFenceNote::validate`] requires for an admissible note; the
+    /// projector re-validates it, so this cannot be relaxed here.
+    ///
+    /// What this does **not** claim: the note is a snapshot of the lineage as
+    /// observed at inspection. It is not re-read at projection time, so it does
+    /// not prove the lineage is unmoved between the two — the registry revision
+    /// comparison at `HostComposition` is what covers that window, exactly as it
+    /// does for every other fact in this bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparationError::InvalidRequest`] if the derived note fails
+    /// [`AuditFenceNote::validate`] — a disposition this function composed that
+    /// is not bounded printable text. It cannot happen for the committed
+    /// lineage (every disposition is built from a registry handle or a counter
+    /// the registry validated), so the arm is a fail-closed guard rather than an
+    /// expected outcome; a note that failed shape must not reach a projection,
+    /// and this is the owner boundary where that is decided.
+    pub fn owner_audit_note(&self) -> Result<AuditFenceNote, PreparationError> {
+        let mut dispositions = Vec::new();
+        if let Some(active) = self.registry.active_generation() {
+            dispositions.push(format!("active_generation:{}", active.as_str()));
+        }
+        if let Some(last_known_good) = self.registry.last_known_good_generation() {
+            dispositions.push(format!(
+                "last_known_good_generation:{}",
+                last_known_good.as_str()
+            ));
+        }
+        dispositions.push(format!("registry_revision:{}", self.registry.revision()));
+        dispositions.push(format!(
+            "committed_generation:{}",
+            self.approved.manifest.generation.as_str()
+        ));
+        dispositions.push(format!(
+            "authority_generation:{}",
+            self.fence.authority_generation.value()
+        ));
+        dispositions.push(format!(
+            "config_digest:{}",
+            self.fence.config_digest.as_str()
+        ));
+        let mut hasher = Sha256::new();
+        // A new domain separator, disjoint from every other digest in this
+        // module and from the projection digest's own `v6` separator, so a
+        // lineage digest can never be read as a projection digest.
+        hasher.update(b"eliot.backup.host-audit-lineage.v1\0");
+        hash_field(
+            &mut hasher,
+            b"registry_wire_version",
+            self.registry.registry_wire_version().as_string().as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"registry_revision",
+            &self.registry.revision().to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"active_generation",
+            self.registry
+                .active_generation()
+                .map_or("", |handle| handle.as_str())
+                .as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"last_known_good_generation",
+            self.registry
+                .last_known_good_generation()
+                .map_or("", |handle| handle.as_str())
+                .as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"committed_generation",
+            self.approved.manifest.generation.as_str().as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"authority_generation",
+            &self.fence.authority_generation.value().to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"config_digest",
+            self.fence.config_digest.as_str().as_bytes(),
+        );
+        // The retained (materialized Phase-B) configuration identity is NOT
+        // re-derived here: `bind_approved_build` already extracts it from the
+        // committed fence or the registry's completed rebind and the projector
+        // binds it, so naming it here would be a second copy of that rule in a
+        // place with no way to keep the two in step.
+        let note = AuditFenceNote {
+            note_digest: format!("{:x}", hasher.finalize()),
+            observed_dispositions: dispositions,
+            // The ceiling I5.13 requires of a `HostStateAuditFence`, and the
+            // only value `AuditFenceNote::validate` admits.
+            active_authority_restored: false,
+        };
+        // Shape-checked here as well as in the projector, so an owner that
+        // produced an unbounded disposition fails at the owner boundary rather
+        // than after being carried into a projection. This is a shape guard on
+        // owner-issued content, never a substitute for the projector's
+        // presented-versus-owner comparison.
+        note.validate().map_err(projection_to_preparation)?;
+        Ok(note)
+    }
+
     /// Projects the bounded owner-issued configuration evidence for one
     /// presented preparation request (issue #958, cases 958/1-4, 958/16).
     ///
@@ -3179,19 +3333,22 @@ impl OwnerEvidence {
     /// itself weakened — before this change any non-empty claim was refused, and
     /// now a claim is refused unless it equals owner evidence.
     ///
-    /// The presented purge-ledger revision and optional forensic note are passed
-    /// through unchanged **so the projector still refuses them**, and each
-    /// refusal names a producer that does not exist rather than a value this
-    /// method chose not to read. The revision is owner-issued by the ORS owner
-    /// and `OwnerEvidence` holds no ORS handle, because
-    /// `crates/storage/AGENTS.md` forbids a second mutable root owner; a
-    /// forensic note has no producer at all, since `HostStateAuditFence` is
-    /// built only in test fixtures and in production arrives as a
-    /// caller-presented optional field of
-    /// `eliot_kernel::backup_capture::CaptureRequest`. The returned
-    /// [`BackupConfigProjection`] therefore carries a zero purge-ledger
-    /// revision, and the projection digest binds that absence explicitly. No
-    /// secret-typed field exists on this path and no credential-typed value is
+    /// The presented purge-ledger revision is passed through unchanged **so the
+    /// projector still refuses it**, and that refusal names a producer that does
+    /// not exist rather than a value this method chose not to read: the revision
+    /// is owner-issued by the ORS owner and `OwnerEvidence` holds no ORS handle,
+    /// because `crates/storage/AGENTS.md` forbids a second mutable root owner.
+    /// The returned [`BackupConfigProjection`] therefore carries a zero
+    /// purge-ledger revision, and the projection digest binds that absence
+    /// explicitly.
+    ///
+    /// The presented forensic note is passed through unchanged too, but its role
+    /// is now a **claim**: the projector compares it against
+    /// [`OwnerEvidence::owner_audit_note`], the note this owner derives from the
+    /// same validated lineage, and refuses a claim that differs as stale
+    /// evidence. So no caller-authored disposition text reaches the record,
+    /// while the projection digest does bind a real owner-observed lineage note.
+    /// No secret-typed field exists on this path and no credential-typed value is
     /// read: the committed fence's `credential_receipt_digest` and
     /// `host_process_nonce_digest` are not extracted, because I5.13 forbids
     /// replaying a raw credential reference in a backup manifest. A
@@ -3263,10 +3420,16 @@ impl OwnerEvidence {
         // a lease that went stale is a named owner refusal rather than a
         // projection digest naming an object that is no longer at the path.
         let owner_lease_ref = self.owner_lease_ref()?;
+        // The owner-issued forensic audit note, derived from the same validated
+        // lineage the rest of this bundle carries. Taken before the projection
+        // for the same reason: a note that cannot be shaped must be a named
+        // owner refusal, not a projection digest over it.
+        let owner_audit = self.owner_audit_note()?;
         project_backup_config_owner_bound(
             &config,
             binding,
             &owner_lease_ref,
+            &owner_audit,
             &self.fence.authority_state_fence,
         )
         .map_err(projection_to_preparation)
