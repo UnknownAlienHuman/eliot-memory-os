@@ -862,6 +862,31 @@ pub(super) fn run() -> Result<(), String> {
     eliotd::startup_readiness::emit_maintenance_trigger_recovery_record(
         composition.maintenance_trigger_recovery(),
     );
+    // #1694 W6: replacement-startup admission for the retained pending set.
+    // The bounded set is surfaced only after replacement authentication (the
+    // once-per-generation supervision bundle exists: Kernel accepted
+    // `report_ready` under the replacement owner session) and required
+    // Governor recovery (owner named reads including the mirror rebuilds are
+    // admitted at the active fence, which is exactly what governor readiness
+    // reports). Until then the pending set stays unknown — never empty,
+    // never complete — while readiness, shutdown, and unrelated work proceed
+    // exactly as before. This record carries only the admission outcome and
+    // the gated completeness claim: no member identities, no opaque
+    // continuation tokens, no local reclassification.
+    let trigger_recovery_admission = admit_replacement_trigger_recovery(
+        composition.maintenance_trigger_recovery(),
+        supervision_progress.is_some(),
+        composition.readiness() == eliot_governor::CompositionReadiness::Ready,
+    );
+    let trigger_recovery = composition.maintenance_trigger_recovery();
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.maintenance_trigger_replacement_startup",
+        admitted = trigger_recovery_admission.is_surfaced(),
+        withheld_reason = trigger_recovery_admission.withheld_reason().unwrap_or(""),
+        reconciliation_complete =
+            trigger_recovery_admission.reconciliation_complete(trigger_recovery),
+    );
     let status = DaemonStatus {
         ready: readiness.ready,
         degraded: readiness.degraded,
@@ -2115,6 +2140,87 @@ fn note_supervision_applied(
     {
         deferred_activity.note_applied();
     }
+}
+
+/// Replacement-startup admission for the retained maintenance-trigger
+/// pending set (issue #1694, W6).
+///
+/// The bounded pending set is surfaced only after the replacement generation
+/// is authenticated (`report_ready` accepted under the replacement owner
+/// session, evidenced by the once-per-generation supervision bundle) and the
+/// required Governor recovery — owner named reads including the Config/Policy
+/// mirror rebuilds — is admitted at the active fence. Until both hold, the
+/// pending set stays unknown: never an empty set and never a complete
+/// reconciliation.
+///
+/// The admission never gates readiness, shutdown, or unrelated work:
+/// ordinary pending debt is visible on the recovery record below and nowhere
+/// else, so it can neither keep this runtime alive nor block safe work.
+/// Surfaced members are the owner-issued page verbatim; this daemon applies
+/// no local routing-class filter (classification is owner-issued only) and
+/// performs no claim, ack, or consume from the surfaced set — claiming stays
+/// on the fenced claim route, so a duplicated delivery can never authorize a
+/// duplicated effect. Safety/recovery triggers therefore keep their
+/// owner-issued classification and stay visible to their registered
+/// Host/Kernel/Watchdog/Doctor route while the evaluator is down, because
+/// this path neither reclassifies nor hides them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementTriggerRecoveryAdmission {
+    Surfaced,
+    Withheld { reason: &'static str },
+}
+
+impl ReplacementTriggerRecoveryAdmission {
+    fn is_surfaced(self) -> bool {
+        matches!(self, Self::Surfaced)
+    }
+
+    fn withheld_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Surfaced => None,
+            Self::Withheld { reason } => Some(reason),
+        }
+    }
+
+    /// Owner-issued reconciliation completeness, consulted only when surfaced.
+    /// A withheld admission reports incomplete regardless of the projection,
+    /// so an unauthenticated or mirror-incomplete startup can never claim
+    /// maintenance reconciliation complete.
+    fn reconciliation_complete(
+        self,
+        recovery: &eliot_governor::MaintenanceTriggerRecoveryProjection,
+    ) -> bool {
+        self.is_surfaced() && recovery.reconciliation_complete()
+    }
+}
+
+/// Admits the retained pending set for one replacement startup.
+///
+/// Pure over already-admitted evidence: replacement authentication, required
+/// mirror recovery, and the Kernel-owned recovery projection. A transport or
+/// owner failure that left no valid envelope stays unavailable evidence, not
+/// an empty pending set and not a successful recovery result.
+fn admit_replacement_trigger_recovery(
+    recovery: &eliot_governor::MaintenanceTriggerRecoveryProjection,
+    replacement_authenticated: bool,
+    mirror_recovery_complete: bool,
+) -> ReplacementTriggerRecoveryAdmission {
+    if !replacement_authenticated {
+        return ReplacementTriggerRecoveryAdmission::Withheld {
+            reason: "replacement_authentication_missing",
+        };
+    }
+    if !mirror_recovery_complete {
+        return ReplacementTriggerRecoveryAdmission::Withheld {
+            reason: "mirror_recovery_incomplete",
+        };
+    }
+    if recovery.unavailable_detail.is_some() {
+        return ReplacementTriggerRecoveryAdmission::Withheld {
+            reason: "recovery_projection_unavailable",
+        };
+    }
+    ReplacementTriggerRecoveryAdmission::Surfaced
 }
 
 /// Builds the sanitized maintenance observation for one wired trigger site.
