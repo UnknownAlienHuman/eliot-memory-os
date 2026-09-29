@@ -310,6 +310,269 @@ impl ProtectedRootLease {
             Err(ProtectedPathError::UnsupportedPlatform)
         }
     }
+
+    /// Carries this retained ownership proof into a handle-bound removal
+    /// operation for the very same object.
+    ///
+    /// A lease is a *read* proof: it pins the whole directory contour by
+    /// retained handles and hands back `()`. That is the correct shape for
+    /// deciding whether an object is still owned, and the wrong shape for
+    /// destroying one, because a caller that only has the proof must re-resolve
+    /// the name to act on it. [`ProtectedRootRemovalProof`] is the shape that
+    /// does not: it keeps every retained ancestor pin, holds the leaf itself in
+    /// a `DELETE`-capable handle, and the only operation it exposes is
+    /// [`ProtectedRootRemovalProof::remove_if_empty`], which is bound to that
+    /// handle rather than to a pathname.
+    ///
+    /// The leaf pin this lease retains is deliberately released here, and only
+    /// here: `pin_protected_directory` excludes delete sharing by construction,
+    /// which forbids the `DELETE` open a removal needs. Every ancestor pin — the
+    /// ones that make the path non-rebindable — stays retained, the `DELETE`
+    /// handle is opened **relative to the retained parent handle** rather than
+    /// by pathname, and the replacement handle is proved to be the same object
+    /// (exact `volume_serial_number`/`file_index` and the object's own current
+    /// final path) before it is returned. A substitution that wins the gap is
+    /// therefore refused as [`ProtectedPathError::IdentityMismatch`] instead of
+    /// being deleted.
+    pub fn into_removal_proof(self) -> Result<ProtectedRootRemovalProof, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let Self {
+                path,
+                identity,
+                mut directories,
+            } = self;
+            let leaf_pin = directories.pop().ok_or(ProtectedPathError::InvalidPath)?;
+            let name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or(ProtectedPathError::InvalidPath)?
+                .to_owned();
+            let parent_identity = {
+                let parent = directories.last().ok_or(ProtectedPathError::InvalidPath)?;
+                file_identity_from_handle(parent).map_err(|error| {
+                    protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
+                })?
+            };
+            drop(leaf_pin);
+            let child = {
+                let parent = directories.last().ok_or(ProtectedPathError::InvalidPath)?;
+                crate::open_owned_directory_relative(parent, &name)
+                    .map_err(protected_publication_error)?
+            };
+            verify_retained_removal_object(&path, identity, parent_identity, &directories, &child)?;
+            Ok(ProtectedRootRemovalProof {
+                path,
+                identity,
+                parent_identity,
+                ancestors: directories,
+                child,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
+/// Outcome of one bounded, handle-bound removal of an empty protected root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtectedRootRemovalOutcome {
+    /// The exact retained object was observed empty, its delete disposition
+    /// committed, and its name is confirmed absent afterwards.
+    Removed,
+    /// The exact retained object still holds children. Nothing was deleted and
+    /// nothing was enumerated beyond the first entry; the object is preserved
+    /// as unknown state because its current contents are not this owner's to
+    /// destroy.
+    NotEmpty,
+    /// A delete disposition committed but the final absence could not be
+    /// classified. Never reported as a removal: the caller must reconcile.
+    CommittedUnconfirmed,
+}
+
+/// A retained, identity-pinned proof that one protected root may be reclaimed,
+/// carrying the ownership handles into the removal itself.
+///
+/// Built only by [`ProtectedRootLease::into_removal_proof`], so a caller cannot
+/// hold one for an object it never proved. The type has no `remove_dir_all`
+/// equivalent and no pathname operation of any kind: the single effect it
+/// exposes is [`Self::remove_if_empty`], which is bounded to one empty
+/// directory and applied to the retained `DELETE` handle.
+pub struct ProtectedRootRemovalProof {
+    path: PathBuf,
+    identity: FileIdentity,
+    #[cfg(windows)]
+    parent_identity: FileIdentity,
+    #[cfg(windows)]
+    ancestors: Vec<std::fs::File>,
+    #[cfg(windows)]
+    child: std::fs::File,
+}
+
+impl std::fmt::Debug for ProtectedRootRemovalProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtectedRootRemovalProof")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtectedRootRemovalProof {
+    /// Reclaims the retained object only if it is empty, through the retained
+    /// handle.
+    ///
+    /// The bound is the point: exactly one empty directory, observed with at
+    /// most one enumeration step and then removed by a single handle-bound
+    /// delete disposition. There is no recursion, no child walk, and no count
+    /// or byte budget standing in for an ownership decision. A root that has
+    /// been populated or adopted since preparation — by a restore, by another
+    /// owner, or by an operator — is reported as
+    /// [`ProtectedRootRemovalOutcome::NotEmpty`] and preserved, because its
+    /// current contents are not provably this preparation's to destroy.
+    ///
+    /// The final name observation exists because a committed disposition is not
+    /// an observed absence: when the name is still resolvable afterwards the
+    /// outcome is [`ProtectedRootRemovalOutcome::CommittedUnconfirmed`], never a
+    /// removal.
+    pub fn remove_if_empty(self) -> Result<ProtectedRootRemovalOutcome, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let Self {
+                path,
+                identity,
+                parent_identity,
+                ancestors,
+                child,
+            } = self;
+            verify_retained_removal_object(&path, identity, parent_identity, &ancestors, &child)?;
+            if !protected_root_is_empty(&path)? {
+                return Ok(ProtectedRootRemovalOutcome::NotEmpty);
+            }
+            mark_retained_directory_delete(&child)?;
+            drop(child);
+            drop(ancestors);
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(ProtectedRootRemovalOutcome::Removed)
+                }
+                Ok(_) | Err(_) => Ok(ProtectedRootRemovalOutcome::CommittedUnconfirmed),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn verify_retained_removal_object(
+    path: &Path,
+    identity: FileIdentity,
+    parent_identity: FileIdentity,
+    ancestors: &[std::fs::File],
+    child: &std::fs::File,
+) -> Result<(), ProtectedPathError> {
+    let parent = ancestors.last().ok_or(ProtectedPathError::InvalidPath)?;
+    let observed_parent = file_identity_from_handle(parent).map_err(|error| {
+        protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
+    })?;
+    if observed_parent != parent_identity {
+        return Err(ProtectedPathError::IdentityMismatch);
+    }
+    let observed = file_identity_from_handle(child).map_err(|error| {
+        protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
+    })?;
+    if observed != identity {
+        return Err(ProtectedPathError::IdentityMismatch);
+    }
+    let observed_path = final_windows_path_from_handle(child)?;
+    if !crate::windows_paths_equal(&observed_path, path) {
+        return Err(ProtectedPathError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+/// Observes whether the retained object holds any child, stopping at the first.
+///
+/// The observation resolves the object's canonical final path, which is safe
+/// here for the same reason the deletion is handle-bound rather than
+/// name-bound: every ancestor pin and the leaf handle itself exclude delete
+/// sharing, so no component of the path — including the leaf — can be deleted
+/// or renamed while these handles are live, and a new entry cannot take the
+/// leaf's name while the leaf still exists. What this cannot exclude is a child
+/// added after the observation, which is why the disposition that follows is
+/// still checked and the final absence is still observed.
+#[cfg(windows)]
+fn protected_root_is_empty(path: &Path) -> Result<bool, ProtectedPathError> {
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|error| protected_path_io_error(ProtectedPathStage::CreateFileW, &error))?;
+    match entries.next() {
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(protected_path_io_error(
+            ProtectedPathStage::FileMetadata,
+            &error,
+        )),
+        None => Ok(true),
+    }
+}
+
+#[cfg(windows)]
+fn mark_retained_directory_delete(directory: &std::fs::File) -> Result<(), ProtectedPathError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let ok = unsafe {
+        // SAFETY: the handle is the retained `DELETE` handle for the exact
+        // directory object this proof pinned, and the disposition buffer has
+        // the documented layout for its size.
+        SetFileInformationByHandle(
+            directory.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                .map_err(|_| ProtectedPathError::Io)?,
+        )
+    };
+    if ok == 0 {
+        Err(protected_path_io_error(
+            ProtectedPathStage::CreateFileW,
+            &std::io::Error::last_os_error(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Maps the handle-relative open owner's typed failures onto this module's
+/// protected-path failures, keeping every category distinct rather than
+/// collapsing an identity or reparse refusal into generic I/O.
+#[cfg(windows)]
+fn protected_publication_error(error: crate::DirectoryPublicationError) -> ProtectedPathError {
+    match error {
+        crate::DirectoryPublicationError::InvalidPath => ProtectedPathError::InvalidPath,
+        crate::DirectoryPublicationError::ReparsePoint => ProtectedPathError::ReparsePoint,
+        crate::DirectoryPublicationError::IdentityMismatch => ProtectedPathError::IdentityMismatch,
+        crate::DirectoryPublicationError::AlreadyExists | crate::DirectoryPublicationError::Io => {
+            ProtectedPathError::Io
+        }
+        crate::DirectoryPublicationError::Win32 { code } => ProtectedPathError::Win32 {
+            stage: ProtectedPathStage::CreateFileW,
+            code,
+        },
+        crate::DirectoryPublicationError::UnsupportedPlatform => {
+            ProtectedPathError::UnsupportedPlatform
+        }
+    }
 }
 
 impl std::fmt::Debug for ProtectedPathLease {
