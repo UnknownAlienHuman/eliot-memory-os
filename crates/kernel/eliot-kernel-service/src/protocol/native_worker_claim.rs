@@ -48,6 +48,8 @@ use eliot_store_api::EffectClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use std::borrow::Borrow;
+
 use crate::{KernelServiceError, validate_text};
 
 /// Stable identity for the Kernel-owned native-worker claim wire.
@@ -318,53 +320,101 @@ impl NativeWorkerExecutableBinding {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerExecutableBindingPublication {
+    /// Stable identity of the admitted native-worker claim.
     pub claim_id: String,
+    /// Registration whose authenticated worker session presented the claim.
     pub registration_id: String,
+    /// Canonical task identity bound to the claim.
     pub task_id: String,
+    /// Work unit delegated to the worker for this attempt.
     pub work_unit_id: String,
+    /// WorkScope that bounds the worker's permitted inputs and effects.
     pub work_scope_id: String,
+    /// Attempt number within the bound work unit.
     pub attempt: u32,
+    /// Lease identity authorizing this exact attempt.
     pub lease_id: String,
+    /// Idempotent identity of the operation associated with this attempt.
     pub operation_id: String,
+    /// Lowercase SHA-256 of the canonical request bound to the claim.
     pub canonical_request_hash: String,
+    /// Installation that owns the published executable binding.
     pub installation_id: String,
+    /// Principal to which the authenticated worker session is bound.
     pub principal_id: String,
+    /// Authenticated session presenting this claim.
     pub session_id: String,
+    /// Native-worker registration generation that owns the claim.
     pub worker_generation: u64,
+    /// Operating-system process-tree identity for the worker.
     pub process_tree_id: String,
+    /// Generation of the bound operating-system process instance.
     pub process_generation: u64,
+    /// Owner-issued fence identifying the bound process instance.
     pub process_fence: String,
+    /// Stable reference to the selected route.
     pub route_ref: String,
+    /// Identity of the adapter bound to the route.
     pub adapter_id: String,
+    /// Current revision of the bound adapter.
     pub adapter_revision: u64,
+    /// Lowercase SHA-256 of the executable artifact bytes.
     pub artifact_digest: String,
+    /// Lowercase SHA-256 of the effective adapter configuration.
     pub config_digest: String,
+    /// Lowercase SHA-256 of the protocol contract used by the worker.
     pub protocol_digest: String,
+    /// Reference to the command admitted for this worker attempt.
     pub command_ref: String,
+    /// Reference to the facet manifest governing this attempt.
     pub facet_manifest_ref: String,
+    /// Capability cell under which the attempt was admitted.
     pub capability_cell: CapabilityCellId,
+    /// Provenance references introducing the admitted capability.
     pub introduction_refs: Vec<String>,
+    /// Grant references supporting the admitted capability.
     pub supporting_grant_refs: Vec<String>,
+    /// Current owner revision of the supporting grant graph.
     pub grant_graph_revision: u64,
+    /// Current owner revision of the module catalogue.
     pub module_catalog_revision: u64,
+    /// Maximum effect class authorized for this attempt.
     pub effective_ceiling: EffectClass,
+    /// Opaque references to credentials; raw credential material is absent.
     pub credential_refs: Vec<String>,
+    /// References to resources available to the worker attempt.
     pub resource_refs: Vec<String>,
+    /// Durable event stream used to replay claim evidence.
     pub replay_stream_id: String,
+    /// Nonce binding the launch to this exact worker instance.
     pub launch_nonce: String,
+    /// Lowercase SHA-256 of the exact process invocation.
     pub process_invocation_digest: String,
+    /// Kernel state fence current when the binding was published.
     pub state_fence: StateFence,
+    /// Authority epoch current when the binding was published.
     pub authority_epoch: EpochId,
+    /// Resource generation bound to the state fence.
     pub generation: ResourceGeneration,
+    /// Latest time, in Unix milliseconds, at which this attempt may start.
     pub deadline_unix_ms: u64,
+    /// Time, in Unix milliseconds, when the binding expires.
     pub expires_at_unix_ms: u64,
+    /// Identity of the Governor plan that admitted this attempt.
     pub plan_id: String,
+    /// Revision of the Governor plan that admitted this attempt.
     pub plan_revision: String,
+    /// Current revision of the bound task.
     pub task_revision: u64,
+    /// Lowercase SHA-256 of the Governor configuration snapshot.
     pub config_snapshot_digest: String,
+    /// Reference to the owner-issued admission revision.
     pub admission_revision_ref: String,
+    /// Stable wire identity for the Governor publication.
     pub wire_id: String,
+    /// Wire revision for the Governor publication.
     pub wire_version: u16,
+    /// Original Governor digest over the complete binding publication.
     pub binding_digest: String,
 }
 
@@ -382,6 +432,21 @@ impl NativeWorkerExecutableBindingPublication {
                 reason: "unsupported Governor binding wire",
             });
         }
+        self.validate_text_fields()?;
+        self.validate_digest_fields()?;
+        self.validate_launch_nonce()?;
+        self.validate_reference_lists()?;
+        self.validate_generation_and_fence()?;
+        if self.compute_original_binding_digest()? != self.binding_digest {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.binding_digest",
+                reason: "original Governor binding digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_text_fields(&self) -> Result<(), KernelServiceError> {
         for (value, field) in [
             (&self.claim_id, "claim_id"),
             (&self.registration_id, "registration_id"),
@@ -410,6 +475,10 @@ impl NativeWorkerExecutableBindingPublication {
                     reason: field,
                 })?;
         }
+        Ok(())
+    }
+
+    fn validate_digest_fields(&self) -> Result<(), KernelServiceError> {
         for (value, field) in [
             (&self.canonical_request_hash, "canonical_request_hash"),
             (&self.artifact_digest, "artifact_digest"),
@@ -425,6 +494,10 @@ impl NativeWorkerExecutableBindingPublication {
                     reason: field,
                 })?;
         }
+        Ok(())
+    }
+
+    fn validate_launch_nonce(&self) -> Result<(), KernelServiceError> {
         validate_wire_text(
             &self.launch_nonce,
             "native_worker_executable_binding_publication.launch_nonce",
@@ -435,6 +508,10 @@ impl NativeWorkerExecutableBindingPublication {
                 reason: "launch nonce must be 16..=256 characters",
             });
         }
+        Ok(())
+    }
+
+    fn validate_reference_lists(&self) -> Result<(), KernelServiceError> {
         for values in [
             &self.introduction_refs,
             &self.supporting_grant_refs,
@@ -461,6 +538,10 @@ impl NativeWorkerExecutableBindingPublication {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_generation_and_fence(&self) -> Result<(), KernelServiceError> {
         if self.worker_generation == 0
             || self.process_generation == 0
             || self.adapter_revision == 0
@@ -487,12 +568,6 @@ impl NativeWorkerExecutableBindingPublication {
         {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "native_worker_executable_binding_publication.fence_binding",
-            });
-        }
-        if self.compute_original_binding_digest()? != self.binding_digest {
-            return Err(KernelServiceError::InvalidField {
-                field: "native_worker_executable_binding_publication.binding_digest",
-                reason: "original Governor binding digest mismatch",
             });
         }
         Ok(())
@@ -949,7 +1024,7 @@ impl NativeWorkerClaimRequest {
         &self,
         registration_id: &str,
         worker_generation: u64,
-        authority_epoch: EpochId,
+        authority_epoch: impl Borrow<EpochId>,
         state_fence: &StateFence,
     ) -> Result<(), KernelServiceError> {
         if self.registration_id != registration_id {
@@ -964,7 +1039,7 @@ impl NativeWorkerClaimRequest {
                 reason: "claim generation does not match the presenting registration",
             });
         }
-        if self.authority_epoch != authority_epoch {
+        if self.authority_epoch != *authority_epoch.borrow() {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "native_worker_claim.epoch_fence",
             });
@@ -1418,7 +1493,7 @@ impl NativeWorkerClaimConflict {
 )]
 pub enum NativeWorkerClaimResponse {
     /// The claim was admitted; the receipt is the admission proof.
-    Admitted(NativeWorkerClaimReceipt),
+    Admitted(Box<NativeWorkerClaimReceipt>),
     /// The claim was refused for the named typed reason.
     Rejected(NativeWorkerClaimRejection),
     /// The claim identity conflicts with admitted bound work.
