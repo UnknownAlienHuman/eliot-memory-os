@@ -977,13 +977,10 @@ function Invoke-RuntimeStart {
     }
     $runtimePath = [string]$receipt['runtimePath']
     if (-not $runtimePath.EndsWith($Script:RuntimeArtifact, [System.StringComparison]::OrdinalIgnoreCase)) { throw [System.InvalidOperationException]::new('RUNTIME-ACQUISITION-FAILED: runtime path does not name the approved artifact.') }
-    $artifactLane = 'seam-attested'
-    $artifactProof = $null
-    if ($VerifyArtifactFile) {
-        $artifactProof = Test-RuntimeArtifactFile -RuntimePath $runtimePath -ExpectedDigest $Script:RuntimeDigest -ExpectedPeMachine $Script:RuntimePeMachine
-        if ([string]$artifactProof['digest'] -cne [string]$receipt['digest']) { throw [System.InvalidOperationException]::new('RUNTIME-DIGEST-MISMATCH: verified file digest diverges from the acquisition receipt digest.') }
-        $artifactLane = 'local-file-verified'
-    }
+    # Guaranteed path: the artifact file itself is always verified before launch.
+    $artifactProof = Test-RuntimeArtifactFile -RuntimePath $runtimePath -ExpectedDigest $Script:RuntimeDigest -ExpectedPeMachine $Script:RuntimePeMachine
+    if ([string]$artifactProof['digest'] -cne [string]$receipt['digest']) { throw [System.InvalidOperationException]::new('RUNTIME-DIGEST-MISMATCH: verified file digest diverges from the acquisition receipt digest.') }
+    $artifactLane = 'local-file-verified'
     $issuance = $null
     try { $issuance = (& $OwnerIssuance @{ runId = $runId }) }
     catch { throw [System.InvalidOperationException]::new("RUNTIME-ISSUANCE-FAILED: $(Get-RuntimeSafeDiagnosticText -Text $_.Exception.Message)") }
@@ -1126,7 +1123,7 @@ function Invoke-RuntimeStart {
         $governorStartLane = 'receipt-declared'
         if ($governorBinding.ContainsKey('provenance') -and ([string]$governorBinding['provenance'] -ceq 'run-local-config-created')) { $governorStartLane = 'created-file' }
     }
-    $startResult = @{ runId = $runId; launchState = 'launch-registered'; containedObserved = $true; requested = @{ requestKeys = $requestKeys; pipeNamespace = $pipeNamespace; sessionId = $sessionId }; observed = $observed; invocation = @{ argvCount = 8; artifact = $Script:RuntimeArtifact }; binary = @{ version = $Script:RuntimeVersion; architecture = $Script:RuntimeArchitecture; peMachine = $Script:RuntimePeMachine; peProfile = $Script:RuntimePeProfile; digest = [string]$receipt['digest']; provenance = $provenance; runtimePath = $runtimePath }; ownerIssuance = $ownerIssuanceOut; pipeNamespace = $pipeNamespace; sessionId = $sessionId }
+    $startResult = @{ runId = $runId; launchState = 'launch-registered'; containedObserved = ($containmentLane -ceq 'proof-bound'); requested = @{ requestKeys = $requestKeys; pipeNamespace = $pipeNamespace; sessionId = $sessionId }; observed = $observed; invocation = @{ argvCount = 8; artifact = $Script:RuntimeArtifact }; binary = @{ version = $Script:RuntimeVersion; architecture = $Script:RuntimeArchitecture; peMachine = $Script:RuntimePeMachine; peProfile = $Script:RuntimePeProfile; digest = [string]$receipt['digest']; provenance = $provenance; runtimePath = $runtimePath }; ownerIssuance = $ownerIssuanceOut; pipeNamespace = $pipeNamespace; sessionId = $sessionId }
     if ($null -ne $governorBinding) { $startResult['governorConfig'] = $governorBinding }
     if ($null -ne $governorConfigFullPath) { $startResult['governorConfigPath'] = $governorConfigFullPath }
     $startResult['principal'] = $Allocation['principal']
@@ -1551,7 +1548,7 @@ function Invoke-RuntimeVerifyCleanup {
             foreach ($portFailure in @($portCheck['failures'])) { [void]$failures.Add($portFailure) }
         }
     }
-    if ($failures.Count -gt 0 -or ($Strict -and $unknowns.Count -gt 0)) {
+    if ($failures.Count -gt 0 -or $unknowns.Count -gt 0) {
         $cleanupResult = @{ runId = $runId; cleanupState = 'ReconciliationRequired'; cleaned = $false; failures = @($failures); unknowns = @($unknowns); ownedRoot = $runRoot; verificationLane = $verificationLane }
         if ($priorFailureText -ne '') { $cleanupResult['priorFailure'] = $priorFailureText }
         return $cleanupResult
