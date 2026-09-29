@@ -7,7 +7,7 @@ use eliot_wasm_host::{
     CliError, ContourGateError, PrototypeContourDecision, TypedWorld, admit_generation,
     admit_prototype, check_governed_admission, default_experimental_limits,
     execute_describe_experimental, experimental_manifest, parse_args, read_bounded_artifact,
-    run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
+    require_absolute_artifact_path, run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -226,6 +226,13 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
         emit_error("UNKNOWN_WORLD", "world is unknown");
         std::process::exit(INVALID_ARGUMENT_EXIT);
     };
+    // The experimental lane takes only an explicit absolute local artifact:
+    // a relative spelling is denied here so acquisition never resolves it
+    // against the process working directory.
+    if let Err(error) = require_absolute_artifact_path(component_path) {
+        emit_error("PREFLIGHT_DENIED", &error.to_string());
+        std::process::exit(ADMISSION_REQUIRED_EXIT);
+    }
     let (artifact, preflight) = match read_bounded_artifact(component_path) {
         Ok(pair) => pair,
         Err(error) => {
