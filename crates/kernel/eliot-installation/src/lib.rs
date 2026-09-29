@@ -21,8 +21,8 @@ use eliot_contracts::{
 use eliot_ipc::{NamedPipeTransport, TransportLimits};
 pub use eliot_platform::{HostProcessNonce, PlatformHandle};
 use eliot_platform::{
-    InstallationObservation, InstallationPort, InstallationRequest, PortError, PortOutcome,
-    ProviderError, ProviderErrorCode, UnknownReason,
+    GuardRevertOutcome, InstallationObservation, InstallationPort, InstallationRequest, PortError,
+    PortOutcome, ProviderError, ProviderErrorCode, UnknownReason,
 };
 pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
@@ -47,11 +47,12 @@ use eliot_platform_windows::{
     ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceRegistrationRuntimeReadback, ServiceStartMode,
     ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
+    SupervisionAuthorityKeyStoreRequest, TerminalContainmentReadback, UserOwnedPathLease,
+    WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
+    WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -118,6 +119,7 @@ mod agent_bridge_profile;
 mod approved_generation_registry;
 mod canary_removal;
 mod credential_provision;
+mod guard_containment;
 mod installation_registry;
 mod integration_discovery;
 mod package;
@@ -134,6 +136,7 @@ mod signed_activation;
 mod survey;
 mod transaction;
 
+pub use guard_containment::RetainedGuardRevert;
 pub use installation_registry::RedbInstallationRegistry;
 #[cfg(test)]
 use installation_registry::classify_registry_table;
@@ -9796,6 +9799,71 @@ where
         Ok(InstallationStepOutcome::RollbackRequired {
             pending_refs: vec![pending_ref],
         })
+    }
+
+    /// Retains the exact composite a guard owner returned inside the durable
+    /// transaction record, in the same single sealed compare-and-save that
+    /// records the dependent rollback.
+    ///
+    /// This is the normal-path persistence seam for a safe-return guard
+    /// failure: the composite reaches the durable transaction before any
+    /// dependent retry or rollback runs, and it survives restart. A persistence
+    /// failure returns the error with the composite still owned by the caller;
+    /// it never discards the original effects and never invents a cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the composite's own validation or
+    /// the transaction's own invariants.
+    pub fn record_guard_revert(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        outcome: GuardRevertOutcome,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let expected = TransactionVersion::of(&transaction)?;
+        let result = transaction.record_guard_revert(outcome)?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(result)
+    }
+
+    /// Restart reader for the retained guard evidence of one exact
+    /// transaction.
+    ///
+    /// A restarted process calls this before it adopts or overwrites the object
+    /// a retained composite protects. The retained bounded terminal record is
+    /// validated by the terminal owner's own readback validator and compared
+    /// with this operation's own identity, so a missing, short, torn, foreign,
+    /// stale, or unbound record leaves the block in place. No automatic retry
+    /// is authorized here and no receipt is synthesized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::TransactionNotFound`] when no such
+    /// transaction exists, and any error from the transaction's own invariants.
+    pub fn reconcile_retained_guard_evidence(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        retained_record: &[u8],
+    ) -> Result<TerminalContainmentReadback, InstallationError> {
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let readback = transaction.reconcile_guard_revert_evidence(retained_record)?;
+        if matches!(readback, TerminalContainmentReadback::Complete(_)) {
+            let expected = TransactionVersion::of(&transaction)?;
+            self.store.compare_and_save(expected, &transaction)?;
+        }
+        Ok(readback)
     }
 
     /// Recovery-only readback reconciliation for a first-install service-start

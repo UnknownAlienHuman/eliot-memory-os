@@ -188,6 +188,11 @@ pub enum TerminalContainmentUnresolved {
     UnsupportedVersion,
     /// A length, binding, or reserved field does not match the fixed encoding.
     MalformedField,
+    /// The record is a valid current fixed record, but it is not bound to the
+    /// exact operation whose evidence was requested. An unbound record and a
+    /// record bound to a different operation are both this case; neither is a
+    /// completed cleanup.
+    OperationGenerationMismatch,
 }
 
 /// One validated current fixed terminal-containment record.
@@ -233,6 +238,39 @@ static INSTALLED_EVIDENCE_RESOURCE: OnceLock<InstalledEvidenceResource> = OnceLo
 /// deadlock the process it is trying to contain.
 static TERMINAL_REENTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// #860 handoff — the one accepted interface, for both guard families.
+//
+// Both `ScopedRestorePrivilege` (token privilege) and `ImpersonationGuard`
+// (thread impersonation) use exactly these three entry points and no other
+// terminal mechanism. There is no second logger, no second journal, and no
+// per-guard emitter.
+//
+// 1. Before the guarded mutation, in the operation that owns the failure
+//    evidence, call [`prepare_terminal_containment`] once with the same
+//    validated `RequestMetadata` the composite's `parent_operation` carries.
+//    A returned error refuses the mutation; impersonation or elevation must not
+//    proceed. Preparation is per process, so a second call is
+//    [`TerminalContainmentError::SinkAlreadyPrepared`] rather than a silent
+//    replacement.
+//
+// 2. When the OS state is not proven continuation-safe, and only then, call
+//    [`fail_stop_with_terminal_containment`] with a `&'static str` site, a
+//    `&'static str` detail, and the exact `u32` captured immediately after the
+//    failed call. This never returns.
+//
+// 3. On the normal path, where the guard owner established continuation-safe OS
+//    state, do not call the terminal path at all. Return the
+//    `eliot_platform::GuardRevertOutcome` composite to the installation caller,
+//    which persists it through
+//    `InstallationCoordinator::record_guard_revert` and reads it back on
+//    restart through
+//    `InstallationCoordinator::reconcile_retained_guard_evidence`.
+//
+// The composite retains the primary failure, the explicit restore failure and
+// the emergency restore failure as separate slots; a successful emergency
+// restoration must not erase the explicit failure that preceded it. Both
+// attempts stay separately recorded.
+
 /// Acquires the bounded terminal-containment evidence resource **before** a
 /// guarded mutation, and fixes every terminal-path decision while normal
 /// allocation is still safe.
@@ -262,10 +300,7 @@ pub fn prepare_terminal_containment(
     if !is_bounded_identity(detail, TERMINAL_CONTAINMENT_DETAIL_MAX_BYTES) {
         return Err(TerminalContainmentError::DetailIdentityNotRepresentable);
     }
-    let encoded = serde_json::to_vec(context)
-        .map_err(|_| TerminalContainmentError::OperationIdentityUnavailable)?;
-    let operation_digest: [u8; TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES] =
-        Sha256::digest(&encoded).into();
+    let operation_digest = terminal_containment_operation_digest(context)?;
 
     #[cfg(not(windows))]
     {
@@ -278,6 +313,31 @@ pub fn prepare_terminal_containment(
             .set(InstalledEvidenceResource { operation_digest })
             .map_err(|_| TerminalContainmentError::SinkAlreadyPrepared)
     }
+}
+
+/// Derives the exact bounded operation identity one prepared record is bound
+/// to.
+///
+/// This is the single derivation used both by
+/// [`prepare_terminal_containment`] and by the normal recovery owner, so the
+/// expected identity is computed from the same rule the writer used rather
+/// than supplied by a second caller-supplied list.
+///
+/// # Errors
+///
+/// Returns [`TerminalContainmentError::InvalidOperationContext`] for an
+/// unvalidated operation context and
+/// [`TerminalContainmentError::OperationIdentityUnavailable`] when the
+/// context cannot be canonicalized.
+pub fn terminal_containment_operation_digest(
+    context: &RequestMetadata,
+) -> Result<[u8; TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES], TerminalContainmentError> {
+    context
+        .validate()
+        .map_err(|_| TerminalContainmentError::InvalidOperationContext)?;
+    let encoded = serde_json::to_vec(context)
+        .map_err(|_| TerminalContainmentError::OperationIdentityUnavailable)?;
+    Ok(Sha256::digest(&encoded).into())
 }
 
 /// Submits one bounded terminal-containment record and never returns to
@@ -361,6 +421,8 @@ pub fn validate_terminal_containment_readback(bytes: &[u8]) -> TerminalContainme
     {
         return TerminalContainmentReadback::Unresolved(MalformedField);
     }
+    // `bytes.len() == TERMINAL_CONTAINMENT_RECORD_BYTES` is already proven
+    // above, so this slice is exactly the fixed digest width.
     let digest_bytes = &bytes[OFFSET_OPERATION_DIGEST
         ..OFFSET_OPERATION_DIGEST + TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES];
     let all_zero = digest_bytes.iter().all(|byte| *byte == 0);
@@ -379,6 +441,34 @@ pub fn validate_terminal_containment_readback(bytes: &[u8]) -> TerminalContainme
         site_len,
         detail_len,
     })
+}
+
+/// Validates one retained record against the exact fixed encoding **and**
+/// against the exact operation generation whose evidence was requested.
+///
+/// This is the normal recovery owner's entry point. It first runs the same
+/// fixed-encoding validator the terminal path uses, then compares the record's
+/// bound operation identity with the expected one by content. A valid record
+/// that is unbound, or that is bound to a different operation, stays
+/// [`TerminalContainmentUnresolved::OperationGenerationMismatch`]: an
+/// unsupported, stale, or foreign record is never a completed cleanup.
+pub fn validate_terminal_containment_readback_for(
+    bytes: &[u8],
+    expected_operation_digest: [u8; TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES],
+) -> TerminalContainmentReadback {
+    match validate_terminal_containment_readback(bytes) {
+        TerminalContainmentReadback::Unresolved(unresolved) => {
+            TerminalContainmentReadback::Unresolved(unresolved)
+        }
+        TerminalContainmentReadback::Complete(record) => {
+            if record.operation_digest != Some(expected_operation_digest) {
+                return TerminalContainmentReadback::Unresolved(
+                    TerminalContainmentUnresolved::OperationGenerationMismatch,
+                );
+            }
+            TerminalContainmentReadback::Complete(record)
+        }
+    }
 }
 
 fn is_bounded_identity(value: &str, max_bytes: usize) -> bool {
