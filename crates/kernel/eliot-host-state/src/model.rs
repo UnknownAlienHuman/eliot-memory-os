@@ -2189,6 +2189,260 @@ pub enum CutoverIntentState {
     Failed,
 }
 
+/// Closed outcome of one durable backup destination preparation.
+///
+/// `Pending` is the pre-effect state and the only non-terminal one: the
+/// destination root may be created only after the admission is durable.
+/// `Prepared` is terminal and is written only after the root exists and its OS
+/// identity was pinned, so it is the sole proof that this operation - and no
+/// other - created that exact directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackupPreparationState {
+    /// The admitted operation is durable; no result is.
+    ///
+    /// The proposed destination may be absent, or present because this
+    /// operation created it and the process stopped before the identity was
+    /// pinned and the result recorded. This record cannot tell those apart and
+    /// does not try: it proves the operation was ADMITTED, never that a root
+    /// was or was not created. The outcome is therefore reconciling - not an
+    /// absence, not a failure, and never permission to prepare a second
+    /// destination under this operation identity. A root observed under this
+    /// state is a partial destination: owned by nothing until a `Prepared`
+    /// record pins it, and therefore preserved rather than deleted.
+    Pending,
+    /// The result is durable: this operation exclusively created the recorded
+    /// destination and pinned its OS identity.
+    Prepared,
+}
+
+/// Durable admission, binding and outcome of one separately authorized isolated
+/// backup destination preparation.
+///
+/// # Why this record exists
+///
+/// A preparation has an effect a caller can lose the response to: it creates a
+/// root on disk under the admitted staging parent. The operation identity, the
+/// binding it was admitted under, the proposed destination, the owner-issued
+/// identities derived from it, and whether a result was ever recorded are
+/// facts about that one operation, and the Host journal is the only durable
+/// owner of Host operational state. Without a record here a restart loses every
+/// one of them, and a repeated request under the same operation identity can
+/// neither return the same verified destination nor refuse as a conflict.
+///
+/// This is NOT a second registry and NOT a second record store. It is one
+/// `HostStateRecord` variant appended to the same `HostStateJournal`, carried
+/// in the same `HostState` projection, fenced by the same
+/// `RecordFence`/`IdempotencyIdentity` pair, and reduced by the same
+/// single-writer `apply` boundary as every other record. It is deliberately
+/// distinguishable from `CutoverIntentRecord`: a preparation creates a fenced
+/// destination and stops there, while a cutover activates an approved
+/// installation generation - separate effects, separate owners, separate
+/// states, and neither may stand in for the other.
+///
+/// # What is owner-issued and what is presented
+///
+/// `class`, `source_installation`, `source_archive` and the whole admission
+/// digest are the binding the caller was admitted under; `authority_generation`
+/// and `config_projection_digest` are the owner-issued evidence the destination
+/// was admitted against; `destination_id` and `destination_epoch` are derived
+/// from owner-issued evidence and the operation identity, never from a
+/// presented value. A reader compares the retained record against its own
+/// admission; it does not learn authority from this record alone.
+///
+/// `destination_root` is the PROPOSED destination, recorded before any effect.
+/// It is a name, not ownership: on its own it never authorises deleting
+/// anything at that path. `destination_root_identity` is the exclusive-creation
+/// proof, and it is present in exactly one state (`Prepared`) - which is why
+/// cleanup can remove a destination this operation created while a `Pending`
+/// root is preserved as unknown rather than removed by path name.
+///
+/// Scope, stated as for every other Host journal record: the record lives in
+/// the log of the Host epoch that wrote it, and a restart re-bases the journal
+/// into a new epoch. An unsettled `Pending` therefore blocks the clean marker,
+/// because closing a clean lineage would discard the only durable proof that
+/// the operation was admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPreparationRecord {
+    pub fence: RecordFence,
+    /// Journal mutation identity. One per outcome of this preparation
+    /// (`<preparation operation>:<state>`), for the same reason the cutover
+    /// intent uses one per disposition: the journal keys `applied_operations`
+    /// on this identity, so reusing it for the admission and its result would
+    /// be a checksum conflict rather than a second mutation. A replay of the
+    /// SAME outcome reuses the identity and therefore reproduces byte for byte.
+    pub operation: IdempotencyIdentity,
+    /// Admitted preparation operation identity. This is the key the journal
+    /// projection is indexed by: one entry per admitted preparation, so a
+    /// repeat resolves the original rather than starting a second one.
+    pub preparation_operation: PlatformHandle,
+    /// Closed preparation class token the admission was made under.
+    ///
+    /// Carried as the owner-issued token rather than a second class enum: this
+    /// crate owns the durable record, not the backup admission contract, and
+    /// duplicating that closed set here would create a second spelling that can
+    /// drift. The closed-set admission decision belongs to the owner that
+    /// validates the request; the token is what this record binds so a change
+    /// of class under one operation identity is a conflict rather than a
+    /// silently re-scoped preparation.
+    pub class: PlatformHandle,
+    /// Source installation identity. Its root is read for comparison only and
+    /// is never a destination.
+    pub source_installation: PlatformHandle,
+    /// Source archive identity the admitted request bound.
+    pub source_archive: PlatformHandle,
+    /// Canonical admission digest over the admitted inputs. Compared against
+    /// this operation's retained intent, never merely shape-checked.
+    pub admission_digest: PlatformHandle,
+    /// Proposed isolated destination root, recorded BEFORE any effect. A name,
+    /// not ownership: see the type documentation.
+    pub destination_root: PlatformHandle,
+    /// Owner-issued destination identity, derived from owner-issued evidence
+    /// and the operation identity rather than from any presented value.
+    pub destination_id: PlatformHandle,
+    /// Owner-issued configuration projection digest proved for this request.
+    pub config_projection_digest: PlatformHandle,
+    /// Owner-issued authority generation the admission was checked against.
+    ///
+    /// Zero is refused: it is the marker the preparation owner uses for "this
+    /// boundary does not carry a generation", so a record naming it would bind
+    /// the operation to no generation at all.
+    pub authority_generation: u64,
+    /// Preparation-scope lineage marker derived from the same owner-issued
+    /// evidence as `destination_id`.
+    ///
+    /// NOT an Authority Epoch and never read as one: preparation issues no
+    /// Authority Epoch, and the derivation floors the value at 1, so zero is
+    /// likewise refused.
+    pub destination_epoch: u64,
+    /// OS identity pinned at exclusive creation. Present in exactly one state;
+    /// see [`Self::validate`].
+    pub destination_root_identity: Option<PlatformHandle>,
+    /// Bounded retained evidence for this outcome. Digests/handles only.
+    ///
+    /// On `Pending` this is the evidence retained for a destination whose
+    /// existence is unproven - the partial-destination case - and it is
+    /// required so an unsettled admission is never an evidence-free frame.
+    pub retained_evidence_refs: Vec<PlatformHandle>,
+    pub state: BackupPreparationState,
+}
+
+impl BackupPreparationRecord {
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        handle(
+            &self.preparation_operation,
+            "backup_preparation.preparation_operation",
+        )?;
+        handle(&self.class, "backup_preparation.class")?;
+        handle(
+            &self.source_installation,
+            "backup_preparation.source_installation",
+        )?;
+        handle(&self.source_archive, "backup_preparation.source_archive")?;
+        digest(
+            &self.admission_digest,
+            "backup_preparation.admission_digest",
+        )?;
+        handle(
+            &self.destination_root,
+            "backup_preparation.destination_root",
+        )?;
+        digest(&self.destination_id, "backup_preparation.destination_id")?;
+        digest(
+            &self.config_projection_digest,
+            "backup_preparation.config_projection_digest",
+        )?;
+        if self.authority_generation == 0 {
+            return Err(JournalError::Invalid(
+                "backup preparation must bind a non-zero owner-issued authority generation".into(),
+            ));
+        }
+        if self.destination_epoch == 0 {
+            return Err(JournalError::Invalid(
+                "backup preparation must bind a non-zero destination lineage marker".into(),
+            ));
+        }
+        // The pinned identity is the exclusive-creation proof, so it exists in
+        // exactly one state. A `Prepared` result without it would assert
+        // ownership of a root whose identity was never captured, and a `Pending`
+        // admission carrying one would claim an effect the record says has not
+        // been recorded.
+        match (&self.destination_root_identity, self.state) {
+            (None, BackupPreparationState::Pending) => {}
+            (Some(identity), BackupPreparationState::Prepared) => {
+                handle(identity, "backup_preparation.destination_root_identity")?;
+            }
+            (Some(_), BackupPreparationState::Pending) => {
+                return Err(JournalError::Invalid(
+                    "pending backup preparation must not carry a pinned destination identity"
+                        .into(),
+                ));
+            }
+            (None, BackupPreparationState::Prepared) => {
+                return Err(JournalError::Invalid(
+                    "prepared backup preparation requires the pinned destination identity".into(),
+                ));
+            }
+        }
+        handles(
+            &self.retained_evidence_refs,
+            "backup_preparation.retained_evidence_refs",
+            true,
+        )
+    }
+}
+
+/// Transition law of one preparation operation's durable record.
+///
+/// The rule is exact binding, not shape: a successor must agree with the
+/// retained record on the operation identity, the admitted source/archive/class
+/// binding, the admission digest, the proposed destination and every
+/// owner-issued identity, so a changed binding under one operation identity is
+/// an idempotency conflict rather than a re-scoped preparation. `Prepared` is
+/// the only terminal state and nothing moves out of it.
+///
+/// `retained_evidence_refs` is deliberately NOT part of the comparison, for the
+/// same reason the cutover intent's evidence list is not: a `Prepared` result
+/// necessarily carries evidence a `Pending` cannot - that this operation
+/// created the root and pinned its identity. Requiring the two lists to be
+/// equal would demand a fact be recorded before it exists. The evidence is
+/// still required non-empty on every frame, so no outcome is ever evidence-free.
+pub(crate) fn backup_preparation_transition(
+    current: Option<&BackupPreparationRecord>,
+    next: &BackupPreparationRecord,
+) -> Result<(), JournalError> {
+    let Some(current) = current else {
+        // The root may be created only after the admission is durable, so a
+        // result with no durable intent is refused here rather than trusted.
+        return if next.state == BackupPreparationState::Pending {
+            Ok(())
+        } else {
+            Err(illegal("backup_preparation", "NONE", next.state))
+        };
+    };
+    if current.fence != next.fence
+        || current.preparation_operation != next.preparation_operation
+        || current.class != next.class
+        || current.source_installation != next.source_installation
+        || current.source_archive != next.source_archive
+        || current.admission_digest != next.admission_digest
+        || current.destination_root != next.destination_root
+        || current.destination_id != next.destination_id
+        || current.config_projection_digest != next.config_projection_digest
+        || current.authority_generation != next.authority_generation
+        || current.destination_epoch != next.destination_epoch
+    {
+        return Err(JournalError::IdempotencyConflict);
+    }
+    if current.state == BackupPreparationState::Prepared {
+        return Err(illegal("backup_preparation", current.state, next.state));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StoreRebindState {
@@ -2357,6 +2611,11 @@ pub enum HostStateRecord {
     ReactiveContext(ReactiveContextRecord),
     /// Durable cutover intent/terminal record (#961).
     CutoverIntent(CutoverIntentRecord),
+    /// Durable isolated backup destination preparation admission/result.
+    ///
+    /// A separate variant, not another `CutoverIntent`: preparation produces a
+    /// fenced destination and stops, cutover activates an approved generation.
+    BackupPreparation(BackupPreparationRecord),
 }
 
 impl HostStateRecord {
@@ -2376,6 +2635,7 @@ impl HostStateRecord {
             Self::StoreRebind(value) => value.validate(),
             Self::ReactiveContext(value) => validate_record_for_journal(value),
             Self::CutoverIntent(value) => value.validate(),
+            Self::BackupPreparation(value) => value.validate(),
         }
     }
 
@@ -2403,6 +2663,7 @@ impl HostStateRecord {
             Self::StoreRebind(value) => &value.fence,
             Self::ReactiveContext(value) => &value.fence,
             Self::CutoverIntent(value) => &value.fence,
+            Self::BackupPreparation(value) => &value.fence,
         }
     }
 
@@ -2422,6 +2683,7 @@ impl HostStateRecord {
             Self::StoreRebind(value) => &value.operation,
             Self::ReactiveContext(value) => &value.operation,
             Self::CutoverIntent(value) => &value.operation,
+            Self::BackupPreparation(value) => &value.operation,
         }
     }
 }
@@ -2477,6 +2739,24 @@ pub struct HostState {
     /// this projection instead of assuming an activation from local state.
     #[serde(default)]
     pub pending_cutover: Option<CutoverIntentRecord>,
+    /// Durable isolated backup destination preparation outcomes owned by this
+    /// journal, keyed by the admitted preparation operation identity.
+    ///
+    /// `default` is mandatory, not stylistic: `HostState` is a rebuildable read
+    /// model serialized from an already-installed journal, and a required field
+    /// would make every existing projection fail to decode.
+    ///
+    /// This is a projection of the same single writer, not a second registry.
+    /// One entry per admitted preparation, and the reducer replaces an entry
+    /// only by that same operation identity, so the list is bounded by the
+    /// number of admitted preparations rather than by the number of attempts.
+    ///
+    /// The field grants no authority: an entry is a resolution aid for a reader
+    /// that already has the operation identity, never proof that a root exists
+    /// or that this Host owns it. A `Pending` entry in particular says only that
+    /// the operation was admitted and its outcome was never recorded.
+    #[serde(default)]
+    pub backup_preparations: Vec<BackupPreparationRecord>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -2521,6 +2801,7 @@ impl HostState {
             store_rebinds: Vec::new(),
             reactive_context: Some(ReactiveContextQueueState::default()),
             pending_cutover: None,
+            backup_preparations: Vec::new(),
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),

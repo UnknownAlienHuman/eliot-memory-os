@@ -7,11 +7,12 @@ use thiserror::Error;
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, CutoverIntentState, DrainState, EpochEvidence, EpochRetirementRecord,
-    HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity,
+    AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState, EpochEvidence,
+    EpochRetirementRecord, HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity,
     PredecessorRetirementRelation, RecordFence, RecoveryLineageReason, activation_transition,
-    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
-    kernel_transition, store_rebind_transition, wake_transition,
+    backup_preparation_transition, dependency_transition, drain_transition,
+    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
+    wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
@@ -727,6 +728,15 @@ fn apply(
                 .pending_cutover
                 .as_ref()
                 .is_none_or(|intent| intent.state != CutoverIntentState::Pending);
+            // A preparation with no recorded result is the same hazard for the
+            // same reason: the operation was admitted and its destination may
+            // exist, so closing a clean Host epoch lineage would re-base this
+            // journal and discard the only durable proof that it was admitted.
+            // A recorded result is settled history and does not block shutdown.
+            let preparations_settled = state
+                .backup_preparations
+                .iter()
+                .all(|record| record.state != BackupPreparationState::Pending);
             let reactive_context_clean = state
                 .reactive_context
                 .as_ref()
@@ -740,6 +750,7 @@ fn apply(
                     && !genesis_without_runtime_contour)
                 || !reactive_context_clean
                 || !cutover_settled
+                || !preparations_settled
             {
                 return Err(JournalError::Invalid(
                     "clean marker does not cover a cleanly stopped journal".into(),
@@ -882,6 +893,39 @@ fn apply(
                 ));
             }
             state.pending_cutover = Some(next.clone());
+            state.clean_marker = None;
+        }
+        HostStateRecord::BackupPreparation(next) => {
+            // Preparation is a per-operation state machine in this journal's
+            // own projection, keyed by the admitted preparation operation
+            // identity - not a second registry. `backup_preparation_transition`
+            // holds the law; this arm is the single-writer bookkeeping:
+            //  * one entry per admitted preparation, replaced only by that same
+            //    operation identity, so a repeat resolves the original entry
+            //    instead of starting a second preparation;
+            //  * a `Prepared` result is admitted only after a durable `Pending`
+            //    with identical bindings and fence, so a root can never be
+            //    claimed as created without a recorded admission that proposed
+            //    exactly that root;
+            //  * a changed source, archive, class, admission, destination or
+            //    owner-issued identity under one operation identity is a
+            //    conflict, not a re-scoped preparation;
+            //  * `Prepared` is terminal, so an unsettled admission is never
+            //    re-opened and a partial destination is never silently replaced
+            //    by a second outcome.
+            let index = state
+                .backup_preparations
+                .iter()
+                .position(|item| item.preparation_operation == next.preparation_operation);
+            backup_preparation_transition(
+                index.map(|index| &state.backup_preparations[index]),
+                next,
+            )?;
+            if let Some(index) = index {
+                state.backup_preparations[index] = next.clone();
+            } else {
+                state.backup_preparations.push(next.clone());
+            }
             state.clean_marker = None;
         }
     }
