@@ -14,7 +14,12 @@
     "manifest_sha256": "84d4087dbc39938e6f05999337d383d8c19c889df2717a118bb5e4f90bd47556",
     "pack_hash": "6721836121fc0106670037725d821656179ec562af3514af04adbdac00d24c60",
     "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
-    "order": ["eliot-work", "eliot-remember", "eliot-recover", "eliot-finish"],
+    "order": [
+      "eliot-work",
+      "eliot-remember",
+      "eliot-recover",
+      "eliot-finish"
+    ],
     "derived_packages": [
       "integrations/opencode/skills",
       "integrations/claude/eliot/skills",
@@ -92,10 +97,10 @@
     },
     "opencode": {
       "route_profile": "integrations/opencode/route-profile.json",
-      "route_profile_sha256": "e521f37e5d20e28e03fc89d5b0394c0ac93ef3163c13c0d84604d2e11b11f9df",
+      "route_profile_sha256": "0f5c089a6bb801e61329992c08e428472bfcbf8cd5ed56b6dbc730e3b828e692",
       "bundle_generation": "1217-A.1",
       "adapter_contract": "integrations/opencode/plugin-bridge-contract.json",
-      "adapter_contract_sha256": "622b3e3d85b4fa95a6fc5fdfcb9d7b4f97b1a69bf91c8479bc0a26f0106e1c39",
+      "adapter_contract_sha256": "ffb3fb10bd77608df5d9f06e4a8760cd2ff8ab51c1ea93d5e7bd921d17eb1b09",
       "adapter_generation": "eliot.opencode-plugin-bridge.v1",
       "adapter_note": "compatibility_fallback only_when_loopback_http_is_not_configured; cross_transport_failover_after_http_attempt is false; unprobed and requires live probe; contract presence is not admission.",
       "host_runtime_version": null,
@@ -115,7 +120,7 @@
           "destination": "plugins/eliot.js",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "939748bbccc06a10969304105cae81e8979b211145096c57833fecb6dce009e3"
+          "sha256": "a8ab084a12755b61b304888b4db36f0fbbd0aa429c60290daca3792753268e9d"
         },
         {
           "source": "integrations/opencode/instructions/eliot.md",
@@ -163,10 +168,10 @@
     },
     "antigravity": {
       "route_profile": "integrations/antigravity/route-profile.json",
-      "route_profile_sha256": "8bad3925bbdf4194df4c05c0d5ee971456460bd57bb2364cc9b54d92a58f790a",
+      "route_profile_sha256": "5139a35a5326ccd70e5396ee107e67154f9253827c75994325a3f2532f71ad2d",
       "bundle_generation": "1217-A.1",
       "adapter_contract": "integrations/antigravity/runtime-preflight.contract.json",
-      "adapter_contract_sha256": "4220c54ab5cdfb687503e1df24db256303272287218163c05acbfc7f7b0cd921",
+      "adapter_contract_sha256": "7286ac5ea99207eeb43a6b660db1c0b9bdf3272c190d87d33dd460c88601b389",
       "adapter_generation": "eliot.antigravity-runtime-preflight.v1",
       "adapter_note": "execution_allowed is false for all candidate runtimes; route_admitted is false; model_calls is 0; preflight fingerprint only, not admission.",
       "host_runtime_version": null,

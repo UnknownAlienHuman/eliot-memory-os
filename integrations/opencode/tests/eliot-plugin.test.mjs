@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import http from "node:http"
+import crypto from "node:crypto"
 import { once } from "node:events"
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
@@ -8,6 +9,59 @@ import { resolve } from "node:path"
 const pluginPath = resolve("integrations/opencode/plugins/eliot.js")
 const source = await readFile(pluginPath, "utf8")
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`)
+
+function buildGateResponse({
+  payload,
+  token = "unit-token",
+  decision = "allow",
+  disposition = null,
+  reasonCode = null,
+  expiresAtMs = Date.now() + 60000,
+  replayed = false,
+}) {
+  const isAllow = decision === "allow"
+  const isDeny = decision === "deny"
+  const fields = {
+    response_version: "eliot.opencode.host-event-response.v1",
+    event_id: payload.event_id,
+    effect_digest: payload.effect_digest ?? null,
+    decision,
+    disposition: isDeny ? (disposition ?? "DENIED") : null,
+    reason_code: isDeny ? (reasonCode ?? "POLICY_DENIED") : null,
+    installation_id: process.env.ELIOT_INSTALLATION_ID ?? "inst-unit",
+    bridge_generation: 1,
+    authority_epoch: process.env.ELIOT_AUTHORITY_EPOCH ?? "epoch-unit:1",
+    state_fence: process.env.ELIOT_STATE_FENCE ?? "fence-unit",
+    policy_revision: "pol-unit",
+    authority_revision: "auth-unit",
+    expires_at_ms: isAllow ? expiresAtMs : null,
+    event_receipt: "receipt-unit",
+    decision_receipt: "dec-unit",
+    replayed,
+  }
+
+  const message = JSON.stringify([
+    fields.response_version,
+    fields.event_id,
+    fields.effect_digest,
+    fields.decision,
+    fields.disposition,
+    fields.reason_code,
+    fields.installation_id,
+    fields.bridge_generation,
+    fields.authority_epoch,
+    fields.state_fence,
+    fields.policy_revision,
+    fields.authority_revision,
+    fields.expires_at_ms,
+    fields.event_receipt,
+    fields.decision_receipt,
+    fields.replayed,
+  ])
+
+  fields.response_commitment = crypto.createHmac("sha256", token).update(message).digest("hex")
+  return fields
+}
 
 const ENV_KEYS = [
   "ELIOT_TASK_ID",
@@ -73,7 +127,7 @@ test("mutating gate prefers authenticated loopback HTTP and never sends argument
     assert.equal(text.includes("unit-token"), false)
 
     response.writeHead(200, { "content-type": "application/json" })
-    response.end(JSON.stringify({ decision: "allow" }))
+    response.end(JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" })))
   }, async (url) => {
     process.env.ELIOT_TASK_ID = "task-1"
     process.env.ELIOT_OPENCODE_BRIDGE_URL = url
@@ -90,9 +144,9 @@ test("one transient HTTP retry preserves the exact idempotency key", async () =>
   const keys = []
   let calls = 0
   await withServer(async (request, response) => {
-    for await (const _chunk of request) {
-      // Drain request before responding.
-    }
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
     keys.push(request.headers["idempotency-key"])
     calls += 1
     if (calls === 1) {
@@ -101,7 +155,7 @@ test("one transient HTTP retry preserves the exact idempotency key", async () =>
       return
     }
     response.writeHead(200, { "content-type": "application/json" })
-    response.end(JSON.stringify({ decision: "allow" }))
+    response.end(JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" })))
   }, async (url) => {
     process.env.ELIOT_TASK_ID = "task-1"
     process.env.ELIOT_OPENCODE_BRIDGE_URL = url
@@ -128,12 +182,12 @@ test("non-loopback bridge configuration fails closed for attached mutations", as
 test("a redirecting bridge never re-issues the payload and never decides the gate", async () => {
   let redirectTargetHits = 0
   await withServer(async (request, response) => {
-    for await (const _chunk of request) {
-      // Drain before responding.
-    }
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
     redirectTargetHits += 1
     response.writeHead(200, { "content-type": "application/json" })
-    response.end(JSON.stringify({ decision: "allow" }))
+    response.end(JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" })))
   }, async (targetUrl) => {
     await withServer(async (request, response) => {
       for await (const _chunk of request) {
@@ -314,22 +368,26 @@ test("each retried failed JSON response read cancels its reader exactly once", a
 
 test("case-insensitive JSON media types accept valid parameters and whitespace", async () => {
   let reads = 0
-  globalThis.fetch = async () => ({
-    status: 200,
-    ok: true,
-    headers: new Headers({ "content-type": "  Application/JSON ; charset=utf-8; profile=\"unit\"  " }),
-    body: {
-      getReader: () => ({
-        read: async () => {
-          reads += 1
-          return reads === 1
-            ? { done: false, value: new TextEncoder().encode('{"decision":"allow"}') }
-            : { done: true, value: undefined }
-        },
-        releaseLock: () => {},
-      }),
-    },
-  })
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body)
+    const responseJson = JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" }))
+    return {
+      status: 200,
+      ok: true,
+      headers: new Headers({ "content-type": "  Application/JSON ; charset=utf-8; profile=\"unit\"  " }),
+      body: {
+        getReader: () => ({
+          read: async () => {
+            reads += 1
+            return reads === 1
+              ? { done: false, value: new TextEncoder().encode(responseJson) }
+              : { done: true, value: undefined }
+          },
+          releaseLock: () => {},
+        }),
+      },
+    }
+  }
   process.env.ELIOT_TASK_ID = "task-content-type"
   process.env.ELIOT_OPENCODE_BRIDGE_URL = "http://127.0.0.1:43123/"
   process.env.ELIOT_OPENCODE_BRIDGE_TOKEN = "unit-token"
@@ -340,9 +398,11 @@ test("case-insensitive JSON media types accept valid parameters and whitespace",
 
 test("argument key count beyond 64 fails closed instead of truncating the action", async () => {
   await withServer(async (request, response) => {
-    request.resume()
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
     response.writeHead(200, { "content-type": "application/json" })
-    response.end(JSON.stringify({ decision: "allow" }))
+    response.end(JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" })))
   }, async (url) => {
     process.env.ELIOT_TASK_ID = "task-bounds"
     process.env.ELIOT_OPENCODE_BRIDGE_URL = url
@@ -360,9 +420,11 @@ test("argument key count beyond 64 fails closed instead of truncating the action
 
 test("argument key length beyond 128 fails closed instead of dropping the key", async () => {
   await withServer(async (request, response) => {
-    request.resume()
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
     response.writeHead(200, { "content-type": "application/json" })
-    response.end(JSON.stringify({ decision: "allow" }))
+    response.end(JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" })))
   }, async (url) => {
     process.env.ELIOT_TASK_ID = "task-bounds"
     process.env.ELIOT_OPENCODE_BRIDGE_URL = url
@@ -394,7 +456,7 @@ test("the gate payload carries exactly the contract allowlist and nothing else",
     assert.deepEqual(Object.keys(payload).sort(), allowlist)
 
     response.writeHead(200, { "content-type": "application/json" })
-    response.end(JSON.stringify({ decision: "allow" }))
+    response.end(JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" })))
   }, async (url) => {
     process.env.ELIOT_TASK_ID = "task-1"
     process.env.ELIOT_OPENCODE_BRIDGE_URL = url
@@ -424,9 +486,10 @@ test("effect binding is stable for key order and changes for argument values", a
   await withServer(async (request, response) => {
     const chunks = []
     for await (const chunk of request) chunks.push(chunk)
-    payloads.push(JSON.parse(Buffer.concat(chunks).toString("utf8")))
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    payloads.push(payload)
     response.writeHead(200, { "content-type": "application/json" })
-    response.end(JSON.stringify({ decision: "allow" }))
+    response.end(JSON.stringify(buildGateResponse({ payload, token: "unit-token", decision: "allow" })))
   }, async (url) => {
     process.env.ELIOT_TASK_ID = "task-digest"
     process.env.ELIOT_OPENCODE_BRIDGE_URL = url
