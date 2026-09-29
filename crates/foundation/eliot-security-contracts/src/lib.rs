@@ -7,9 +7,15 @@
 #![forbid(unsafe_code)]
 
 mod revocation_digest;
+mod native_resource_lease;
 mod surface_types;
 mod validation;
 
+pub use native_resource_lease::{
+    NATIVE_RESOURCE_LEASE_VERSION, NativeResourceLease, NativeResourceLeaseBinding,
+    NativeResourceLeaseBindingField, NativeResourceLeaseConsumptionReceipt,
+    NativeResourceLeaseError, NativeResourceLeaseField, NativeResourceMeasurement,
+};
 pub use revocation_digest::{
     REVOCATION_DISPOSITION_COMPLETE, REVOCATION_DISPOSITION_PARTIAL,
     REVOCATION_DISPOSITION_UNKNOWN, REVOCATION_HISTORY_EVIDENCE_VERSION,

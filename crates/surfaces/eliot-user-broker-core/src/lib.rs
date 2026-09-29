@@ -27,7 +27,10 @@ use eliot_process::{
 };
 use eliot_protocol::{ProtocolVersion, RequestIdentity};
 use eliot_receipts::ProofCeiling;
-use eliot_security_contracts::EffectCeiling;
+use eliot_security_contracts::{
+    EffectCeiling, NativeResourceLease, NativeResourceLeaseBinding,
+    NativeResourceLeaseConsumptionReceipt, NativeResourceLeaseError, NativeResourceMeasurement,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -55,6 +58,8 @@ pub const ISSUED_OPERATION_CONTROL_BYTE_RESERVE: usize = 16 * 1024;
 pub const MAX_PROCESS_EFFECT_LINEAGE_ENTRIES: usize = 4_096;
 /// Serialized process-lineage budget, leaving room for cursors and receipts.
 pub const MAX_PROCESS_EFFECT_LINEAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Native resource leases are deliberately short lived and never renewed.
+pub const NATIVE_RESOURCE_LEASE_TTL_MS: u64 = 5_000;
 
 fn legacy_issued_operation_identity_version() -> u16 {
     LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
@@ -279,6 +284,14 @@ fn text(value: &str, field: &'static str) -> Result<(), BrokerError> {
     Ok(())
 }
 
+fn bounded_text(value: &str, max_bytes: usize, field: &'static str) -> Result<(), BrokerError> {
+    text(value, field)?;
+    if value.len() > max_bytes {
+        return Err(BrokerError::InvalidField(field));
+    }
+    Ok(())
+}
+
 fn digest<T: Serialize>(value: &T) -> Result<String, BrokerError> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| BrokerError::Provider(error.to_string()))?;
@@ -394,6 +407,7 @@ pub enum RequiredProvider {
     G01Authority,
     P03Process,
     DurableRegistration,
+    NativeResourceResolver,
 }
 
 /// Provider outcome that cannot be reinterpreted as successful launch.
@@ -709,6 +723,10 @@ pub struct ApprovedLaunch {
     /// Kernel/N4-owned interactive session identity.
     pub session_id: SessionId,
     pub request_id: String,
+    /// Owner-issued attempt identity; it is distinct from `request_id` and
+    /// `operation_id`. Required on the launch wire; older payloads without it
+    /// fail closed during deserialization.
+    pub attempt_id: String,
     pub route_fingerprint: String,
     pub artifact_digest: String,
     pub executable: String,
@@ -766,6 +784,7 @@ pub struct LaunchRequest {
 impl LaunchRequest {
     pub fn validate(&self) -> Result<(), BrokerError> {
         text(&self.approved.request_id, "request_id")?;
+        bounded_text(&self.approved.attempt_id, 512, "attempt_id")?;
         text(&self.approved.route_fingerprint, "route_fingerprint")?;
         text(&self.approved.artifact_digest, "artifact_digest")?;
         hex_digest(&self.approved.artifact_digest, "artifact_digest")?;
@@ -941,6 +960,8 @@ pub struct LaunchReceipt {
     pub registration_digest: String,
     pub user_broker_epoch: u64,
     pub fence_id: String,
+    /// Current resource identity check and one-shot lease consumption performed for this launch.
+    pub native_resource_lease_receipt: NativeResourceLeaseConsumptionReceipt,
     pub process_receipt: ProcessStartReceipt,
     pub proof_ceiling: ProofCeiling,
     pub operation_permit: OperationPermit,
@@ -1403,6 +1424,15 @@ pub struct RetiredOperationIdentity {
     /// additive migration for a tombstone written before this field existed.
     #[serde(default)]
     pub introduction: Option<ResourceIntroduction>,
+    /// One-shot resource lease retained when this operation crossed a resource boundary.
+    #[serde(default)]
+    pub native_resource_lease: Option<NativeResourceLease>,
+    /// Durable one-shot resolution state retained through broker cutover.
+    #[serde(default)]
+    pub native_resource_lease_use_state: Option<NativeResourceLeaseUseState>,
+    /// Durable evidence of the lease's immediate re-resolve/re-measure and consumption.
+    #[serde(default)]
+    pub native_resource_lease_receipt: Option<NativeResourceLeaseConsumptionReceipt>,
     /// State the operation held when its generation was fenced.
     pub state: OperationState,
 }
@@ -1463,6 +1493,17 @@ pub struct OperationCursor {
     /// with that process.
     #[serde(default)]
     pub introduction: Option<ResourceIntroduction>,
+    /// One-shot resource lease bound to this operation, attempt and consumer generation.
+    #[serde(default)]
+    pub native_resource_lease: Option<NativeResourceLease>,
+    /// Durable reservation/in-flight/consumed marker. The in-flight state is
+    /// committed before the second owner-port call so recovery never retries
+    /// an outcome whose acknowledgement was lost.
+    #[serde(default)]
+    pub native_resource_lease_use_state: Option<NativeResourceLeaseUseState>,
+    /// Persisted before process start so an unknown start outcome cannot replay the lease.
+    #[serde(default)]
+    pub native_resource_lease_receipt: Option<NativeResourceLeaseConsumptionReceipt>,
     /// A durable recovery obligation when the process effect could not be
     /// joined to its caller/grant lineage. The operation ID and invocation
     /// digest above remain the exact handle for reconciliation.
@@ -1477,6 +1518,18 @@ pub enum OperationState {
     Active,
     Unknown,
     Reconciled,
+}
+
+/// Durable phase of the broker's one-shot resource lease consumption.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeResourceLeaseUseState {
+    /// The operation and lease ID are durably reserved; owner re-resolution has not begun.
+    Reserved,
+    /// Persisted before re-resolution; recovery must treat the outcome as spent and unknown.
+    ResolutionInFlight,
+    /// Fresh measurement and receipt were durably recorded before process start.
+    Consumed,
 }
 
 impl OperationCursor {
@@ -1495,8 +1548,70 @@ impl OperationCursor {
         if let Some(introduction) = &self.introduction {
             introduction.validate()?;
         }
+        validate_retained_native_resource_lease(
+            self.native_resource_lease.as_ref(),
+            self.native_resource_lease_use_state,
+            self.native_resource_lease_receipt.as_ref(),
+            self.operation_id.as_str(),
+            &self.registration_digest,
+            self.user_broker_epoch,
+            Some(self.generation.get()),
+            Some(&self.authority_epoch),
+            self.introduction.as_ref(),
+            "operation_cursor.native_resource_lease",
+        )?;
         Ok(())
     }
+}
+
+fn validate_retained_native_resource_lease(
+    lease: Option<&NativeResourceLease>,
+    use_state: Option<NativeResourceLeaseUseState>,
+    receipt: Option<&NativeResourceLeaseConsumptionReceipt>,
+    operation_id: &str,
+    registration_digest: &str,
+    user_broker_epoch: u64,
+    consumer_generation: Option<u64>,
+    authority_epoch: Option<&EpochId>,
+    introduction: Option<&ResourceIntroduction>,
+    field: &'static str,
+) -> Result<(), BrokerError> {
+    let Some(lease) = lease else {
+        return if use_state.is_none() && receipt.is_none() {
+            Ok(())
+        } else {
+            Err(BrokerError::InvalidField(field))
+        };
+    };
+
+    lease.validate().map_err(BrokerError::NativeResourceLease)?;
+    match (use_state, receipt) {
+        (Some(NativeResourceLeaseUseState::Reserved), None)
+        | (Some(NativeResourceLeaseUseState::ResolutionInFlight), None) => {}
+        (Some(NativeResourceLeaseUseState::Consumed), Some(receipt)) => receipt
+            .validate_for(lease)
+            .map_err(BrokerError::NativeResourceLease)?,
+        _ => return Err(BrokerError::InvalidField(field)),
+    }
+    if lease.operation_ref != operation_id
+        || lease.registration_ref != registration_digest
+        || lease.broker_epoch != user_broker_epoch
+        || consumer_generation
+            .is_some_and(|generation| lease.consumer_generation != generation)
+        || authority_epoch.is_some_and(|authority| {
+            !lease
+                .state_fence
+                .authority_epoch
+                .is_same_authority(authority)
+        })
+        || introduction
+            .is_none_or(|introduction| introduction.resource_ref != lease.resource_ref)
+    {
+        return Err(BrokerError::NativeResourceLease(
+            NativeResourceLeaseError::ReceiptBindingMismatch,
+        ));
+    }
+    Ok(())
 }
 
 /// The explicitly recorded broker-independent part of one broker Session
@@ -1748,6 +1863,43 @@ pub trait DurableRegistrationPort: Send {
     fn save(&mut self, snapshot: &BrokerSnapshot) -> Result<(), PortError>;
 }
 
+/// Current resource-owner failure when the broker re-resolves a lease target.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum NativeResourceResolutionError {
+    #[error("resource was revoked")]
+    Revoked,
+    #[error("resource identity or scope was substituted")]
+    Substituted,
+    #[error("resource no longer exists")]
+    NotFound,
+    #[error("resource resolver unavailable")]
+    Unavailable,
+    #[error("resource measurement outcome is unknown")]
+    Unknown,
+    #[error("invalid resource resolver contract: {0}")]
+    Invalid(String),
+}
+
+/// Resolves the opaque resource reference and returns a fresh, path-free measurement.
+///
+/// Implementations resolve the reference again on every call, check its exact
+/// principal and scope, authenticate `issuer_process_ref` and
+/// `registration_ref` against the live broker caller, and report the current
+/// State Fence, resource identity, and measurement. The issuer identity is
+/// taken from the broker's sealed `RegistrationReceipt`; it is not supplied by
+/// the launch caller. `measured_at` must come from the owner's current clock
+/// and be at least `not_before`; identity and measurement digests must cover
+/// the fresh resolution rather than copy the caller's values. The broker calls
+/// this once to issue the lease and again immediately before it durably
+/// records consumption and starts the admitted consumer.
+pub trait NativeResourceResolverPort: Send {
+    fn resolve_and_measure(
+        &mut self,
+        binding: &NativeResourceLeaseBinding,
+        not_before: u64,
+    ) -> Result<NativeResourceMeasurement, NativeResourceResolutionError>;
+}
+
 /// One physical start result.  The request digest is retained even when the
 /// external process outcome is unknown, so reconciliation can bind evidence to
 /// the exact one-shot invocation without transporting sealed P-03 authority.
@@ -1822,6 +1974,7 @@ pub struct UserBroker {
     authority: Option<Box<dyn AuthorityPort>>,
     process: Option<Box<dyn ProcessPort>>,
     durable: Option<Box<dyn DurableRegistrationPort>>,
+    native_resource_resolver: Option<Box<dyn NativeResourceResolverPort>>,
     identity_ledger: Option<Box<dyn IssuedOperationIdentityLedger>>,
     admission: Option<BrokerAdmissionIdentity>,
     registration: Option<RegistrationReceipt>,
@@ -1867,6 +2020,7 @@ impl UserBroker {
             authority,
             process,
             durable,
+            native_resource_resolver: None,
             identity_ledger: None,
             admission: None,
             registration: None,
@@ -1926,6 +2080,18 @@ impl UserBroker {
         ledger: Box<dyn IssuedOperationIdentityLedger>,
     ) {
         self.identity_ledger = Some(ledger);
+    }
+
+    /// Attaches the owner that can freshly resolve and measure introduced resources.
+    ///
+    /// Launch admission fails closed until this provider is present because a
+    /// `ResourceIntroduction` alone cannot prove that its target still denotes
+    /// the approved resource at the effect boundary.
+    pub fn attach_native_resource_resolver(
+        &mut self,
+        resolver: Box<dyn NativeResourceResolverPort>,
+    ) {
+        self.native_resource_resolver = Some(resolver);
     }
 
     /// Returns the durable per-operation identity ledger recovered from the
@@ -2222,6 +2388,14 @@ impl UserBroker {
                 registration_digest: record.cursor.registration_digest.clone(),
                 user_broker_epoch: record.cursor.user_broker_epoch,
                 introduction: record.cursor.introduction.clone(),
+                native_resource_lease: record.cursor.native_resource_lease.clone(),
+                native_resource_lease_use_state: record
+                    .cursor
+                    .native_resource_lease_use_state,
+                native_resource_lease_receipt: record
+                    .cursor
+                    .native_resource_lease_receipt
+                    .clone(),
                 state: record.cursor.state,
             };
             self.retired_operations
@@ -2469,6 +2643,223 @@ impl UserBroker {
         self.cutover.state()
     }
 
+    fn issue_native_resource_lease(
+        &mut self,
+        binding: &NativeResourceLeaseBinding,
+        current: &RegistrationReceipt,
+        request: &LaunchRequest,
+        grant: &LaunchGrant,
+    ) -> Result<NativeResourceLease, BrokerError> {
+        binding
+            .validate()
+            .map_err(BrokerError::NativeResourceLease)?;
+        let measurement = self
+            .native_resource_resolver
+            .as_mut()
+            .ok_or(BrokerError::PlanGap(RequiredProvider::NativeResourceResolver))?
+            .resolve_and_measure(binding, request.observed_at)
+            .map_err(map_native_resource_resolution)?;
+        if binding.issuer_process_ref != current.broker_process_id
+            || binding.registration_ref != current.registration_digest
+            || binding.broker_epoch != current.user_broker_epoch
+        {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Revoked,
+            ));
+        }
+        measurement
+            .validate()
+            .map_err(BrokerError::NativeResourceLease)?;
+        if measurement.resource_ref != binding.resource_ref
+            || measurement.scope_digest != binding.scope_digest
+        {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::ResourceSubstituted,
+            ));
+        }
+        if !measurement
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&current.authority_epoch)
+        {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Revoked,
+            ));
+        }
+        if measurement.measured_at < request.observed_at {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::StaleMeasurement,
+            ));
+        }
+        let issued_at = measurement.measured_at;
+        let credential_expires_at = grant
+            .approved
+            .introduction
+            .credential_binding
+            .as_ref()
+            .map_or(u64::MAX, |binding| binding.expires_at);
+        let expires_at = issued_at
+            .saturating_add(NATIVE_RESOURCE_LEASE_TTL_MS)
+            .min(request.lease_expires_at)
+            .min(current.expires_at)
+            .min(grant.expires_at)
+            .min(grant.approved.introduction.expires_at)
+            .min(credential_expires_at);
+        if expires_at <= issued_at {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Expired,
+            ));
+        }
+        let lease = NativeResourceLease {
+            lease_id: Uuid::new_v4().to_string(),
+            principal_ref: binding.principal_ref.clone(),
+            issuer_process_ref: binding.issuer_process_ref.clone(),
+            attempt_ref: binding.attempt_ref.clone(),
+            request_ref: binding.request_ref.clone(),
+            operation_ref: binding.operation_ref.clone(),
+            resource_ref: binding.resource_ref.clone(),
+            scope_digest: binding.scope_digest.clone(),
+            registration_ref: binding.registration_ref.clone(),
+            broker_epoch: binding.broker_epoch,
+            consumer_generation: binding.consumer_generation,
+            state_fence: measurement.state_fence,
+            resource_identity_digest: measurement.resource_identity_digest,
+            measurement_digest: measurement.measurement_digest,
+            issued_at,
+            expires_at,
+        };
+        lease.validate().map_err(BrokerError::NativeResourceLease)?;
+        Ok(lease)
+    }
+
+    fn consume_native_resource_lease(
+        &mut self,
+        lease: &NativeResourceLease,
+        expected: &NativeResourceLeaseBinding,
+    ) -> Result<NativeResourceLeaseConsumptionReceipt, BrokerError> {
+        lease.validate().map_err(BrokerError::NativeResourceLease)?;
+        expected
+            .validate()
+            .map_err(BrokerError::NativeResourceLease)?;
+        if lease.binding() != *expected {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Revoked,
+            ));
+        }
+        let mut reservation_key = None;
+        let mut replay = false;
+        for (key, record) in &self.operations {
+            if let Some(retained) = &record.cursor.native_resource_lease
+                && retained.lease_id == lease.lease_id
+            {
+                let is_this_reservation = retained == lease
+                    && record.cursor.operation_id.as_str() == expected.operation_ref
+                    && record.cursor.native_resource_lease_use_state
+                        == Some(NativeResourceLeaseUseState::Reserved)
+                    && record.cursor.native_resource_lease_receipt.is_none();
+                if !is_this_reservation || reservation_key.replace(key.clone()).is_some() {
+                    replay = true;
+                }
+            }
+        }
+        if self.retired_operations.values().any(|retired| {
+            retired
+                .native_resource_lease
+                .as_ref()
+                .is_some_and(|retained| retained.lease_id == lease.lease_id)
+        }) {
+            replay = true;
+        }
+        let Some(reservation_key) = reservation_key.filter(|_| !replay) else {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Replay,
+            ));
+        };
+        // Persist the in-flight fence before crossing the owner port. A crash
+        // or unknown acknowledgement from this point burns the lease rather
+        // than allowing a second resolution after restart.
+        self.operations
+            .get_mut(&reservation_key)
+            .ok_or(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Replay,
+            ))?
+            .cursor
+            .native_resource_lease_use_state =
+            Some(NativeResourceLeaseUseState::ResolutionInFlight);
+        self.persist()?;
+        let measurement = self
+            .native_resource_resolver
+            .as_mut()
+            .ok_or(BrokerError::PlanGap(RequiredProvider::NativeResourceResolver))?
+            .resolve_and_measure(expected, lease.issued_at)
+            .map_err(map_native_resource_resolution)?;
+        measurement
+            .validate()
+            .map_err(BrokerError::NativeResourceLease)?;
+        let consumed_at = measurement.measured_at;
+        let current = self
+            .active_registration(consumed_at)
+            .map_err(map_native_resource_currentness)?
+            .clone();
+        if current.registration_digest != expected.registration_ref
+            || current.windows_sid != expected.principal_ref
+            || current.broker_process_id != expected.issuer_process_ref
+            || current.user_broker_epoch != expected.broker_epoch
+            || !current
+                .authority_epoch
+                .is_same_authority(&expected.authority_epoch)
+        {
+            return Err(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Revoked,
+            ));
+        }
+        self.admit_new_launch(&current, consumed_at)
+            .map_err(map_native_resource_currentness)?;
+        lease
+            .validate_use(expected, &measurement, consumed_at)
+            .map_err(BrokerError::NativeResourceLease)?;
+        let receipt = NativeResourceLeaseConsumptionReceipt {
+            receipt_id: Uuid::new_v4().to_string(),
+            lease_id: lease.lease_id.clone(),
+            lease_digest: lease
+                .canonical_digest()
+                .map_err(BrokerError::NativeResourceLease)?,
+            principal_ref: lease.principal_ref.clone(),
+            issuer_process_ref: lease.issuer_process_ref.clone(),
+            attempt_ref: lease.attempt_ref.clone(),
+            request_ref: lease.request_ref.clone(),
+            operation_ref: lease.operation_ref.clone(),
+            resource_ref: lease.resource_ref.clone(),
+            scope_digest: lease.scope_digest.clone(),
+            registration_ref: lease.registration_ref.clone(),
+            broker_epoch: lease.broker_epoch,
+            consumer_generation: lease.consumer_generation,
+            state_fence: measurement.state_fence,
+            resource_identity_digest: measurement.resource_identity_digest,
+            measurement_digest: measurement.measurement_digest,
+            consumed_at,
+        };
+        receipt
+            .validate_for(lease)
+            .map_err(BrokerError::NativeResourceLease)?;
+        {
+            let record = self
+                .operations
+                .get_mut(&reservation_key)
+                .ok_or(BrokerError::NativeResourceLease(
+                    NativeResourceLeaseError::Replay,
+                ))?;
+            record.cursor.native_resource_lease_receipt = Some(receipt.clone());
+            record.cursor.native_resource_lease_use_state =
+                Some(NativeResourceLeaseUseState::Consumed);
+        }
+        // The fresh re-resolve receipt is durable before launch crosses the
+        // physical process start boundary. If this save fails, the already
+        // durable ResolutionInFlight state still prevents replay.
+        self.persist()?;
+        Ok(receipt)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     #[allow(clippy::too_many_lines)]
     pub fn launch(&mut self, request: LaunchRequest) -> Result<LaunchReceipt, BrokerError> {
@@ -2516,6 +2907,9 @@ impl UserBroker {
             self.close(RegistrationStatus::Closed)?;
             return Err(error);
         }
+        let resource_lease_binding = native_resource_lease_binding(&current, &grant)?;
+        let resource_lease =
+            self.issue_native_resource_lease(&resource_lease_binding, &current, &request, &grant)?;
         let process_operation_id = grant.approved.operation_id.clone();
         let process_generation = grant.approved.generation;
         let permit = permit_from_grant(&grant, &current, &request_digest);
@@ -2536,21 +2930,36 @@ impl UserBroker {
             &current,
             &request_digest,
             &expected_process_request_digest,
+            &resource_lease,
+            None,
+            NativeResourceLeaseUseState::Reserved,
             OperationState::Unknown,
         );
-        let pending_record = OperationRecord {
+        let reserved_record = OperationRecord {
             cursor: cursor.clone(),
             permit: permit.clone(),
             receipt: None,
         };
         self.operations.insert(
             request.approved.idempotency_key.clone(),
-            pending_record.clone(),
+            reserved_record,
         );
-        // This is the last durable boundary before the provider can create a
-        // process.  Any save error leaves the exact Unknown cursor in memory
-        // and prevents crossing the physical start boundary.
+        // Reserve this one-shot lease before the second owner resolution. A
+        // save error prevents consumption; after a successful save any later
+        // interruption leaves a durable operation that cannot be retried.
         self.persist()?;
+        let resource_lease_receipt =
+            self.consume_native_resource_lease(&resource_lease, &resource_lease_binding)?;
+        let pending_record = self
+            .operations
+            .get(&request.approved.idempotency_key)
+            .cloned()
+            .ok_or(BrokerError::NativeResourceLease(
+                NativeResourceLeaseError::Replay,
+            ))?;
+        // The receipt and Consumed state were persisted by the consume path.
+        // This is the last durable boundary before the provider can create a
+        // process; any save error above prevents physical start.
         let (start_result, lineage_status) = {
             let process = self
                 .process
@@ -2634,6 +3043,7 @@ impl UserBroker {
             registration_digest: current.registration_digest.clone(),
             user_broker_epoch: current.user_broker_epoch,
             fence_id: current.fence_id.clone(),
+            native_resource_lease_receipt: resource_lease_receipt.clone(),
             process_receipt: receipt,
             proof_ceiling: grant.proof_ceiling,
             operation_permit: permit.clone(),
@@ -3560,6 +3970,65 @@ fn seal_registration_from_grant(
     seal_registration(request, grant)
 }
 
+fn native_resource_lease_binding(
+    registration: &RegistrationReceipt,
+    grant: &LaunchGrant,
+) -> Result<NativeResourceLeaseBinding, BrokerError> {
+    let binding = NativeResourceLeaseBinding {
+        principal_ref: registration.windows_sid.clone(),
+        issuer_process_ref: registration.broker_process_id.clone(),
+        attempt_ref: grant.approved.attempt_id.clone(),
+        request_ref: grant.approved.request_id.clone(),
+        operation_ref: grant.approved.operation_id.as_str().to_owned(),
+        resource_ref: grant.approved.introduction.resource_ref.clone(),
+        scope_digest: digest(&(
+            "eliot.user-broker.native-resource-lease.scope.v1",
+            &grant.approved.root,
+            &grant.approved.introduction,
+            grant.approved.effect_ceiling,
+            &grant.approved.tool,
+            &grant.approved.route_fingerprint,
+        ))?,
+        registration_ref: registration.registration_digest.clone(),
+        broker_epoch: registration.user_broker_epoch,
+        consumer_generation: grant.approved.generation.get(),
+        authority_epoch: registration.authority_epoch.clone(),
+    };
+    binding
+        .validate()
+        .map_err(BrokerError::NativeResourceLease)?;
+    Ok(binding)
+}
+
+fn map_native_resource_resolution(error: NativeResourceResolutionError) -> BrokerError {
+    match error {
+        NativeResourceResolutionError::Revoked => BrokerError::NativeResourceLease(
+            NativeResourceLeaseError::Revoked,
+        ),
+        NativeResourceResolutionError::Substituted | NativeResourceResolutionError::NotFound => {
+            BrokerError::NativeResourceLease(NativeResourceLeaseError::ResourceSubstituted)
+        }
+        NativeResourceResolutionError::Unavailable => {
+            BrokerError::PlanGap(RequiredProvider::NativeResourceResolver)
+        }
+        NativeResourceResolutionError::Unknown => BrokerError::NativeResourceResolutionUnknown,
+        NativeResourceResolutionError::Invalid(detail) => BrokerError::Provider(detail),
+    }
+}
+
+fn map_native_resource_currentness(error: BrokerError) -> BrokerError {
+    match error {
+        BrokerError::LeaseExpired
+        | BrokerError::StaleEpoch
+        | BrokerError::StaleRegistrationIdentity
+        | BrokerError::RegistrationNotAdmitted
+        | BrokerError::GrantBindingMismatch => {
+            BrokerError::NativeResourceLease(NativeResourceLeaseError::Revoked)
+        }
+        other => other,
+    }
+}
+
 fn validate_launch_grant(
     current: &RegistrationReceipt,
     request: &LaunchRequest,
@@ -3620,6 +4089,9 @@ fn cursor_from_grant(
     registration: &RegistrationReceipt,
     request_digest: &str,
     process_request_digest: &str,
+    native_resource_lease: &NativeResourceLease,
+    native_resource_lease_receipt: Option<&NativeResourceLeaseConsumptionReceipt>,
+    native_resource_lease_use_state: NativeResourceLeaseUseState,
     state: OperationState,
 ) -> OperationCursor {
     OperationCursor {
@@ -3639,6 +4111,9 @@ fn cursor_from_grant(
         // the operation so revocation and restart reconciliation name the
         // exact thing that was introduced, instead of only the child id.
         introduction: Some(grant.approved.introduction.clone()),
+        native_resource_lease: Some(native_resource_lease.clone()),
+        native_resource_lease_use_state: Some(native_resource_lease_use_state),
+        native_resource_lease_receipt: native_resource_lease_receipt.cloned(),
         // Published with the Unknown cursor before physical start. It is
         // cleared only when the exact process lineage is retained durably.
         process_lineage_recovery_required: true,
@@ -3739,6 +4214,18 @@ fn retired_index(
         if let Some(introduction) = &retired.introduction {
             introduction.validate()?;
         }
+        validate_retained_native_resource_lease(
+            retired.native_resource_lease.as_ref(),
+            retired.native_resource_lease_use_state,
+            retired.native_resource_lease_receipt.as_ref(),
+            retired.operation_id.as_str(),
+            &retired.registration_digest,
+            retired.user_broker_epoch,
+            None,
+            None,
+            retired.introduction.as_ref(),
+            "retired_operation.native_resource_lease",
+        )?;
         if retired_operations
             .insert(retired.operation_id.as_str().to_owned(), retired)
             .is_some()
@@ -3849,6 +4336,10 @@ pub enum BrokerError {
     IntroductionExpired,
     #[error("the launch's credential is not the one its introduction names")]
     IntroductionCredentialUnnamed,
+    #[error("native resource resolution outcome is unknown")]
+    NativeResourceResolutionUnknown,
+    #[error("native resource lease validation failed: {0}")]
+    NativeResourceLease(NativeResourceLeaseError),
     #[error("operation {} has an unreconciled outcome and must be reconciled before cancellation", .0.as_str())]
     UnreconciledEffect(OperationId),
     #[error("operation {} was already spent under a fenced broker generation and cannot be replayed", .0.as_str())]
@@ -5564,7 +6055,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use eliot_contracts::EpochLineageId;
+    use eliot_contracts::{EpochLineageId, ResourceGeneration, StateFence};
     use eliot_platform::ClockObservation;
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
@@ -5928,6 +6419,31 @@ mod tests {
         }
     }
 
+    struct FakeNativeResourceResolver;
+
+    impl NativeResourceResolverPort for FakeNativeResourceResolver {
+        fn resolve_and_measure(
+            &mut self,
+            binding: &NativeResourceLeaseBinding,
+            not_before: u64,
+        ) -> Result<NativeResourceMeasurement, NativeResourceResolutionError> {
+            Ok(NativeResourceMeasurement {
+                resource_ref: binding.resource_ref.clone(),
+                scope_digest: binding.scope_digest.clone(),
+                resource_identity_digest: "b".repeat(64),
+                measurement_digest: "c".repeat(64),
+                state_fence: StateFence {
+                    authority_epoch: binding.authority_epoch.clone(),
+                    resource_generation: ResourceGeneration::genesis(),
+                    task_revision: None,
+                    policy_revision: None,
+                    integration_revision: None,
+                },
+                measured_at: not_before,
+            })
+        }
+    }
+
     struct UncertainDurable {
         snapshot: Arc<Mutex<Option<BrokerSnapshot>>>,
         fail_next: Arc<AtomicBool>,
@@ -6276,6 +6792,7 @@ mod tests {
             image_id: ImageId::new("image-1").expect("image"),
             session_id: SessionId::new("session-1").expect("session"),
             request_id: "request-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
             route_fingerprint: "route-1".to_owned(),
             artifact_digest: "a".repeat(64),
             executable: "C:\\Eliot\\bin\\tool.exe".to_owned(),
@@ -6320,11 +6837,13 @@ mod tests {
     }
 
     fn broker(authority: FakeAuthority, process: FakeProcess) -> UserBroker {
-        UserBroker::new(
+        let mut broker = UserBroker::new(
             Some(Box::new(authority)),
             Some(Box::new(process)),
             Some(Box::new(FakeDurable { snapshot: None })),
-        )
+        );
+        broker.attach_native_resource_resolver(Box::new(FakeNativeResourceResolver));
+        broker
     }
 
     #[test]
