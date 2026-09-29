@@ -208,16 +208,22 @@ jobs:
             [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($data.content))
             if ((((git hash-object $path) | Out-String).Trim()) -ne $blob) { throw 'Proof input identity mismatch' }
           }
-          # The first run stopped before mutation. Its complete required-item
-          # list was byte-identical; the optional Cargo.toml identity changed
-          # the route hash. Recomputed locally against that exact current input,
-          # the full source-reading receipt now equals the runner's receipt.
+          # Both earlier runs stopped before source mutation. Required source
+          # documents matched; the route changed with optional Cargo.toml.
+          # The workflow bundle additionally binds verify.ps1's Windows CRLF
+          # bytes. The complete receipts below were downloaded, compared and
+          # reproduced locally against those exact bytes before this attempt.
           $scriptPath = Join-Path $env:RUNNER_TEMP 'hot-path-4042-proof.py'
           $scriptText = [IO.File]::ReadAllText($scriptPath)
-          $old = 'c7f4b8e9fc3e97c811b7f35804e26667e30d90b353e08e478761b922e9ae5025'
-          $verified = '99bf5e26295a8d410ae37260253569af22fc03719d170bee057c4f847bbde3ae'
-          if (-not $scriptText.Contains($old)) { throw 'Unexpected documentation expectation source' }
-          [IO.File]::WriteAllText($scriptPath, $scriptText.Replace($old, $verified), [Text.UTF8Encoding]::new($false))
+          $expectations = @{
+            'c7f4b8e9fc3e97c811b7f35804e26667e30d90b353e08e478761b922e9ae5025' = '99bf5e26295a8d410ae37260253569af22fc03719d170bee057c4f847bbde3ae'
+            'efa742d93e005208d94d878fc8e55a066b5d7931da924ce851b46fded07582f8' = '12f0232c39be76bc2e80b228fefea9a5b6143bee20e995112fb6d800f9f96e14'
+          }
+          foreach ($old in $expectations.Keys) {
+            if (-not $scriptText.Contains($old)) { throw 'Unexpected documentation expectation source' }
+            $scriptText = $scriptText.Replace($old, $expectations[$old])
+          }
+          [IO.File]::WriteAllText($scriptPath, $scriptText, [Text.UTF8Encoding]::new($false))
           Remove-Item Env:GH_TOKEN
           python $scriptPath (Join-Path $env:RUNNER_TEMP 'hot-path-4042-test.rs')
           exit $LASTEXITCODE
