@@ -179,3 +179,39 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "MERGE_COMPILE_SOURCE_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
+
+  cue-repair-proof:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run bounded Cue scanner repair proof') }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 4c54ca01706a3d4be178e93d47a4240c1ef9563f
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Execute pinned scanner repair and source proof
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git switch -C main
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          $blob = '811a5cf634edb8a2511f015d254417eeac58d932'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $data = Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$blob" -Headers $headers
+          $script = Join-Path $env:RUNNER_TEMP 'r4-proof.py'
+          [IO.File]::WriteAllBytes($script, [Convert]::FromBase64String($data.content))
+          if ((((git hash-object $script) | Out-String).Trim()) -ne $blob) { throw 'Cue proof script identity mismatch' }
+          python $script
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: cue-repair-proof-4c54ca01
+          path: ${{ runner.temp }}/r4-proof/
+          if-no-files-found: error
+          retention-days: 5
