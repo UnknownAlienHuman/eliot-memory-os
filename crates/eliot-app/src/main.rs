@@ -2,6 +2,7 @@
 
 mod action_plan;
 mod calibration_runtime;
+mod cell_declaration_registry;
 mod cognitive_field_runner;
 mod cognitive_runner;
 mod commands;
