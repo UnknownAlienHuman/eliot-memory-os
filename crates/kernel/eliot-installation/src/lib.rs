@@ -5168,12 +5168,11 @@ impl WindowsInstallationEffectPort {
         operation: HostCredentialControlOperation,
         ownership_key: Vec<u8>,
     ) -> Result<HostCredentialControlRequest, PortError> {
-        let provision = match &request.plan {
-            InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
-            | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { provision, .. } => {
-                provision
-            }
-            _ => return Err(PortError::InvalidRequestMetadata),
+        let (InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
+        | InstallerEffectPlan::ProvisionCurrentUserStoreCredential { provision, .. }) =
+            &request.plan
+        else {
+            return Err(PortError::InvalidRequestMetadata);
         };
         let intent = HostCredentialControlIntent::new(
             operation,
@@ -7436,9 +7435,8 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             let Some(receipt) = request.current_user_task_receipt.as_ref() else {
                 return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
-            let identity = match task_xml_handle(&receipt.task_xml_sha256) {
-                Ok(identity) => identity,
-                Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+            let Ok(identity) = task_xml_handle(&receipt.task_xml_sha256) else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
             if request.expected_external_identity.as_ref() != Some(&identity) {
                 return PortOutcome::Error(PortError::InvalidRequestMetadata);
@@ -9767,7 +9765,7 @@ where
     pub(crate) fn register_or_reconcile_current_user_task(
         &mut self,
         transaction_id: &PlatformHandle,
-        task_request: CurrentUserTaskRequest,
+        task_request: &CurrentUserTaskRequest,
     ) -> Result<CurrentUserTaskReceipt, InstallationError> {
         let mut transaction = self.load_transaction(transaction_id)?;
         transaction.require_user_mode_task_registration_ready()?;
@@ -9776,7 +9774,7 @@ where
             .current_user_task_request
             .as_ref()
         {
-            Some(retained) if retained == &task_request => {}
+            Some(retained) if retained == task_request => {}
             Some(_) => return Err(InstallationError::IdentityConflict),
             None => {
                 let expected = TransactionVersion::of(&transaction)?;
@@ -9791,13 +9789,12 @@ where
         if let Some(receipt) = transaction.effect_progress[task_index]
             .current_user_task_receipt
             .as_ref()
-        {
-            if matches!(
+            && matches!(
                 transaction.effect_progress[task_index].state,
                 InstallationEffectProgressState::Applied { .. }
-            ) {
-                return Ok(receipt.clone());
-            }
+            )
+        {
+            return Ok(receipt.clone());
         }
 
         let state = transaction.effect_progress[task_index].state.clone();
@@ -9806,9 +9803,9 @@ where
             .as_ref()
             .is_some_and(|unknown| unknown.kind == CurrentUserTaskUnknownKind::CleanupRequired);
         let attempt = match &state {
-            InstallationEffectProgressState::Pending => 1,
+            InstallationEffectProgressState::Pending
+            | InstallationEffectProgressState::Unknown { .. } => 1,
             InstallationEffectProgressState::IntentCommitted { attempt, .. } => *attempt,
-            InstallationEffectProgressState::Unknown { .. } => 1,
             InstallationEffectProgressState::Applied { .. }
             | InstallationEffectProgressState::NoEffectAborted { .. } => {
                 return Err(InstallationError::IdentityConflict);
@@ -9907,7 +9904,7 @@ where
                     ));
                 }
                 if !current_user_task_receipt_matches_absence(snapshot, &receipt)
-                    || receipt.request != task_request
+                    || receipt.request != *task_request
                 {
                     return Err(InstallationError::IdentityConflict);
                 }
@@ -9943,7 +9940,7 @@ where
 
         match self.port.register_current_user_task(&task_request) {
             Ok(receipt) => {
-                if receipt.request != task_request
+                if receipt.request != *task_request
                     || !current_user_task_receipt_matches_absence(snapshot, &receipt)
                 {
                     return Err(InstallationError::IdentityConflict);
@@ -9954,8 +9951,8 @@ where
             Err(CurrentUserTaskRegistrationError::Rejected(error)) => {
                 Err(InstallationError::Platform(error.to_string()))
             }
-            Err(error @ CurrentUserTaskRegistrationError::CommittedUnknown { .. })
-            | Err(error @ CurrentUserTaskRegistrationError::CleanupRequired { .. }) => {
+            Err(error @ (CurrentUserTaskRegistrationError::CommittedUnknown { .. }
+            | CurrentUserTaskRegistrationError::CleanupRequired { .. })) => {
                 self.persist_current_user_task_unknown(transaction, task_index, &error)?;
                 Err(InstallationError::IncompleteObservation(
                     "UserMode Task registration has a retained unknown outcome and requires exact readback reconciliation"
@@ -10063,7 +10060,6 @@ where
         if receipt.request != *request {
             return Err(InstallationError::IdentityConflict);
         }
-        transaction.effect_progress[index].current_user_task_receipt = Some(receipt.clone());
         transaction.effect_progress[index].current_user_task_unknown = None;
         let evidence = vec![task_xml_handle(&receipt.task_xml_sha256)?];
         let postcondition_digest = serde_json::to_vec(&receipt)
@@ -10081,6 +10077,7 @@ where
             evidence: evidence.clone(),
             postcondition_digest,
         };
+        transaction.effect_progress[index].current_user_task_receipt = Some(receipt);
         transaction.observed_postconditions.extend(evidence);
         increment_revision(&mut transaction)?;
         transaction.validate()?;
@@ -12777,7 +12774,7 @@ where
     pub fn register_or_reconcile_current_user_task(
         &mut self,
         transaction_id: &PlatformHandle,
-        request: CurrentUserTaskRequest,
+        request: &CurrentUserTaskRequest,
     ) -> Result<CurrentUserTaskReceipt, InstallationError> {
         self.inner
             .register_or_reconcile_current_user_task(transaction_id, request)

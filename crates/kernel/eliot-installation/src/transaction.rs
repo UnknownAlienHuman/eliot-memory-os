@@ -1266,7 +1266,6 @@ impl InstallationTransaction {
                 &transaction_id,
                 &candidate_manifest,
                 &staging_root,
-                &candidate_manifest.runtime_launch.runtime_state_roots,
                 None,
                 minimum_store_available_bytes,
                 &planned_changes,
@@ -1692,14 +1691,8 @@ impl InstallationTransaction {
         expected_stage: InstallationStage,
     ) -> Result<(), InstallationError> {
         self.validate()?;
-        match self.profile {
-            InstallationProfile::UserMode => {
-                return self.require_user_mode_pre_activation_effects_at(expected_stage);
-            }
-            InstallationProfile::PortableDev => {
-                return self.require_portable_dev_pre_activation_effects_at(expected_stage);
-            }
-            InstallationProfile::SystemService => {}
+        if self.profile != InstallationProfile::SystemService {
+            return self.require_current_user_pre_activation_effects_at(expected_stage);
         }
         if self.stage != expected_stage {
             return Err(InstallationError::IncompleteObservation(format!(
@@ -1796,6 +1789,21 @@ impl InstallationTransaction {
             }
         }
         Ok(())
+    }
+
+    fn require_current_user_pre_activation_effects_at(
+        &self,
+        expected_stage: InstallationStage,
+    ) -> Result<(), InstallationError> {
+        match self.profile {
+            InstallationProfile::UserMode => {
+                self.require_user_mode_pre_activation_effects_at(expected_stage)
+            }
+            InstallationProfile::PortableDev => {
+                self.require_portable_dev_pre_activation_effects_at(expected_stage)
+            }
+            InstallationProfile::SystemService => Err(InstallationError::IdentityConflict),
+        }
     }
 
     fn require_user_mode_pre_activation_effects_at(
@@ -2071,7 +2079,7 @@ impl InstallationTransaction {
             if existing != &intent {
                 return Err(InstallationError::IdentityConflict);
             }
-            self.validate_current_user_task_run_intent(receipt, existing)?;
+            Self::validate_current_user_task_run_intent(receipt, existing)?;
             return Ok(existing.clone());
         }
         if self.effect_progress[positions.task]
@@ -2316,7 +2324,6 @@ impl InstallationTransaction {
     }
 
     fn validate_current_user_task_run_intent(
-        &self,
         task_receipt: &CurrentUserTaskReceipt,
         intent: &CurrentUserTaskRunIntent,
     ) -> Result<(), InstallationError> {
@@ -2354,7 +2361,7 @@ impl InstallationTransaction {
         intent: &CurrentUserTaskRunIntent,
         receipt: &CurrentUserTaskRunReceipt,
     ) -> Result<(), InstallationError> {
-        self.validate_current_user_task_run_intent(task_receipt, intent)?;
+        Self::validate_current_user_task_run_intent(task_receipt, intent)?;
         text(
             &receipt.task_name,
             "effect_progress.current_user_task_run_receipt.task_name",
@@ -2910,7 +2917,6 @@ impl InstallationTransaction {
         transaction_id: &PlatformHandle,
         candidate_manifest: &CandidateManifest,
         staging_root: &PlatformHandle,
-        runtime_state_roots: &RuntimeStateRoots,
         retained_profile_anchor: Option<&RetainedProfileAnchor>,
         minimum_store_available_bytes: u64,
         planned_changes: &[PlannedChange],
@@ -2931,7 +2937,7 @@ impl InstallationTransaction {
             transaction_id,
             candidate_manifest,
             staging_root,
-            runtime_state_roots,
+            runtime_state_roots: &candidate_manifest.runtime_launch.runtime_state_roots,
             retained_profile_anchor,
             minimum_store_available_bytes,
             planned_changes,
@@ -2948,7 +2954,6 @@ impl InstallationTransaction {
             &self.transaction_id,
             &self.candidate_manifest,
             &self.staging_root,
-            &self.candidate_manifest.runtime_launch.runtime_state_roots,
             self.retained_profile_anchor.as_ref(),
             self.minimum_store_available_bytes,
             &self.planned_changes,
@@ -3069,7 +3074,6 @@ impl InstallationTransaction {
             &self.transaction_id,
             &self.candidate_manifest,
             &self.staging_root,
-            &self.candidate_manifest.runtime_launch.runtime_state_roots,
             self.retained_profile_anchor.as_ref(),
             self.minimum_store_available_bytes,
             &self.planned_changes,
@@ -3408,7 +3412,7 @@ impl InstallationTransaction {
                         match (run_intent, run_receipt) {
                             (None, None) => {}
                             (Some(intent), None) => {
-                                self.validate_current_user_task_run_intent(receipt, intent)?;
+                                Self::validate_current_user_task_run_intent(receipt, intent)?;
                             }
                             (Some(intent), Some(run_receipt)) => {
                                 self.validate_current_user_task_run_receipt(

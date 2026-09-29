@@ -536,7 +536,14 @@ impl RedbInstallationRegistry {
                     "installation_registry.owner.retained_host_state_root",
                 )?
             }
-            _ => {
+            RegistryPathLease::Legacy { .. } => {
+                return Err(InstallationError::Platform(
+                    "owner-bound abort requires the retained installation Host registry root"
+                        .to_owned(),
+                ));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            RegistryPathLease::Test => {
                 return Err(InstallationError::Platform(
                     "owner-bound abort requires the retained installation Host registry root"
                         .to_owned(),

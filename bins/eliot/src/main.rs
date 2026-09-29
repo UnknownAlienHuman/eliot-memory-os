@@ -3958,7 +3958,7 @@ fn register_or_reconcile_user_mode_task(
 ) -> std::result::Result<InstallationStepOutcome, InstallationError> {
     let receipt = coordinator.register_or_reconcile_current_user_task(
         transaction_id,
-        request.clone(),
+        request,
     )?;
     if receipt.request != *request {
         return Err(InstallationError::IdentityConflict);
