@@ -6153,8 +6153,17 @@ impl HostComposition {
         // history claim is gated by a coherence proof that does not cover the
         // observation it gates. This is the same stale-currency defect
         // `read_cutover_disposition` already closed on the status side.
-        let retirement =
-            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
+        // The same status read model the disposition port uses, so this
+        // post-commit reconciliation names its operation through one
+        // `CutoverReadback` rather than through the whole admitted body. It
+        // takes no admission-bearing field with it.
+        let status_readback = crate::backup_cutover::CutoverReadback::from_request(request);
+        let retirement = crate::backup_cutover::resolve_cutover_retirement(
+            self,
+            &durable,
+            &status_readback,
+            None,
+        )?;
         // A failed READ is a failure, never a concurrency fact: it is propagated
         // with the same error the surrounding reads use, so it can never be
         // reported as owner movement.
@@ -6175,7 +6184,7 @@ impl HostComposition {
             }
         };
         let reconciled = reconcile_cutover_outcome(
-            request,
+            &status_readback,
             durable.pending_cutover.as_ref(),
             readback.committed_cutover_activation(),
             readback.active_generation(),
@@ -6237,8 +6246,19 @@ impl HostComposition {
         // leaf's read-failure observation stays nonterminal beneath it.
         let mut host_terminal =
             HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL);
-        let outcome =
-            crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)?;
+        // The status read model consumes only the six bindings a disposition
+        // projection reads, so the admitted body's envelope, admission receipt,
+        // archive digest/class, activation fence and recovery evidence are
+        // deliberately NOT passed into it: reading a historical result must
+        // not reopen execution admission. The diagnostic token names this
+        // contour and selects no branch.
+        let readback = crate::backup_cutover::CutoverReadback::from_request(request);
+        let outcome = crate::backup_cutover::read_cutover_disposition(
+            self,
+            crate::backup_cutover::READ_DISPOSITION_OP,
+            &readback,
+            retirement_receipt,
+        )?;
         host_terminal.disarm();
         Ok(outcome)
     }
@@ -9162,9 +9182,11 @@ impl HostComposition {
         // The corroboration lives in the projection, not here, and the value is
         // deliberately not consumed by this caller. The observed artifact is
         // the `observe_cutover_progress` record the projection emits, and that
-        // projection resolves the disposition from BOTH owners on one
-        // coherence-bracketed read, applying the same arms in the same order
-        // `reconcile_cutover_outcome` applies to the same durable state: a
+        // projection is the SHARED status read model: it resolves the
+        // disposition from BOTH owners on one coherence-bracketed read, through
+        // the same journal-owner retirement lookup and the same
+        // `reconcile_cutover_outcome` arms the separately admitted
+        // `backup_dispatch_cutover_disposition` port projects through, so a
         // retained intent whose target is the active generation is reported
         // `RetirementPending` only when the registry's own operation-bound
         // receipt names this operation, and `Unknown` otherwise; a retained
@@ -9174,12 +9196,10 @@ impl HostComposition {
         // So a journal slot alone cannot emit `Prepared` for a state the full
         // owner read model calls ambiguous, and cannot emit a settlement claim
         // either — which is what "nothing downstream to correct" means here: no
-        // observed word overstates what its two owners proved. It does NOT mean
-        // the two paths are word-identical: the resolved retirement evidence is
-        // not an input to this read, so a cutover the retirement owner has
-        // already settled is `Reconciled` on the two-owner read model and only
-        // its recorded `Committed` word here. Nothing here needs the returned
-        // outcome, and reading it would add a gate this contour does not have.
+        // observed word overstates what its two owners proved, and one durable
+        // state is no longer described two different ways. Nothing here needs
+        // the returned outcome, and reading it would add a gate this contour
+        // does not have.
         let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
         let active =
             self.registry.active().cloned().ok_or_else(|| {
