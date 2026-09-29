@@ -863,7 +863,7 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
         if journal_key.trim().is_empty() {
             return Err(BackupError::InvalidField {
                 field: "restore.journal_admission.journal_key",
-                reason: "the journal identity must be non-blank".to_owned(),
+                reason: "the journal identity must be non-blank",
             });
         }
         // The ORS owner reports a missing binding as absent, and absence is a
