@@ -754,21 +754,22 @@ pub struct SkillCatalogue {
 /// observed dependency set, so added, removed, and changed names all count as
 /// drift.
 ///
-/// # STITCH: no production caller in this slice
+/// # STITCH: full-world driver pending; legs driven per caller
 ///
-/// `caller: STITCH`. The sweep implementation is present but no production
-/// driver builds this world yet. The designated caller is the bridge
-/// activation display path ([`activation_display_against`](SkillCatalogue::activation_display_against))
-/// once its owner can observe the full live world for the operation: the
-/// versioned display entry the daemon drives today carries only the
-/// tool-owner view and the admitted Tool Definition version — no live
-/// dependency set and no live host/profile versions — so the owning crate
-/// cannot build this world without inventing live terms, which would be a
-/// fake caller. Install-time legs already mark drift from the presented
-/// material and the promote path observes the committed candidate set; this
-/// world covers the remaining display-time leg. A timer, startup, or refresh
-/// arm must never synthesize the world: every leg must compare against
-/// caller-observed live content.
+/// `caller: STITCH` for the full world only. Verified per-leg production
+/// drivers (issue #1882): install-time legs mark from the presented material
+/// (`install_package` in `install.rs`); the promote path observes the
+/// committed candidate set pre-commit and feeds it post-commit; the display
+/// path marks the tool leg (`invalidate_unknown_tool_basis`) and the
+/// definition leg (`acknowledge_and_display_versioned`) per call under the
+/// live tool-owner source, driven by the bridge display port
+/// (`BridgeSkillForwarder::display_skill`). Undriven: the dependency-set and
+/// host/profile legs at display and refresh — the versioned display entry
+/// carries only the tool-owner view and the admitted definition version, so
+/// the owning crate cannot build those legs without inventing live terms,
+/// which would be a fake caller. A timer, startup, or refresh arm must never
+/// synthesize the world: every leg must compare against caller-observed live
+/// content.
 pub struct LiveSkillWorld<'a> {
     /// Currently registered dependency versions (the full live set).
     pub current_dependencies: &'a [DependencyVersion],
@@ -1055,17 +1056,21 @@ impl SkillCatalogue {
     /// activation instead of displaying a drifted body. Returns the skill ids
     /// that became stale, in catalogue order.
     ///
-    /// # STITCH: production drivers adopt per leg
+    /// # STITCH: full-sweep driver pending; legs driven per caller
     ///
-    /// `caller: STITCH`. Install-time legs mark from the presented material
-    /// (`install_package`), the promote path observes the committed candidate
-    /// set, and the tool/definition display legs mark upstream of
-    /// `activation_display`; the full-sweep production driver is the pre-serve
-    /// entry [`activation_display_against`](Self::activation_display_against)
-    /// once its display-path owner supplies the observed world. The
-    /// install-wide sweep is deliberately not restored here: without an
-    /// operation-observed world it false-marks. No caller is manufactured
-    /// from the owning crate — bins-owned live terms stay with their lanes.
+    /// `caller: STITCH` for the full sweep only. Install-time legs mark from
+    /// the presented material (`install_package`), the promote path observes
+    /// the committed candidate set, and the tool/definition display legs mark
+    /// upstream of `activation_display` per call under the live tool-owner
+    /// source (bridge display port into the versioned acknowledge entry);
+    /// the refresh driver covers the tool/definition legs across entries.
+    /// The full-sweep production driver is the pre-serve entry
+    /// [`activation_display_against`](Self::activation_display_against)
+    /// once its display-path owner additionally supplies the observed live
+    /// dependency set and host/profile versions. The install-wide sweep is
+    /// deliberately not restored here: without an operation-observed world it
+    /// false-marks. No caller is manufactured from the owning crate —
+    /// bins-owned live terms stay with their lanes.
     pub fn reconcile_staleness(
         &mut self,
         world: &LiveSkillWorld<'_>,
@@ -1417,12 +1422,15 @@ impl SkillCatalogue {
     /// provisional. A passing display keeps the full receipt chain
     /// (validation + catalogue-staleness + delivery-ack records).
     ///
-    /// # STITCH: designated display-path caller
+    /// # STITCH: designated display-path caller, two live terms short
     ///
-    /// `caller: STITCH`. The designated caller is the daemon display drive
-    /// (`skill_carry_receipt_to_display` into the versioned acknowledge
-    /// entry) once it can supply the operation-observed [`LiveSkillWorld`];
-    /// until then production display flows through
+    /// `caller: STITCH`. The designated caller is the daemon display drive —
+    /// the bridge display port (`BridgeSkillForwarder::display_skill`) into
+    /// the versioned acknowledge entry
+    /// (`skill_carry_receipt_to_display` path) — once it can additionally
+    /// supply the operation-observed live dependency set and host/profile
+    /// versions alongside the live tool-owner view it already resolves per
+    /// call. Until then production display flows through
     /// [`activation_display`](Self::activation_display) with the
     /// tool/definition drift legs enforced upstream. The owning crate holds
     /// the catalogue behind its own handle and cannot observe the bins-owned
