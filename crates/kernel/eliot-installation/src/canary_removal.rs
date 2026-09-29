@@ -1479,9 +1479,10 @@ fn require_quiesced_owner_effects(
         // The authority must be this canary's own, in this installation. A
         // neighbour's or a foreign installation's authority is refused here
         // instead of being revoked under the wrong identity.
+        let installation = &plan.installation_epoch.installation;
         if authority.supervision_lease_scope_id != lease_scope.as_str()
             || authority.candidate_generation != plan.generation.as_str()
-            || authority.trust_anchor.installation_id != plan.installation_epoch.installation.as_str()
+            || authority.trust_anchor.installation_id != installation.as_str()
         {
             return Err(InstallationError::IdentityConflict);
         }
