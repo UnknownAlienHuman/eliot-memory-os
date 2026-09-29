@@ -1,9 +1,13 @@
 //! Typed sandboxed execution for the six frozen worlds.
 //!
-//! Default governed mode refuses without actual Kernel admission
-//! (`KERNEL_ADMISSION_REQUIRED`). An explicitly selected local-experimental
-//! path instantiates and executes a typed component through the frozen WIT
-//! world with deny-by-default Wasmtime policy and zero ambient imports.
+//! The default governed lane ([`execute_governed_describe`] /
+//! [`execute_governed_domain`]) binds the current Kernel grant
+//! ([`GovernedTypedAdmission`]) before any byte is compiled or
+//! instantiated: an absent or stale grant refuses with
+//! `KERNEL_ADMISSION_REQUIRED` and a mismatched one with an exact typed
+//! denial. An explicitly selected local-experimental path instantiates and
+//! executes a typed component through the frozen WIT world with
+//! deny-by-default Wasmtime policy and zero ambient imports.
 //!
 //! Both the `describe` descriptor and the admitted typed domain operation
 //! (`admit`/`assemble`/`activate`/`handle`/`screen`/`step`) execute here. The
@@ -28,6 +32,7 @@ use eliot_wasm_runtime::{
 
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
 use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
+use crate::dispatch_material::ValidatedDispatchMaterial;
 use crate::typed_bindings::{TypedWorld, typed_wit_digest};
 
 const ENGINE_VERSION: &str = "47.0.4";
@@ -308,6 +313,254 @@ pub fn execute_governed_refusal() -> Result<(), TypedExecutionError> {
     Err(TypedExecutionError::GovernedAdmissionRequired)
 }
 
+/// Kernel-admission-bound identity for one governed typed call.
+///
+/// Every field is bound from the single owner-published Kernel grant
+/// ([`ValidatedDispatchMaterial`]) staged beside the installation-approved
+/// image: artifact bytes re-hashed against the admitted digest, the
+/// owner-recorded source digest, the installation image digest, the
+/// authenticated principal, the work owner/unit/scope/task reference, the
+/// grant fence and lease, the admitted operation and idempotency key, the
+/// manifest world with its frozen ABI digest, and the admitted policy
+/// contour. Constructed only by [`bind_governed_typed_admission`]: there is
+/// no path, URL, environment, or ambient constructor, and no fallback to
+/// the experimental lane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedTypedAdmission {
+    /// Admitted world, equal to the material manifest world.
+    pub world: TypedWorld,
+    /// Admitted artifact digest, re-hashed from the presented bytes.
+    pub artifact_digest: Sha256Digest,
+    /// Owner-recorded source digest from the manifest record.
+    pub source_digest: Sha256Digest,
+    /// Owner-measured installation image digest from the grant.
+    pub installation_digest: Sha256Digest,
+    /// Authenticated Kernel principal from the snapshot record.
+    pub principal: String,
+    /// Admitted operation identity.
+    pub operation_id: String,
+    /// Grant lease identity; the idempotency key for this operation.
+    pub idempotency_key: String,
+    /// Admitted task identity from the material task reference.
+    pub task_id: String,
+    /// Admitted attempt identity from the material work unit.
+    pub attempt_id: String,
+    /// Admitted scope identity from the material work scope.
+    pub scope_id: String,
+    /// Admitted state-fence identity (`epoch-digest:generation`).
+    pub fence_epoch: String,
+    /// Highest proof ceiling this operation may claim, fixed by the world.
+    pub proof_ceiling: ProofCeiling,
+    /// Admitted policy identity (`contour/required-verifier`).
+    pub policy_id: String,
+    /// Digest of the frozen WIT bytes the bindings generated from.
+    pub wit_digest: Sha256Digest,
+}
+
+impl GovernedTypedAdmission {
+    /// Echo identity the admitted guest result must repeat: the domain
+    /// result checks below compare the guest echo against exactly these
+    /// material-bound values, never against caller-supplied strings.
+    #[must_use]
+    pub fn domain_admission(&self) -> TypedDomainAdmission {
+        TypedDomainAdmission {
+            operation_id: self.operation_id.clone(),
+            task_id: self.task_id.clone(),
+            scope_id: self.scope_id.clone(),
+            fence_epoch: self.fence_epoch.clone(),
+            policy_id: self.policy_id.clone(),
+            proof_ceiling: self.proof_ceiling,
+        }
+    }
+
+    /// Stamps a just-executed receipt as governed: the execution already ran
+    /// under the bound echo identity, so only the proof, the admitted
+    /// identity fields, and the semantic digest need rebinding. The timing
+    /// observation stays the measured one.
+    fn stamp_governed_receipt(&self, receipt: &mut TypedReceipt) {
+        ExecutionMode::Governed
+            .proof()
+            .clone_into(&mut receipt.proof);
+        receipt.operation_id = Some(self.operation_id.clone());
+        receipt.task_id = Some(self.task_id.clone());
+        receipt.fence_epoch = Some(self.fence_epoch.clone());
+        receipt.policy_id = Some(self.policy_id.clone());
+        let canonical = format!(
+            "758-governed|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            receipt.world,
+            receipt.artifact_digest.as_str(),
+            receipt.artifact_bytes,
+            receipt.output_digest.as_str(),
+            receipt.output_bytes,
+            receipt.terminal,
+            self.operation_id,
+            self.policy_id,
+            self.idempotency_key,
+        );
+        receipt.semantic_digest = Sha256Digest::of_bytes(canonical.as_bytes());
+    }
+}
+
+/// Highest proof ceiling one world may claim. The ceiling is a function of
+/// the admitted world itself — bound at admission, never negotiated — so a
+/// guest result claiming above it is rejected by the existing ceiling
+/// checks.
+const fn world_ceiling(world: TypedWorld) -> ProofCeiling {
+    match world {
+        TypedWorld::ContextAdmission => ProofCeiling::Admission,
+        TypedWorld::ContextAssembly => ProofCeiling::Assembly,
+        TypedWorld::CueActivation => ProofCeiling::Activation,
+        TypedWorld::DreamerHandler => ProofCeiling::Handler,
+        TypedWorld::MemoryCurationScreen => ProofCeiling::Screen,
+        TypedWorld::DreamerCycle => ProofCeiling::Cycle,
+    }
+}
+
+/// Rejects a material-bound identity string that is itself unbounded or
+/// malformed, before any component is compiled. Mirrors the
+/// [`TypedDomainAdmission`] shape rule so a malformed grant field is an
+/// exact typed denial, never a trusted echo.
+fn governed_text(value: &str) -> Result<(), TypedExecutionError> {
+    if value.is_empty()
+        || value.len() > MAX_DESCRIPTOR_STRING_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(TypedExecutionError::LimitDenied(
+            "admission-field".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Binds one governed typed admission from the current Kernel grant.
+///
+/// The grant window opens first: a window that never opened, closed, or
+/// does not contain `now_unix_ms` has no live admission and refuses with
+/// `KERNEL_ADMISSION_REQUIRED`, exactly like an absent grant. The manifest
+/// world must name exactly the selected world, the presented bytes must
+/// re-hash to the admitted artifact digest, and every echoed identity must
+/// be present and well formed; anything else is an exact typed denial.
+/// Every check runs before any byte is compiled or instantiated, the
+/// artifact travels as the caller's buffer (never a path or URL), and the
+/// installation digest is recorded from the grant — launch-time re-hash of
+/// the installed image stays with the P03 executor.
+pub fn bind_governed_typed_admission(
+    material: &ValidatedDispatchMaterial,
+    world: TypedWorld,
+    artifact: &[u8],
+    now_unix_ms: u64,
+) -> Result<GovernedTypedAdmission, TypedExecutionError> {
+    if material.admitted_at_unix_ms == 0
+        || material.grant.expires_at <= material.admitted_at_unix_ms
+        || now_unix_ms < material.admitted_at_unix_ms
+        || now_unix_ms >= material.grant.expires_at
+    {
+        return Err(TypedExecutionError::GovernedAdmissionRequired);
+    }
+    let admitted_world = match TypedWorld::parse(&material.manifest.world) {
+        Some(selected) if selected == world => selected,
+        _ => {
+            return Err(TypedExecutionError::WorldSelection {
+                reason: "admission-world".to_owned(),
+            });
+        }
+    };
+    let observed = Sha256Digest::of_bytes(artifact);
+    if observed != material.ceilings.artifact_digest {
+        return Err(TypedExecutionError::OutputViolation(
+            "artifact-digest".to_owned(),
+        ));
+    }
+    // The typed echo fields require an admitted task: a grant without one
+    // cannot authorize a typed call, and no task is fabricated here.
+    let task_id = match material.work.task_ref.as_deref() {
+        Some(task) => task.to_owned(),
+        None => return Err(TypedExecutionError::GovernedAdmissionRequired),
+    };
+    for value in [
+        task_id.as_str(),
+        material.work.work_unit.as_str(),
+        material.work.work_scope.as_str(),
+        material.operation_id.as_str(),
+        material.grant.idempotency_key.as_str(),
+        material.snapshot.principal.as_str(),
+        material.work.contour.as_str(),
+        material.manifest.required_verifier.as_str(),
+    ] {
+        governed_text(value)?;
+    }
+    let fence_epoch = format!(
+        "{}:{}",
+        Sha256Digest::of_bytes(material.authority_epoch_json.as_bytes()).as_str(),
+        material.grant.fence_generation,
+    );
+    let policy_id = format!(
+        "{}/{}",
+        material.work.contour, material.manifest.required_verifier,
+    );
+    governed_text(&fence_epoch)?;
+    governed_text(&policy_id)?;
+    Ok(GovernedTypedAdmission {
+        world: admitted_world,
+        artifact_digest: observed,
+        source_digest: material.manifest.source_digest.clone(),
+        installation_digest: material.host_artifact_digest.clone(),
+        principal: material.snapshot.principal.clone(),
+        operation_id: material.operation_id.clone(),
+        idempotency_key: material.grant.idempotency_key.clone(),
+        task_id,
+        attempt_id: material.work.work_unit.clone(),
+        scope_id: material.work.work_scope.clone(),
+        fence_epoch,
+        proof_ceiling: world_ceiling(admitted_world),
+        policy_id,
+        wit_digest: typed_wit_digest(),
+    })
+}
+
+/// Executes the typed `describe` descriptor under the current Kernel grant:
+/// the admission is bound first (absent or stale grants refuse with
+/// `KERNEL_ADMISSION_REQUIRED`, mismatches with an exact typed denial),
+/// then the same bounded buffer runs the same sandboxed engine path the
+/// experimental lane uses, and the receipt is stamped with the governed
+/// proof and the admitted identity. The artifact travels as bytes, never a
+/// path or URL, and a refused admission never reaches the experimental
+/// lane.
+pub fn execute_governed_describe(
+    material: &ValidatedDispatchMaterial,
+    world: TypedWorld,
+    artifact: &[u8],
+    limits: &InvocationLimits,
+    now_unix_ms: u64,
+) -> Result<(TypedReceipt, TypedDescriptor), TypedExecutionError> {
+    let admission = bind_governed_typed_admission(material, world, artifact, now_unix_ms)?;
+    let (mut receipt, descriptor) = execute_describe_experimental(world, artifact, limits)?;
+    admission.stamp_governed_receipt(&mut receipt);
+    Ok((receipt, descriptor))
+}
+
+/// Executes the admitted typed domain operation under the current Kernel
+/// grant: the admission is bound first, the domain request runs once under
+/// the bound echo identity with the same sandbox envelope as the
+/// experimental lane, and the receipt is stamped with the governed proof
+/// and the admitted identity. Same byte-only, no-fallback discipline as
+/// [`execute_governed_describe`].
+pub fn execute_governed_domain(
+    material: &ValidatedDispatchMaterial,
+    world: TypedWorld,
+    artifact: &[u8],
+    limits: &InvocationLimits,
+    request: &TypedDomainRequest,
+    now_unix_ms: u64,
+) -> Result<(TypedReceipt, TypedDomainResult), TypedExecutionError> {
+    let admission = bind_governed_typed_admission(material, world, artifact, now_unix_ms)?;
+    let admitted = admission.domain_admission();
+    let (mut receipt, result) =
+        execute_domain_experimental(world, artifact, limits, request, &admitted)?;
+    admission.stamp_governed_receipt(&mut receipt);
+    Ok((receipt, result))
+}
+
 /// Bounded default limits for the local-experimental path. The caller
 /// supplies the exact artifact digest allow-listed for this invocation.
 #[must_use]
@@ -475,6 +728,34 @@ fn validate_descriptor_abi_digest(descriptor: &TypedDescriptor) -> Result<(), Ty
     Ok(())
 }
 
+/// The single linker constructor for typed worlds: a fresh empty linker with
+/// zero ambient imports. No WASI command/preopens/stdio inheritance, no
+/// network/HTTP/DNS, no env/args, no clock/random, no process/thread, no
+/// credential/Store/provider/model/tool access, and no mutation host function
+/// is ever defined on it. A component that imports anything fails closed:
+/// `preflight_component_type` rejects observed imports before instantiation,
+/// and instantiation on this linker fails for unregistered imports.
+fn empty_linker(engine: &wasmtime::Engine) -> wasmtime::component::Linker<StoreState> {
+    wasmtime::component::Linker::new(engine)
+}
+
+/// Validates the guest's descriptor identity before the domain export runs.
+/// A lying descriptor is denied at `TypedStage::Descriptor` here, so its
+/// claims can neither select imports nor reach domain invocation. Linking
+/// never consults the descriptor: every world instantiates on `empty_linker`
+/// with zero ambient imports, and this check only denies.
+fn check_descriptor_identity(
+    world: TypedWorld,
+    descriptor: &TypedDescriptor,
+    limits: &InvocationLimits,
+) -> Result<(), TypedExecutionError> {
+    validate_descriptor(world, descriptor, limits.max_output_bytes)
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+    validate_descriptor_abi_digest(descriptor)
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+    Ok(())
+}
+
 /// Bounded pre-lift and post-lift measurement of one typed value. String and
 /// list ceilings are checked as each leaf is visited, so a request is bounded
 /// before the host lowers it into guest memory and a result is bounded while
@@ -568,8 +849,9 @@ fn check_ceiling(
 /// Reads nothing: the caller supplies the exact immutable buffer. The same
 /// buffer is hashed (preflight) and compiled; the path is never reread.
 /// Zero ambient imports, full resource limits, and output checks apply to
-/// descriptor/initialization execution exactly like a domain call. The
-/// admitted typed domain operation is executed by
+/// descriptor/initialization execution exactly like a domain call, including
+/// the descriptor ABI-digest check [`execute_domain_experimental`] applies.
+/// The admitted typed domain operation is executed by
 /// [`execute_domain_experimental`], which reuses this same preflight,
 /// envelope and limits.
 pub fn execute_describe_experimental(
@@ -602,6 +884,7 @@ pub fn execute_describe_experimental(
     let (output_digest, output_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
             .map_err(|error| staged(TypedStage::Output, error))?;
+    validate_descriptor_abi_digest(&descriptor).map_err(|error| staged(TypedStage::Output, error))?;
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let input_digest = Sha256Digest::of_bytes(&[]);
@@ -1086,7 +1369,7 @@ fn describe_context_admission(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_admission::ContextAdmission;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = ContextAdmission::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1111,7 +1394,7 @@ fn describe_context_assembly(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_assembly::ContextAssembly;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = ContextAssembly::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1136,7 +1419,7 @@ fn describe_cue_activation(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::cue_activation::CueActivation;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = CueActivation::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1161,7 +1444,7 @@ fn describe_dreamer_handler(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_handler::DreamerHandler;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = DreamerHandler::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1186,7 +1469,7 @@ fn describe_memory_curation_screen(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::memory_curation_screen::MemoryCurationScreen;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = MemoryCurationScreen::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1211,7 +1494,7 @@ fn describe_dreamer_cycle(
 ) -> Result<(TypedDescriptor, ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_cycle::DreamerCycle;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = DreamerCycle::instantiate(&mut *store, component, &linker)
             .map_err(|error| map_instantiate_error(&error, store.data().limit_hit))?;
         let raw = instance
@@ -1994,7 +2277,7 @@ fn call_admission(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_admission::ContextAdmission;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             ContextAdmission::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2017,6 +2300,10 @@ fn call_admission(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::ContextAdmission, &descriptor, limits)?;
         let called = interface
             .call_admit(&mut *store, request)
             .map_err(|error| {
@@ -2045,7 +2332,7 @@ fn call_assembly(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::context_assembly::ContextAssembly;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             ContextAssembly::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2068,6 +2355,10 @@ fn call_assembly(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::ContextAssembly, &descriptor, limits)?;
         let called = interface
             .call_assemble(&mut *store, request)
             .map_err(|error| {
@@ -2096,7 +2387,7 @@ fn call_cue_activation(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::cue_activation::CueActivation;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             CueActivation::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2119,6 +2410,10 @@ fn call_cue_activation(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::CueActivation, &descriptor, limits)?;
         let called = interface
             .call_activate(&mut *store, request)
             .map_err(|error| {
@@ -2147,7 +2442,7 @@ fn call_dreamer_handler(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_handler::DreamerHandler;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             DreamerHandler::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2170,6 +2465,10 @@ fn call_dreamer_handler(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::DreamerHandler, &descriptor, limits)?;
         let called = interface
             .call_handle(&mut *store, request)
             .map_err(|error| {
@@ -2198,7 +2497,7 @@ fn call_memory_curation_screen(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::memory_curation_screen::MemoryCurationScreen;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance = MemoryCurationScreen::instantiate(&mut *store, component, &linker).map_err(
             |error| {
                 staged(
@@ -2222,6 +2521,10 @@ fn call_memory_curation_screen(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::MemoryCurationScreen, &descriptor, limits)?;
         let called = interface
             .call_screen(&mut *store, request)
             .map_err(|error| {
@@ -2250,7 +2553,7 @@ fn call_dreamer_cycle(
 ) -> Result<((TypedDescriptor, TypedDomainResult), ObservedUsage), TypedExecutionError> {
     use crate::typed_bindings::dreamer_cycle::DreamerCycle;
     run_guarded(engine, limits, |store| {
-        let linker = wasmtime::component::Linker::new(engine);
+        let linker = empty_linker(engine);
         let instance =
             DreamerCycle::instantiate(&mut *store, component, &linker).map_err(|error| {
                 staged(
@@ -2273,6 +2576,10 @@ fn call_dreamer_cycle(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5/item 12: descriptor claims are validated before the domain
+        // export runs; a lying descriptor is denied here and cannot grant
+        // imports or reach domain invocation.
+        check_descriptor_identity(TypedWorld::DreamerCycle, &descriptor, limits)?;
         let called = interface.call_step(&mut *store, request).map_err(|error| {
             staged(
                 TypedStage::Invoke,
