@@ -4703,16 +4703,13 @@ impl KernelStoreGateway {
                     detail: "no durable recovery owner is bound at the Dreamer send claim boundary"
                         .to_owned(),
                 }
-                .to_string()
             })?;
             let snapshot = observed.owner_snapshot().ok_or_else(|| {
                 CommitRecoveryError::OrsUnavailable {
                     detail: "the checked pause observation carries no complete owner snapshot for the send claim".to_owned(),
                 }
-                .to_string()
             })?;
-            let record = open_record_for(&identity, &scope_proof.scopes)
-                .map_err(|error| error.to_string())?;
+            let record = open_record_for(&identity, &scope_proof.scopes)?;
             let fence = StateFenceSnapshot::capture(
                 &context.state_fence,
                 context.state_fence.authority_epoch.sequence.get(),
@@ -4726,7 +4723,6 @@ impl KernelStoreGateway {
                                 "the owner rejected the checked pause revision at the Dreamer send claim boundary; no send occurred: {error}"
                             ),
                         }
-                        .to_string()
                     })?,
             );
         }
