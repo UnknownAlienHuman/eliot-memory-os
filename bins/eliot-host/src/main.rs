@@ -305,11 +305,10 @@ fn main() {
             Some(USER_MODE_SUPERVISOR_SWITCH) => {
                 match process_args.get(1).and_then(|argument| argument.to_str()) {
                     Some("user_mode") => Some(InstallationProfile::UserMode),
-                    Some("portable_dev") => Some(InstallationProfile::PortableDev),
                     _ => {
                         let _ = writeln!(
                             io::stderr().lock(),
-                            "eliot-host: unsupported profile supervisor selection"
+                            "eliot-host: only the admitted UserMode supervisor is supported"
                         );
                         std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
                     }
@@ -630,6 +629,11 @@ fn run_profile_supervisor(
 ) -> Result<(), HostError> {
     use std::sync::atomic::Ordering;
 
+    if profile != InstallationProfile::UserMode {
+        return Err(HostError::ProcessContour(
+            "current-user supervisor handoff is supported only for UserMode".to_owned(),
+        ));
+    }
     STOP_REQUESTED.store(false, Ordering::Release);
     let launch_options = HostLaunchOptions::parse(arguments)?;
     if launch_options.registration_nonce().is_some() {
@@ -679,14 +683,14 @@ fn run_profile_supervisor(
         }
     }
 
-    let credential_control = host.credential_control()?;
-    let phase_b_queue = credential_control.phase_b_queue();
-    let credential_thread = spawn_credential_control(credential_control)?;
+    // UserMode never enters the SystemService credential-control endpoint,
+    // which requires Administrators and opens ProgramData. `open_for_profile`
+    // has bound this launch descriptor to the approved UserMode generation
+    // and retained the current user's descriptor-bound roots before startup.
     let runtime_control = match host.runtime_control() {
         Ok(control) => control,
         Err(error) => {
             STOP_REQUESTED.store(true, Ordering::Release);
-            let _ = credential_thread.join();
             let _ = host.stop();
             return Err(error);
         }
@@ -696,7 +700,6 @@ fn run_profile_supervisor(
         Ok(thread) => thread,
         Err(error) => {
             STOP_REQUESTED.store(true, Ordering::Release);
-            let _ = credential_thread.join();
             let _ = host.stop();
             return Err(error);
         }
@@ -731,7 +734,6 @@ fn run_profile_supervisor(
                 }
             }
         }
-        process_phase_b_requests(&mut host, &phase_b_queue);
         for (trigger, evidence) in process_runtime_control_requests(&mut host, &runtime_queue) {
             idle_drain.note_observable_use(&mut host, trigger, &evidence);
         }
@@ -746,7 +748,6 @@ fn run_profile_supervisor(
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     STOP_REQUESTED.store(true, Ordering::Release);
-    let _ = credential_thread.join();
     let _ = runtime_thread.join();
     if host.running() {
         host.stop()?;
