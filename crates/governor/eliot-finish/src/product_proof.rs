@@ -29,7 +29,8 @@ use eliot_reports::product_proof::{
     ProductProofAuthority, ProductProofBuildEvidence, ProductProofEnvironmentIdentity,
     ProductProofEvidence, ProductProofEvidenceDomain, ProductProofExecutableIdentity,
     ProductProofFailureClass, ProductProofRetainedEvidence, ProductProofRollup,
-    ProductProofRunAttempt, ProductProofStageReceipt, ProductProofStageReceipts, ProductProofStatus,
+    ProductProofRunAttempt, ProductProofStageReceipt, ProductProofStageReceipts,
+    ProductProofStatus,
 };
 use eliot_reports::projection::{ReportInputRevision, ReportInputSource};
 use thiserror::Error;
