@@ -113,6 +113,300 @@ impl OperatorArtifact {
     }
 }
 
+/// OS-observed Operator process identity supplied by the authenticated User
+/// Broker to the Kernel binding route. The strings and scalar fields are a
+/// serialized observation; authority comes from the already-authenticated
+/// broker channel and the Kernel's comparison against its live registration,
+/// not from this DTO's shape alone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorBindingPeer {
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub process_id: u32,
+    pub process_start_time_100ns: u64,
+    pub process_image_path: String,
+    pub executable_file_volume_serial_number: Option<u32>,
+    pub executable_file_index: Option<u64>,
+}
+
+impl OperatorBindingPeer {
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.windows_sid, "operator_peer.windows_sid")?;
+        text(
+            &self.interactive_session_id,
+            "operator_peer.interactive_session_id",
+        )?;
+        text(&self.process_image_path, "operator_peer.process_image_path")?;
+        if self.process_id == 0 || self.process_start_time_100ns == 0 {
+            return Err(BrokerError::InvalidField("operator_peer.process_identity"));
+        }
+        if self.executable_file_volume_serial_number.is_some()
+            != self.executable_file_index.is_some()
+        {
+            return Err(BrokerError::InvalidField(
+                "operator_peer.executable_file_identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact installation, endpoint, expiry, approved image and OS-observed peer
+/// joined for one Kernel-owned Operator binding exchange.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorBindingContext {
+    pub registration: RegistrationReceipt,
+    pub endpoint: OperatorEndpoint,
+    pub endpoint_expires_at: u64,
+    pub peer: OperatorBindingPeer,
+    pub approved_artifact: OperatorArtifact,
+}
+
+impl OperatorBindingContext {
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        self.registration.validate_shape()?;
+        self.endpoint.validate()?;
+        self.peer.validate()?;
+        self.approved_artifact.validate()?;
+        if self.registration.status != RegistrationStatus::Active
+            || self.registration.user_broker_epoch != self.endpoint.broker_epoch
+            || self.registration.windows_sid != self.endpoint_peer_sid()
+            || self.registration.interactive_session_id != self.endpoint.interactive_session_id
+            || self.peer.interactive_session_id != self.endpoint.interactive_session_id
+            || self.endpoint_expires_at == 0
+            || self.endpoint_expires_at > self.registration.expires_at
+            || self.endpoint.role != OPERATOR_ROLE
+            || !exact_operator_capabilities(&self.endpoint.capabilities)
+        {
+            return Err(BrokerError::InvalidField("operator_binding_context"));
+        }
+        Ok(())
+    }
+
+    /// Stable digest of the exact provider-neutral context sent to Kernel.
+    /// The domain separator prevents this value from being confused with a
+    /// registration, launch or approval digest.
+    pub fn digest(&self) -> Result<String, BrokerError> {
+        self.validate()?;
+        let bytes = eliot_contracts::canonical_json_bytes(self)
+            .map_err(|error| BrokerError::Provider(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"eliot.user-broker.operator-binding-context.v1\0");
+        hasher.update(bytes);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn endpoint_peer_sid(&self) -> &str {
+        &self.peer.windows_sid
+    }
+}
+
+/// Begins a one-shot Kernel challenge for one exact broker registration,
+/// endpoint and Windows-observed Operator process.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorBindingChallengeRequest {
+    pub context: OperatorBindingContext,
+}
+
+impl OperatorBindingChallengeRequest {
+    /// Validates the endpoint and OS-observed peer shape before transport.
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        self.context.validate().map(|_| ())
+    }
+}
+
+/// Kernel-issued, short-lived challenge bound to one context digest. The
+/// challenge token is a bearer value only for the matching redeem operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorBindingChallengeGrant {
+    pub schema_version: u16,
+    pub challenge_id: String,
+    pub challenge_token: String,
+    pub context_digest: String,
+    pub broker_registration_digest: String,
+    pub expires_at: u64,
+}
+
+impl OperatorBindingChallengeGrant {
+    pub fn validate_for(
+        &self,
+        request: &OperatorBindingChallengeRequest,
+        observed_at: u64,
+    ) -> Result<(), BrokerError> {
+        let context_digest = request.context.digest()?;
+        if self.schema_version != 1
+            || self.challenge_id.trim().is_empty()
+            || self.challenge_id.chars().any(char::is_control)
+            || self.challenge_token.trim().is_empty()
+            || self.challenge_token.chars().any(char::is_control)
+            || self.context_digest != context_digest
+            || self.broker_registration_digest != request.context.registration.registration_digest
+            || self.expires_at <= observed_at
+            || self.expires_at > request.context.endpoint_expires_at
+        {
+            return Err(BrokerError::InvalidField(
+                "operator_binding_challenge_grant",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Redeems the exact Kernel challenge from the same context and OS-observed
+/// peer. The Kernel rejects a changed endpoint, registration, principal,
+/// session, process, artifact, role or capability set before issuing a
+/// session token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorBindingRedeemRequest {
+    pub context: OperatorBindingContext,
+    pub challenge: OperatorBindingChallengeGrant,
+}
+
+impl OperatorBindingRedeemRequest {
+    pub fn validate(&self, observed_at: u64) -> Result<(), BrokerError> {
+        let challenge_request = OperatorBindingChallengeRequest {
+            context: self.context.clone(),
+        };
+        self.challenge.validate_for(&challenge_request, observed_at)
+    }
+}
+
+/// Kernel-issued short-lived Human Operator session grant. Its token is
+/// useful only with the exact challenge and binding context that produced it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorBindingGrant {
+    pub schema_version: u16,
+    pub challenge_id: String,
+    pub context_digest: String,
+    pub kernel_session_token: String,
+    pub expires_at: u64,
+}
+
+impl OperatorBindingGrant {
+    pub fn validate_for(
+        &self,
+        request: &OperatorBindingRedeemRequest,
+        observed_at: u64,
+    ) -> Result<(), BrokerError> {
+        request.validate(observed_at)?;
+        let context_digest = request.context.digest()?;
+        if self.schema_version != 1
+            || self.challenge_id != request.challenge.challenge_id
+            || self.context_digest != context_digest
+            || self.kernel_session_token.trim().is_empty()
+            || self.kernel_session_token.chars().any(char::is_control)
+            || self.expires_at <= observed_at
+            || self.expires_at > request.context.registration.expires_at
+        {
+            return Err(BrokerError::InvalidField("operator_binding_grant"));
+        }
+        Ok(())
+    }
+}
+
+/// Flattened, owner-issued redemption material forwarded unchanged by the
+/// WinUI client into the Governor handshake. This DTO carries no local mint:
+/// the session token and expiry must come from `OperatorBindingGrant`, while
+/// every other binding field is projected from its exact request context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerRedemption {
+    pub schema_version: u16,
+    pub installation_id: String,
+    pub broker_registration_digest: String,
+    pub authority_epoch: EpochId,
+    pub broker_epoch: u64,
+    pub handoff_nonce: String,
+    pub principal: String,
+    pub interactive_session_id: String,
+    pub process_id: u32,
+    pub process_start_time_100ns: u64,
+    pub process_image_path: String,
+    pub executable_file_volume_serial_number: Option<u32>,
+    pub executable_file_index: Option<u64>,
+    pub approved_artifact_digest: String,
+    pub role: String,
+    pub capabilities: Vec<String>,
+    pub challenge_id: String,
+    pub kernel_session_token: String,
+    pub expires_at: u64,
+}
+
+impl BrokerRedemption {
+    pub fn from_grant(
+        request: &OperatorBindingRedeemRequest,
+        grant: &OperatorBindingGrant,
+        observed_at: u64,
+    ) -> Result<Self, BrokerError> {
+        grant.validate_for(request, observed_at)?;
+        let context = &request.context;
+        let peer = &context.peer;
+        Ok(Self {
+            schema_version: 1,
+            installation_id: context.registration.installation_id.clone(),
+            broker_registration_digest: context.registration.registration_digest.clone(),
+            authority_epoch: context.registration.authority_epoch.clone(),
+            broker_epoch: context.endpoint.broker_epoch,
+            handoff_nonce: context.endpoint.handoff_nonce.clone(),
+            principal: peer.windows_sid.clone(),
+            interactive_session_id: peer.interactive_session_id.clone(),
+            process_id: peer.process_id,
+            process_start_time_100ns: peer.process_start_time_100ns,
+            process_image_path: peer.process_image_path.clone(),
+            executable_file_volume_serial_number: peer.executable_file_volume_serial_number,
+            executable_file_index: peer.executable_file_index,
+            approved_artifact_digest: context.approved_artifact.artifact_digest.clone(),
+            role: context.endpoint.role.clone(),
+            capabilities: context.endpoint.capabilities.clone(),
+            challenge_id: grant.challenge_id.clone(),
+            kernel_session_token: grant.kernel_session_token.clone(),
+            expires_at: grant.expires_at,
+        })
+    }
+
+    /// Validates the closed wire shape only. Kernel admission must compare
+    /// this projection with its retained grant and current registration; a
+    /// structurally valid caller-supplied DTO does not grant authority.
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        if self.schema_version != 1
+            || self.installation_id.trim().is_empty()
+            || self.broker_registration_digest.len() != 64
+            || !self
+                .broker_registration_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.broker_epoch == 0
+            || self.handoff_nonce.trim().is_empty()
+            || self.principal.trim().is_empty()
+            || self.interactive_session_id.trim().is_empty()
+            || self.process_id == 0
+            || self.process_start_time_100ns == 0
+            || self.process_image_path.trim().is_empty()
+            || self.approved_artifact_digest.len() != 64
+            || !self
+                .approved_artifact_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.role != OPERATOR_ROLE
+            || !exact_operator_capabilities(&self.capabilities)
+            || self.challenge_id.trim().is_empty()
+            || self.kernel_session_token.trim().is_empty()
+            || self.expires_at == 0
+            || self.executable_file_volume_serial_number.is_some()
+                != self.executable_file_index.is_some()
+        {
+            return Err(BrokerError::InvalidField("broker_redemption"));
+        }
+        Ok(())
+    }
+}
+
 /// Request accepted by the broker launch boundary.  It deliberately has no
 /// executable or capability fields: those are selected by the broker policy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
