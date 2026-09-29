@@ -6660,7 +6660,7 @@ impl HostComposition {
             selected_profile,
             profile_root_leases
                 .as_ref()
-                .map(|leases| leases.selection()),
+                .map(eliot_platform_windows::profile_supervision::ProfileRootLeaseSet::selection),
             pending_for_reopen.as_ref(),
             registry.active_phase_b_rebind(),
             &durable_store_recovery_fences,
