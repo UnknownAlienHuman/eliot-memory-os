@@ -15,6 +15,7 @@
 //! the installation registry/Host owns durable mutation and authority.
 
 use serde::Deserialize;
+use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 
 use super::super::{
     ActivationCommitFence, ActivePhaseBRebind, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -74,6 +75,8 @@ struct ApprovedGenerationWire {
     approval: InstallationActivationApprovalWire,
     active: bool,
     last_known_good: bool,
+    #[serde(default)]
+    profile_selection_receipt: Option<ProfileSelectionReceipt>,
 }
 
 impl ApprovedGenerationWire {
@@ -83,6 +86,7 @@ impl ApprovedGenerationWire {
             approval: self.approval.into_approval(),
             active: self.active,
             last_known_good: self.last_known_good,
+            profile_selection_receipt: self.profile_selection_receipt,
         }
     }
 }

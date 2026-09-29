@@ -7,6 +7,7 @@ use eliot_platform_windows::{
     TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
     terminal_containment_operation_digest, validate_terminal_containment_readback_for,
 };
+use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -462,6 +463,12 @@ pub struct InstallationTransaction {
     /// layout from ambient paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_governed_roots: Option<InstallationRoots>,
+    /// Original no-follow selection of all I3.1 profile and runtime roots.
+    ///
+    /// This is absent while a fresh plan has not yet created/admitted its
+    /// roots. Once captured, the original file identities are persisted and
+    /// never reconstructed from the descriptor's path strings.
+    pub(crate) profile_selection_receipt: Option<ProfileSelectionReceipt>,
     /// Governing request identity.
     pub request: ManagedEnvironmentChangeRequest,
     /// Previously active generation, if one exists.
@@ -605,6 +612,146 @@ impl InstallationTransaction {
             governance: governed.governance_report(),
             no_service_authority_proof,
         })
+    }
+
+    /// Returns the original generation-bound selection of live profile roots.
+    ///
+    /// A missing receipt is not replaced from InstallationRoots; callers must
+    /// classify it as an explicit migration or recovery condition.
+    #[must_use]
+    pub const fn profile_selection_receipt(&self) -> Option<&ProfileSelectionReceipt> {
+        self.profile_selection_receipt.as_ref()
+    }
+
+    /// Retains the original no-follow root selection after every admitted
+    /// root-creation/ACL effect and StagePackage publication have been
+    /// observed, before executable acceptance.
+    ///
+    /// The receipt is checked against the transaction's immutable generation
+    /// and exact four-root/runtime-root binding. Replaying the same receipt is
+    /// idempotent; a different receipt can never replace the first.
+    pub(crate) fn record_profile_selection_receipt(
+        &mut self,
+        receipt: ProfileSelectionReceipt,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        if !matches!(
+            self.stage,
+            InstallationStage::Planned
+                | InstallationStage::Staging
+                | InstallationStage::StaticVerified
+                | InstallationStage::Registering
+        ) {
+            return Err(InstallationError::IncompleteObservation(
+                "profile selection must be retained before executable acceptance or launch"
+                    .to_owned(),
+            ));
+        }
+        if self.profile == InstallationProfile::SystemService {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService retains protected root ownership receipts instead"
+                    .to_owned(),
+            ));
+        }
+        let roots = self.profile_governed_roots.as_ref().ok_or_else(|| {
+            InstallationError::MigrationRequired {
+                reason: "transaction has no retained profile root binding".to_owned(),
+            }
+        })?;
+        roots.validate_profile_selection_receipt(
+            &self.candidate_manifest.runtime_launch,
+            &receipt,
+        )?;
+        self.require_profile_root_creation_complete()?;
+        match self.profile_selection_receipt.as_ref() {
+            Some(existing) if existing == &receipt => return Ok(()),
+            Some(_) => return Err(InstallationError::IdentityConflict),
+            None => {}
+        }
+        self.profile_selection_receipt = Some(receipt);
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            InstallationError::InvalidField {
+                field: "revision".to_owned(),
+                reason: "overflow".to_owned(),
+            }
+        })?;
+        self.validate()
+    }
+
+    fn require_profile_root_creation_complete(&self) -> Result<(), InstallationError> {
+        let package_indices = self
+            .installer_effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| {
+                matches!(effect, InstallerEffectPlan::StagePackage { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [package_index] = package_indices.as_slice() else {
+            return Err(InstallationError::IncompleteObservation(
+                "profile identity capture requires exactly one admitted StagePackage effect"
+                    .to_owned(),
+            ));
+        };
+        let mut create_root_count = 0usize;
+        for (index, effect) in self.installer_effects.iter().enumerate() {
+            if matches!(effect, InstallerEffectPlan::CreateRoot { .. }) {
+                create_root_count += 1;
+            }
+            if matches!(
+                effect,
+                InstallerEffectPlan::CreateRoot { .. }
+                    | InstallerEffectPlan::ApplyAcl { .. }
+                    | InstallerEffectPlan::StagePackage { .. }
+            ) && index > *package_index
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "all profile root creation, ACL, and package staging effects must precede executable acceptance"
+                        .to_owned(),
+                ));
+            }
+        }
+        if create_root_count == 0 {
+            return Err(InstallationError::IncompleteObservation(
+                "transaction has no admitted CreateRoot effects for the profile roots".to_owned(),
+            ));
+        }
+        if self.installer_effects[..=*package_index]
+            .iter()
+            .enumerate()
+            .any(|(index, _)| {
+                !matches!(
+                    self.effect_progress
+                        .get(index)
+                        .map(|progress| &progress.state),
+                    Some(InstallationEffectProgressState::Applied { .. })
+                )
+            })
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "every admitted root creation, ACL, and StagePackage prefix effect must be durably Applied before retaining profile identities"
+                    .to_owned(),
+            ));
+        }
+        let package_progress = self.effect_progress.get(*package_index).ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "StagePackage effect has no durable progress entry".to_owned(),
+            )
+        })?;
+        if !matches!(
+            package_progress.state,
+            InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                ..
+            }
+        ) || package_progress.staging_receipt.is_none()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "immutable package root must be published with its exact StagePackage receipt before retaining profile identities"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Creates a validated immutable plan at `PLANNED`.
@@ -812,6 +959,7 @@ impl InstallationTransaction {
             installation_epoch,
             profile,
             profile_governed_roots,
+            profile_selection_receipt: None,
             request,
             current_active_manifest,
             candidate_manifest,
@@ -1435,6 +1583,17 @@ impl InstallationTransaction {
         // current environment. `None` is never valid at this boundary; only
         // the crate-private planner constructor may hold it before binding.
         self.rehydrate_profile_binding()?;
+        if let Some(receipt) = self.profile_selection_receipt.as_ref() {
+            let roots = self
+                .profile_governed_roots
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            roots.validate_profile_selection_receipt(
+                &self.candidate_manifest.runtime_launch,
+                receipt,
+            )?;
+            self.require_profile_root_creation_complete()?;
+        }
         if self.candidate_manifest.runtime_launch.installation_epoch != self.installation_epoch {
             return Err(InstallationError::InvalidField {
                 field: "candidate_manifest.runtime_launch.installation_epoch".to_owned(),
@@ -2897,6 +3056,8 @@ struct InstallationTransactionWire {
     // unbound state. A non-optional wire field rejects both an omitted member
     // and an explicit JSON null before the in-memory transaction is rebuilt.
     profile_governed_roots: InstallationRoots,
+    /// Explicit null before root selection; omission is a current-wire error.
+    profile_selection_receipt: Option<ProfileSelectionReceipt>,
     request: ManagedEnvironmentChangeRequest,
     current_active_manifest: Option<CandidateManifest>,
     candidate_manifest: CandidateManifest,
@@ -2930,6 +3091,7 @@ impl InstallationTransactionWire {
             installation_epoch: self.installation_epoch,
             profile: self.profile,
             profile_governed_roots: Some(self.profile_governed_roots),
+            profile_selection_receipt: self.profile_selection_receipt,
             request: self.request,
             current_active_manifest: self.current_active_manifest,
             candidate_manifest: self.candidate_manifest,
@@ -2958,7 +3120,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v26 records are
+/// transaction authority object to another crate. Pre-v27 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -3093,7 +3255,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v26 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v27 is required"
                         ),
                     });
                 }
@@ -3132,7 +3294,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v26 discriminator".to_owned(),
+            reason: "installation transaction predates the required v27 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -3153,6 +3315,15 @@ fn decode_installation_transaction_json_with_policy(
     {
         return Err(InstallationError::CorruptRegistry {
             reason: "installation transaction wire is missing mandatory activation projection intent member"
+                .to_owned(),
+        });
+    }
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("profile_selection_receipt"))
+    {
+        return Err(InstallationError::MigrationRequired {
+            reason: "installation transaction wire is missing mandatory original profile selection receipt member; explicit migration to v27 is required"
                 .to_owned(),
         });
     }
