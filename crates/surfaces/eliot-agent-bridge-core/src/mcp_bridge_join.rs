@@ -31,6 +31,17 @@
 //! caller supplied, or recomputing a fresh digest over what the join already
 //! holds, could only prove that the caller agrees with itself.
 //!
+//! Contiguity is a property of the *owner journal*, not of any one
+//! invocation, so a proven interval is never coverage until it is bounded to
+//! the correlation being assessed. [`reconcile_terminal_event`] requires the
+//! proven interval to reach the candidate's own journaled sequence, and
+//! [`reconcile_deadline_sweep`] requires it to continue one sequence past the
+//! owner's highest, both read from the owner rather than from the request. A
+//! long-contiguous run of *other* invocations' events therefore leaves the
+//! outcome unknown instead of reading as an owner-proven clean interval
+//! (issue #2899 item 7; I7.23 "missing host coverage is `TAINTED/UNKNOWN`,
+//! never a self-reported PASS").
+//!
 //! Everything this seam retains is bounded and owned elsewhere. The expected
 //! sets are the owner's journal, capped by the owner's
 //! `TERMINAL_JOURNAL_CAPACITY` with an explicit eviction policy (the oldest
@@ -142,6 +153,12 @@ pub struct BridgeHostCoverage {
 /// cursor gap; rotation proves indeterminacy; an unattached owner proves
 /// nothing. Coverage comes only from this owner projection, never from
 /// facade-local guessing.
+///
+/// The result is a property of the *journal*, not of any one invocation, so
+/// it is only coverage once bounded to the correlation under assessment: see
+/// [`ObservationWindow::covers_this_correlation`]. A journal that is
+/// contiguous but stops short of that correlation's own sequence yields
+/// [`CoverageProof::Indeterminate`] downstream, not a clean interval.
 ///
 /// The journal is the denominator and it is bounded by the owner, not by this
 /// module: the owner caps it at its `TERMINAL_JOURNAL_CAPACITY`, evicts the
@@ -355,8 +372,9 @@ pub struct TerminalReconcileRequest<'a> {
 ///    evidence read back out of this correlation's own retained revisions.
 ///
 /// Only then is the event assessed, with the owner's live coverage
-/// denominator. Stale, foreign, duplicated, reordered, and out-of-order host
-/// events each close nothing current.
+/// denominator bounded to the candidate's own journaled sequence. Stale,
+/// foreign, duplicated, reordered, and out-of-order host events each close
+/// nothing current.
 pub fn reconcile_terminal_event(
     bridge: &AgentBridgeCore,
     request: &TerminalReconcileRequest<'_>,
@@ -395,6 +413,7 @@ pub fn reconcile_terminal_event(
         deadline_unix_ms: request.keys.deadline_unix_ms,
         now_unix_ms: request.now_unix_ms,
         coverage: coverage.coverage,
+        required_seq: Some(journaled.sequence),
     };
     let transport_edge = inputs
         .edges()
@@ -509,6 +528,14 @@ pub struct DeadlineSweepRequest<'a> {
 /// With no terminal event, only an owner-proven complete interval past the
 /// admitted deadline establishes stuck; every other denominator stays
 /// pending or unknown. Never files edges and never invents host completion.
+///
+/// The sweep names no candidate event, so the sequence its coverage must reach
+/// is derived from the owner's own journal rather than from the request: the
+/// terminal event for a still-pending correlation would be the next one the
+/// owner admits, so contiguity proves coverage only once the journal actually
+/// continued past it. A journal that stopped short — including a long-contiguous
+/// one covering only *earlier, unrelated* invocations — leaves the outcome
+/// `UNKNOWN`, never stuck (issue #2899 item 7; I7.23).
 pub fn reconcile_deadline_sweep(
     bridge: &AgentBridgeCore,
     request: &DeadlineSweepRequest<'_>,
@@ -518,6 +545,7 @@ pub fn reconcile_deadline_sweep(
         deadline_unix_ms: request.deadline_unix_ms,
         now_unix_ms: request.now_unix_ms,
         coverage: coverage.coverage,
+        required_seq: pending_required_seq(bridge),
     };
     let host = HostTerminalObservation::PartialUnknown(PartialObservation::stdio_boundary());
     let assessment_inputs = AssessmentInputs {
@@ -530,4 +558,18 @@ pub fn reconcile_deadline_sweep(
         ui_confirmed_stale: false,
     };
     assess_correlation(&assessment_inputs)
+}
+
+/// Host-event sequence a still-pending correlation must reach before a
+/// proven interval says anything about it.
+///
+/// Read from the owner's live journal, never from the requesting caller: a
+/// caller-supplied floor could be set arbitrarily low and would then let a
+/// short interval cover an unrelated invocation. With no journal at all the
+/// owner has admitted no sequence binding, which is indeterminacy and leaves
+/// the correlation pending.
+fn pending_required_seq(bridge: &AgentBridgeCore) -> Option<u64> {
+    let inputs = bridge.terminal_reduction_inputs()?;
+    let highest = inputs.history().last()?.sequence;
+    Some(highest.saturating_add(1))
 }
