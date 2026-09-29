@@ -6532,7 +6532,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
 
-        let plan = self.owners.canonical.read_current_plan(fence)?;
+        let plan = self.owners.canonical.read_current_plan(&fence)?;
         if plan.plan_id != binding.plan_id
             || plan.plan_revision != binding.plan_revision
             || plan.task_id.as_str() != binding.task_id
@@ -6543,7 +6543,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         self.check_native_binding_identity(
-            fence,
+            &fence,
             &binding.task_id,
             binding.task_revision,
             &binding.session_id,
