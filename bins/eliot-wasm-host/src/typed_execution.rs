@@ -330,7 +330,7 @@ pub fn execute_governed_refusal() -> Result<(), TypedExecutionError> {
     };
     check_governed_admission(
         unadmitted.world,
-        &unadmitted.artifact_digest,
+        Some(&unadmitted.artifact_digest),
         None,
         Some(&unadmitted),
     )
