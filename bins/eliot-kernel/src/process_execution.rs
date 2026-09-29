@@ -41,12 +41,12 @@ use eliot_platform_windows::{
 };
 use eliot_process::{
     DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation, KernelDispatchKey,
-    OriginChallenge, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
-    OriginControlPresentation, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
+    OperationId, OriginChallenge, OriginChallengeRequest, OriginControlGrant,
+    OriginControlOperation, OriginControlPresentation, PermitIssuance, ProcessEvidence,
+    ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
     ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
-    ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SuspendedLaunchEvidence,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SessionId,
+    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_store_api::{
@@ -95,6 +95,115 @@ pub struct ProcessExecutionAuthorityConfig {
 
 struct OrsProcessReplayStore {
     store: Arc<RedbRecoveryStore>,
+}
+
+/// The authenticated process operation whose source effect is being observed.
+///
+/// This is formed from the admitted request and server-derived owner before a
+/// process can start. A source adapter must use it to select the governed
+/// attempt and tracked-resource baseline; executable, cwd, and exit status are
+/// deliberately absent as source-mutation evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessEffectBinding {
+    operation_id: OperationId,
+    session_id: SessionId,
+    state_fence: FencingToken,
+    owner: ProcessOwnerBinding,
+}
+
+impl GovernedProcessEffectBinding {
+    fn from_admission(
+        owner: &ProcessOwnerBinding,
+        admission: &ProcessExecutionAdmissionRequest,
+    ) -> Result<Self, ProcessExecutionError> {
+        admission.validate()?;
+        let intent = admission.intent();
+        if admission.recipient_module_id() != owner.module_id()
+            || !admission
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(owner.authority_epoch())
+            || admission.state_fence().generation() != owner.generation()
+            || admission.state_fence().generation() != intent.generation()
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
+        Ok(Self {
+            operation_id: intent.operation_id().clone(),
+            session_id: intent.session_id().clone(),
+            state_fence: admission.state_fence().clone(),
+            owner: owner.clone(),
+        })
+    }
+
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    fn matches_request(&self, owner: &ProcessOwnerBinding, request: &ProcessRequest) -> bool {
+        self.owner == *owner
+            && self.operation_id == *request.operation_id()
+            && self.session_id == *request.session_id()
+            && self.state_fence == *request.fence()
+            && self.state_fence.generation() == request.generation()
+    }
+}
+
+/// Complete tracked-source baseline captured before the admitted process effect.
+///
+/// The Governor-owned adapter constructs the baseline; Kernel retains it
+/// between start capture and reconcile readback and checks only that it
+/// belongs to the exact operation being executed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessEffectBaseline {
+    binding: GovernedProcessEffectBinding,
+}
+
+impl GovernedProcessEffectBaseline {
+    pub(crate) fn binding(&self) -> &GovernedProcessEffectBinding {
+        &self.binding
+    }
+}
+
+/// Validated post-effect readback for one admitted process operation.
+///
+/// The Governor-owned adapter constructs the receipt; Kernel shuttles it from
+/// readback to ingest without inspecting its contents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedProcessChangeReceipt;
+
+/// Stable categories for a missing or malformed independent source observation.
+///
+/// The Governor-owned adapter introduces one variant per failure it can
+/// actually report; Kernel only forwards the value to the stable observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GovernedProcessEffectPortError {}
+
+/// Required Governor-owned readback and `ChangeMonitor` ingress for process tools.
+///
+/// Implementations capture the complete tracked-source baseline before launch,
+/// independently read the terminal source state, attach actual diff and fence
+/// invalidation handles, and ingest only the validated receipt supplied back by
+/// Kernel. Returning an empty `changes` list is valid only after complete
+/// before/after readback; process success is never source evidence.
+pub(crate) trait GovernedProcessEffectPort: Send + Sync {
+    fn capture_before(
+        &self,
+        binding: &GovernedProcessEffectBinding,
+    ) -> Result<GovernedProcessEffectBaseline, GovernedProcessEffectPortError>;
+
+    fn read_after(
+        &self,
+        baseline: &GovernedProcessEffectBaseline,
+        terminal_evidence: &ProcessEvidence,
+    ) -> Result<GovernedProcessChangeReceipt, GovernedProcessEffectPortError>;
+
+    fn ingest(
+        &self,
+        receipt: &GovernedProcessChangeReceipt,
+    ) -> Result<(), GovernedProcessEffectPortError>;
 }
 
 struct OrsProcessEvidenceSink {
@@ -596,6 +705,13 @@ pub(crate) struct ProcessExecutionGateway {
     pub(crate) path_admission: Arc<KernelPathAdmission>,
     /// Launched-but-not-closed descendants (CHILD-1/CHILD-2).
     pub(crate) descendants: Arc<Mutex<DescendantRegistry>>,
+    /// Governor-owned `ChangeMonitor` ingress for governed tool effects (#1824,
+    /// I10.21). Attached once by composition when the readback/monitor
+    /// adapter exists; absent means process execution runs unobserved.
+    effect_port: Mutex<Option<Arc<dyn GovernedProcessEffectPort>>>,
+    /// Pre-effect tracked-source baselines retained between `start` capture
+    /// and `reconcile` readback, keyed by exact operation identity.
+    effect_baselines: Mutex<BTreeMap<OperationId, GovernedProcessEffectBaseline>>,
 }
 
 #[cfg(windows)]
@@ -944,6 +1060,8 @@ impl ProcessExecutionGateway {
             canonical_store: Arc::new(Mutex::new(None)),
             path_admission,
             descendants: Arc::new(Mutex::new(DescendantRegistry::new())),
+            effect_port: Mutex::new(None),
+            effect_baselines: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1081,6 +1199,131 @@ impl ProcessExecutionGateway {
         );
     }
 
+    /// Maps one typed effect-port failure to its stable observation outcome.
+    ///
+    /// Only the variant is emitted; no receipt, handle, or owner string
+    /// crosses into diagnostics.
+    fn effect_port_outcome(error: GovernedProcessEffectPortError) -> &'static str {
+        match error {}
+    }
+
+    /// Captures the pre-effect tracked-source baseline for one admitted
+    /// governed operation (I10.21 A1: exact before revisions, attempt/tool
+    /// operation binding).
+    ///
+    /// A malformed binding fails the start with the same typed contract
+    /// rejection the admission pipeline would produce. A readback-owner
+    /// failure never fences the tool: it is observed and the operation runs
+    /// unobserved, so monitor outage cannot crash unrelated execution.
+    fn capture_governed_effect_baseline(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: &ProcessExecutionAdmissionRequest,
+    ) -> Result<(), ProcessExecutionError> {
+        let port = self
+            .effect_port
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("governed effect port lock poisoned".to_owned())
+            })?
+            .clone();
+        let Some(port) = port else {
+            return Ok(());
+        };
+        let binding = GovernedProcessEffectBinding::from_admission(owner, admission)?;
+        let operation_id = binding.operation_id().clone();
+        match port.capture_before(&binding) {
+            Ok(baseline) => {
+                self.effect_baselines
+                    .lock()
+                    .map_err(|_| {
+                        ProcessExecutionError::Unavailable(
+                            "governed effect baseline lock poisoned".to_owned(),
+                        )
+                    })?
+                    .insert(operation_id, baseline);
+                Ok(())
+            }
+            Err(error) => {
+                observe_process(
+                    "kernel.process.effect_baseline_unavailable",
+                    Self::effect_port_outcome(error),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Verifies the retained pre-effect baseline belongs to the exact request
+    /// about to be handed to the executor (I10.21: evidence bound to this
+    /// operation). A baseline captured for another operation refuses the
+    /// handoff; a missing baseline (unobserved operation) proceeds.
+    fn verify_governed_effect_request(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: &ProcessRequest,
+    ) -> Result<(), ProcessExecutionError> {
+        let baselines = self.effect_baselines.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable("governed effect baseline lock poisoned".to_owned())
+        })?;
+        match baselines.get(request.operation_id()) {
+            Some(baseline) if baseline.binding().matches_request(owner, request) => Ok(()),
+            Some(_) => Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Drops one retained pre-effect baseline without observation (unknown or
+    /// failed start claims no governed effect).
+    fn release_governed_effect_baseline(&self, operation_id: &eliot_process::OperationId) {
+        if let Ok(mut baselines) = self.effect_baselines.lock() {
+            baselines.remove(operation_id);
+        }
+    }
+
+    /// Reads the terminal source state against the retained pre-effect
+    /// baseline and ingests the validated receipt (I10.21 A1: exact
+    /// before/after revisions, diff handle, State-Fence invalidation; W2:
+    /// Git/content re-read confirmation).
+    ///
+    /// Monitor-path failures are observed and never fail the reconcile: the
+    /// reported terminal evidence stays the owner's.
+    fn ingest_governed_effect_observation(
+        &self,
+        operation_id: &eliot_process::OperationId,
+        evidence: &ProcessEvidence,
+    ) {
+        let baseline = match self.effect_baselines.lock() {
+            Ok(mut baselines) => baselines.remove(operation_id),
+            Err(_) => return,
+        };
+        let Some(baseline) = baseline else {
+            return;
+        };
+        let port = match self.effect_port.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        let Some(port) = port else {
+            return;
+        };
+        match port.read_after(&baseline, evidence) {
+            Ok(receipt) => match port.ingest(&receipt) {
+                Ok(()) => observe_process("kernel.process.effect_observed", "success"),
+                Err(error) => observe_process(
+                    "kernel.process.effect_ingest_failed",
+                    Self::effect_port_outcome(error),
+                ),
+            },
+            Err(error) => observe_process(
+                "kernel.process.effect_readback_failed",
+                Self::effect_port_outcome(error),
+            ),
+        }
+    }
+
     /// Gates one effect-capable process-start REPLAY on its exact unexpired
     /// effect operation lease (issue #1885; I1.9, W2/W5).
     ///
@@ -1159,6 +1402,16 @@ impl ProcessExecutionGateway {
         // start, and an `UnknownOutcome` (possible launch/response loss)
         // keeps its unknown code instead of a committed-start claim.
         observe_process("kernel.process.start_requested", "attempt");
+        // #1824 (I10.21 A1): capture the pre-effect tracked-source baseline
+        // before the reservation/executor handoff below. This is the closest
+        // pre-effect point that still carries the admission the binding is
+        // formed from.
+        if let Err(error) = self.capture_governed_effect_baseline(owner, &admission) {
+            observe_process("kernel.process.start_failed", "rejected");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
+        }
+        let effect_operation_id = admission.intent().operation_id().clone();
         match Box::pin(run_process_start(
             self,
             owner,
@@ -1173,6 +1426,10 @@ impl ProcessExecutionGateway {
                 Ok(receipt)
             }
             Err(error) => {
+                // A failed or unknown start claims no governed effect: drop
+                // any baseline captured above so a later retry captures fresh
+                // pre-effect state.
+                self.release_governed_effect_baseline(&effect_operation_id);
                 observe_process("kernel.process.start_failed", "rejected");
                 super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
                 Err(error)
@@ -1473,8 +1730,13 @@ impl ProcessExecutionGateway {
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             return Err(error);
         }
+        let effect_operation_id = operation_id.clone();
         match self.executor.reconcile(operation_id).await {
             Ok(evidence) => {
+                // #1824 (I10.21 A1/W2): read the terminal source state against
+                // the retained pre-effect baseline and ingest the validated
+                // receipt. Monitor-path failure never fails the reconcile.
+                self.ingest_governed_effect_observation(&effect_operation_id, &evidence);
                 observe_process("kernel.process.reconcile_reported", "success");
                 Ok(evidence)
             }
@@ -1925,6 +2187,15 @@ impl ProcessStartPorts for ProcessExecutionGateway {
             })?
             .register(registration)
             .map_err(ProcessExecutionError::Contract)?;
+        // #1824 (I10.21): the retained pre-effect baseline must belong to the
+        // exact request about to be handed to the executor. A mismatch refuses
+        // the handoff and drops the registration like any other failed launch.
+        if let Err(error) = self.verify_governed_effect_request(owner, &request) {
+            if let Ok(mut registry) = self.descendants.lock() {
+                registry.remove(&operation_id);
+            }
+            return Err(error);
+        }
         let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(OrsProcessStreamRecoverySink {
             store: Arc::clone(&self.evidence_store),
             owner: owner.clone(),

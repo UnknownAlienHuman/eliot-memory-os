@@ -1254,6 +1254,23 @@ impl ChangeMonitor {
         })
     }
 
+    /// Confirms a pending host/filesystem hint with trusted content and Git
+    /// readback evidence from the owner-side adapter.
+    ///
+    /// The adapter must perform two independent direct content reads and
+    /// obtain the bound read-only Git evidence before constructing
+    /// `verification`. Transport payloads must remain [`ChangeHint`] values;
+    /// they must never be deserialized into [`ChangeHintVerification`]. The
+    /// strict path requires the verified before-state to match an admitted
+    /// resource projection before a material change can be confirmed.
+    pub fn confirm_hint_with_readback(
+        &mut self,
+        hint_id: &str,
+        verification: &ChangeHintVerification,
+    ) -> Result<ChangeHintConfirmation, ChangeMonitorError> {
+        self.confirm_hint_inner(hint_id, verification, true)
+    }
+
     fn confirm_hint_inner(
         &mut self,
         hint_id: &str,
