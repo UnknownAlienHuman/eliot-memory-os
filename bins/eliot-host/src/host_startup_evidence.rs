@@ -441,8 +441,41 @@ mod tests {
             .unwrap_or_else(|_| panic!("portable roots must derive"))
     }
 
+    fn test_profile_roots(
+        dir: &Path,
+        generation: &str,
+        runtime_state_roots: &RuntimeStateRoots,
+    ) -> eliot_installation::InstallationRoots {
+        eliot_installation::InstallationRoots {
+            binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: dir
+                .join("target")
+                .join("eliot-dev")
+                .join(generation)
+                .to_string_lossy()
+                .into_owned(),
+            durable_data: dir
+                .join(".eliot-dev")
+                .join("state")
+                .to_string_lossy()
+                .into_owned(),
+            user_config: dir
+                .join(".eliot-dev")
+                .join("config")
+                .to_string_lossy()
+                .into_owned(),
+            user_cache: dir
+                .join(".eliot-dev")
+                .join("cache")
+                .to_string_lossy()
+                .into_owned(),
+            runtime_state_roots: runtime_state_roots.clone(),
+        }
+    }
+
     fn test_launch(dir: &Path, roots: &RuntimeStateRoots) -> RuntimeLaunchDescriptor {
         let path = |name: &str| handle(dir.join(name).to_string_lossy().as_ref());
+        let generation = handle("generation-evidence-1");
         let installation_epoch = InstallationEpoch {
             installation: handle("test-installation-1967"),
             lineage_id: handle("lineage-test-1967"),
@@ -450,9 +483,13 @@ mod tests {
         };
         RuntimeLaunchDescriptor {
             profile: InstallationProfile::PortableDev,
+            profile_component: handle("eliot"),
+            profile_version: handle("test-version"),
+            profile_installation_key: None,
+            profile_governed_roots: test_profile_roots(dir, generation.as_str(), roots),
             portable_root: Some(roots.installation_root.clone()),
             installation_epoch,
-            generation: handle("generation-evidence-1"),
+            generation,
             authority_generation: ResourceGeneration::new(7)
                 .unwrap_or_else(|_| panic!("generation")),
             authority_state_fence: StateFence::new(
