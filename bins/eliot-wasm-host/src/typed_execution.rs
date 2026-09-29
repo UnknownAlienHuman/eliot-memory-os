@@ -300,8 +300,8 @@ pub enum TypedExecutionError {
 
 /// Cuts `value` to [`MAX_LOG_DETAIL_BYTES`] on a char boundary. Returns the
 /// whole value when it already fits; no allocation, no escaping change.
-/// Called by [`TypedExecutionError::fmt`] (typed_execution.rs::fmt) and by
-/// [`map_contract_error`] (typed_execution.rs::map_contract_error).
+/// Called by [`TypedExecutionError::fmt`] (`typed_execution.rs::fmt`) and by
+/// [`map_contract_error`] (`typed_execution.rs::map_contract_error`).
 fn truncate_detail(value: &str) -> &str {
     if value.len() <= MAX_LOG_DETAIL_BYTES {
         return value;
@@ -808,8 +808,8 @@ const MAX_TYPED_RECEIPT_BYTES: usize = 16_384;
 /// payload, path, secret, or backtrace — so this gate bounds the envelope,
 /// not content that must be redacted. Failure is the typed
 /// `OUTPUT_VIOLATION:receipt-bound` denial. Called by
-/// [`execute_describe_experimental`] (typed_execution.rs::execute_describe_experimental)
-/// and [`execute_domain_experimental`] (typed_execution.rs::execute_domain_experimental).
+/// [`execute_describe_experimental`] (`typed_execution.rs::execute_describe_experimental`)
+/// and [`execute_domain_experimental`] (`typed_execution.rs::execute_domain_experimental`).
 fn check_receipt_bounds(receipt: &TypedReceipt) -> Result<(), TypedExecutionError> {
     if receipt.actual_imports.len() > 8 || receipt.actual_exports.len() > 8 {
         return Err(TypedExecutionError::OutputViolation(
@@ -830,15 +830,16 @@ fn check_receipt_bounds(receipt: &TypedReceipt) -> Result<(), TypedExecutionErro
     ] {
         bytes = bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
     }
-    for identity in [
+    for value in [
         receipt.operation_id.as_ref(),
         receipt.task_id.as_ref(),
         receipt.fence_epoch.as_ref(),
         receipt.policy_id.as_ref(),
-    ] {
-        if let Some(value) = identity {
-            bytes = bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bytes = bytes.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
     }
     for values in [&receipt.actual_imports, &receipt.actual_exports] {
         for value in values {
@@ -2121,10 +2122,7 @@ fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
         TypedContractError::EngineUnknown => {
             TypedExecutionError::Engine("capsule-engine-unknown".to_owned())
         }
-        TypedContractError::InvalidKit(detail) => {
-            TypedExecutionError::AdmissionMismatch(truncate_detail(&detail).to_owned())
-        }
-        TypedContractError::InvalidCapsule(detail) => {
+        TypedContractError::InvalidKit(detail) | TypedContractError::InvalidCapsule(detail) => {
             TypedExecutionError::AdmissionMismatch(truncate_detail(&detail).to_owned())
         }
         TypedContractError::Serialization(_) => {
