@@ -1470,6 +1470,18 @@ impl KernelContextReadClient {
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         check_delivered_traces(&delivery, &assembled)
             .map_err(PacketCompositionError::TraceDelivery)?;
+        // #1727: the assembled packet is not delivered on the strength of its
+        // rendered atoms alone. Each logical unit must still round-trip through
+        // packing with its own source identity, scope/fence and admitted source
+        // order intact, and the whole set must still match the output identity
+        // bound at production against the upstream admission receipt. The check
+        // is made here, at the delivery-acceptance owner, so a substituted
+        // boundary, a reordered source member, a foreign source revision or a
+        // lost unit fails closed before the packet leaves this composition
+        // rather than after it has been consumed.
+        assembled
+            .verify_boundaries()
+            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         Ok((assembled, delivery))
     }
 }
