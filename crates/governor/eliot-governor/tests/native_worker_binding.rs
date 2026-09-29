@@ -19,7 +19,8 @@ use eliot_governor::{
     KernelGenerationSnapshot, KernelGenerationSnapshotProvider, KernelNamedReadReply,
     KernelNamedReadRequest, KernelPortError, KernelPortFuture, KernelRecoveryPort,
     KernelServiceObservationPort, KernelServiceRecovery, KernelTransitionPort,
-    NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NativeWorkerExecutableBinding, OWNER_SNAPSHOT_SCHEMA,
+    NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NativeWorkerExecutableBinding,
+    NativeWorkerLifecycleBinding, OWNER_SNAPSHOT_SCHEMA,
     PolicyOwnerSnapshot, ProblemOwnerSnapshot, QueueLimits, ReadOwnerSnapshot, RecoveryOwner,
 };
 use eliot_module_registry::ModuleCatalog;
@@ -536,6 +537,16 @@ fn publish_valid(composition: &GovernorComposition<TestKernel>) -> NativeWorkerE
             EffectClass::ReversibleMutation,
             vec!["cred-1".to_owned()],
             vec!["res-1".to_owned()],
+            NativeWorkerLifecycleBinding {
+                capability_cell_registry_digest: "5".repeat(64),
+                kernel_execution_manifest_digest: "9".repeat(64),
+                job_object_lineage_ref: "job-lineage-1".to_owned(),
+                resource_limits_digest: "8".repeat(64),
+                cancellation_policy_ref: "cancel-policy-1".to_owned(),
+                checkpoint_policy_digest: "7".repeat(64),
+                drain_policy_ref: "drain-policy-1".to_owned(),
+                restart_policy_digest: "6".repeat(64),
+            },
             "stream-1",
             "0123456789abcdef",
             &"1".repeat(64),
@@ -555,7 +566,7 @@ fn publish_produces_valid_binding_with_stable_digest() {
     let composition = build_composition();
     let binding = publish_valid(&composition);
     assert_eq!(binding.wire_id, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID);
-    assert_eq!(binding.wire_version, 1);
+    assert_eq!(binding.wire_version, 2);
     binding.validate().expect("valid binding");
     let first = binding.compute_digest().expect("digest");
     let second = binding.compute_digest().expect("digest");
@@ -587,7 +598,7 @@ fn wrong_wire_version_fails() {
     let composition = build_composition();
     let binding = publish_valid(&composition);
     let mut wrong = binding.clone();
-    wrong.wire_version = 2;
+    wrong.wire_version = 1;
     let recomputed = wrong
         .compute_digest()
         .expect("recompute after version change");
@@ -631,6 +642,16 @@ fn stale_task_revision_fails_publish() {
         EffectClass::ReversibleMutation,
         vec!["cred-1".to_owned()],
         vec!["res-1".to_owned()],
+        NativeWorkerLifecycleBinding {
+            capability_cell_registry_digest: "5".repeat(64),
+            kernel_execution_manifest_digest: "9".repeat(64),
+            job_object_lineage_ref: "job-lineage-1".to_owned(),
+            resource_limits_digest: "8".repeat(64),
+            cancellation_policy_ref: "cancel-policy-1".to_owned(),
+            checkpoint_policy_digest: "7".repeat(64),
+            drain_policy_ref: "drain-policy-1".to_owned(),
+            restart_policy_digest: "6".repeat(64),
+        },
         "stream-1",
         "0123456789abcdef",
         &"1".repeat(64),

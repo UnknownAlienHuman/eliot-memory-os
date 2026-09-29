@@ -142,7 +142,7 @@ pub use genesis_owner_packet::{
 mod native_worker_binding;
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
-    NativeWorkerExecutableBinding, process_invocation_digest_for,
+    NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
 };
 
 /// The only application write port exposed to the daemon.
@@ -6767,8 +6767,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// This method performs no transport: the caller commits a sibling
     /// `PreparedTransition` through the existing `commit_canonical` path and
     /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
-    /// The admitted capability cell and Module Catalog revision are required
-    /// caller-supplied owner inputs; this method does not infer either value.
+    /// The admitted capability cell, Module Catalog revision and
+    /// `NativeWorkerLifecycleBinding` are required caller-supplied owner
+    /// inputs; this method does not infer or refresh those values.
     /// The supplied revision must equal the live `module_registry` revision at
     /// publish: a binding is compiled against the current catalog, never a
     /// stale one (Implements #22 W1). A catalog change makes the binding
@@ -6812,6 +6813,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
+        lifecycle_binding: NativeWorkerLifecycleBinding,
         replay_stream_id: &str,
         launch_nonce: &str,
         process_invocation_digest: &str,
@@ -6881,6 +6883,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             session_id: session_id.to_owned(),
             worker_generation,
             process_tree_id: process_tree_id.to_owned(),
+            job_object_lineage_ref: lifecycle_binding.job_object_lineage_ref,
             process_generation,
             process_fence: process_fence.to_owned(),
             route_ref: route_ref.to_owned(),
@@ -6896,6 +6899,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             supporting_grant_refs,
             grant_graph_revision,
             module_catalog_revision,
+            capability_cell_registry_digest: lifecycle_binding.capability_cell_registry_digest,
+            kernel_execution_manifest_digest: lifecycle_binding
+                .kernel_execution_manifest_digest,
+            resource_limits_digest: lifecycle_binding.resource_limits_digest,
+            cancellation_policy_ref: lifecycle_binding.cancellation_policy_ref,
+            checkpoint_policy_digest: lifecycle_binding.checkpoint_policy_digest,
+            drain_policy_ref: lifecycle_binding.drain_policy_ref,
+            restart_policy_digest: lifecycle_binding.restart_policy_digest,
             effective_ceiling,
             credential_refs,
             resource_refs,
@@ -6976,6 +6987,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
+        lifecycle_binding: NativeWorkerLifecycleBinding,
         replay_stream_id: &str,
         launch_nonce: &str,
         process_invocation: &serde_json::Value,
@@ -7022,6 +7034,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             effective_ceiling,
             credential_refs,
             resource_refs,
+            lifecycle_binding,
             replay_stream_id,
             launch_nonce,
             &derived,
@@ -11354,6 +11367,16 @@ mod tests {
                 eliot_store_api::EffectClass::ReversibleMutation,
                 vec!["cred-1".to_owned()],
                 vec!["res-1".to_owned()],
+                NativeWorkerLifecycleBinding {
+                    capability_cell_registry_digest: "5".repeat(64),
+                    kernel_execution_manifest_digest: "9".repeat(64),
+                    job_object_lineage_ref: "job-lineage-1".to_owned(),
+                    resource_limits_digest: "8".repeat(64),
+                    cancellation_policy_ref: "cancel-policy-1".to_owned(),
+                    checkpoint_policy_digest: "7".repeat(64),
+                    drain_policy_ref: "drain-policy-1".to_owned(),
+                    restart_policy_digest: "6".repeat(64),
+                },
                 "stream-1",
                 "0123456789abcdef",
                 invocation,
