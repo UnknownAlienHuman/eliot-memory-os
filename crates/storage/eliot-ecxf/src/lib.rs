@@ -587,15 +587,16 @@ impl EcxfManifest {
         // comparison belongs where the delivered blobs are known, which is
         // `check_reachability` and `EcxfArchive::validate`; the importer
         // repeats it against the members it actually received.
-        let head_span = self.export_fence.revision_heads.iter().fold(
-            None::<(u64, u64)>,
-            |span, head| {
-                Some(match span {
-                    Some((start, end)) => (start.min(head.revision), end.max(head.revision)),
-                    None => (head.revision, head.revision),
-                })
-            },
-        );
+        let head_span =
+            self.export_fence
+                .revision_heads
+                .iter()
+                .fold(None::<(u64, u64)>, |span, head| {
+                    Some(match span {
+                        Some((start, end)) => (start.min(head.revision), end.max(head.revision)),
+                        None => (head.revision, head.revision),
+                    })
+                });
         if head_span != self.revision_start.zip(self.revision_end) {
             return Err(EcxfError::InconsistentBoundary);
         }
@@ -705,10 +706,7 @@ impl IntegrityManifest {
     /// successful export (issue #1141, A2/A5).
     pub fn validate(&self) -> Result<(), EcxfError> {
         digest(&self.manifest_sha256, "integrity.manifest_sha256")?;
-        digest(
-            &self.purge_ledger_sha256,
-            "integrity.purge_ledger_sha256",
-        )?;
+        digest(&self.purge_ledger_sha256, "integrity.purge_ledger_sha256")?;
         digest(&self.archive_sha256, "integrity.archive_sha256")?;
         for (name, checksum) in &self.section_sha256 {
             text(name, "integrity.section_sha256.name")?;
@@ -1029,11 +1027,17 @@ impl EcxfArchive {
                 if encoded.len() > MAX_SECTION_BYTES {
                     return Err(EcxfError::Codec("encoded section exceeds limit".to_owned()));
                 }
-                files.insert(section_member_name(kind.wire_name(), codec.suffix()), encoded);
+                files.insert(
+                    section_member_name(kind.wire_name(), codec.suffix()),
+                    encoded,
+                );
             }
         }
         for blob in &self.blobs {
-            files.insert(blob_member_name(&blob.entry_path()?), blob.sealed_bytes.clone());
+            files.insert(
+                blob_member_name(&blob.entry_path()?),
+                blob.sealed_bytes.clone(),
+            );
         }
         files.insert(INTEGRITY_FILE.to_owned(), self.integrity_json()?);
         files.insert(
@@ -1191,10 +1195,12 @@ pub fn import_ecxf_package(
         field: INTEGRITY_FILE,
         reason: "package member is absent",
     })?;
-    let ledger_bytes = files.get(PURGE_LEDGER_FILE).ok_or(EcxfError::InvalidField {
-        field: PURGE_LEDGER_FILE,
-        reason: "package member is absent",
-    })?;
+    let ledger_bytes = files
+        .get(PURGE_LEDGER_FILE)
+        .ok_or(EcxfError::InvalidField {
+            field: PURGE_LEDGER_FILE,
+            reason: "package member is absent",
+        })?;
     let schema_bytes = files.get(SCHEMA_FILE).ok_or(EcxfError::InvalidField {
         field: SCHEMA_FILE,
         reason: "package member is absent",
@@ -1203,8 +1209,8 @@ pub fn import_ecxf_package(
     // Parse the recorded artifacts and run their own existing validators, so
     // this function never becomes a second validator for a type it did not
     // write.
-    let manifest: EcxfManifest =
-        serde_json::from_slice(manifest_bytes).map_err(|error| EcxfError::Serialization(error.to_string()))?;
+    let manifest: EcxfManifest = serde_json::from_slice(manifest_bytes)
+        .map_err(|error| EcxfError::Serialization(error.to_string()))?;
     manifest.validate()?;
     let integrity: IntegrityManifest = serde_json::from_slice(integrity_bytes)
         .map_err(|error| EcxfError::Serialization(error.to_string()))?;
@@ -1226,13 +1232,14 @@ pub fn import_ecxf_package(
             subject: PURGE_LEDGER_FILE.to_owned(),
         });
     }
-    let recorded_ledger_digest = manifest
-        .checksums
-        .get("privacy-purge-ledger")
-        .ok_or(EcxfError::InvalidField {
-            field: "checksums.privacy-purge-ledger",
-            reason: "manifest does not record the purge-ledger member",
-        })?;
+    let recorded_ledger_digest =
+        manifest
+            .checksums
+            .get("privacy-purge-ledger")
+            .ok_or(EcxfError::InvalidField {
+                field: "checksums.privacy-purge-ledger",
+                reason: "manifest does not record the purge-ledger member",
+            })?;
     if recorded_ledger_digest != &integrity.purge_ledger_sha256 {
         return Err(EcxfError::DigestMismatch {
             subject: "privacy-purge-ledger".to_owned(),
@@ -1244,7 +1251,9 @@ pub fn import_ecxf_package(
     // export fence. A ledger from another epoch cannot be admitted as this
     // export's erasure evidence.
     unique(
-        privacy_purge_ledger.iter().map(|entry| entry.purge_id.clone()),
+        privacy_purge_ledger
+            .iter()
+            .map(|entry| entry.purge_id.clone()),
         "privacy_purge_ledger.purge_id",
     )?;
     for entry in &privacy_purge_ledger {
@@ -1263,8 +1272,8 @@ pub fn import_ecxf_package(
 
     // The recorded schema declaration must be this crate's format and contract,
     // so a package that declares another format cannot be read as ECXF/1.
-    let schema: Value =
-        serde_json::from_slice(schema_bytes).map_err(|error| EcxfError::Serialization(error.to_string()))?;
+    let schema: Value = serde_json::from_slice(schema_bytes)
+        .map_err(|error| EcxfError::Serialization(error.to_string()))?;
     if schema.get("format").and_then(Value::as_str) != Some(FORMAT_VERSION)
         || schema.get("contract").and_then(Value::as_str) != Some(CONTRACT_NAME)
     {
@@ -1281,9 +1290,9 @@ pub fn import_ecxf_package(
     for (wire_name, recorded_digest) in &integrity.section_sha256 {
         let kind = section_kind_from_wire_name(wire_name)?;
         let member = section_member_name(wire_name, codec.suffix());
-        let encoded = files
-            .get(&member)
-            .ok_or_else(|| EcxfError::Codec(format!("recorded section member {member} is absent")))?;
+        let encoded = files.get(&member).ok_or_else(|| {
+            EcxfError::Codec(format!("recorded section member {member} is absent"))
+        })?;
         if encoded.len() > MAX_SECTION_BYTES {
             return Err(EcxfError::Codec(format!(
                 "section member {member} exceeds MAX_SECTION_BYTES"
@@ -1358,10 +1367,9 @@ pub fn import_ecxf_package(
             .get(&member)
             .ok_or_else(|| EcxfError::Blob(format!("recorded blob member {member} is absent")))?
             .clone();
-        let recorded_digest = manifest
-            .checksums
-            .get(&entry_path)
-            .ok_or_else(|| EcxfError::Blob(format!("manifest does not record blob {entry_path}")))?;
+        let recorded_digest = manifest.checksums.get(&entry_path).ok_or_else(|| {
+            EcxfError::Blob(format!("manifest does not record blob {entry_path}"))
+        })?;
         if integrity.blob_sha256.get(&entry_path) != Some(recorded_digest) {
             return Err(EcxfError::DigestMismatch {
                 subject: format!("integrity blob {entry_path}"),
