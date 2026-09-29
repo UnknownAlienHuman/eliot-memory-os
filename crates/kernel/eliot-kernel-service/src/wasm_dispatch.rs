@@ -1331,8 +1331,9 @@ pub enum WasmDeliveryDisposition {
         /// Exact terminal event sequence (zero-based as in the retained stream).
         result_sequence: u64,
     },
-    /// Future owner-authored terminal disposition. No current production
-    /// caller writes this variant; reclamation requires every exact receipt.
+    /// Reserved terminal disposition. The wire shape alone is not evidence:
+    /// the owner must verify typed receiver-ACK and process/material
+    /// settlement receipts before this state can authorize reclamation.
     Acknowledged {
         /// Full owner-issued publication identity.
         identity: WasmDeliveryIdentity,
@@ -2136,6 +2137,18 @@ fn validate_disposition_record(
 fn validate_disposition_custody(
     record: &WasmDeliveryDispositionRecord,
 ) -> Result<(), WasmDispatchError> {
+    // W5's receipt seam is not present in this owner module yet. These fields
+    // are plain strings in the persisted schema, so checking only their shape
+    // would let a guessed identity or self-asserted digest authorize reclaim.
+    // Fail closed until a caller can provide verified, identity-bound receipt
+    // types and the owner transition can compare them with the retained result.
+    if matches!(
+        &record.disposition,
+        WasmDeliveryDisposition::Acknowledged { .. }
+    ) {
+        return Err(WasmDispatchError::DeliveryUnavailable);
+    }
+
     match &record.disposition {
         WasmDeliveryDisposition::LaunchReserved {
             launch_incarnation: actual,
