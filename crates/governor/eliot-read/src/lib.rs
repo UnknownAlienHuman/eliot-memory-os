@@ -126,13 +126,18 @@
 //!
 //! | member | declared edge | what that member does with it |
 //! |---|---|---|
-//! | `eliot-governor` | normal | production `ReadApi` implementor: `GovernorContextInputs<'_, R: ReadApi + ?Sized>` (`context_inputs.rs:391`) issues the seven role reads and classifies each `ReadOutcome`; its only call site is `KernelContextReadClient::reconstruct_context_inputs` (`bins/eliotd/src/kernel_context_read_client.rs:702`), itself reached only through `DaemonComposition::reconstruction_composition` (`bins/eliotd/src/lib.rs:3296`), which **no caller in this repository invokes**; |
-//! | `eliotd` | normal | production entry points `answer_evidence_query` / `answer_projection_inputs` construct a `ReadService` and are re-exported from the library (`bins/eliotd/src/lib.rs:227`), but the `eliotd` **binary** composes none of them: `main.rs` reaches only `daemon_runtime::run`, and the run loop's local-read leg calls `forward_admitted_local_read` -> `DaemonKernelClient::local_read_async`, which asks the **Kernel** to serve the read and returns the persisted result body. The only caller of the Governor-serving path `serve_admitted_local_read` -> `KernelContextReadClient::execute_local_read` is `bins/eliotd/tests/local_read_e2e.rs`; |
+//! | `eliot-governor` | normal | production `ReadApi` implementor: `GovernorContextInputs<'_, R: ReadApi + ?Sized>` (`context_inputs.rs:391`) issues the seven role reads and classifies each `ReadOutcome`; its only call site is `KernelContextReadClient::reconstruct_context_inputs` (`bins/eliotd/src/kernel_context_read_client.rs:736`), which is now reached from the live daemon route `context_reconstruction_route::serve_context_reconstruction` (`bins/eliotd/src/context_reconstruction_route.rs:204`) on the admitted `eliot.query` `context_reconstruction` intent, and separately through the `DaemonComposition::reconstruction_composition` accessor (`bins/eliotd/src/lib.rs:3658`), which **no caller in this repository invokes**; |
+//! | `eliotd` | normal | production entry points `answer_evidence_query` / `answer_projection_inputs` construct a `ReadService` and are re-exported from the library (`bins/eliotd/src/lib.rs:227`), but the `eliotd` **binary** composes none of them: `main.rs` reaches only `daemon_runtime::run`, and the run loop's local-read leg calls `forward_admitted_local_read` -> `DaemonKernelClient::local_read_async`, which asks the **Kernel** to serve the read and returns the persisted result body (the one exception being the `context_reconstruction` intent mode, which the same leg serves locally through `serve_context_reconstruction` instead of forwarding, and which is what makes the `eliot-governor` row above live). The only caller of the Governor-serving path `serve_admitted_local_read` -> `KernelContextReadClient::execute_local_read` is `bins/eliotd/tests/local_read_e2e.rs`; |
 //! | `eliot-kernel-service` | **dev-dependency only** | uses `ReadService` inside `mod live_surreal_evidence_pack_e2e` in `store_gateway.rs`. Not in the production graph. |
 //!
-//! So on the exact source searched, `eliot-read` has **no read that a process
-//! entry point can reach**: every production call site is either reached only by
-//! a test or by an accessor nothing calls. `provider_memory_feed` has no
+//! So on the exact source searched, `eliot-read` has **exactly one read that a
+//! process entry point can reach**: the seven-role Context reconstruction
+//! closure, reached from the `eliotd` run loop's local-read leg when it serves an
+//! already-admitted `eliot.query` whose intent mode is `context_reconstruction`
+//! (`context_reconstruction_route::serve_context_reconstruction` -> `reconstruct_context_inputs`
+//! -> `GovernorContextInputs::reconstruct`). Every other production call site is
+//! still reached only by a test or by an accessor nothing calls.
+//! `provider_memory_feed` has no
 //! importer at all. No caller was invented, no `#[allow(dead_code)]` was added,
 //! and no value is constructed and dropped to make the set look populated; the
 //! crate's proof ceiling is therefore
