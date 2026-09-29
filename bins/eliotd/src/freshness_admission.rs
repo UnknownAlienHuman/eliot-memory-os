@@ -712,7 +712,11 @@ impl CandidateFetchOutcome {
 /// A known handle with no matching current publication resolves to
 /// `CANDIDATE_COMMITTED_PROJECTION_PENDING`: the record exists and is
 /// fetchable, but the owning hot-path and Material gates must refuse it
-/// until a current publication record exists. Every presented publication is
+/// until a current publication record exists. "Current" is decided against
+/// the candidate, not by the presence of a publication: the matching
+/// publication must carry the candidate's own recorded commit as its
+/// `atomic_data_commit`, so a publication issued by a sibling commit at the
+/// same fence leaves the candidate pending. Every presented publication is
 /// validated through the store's own validator first, so a malformed record
 /// fails closed instead of being skipped as if it were absent.
 ///
