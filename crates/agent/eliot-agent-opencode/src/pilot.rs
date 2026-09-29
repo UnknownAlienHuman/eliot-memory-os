@@ -87,8 +87,11 @@ pub fn opencode_pilot_observation(result: &NoAuthorityRunResult) -> OpenCodePilo
 /// from the pair by [`opencode_equal_stack_comparison`]. The fallback run is
 /// operator-supplied retained evidence of the same controlled task run against
 /// the fallback route, never an automatic second attempt: this harness runs
-/// nothing on its own, and task sameness across the two runs is the operator's
-/// precondition, stated here because the run receipts do not carry the prompt.
+/// nothing on its own. Task sameness is not taken on trust: the comparison
+/// requires both runs to carry the same controlled-task session identity
+/// before it reads `Observed`.
+///
+/// [`opencode_equal_stack_comparison`]: crate::opencode_equal_stack_comparison
 #[must_use]
 pub fn opencode_pilot_observation_with_fallback(
     candidate: &NoAuthorityRunResult,
@@ -105,13 +108,23 @@ pub fn opencode_pilot_observation_with_fallback(
 /// implementation tasks are compared with an equal-stack fallback route").
 ///
 /// `Observed` requires all of: both runs succeeded, because a failed attempt
-/// produced no evidence for any probe; both retained their actual-route
-/// receipts on the same observed stack — the same endpoint and the same
-/// installed server version (I10.6 keeps the route provisional until the exact
-/// installed server passes the gate); and both retained an identified route
-/// with the two route fingerprints differing, so a run compared with itself
-/// can never read as a fallback comparison. Any absence reads
+/// produced no evidence for any probe; both runs executed the same controlled
+/// task — both retained the same session identity, present on both sides and
+/// equal, so an unrelated successful fallback run on the same stack never
+/// reads as the comparison; both retained their actual-route receipts on the
+/// same observed stack — the same endpoint and the same installed server
+/// version (I10.6 keeps the route provisional until the exact installed
+/// server passes the gate); and both retained an identified route with the
+/// two route fingerprints differing, so a run compared with itself can never
+/// read as a fallback comparison. Any absence reads
 /// [`OpenCodeProbeReading::NotObserved`]: absence is never a pass.
+///
+/// The session identity is the existing [`NoAuthorityRunResult::session_id`]
+/// each run already carries: the production minter records the `OpenCode`
+/// server session the controlled task ran in, the actual-route receipt
+/// mirrors it (deserialization rejects an `Observed` receipt whose session
+/// identity differs from its run result), and a continued task reuses its
+/// session. Compared for equality only, never parsed.
 #[must_use]
 pub fn opencode_equal_stack_comparison(
     candidate: &NoAuthorityRunResult,
@@ -122,6 +135,8 @@ pub fn opencode_equal_stack_comparison(
     }
     let candidate_route = &candidate.actual_route;
     let fallback_route = &fallback.actual_route;
+    let same_controlled_task =
+        same_observed(candidate.session_id.as_ref(), fallback.session_id.as_ref());
     let equal_stack = same_observed(
         candidate_route.endpoint.as_ref(),
         fallback_route.endpoint.as_ref(),
@@ -133,7 +148,7 @@ pub fn opencode_equal_stack_comparison(
         candidate_route.route_fingerprint.as_ref(),
         fallback_route.route_fingerprint.as_ref(),
     );
-    reading(equal_stack && distinct_routes)
+    reading(same_controlled_task && equal_stack && distinct_routes)
 }
 
 /// Whether both runs retained the same observed value: present on both sides
