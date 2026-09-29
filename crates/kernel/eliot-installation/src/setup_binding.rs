@@ -648,7 +648,7 @@ impl SetupBinding {
     }
 }
 
-fn profile_ref(profile: InstallationProfile) -> Result<String, InstallationError> {
+pub(crate) fn profile_ref(profile: InstallationProfile) -> Result<String, InstallationError> {
     let text = match profile {
         InstallationProfile::SystemService => "system_service",
         InstallationProfile::UserMode => "user_mode",
