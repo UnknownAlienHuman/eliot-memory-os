@@ -16,9 +16,6 @@ use crate::policy::{ConceptPolicy, work_bound};
 
 const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// Local decision projection for callers that need to inspect the outcome.
-pub type ConceptDecision = ConceptDisposition;
-
 /// Returns the one registry descriptor owned by this cell.
 #[must_use]
 pub fn handler_port() -> CurationHandlerPort {

@@ -503,8 +503,6 @@ pub struct ProposedStageTransition {
     pub job_digest: String,
 }
 
-pub type AdvanceStageCommand = ProposedStageTransition;
-
 /// Request the adapter to read back one parked operation under the same
 /// identity. A replacement retry is never permitted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -530,7 +528,7 @@ pub struct EscalateCommand {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DurableCommand {
     /// Inert stage transition proposal requiring Kernel authorization.
-    AdvanceStage(AdvanceStageCommand),
+    AdvanceStage(ProposedStageTransition),
     /// Reconcile one parked operation under the same identity.
     ReconcileOperation(ReconcileCommand),
     /// Escalate a blocked job for owner review.
@@ -891,7 +889,7 @@ fn apply_request_stage(
     if let Some(rank) = requested.rank() {
         next.progress_rank = next.progress_rank.max(rank);
     }
-    let command = DurableCommand::AdvanceStage(AdvanceStageCommand {
+    let command = DurableCommand::AdvanceStage(ProposedStageTransition {
         stage: request.stage,
         operation_id: request.operation_id.clone(),
         idempotency_key: request.idempotency_key.clone(),
