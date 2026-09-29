@@ -952,7 +952,10 @@ impl<'a> HostStatePreparationJournal<'a> {
 /// [`PreparationError::InvalidRequest`] naming the field, rather than being
 /// substituted with a placeholder that would put an invented identity into a
 /// durable record.
-fn preparation_handle(value: &str, field: &'static str) -> Result<PlatformHandle, PreparationError> {
+fn preparation_handle(
+    value: &str,
+    field: &'static str,
+) -> Result<PlatformHandle, PreparationError> {
     PlatformHandle::new(value.to_owned()).map_err(|_| PreparationError::InvalidRequest {
         field,
         reason: "value is not a valid journal handle".to_owned(),
