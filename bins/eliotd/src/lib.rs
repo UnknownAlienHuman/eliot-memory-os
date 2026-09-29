@@ -80,6 +80,12 @@ pub mod governed_source_readback;
 mod governor_authority_feed;
 mod governor_local_read;
 mod governor_observe_serve;
+/// Issue #1734 (I12.14 W2/W3): the hot-path measurement producers for the
+/// daemon's own local-read boundaries. `pub` because the poll step that
+/// consumes them is compiled in the `eliotd` binary, not in this library
+/// target — the same reason `skill_dispatch` and
+/// `testd_terminal_completion` are public.
+pub mod hot_path_measure;
 pub mod improvement_candidate_route;
 pub mod improvement_intake;
 /// Issue #1867 W1: the production improvement-intake dispatch. This is the

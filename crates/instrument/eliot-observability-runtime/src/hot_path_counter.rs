@@ -349,6 +349,58 @@ impl HotPathResourceCounters {
     pub fn allocations(&self) -> Option<HotPathAllocationObservation> {
         self.allocations
     }
+
+    /// Lock acquisitions this boundary made at the actual lock owner.
+    ///
+    /// Read-only: the figures are observed at the lock owner and projected
+    /// here, so a reader correlating them with other boundaries' records needs
+    /// neither a second store nor a mutable handle on this counter.
+    #[must_use]
+    pub const fn lock_acquisitions(&self) -> u64 {
+        self.lock_acquisitions
+    }
+
+    /// Acquisitions that had to wait for the owner.
+    #[must_use]
+    pub const fn lock_contended(&self) -> u64 {
+        self.lock_contended
+    }
+
+    /// Nanoseconds waited for the owner, within one boot.
+    #[must_use]
+    pub const fn lock_wait_nanos(&self) -> u64 {
+        self.lock_wait_nanos
+    }
+
+    /// Cache lookups this boundary made at the actual lookup site.
+    #[must_use]
+    pub const fn cache_lookups(&self) -> u64 {
+        self.cache_lookups
+    }
+
+    /// Lookups the cache answered.
+    #[must_use]
+    pub const fn cache_hits(&self) -> u64 {
+        self.cache_hits
+    }
+
+    /// Lookups the cache did not hold.
+    #[must_use]
+    pub const fn cache_misses(&self) -> u64 {
+        self.cache_misses
+    }
+
+    /// Lookups answered from a superseded revision.
+    #[must_use]
+    pub const fn cache_stale(&self) -> u64 {
+        self.cache_stale
+    }
+
+    /// Lookups that deliberately skipped the cache.
+    #[must_use]
+    pub const fn cache_bypasses(&self) -> u64 {
+        self.cache_bypasses
+    }
 }
 
 /// One cache lookup outcome observed at an actual lookup site.

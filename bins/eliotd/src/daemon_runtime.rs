@@ -56,15 +56,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
+use eliot_observability_runtime::HotPathResourceCounters;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile, host_request_operation_id,
 };
-use eliot_runtime_contracts::DaemonProgressChannel;
+use eliot_runtime_contracts::{DaemonProgressChannel, HotPathAttemptDisposition};
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
 use eliotd::diagnostics::RepeatedFailureGuard;
+use eliotd::hot_path_measure::{
+    HOT_PATH_MEASURE_TARGET, LocalReadAttemptTrace, SharedLocalReadHotPath,
+};
 use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
     StartupCapabilityBindings,
@@ -480,6 +484,40 @@ fn decide_campaign_packet_tick(flight: &CampaignPacketFlight) -> CampaignPacketT
     }
 }
 
+/// Installs this daemon's hot-path collector over the observability stack's own
+/// live handles, resolving the declaration file beside the running artifact.
+///
+/// #1734 (I12.14 W2/W3): the declaration is service-local and travels beside the
+/// installed binary, exactly like the module manifest this daemon already admits
+/// from the same directory, so the root is derived from this process's own
+/// admitted artifact location — never from a hard-coded path or an environment
+/// variable. The collector reuses the install's own [`RollingLogWriter`] and
+/// registry; it opens no second file, thread or socket.
+///
+/// # Errors
+///
+/// Returns the install error when the declaration file beside the artifact is
+/// unreadable, refused, or declares no local-read operation. A refusal disables
+/// collection; it never fails the daemon.
+fn daemon_hot_path_collector(
+    observability: &eliotd::execution_metrics::DaemonObservability,
+) -> Result<SharedLocalReadHotPath, eliotd::hot_path_measure::HotPathMeasureError> {
+    let artifact = std::env::current_exe().map_err(|error| {
+        eliotd::hot_path_measure::HotPathMeasureError::Unreadable {
+            reason: format!("the admitted artifact location is unavailable: {error}"),
+        }
+    })?;
+    let crate_root = artifact.parent().ok_or_else(|| {
+        eliotd::hot_path_measure::HotPathMeasureError::Unreadable {
+            reason: "the admitted artifact has no containing directory".to_owned(),
+        }
+    })?;
+    eliotd::hot_path_measure::install_daemon_hot_path_collector(
+        crate_root,
+        observability.install.log.clone(),
+    )
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(super) enum ReadyMessage {
@@ -534,7 +572,16 @@ pub(super) fn run() -> Result<(), String> {
     // inference. The Host launch contour carries no scrape address, so none is
     // admitted and the install reports an absent endpoint rather than
     // inventing a port.
-    match eliotd::execution_metrics::install_daemon_execution_metrics(&config, None) {
+    // #1734 (I12.14 W2/W3): the hot-path collector is installed HERE, on the same
+    // never-gate site as the rest of the observability stack, because the sink it
+    // needs is this install's own already-running non-blocking appender. It is
+    // installed against the SAME admitted service-local declaration file the
+    // binary ships beside its artifact, and a refused declaration leaves
+    // collection disabled rather than failing the daemon. There is no second
+    // appender, no second registry and no second writer thread: the collector
+    // reuses `ObservabilityInstall`'s own handles.
+    let hot_path = match eliotd::execution_metrics::install_daemon_execution_metrics(&config, None)
+    {
         Ok(observability) => {
             observability.publish_runtime_counters();
             tracing::info!(
@@ -542,6 +589,24 @@ pub(super) fn run() -> Result<(), String> {
                 event = "eliotd.metrics_installed",
                 endpoint = observability.describe(),
             );
+            match daemon_hot_path_collector(&observability) {
+                Ok(collector) => {
+                    tracing::info!(
+                        target: HOT_PATH_MEASURE_TARGET,
+                        event = "eliotd.hot_path_collector_installed",
+                        operation = eliotd::hot_path_measure::LOCAL_READ_OPERATION,
+                    );
+                    Some(collector)
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        target: HOT_PATH_MEASURE_TARGET,
+                        event = "eliotd.hot_path_collector_refused",
+                        reason = %reason,
+                    );
+                    None
+                }
+            }
         }
         Err(error) => {
             tracing::warn!(
@@ -549,8 +614,9 @@ pub(super) fn run() -> Result<(), String> {
                 event = "eliotd.metrics_install_refused",
                 reason = error.to_string(),
             );
+            None
         }
-    }
+    };
     // I3.9: the load above already resolved and enforced the effective canonical
     // configuration — a script, an untyped document, or a lower-layer expansion
     // that no higher layer delegated returns `Err` there, so this line is
@@ -777,6 +843,7 @@ pub(super) fn run() -> Result<(), String> {
         supervision_progress,
         startup_readiness,
         startup_maintenance_observations,
+        hot_path,
     ));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
@@ -1459,6 +1526,11 @@ async fn run_loop(
     // late completion can never overwrite newer owner observations.
     startup_readiness: StartupReadinessProjection,
     startup_maintenance_observations: [MaintenanceObservation; 2],
+    // #1734: the process-lifetime hot-path collector, installed once above and
+    // shared by every local-read poll step. It is `Option` because a refused
+    // declaration disables collection instead of failing the daemon; the poll
+    // step then measures nothing and changes no governed outcome.
+    hot_path: Option<SharedLocalReadHotPath>,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // One projection instance is shared with the heartbeat future. Both
@@ -1599,10 +1671,13 @@ async fn run_loop(
                     &kernel,
                     &composition,
                     &readiness_projection,
-                    &mut local_read_flight,
-                    &mut observe_flight,
-                    &mut testd_owner_flight,
-                    &mut flight,
+                    TickFlights {
+                        local_read: &mut local_read_flight,
+                        observe: &mut observe_flight,
+                        testd_owner: &mut testd_owner_flight,
+                        activation: &mut flight,
+                    },
+                    hot_path.as_ref(),
                 );
                 // Campaign packets ride the same tick under their own gate and
                 // are never consumed by the query poller.
@@ -1883,22 +1958,56 @@ fn settle_activation_completion(
     }
 }
 
+/// The four per-tick flight states one tick starts work against.
+///
+/// Each field names WHICH flight a start mutates, so grouping the four borrows
+/// states the same fact the four arguments did while letting the tick also
+/// carry the collector the local-read leg measures through.
+struct TickFlights<'a> {
+    /// The single local-read poll step, started only while idle.
+    local_read: &'a mut LocalReadFlight,
+    /// The single observe poll step.
+    observe: &'a mut ObserveFlight,
+    /// The single TestD owner drain step.
+    testd_owner: &'a mut TestdOwnerFlight,
+    /// The single activation claim/dispatch step.
+    activation: &'a mut ActivationFlight,
+}
+
 /// Starts the tick-driven work for one shared-cadence tick.
 ///
 /// The local-read poller and the `TestD` owner drain each ride the same tick
 /// under their own gate: both must start even while an activation is in
 /// flight, so their gates are checked before the activation early-continue.
 /// The activation claim itself still starts only when its flight is idle.
+///
+/// #1734: the tick also starts the local-read poll step, which measures through
+/// the process-lifetime collector. The collector travels beside the flights
+/// because it is what the local-read leg alone reads, and the four flight states
+/// travel as one named group because one tick starts all four.
 fn start_tick_work(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     startup_readiness: &StartupReadinessProjection,
-    local_read_flight: &mut LocalReadFlight,
-    observe_flight: &mut ObserveFlight,
-    testd_owner_flight: &mut TestdOwnerFlight,
-    flight: &mut ActivationFlight,
+    flights: TickFlights<'_>,
+    // #1734: the shared hot-path collector reaches the local-read poll step
+    // through this one borrow, so the poll future owns the handle for its own
+    // lifetime and no second owner of the collector exists.
+    hot_path: Option<&SharedLocalReadHotPath>,
 ) {
-    maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
+    let TickFlights {
+        local_read: local_read_flight,
+        observe: observe_flight,
+        testd_owner: testd_owner_flight,
+        activation: flight,
+    } = flights;
+    maybe_start_local_read_poll(
+        kernel,
+        composition,
+        startup_readiness,
+        local_read_flight,
+        hot_path,
+    );
     maybe_start_observe_poll(kernel, observe_flight);
     maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
     if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
@@ -2998,11 +3107,12 @@ fn start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     startup_readiness: StartupReadinessProjection,
+    hot_path: Option<SharedLocalReadHotPath>,
 ) -> Pin<Box<dyn std::future::Future<Output = LocalReadCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
     Box::pin(async move {
         LocalReadCompletion::Settled(
-            run_local_read_poll(&kernel_clone, composition, startup_readiness).await,
+            run_local_read_poll(&kernel_clone, composition, startup_readiness, hot_path).await,
         )
     })
 }
@@ -3015,6 +3125,7 @@ fn maybe_start_local_read_poll(
     composition: &SharedComposition,
     startup_readiness: &StartupReadinessProjection,
     flight: &mut LocalReadFlight,
+    hot_path: Option<&SharedLocalReadHotPath>,
 ) {
     if decide_local_read_tick(flight) == LocalReadTickDecision::StartPoll {
         *flight = LocalReadFlight::InFlight(LocalReadFlightState {
@@ -3025,6 +3136,7 @@ fn maybe_start_local_read_poll(
                 kernel,
                 Arc::clone(composition),
                 startup_readiness.clone(),
+                hot_path.cloned(),
             ),
         });
     }
@@ -3142,14 +3254,11 @@ fn local_delta_adoption_name(adoption: &LocalDeltaAdoption) -> &'static str {
 /// the daemon closed — a claimed pair that cannot forward or submit is never
 /// silently discarded. A stale capability is never retried: the step settles
 /// and the next tick claims the current generation anew.
-#[expect(
-    clippy::too_many_lines,
-    reason = "ordered claim-forward-submit poll step stays whole: any step failure fails closed, never discards (#838)"
-)]
 async fn run_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     startup_readiness: StartupReadinessProjection,
+    hot_path: Option<SharedLocalReadHotPath>,
 ) -> Result<LocalReadStep, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
@@ -3165,10 +3274,139 @@ async fn run_local_read_poll(
             delta: None,
         });
     };
-    let step = |outcome: LocalReadPollOutcome, delta: Option<LocalReadinessDelta>| LocalReadStep {
-        outcome,
-        delta,
+    // #1734 (I12.14 W2): the claim boundary is the first boundary this daemon
+    // can honestly observe for the admitted pair. The trace is opened HERE, from
+    // the claimed envelope and the Kernel-minted attempt identity, so the
+    // request/attempt/generation join key is the pair's own identity rather than
+    // a value this poller invented. A refused or absent collector measures
+    // nothing and changes no outcome below.
+    let mut trace = hot_path
+        .as_ref()
+        .and_then(|collector| collector.begin_attempt(&envelope, &attempt));
+    // Settles the trace with the step's real terminal disposition: an expired or
+    // stale attempt is a declared degradation and stays in the denominator
+    // rather than disappearing from it.
+    let settle = |trace: Option<LocalReadAttemptTrace>, outcome: LocalReadSubmitOutcome| {
+        if let Some(trace) = trace {
+            trace.finish_attempt(local_read_disposition(outcome));
+        }
     };
+    // #1734 (I12.14 W2, census semantics): every `?` between the claim above and
+    // the settle below used to drop this trace on the floor, leaving an attempt
+    // that the census had already counted as `admitted` with no terminal
+    // disposition — a settled-looking denominator that quietly lost its failures.
+    // The step now hands the whole local-read service to a body that settles in
+    // one place, so an error a leg propagates reaches `abandon_attempt` and is
+    // counted as the real degradation it was.
+    match serve_claimed_local_read(
+        kernel,
+        &composition,
+        &startup_readiness,
+        ClaimedLocalReadPair {
+            envelope: &envelope,
+            tool: &tool,
+            attempt: &attempt,
+        },
+        &mut trace,
+    )
+    .await
+    {
+        // The terminal disposition is read off the submit outcome the step
+        // actually settled, before the step itself is handed to the loop, so
+        // the census and the loop observe the same one outcome.
+        Ok(settled) => {
+            settle(trace, settled.submit_outcome);
+            Ok(settled.step)
+        }
+        Err(refusal) => {
+            // A step that could not forward or submit is a failed attempt, not a
+            // vanished one: the census counts it as a degradation so the
+            // denominator keeps it visible.
+            if let Some(trace) = trace {
+                trace.abandon_attempt(HotPathAttemptDisposition::Failed);
+            }
+            Err(refusal)
+        }
+    }
+}
+
+/// What one served claimed pair produced, as the two owners of it need it.
+///
+/// #1734: the loop settles the returned [`LocalReadStep`], and the hot-path
+/// census settles the SAME attempt from the returned submit outcome. They travel
+/// as one named value rather than as a positional pair, so the disposition the
+/// census records cannot be separated from the outcome the loop acts on.
+struct ServedLocalRead {
+    /// The step the loop settles back to idle.
+    step: LocalReadStep,
+    /// The terminal submit outcome the census records the disposition from.
+    submit_outcome: LocalReadSubmitOutcome,
+}
+
+impl ServedLocalRead {
+    /// Projects one terminal submit outcome onto the step and the census value.
+    ///
+    /// The poll outcome the loop acts on is derived from the SAME submit outcome
+    /// the census records its disposition from, in one place, so the two owners
+    /// can never disagree about which of the three legs actually settled.
+    fn settled(submit_outcome: LocalReadSubmitOutcome, delta: Option<LocalReadinessDelta>) -> Self {
+        Self {
+            step: LocalReadStep {
+                outcome: local_read_poll_outcome(submit_outcome),
+                delta,
+            },
+            submit_outcome,
+        }
+    }
+}
+
+/// One claimed pair, as the Kernel handed it to this poll step.
+///
+/// #1734: the envelope, its tool and its Kernel-minted attempt are ONE claim,
+/// not three unrelated arguments. The three service legs all read this exact
+/// pair, and each of them reads named fields of it, so grouping them keeps the
+/// leg that reads the fence and the leg that forwards the same attempt
+/// visibly reading the same claim.
+struct ClaimedLocalReadPair<'a> {
+    /// The admitted envelope the Kernel claimed.
+    envelope: &'a HostRequestEnvelope,
+    /// The exact tool the envelope names, which selects the service leg.
+    tool: &'a serde_json::Value,
+    /// The Kernel-minted attempt identity that may complete the work.
+    attempt: &'a LocalReadAttempt,
+}
+
+/// Serves one claimed pair through whichever real leg its tool names, and
+/// reports the terminal submit outcome with the step's own readiness delta.
+///
+/// #1734: the claim, the three service legs and the submit leg stay in the order
+/// the poll step performed them, and the hot-path trace is carried by the caller
+/// so every leg that observes a boundary records on the same attempt. Splitting
+/// the body out is what lets one `match` settle the trace on the success path and
+/// abandon it on every propagated error, instead of leaving a `?` to drop an
+/// already-admitted attempt.
+///
+/// The three service legs stay in the order the poll step performed them, and
+/// each of them closes its own hot-path boundary at the leg that performs it, so
+/// the legs are not folded together or reordered behind a shared wrapper.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the three service legs stay in claim-order, and each closes its own hot-path boundary at the leg that performs it (#838)"
+)]
+async fn serve_claimed_local_read(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    startup_readiness: &StartupReadinessProjection,
+    pair: ClaimedLocalReadPair<'_>,
+    trace: &mut Option<LocalReadAttemptTrace>,
+) -> Result<ServedLocalRead, String> {
+    // The claimed pair's three parts are bound once here so every service leg
+    // below reads the same attempt through one name.
+    let ClaimedLocalReadPair {
+        envelope,
+        tool,
+        attempt,
+    } = pair;
     // The Skill plan captures the admitted fence under a short guard, performs
     // canonical acceptance I/O with no composition lock, then commits against
     // a fresh guard only after rechecking that exact fence. Ordinary forwarded
@@ -3193,47 +3431,65 @@ async fn run_local_read_poll(
     // an unrelated admitted read. The claimed pair still settles through the
     // same idempotent submit leg, so a capability refusal is never a dropped
     // pair.
-    if eliotd::skill_dispatch::is_skill_tool(&tool) {
+    if eliotd::skill_dispatch::is_skill_tool(tool) {
         // #2647: one demand-driven attempt per flight. The attach runs at most
         // once here; its observation travels with the step whether this demand
         // is refused or served, and the loop adopts it only while the
         // snapshot's basis is still current.
-        let (refused, delta) = skill_capability_refusal(&startup_readiness)?;
+        //
+        // #1734 (I12.14 W2): the capability re-evaluation IS this leg's service,
+        // and it is the same work whether the demand is served or refused, so
+        // the interval is opened before it and closed after it below.
+        if let Some(trace) = trace.as_mut() {
+            trace.note_service_start();
+        }
+        let (refused, delta) = skill_capability_refusal(startup_readiness)?;
         if let Some(refusal) = refused {
             let body = eliotd::skill_dispatch::skill_result_body(
-                &envelope,
-                &attempt,
+                envelope,
+                attempt,
                 &eliot_agent_bridge_core::SkillResultEnvelope::refused(
                     &eliot_skill::SkillError::Surface(refusal.clone()),
                 ),
             )
             .map_err(|error| format!("daemon skill capability refusal body: {error}"))?;
-            let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
-                LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
-                LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
-                LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
-            };
-            return Ok(step(outcome, delta));
+            // #1734 (I12.14 W2): a capability refusal is a refusal this
+            // boundary itself produced, so the service interval closes on this
+            // leg rather than staying open until the submit returns.
+            if let Some(trace) = trace.as_mut() {
+                trace.close_service();
+            }
+            let submit = submit_local_read_result_idempotent(kernel, &body).await?;
+            return Ok(ServedLocalRead::settled(submit, delta));
         }
         // #2664: the execute leg also reads the owner-retained execution
         // position, and that read is a plain in-process owner lookup. It runs
         // under the SAME short composition borrow that snapshots the fence and
         // the borrow is dropped before the plan runs, so no composition guard
         // is ever held across the plan's canonical reads or its awaits.
+        //
+        // #1734 (I12.14 W3): the composition guard is the actual lock owner on
+        // this leg, so this borrow is where lock acquisition and contention are
+        // observed. The wait is read from the collector's own declared clock
+        // domain, immediately around the acquisition, so it is a real duration
+        // of this boundary's own acquisition and not a poll-cadence interval.
         let (admitted_fence, execution_owner_read) = {
-            let guard = composition.lock().await;
-            (
-                guard.kernel_snapshot().state_fence().clone(),
-                eliotd::skill_dispatch::execution_owner_read(&guard, &tool),
-            )
+            if let Some(trace) = trace.as_mut() {
+                trace.note_service_start();
+            }
+            let observed = time_composition_guard(composition, tool).await;
+            if let Some(trace) = trace.as_mut() {
+                trace.note_lock_acquisition(observed.waited_nanos);
+            }
+            (observed.admitted_fence, observed.execution_owner_read)
         };
         let plan = Box::pin(eliotd::skill_dispatch::plan_skill_pair(
             kernel,
             admitted_fence,
             execution_owner_read,
-            &envelope,
-            &tool,
-            &attempt,
+            envelope,
+            tool,
+            attempt,
         ))
         .await;
         let body = {
@@ -3241,14 +3497,17 @@ async fn run_local_read_poll(
             // capability admission view from the canonical evidence read this
             // intake already performed, so the guard is taken mutably here.
             let mut guard = composition.lock().await;
-            eliotd::skill_dispatch::commit_skill_pair(&mut guard, &envelope, &attempt, plan)
+            eliotd::skill_dispatch::commit_skill_pair(&mut guard, envelope, attempt, plan)
         };
-        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
-            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
-            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
-            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
-        };
-        return Ok(step(outcome, delta));
+        // #1734 (I12.14 W2/W3): the service boundary closed above the commit.
+        // The counters this boundary actually holds are the ones it reported
+        // through its own scope; a scope it never entered leaves the category
+        // unobserved rather than measured zero.
+        if let Some(trace) = trace.as_mut() {
+            trace.note_service_observed(observed_composition_locks(0));
+        }
+        let submit = submit_local_read_result_idempotent(kernel, &body).await?;
+        return Ok(ServedLocalRead::settled(submit, delta));
     }
     // #1187 W1/A1: a claimed pair naming the broker-owned operator read
     // capability is served here, not forwarded on the Kernel `local_read` leg,
@@ -3317,52 +3576,163 @@ async fn run_local_read_poll(
     // `operator.command`, adding a branch would NOT create a production caller,
     // and claiming one would be false: none of the four gates admits that
     // capability, and no producer presents it either.
-    if eliotd::is_controlboard_read_tool(&tool) {
+    if eliotd::is_controlboard_read_tool(tool) {
+        // #1734 (I12.14 W2): this is a real service interval — the snapshot
+        // fetch, the fence comparison and the board read all happen inside it —
+        // so it is opened before the fetch rather than before the submit.
+        if let Some(trace) = trace.as_mut() {
+            trace.note_service_start();
+        }
         let body = match eliotd::notification_board_attach::fetch_notification_snapshot(kernel)
             .await
         {
             Ok(snapshot) => {
+                // #1734 (I12.14 W3): the composition guard is the lock owner on
+                // this leg, and this borrow is the acquisition being observed.
                 let mut guard = composition.lock().await;
                 let kernel_fence = kernel.snapshot().state_fence();
                 let composition_fence = guard.kernel_snapshot().state_fence();
                 if snapshot.state_fence != kernel_fence || snapshot.state_fence != composition_fence
                 {
                     eliotd::controlboard_notification_refresh_refusal_body(
-                        &envelope,
-                        &attempt,
+                        envelope,
+                        attempt,
                         "Kernel or composition state fence changed before notification attach",
                     )
                 } else {
                     guard.note_notification_snapshot(snapshot.records);
-                    eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
+                    eliotd::serve_controlboard_view(&guard, envelope, attempt)
                 }
             }
             Err(reason) => {
-                eliotd::controlboard_notification_refresh_refusal_body(&envelope, &attempt, &reason)
+                eliotd::controlboard_notification_refresh_refusal_body(envelope, attempt, &reason)
             }
         };
-        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
-            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
-            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
-            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
-        };
+        // #1734 (I12.14 W2/W3): this boundary's own scoped counters and the
+        // interval it actually performed are recorded before the submit leg,
+        // exactly as the Skill leg records its own.
+        if let Some(trace) = trace.as_mut() {
+            trace.note_service_observed(observed_composition_locks(0));
+        }
+        let submit = submit_local_read_result_idempotent(kernel, &body).await?;
         // #2647: this leg builds a board over the composition and reads it; it
         // attaches no startup capability and re-evaluates no readiness, so the
         // flight observed nothing and carries no delta. Settling it therefore
         // cannot overwrite owner observations the loop recorded meanwhile, the
         // same contract the ordinary forwarded read below settles under.
-        return Ok(step(outcome, None));
+        return Ok(ServedLocalRead::settled(submit, None));
     }
-    let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
+    // #1734 (I12.14 W2): the ordinary forward is the daemon's synchronous Kernel
+    // hop, so the service interval is the forward itself. It opens here, before
+    // the hop, and closes on the far side of it.
+    if let Some(trace) = trace.as_mut() {
+        trace.note_service_start();
+    }
+    let body = forward_admitted_local_read(kernel, envelope.clone(), tool.clone(), attempt.clone())
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
-    let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+    // #1734 (I12.14 W3): a boundary that acquired no lock and admitted no
+    // allocation or cache scope reports those categories as unobserved
+    // (`Unknown`) rather than as a measured zero.
+    if let Some(trace) = trace.as_mut() {
+        trace.note_service_observed(HotPathResourceCounters::default());
+    }
+    let submit = submit_local_read_result_idempotent(kernel, &body).await?;
+    // #2647: an ordinary forwarded read produces no readiness observation.
+    Ok(ServedLocalRead::settled(submit, None))
+}
+
+/// Projects one submit's outcome onto the poll step's terminal outcome.
+///
+/// #1734: the three submit sites previously each restated this same mapping.
+/// One mapping is the single owner, so the poll outcome and the attempt
+/// disposition below cannot drift apart on one of the three legs.
+fn local_read_poll_outcome(outcome: LocalReadSubmitOutcome) -> LocalReadPollOutcome {
+    match outcome {
         LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
         LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
         LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
-    };
-    // #2647: an ordinary forwarded read produces no readiness observation.
-    Ok(step(outcome, None))
+    }
+}
+
+/// Projects one submit's outcome onto the attempt's terminal disposition.
+///
+/// #1734: `Accepted` is the only disposition the hot-path contract counts as
+/// served. An expired lease and a superseded attempt are both real, countable
+/// degradations, so they stay in the degradation numerator and denominator
+/// rather than disappearing from them.
+fn local_read_disposition(outcome: LocalReadSubmitOutcome) -> HotPathAttemptDisposition {
+    match outcome {
+        LocalReadSubmitOutcome::Accepted => HotPathAttemptDisposition::Served,
+        LocalReadSubmitOutcome::Expired => HotPathAttemptDisposition::TimedOut,
+        LocalReadSubmitOutcome::StaleAttempt => HotPathAttemptDisposition::Cancelled,
+    }
+}
+
+/// What one timed composition-guard acquisition actually observed.
+///
+/// #1734 (I12.14 W3): the two values the caller needs from the guard are the
+/// admitted fence and the owner-retained execution read it already performed,
+/// plus the one new observation — how long this acquisition waited. They travel
+/// as one named value so the acquisition's wait cannot be silently separated
+/// from the acquisition it was taken at.
+struct CompositionGuardObservation {
+    /// Admitted fence read under the guard.
+    admitted_fence: eliot_contracts::StateFence,
+    /// Owner-retained execution position read under the same guard.
+    execution_owner_read: Option<eliotd::skill_dispatch::OwnerPositionRead>,
+    /// Nanoseconds this acquisition waited, or `None` when it did not wait.
+    waited_nanos: Option<u64>,
+}
+
+/// Takes the composition guard and reports how long the acquisition waited.
+///
+/// #1734 (I12.14 W3): the composition guard is the actual lock owner this
+/// daemon's hot path contends for, so the acquisition is observed here rather
+/// than inferred from a poll interval. Both readings are taken with
+/// `std::time::Instant`, which is the one declared monotonic domain the
+/// hot-path contract names, and the wait is the difference of the two readings
+/// around this acquisition alone.
+///
+/// The wait is `None` when the guard was free the instant it was requested, so
+/// "acquired without contention" and "never observed" stay different figures and
+/// an uncontended acquisition is not reported as a zero-length contention.
+async fn time_composition_guard(
+    composition: &SharedComposition,
+    tool: &serde_json::Value,
+) -> CompositionGuardObservation {
+    let requested_at = std::time::Instant::now();
+    let guard = composition.lock().await;
+    let held_at = std::time::Instant::now();
+    let admitted_fence = guard.kernel_snapshot().state_fence().clone();
+    let execution_owner_read = eliotd::skill_dispatch::execution_owner_read(&guard, tool);
+    drop(guard);
+    let waited_nanos = held_at
+        .checked_duration_since(requested_at)
+        .map(|waited| u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX));
+    CompositionGuardObservation {
+        admitted_fence,
+        execution_owner_read,
+        waited_nanos,
+    }
+}
+
+/// Builds the resource counters one service boundary actually observed.
+///
+/// #1734 (I12.14 W3): a boundary reports what it observed and nothing else. The
+/// allocation and cache categories carry no figure here because this daemon's
+/// local-read legs enter no allocation scope and perform no cache lookup at a
+/// real lookup site, and an unobserved category must read `Unknown` upstream
+/// rather than as a measured zero. The lock figures are added by
+/// [`LocalReadAttemptTrace::note_lock_acquisition`] at the lock owner itself, so
+/// the contended count and its wait come from the acquisition this step
+/// actually performed.
+fn observed_composition_locks(acquisitions: u64) -> HotPathResourceCounters {
+    let mut counters = HotPathResourceCounters::default();
+    for _ in 0..acquisitions {
+        counters.record_lock_acquisition(None);
+    }
+    counters
 }
 
 /// Re-evaluates the Skill startup capabilities this demand names, and returns
