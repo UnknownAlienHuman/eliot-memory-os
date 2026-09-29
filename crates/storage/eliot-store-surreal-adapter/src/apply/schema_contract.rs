@@ -282,10 +282,15 @@ pub(super) fn validate_migration_intent_record(
     {
         return Err(AdapterError::PartialOutcome);
     }
-    if migration.predecessor_migration_id.is_none() || migration.predecessor_generation.is_none() {
-        return Err(AdapterError::Config(
-            "a durable migration intent requires a plan with a bound predecessor".to_owned(),
-        ));
+    // Only a plan the published graph binds to a predecessor can leave a
+    // resumable intent: a fresh-database baseline has nothing to resume, and
+    // its DDL commits with the record it creates in one transaction.
+    if migration.predecessor_generation.as_deref()
+        != crate::schema_inventory::required_predecessor_generation(&migration.migration_id)
+        || migration.predecessor_migration_id.as_deref()
+            != crate::schema_inventory::required_predecessor_migration_id(&migration.migration_id)
+    {
+        return Err(AdapterError::PartialOutcome);
     }
     Ok(())
 }
