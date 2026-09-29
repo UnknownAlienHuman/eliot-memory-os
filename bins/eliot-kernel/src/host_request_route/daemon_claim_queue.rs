@@ -19,6 +19,8 @@
 //! host-request record owns lifecycle state, so eviction and retirement here
 //! only drop daemon-leg memory and never fabricate admission.
 
+use std::collections::BTreeMap;
+
 use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
@@ -38,6 +40,29 @@ use super::{
     MAX_QUEUED_LOCAL_READS, StaleLocalReadObservation, StaleLocalReadReason,
     check_local_read_admission,
 };
+
+/// Reports whether a campaign-packet staging candidate repeats retained work.
+///
+/// I7.24 W3/A2: a materially repeated effect-capable call on unchanged
+/// inputs without a new expected delta is a loop/no-progress signal, not a
+/// fresh dispatch. Only campaign-packet pairs are compared; other lanes and
+/// unreconstructible pairs never match.
+fn campaign_staged_repeat_without_progress(
+    index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> bool {
+    let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool) else {
+        return false;
+    };
+    let retained = index.values().flatten().filter_map(|candidate| {
+        Some((
+            candidate.campaign_packet_envelope.as_ref()?,
+            candidate.campaign_packet_tool.as_ref()?,
+        ))
+    });
+    crate::tool_exposure::staged_repeat_without_progress(retained, &current).is_some()
+}
 
 impl KernelComposition {
     pub(super) fn enqueue_campaign_packet_pair_under_transition(
@@ -86,21 +111,9 @@ impl KernelComposition {
                 return Ok(());
             }
         }
-        // I7.24 W3/A2: a materially repeated effect-capable call on unchanged
-        // inputs without a new expected delta is a loop/no-progress signal,
-        // not a fresh dispatch. The retained per-route stage above is the
-        // kernel-owned store; the repeat is refused with the existing
-        // identity-conflict signal so it is never staged as progress.
-        if let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool) {
-            let retained = index.values().flatten().filter_map(|candidate| {
-                Some((
-                    candidate.campaign_packet_envelope.as_ref()?,
-                    candidate.campaign_packet_tool.as_ref()?,
-                ))
-            });
-            if crate::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
-                return Err(TransportError::IdentityConflict);
-            }
+        // I7.24 W3/A2: a materially repeated call is refused, never staged.
+        if campaign_staged_repeat_without_progress(&index, envelope, tool) {
+            return Err(TransportError::IdentityConflict);
         }
         let queued = index
             .values()
