@@ -341,8 +341,17 @@ fn migration_preflight(
     ))
 }
 
-/// Builds the receipt of one applied migration and compares every bound value
-/// with the migration that was applied.
+/// Builds the receipt of one applied migration and compares every plan-bound
+/// value with the migration that was applied.
+///
+/// This is the only constructor of a production migration receipt, and it
+/// fills `root_identity`, `state_fence`, `provider_protocol_major` and
+/// `provider_artifact_sha256` from the adapter configuration and the state
+/// fence this operation was admitted under. Those four values are therefore
+/// bound by construction, not by a comparison here: a receipt cannot name a
+/// different root, fence or provider than the operation that produced it.
+/// `validate_against` re-derives the plan binding and independently checks the
+/// provider protocol generation against the pinned generation.
 ///
 /// A receipt that cannot be re-derived from the plan, the root, the fence and
 /// the provider is a partial outcome: it is never handed out as a success.

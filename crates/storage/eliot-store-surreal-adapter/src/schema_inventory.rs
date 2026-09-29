@@ -1212,6 +1212,25 @@ pub(crate) fn validate_legacy_table_mapping() -> Result<(), LegacyMappingOmissio
     Ok(())
 }
 
+/// Finds the declared non-executable root a presented identity names.
+///
+/// The refusal covers the whole root, not one filename: the recorded identity,
+/// the exact repository path and every path under that root (the `root.path`
+/// directory prefix with its `/` separator) all resolve to the same
+/// [`ExecutableBodyRefusal::NonExecutableRoot`]. A file inside
+/// `crates/eliot-store/migrations/` or `crates/eliot-store/src/surql/`, or the
+/// retired root `migrations/0001_bootstrap.surql.retired` under any other
+/// name, therefore cannot be selected by current configuration, launch,
+/// packaging or restore: `I5.9` admits one executable migration graph, and
+/// this array is that graph's closed non-executable complement.
+fn non_executable_root_for(identity: &str) -> Option<&'static NonExecutableRoot> {
+    NON_EXECUTABLE_MIGRATION_ROOTS.iter().find(|root| {
+        root.identity == identity
+            || root.path == identity
+            || identity.strip_prefix(root.path).is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Fail-closed resolution: is the presented body executable by the current
 /// owner?
 ///
@@ -1219,7 +1238,10 @@ pub(crate) fn validate_legacy_table_mapping() -> Result<(), LegacyMappingOmissio
 /// the executable graph and the presented statements, digest and target
 /// generation are exactly the published ones. Every other outcome is a typed
 /// [`ExecutableBodyRefusal`]; there is no default-allow path and no way for a
-/// caller to name a different body, directory or DDL text.
+/// caller to name a different body, directory or DDL text. A declared
+/// non-executable root refuses every identity it covers — its recorded
+/// identity, its exact path and every path beneath it (see
+/// [`non_executable_root_for`]).
 pub(crate) fn resolve_executable_body(
     identity: &str,
     statements: &str,
@@ -1247,10 +1269,7 @@ pub(crate) fn resolve_executable_body(
             disposition: table.disposition,
         });
     }
-    if let Some(root) = NON_EXECUTABLE_MIGRATION_ROOTS
-        .iter()
-        .find(|root| root.identity == identity || root.path == identity)
-    {
+    if let Some(root) = non_executable_root_for(identity) {
         return Err(ExecutableBodyRefusal::NonExecutableRoot {
             path: root.path,
             disposition: root.disposition,

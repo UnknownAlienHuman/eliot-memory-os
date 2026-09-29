@@ -204,8 +204,19 @@ impl MigrationReceipt {
     ///
     /// The plan is revalidated with its own [`CompiledMigration::validate`], so
     /// a receipt cannot launder a plan that no longer binds the published
-    /// predecessor, bridge range or operation manifest set, and every bound
+    /// predecessor, bridge range or operation manifest set, and every plan
     /// value is compared with this migration rather than merely present.
+    ///
+    /// `root_identity` and `provider_artifact_sha256` are required to be
+    /// non-empty and `state_fence` is required to be internally valid; those
+    /// three fields are bound to the running operation by construction rather
+    /// than by a comparison here, because this crate has no second producer of
+    /// them to compare against. `migration_receipt` in `apply` is their only
+    /// constructor, and it fills them from the adapter configuration and the
+    /// admitted state fence, so a receipt cannot name a different root, fence
+    /// or provider than the one it was issued for. The provider protocol
+    /// generation is additionally compared against the pinned provider
+    /// generation this owner supports, which is an independent constant.
     pub(crate) fn validate_against(
         &self,
         migration: &CompiledMigration,
@@ -223,6 +234,9 @@ impl MigrationReceipt {
         }
         if self.root_identity.trim().is_empty() || self.provider_artifact_sha256.trim().is_empty() {
             return Err("migration receipt does not name the root and provider it ran against");
+        }
+        if self.provider_protocol_major != crate::config::PINNED_SURREALDB_MAJOR {
+            return Err("migration receipt names an unsupported provider protocol generation");
         }
         self.state_fence
             .validate()
