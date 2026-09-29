@@ -1730,7 +1730,7 @@ fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
 /// capsule world and operation are rebound to the host's own generated
 /// selection by canonical contract name (no cross-crate type bridge), and
 /// the same artifact buffer is hashed and required to equal the kit-bound
-/// digest. A governed kit is refused on this lane: the experimental receipt
+/// digest and length. A governed kit is refused on this lane: the experimental receipt
 /// is `NON_GOVERNED_EXPERIMENTAL` and can never satisfy governed proof.
 ///
 /// The single invocation itself runs through [`execute_domain_experimental`]
@@ -1771,6 +1771,11 @@ pub fn execute_capsule_domain_experimental(
     if kit.artifact_digest != preflight.digest {
         return Err(TypedExecutionError::AdmissionMismatch(
             "artifact-digest".to_owned(),
+        ));
+    }
+    if kit.artifact_len != preflight.byte_len {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "artifact-length".to_owned(),
         ));
     }
     if capsule.max_input_bytes > limits.max_input_bytes {
