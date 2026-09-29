@@ -33,6 +33,7 @@ use eliot_wasm_runtime::{
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
 use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
 use crate::typed_bindings::{TypedWorld, typed_wit_digest};
+use crate::wasmtime_provider::is_instance_limit_error;
 
 const ENGINE_VERSION: &str = "47.0.4";
 const PROVIDER_STACK_SIZE: u64 = 8 * 1024;
@@ -46,6 +47,9 @@ const MAX_TYPED_LIST_ITEMS: usize = 256;
 /// Memory-COUNT ceiling. `InvocationLimits` bounds memory bytes and instance
 /// count but carries no memory count, so the Host fixes it here.
 const MAX_TYPED_MEMORIES: usize = 1;
+/// Table-COUNT ceiling. `InvocationLimits` bounds table elements and instance
+/// count but carries no table count, so the Host fixes it here.
+const MAX_TYPED_TABLES: usize = 1;
 /// Approximate per-item lift cost used to convert a list into a byte bound.
 const TYPED_ITEM_LIFT_BYTES: u64 = 8;
 
@@ -707,7 +711,7 @@ pub fn execute_describe_experimental(
 
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
-    config.consume_fuel(true);
+    config.consume_fuel(typed_fuel_budget(limits).is_some());
     config.epoch_interruption(true);
     config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
     let engine = wasmtime::Engine::new(&config)
@@ -991,6 +995,12 @@ fn map_instantiate_error(
     if let Some(hit) = limit_hit {
         return resource_limit_error(hit);
     }
+    // Instance exhaustion surfaces as an instantiation error, never as a
+    // growth callback: reuse the provider owner's classifier so the typed
+    // lane reports the same typed `InstanceLimit` denial.
+    if is_instance_limit_error(error) {
+        return TypedExecutionError::Engine(format!("{:?}", EngineTermination::InstanceLimit));
+    }
     let lowered = error.to_string().to_ascii_lowercase();
     if lowered.contains("import") {
         TypedExecutionError::ForbiddenImport("component-import".to_owned())
@@ -1008,6 +1018,13 @@ struct ObservedUsage {
     table_elements: Option<u32>,
 }
 
+/// Per-store resource state for one guarded typed invocation. Count bounds
+/// (`memories`, `tables`, `instances`) are forwarded to the configured
+/// [`wasmtime::StoreLimits`]; byte/element bounds are enforced in the growth
+/// callbacks below. The pinned Wasmtime 47 `ResourceLimiter` offers no
+/// resource/handle/module bound, so those classes are explicit unsupported
+/// policy here: no field claims to enforce them, and receipts must never
+/// claim they were bounded.
 struct StoreState {
     limits: wasmtime::StoreLimits,
     peak_memory_bytes: Option<u64>,
@@ -1040,6 +1057,18 @@ impl StoreState {
     }
 }
 
+/// Fuel budget for one guarded invocation. `Some` only when the admitted
+/// cancellation policy meters fuel (`EpochAndFuel`): epoch-only execution
+/// leaves fuel disabled so the injected epoch/wall deadline alone decides
+/// termination. Compilation and host-side bounding (preflight, lift checks,
+/// receipts) never consume fuel either way.
+fn typed_fuel_budget(limits: &InvocationLimits) -> Option<u64> {
+    match limits.epoch.cancellation {
+        CancellationPolicy::EpochAndFuel => Some(limits.max_fuel),
+        CancellationPolicy::EpochInterruption => None,
+    }
+}
+
 fn new_store(
     engine: &wasmtime::Engine,
     limits: &InvocationLimits,
@@ -1051,6 +1080,7 @@ fn new_store(
                 .memory_size(usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX))
                 .memories(MAX_TYPED_MEMORIES)
                 .table_elements(usize::try_from(limits.max_table_elements).unwrap_or(usize::MAX))
+                .tables(MAX_TYPED_TABLES)
                 .instances(usize::try_from(limits.max_instances).unwrap_or(usize::MAX))
                 .build(),
             peak_memory_bytes: None,
@@ -1061,9 +1091,11 @@ fn new_store(
         },
     );
     store.limiter(|state| state);
-    store
-        .set_fuel(limits.max_fuel)
-        .map_err(|_| TypedExecutionError::LimitDenied("fuel".to_owned()))?;
+    if let Some(budget) = typed_fuel_budget(limits) {
+        store
+            .set_fuel(budget)
+            .map_err(|_| TypedExecutionError::LimitDenied("fuel".to_owned()))?;
+    }
     store.set_epoch_deadline(limits.epoch.deadline_ticks);
     Ok(store)
 }
@@ -1123,13 +1155,23 @@ impl wasmtime::ResourceLimiter for StoreState {
     fn instances(&self) -> usize {
         self.limits.instances()
     }
+
+    fn tables(&self) -> usize {
+        self.limits.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.limits.memories()
+    }
 }
 
 /// Runs one descriptor closure with fuel, memory/table/instance limits,
 /// and epoch interruption driven by both a tick pump and the wall
 /// deadline. The wall deadline forces epoch ticks independent of remaining
 /// fuel, so the epoch deadline fires even when fuel is plentiful. No clock,
-/// randomness, or ambient capability reaches the guest.
+/// randomness, or ambient capability reaches the guest. There is no
+/// synchronous cancellation: dropping a caller future stops nothing; only
+/// fuel exhaustion or the epoch/wall deadline traps below stop the guest.
 fn run_guarded<T>(
     engine: &wasmtime::Engine,
     limits: &InvocationLimits,
@@ -1162,8 +1204,10 @@ fn run_guarded<T>(
     let outcome = invoke(&mut store);
     stop.store(true, Ordering::Release);
     let _ = driver.join();
-    let remaining_fuel = store.get_fuel().unwrap_or(0);
-    let fuel_consumed = limits.max_fuel.saturating_sub(remaining_fuel);
+    let fuel_consumed = match typed_fuel_budget(limits) {
+        Some(budget) => budget.saturating_sub(store.get_fuel().unwrap_or(0)),
+        None => 0,
+    };
     let limit_hit = store.data().limit_hit;
     let (peak_memory_bytes, table_elements) = store.data_mut().finish_measurements();
     match outcome {
@@ -1627,7 +1671,7 @@ pub fn execute_domain_experimental(
 
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
-    config.consume_fuel(true);
+    config.consume_fuel(typed_fuel_budget(limits).is_some());
     config.epoch_interruption(true);
     config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
     let engine = wasmtime::Engine::new(&config)
