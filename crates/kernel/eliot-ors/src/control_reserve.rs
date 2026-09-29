@@ -23,6 +23,22 @@
 //! the live reserve it reports and refuses while that reserve still admits
 //! the request, so pressure evidence is never manufactured.
 //!
+//! Every [`OrsPermit`] is owner-issued non-clone evidence bound to permit and
+//! operation identities, capacity/operation class, issuing owner generation,
+//! requester generation, exact bottleneck/unit/granted amount, profile
+//! revision, typed Authority Epoch, issue/expiry and owner-derived evidence.
+//! A caller-provided queue position, PID, process survival or copied profile
+//! row is not a permit: only [`OrsPermitOperation`] typechecks on the
+//! acquisition paths, and every binding is recorded by the owner at issue.
+//! Stale profile/generation/epoch comparison belongs to the Kernel
+//! composition (contract admission step 1: validate exact
+//! profile/product/config/generation identity): the owner records the
+//! bindings, the composer validates them against current evidence.
+//! DISCLOSED LIMIT: `owner_generation`, `requester_generation`,
+//! `profile_revision`, `epoch` and the issue/expiry timestamps are
+//! composition-supplied and echoed into the permit; this module opens no clock
+//! and reads no profile.
+//!
 //! This module has no production caller yet (STITCH): it publishes the owner
 //! evidence the Kernel profile composition will join. There is no emergency
 //! partition here; recording reserve loss stays with the front-door
@@ -36,11 +52,11 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId, ResourceGeneration};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
-    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
+    CapacityUnit, ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
     HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
@@ -172,6 +188,36 @@ pub struct OrsReserve {
     inner: Arc<OrsReserveInner>,
 }
 
+/// Owner-supplied bindings for one [`OrsPermit`] acquisition (issue #1679, W4).
+///
+/// The bundle keeps the typed acquisition paths at two arguments: the closed
+/// operation class plus this evidence record. Every field is recorded into the
+/// issued permit by the owner; nothing is inferred from a live process, PID,
+/// queue entry or surviving counter. Profile/generation/epoch values are
+/// composition-supplied current evidence (contract admission step 1); the
+/// Kernel composition validates them, this owner records them.
+#[derive(Clone, Debug)]
+pub struct OrsPermitRequest<'a> {
+    /// Requesting owner label (validated non-blank, bounded).
+    pub owner: &'a str,
+    /// Operation identity the permit is granted for.
+    pub operation_id: &'a str,
+    /// Owner-issued permit identity, distinct from the operation identity.
+    pub permit_id: &'a str,
+    /// Issuing ORS owner generation (owner side of the frozen owner binding).
+    pub owner_generation: ResourceGeneration,
+    /// Requesting owner's generation.
+    pub requester_generation: ResourceGeneration,
+    /// Profile revision the request was admitted under.
+    pub profile_revision: ArtifactId,
+    /// Typed Authority Epoch the request was admitted under.
+    pub epoch: AuthorityEpoch,
+    /// Caller-observed issue time (Unix millis); no clock is opened here.
+    pub issued_at_ms: i64,
+    /// Caller-observed expiry (Unix millis), if the grant expires.
+    pub expires_at_ms: Option<i64>,
+}
+
 /// One held ORS capacity permit, bound to dimension, class, operation and
 /// owner. Releasing is automatic on drop and returns exactly the consumed
 /// partition and amount.
@@ -185,8 +231,16 @@ pub struct OrsPermit {
     class: CapacityClass,
     amount: u64,
     operation: OrsPermitOperation,
+    permit_id: OperationId,
     operation_id: String,
     owner: String,
+    owner_generation: ResourceGeneration,
+    requester_generation: ResourceGeneration,
+    profile_revision: ArtifactId,
+    epoch: AuthorityEpoch,
+    issued_at_ms: i64,
+    expires_at_ms: Option<i64>,
+    owner_evidence: String,
 }
 
 impl OrsPermit {
@@ -220,6 +274,12 @@ impl OrsPermit {
         self.operation
     }
 
+    /// Returns the owner-issued permit identity, distinct from the operation identity.
+    #[must_use]
+    pub fn permit_id(&self) -> &str {
+        self.permit_id.as_str()
+    }
+
     /// Returns the operation identity this permit was granted for.
     #[must_use]
     pub fn operation_id(&self) -> &str {
@@ -230,6 +290,73 @@ impl OrsPermit {
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Returns the issuing ORS owner generation recorded at issue.
+    #[must_use]
+    pub const fn owner_generation(&self) -> ResourceGeneration {
+        self.owner_generation
+    }
+
+    /// Returns the requesting owner's generation recorded at issue.
+    #[must_use]
+    pub const fn requester_generation(&self) -> ResourceGeneration {
+        self.requester_generation
+    }
+
+    /// Returns the profile revision recorded at issue.
+    #[must_use]
+    pub fn profile_revision(&self) -> &str {
+        self.profile_revision.as_str()
+    }
+
+    /// Returns the typed Authority Epoch recorded at issue.
+    #[must_use]
+    pub const fn epoch(&self) -> AuthorityEpoch {
+        self.epoch
+    }
+
+    /// Returns the caller-observed issue time recorded at issue (Unix millis).
+    #[must_use]
+    pub const fn issued_at_ms(&self) -> i64 {
+        self.issued_at_ms
+    }
+
+    /// Returns the caller-observed expiry recorded at issue, if the grant expires.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> Option<i64> {
+        self.expires_at_ms
+    }
+
+    /// Returns the owner-derived evidence reference recorded at issue.
+    #[must_use]
+    pub fn owner_evidence(&self) -> &str {
+        &self.owner_evidence
+    }
+
+    /// Returns the exact unit of the bottleneck this permit was granted from.
+    #[must_use]
+    pub const fn unit(&self) -> CapacityUnit {
+        self.dimension.bottleneck().unit()
+    }
+
+    /// Returns `true` only when every presented binding matches the recorded
+    /// evidence: same operation identity, same owner, same Authority Epoch
+    /// and same profile revision. Changed content never matches; the owner
+    /// refuses consumption before it happens and the composition treats a
+    /// mismatch as a conflict, never as a replay.
+    #[must_use]
+    pub fn binding_matches(
+        &self,
+        operation_id: &str,
+        owner: &str,
+        epoch: AuthorityEpoch,
+        profile_revision: &ArtifactId,
+    ) -> bool {
+        self.operation_id == operation_id
+            && self.owner == owner
+            && self.epoch == epoch
+            && self.profile_revision == *profile_revision
     }
 }
 
@@ -271,6 +398,76 @@ fn cas_add(slot: &AtomicU64, capacity: u64, amount: u64) -> bool {
 }
 
 impl OrsReserve {
+    /// Validates the caller-presented bindings of one permit request before
+    /// any partition counter is touched. Returns the validated permit
+    /// identity for the issuing constructor.
+    fn checked_request(request: &OrsPermitRequest<'_>) -> Result<OperationId, OrsReserveError> {
+        validate_text(request.owner, "ors_permit.owner").map_err(|_| {
+            OrsReserveError::InvalidField {
+                field: "ors_permit.owner",
+                reason: "must be non-blank",
+            }
+        })?;
+        validate_text(request.operation_id, "ors_permit.operation_id").map_err(|_| {
+            OrsReserveError::InvalidField {
+                field: "ors_permit.operation_id",
+                reason: "must be non-blank",
+            }
+        })?;
+        let permit_id =
+            OperationId::new(request.permit_id).map_err(|_| OrsReserveError::InvalidField {
+                field: "ors_permit.permit_id",
+                reason: "must be a bounded non-blank reference",
+            })?;
+        if let Some(expires_at_ms) = request.expires_at_ms {
+            if expires_at_ms <= request.issued_at_ms {
+                return Err(OrsReserveError::InvalidField {
+                    field: "ors_permit.expires_at_ms",
+                    reason: "must be after issued_at_ms",
+                });
+            }
+        }
+        Ok(permit_id)
+    }
+
+    /// Issues the owner-bound permit after the partition counter was claimed.
+    /// The evidence reference is derived by the owner from the claimed
+    /// partition and the recorded bindings; callers cannot supply it.
+    fn issue_permit(
+        inner: Arc<OrsReserveInner>,
+        dimension: OrsDimension,
+        class: CapacityClass,
+        amount: u64,
+        operation: OrsPermitOperation,
+        request: &OrsPermitRequest<'_>,
+        permit_id: OperationId,
+    ) -> OrsPermit {
+        let owner_evidence = format!(
+            "ors-reserve/{:?}/{:?}/owner-gen-{}/req-gen-{}/amt-{amount}",
+            dimension.bottleneck(),
+            class,
+            request.owner_generation.value(),
+            request.requester_generation.value(),
+        );
+        OrsPermit {
+            inner,
+            dimension,
+            class,
+            amount,
+            operation,
+            permit_id,
+            operation_id: request.operation_id.to_owned(),
+            owner: request.owner.to_owned(),
+            owner_generation: request.owner_generation,
+            requester_generation: request.requester_generation,
+            profile_revision: request.profile_revision.clone(),
+            epoch: request.epoch,
+            issued_at_ms: request.issued_at_ms,
+            expires_at_ms: request.expires_at_ms,
+            owner_evidence,
+        }
+    }
+
     /// Creates an ORS reserve with disjoint normal and protected partitions
     /// for both ORS dimensions.
     ///
@@ -382,30 +579,25 @@ impl OrsReserve {
     /// Attempts to acquire one normal transaction slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
-    /// capacity is unreachable through this path by construction.
+    /// capacity is unreachable through this path by construction. The issued
+    /// [`OrsPermit`] records the full owner evidence from `request`:
+    /// permit/operation identities, owner and requester generations, exact
+    /// bottleneck/unit/amount, profile revision, Authority Epoch, issue/expiry
+    /// and owner-derived evidence.
     ///
     /// # Errors
     ///
-    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
-    /// identity, or [`OrsReserveError::NormalCapacityExhausted`] naming the
-    /// transaction bottleneck and shed work when the normal partition is
-    /// saturated. The protected partition is untouched in every case.
+    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation/
+    /// permit identity or an expiry that does not follow issue, or
+    /// [`OrsReserveError::NormalCapacityExhausted`] naming the transaction
+    /// bottleneck and shed work when the normal partition is saturated. The
+    /// protected partition is untouched in every case.
     pub fn try_acquire_normal_transaction(
         &self,
         work: NormalWorkClass,
-        owner: &str,
-        operation_id: &str,
+        request: OrsPermitRequest<'_>,
     ) -> Result<OrsPermit, OrsReserveError> {
-        validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
-            field: "ors_permit.owner",
-            reason: "must be non-blank",
-        })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
-            OrsReserveError::InvalidField {
-                field: "ors_permit.operation_id",
-                reason: "must be non-blank",
-            }
-        })?;
+        let permit_id = Self::checked_request(&request)?;
         if !cas_add(
             &self.inner.transaction_normal_in_flight,
             self.inner.transaction_normal_capacity,
@@ -414,50 +606,41 @@ impl OrsReserve {
             return Err(OrsReserveError::NormalCapacityExhausted {
                 bottleneck: ORS_TRANSACTION_BOTTLENECK,
                 work_class: work,
-                operation_id: operation_id.to_owned(),
-                owner: owner.to_owned(),
+                operation_id: request.operation_id.to_owned(),
+                owner: request.owner.to_owned(),
             });
         }
-        Ok(OrsPermit {
-            inner: self.inner.clone(),
-            dimension: OrsDimension::TransactionSlots,
-            class: CapacityClass::NormalWorkload,
-            amount: 1,
-            operation: OrsPermitOperation::Normal(work),
-            operation_id: operation_id.to_owned(),
-            owner: owner.to_owned(),
-        })
+        Ok(Self::issue_permit(
+            self.inner.clone(),
+            OrsDimension::TransactionSlots,
+            CapacityClass::NormalWorkload,
+            1,
+            OrsPermitOperation::Normal(work),
+            &request,
+            permit_id,
+        ))
     }
 
     /// Attempts to acquire `bytes` normal durable bytes without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
-    /// durable capacity is unreachable through this path by construction.
+    /// durable capacity is unreachable through this path by construction. The
+    /// issued [`OrsPermit`] records the full owner evidence from `request`.
     ///
     /// # Errors
     ///
-    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
-    /// identity, or [`OrsReserveError::NormalCapacityExhausted`] naming the
-    /// durable-byte bottleneck and shed work when the normal partition cannot
-    /// satisfy the request. The protected partition is untouched in every
-    /// case.
+    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation/
+    /// permit identity or an expiry that does not follow issue, or
+    /// [`OrsReserveError::NormalCapacityExhausted`] naming the durable-byte
+    /// bottleneck and shed work when the normal partition cannot satisfy the
+    /// request. The protected partition is untouched in every case.
     pub fn try_acquire_normal_durable_bytes(
         &self,
         work: NormalWorkClass,
-        owner: &str,
-        operation_id: &str,
+        request: OrsPermitRequest<'_>,
         bytes: NonZeroU64,
     ) -> Result<OrsPermit, OrsReserveError> {
-        validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
-            field: "ors_permit.owner",
-            reason: "must be non-blank",
-        })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
-            OrsReserveError::InvalidField {
-                field: "ors_permit.operation_id",
-                reason: "must be non-blank",
-            }
-        })?;
+        let permit_id = Self::checked_request(&request)?;
         if !cas_add(
             &self.inner.durable_normal_in_flight_bytes,
             self.inner.durable_normal_capacity_bytes,
@@ -466,19 +649,19 @@ impl OrsReserve {
             return Err(OrsReserveError::NormalCapacityExhausted {
                 bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
                 work_class: work,
-                operation_id: operation_id.to_owned(),
-                owner: owner.to_owned(),
+                operation_id: request.operation_id.to_owned(),
+                owner: request.owner.to_owned(),
             });
         }
-        Ok(OrsPermit {
-            inner: self.inner.clone(),
-            dimension: OrsDimension::DurableQueueBytes,
-            class: CapacityClass::NormalWorkload,
-            amount: bytes.get(),
-            operation: OrsPermitOperation::Normal(work),
-            operation_id: operation_id.to_owned(),
-            owner: owner.to_owned(),
-        })
+        Ok(Self::issue_permit(
+            self.inner.clone(),
+            OrsDimension::DurableQueueBytes,
+            CapacityClass::NormalWorkload,
+            bytes.get(),
+            OrsPermitOperation::Normal(work),
+            &request,
+            permit_id,
+        ))
     }
 
     /// Attempts to acquire one protected transaction slot without blocking.
@@ -487,30 +670,22 @@ impl OrsReserve {
     /// Store write, named read, agent admission or module job cannot name a
     /// protected operation and therefore cannot acquire this partition. This
     /// is the path an admitted cancellation/recovery record keeps while
-    /// normal transaction work is saturated.
+    /// normal transaction work is saturated. The issued [`OrsPermit`] records
+    /// the full owner evidence from `request`.
     ///
     /// # Errors
     ///
-    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
-    /// identity, or [`OrsReserveError::ProtectedReserveExhausted`] naming the
-    /// transaction bottleneck, operation, owner and request when the
-    /// protected partition is saturated.
+    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation/
+    /// permit identity or an expiry that does not follow issue, or
+    /// [`OrsReserveError::ProtectedReserveExhausted`] naming the transaction
+    /// bottleneck, operation, owner and request when the protected partition
+    /// is saturated.
     pub fn try_acquire_protected_transaction(
         &self,
         operation: ControlOperationClass,
-        owner: &str,
-        operation_id: &str,
+        request: OrsPermitRequest<'_>,
     ) -> Result<OrsPermit, OrsReserveError> {
-        validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
-            field: "ors_permit.owner",
-            reason: "must be non-blank",
-        })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
-            OrsReserveError::InvalidField {
-                field: "ors_permit.operation_id",
-                reason: "must be non-blank",
-            }
-        })?;
+        let permit_id = Self::checked_request(&request)?;
         if !cas_add(
             &self.inner.transaction_protected_in_flight,
             self.inner.transaction_protected_capacity,
@@ -519,50 +694,42 @@ impl OrsReserve {
             return Err(OrsReserveError::ProtectedReserveExhausted {
                 bottleneck: ORS_TRANSACTION_BOTTLENECK,
                 operation,
-                operation_id: operation_id.to_owned(),
-                owner: owner.to_owned(),
+                operation_id: request.operation_id.to_owned(),
+                owner: request.owner.to_owned(),
             });
         }
-        Ok(OrsPermit {
-            inner: self.inner.clone(),
-            dimension: OrsDimension::TransactionSlots,
-            class: CapacityClass::ProtectedControl,
-            amount: 1,
-            operation: OrsPermitOperation::Protected(operation),
-            operation_id: operation_id.to_owned(),
-            owner: owner.to_owned(),
-        })
+        Ok(Self::issue_permit(
+            self.inner.clone(),
+            OrsDimension::TransactionSlots,
+            CapacityClass::ProtectedControl,
+            1,
+            OrsPermitOperation::Protected(operation),
+            &request,
+            permit_id,
+        ))
     }
 
     /// Attempts to acquire `bytes` protected durable bytes without blocking.
     ///
     /// Only [`ControlOperationClass`] operations typecheck here. This is the
     /// path an admitted cancellation/recovery record keeps while normal
-    /// durable-byte work reports `STORAGE_BACKPRESSURE`.
+    /// durable-byte work reports `STORAGE_BACKPRESSURE`. The issued
+    /// [`OrsPermit`] records the full owner evidence from `request`.
     ///
     /// # Errors
     ///
-    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
-    /// identity, or [`OrsReserveError::ProtectedReserveExhausted`] naming the
-    /// durable-byte bottleneck, operation, owner and request when the
-    /// protected partition cannot satisfy the request.
+    /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation/
+    /// permit identity or an expiry that does not follow issue, or
+    /// [`OrsReserveError::ProtectedReserveExhausted`] naming the durable-byte
+    /// bottleneck, operation, owner and request when the protected partition
+    /// cannot satisfy the request.
     pub fn try_acquire_protected_durable_bytes(
         &self,
         operation: ControlOperationClass,
-        owner: &str,
-        operation_id: &str,
+        request: OrsPermitRequest<'_>,
         bytes: NonZeroU64,
     ) -> Result<OrsPermit, OrsReserveError> {
-        validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
-            field: "ors_permit.owner",
-            reason: "must be non-blank",
-        })?;
-        validate_text(operation_id, "ors_permit.operation_id").map_err(|_| {
-            OrsReserveError::InvalidField {
-                field: "ors_permit.operation_id",
-                reason: "must be non-blank",
-            }
-        })?;
+        let permit_id = Self::checked_request(&request)?;
         if !cas_add(
             &self.inner.durable_protected_in_flight_bytes,
             self.inner.durable_protected_capacity_bytes,
@@ -571,19 +738,19 @@ impl OrsReserve {
             return Err(OrsReserveError::ProtectedReserveExhausted {
                 bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
                 operation,
-                operation_id: operation_id.to_owned(),
-                owner: owner.to_owned(),
+                operation_id: request.operation_id.to_owned(),
+                owner: request.owner.to_owned(),
             });
         }
-        Ok(OrsPermit {
-            inner: self.inner.clone(),
-            dimension: OrsDimension::DurableQueueBytes,
-            class: CapacityClass::ProtectedControl,
-            amount: bytes.get(),
-            operation: OrsPermitOperation::Protected(operation),
-            operation_id: operation_id.to_owned(),
-            owner: owner.to_owned(),
-        })
+        Ok(Self::issue_permit(
+            self.inner.clone(),
+            OrsDimension::DurableQueueBytes,
+            CapacityClass::ProtectedControl,
+            bytes.get(),
+            OrsPermitOperation::Protected(operation),
+            &request,
+            permit_id,
+        ))
     }
 
     /// Reports exhausted normal durable bytes as a `STORAGE_BACKPRESSURE`
