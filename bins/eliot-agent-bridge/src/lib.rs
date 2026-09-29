@@ -42,13 +42,13 @@ pub use eliot_agent_bridge_core::{
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
 use eliot_contracts::{
-    BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
-    BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION,
-    BRIDGE_RECOVERY_RESUME_OR_OPEN_SELECTOR_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
-    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
-    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
-    BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
-    RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
+    BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_RESUME_OR_OPEN_SELECTOR_VERSION,
+    BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION, BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION,
+    BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeEventCapacityDimension, BridgeEventCapacityPressure,
+    BridgeEventLocalPhase, BridgeRecoveryPageCommitment, BridgeRecoverySelector,
+    BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition, BridgeTransportBackpressure,
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -1877,13 +1877,13 @@ fn decode_page_events(
         // inferred from the phase.
         let delivery_class = match item.get("delivery_class") {
             None | Some(serde_json::Value::Null) => None,
-            Some(value) => Some(serde_json::from_value::<DeliveryClass>(value.clone()).map_err(
-                |_| {
+            Some(value) => Some(
+                serde_json::from_value::<DeliveryClass>(value.clone()).map_err(|_| {
                     event_shape_failure(
                         "reconciliation refused: page event carries an unsupported delivery class",
                     )
-                },
-            )?),
+                })?,
+            ),
         };
         let mut fact = RecoveredEventFact::checked(
             stream_id.to_owned(),
@@ -2207,13 +2207,7 @@ fn validate_recovery_window_identity_and_reply_shape(
         unresolved,
     )?;
     if let Some(legacy_denial) = legacy_denial {
-        check_expected_continuation(
-            reconciliation,
-            &[],
-            expected_scope,
-            expected,
-            window_status,
-        )?;
+        check_expected_continuation(reconciliation, &[], expected_scope, expected, window_status)?;
         return Ok(Some(legacy_denial));
     }
     Ok(None)
@@ -4432,14 +4426,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         )?;
         let reply = self.exchange(&frame)?;
         let value = decode_bridge_event_reply(&reply, &frame)?;
-        decode_reconciliation_outcome(
-            binding,
-            &facts,
-            &value,
-            Vec::new(),
-            None,
-            Some(request),
-        )
+        decode_reconciliation_outcome(binding, &facts, &value, Vec::new(), None, Some(request))
     }
 
     /// Jointly commits the transport half of one validated reconciliation

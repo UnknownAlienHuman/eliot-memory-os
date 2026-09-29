@@ -2173,8 +2173,7 @@ pub const RECOVERY_PARTIAL_RECEIVER_ACCOUNTING: &str = "receiver-accounting-pend
 pub const RECOVERY_PARTIAL_OWNER_WINDOW_HOLE: &str = "owner-window-interval-unaccounted";
 /// Retained rows begin after an unproven compacted receiver prefix; an ORS
 /// producer cursor cannot supply the missing receiver phase evidence.
-pub const RECOVERY_PARTIAL_RECEIVER_BASE_UNPROVEN: &str =
-    "receiver-compacted-prefix-unproven";
+pub const RECOVERY_PARTIAL_RECEIVER_BASE_UNPROVEN: &str = "receiver-compacted-prefix-unproven";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryWindowStatus {
@@ -2551,12 +2550,13 @@ impl RecoveredEventFact {
         if let Some(projection) = self.source_projection.as_ref()
             && projection.kind == RecoveredSourceKind::AdmittedInline
         {
-            let envelope: EventEnvelope = serde_json::from_str(&projection.source_utf8).map_err(|_| {
-                BridgeError::InvalidContract {
-                    field: "recovered_event.delivery_class",
-                    reason: "admitted source is not an event envelope",
-                }
-            })?;
+            let envelope: EventEnvelope =
+                serde_json::from_str(&projection.source_utf8).map_err(|_| {
+                    BridgeError::InvalidContract {
+                        field: "recovered_event.delivery_class",
+                        reason: "admitted source is not an event envelope",
+                    }
+                })?;
             if envelope.delivery_class != delivery_class {
                 return Err(BridgeError::InvalidContract {
                     field: "recovered_event.delivery_class",
@@ -4226,9 +4226,9 @@ fn merge_recovery_stream_records(
         .highest_observed
         .max(facts.highest_observed_sequence)
         .max(facts.durable_cursor);
-    let retained_base = facts
-        .recovery_cut()
-        .map_or(facts.acked_cursor, |cut| cut.retention_floor().saturating_sub(1));
+    let retained_base = facts.recovery_cut().map_or(facts.acked_cursor, |cut| {
+        cut.retention_floor().saturating_sub(1)
+    });
     progress.next_after = progress
         .events
         .last_key_value()
@@ -4290,10 +4290,7 @@ fn recovered_receipt_qualifies(
     }
 }
 
-fn recovery_stream_interval_accounted(
-    stream_id: &str,
-    progress: &RecoveryStreamProgress,
-) -> bool {
+fn recovery_stream_interval_accounted(stream_id: &str, progress: &RecoveryStreamProgress) -> bool {
     let Some(cut) = progress.cut else {
         return false;
     };
@@ -4462,10 +4459,7 @@ impl RecoveryWindow {
                     reason: RECOVERY_PARTIAL_PAGE_CONTINUATION,
                 };
             }
-            if progress
-                .cut
-                .is_none_or(|cut| cut.retention_floor() > 1)
-            {
+            if progress.cut.is_none_or(|cut| cut.retention_floor() > 1) {
                 return RecoveryDisposition::Partial {
                     reason: RECOVERY_PARTIAL_RECEIVER_BASE_UNPROVEN,
                 };
@@ -4477,9 +4471,10 @@ impl RecoveryWindow {
             }
             if progress.events.values().any(|event| {
                 event.delivery_class.is_none()
-                    || event.receiver_receipt.as_ref().is_none_or(|receipt| {
-                        receipt.acknowledgement.phase == AckPhase::Unknown
-                    })
+                    || event
+                        .receiver_receipt
+                        .as_ref()
+                        .is_none_or(|receipt| receipt.acknowledgement.phase == AckPhase::Unknown)
             }) {
                 return RecoveryDisposition::Partial {
                     reason: RECOVERY_PARTIAL_RECEIVER_ACCOUNTING,
@@ -4505,8 +4500,7 @@ impl RecoveryWindow {
                             acked_base: progress.acked_base,
                             durable_cursor: progress.durable_cursor,
                             contiguous_frontier: progress.contiguous_frontier,
-                            receiver_acknowledged_frontier: progress
-                                .receiver_acknowledged_frontier,
+                            receiver_acknowledged_frontier: progress.receiver_acknowledged_frontier,
                             highest_observed: progress.highest_observed,
                             next_after: progress.next_after,
                             recovered_events: progress.events.len() as u64,
@@ -5012,12 +5006,10 @@ impl AgentBridgeCore {
                 let key = EventIdentityKey::new(&event.stream_id, &event.event_id);
                 let inline_envelope = match event.source_projection.as_ref() {
                     Some(projection) if projection.kind == RecoveredSourceKind::AdmittedInline => {
-                        let envelope: EventEnvelope =
-                            serde_json::from_str(&projection.source_utf8).map_err(|_| {
-                                BridgeError::InvalidContract {
-                                    field: "recovered_event.source_projection",
-                                    reason: "admitted inline source is not an event envelope",
-                                }
+                        let envelope: EventEnvelope = serde_json::from_str(&projection.source_utf8)
+                            .map_err(|_| BridgeError::InvalidContract {
+                                field: "recovered_event.source_projection",
+                                reason: "admitted inline source is not an event envelope",
                             })?;
                         Some(envelope)
                     }
@@ -5063,14 +5055,11 @@ impl AgentBridgeCore {
                     )));
                 }
                 let required_phase = self.cursor_policy.required_for(delivery_class);
-                let phase_qualified = required_phase.is_some_and(|required| {
-                    recovered_receipt_qualifies(required, acknowledgement)
-                });
+                let phase_qualified = required_phase
+                    .is_some_and(|required| recovered_receipt_qualifies(required, acknowledgement));
                 if phase_qualified {
                     state.pending_deliveries.remove(&key);
-                    state
-                        .acknowledged_phases
-                        .insert(key, acknowledgement.phase);
+                    state.acknowledged_phases.insert(key, acknowledgement.phase);
                     advance_recovered_contiguous_cursor(
                         &mut state.cursors,
                         &mut state.acknowledged_out_of_order,
@@ -5624,8 +5613,7 @@ impl AgentBridgeCore {
         if !window.stream_order.contains(&facts.stream_id) {
             window.stream_order.push(facts.stream_id.clone());
         }
-        let gap_cursor_regressed =
-            merge_recovery_stream_records(progress, facts, cursor_policy);
+        let gap_cursor_regressed = merge_recovery_stream_records(progress, facts, cursor_policy);
         if gap_cursor_regressed {
             let changed = window.incomplete_reason != Some(RECOVERY_PARTIAL_WINDOW_MOVED);
             window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
