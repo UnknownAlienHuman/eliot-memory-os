@@ -871,7 +871,7 @@ struct AgentBridgeProfile {
 /// ticket and typed result that produced it, so a stored `Resolved` projection
 /// is never treated as perpetual authority on its own.
 #[cfg(windows)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ActivatedApplicationBinding {
     /// Application principal the activation owner resolved for this
     /// connection. Never the bridge module identity or the pipe peer identity.
