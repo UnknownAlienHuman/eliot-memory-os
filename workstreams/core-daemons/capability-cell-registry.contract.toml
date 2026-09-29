@@ -13,6 +13,19 @@ normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc
 normative_architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
 normative_implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
 
+# Audit 5848256288 honest non-normative handling: no project generator exists
+# for this contract (the creating commit declares it non-normative
+# implementation contract only), so the step "regenerate it with the
+# project's own generator" cannot be performed as stated. The file is
+# hand-maintained; the [[declared_functional_cell]] projection mirrors the
+# canonical manifest source below, and the mirror is enforced at runtime by
+# the named guard instead of a generator.
+[provenance]
+generator = "none-hand-maintained"
+generator_reason = "No project generator exists for this contract; regenerating it with the project's own generator is not performable as stated (audit 5848256288)."
+mirror_source = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs + functional_cell_state_owners"
+mirror_enforced_by = "crates/eliot-app/src/cell_declaration_registry.rs::cell_declaration_guard"
+
 [documentation]
 architecture = [
   "docs/architecture/A02-03-modular-architecture.md#a23-modular-architecture",
