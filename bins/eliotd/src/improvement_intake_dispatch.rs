@@ -1495,7 +1495,8 @@ pub async fn commit_improvement_artifact(
         (AdmitOutcome::Admitted { .. }, None) => {}
         (
             AdmitOutcome::Merged {
-                absorbed_candidate_id, ..
+                absorbed_candidate_id,
+                ..
             },
             Some(survivor),
         ) => {

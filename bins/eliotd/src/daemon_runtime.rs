@@ -4349,13 +4349,12 @@ fn improvement_intake_artifact(
     // Governor-owned closure image, and `store()` hands back the canonical
     // learning-delta store whose newest committed record IS an
     // owner-observed consequential boundary.
-    let artifact =
-        eliotd::improvement_intake_dispatch::assemble_improvement_artifact(
-            &decision,
-            &fence,
-            composition.learning_closure().store(),
-        )
-        .map_err(|error| error.to_string())?;
+    let artifact = eliotd::improvement_intake_dispatch::assemble_improvement_artifact(
+        &decision,
+        &fence,
+        composition.learning_closure().store(),
+    )
+    .map_err(|error| error.to_string())?;
     // The G-19 decision record, read through the EXISTING maintenance owner.
     // The operation and idempotency key bind this exact observation, so the
     // policy a candidate is admitted under names the observation it belongs to.

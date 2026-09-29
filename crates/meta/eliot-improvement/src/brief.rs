@@ -166,9 +166,7 @@ impl SafeBoundary {
     pub fn from_observed_closure(
         store: &CanonicalLearningDeltaStore,
     ) -> Result<Self, ImprovementError> {
-        let (records, _version) = store
-            .load()
-            .map_err(|_| ImprovementError::UnsafeBoundary)?;
+        let (records, _version) = store.load().map_err(|_| ImprovementError::UnsafeBoundary)?;
         let record = records.last().ok_or(ImprovementError::UnsafeBoundary)?;
         // `consequential_boundary` is not named as a type here: this crate has
         // no `eliot-learning-delta` edge, and reading the record's own public
