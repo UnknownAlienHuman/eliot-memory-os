@@ -3434,7 +3434,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 result: UserAutomationReadResult::Status { execution, .. },
             } => {
                 require_complete_occurrence_view(&execution)?;
-                Ok(execution)
+                Ok(*execution)
             }
             _ => Err(UserAutomationExecutionError::OperationMismatch(
                 "owner execution view did not return a status projection",
