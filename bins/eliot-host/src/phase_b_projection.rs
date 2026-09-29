@@ -121,19 +121,20 @@ pub(super) fn validate_phase_b_credential_receipt(
         HostError::RecoveryRequired(error.to_string())
     })?;
     let profile_credential_matches = match manifest.runtime_launch.profile {
-        InstallationProfile::SystemService | InstallationProfile::PortableDev => {
+        InstallationProfile::SystemService => {
             selected_owner_sid.is_none()
                 && receipt.scope == StoreCredentialScope::LocalService
                 && receipt.principal_sid.as_str() == LOCAL_SERVICE_SID
         }
-        InstallationProfile::UserMode => {
+        InstallationProfile::UserMode | InstallationProfile::PortableDev => {
             let selected_owner_sid = selected_owner_sid.ok_or_else(|| {
                 HostError::RecoveryRequired(
-                    "Phase-B UserMode profile owner selection is not retained by Host".to_owned(),
+                    "Phase-B current-user profile owner selection is not retained by Host"
+                        .to_owned(),
                 )
             })?;
             // The descriptor's admitted Host state root is a retained
-            // current-user object for UserMode. Re-open it under the live Host
+            // current-user object for both current-user profiles. Re-open it under the live Host
             // token so the receipt SID is checked against both the actual
             // owner and the original retained profile selection, not accepted
             // from the receipt's own claim.
@@ -147,12 +148,13 @@ pub(super) fn validate_phase_b_credential_receipt(
             let root = eliot_platform_windows::UserOwnedRootLease::open_existing(host_state_root)
                 .map_err(|_| {
                 HostError::RecoveryRequired(
-                    "Phase-B UserMode Host state root is not owned by the current user".to_owned(),
+                    "Phase-B current-user Host state root is not owned by the current user"
+                        .to_owned(),
                 )
             })?;
             root.verify_stable_identity().map_err(|_| {
                 HostError::RecoveryRequired(
-                    "Phase-B UserMode Host state root identity changed".to_owned(),
+                    "Phase-B current-user Host state root identity changed".to_owned(),
                 )
             })?;
             let current_user_sid = root.current_user_sid();

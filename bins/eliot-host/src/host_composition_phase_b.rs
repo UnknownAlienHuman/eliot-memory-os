@@ -230,8 +230,8 @@ fn phase_b_observe_bound(observation: &PhaseBObservation) {
 impl HostComposition {
     /// Validates a Phase-B credential receipt against the Host's retained
     /// profile selection before any operation can publish or reconcile its
-    /// live descriptors. UserMode rechecks every admitted root and binds the
-    /// receipt principal to the original selected owner SID.
+    /// live descriptors. Current-user profiles recheck every admitted root
+    /// and bind the receipt principal to the original selected owner SID.
     #[cfg(windows)]
     pub(super) fn validate_phase_b_credential_receipt_for_profile(
         &self,
@@ -240,23 +240,31 @@ impl HostComposition {
         intent: &HostPhaseBMaterializationIntent,
     ) -> Result<(), HostError> {
         let selected_owner_sid = match manifest.runtime_launch.profile {
-            InstallationProfile::UserMode => {
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
                 #[cfg(not(test))]
                 {
                     let retained = self.profile_root_leases.as_ref().ok_or_else(|| {
                         HostError::RecoveryRequired(
-                            "Phase-B UserMode profile roots are not retained by Host".to_owned(),
+                            "Phase-B current-user profile roots are not retained by Host"
+                                .to_owned(),
                         )
                     })?;
                     retained.verify_stable_identity().map_err(|_| {
                         HostError::RecoveryRequired(
-                            "Phase-B UserMode profile root identity changed".to_owned(),
+                            "Phase-B current-user profile root identity changed".to_owned(),
                         )
                     })?;
                     let selection = retained.selection();
                     let launch = &manifest.runtime_launch;
-                    if selection.profile
-                        != eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+                    let expected_descriptor_digest =
+                        phase_b_scm_selector(&launch.authority_descriptor_digest)
+                            .map_err(HostError::Installation)?;
+                    let expected_profile = match launch.profile {
+                        InstallationProfile::UserMode => eliot_platform_windows::profile_supervision::ProfileSelection::UserMode,
+                        InstallationProfile::PortableDev => eliot_platform_windows::profile_supervision::ProfileSelection::PortableDev,
+                        InstallationProfile::SystemService => unreachable!(),
+                    };
+                    if selection.profile != expected_profile
                         || selection.installation_id
                             != launch.installation_epoch.installation.as_str()
                         || selection.installation_key.as_deref()
@@ -267,15 +275,17 @@ impl HostComposition {
                         || selection.component != launch.profile_component.as_str()
                         || selection.version != launch.profile_version.as_str()
                         || selection.generation != launch.generation.as_str()
-                        || selection.authority_descriptor_path
-                            != Path::new(launch.authority_descriptor_path.as_str())
+                        || !eliot_platform_windows::windows_paths_equal(
+                            &selection.authority_descriptor_path,
+                            Path::new(launch.authority_descriptor_path.as_str()),
+                        )
                         || selection.authority_descriptor_sha256
-                            != launch.authority_descriptor_digest.as_str()
+                            != expected_descriptor_digest.as_str()
                         || selection.authority_generation != launch.authority_generation.value()
                         || selection.owner_sid == LOCAL_SERVICE_SID
                     {
                         return Err(HostError::RecoveryRequired(
-                            "Phase-B UserMode profile selection does not match the candidate"
+                            "Phase-B current-user profile selection does not match the candidate"
                                 .to_owned(),
                         ));
                     }
@@ -286,13 +296,13 @@ impl HostComposition {
                         )
                         .map_err(|_| {
                             HostError::RecoveryRequired(
-                                "Phase-B UserMode profile roots no longer match their admission"
+                                "Phase-B current-user profile roots no longer match their admission"
                                     .to_owned(),
                             )
                         })?;
                     if &observed_selection != selection {
                         return Err(HostError::RecoveryRequired(
-                            "Phase-B UserMode profile root identities changed".to_owned(),
+                            "Phase-B current-user profile root identities changed".to_owned(),
                         ));
                     }
                     Some(selection.owner_sid.as_str())
@@ -301,11 +311,11 @@ impl HostComposition {
                 {
                     // Test compositions do not retain the production root
                     // selection; the projection validator therefore fails
-                    // closed for UserMode.
+                    // closed for current-user profiles.
                     None
                 }
             }
-            InstallationProfile::SystemService | InstallationProfile::PortableDev => None,
+            InstallationProfile::SystemService => None,
         };
 
         super::validate_phase_b_credential_receipt(receipt, manifest, intent, selected_owner_sid)

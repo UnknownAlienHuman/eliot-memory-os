@@ -305,10 +305,11 @@ fn main() {
             Some(USER_MODE_SUPERVISOR_SWITCH) => {
                 match process_args.get(1).and_then(|argument| argument.to_str()) {
                     Some("user_mode") => Some(InstallationProfile::UserMode),
+                    Some("portable_dev") => Some(InstallationProfile::PortableDev),
                     _ => {
                         let _ = writeln!(
                             io::stderr().lock(),
-                            "eliot-host: only the admitted UserMode supervisor is supported"
+                            "eliot-host: unsupported current-user supervisor profile"
                         );
                         std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
                     }
@@ -352,7 +353,7 @@ fn main() {
         if let Err(error) = result {
             let _ = writeln!(
                 io::stderr().lock(),
-                "eliot-host: UserMode supervisor failed: {error}"
+                "eliot-host: current-user supervisor failed: {error}"
             );
             std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
         }
@@ -629,9 +630,12 @@ fn run_profile_supervisor(
 ) -> Result<(), HostError> {
     use std::sync::atomic::Ordering;
 
-    if profile != InstallationProfile::UserMode {
+    if !matches!(
+        profile,
+        InstallationProfile::UserMode | InstallationProfile::PortableDev
+    ) {
         return Err(HostError::ProcessContour(
-            "current-user supervisor handoff is supported only for UserMode".to_owned(),
+            "current-user supervisor handoff requires UserMode or PortableDev".to_owned(),
         ));
     }
     STOP_REQUESTED.store(false, Ordering::Release);
@@ -643,7 +647,7 @@ fn run_profile_supervisor(
     }
     let mut host = HostComposition::open_for_profile(launch_options.clone(), profile)?;
     if host.registry().pending_activation().is_some() {
-        return run_pending_user_mode_bootstrap(&mut host);
+        return run_pending_current_user_bootstrap(&mut host);
     }
     let active = host.registry().active().ok_or_else(|| {
         HostError::ProcessContour(format!(
@@ -686,9 +690,9 @@ fn run_profile_supervisor(
         }
     }
 
-    // UserMode never enters the SystemService credential-control endpoint,
+    // Current-user profiles never enter the SystemService credential-control endpoint,
     // which requires Administrators and opens ProgramData. `open_for_profile`
-    // has bound this launch descriptor to the approved UserMode generation
+    // has bound this launch descriptor to the approved profile generation
     // and retained the current user's descriptor-bound roots before startup.
     let runtime_control = match host.runtime_control() {
         Ok(control) => control,
@@ -766,7 +770,7 @@ fn run_profile_supervisor(
 }
 
 #[cfg(windows)]
-fn run_pending_user_mode_bootstrap(host: &mut HostComposition) -> Result<(), HostError> {
+fn run_pending_current_user_bootstrap(host: &mut HostComposition) -> Result<(), HostError> {
     use std::sync::atomic::Ordering;
 
     // The installer retains the dedicated current-user Job until this Host

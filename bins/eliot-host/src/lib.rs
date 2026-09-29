@@ -6990,12 +6990,7 @@ impl HostComposition {
                     .credential_mutation_capability()
                     .map_err(|error| HostError::Platform(error.to_string()))?,
             ),
-            InstallationProfile::UserMode => None,
-            InstallationProfile::PortableDev => {
-                return Err(HostError::ProcessContour(
-                    "PortableDev does not use the Host credential-control endpoint".to_owned(),
-                ));
-            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => None,
         };
         let selected_roots = self
             .profile_root_leases
