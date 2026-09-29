@@ -179,3 +179,31 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "MERGE_COMPILE_SOURCE_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
+
+  audit-source-snapshot:
+    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: capture post-merge audit source snapshot' }}
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: f4e05bc50117e47382d9e1e666d89934443b5b25
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Retain exact tracked source without local state
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'post-merge-source'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          git archive --format=zip --output="$out/source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
+          git rev-parse HEAD | Set-Content "$out/source-sha.txt"
+          git rev-parse 'HEAD^{tree}' | Set-Content "$out/tree-sha.txt"
+          git ls-tree -r HEAD | Set-Content "$out/tree.txt"
+          Get-FileHash "$out/source.zip" -Algorithm SHA256 | Format-List | Out-File "$out/archive-sha256.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: post-merge-source-f4e05bc5
+          path: ${{ runner.temp }}/post-merge-source/
+          if-no-files-found: error
+          retention-days: 5
