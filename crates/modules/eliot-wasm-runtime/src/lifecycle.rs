@@ -20,9 +20,10 @@
 //! scheduler handle is taken, external effects are dropped before they can
 //! be emitted) and the comparator outcome persists observed legs with
 //! explicit unknown where nothing was observed. Rollback proposes a newer
-//! routing cutover — never a committed one: the new authority epoch must
-//! strictly rise, an old epoch is never reactivated, and only the
-//! Kernel-owned cutover receipt commits the route.
+//! routing cutover — never a committed one: the new authority epoch is the
+//! exact one-step direct child inside one epoch lineage, as admitted by the
+//! carried cutover record's own validation, so an old epoch is never
+//! reactivated, and only the Kernel-owned cutover receipt commits the route.
 //!
 //! State migration performs no transform of its own: the component-owned
 //! migration handler exports/imports state, and [`migrate_state`] verifies
@@ -30,7 +31,9 @@
 
 use std::collections::BTreeMap;
 
-use eliot_runtime_contracts::{GenerationCutoverState, ModuleGenerationState};
+use eliot_runtime_contracts::{
+    GenerationCutoverRecord, GenerationCutoverState, ModuleGenerationState, RuntimeContractError,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -888,12 +891,12 @@ pub enum SnapshotStrategy {
 /// exact defect this module exists to prevent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RollbackRouteRequest {
-    pub cutover_id: String,
-    pub route_scope: String,
-    pub from_generation: u64,
-    pub to_generation: u64,
-    pub old_epoch: u64,
-    pub new_epoch: u64,
+    /// The Kernel-owned cutover record this route proposes. Its epoch pair is
+    /// the lineage-aware [`GenerationCutoverRecord`] pair, and the original
+    /// recorded value is what gets validated: this module never re-derives,
+    /// re-binds, or re-orders an epoch from loose counters, so an old epoch
+    /// cannot be presented as the new authority.
+    pub cutover: GenerationCutoverRecord,
     pub in_flight: Vec<(String, InFlightDisposition)>,
     pub snapshot_strategy: SnapshotStrategy,
     pub state_compatible: bool,
@@ -907,10 +910,13 @@ pub struct RollbackRouteRequest {
 pub struct RollbackRouteProposal {
     pub cutover_id: String,
     pub route_scope: String,
-    pub from_generation: u64,
-    pub to_generation: u64,
-    pub old_epoch: u64,
-    pub new_epoch: u64,
+    /// The validated canonical cutover record, carried through unchanged. The
+    /// proposal therefore cannot present an epoch pair other than the one
+    /// [`GenerationCutoverRecord::validate`] admitted, and the sealing digest
+    /// below covers the record as validated rather than a re-derived scalar.
+    /// Committing it, and re-checking the authority epoch against the currently
+    /// active tuple, stays with the Kernel cutover path.
+    pub cutover: GenerationCutoverRecord,
     pub in_flight_count: u64,
     pub snapshot_strategy: SnapshotStrategy,
     pub route_digest: Sha256Digest,
@@ -920,34 +926,60 @@ pub struct RollbackRouteProposal {
 /// epoch. Every in-flight operation must carry an exact disposition, one
 /// operation identity admits exactly one disposition, and state must be
 /// compatible (prior snapshot) or forward-repaired. The sealing digest
-/// binds the cutover/route/generation/epoch identities together with the
-/// committed in-flight dispositions, snapshot strategy, and compatibility
-/// flag, so the sealed decision cannot silently change after commit.
+/// binds the cutover record together with the proposed in-flight
+/// dispositions, snapshot strategy, and compatibility flag, so the sealed
+/// decision cannot silently change before the Kernel path commits it.
+///
+/// The authority for identity and epoch lineage is the carried
+/// [`GenerationCutoverRecord`], not a pair of counters supplied here: its
+/// own `validate()` is applied to the original recorded value, so "newer"
+/// means the exact one-step direct child inside one epoch lineage rather
+/// than any numerically larger number.
 ///
 /// # Errors
 ///
-/// Returns a typed failure when the epoch does not strictly rise (an old
-/// epoch would be revived), the target is not a distinct prior compatible
-/// generation, state is incompatible, any disposition entry is blank, or one
+/// Returns a typed failure when the carried record's own `validate()` refuses
+/// it — a blank or control-bearing identity, a new epoch outside the old
+/// epoch's lineage or not its exact one-step direct child (an old epoch
+/// would be revived), or a non-distinct generation; when the rollback target
+/// is not a strict prior generation; when state is incompatible yet a prior
+/// snapshot was selected; when any disposition entry is blank; or when one
 /// operation identity carries conflicting dispositions.
 pub fn route_rollback(
     request: &RollbackRouteRequest,
 ) -> Result<RollbackRouteProposal, LifecycleError> {
-    if request.cutover_id.trim().is_empty() || request.route_scope.trim().is_empty() {
-        return Err(LifecycleError::InvalidField {
-            field: "rollback.cutover_id",
+    // The canonical record is the authority for identity and epoch lineage.
+    // Its own `validate()` is the existing owner check, applied to the ORIGINAL
+    // recorded value: it refuses a blank or control-bearing identity, a
+    // non-distinct generation, a foreign-lineage epoch, and any epoch that is
+    // not the exact one-step direct child of the old epoch. That last rule is
+    // what makes "never reactivate an old epoch" structural — an epoch tuple
+    // that merely happens to be numerically larger, or that belongs to another
+    // lineage, is refused here instead of being compared as two loose counters
+    // this module would then trust. Each refusal keeps its own cause: a
+    // malformed identity is never reported as an epoch failure.
+    if let Err(error) = request.cutover.validate() {
+        return Err(match error {
+            RuntimeContractError::InvalidField {
+                field: "new_epoch", ..
+            } => LifecycleError::RollbackEpochNotNewer,
+            RuntimeContractError::InvalidField {
+                field: "new_generation",
+                ..
+            } => LifecycleError::RollbackNotPriorCompatible,
+            _ => LifecycleError::InvalidField {
+                field: "rollback.cutover",
+            },
         });
     }
-    if request.from_generation == 0 || request.to_generation == 0 {
-        return Err(LifecycleError::InvalidField {
-            field: "rollback.generation",
-        });
-    }
-    if request.to_generation >= request.from_generation {
+    // Rollback routes back to a strict prior generation. The record's own
+    // generation pair is the independent expected set: a target that is not a
+    // distinct earlier generation is refused.
+    let Some(previous) = request.cutover.old_generation else {
         return Err(LifecycleError::RollbackNotPriorCompatible);
-    }
-    if request.new_epoch <= request.old_epoch {
-        return Err(LifecycleError::RollbackEpochNotNewer);
+    };
+    if request.cutover.new_generation.value() >= previous.value() {
+        return Err(LifecycleError::RollbackNotPriorCompatible);
     }
     if !request.state_compatible
         && request.snapshot_strategy == SnapshotStrategy::PriorCompatibleSnapshot
@@ -973,12 +1005,7 @@ pub fn route_rollback(
             field: "rollback.in_flight",
         })?;
     let route_digest = canonical_digest(&(
-        &request.cutover_id,
-        &request.route_scope,
-        request.from_generation,
-        request.to_generation,
-        request.old_epoch,
-        request.new_epoch,
+        &request.cutover,
         &request.in_flight,
         request.snapshot_strategy,
         request.state_compatible,
@@ -987,12 +1014,9 @@ pub fn route_rollback(
         detail: error.to_string(),
     })?;
     Ok(RollbackRouteProposal {
-        cutover_id: request.cutover_id.clone(),
-        route_scope: request.route_scope.clone(),
-        from_generation: request.from_generation,
-        to_generation: request.to_generation,
-        old_epoch: request.old_epoch,
-        new_epoch: request.new_epoch,
+        cutover_id: request.cutover.cutover_id.clone(),
+        route_scope: request.cutover.route_scope.clone(),
+        cutover: request.cutover.clone(),
         in_flight_count,
         snapshot_strategy: request.snapshot_strategy,
         route_digest,
@@ -1041,11 +1065,12 @@ mod lifecycle_proof_tests {
     use super::{
         BTreeMap, CapabilityId, ComponentEnginePort, CoreOutcome, DeterministicEchoCore,
         DivergenceKind, EffectProposal, EngineInvocation, EngineReport, EngineTermination,
-        ErrorClass, InFlightDisposition, LifecycleError, LifecycleProjectionInputs,
-        ModuleGenerationState, NativeCoreAdapter, PortError, RollbackRouteRequest, SemanticCore,
-        Sha256Digest, SnapshotStrategy, StateMigrationPlan, StateSnapshot, WasmCoreAdapter,
-        WasmLifecycleState, build_activation_record, canonical_digest, compare_conformance,
-        migrate_state, project_lifecycle, reconcile_shadow, route_rollback,
+        ErrorClass, GenerationCutoverRecord, InFlightDisposition, LifecycleError,
+        LifecycleProjectionInputs, ModuleGenerationState, NativeCoreAdapter, PortError,
+        RollbackRouteRequest, SemanticCore, Sha256Digest, SnapshotStrategy, StateMigrationPlan,
+        StateSnapshot, WasmCoreAdapter, WasmLifecycleState, build_activation_record,
+        canonical_digest, compare_conformance, migrate_state, project_lifecycle, reconcile_shadow,
+        route_rollback,
     };
     use eliot_observation_contracts::ObservationScope;
     use eliot_process::{
@@ -1098,6 +1123,33 @@ mod lifecycle_proof_tests {
             draining: false,
             rollback_cutover_committed: false,
         }
+    }
+
+    /// Canonical cutover record for the rollback-route fixtures.
+    ///
+    /// `EpochId` and `ResourceGeneration` are not re-exported by
+    /// `eliot-runtime-contracts`, so the record is decoded from its own wire
+    /// form rather than assembled from a bare counter: the fixture then
+    /// travels the same lineage validation a durable ORS row travels, and a
+    /// sequence that is not the exact one-step child is refused by the owner
+    /// rather than by anything this module asserts.
+    fn cutover_record(
+        cutover_id: &str,
+        route_scope: &str,
+        old_generation: u64,
+        new_generation: u64,
+        old_sequence: u64,
+        new_sequence: u64,
+    ) -> GenerationCutoverRecord {
+        must(serde_json::from_value(json!({
+            "cutover_id": cutover_id,
+            "route_scope": route_scope,
+            "old_generation": old_generation,
+            "new_generation": new_generation,
+            "old_epoch": { "lineage_id": TEST_LINEAGE, "sequence": old_sequence },
+            "new_epoch": { "lineage_id": TEST_LINEAGE, "sequence": new_sequence },
+            "state": "ARMED",
+        })))
     }
 
     fn must_route(result: Result<RollbackRouteProposal, LifecycleError>) -> RollbackRouteProposal {
@@ -1571,26 +1623,26 @@ mod lifecycle_proof_tests {
         assert_eq!(shadow.comparator.peak_memory_bytes, Some(2_048));
 
         let route = must_route(route_rollback(&RollbackRouteRequest {
-            cutover_id: "cutover-1956-rollback".to_owned(),
-            route_scope: TEST_COMPONENT.to_owned(),
-            from_generation: 3,
-            to_generation: 2,
-            old_epoch: 5,
-            new_epoch: 6,
+            cutover: cutover_record("cutover-1956-rollback", TEST_COMPONENT, 3, 2, 5, 6),
             in_flight: vec![("op-1".to_owned(), InFlightDisposition::CancelProvenNoEffect)],
             snapshot_strategy: SnapshotStrategy::PriorCompatibleSnapshot,
             state_compatible: true,
         }));
-        assert!(route.new_epoch > route.old_epoch);
-        assert_eq!(route.to_generation, 2);
+        // The proposed epoch is the record's own lineage-validated successor,
+        // and the rollback target is the record's own prior generation.
+        assert!(
+            route
+                .cutover
+                .new_epoch
+                .is_direct_child_of(&route.cutover.old_epoch)
+        );
+        assert_eq!(route.cutover.new_generation.value(), 2);
+        assert_eq!(route.cutover_id, "cutover-1956-rollback");
 
+        // A sequence that is merely equal is not a successor: the owner refuses
+        // it, so the old epoch is never reactivated.
         let stale_epoch = route_rollback(&RollbackRouteRequest {
-            cutover_id: "cutover-1956-stale".to_owned(),
-            route_scope: TEST_COMPONENT.to_owned(),
-            from_generation: 3,
-            to_generation: 2,
-            old_epoch: 5,
-            new_epoch: 5,
+            cutover: cutover_record("cutover-1956-stale", TEST_COMPONENT, 3, 2, 5, 5),
             in_flight: Vec::new(),
             snapshot_strategy: SnapshotStrategy::ForwardRepair,
             state_compatible: true,
@@ -1904,12 +1956,7 @@ mod lifecycle_proof_tests {
     #[test]
     fn rollback_seal_covers_dispositions_and_strategy() {
         let base = RollbackRouteRequest {
-            cutover_id: "cutover-seal".to_owned(),
-            route_scope: "component-seal".to_owned(),
-            from_generation: 3,
-            to_generation: 2,
-            old_epoch: 5,
-            new_epoch: 6,
+            cutover: cutover_record("cutover-seal", "component-seal", 3, 2, 5, 6),
             in_flight: vec![("op-1".to_owned(), InFlightDisposition::DrainRead)],
             snapshot_strategy: SnapshotStrategy::PriorCompatibleSnapshot,
             state_compatible: true,
