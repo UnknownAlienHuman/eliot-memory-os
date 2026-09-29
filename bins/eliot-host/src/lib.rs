@@ -1122,6 +1122,14 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         test: "891/case-13",
     },
     HostLifecycleBoundary {
+        name: "backup-dispatch.terminal",
+        source_item: "HostComposition::dispatch_backup_owner_operation",
+        owner_state: "admitted backup operation/closed dispatch target/retained preparation",
+        event: "host-backup-dispatch-failed",
+        caller: "HostComposition::process_backup_dispatch_requests",
+        test: "983/case-9",
+    },
+    HostLifecycleBoundary {
         name: "backup-cutover.terminal",
         source_item: "HostComposition::backup_dispatch_cutover",
         owner_state: "admitted cutover body/evidence/retirement fence",
@@ -1450,13 +1458,27 @@ const BOUNDARY_WAKE_SATISFY_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-wake-satisfy-failed");
 const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
     boundary_by_event("host.wake-satisfied observed");
-// F-LOG-HOST-8 (#983 W4): the three admitted cutover dispatch arms are the
-// outer caller boundaries for one failed cutover operation, so each arms the
-// crate's own `HostTerminalGuard` and owns exactly one terminal record. The
-// leaf `backup_cutover` phase/refusal records stay nonterminal and correlate
-// beneath the armed guard by emission order; there is no dedup cache, and each
-// code keeps its own operation distinct from its siblings and from any process
-// shutdown failure (`host-stop-failed`, `host-open-failed`).
+// F-LOG-HOST-8 (#983 W4): every admitted backup operation has exactly ONE
+// terminal emitter, and the owner is named per operation rather than per layer.
+//
+// `HostComposition::dispatch_backup_owner_operation` owns the live
+// registered-owner operation: it is the outermost boundary the production
+// contour actually reaches, because
+// `HostComposition::process_backup_dispatch_requests` runs it for every request
+// the closed prepare/cutover dispatch table admitted, and it is the only frame
+// that decides the success or typed refusal of that operation. It calls only
+// `HostComposition::backup_dispatch_reconcile`, which arms no guard, so no two
+// guards are ever armed for one operation and no dedup cache is needed to keep
+// the second one quiet.
+//
+// The four admitted ports below own the single operation each of them runs, and
+// none of them is reachable from the dispatch-owner boundary, so their guards
+// never nest inside it. The leaf `backup_cutover` / `backup_preparation` phase
+// and refusal records stay nonterminal and correlate beneath the armed guard by
+// emission order. Every code here is distinct from its siblings and from a
+// separate process shutdown failure (`host-stop-failed`, `host-open-failed`).
+const BOUNDARY_BACKUP_DISPATCH_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-backup-dispatch-failed");
 const BOUNDARY_BACKUP_CUTOVER_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-backup-cutover-failed");
 const BOUNDARY_BACKUP_PREPARE_TERMINAL: &HostLifecycleBoundary =
@@ -6070,11 +6092,52 @@ impl HostComposition {
     /// success case; every other outcome is the typed
     /// [`BackupDispatchRefusal`] naming the owner obligation that is missing,
     /// and is produced before any effect.
+    ///
+    /// # Terminal ownership (F-LOG-HOST-8, #983 W4)
+    ///
+    /// This method is the SINGLE named terminal emitter for one admitted backup
+    /// operation on the live registered-owner contour, and it is named rather
+    /// than deduplicated. It is the outermost frame the production contour
+    /// reaches — [`Self::process_backup_dispatch_requests`] runs it for every
+    /// request the closed prepare/cutover dispatch table admitted, and it is the
+    /// only frame that decides this operation's success or typed refusal — so the
+    /// guard spans exactly the operation.
+    ///
+    /// The non-overlap is structural, not cached: the only owner call below is
+    /// [`Self::backup_dispatch_reconcile`], which arms no guard, and none of the
+    /// four armed admitted ports (`backup_dispatch_prepare`,
+    /// `backup_dispatch_cutover`, `backup_dispatch_cutover_disposition`,
+    /// `backup_dispatch_cutover_retire`) is reachable from here. At most one
+    /// `HostTerminalGuard` is therefore armed for one operation, so no second
+    /// emitter exists to suppress and no process-wide "already reported" set is
+    /// needed. The leaf `backup_preparation` phase/refusal records stay
+    /// nonterminal and correlate beneath the armed guard by emission order.
+    ///
+    /// The pipe ingress
+    /// `HostBackupDispatchOwner::dispatch_backup_operation` deliberately arms
+    /// nothing: it does not run this operation. A refusal it returns is either a
+    /// closed-table routing miss already named by the nonterminal
+    /// `observe_live_cutover_dispatch` static category, or this boundary's own
+    /// refusal propagated back verbatim through
+    /// `HostBackupDispatchQueue::submit`; re-reporting the second kind there
+    /// would be precisely the duplicate terminal W4 forbids.
+    ///
+    /// `host-backup-dispatch-failed` names an OPERATION failure. It is a
+    /// distinct frozen code from the other admitted backup ports and from a
+    /// separate process shutdown failure (`host-stop-failed`,
+    /// `host-open-failed`). The returned [`BackupDispatchRefusal`], the
+    /// operation's order and its effect state are untouched: the guard only
+    /// observes the already-produced outcome.
     #[cfg(windows)]
     fn dispatch_backup_owner_operation(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
     ) -> Result<(), BackupDispatchRefusal> {
+        // Armed on entry, disarmed on the operation's own `Ok` return below, so
+        // every other outcome — the closed-table miss, the reconciliation read's
+        // typed refusals, and the two named owner refusals for the prepare and
+        // cutover arms — emits exactly one terminal record for this operation.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_DISPATCH_TERMINAL);
         let operation = request.operation;
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {
             return Err(BackupDispatchRefusal::new(
@@ -6082,7 +6145,7 @@ impl HostComposition {
                 "no Host backup owner operation is registered for this method",
             ));
         };
-        match target {
+        let outcome = match target {
             // The status/reconciliation read. The operation identity is the
             // admitted request's own authenticated `request_id`, and it is a
             // READ selector only: the owner re-derives the record from its own
@@ -6140,7 +6203,15 @@ impl HostComposition {
                 operation,
                 "no separately admitted cutover body is retained by the Host cutover-intent owner for this operation",
             )),
+        };
+        // The operation reached its own success case, so it owns no terminal
+        // record. This is the only disarm on the path: every `Err` arm above
+        // drops armed and emits exactly one, and the returned refusal is the
+        // owner's own value, unchanged.
+        if outcome.is_ok() {
+            host_terminal.disarm();
         }
+        outcome
     }
 
     /// Reconciles one admitted backup operation against the preparation this
