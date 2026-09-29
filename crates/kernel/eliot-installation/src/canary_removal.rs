@@ -1519,8 +1519,7 @@ fn require_quiesced_owner_effects(
         let mut rows = plan.effects.iter().filter(|row| row.category == category);
         let Some(row) = rows.next() else {
             return Err(InstallationError::IncompleteObservation(format!(
-                "the frozen plan does not account for the canary's own {:?} owner effect",
-                category
+                "the frozen plan does not account for the canary's own {category:?} owner effect"
             )));
         };
         if rows.next().is_some() {
@@ -2244,16 +2243,83 @@ where
     finish_with_readback(coordinator, registry, operation, install, registry_row)
 }
 
+/// Re-observes everything that could have changed since the entry-point fence,
+/// immediately before one mutating call, and refuses that call if any of it did.
+///
+/// The entry fence observes these once per apply or recover call, so observing
+/// them again here is what stops a change made *between two rows of one drive*
+/// from being inherited from a now-stale observation:
+///
+/// * the operation's one recorded reconcile deadline, so a deadline expiring
+///   between two rows refuses the next mutating call instead of letting the
+///   drive run past its own bound to a terminal `Completed`;
+/// * the admission fence, against a projection read now, so a canary admission
+///   or a return to production or last-known-good staged between two rows
+///   refuses this dependent stop/delete;
+/// * the canary's own owner effects and the installer-effect coverage, against
+///   a transaction re-loaded from the durable store rather than the one the
+///   entry fence read, so a pending write, ORS operation, outbox row or possible
+///   external effect, a lease/session/route authority rebound to a neighbour, or
+///   a substituted owner-derived identity refuses this mutating call.
+///
+/// The re-loaded transaction is also compared back to the transaction the entry
+/// fence admitted, so a substituted or replaced install transaction is refused
+/// rather than quietly re-validated on its own terms.
+///
+/// Every check here fails closed and returns before any durable write, so a
+/// refusal leaves the non-terminal stage, the blocking effect and every
+/// unresolved row exactly as the previous rows left them.
+fn reobserve_before_mutation(
+    registry: &RedbInstallationRegistry,
+    store: &RedbInstallationTransactionStore,
+    operation: &CanaryRemovalOperation,
+    install: &InstallationTransaction,
+    row: &CanaryRemovalEffect,
+) -> Result<(), InstallationError> {
+    // The deadline is re-observed immediately before the mutating call, not
+    // only at the entry-point fence. Expiry refuses the call and leaves the
+    // durable projection exactly as the previous rows left it: the non-terminal
+    // stage, the blocking effect and every unresolved `Unknown` row stay as
+    // observed, so a deadline can never author a terminal `Completed` or a
+    // clean cleanup.
+    if reconcile_budget_exhausted(operation) {
+        let unresolved = operation
+            .effect_progress
+            .iter()
+            .filter(|progress| !matches!(progress.state, CanaryRemovalEffectState::Resolved { .. }))
+            .count();
+        return Err(InstallationError::IncompleteObservation(format!(
+            "the bounded reconcile wait for removal {} expired with {} of {} removal effect(s) still unresolved; the exact blocking effect {} keeps this operation in incomplete recovery and no further mutating call is admitted under this operation identity",
+            operation.removal_transaction_id.as_str(),
+            unresolved,
+            operation.plan.effects.len(),
+            row.effect_id.as_str()
+        )));
+    }
+    observe_admission_fence(&registry.load()?, &operation.plan)?;
+    let observed_install = store.load(&operation.plan.install_transaction_id)?.ok_or(
+        InstallationError::TransactionNotFound {
+            transaction_id: operation.plan.install_transaction_id.as_str().to_owned(),
+        },
+    )?;
+    observed_install.validate()?;
+    if observed_install.transaction_id != install.transaction_id
+        || observed_install.installer_plan_digest != operation.plan.install_plan_digest
+        || observed_install.candidate_manifest.generation != operation.plan.generation
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    require_quiesced_owner_effects(&observed_install, &operation.plan)?;
+    require_complete_effect_coverage(&observed_install, &operation.plan)
+}
+
 /// Revalidates the retained resource identity, commits the exact intent before
 /// the mutating call, and persists the observed result before advancing.
 ///
-/// Immediately before the mutating call the operation's one recorded reconcile
-/// deadline and the admission fence are both re-observed. A deadline that
-/// expires between two rows of the same drive therefore refuses the next
-/// mutating call instead of letting the drive run to a terminal `Completed`
-/// past its own bound, and a canary admission staged between two rows refuses
-/// the next dependent stop/delete instead of being inherited from the
-/// entry-point observation.
+/// Immediately before the mutating call `reobserve_before_mutation` re-checks
+/// the recorded reconcile deadline, the admission fence, the canary's own owner
+/// effects and the installer-effect coverage, so none of them can be inherited
+/// from the entry-point observation after changing mid-drive.
 fn advance_row<P>(
     coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
     registry: &RedbInstallationRegistry,
@@ -2309,52 +2375,10 @@ where
             return Ok(());
         }
     }
-    // Re-observed immediately before the mutating call, not only at the
-    // entry-point fence. Expiry refuses the call and leaves the durable
-    // projection exactly as the previous rows left it: the non-terminal stage,
-    // the blocking effect and every unresolved `Unknown` row stay as observed,
-    // so a deadline can never author a terminal `Completed` or a clean cleanup.
-    if reconcile_budget_exhausted(operation) {
-        return Err(InstallationError::IncompleteObservation(format!(
-            "the bounded reconcile wait for removal {} expired with {} of {} removal effect(s) still unresolved; the exact blocking effect {} keeps this operation in incomplete recovery and no further mutating call is admitted under this operation identity",
-            operation.removal_transaction_id.as_str(),
-            operation
-                .effect_progress
-                .iter()
-                .filter(|progress| {
-                    !matches!(progress.state, CanaryRemovalEffectState::Resolved { .. })
-                })
-                .count(),
-            operation.plan.effects.len(),
-            row.effect_id.as_str()
-        )));
-    }
-    // Re-observed against the owner's current durable projection immediately
-    // before the mutating call, so a canary admission staged between two rows
-    // of one drive refuses this dependent stop/delete.
-    observe_admission_fence(&registry.load()?, &operation.plan)?;
-    // The owner effects are re-observed here too, against a transaction
-    // re-loaded from the durable store rather than the one the entry fence read.
-    // A pending write, ORS operation, outbox row or possible external effect
-    // staged between two rows of one drive, a canary lease/session/route
-    // authority rebound to a neighbour, or a substituted owner-derived identity
-    // therefore refuses this mutating call instead of being inherited from the
-    // entry observation. The refusal writes nothing, so the durable incomplete
-    // recovery survives with its blocking effect exactly as observed.
-    let observed_install = store.load(&operation.plan.install_transaction_id)?.ok_or(
-        InstallationError::TransactionNotFound {
-            transaction_id: operation.plan.install_transaction_id.as_str().to_owned(),
-        },
-    )?;
-    observed_install.validate()?;
-    if observed_install.transaction_id != install.transaction_id
-        || observed_install.installer_plan_digest != operation.plan.install_plan_digest
-        || observed_install.candidate_manifest.generation != operation.plan.generation
-    {
-        return Err(InstallationError::IdentityConflict);
-    }
-    require_quiesced_owner_effects(&observed_install, &operation.plan)?;
-    require_complete_effect_coverage(&observed_install, &operation.plan)?;
+    // Everything that could have changed since the entry fence is re-observed
+    // here, immediately before the mutating call, rather than inherited from
+    // that one observation.
+    reobserve_before_mutation(registry, store, operation, install, &row)?;
     let admitted_attempt = if resume {
         let Some(next) = attempt.next() else {
             return unknown_row(store, operation, position, exhausted_bound_ref(&row)?);
@@ -2536,13 +2560,6 @@ fn next_revision(expected: u64) -> Result<u64, InstallationError> {
         })
 }
 
-/// Finishes by independent readback, then commits the terminal registry
-/// projection under the expected registry revision.
-///
-/// The readback runs against the resource's own owner and is separate from the
-/// mutating call, so a green stage can never come from a lost response. A
-/// readback that cannot prove absence preserves the original identity and the
-/// safe next action instead of reporting a clean removal.
 /// Builds the readback request for one already-executed plan row, or `None`
 /// when that row names no installation effect and therefore has nothing to read
 /// back from its owner.
@@ -2568,6 +2585,13 @@ fn readback_request(
     )?))
 }
 
+/// Finishes by independent readback, then commits the terminal registry
+/// projection under the expected registry revision.
+///
+/// The readback runs against the resource's own owner and is separate from the
+/// mutating call, so a green stage can never come from a lost response. A
+/// readback that cannot prove absence preserves the original identity and the
+/// safe next action instead of reporting a clean removal.
 fn finish_with_readback<P>(
     coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
     registry: &RedbInstallationRegistry,
