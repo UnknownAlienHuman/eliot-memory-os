@@ -72,8 +72,9 @@ use eliot_ors::{
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
     AgentActivationResolutionResult, AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding,
-    AgentHostRequestFailure, AgentResponseDisposition, DeliveryClass, EventEnvelope,
-    HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
+    AgentHostRequestFailure, AgentResponseDisposition, BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_ID,
+    BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_VERSION, BridgeEventDisclosureRequest, DeliveryClass,
+    EventEnvelope, HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
@@ -209,14 +210,8 @@ pub(crate) const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_ev
 /// names this adapter's own revision, never a producer-side version the
 /// Kernel cannot observe.
 const BRIDGE_EVENT_ADAPTER_VERSION: &str = "eliot.bridge-event.kernel-ingest.v1";
-/// Closed disclosure verdict the privacy owner emits for a bridge event
-/// (issue #1934, I7.23). The verdict is the OWNER's: the Kernel resolves it
-/// from the owner evidence the live transport carries and never mints an
-/// admission. An owner that has not decided these exact bytes emits the
-/// rejection, which routes the event to the deterministic redacted
-/// representation plus its redaction receipt. This is the same closed
-/// vocabulary `eliot-ors` validates (`admitted` | `rejected`).
-const BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED: &str = "rejected";
+/// No owner authorization is available on the current live bridge-event path.
+/// ORS must interpret this absence as a redacted-only staging decision.
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -1625,7 +1620,7 @@ impl KernelComposition {
     /// durable ticket, request, peer receipt, and accepted result. The ORS
     /// lifecycle is authoritative for retention and terminal state; the
     /// bridge's `Resolved` projection alone cannot keep authority alive.
-    fn activation_result_still_retained(
+    pub(super) fn activation_result_still_retained(
         &self,
         pending: &super::AgentActivationPendingState,
         retained: &super::ActivatedApplicationBinding,
@@ -5314,14 +5309,14 @@ impl KernelComposition {
         // bound to these exact source bytes, the scope, and the policy revision
         // it was decided at. No such owner decision reaches this live route
         // (see [`Self::bridge_event_privacy_authorization`]), so the resolution
-        // is a rejection: the event stages as the deterministic redacted
+        // is unavailable: the event stages as the deterministic redacted
         // representation plus its redaction receipt and never as verbatim raw.
         // The ORS deny scan stays a conservative detector that can only deny.
         let privacy_authorization =
-            Self::bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
+            self.bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
         let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
             &envelope_bytes,
-            Some(&privacy_authorization),
+            privacy_authorization.as_ref(),
         );
         let now = unix_ms();
         let expired = activation_deadline_expired(now, deadline_unix_ms);
@@ -5367,94 +5362,62 @@ impl KernelComposition {
         }
     }
 
-    /// Resolves the privacy owner's disclosure verdict for one bridge event's
-    /// exact source bytes (issue #1934, I7.23).
+    /// Builds a typed request for the Governor disclosure owner from the exact
+    /// source bytes and current activation binding (issue #1934, I7.23).
     ///
-    /// I7.23: "Secret values, provider-forbidden hidden reasoning and data
-    /// outside the `WorkScope` privacy boundary are never persisted merely to
-    /// preserve 'rawness'." The decision that answers that belongs to the
-    /// disclosure owner: I5.26 makes `DisclosureDependencyClosure` and
-    /// `DisclosureDecision` Governor-owned canonical state, and this subtree's
-    /// instructions say Kernel "does not reinterpret policy, `WorkScope`,
-    /// task, plan, verifier or finish". This entry is therefore a resolution of
-    /// the owner verdict, never a mint of it.
-    ///
-    /// What the live transport does carry, and what this entry therefore binds
-    /// (issue #2729 owner read, unchanged):
-    ///
-    /// - the immutable source digest of the canonical envelope bytes;
-    /// - the retained `Session`'s owner evidence — principal, authority
-    ///   lineage, connection, launch nonce, session epoch — through
-    ///   [`bridge_owner_evidence`], the same owner legs the stage entry
-    ///   persists;
-    /// - the scope the ORS stage entry is about to bind for this stream,
-    ///   derived through the owner's own namespace digest;
-    /// - the privacy policy revision: the presenting live generation, already
-    ///   required nonzero and equal on the event, its state fence, and the
-    ///   retained session.
-    ///
-    /// What the transport does NOT carry is the positive privacy grant, and it
-    /// was measured rather than assumed. `EventEnvelope`
-    /// (`crates/foundation/eliot-protocol/src/lib.rs`) has no field carrying a
-    /// `WorkScope`, a privacy class, a source/recipient class, or a provider
-    /// retention constraint; the retained agent-bridge `Session` negotiates an
-    /// EMPTY privacy-class grant (`eliot-ipc`'s
-    /// `Session::establish_agent_bridge`, which is the only constructor on this
-    /// route), so there is no recipient-class evidence either; and the
-    /// Governor-owned `DisclosureDecision` has no producer, store, or wire leg
-    /// that reaches this entry. There is consequently no owner that can present
-    /// a positive verdict bound to these exact bytes, this scope, and this
-    /// policy revision.
-    ///
-    /// Absent evidence is UNRESOLVED, never permission. The resolution is
-    /// therefore [`BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED`]:
-    /// [`RedbRecoveryStore::bridge_event_privacy_decision`] takes the
-    /// rejection arm, the event stages as the deterministic redacted
-    /// representation plus its redaction receipt, and the conservative
-    /// seven-token deny scan still runs inside the ORS owner — where it can
-    /// only narrow the recorded reason and classes, never grant. Ingestion
-    /// stays available; no unproven byte is persisted, and the store's
-    /// re-verification of the presented verdict can no longer be satisfied by
-    /// an echo of its own derivation.
-    ///
-    /// The `admitted` arm is deliberately unreachable here and is not a
-    /// placeholder for a future one: emitting it requires an owner decision
-    /// that does not exist on this path, and inventing a substitute grant would
-    /// reintroduce exactly the defect this removes. A caller cannot reach the
-    /// verbatim path at all while this holds, which is the fail-closed answer
-    /// I7.23 requires until the disclosure owner is wired to this route.
+    /// The request binds source hash, ORS namespace, WorkScope, task revision,
+    /// fence, principal/session, and the ticket/request/result that established
+    /// the application identity. It does not yet carry owner-resolved source
+    /// domains, recovery-recipient capabilities, or provider-retention terms.
+    /// There is not yet an authenticated owner response route on this ingress,
+    /// so this returns no authorization; ORS treats absence as unresolved and
+    /// stores only the redacted projection.
     fn bridge_event_privacy_authorization(
+        &self,
         session: &Session,
         frame_fence: &eliot_contracts::StateFence,
         event: &EventEnvelope,
         envelope_bytes: &[u8],
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<Option<serde_json::Value>, TransportError> {
         let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
-        // The scope is the very owner namespace the ORS stage entry binds for
-        // this stream, derived through the owner's own namespace digest so the
-        // recorded verdict and the row it describes cannot drift.
         let evidence = bridge_owner_evidence(session, frame_fence)?;
-        let scope = RedbRecoveryStore::bridge_event_privacy_scope(
+        let source_scope_digest = RedbRecoveryStore::bridge_event_privacy_scope(
             &evidence.authority_lineage,
             &evidence.principal,
             &event.producer_id,
             &event.stream_id,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        // The retained session's own generation is the privacy policy revision
-        // the verdict is recorded against; zero is never an admissible
-        // revision, and the caller above already refused a zero generation, so
-        // a zero here is a fence failure rather than a silent downgrade.
-        let policy_revision = frame_fence.resource_generation.value();
-        if policy_revision == 0 {
-            return Err(TransportError::SessionFenced);
-        }
-        Ok(serde_json::json!({
-            "verdict": BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED,
-            "source_sha256": source_sha256,
-            "scope": scope,
-            "policy_revision": policy_revision,
-        }))
+        let binding = self.bridge_event_activation_binding(session, frame_fence)?;
+        let request = BridgeEventDisclosureRequest {
+            wire_id: BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_ID.to_owned(),
+            wire_version: BRIDGE_EVENT_DISCLOSURE_REQUEST_WIRE_VERSION,
+            source_sha256,
+            event_id: event.event_id.clone(),
+            stream_id: event.stream_id.clone(),
+            producer_id: event.producer_id.clone(),
+            payload_type: event.payload_type.clone(),
+            delivery_class: event.delivery_class,
+            sequence: event.sequence,
+            source_scope_digest,
+            principal_id: binding.principal_id,
+            session_id: binding.session_id,
+            work_scope_id: binding.work_scope_id,
+            task_id: binding.task_id,
+            task_revision: binding.task_revision.value(),
+            state_fence: frame_fence.clone(),
+            activation_ticket_id: binding.activation_ticket_id,
+            activation_ticket_sha256: binding.activation_ticket_sha256,
+            activation_request_id: binding.activation_request_id,
+            activation_request_sha256: binding.activation_request_sha256,
+            peer_admission_receipt_sha256: binding.peer_admission_receipt_sha256,
+            resolution_result_sha256: binding.resolution_result_sha256,
+        };
+        request
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let _owner_request = request;
+        Ok(None)
     }
 
     /// Projects the three disclosure legs the ORS stage entry re-verifies out
@@ -5462,8 +5425,8 @@ impl KernelComposition {
     ///
     /// The owner authorization travels alongside them so the stage entry can
     /// compare the verdict against the exact bytes and scope it is about to
-    /// bind; a decision that carries no authorization is projected as a null
-    /// authorization, which the store refuses rather than infers.
+    /// bind. An absent owner decision remains null so the store can emit its
+    /// explicit redacted-only receipt without inventing an owner authorization.
     fn bridge_event_privacy_legs(
         privacy: &serde_json::Value,
     ) -> Result<BridgeEventPrivacyLegs<'_>, TransportError> {
