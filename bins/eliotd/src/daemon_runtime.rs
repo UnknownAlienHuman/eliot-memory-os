@@ -2322,7 +2322,8 @@ async fn publish_maintenance_source_results(
         let guard = composition.lock().await;
         let live_fence = guard.governor_kernel_fence();
         obligations.push(eliot_maintenance::decision_result_obligation(
-            decision, &live_fence,
+            decision,
+            &live_fence,
         ));
         if let Some(job_ref) = &decision.durable_job_ref {
             match guard.retained_maintenance_job(job_ref) {
@@ -2354,9 +2355,11 @@ async fn publish_maintenance_source_results(
                 .await
         };
         match publication {
-            Ok(eliotd::maintenance_trigger_evaluator::MaintenanceResultPublication::Reconciled {
-                receipt,
-            }) => {
+            Ok(
+                eliotd::maintenance_trigger_evaluator::MaintenanceResultPublication::Reconciled {
+                    receipt,
+                },
+            ) => {
                 tracing::info!(
                     target: "eliotd::diagnostics",
                     event = "eliotd.maintenance_result_published",

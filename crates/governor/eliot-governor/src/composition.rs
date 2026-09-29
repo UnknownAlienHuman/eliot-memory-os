@@ -4803,10 +4803,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .load_durable_job(job_id, fence)
             .map_err(CompositionError::Kernel)?;
         if let Some(job) = &job {
-            job.validate()
-                .map_err(|error| CompositionError::Recovery(format!(
+            job.validate().map_err(|error| {
+                CompositionError::Recovery(format!(
                     "retained durable maintenance job is invalid: {error}"
-                )))?;
+                ))
+            })?;
             if job.job_id != job_id || job.state_fence != *fence {
                 return Err(CompositionError::Recovery(
                     "retained durable maintenance job is not bound to this fence and identity"
