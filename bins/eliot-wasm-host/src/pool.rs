@@ -114,7 +114,10 @@ pub fn pooled_configuration_digest(pool: &InstancePoolConfig) -> Sha256Digest {
 fn pooled_configuration_descriptor(pool: &InstancePoolConfig) -> String {
     format!(
         "wasmtime={PINNED_WASMTIME_VERSION};target={os}/{arch};component_model=true;typed_abi=guest.run;abi_digest={abi};max_wasm_stack={};max_epoch_deadline_ticks={MAX_EPOCH_DEADLINE_TICKS};allocation=pooling;pool_total_instances={};pool_max_memory_bytes={};pool_table_elements={};pool_structural=wasmtime-default;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true",
-        PROVIDER_STACK_SIZE, pool.total_instances, pool.max_memory_bytes, pool.max_table_elements,
+        PROVIDER_STACK_SIZE,
+        pool.total_instances,
+        pool.max_memory_bytes,
+        pool.max_table_elements,
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         abi = Sha256Digest::of_bytes(include_bytes!("../wit/guest.wit")).as_str(),
