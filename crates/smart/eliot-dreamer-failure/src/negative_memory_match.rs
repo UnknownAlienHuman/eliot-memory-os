@@ -31,10 +31,11 @@
 //! constructible outside this module, so a bounded enumeration with a missing
 //! page can never certify the absence of an applicable rule.
 
+use eliot_contracts::StateFence;
 use eliot_dreamer_contracts::{
     ContractViolation, FailureAction, FailureApplicability, FailureCoverage, FailureDimension,
     FailureDimensionSource, FailureDimensionValue, FailureEnvironment, canonical_bytes, digest_hex,
-    error::check_text, is_hex64_lower,
+    error::{check_fence, check_text}, is_hex64_lower,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -47,13 +48,13 @@ use crate::negative_memory::{
 };
 
 /// Wire revision of a matcher result.
-pub const NEGATIVE_MEMORY_MATCH_SCHEMA_VERSION: u32 = 1;
+pub const NEGATIVE_MEMORY_MATCH_SCHEMA_VERSION: u32 = 2;
 
 /// Domain label mixed into the matcher result content digest.
-const MATCH_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-match/v1";
+const MATCH_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-match/v2";
 
 /// Domain label mixed into the subject content digest.
-const SUBJECT_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-subject/v1";
+const SUBJECT_DIGEST_DOMAIN: &str = "eliot-dreamer-failure/negative-memory-subject/v2";
 
 /// The closed set of relations a compared identity can satisfy.
 ///
@@ -144,6 +145,10 @@ pub struct ScopeComparison {
 pub struct NegativeMemorySubject {
     /// The exact pending action.
     pub action: FailureAction,
+    /// Canonical request digest for the exact canonical envelope this subject
+    /// describes. The Governor compares it with the envelope before the gate
+    /// decision may reach canonical dispatch.
+    pub canonical_request_digest: String,
     /// The owner-issued task, scope and target identities of the pending action.
     pub applicability: FailureApplicability,
     /// The owner-issued environment identity of the pending action.
@@ -161,6 +166,7 @@ pub struct NegativeMemorySubject {
 struct SubjectPreimage<'a> {
     domain: &'static str,
     action: &'a FailureAction,
+    canonical_request_digest: &'a str,
     applicability: &'a FailureApplicability,
     environment: &'a FailureEnvironment,
     resources: &'a [NegativeMemoryResource],
@@ -183,6 +189,7 @@ impl NegativeMemorySubject {
         let preimage = SubjectPreimage {
             domain: SUBJECT_DIGEST_DOMAIN,
             action: &self.action,
+            canonical_request_digest: &self.canonical_request_digest,
             applicability: &self.applicability,
             environment: &self.environment,
             resources: &resources,
@@ -203,14 +210,20 @@ impl NegativeMemorySubject {
     ///
     /// Returns [`NegativeMemoryViolation`] for a malformed identity, a
     /// duplicated dimension or resource identity, a `Missing` dimension value
-    /// (which is never a wildcard) or a completely covered subject that
-    /// supplies no dimensions at all.
+    /// (which is never a wildcard), conflicting duplicate environment
+    /// snapshots, or a completely covered subject that supplies no dimensions
+    /// at all.
     pub fn validate(&self) -> Result<(), NegativeMemoryViolation> {
         self.action
             .validate()
             .map_err(|_| NegativeMemoryViolation::MissingRequiredField {
                 field: "matcher.subject.action",
             })?;
+        if !is_hex64_lower(&self.canonical_request_digest) {
+            return Err(NegativeMemoryViolation::NotADigest {
+                field: "matcher.subject.canonical_request_digest",
+            });
+        }
         self.applicability.validate().map_err(|_| {
             NegativeMemoryViolation::MissingRequiredField {
                 field: "matcher.subject.applicability",
@@ -221,6 +234,17 @@ impl NegativeMemorySubject {
             .map_err(|_| NegativeMemoryViolation::MissingRequiredField {
                 field: "matcher.subject.environment",
             })?;
+        if self.applicability.environment_id != self.environment.environment_id
+            || self.applicability.platform != self.environment.platform
+            || self.applicability.tool_revision != self.environment.tool_revision
+            || self.applicability.model_revision != self.environment.model_revision
+            || self.applicability.config_revision != self.environment.config_revision
+            || self.applicability.capability_revision != self.environment.capability_revision
+        {
+            return Err(NegativeMemoryViolation::BindingInconsistent {
+                field: "matcher.subject.environment_applicability",
+            });
+        }
         if self.resources.is_empty() {
             return Err(NegativeMemoryViolation::MissingRequiredField {
                 field: "matcher.subject.resources",
@@ -307,6 +331,10 @@ pub struct NegativeMemoryCandidateRead {
     /// The rule-set revision head the read observed before reading (I12.16
     /// Fence A). The matcher records it; it does not revalidate it.
     pub rule_set_revision: String,
+    /// Exact StateFence at which the named read observed this rule set.
+    /// Governor rechecks exact equality with both the gate request and the
+    /// canonical effect envelope before dispatch.
+    pub state_fence: StateFence,
     /// Digest over the delivered pages.
     pub rule_set_digest: String,
     /// The page total, when the read established it.
@@ -324,13 +352,23 @@ impl NegativeMemoryCandidateRead {
     ///
     /// # Errors
     ///
-    /// Returns [`NegativeMemoryViolation`] for a blank handle, a malformed
-    /// digest or revision, a duplicated page ordinal or reference, a page
-    /// ordinal of zero, an unknown page total, or complete coverage that still
-    /// omits a required page.
+    /// Returns [`NegativeMemoryViolation`] for a blank handle, malformed
+    /// digest or revision, duplicate page references or ordinals, a zero or
+    /// out-of-range ordinal, an inconsistent known page total, complete
+    /// coverage with a missing reference, or a known total without missing
+    /// references whose delivered ordinals do not cover `1..=N`. An unknown
+    /// total is accepted as incomplete enumeration evidence.
+    ///
+    /// Non-empty missing references also remain incomplete enumeration
+    /// evidence; this contract does not infer their ordinals from their names.
     pub fn validate(&self) -> Result<(), NegativeMemoryViolation> {
         read_text("matcher.read.read_handle", &self.read_handle)?;
         read_text("matcher.read.rule_set_revision", &self.rule_set_revision)?;
+        check_fence(&self.state_fence).map_err(|_| {
+            NegativeMemoryViolation::BindingInconsistent {
+                field: "matcher.read.state_fence",
+            }
+        })?;
         if !is_hex64_lower(&self.rule_set_digest) {
             return Err(NegativeMemoryViolation::NotADigest {
                 field: "matcher.read.rule_set_digest",
@@ -361,14 +399,16 @@ impl NegativeMemoryCandidateRead {
             ordinals.push(delivered.page_ordinal);
             refs.push(&delivered.page_ref);
         }
+        let mut missing_refs: Vec<&str> = Vec::with_capacity(self.missing_page_refs.len());
         for absent in &self.missing_page_refs {
             read_text("matcher.read.missing_page_refs", absent)?;
-            if refs.contains(&absent.as_str()) {
+            if refs.contains(&absent.as_str()) || missing_refs.contains(&absent.as_str()) {
                 return Err(NegativeMemoryViolation::DuplicateMember {
                     field: "matcher.read.missing_page_refs",
                     member: absent.clone(),
                 });
             }
+            missing_refs.push(absent);
         }
         if matches!(self.coverage, FailureCoverage::Complete) && !self.missing_page_refs.is_empty()
         {
@@ -376,12 +416,29 @@ impl NegativeMemoryCandidateRead {
                 field: "matcher.read.coverage",
             });
         }
-        if let DeclaredPageTotal::Known { page_total } = self.declared_page_total
-            && page_total as usize != self.delivered_pages.len() + self.missing_page_refs.len()
-        {
-            return Err(NegativeMemoryViolation::BindingInconsistent {
-                field: "matcher.read.declared_page_total",
-            });
+        if let DeclaredPageTotal::Known { page_total } = self.declared_page_total {
+            if page_total as usize != self.delivered_pages.len() + self.missing_page_refs.len() {
+                return Err(NegativeMemoryViolation::BindingInconsistent {
+                    field: "matcher.read.declared_page_total",
+                });
+            }
+            if ordinals.iter().any(|ordinal| *ordinal > page_total) {
+                return Err(NegativeMemoryViolation::BindingInconsistent {
+                    field: "matcher.read.page_ordinal",
+                });
+            }
+            if self.missing_page_refs.is_empty() {
+                ordinals.sort_unstable();
+                if ordinals
+                    .iter()
+                    .enumerate()
+                    .any(|(index, ordinal)| *ordinal as usize != index + 1)
+                {
+                    return Err(NegativeMemoryViolation::BindingInconsistent {
+                        field: "matcher.read.page_ordinals",
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1222,6 +1279,12 @@ fn compare_environment_identities(
         ),
         scope(
             ComparedScopeSource::AffectedEnvironment,
+            "environment_revision",
+            &text_value(&recorded.environment_revision),
+            &text_value(&observed.environment_revision),
+        ),
+        scope(
+            ComparedScopeSource::AffectedEnvironment,
             "platform",
             &text_value(&recorded.platform),
             &text_value(&observed.platform),
@@ -1263,31 +1326,51 @@ fn compare_resources(
     subject: &[NegativeMemoryResource],
     recorded: &[NegativeMemoryResource],
 ) -> Vec<ScopeComparison> {
-    recorded
-        .iter()
-        .map(|resource| {
-            let observed = subject.iter().find(|candidate| {
-                candidate.kind == resource.kind && candidate.resource_id == resource.resource_id
-            });
-            let relation = match observed {
-                None => IdentityRelation::Unresolved,
-                Some(found) if found.resource_digest == resource.resource_digest => {
+    let mut matched_subject = vec![false; subject.len()];
+    let mut comparisons = Vec::with_capacity(recorded.len() + subject.len());
+
+    for resource in recorded {
+        let found = subject.iter().enumerate().find(|(_, candidate)| {
+            candidate.kind == resource.kind && candidate.resource_id == resource.resource_id
+        });
+        let (observed_value, relation) = match found {
+            None => (FailureDimensionValue::Missing, IdentityRelation::Unresolved),
+            Some((index, found)) => {
+                matched_subject[index] = true;
+                let relation = if found.resource_digest == resource.resource_digest {
                     IdentityRelation::ExactIdentity
-                }
-                Some(_) => IdentityRelation::DistinctIdentity,
-            };
-            let observed_value = observed.map_or(FailureDimensionValue::Missing, |found| {
-                FailureDimensionValue::Digest(found.resource_digest.clone())
-            });
-            ScopeComparison {
-                source: ComparedScopeSource::AffectedResource,
-                field: resource_field_name(resource),
-                recorded: FailureDimensionValue::Digest(resource.resource_digest.clone()),
-                observed: observed_value,
-                relation,
+                } else {
+                    IdentityRelation::DistinctIdentity
+                };
+                (
+                    FailureDimensionValue::Digest(found.resource_digest.clone()),
+                    relation,
+                )
             }
-        })
-        .collect()
+        };
+        comparisons.push(ScopeComparison {
+            source: ComparedScopeSource::AffectedResource,
+            field: resource_field_name(resource),
+            recorded: FailureDimensionValue::Digest(resource.resource_digest.clone()),
+            observed: observed_value,
+            relation,
+        });
+    }
+
+    for (index, resource) in subject.iter().enumerate() {
+        if matched_subject[index] {
+            continue;
+        }
+        comparisons.push(ScopeComparison {
+            source: ComparedScopeSource::AffectedResource,
+            field: resource_field_name(resource),
+            recorded: FailureDimensionValue::Missing,
+            observed: FailureDimensionValue::Digest(resource.resource_digest.clone()),
+            relation: IdentityRelation::DistinctIdentity,
+        });
+    }
+
+    comparisons
 }
 
 fn resource_field_name(resource: &NegativeMemoryResource) -> String {
