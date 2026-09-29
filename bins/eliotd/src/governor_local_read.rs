@@ -20,6 +20,13 @@
 //! [`serve_admitted_local_read`] remains the query-only local twin
 //! ([`KernelContextReadClient::execute_local_read`] over
 //! [`LocalReadPort::evidence_query`]) and returns the exact evidence record.
+//! The one other production edge out of the same poller is
+//! [`crate::context_reconstruction_route`], which serves the already-admitted
+//! `eliot.query` whose intent mode is `context_reconstruction` locally instead
+//! of forwarding it, because that intent needs the seven-role closure rather
+//! than one `GetEvidencePack`; it lives in its own module because it binds a
+//! different identity closure, and neither this module nor the campaign
+//! packet lane may reinterpret a reconstruction.
 //!
 //! Query is fully live (`Verification` + `GetEvidencePack`); projection
 //! inputs stay port-shape fail-closed `Unavailable` until MGR04 (#19)

@@ -3339,7 +3339,7 @@ async fn run_local_read_poll(
     // forwarded path byte-identical.
     if eliotd::is_context_reconstruction_query(&envelope, &tool) {
         let body = Box::pin(eliotd::serve_context_reconstruction(
-            &kernel, &envelope, &tool, &attempt,
+            kernel, &envelope, &tool, &attempt,
         ))
         .await
         .map_err(|error| format!("daemon context reconstruction: {error}"))?;
