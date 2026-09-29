@@ -1069,6 +1069,27 @@ fn installed_route_stage(
     }
 }
 
+/// The raw readback handles a retained finish decision actually carries.
+///
+/// The parked record must retain the evidence handles an operator needs for
+/// forensic readback, and it may not invent one: these are the decision's own
+/// derived artifact/verifier bindings, which `eliot-canonical` assembles from
+/// rehydrated evidence and `FinishDecisionReceipt::validate()` already checks
+/// for internal consistency. A decision that carries no binding therefore
+/// retains an empty handle set, which is a recorded absence rather than a
+/// fabricated log reference.
+fn product_proof_raw_log_refs(receipt: Option<&FinishDecisionReceipt>) -> Vec<String> {
+    receipt.map_or_else(Vec::new, |receipt| {
+        receipt
+            .decision
+            .proof
+            .artifact_and_verifier_bindings
+            .iter()
+            .cloned()
+            .collect()
+    })
+}
+
 /// Re-derives the evidence an unobserved product proof is still missing.
 ///
 /// This is computed from the record's own retained stage and the plan's
@@ -5051,12 +5072,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let observed = receipts
             .iter()
             .find(|receipt| receipt.decision.outcome == FinishDecisionOutcome::VerifiedComplete);
+        // The readback handles are bound to a local first: the stage inputs
+        // borrow them, so the record must not hold a reference into a
+        // temporary that ends with this statement.
+        let raw_log_refs = product_proof_raw_log_refs(observed);
         let inputs = eliot_finish::product_proof::ProductProofStageInputs {
             finish_authority_ref: &finish_authority_ref,
             proof_ceiling: PRODUCT_PROOF_CEILING,
             decision_receipt_digest: observed.map(|receipt| receipt.receipt_digest.as_str()),
             runtime_receipt_ref: None,
-            raw_log_refs: &[],
+            raw_log_refs: &raw_log_refs,
             executable: Some(executable),
             environment: Some(environment),
         };
