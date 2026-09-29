@@ -264,6 +264,30 @@ impl KernelComposition {
     /// Host's installer-pinned path/digest and its token must prove enabled
     /// INTERACTIVE membership plus an active OS-observed session.
     #[cfg(windows)]
+    fn user_broker_peer_profile(&self) -> Result<Option<NamedPipePeerProfile>, KernelBuildError> {
+        let (Some(path), Some(digest)) = (
+            self.user_broker_executable_path.as_deref(),
+            self.user_broker_artifact_sha256.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let (pinned_path, file_identity) =
+            eliot_platform_windows::validate_pinned_artifact_with_identity(path, digest)
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        let expectation = NamedPipePeerExpectation::new_for_interactive_dynamic_process(
+            pinned_path.to_string_lossy().into_owned(),
+            WindowsFileIdentity {
+                volume_serial_number: file_identity.volume_serial_number,
+                file_index: file_identity.file_index,
+            },
+        )
+        .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        NamedPipePeerProfile::new(NamedPipePeerKind::UserBroker, expectation, None)
+            .map(Some)
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+    }
+
+    #[cfg(windows)]
     fn front_door_peer_set_inner(
         &self,
         host_expectation: &NamedPipePeerExpectation,
@@ -361,25 +385,8 @@ impl KernelComposition {
             );
         }
 
-        if let (Some(path), Some(digest)) = (
-            self.user_broker_executable_path.as_deref(),
-            self.user_broker_artifact_sha256.as_deref(),
-        ) {
-            let (pinned_path, file_identity) =
-                eliot_platform_windows::validate_pinned_artifact_with_identity(path, digest)
-                    .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
-            let expectation = NamedPipePeerExpectation::new_for_interactive_dynamic_process(
-                pinned_path.to_string_lossy().into_owned(),
-                WindowsFileIdentity {
-                    volume_serial_number: file_identity.volume_serial_number,
-                    file_index: file_identity.file_index,
-                },
-            )
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
-            entries.push(
-                NamedPipePeerProfile::new(NamedPipePeerKind::UserBroker, expectation, None)
-                    .map_err(|error| KernelBuildError::Principal(error.to_string()))?,
-            );
+        if let Some(profile) = self.user_broker_peer_profile()? {
+            entries.push(profile);
         }
 
         // The Watchdog is an SCM-owned sibling of the Host service, so the
