@@ -43,7 +43,8 @@ pub use eliot_agent_bridge_core::{
 };
 use eliot_contracts::{
     BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
-    BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
+    BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION,
+    BRIDGE_RECOVERY_RESUME_OR_OPEN_SELECTOR_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
     BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
     BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
     BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
@@ -1871,6 +1872,19 @@ fn decode_page_events(
             ));
         }
         let staging_connection = recovery_text(item, "staging_connection")?;
+        // Preserve only an owner-supplied, typed class. Legacy rows (and
+        // explicit JSON null) remain unknown; delivery policy is never
+        // inferred from the phase.
+        let delivery_class = match item.get("delivery_class") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(serde_json::from_value::<DeliveryClass>(value.clone()).map_err(
+                |_| {
+                    event_shape_failure(
+                        "reconciliation refused: page event carries an unsupported delivery class",
+                    )
+                },
+            )?),
+        };
         let mut fact = RecoveredEventFact::checked(
             stream_id.to_owned(),
             event_id,
@@ -1882,6 +1896,11 @@ fn decode_page_events(
             staging_connection,
         )
         .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?;
+        if let Some(delivery_class) = delivery_class {
+            fact = fact.with_delivery_class(delivery_class).map_err(|_| {
+                event_shape_failure("reconciliation refused: malformed page event delivery class")
+            })?;
+        }
         let (source, source_unavailable) = decode_recovered_source_projection(item, budget)?;
         if let Some(source) = source {
             fact = fact.with_source_projection(source).map_err(|_| {
@@ -2171,6 +2190,7 @@ fn validate_recovery_window_identity_and_reply_shape(
     disposition: BridgeRecoveryWindowDisposition,
     window_status: RecoveryWindowStatus,
     unresolved: &BridgeRecoveryUnresolvedFrontier,
+    expected_scope: Option<&BridgeRecoverySelector>,
     expected: Option<&RecoveryReadRequest>,
 ) -> Result<Option<ReconciliationPortOutcome>, ProviderFailure> {
     let legacy_denial = decode_recovery_window_identity_version(
@@ -2187,7 +2207,13 @@ fn validate_recovery_window_identity_and_reply_shape(
         unresolved,
     )?;
     if let Some(legacy_denial) = legacy_denial {
-        check_expected_continuation(reconciliation, &[], expected)?;
+        check_expected_continuation(
+            reconciliation,
+            &[],
+            expected_scope,
+            expected,
+            window_status,
+        )?;
         return Ok(Some(legacy_denial));
     }
     Ok(None)
@@ -2210,6 +2236,7 @@ fn decode_reconciliation_outcome(
     facts: &BridgeEventTransportFacts,
     value: &serde_json::Value,
     consumed_frontiers: Vec<ReconciliationConsumedFrontier>,
+    expected_scope: Option<&BridgeRecoverySelector>,
     expected: Option<&RecoveryReadRequest>,
 ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
     if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -2244,6 +2271,7 @@ fn decode_reconciliation_outcome(
         disposition,
         window_status,
         &unresolved,
+        expected_scope,
         expected,
     )? {
         return Ok(legacy_denial);
@@ -2261,7 +2289,13 @@ fn decode_reconciliation_outcome(
     let key = verify_reconcile_key(reconciliation)?;
     decode_handoff_maintenance_pressure(reconciliation)?;
     let handoffs_reconciled = decode_handoffs_reconciled(reconciliation)?;
-    check_expected_continuation(reconciliation, &stream_facts, expected)?;
+    check_expected_continuation(
+        reconciliation,
+        &stream_facts,
+        expected_scope,
+        expected,
+        window_status,
+    )?;
     check_recovery_page_ordinals(reconciliation, expected, window_status)?;
     let receipt_ref = reconciliation_receipt_ref(&key)?;
     let presenting_connection = ConnectionId::new(identity.connection_echo).map_err(|_| {
@@ -3099,6 +3133,16 @@ fn check_finite_page_end(
     Ok(())
 }
 
+/// A full-window event walk starts immediately before the retained interval.
+/// ORS's producer ack cursor is a separate fact and can be ahead of retained
+/// events, so it cannot stand in for a traversal predecessor.
+fn full_window_predecessor(page: &RecoveredStreamFacts) -> Result<u64, ProviderFailure> {
+    let cut = page
+        .recovery_cut()
+        .ok_or_else(|| event_shape_failure("reconciliation refused: finite owner cut absent"))?;
+    Ok(cut.retention_floor().saturating_sub(1))
+}
+
 /// Owner-list positions and gap offsets prove that the returned page itself
 /// advances in the requested direction; an echoed selector alone does not.
 fn check_recovery_page_ordinals(
@@ -3176,7 +3220,7 @@ fn check_recovery_page_ordinals(
 
 /// Checks an answer that carried NO continuation request: any selector in the
 /// answer is unsolicited and refused, and every returned page is instead
-/// checked against the current acknowledged cursor.
+/// checked from the start of its retained interval.
 fn check_unsolicited_continuation(
     reconciliation: &serde_json::Value,
     stream_facts: &[RecoveredStreamFacts],
@@ -3193,7 +3237,7 @@ fn check_unsolicited_continuation(
         ));
     }
     for page in stream_facts {
-        check_finite_page_end(page, page.acked_cursor())?;
+        check_finite_page_end(page, full_window_predecessor(page)?)?;
     }
     Ok(())
 }
@@ -3201,12 +3245,32 @@ fn check_unsolicited_continuation(
 fn check_expected_continuation(
     reconciliation: &serde_json::Value,
     stream_facts: &[RecoveredStreamFacts],
+    expected_scope: Option<&BridgeRecoverySelector>,
     expected: Option<&RecoveryReadRequest>,
+    window_status: RecoveryWindowStatus,
 ) -> Result<(), ProviderFailure> {
     let requested = reconciliation
         .get("requested_recovery_scope")
         .ok_or_else(|| event_shape_failure("reconciliation refused: requested selector absent"))?;
     let Some(request) = expected else {
+        if let Some(scope) = expected_scope {
+            let exact_value = serde_json::to_value(scope).map_err(|_| {
+                event_shape_failure("reconciliation refused: requested selector is not encodable")
+            })?;
+            if requested != &exact_value
+                || reconciliation.get("selected_scope") != Some(&exact_value)
+            {
+                return Err(event_shape_failure(
+                    "recovery selection refused: owner selected a foreign scope",
+                ));
+            }
+            if window_status == RecoveryWindowStatus::Active {
+                for page in stream_facts {
+                    check_finite_page_end(page, full_window_predecessor(page)?)?;
+                }
+            }
+            return Ok(());
+        }
         return check_unsolicited_continuation(reconciliation, stream_facts);
     };
     let exact = recovery_scope_value(request)?;
@@ -3227,7 +3291,7 @@ fn check_expected_continuation(
     }
     if request.is_resume() {
         for page in stream_facts {
-            check_finite_page_end(page, page.acked_cursor())?;
+            check_finite_page_end(page, full_window_predecessor(page)?)?;
         }
         return Ok(());
     }
@@ -3271,7 +3335,7 @@ fn check_expected_continuation(
             ));
         }
         for page in stream_facts {
-            check_finite_page_end(page, page.acked_cursor())?;
+            check_finite_page_end(page, full_window_predecessor(page)?)?;
         }
         if reconciliation
             .get("stream_list_continuation")
@@ -4018,14 +4082,18 @@ impl KernelMcpForwardingPort {
         consumed_frontiers: &[ReconciliationConsumedFrontier],
         correlation: &str,
         preserve_offer_on_unknown: bool,
+        recovery_scope: &BridgeRecoverySelector,
     ) -> Result<ReconciliationAttempt, ProviderFailure> {
         let now_ms = bridge_event_unix_ms()?;
+        let recovery_scope_value =
+            serde_json::to_value(recovery_scope).map_err(|_| event_transport_failure())?;
         let frame = bridge_event_frame_for_operation(
             correlation,
             facts,
             serde_json::json!({
                 "operation": BridgeEventMethod::Reconcile.kernel_operation(),
                 "consumed": consumed,
+                "recovery_scope": recovery_scope_value,
             }),
             now_ms,
         )?;
@@ -4051,6 +4119,7 @@ impl KernelMcpForwardingPort {
             facts,
             &value,
             consumed_frontiers.to_vec(),
+            Some(recovery_scope),
             None,
         ) {
             Ok(outcome) => outcome,
@@ -4249,6 +4318,9 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             binding.activation_generation().get(),
         )?;
         let correlation = format!("bridge-reconcile:{}", facts.connection_id);
+        let recovery_scope = BridgeRecoverySelector::ResumeOrOpen {
+            version: BRIDGE_RECOVERY_RESUME_OR_OPEN_SELECTOR_VERSION,
+        };
         let first = self.reconcile_external_attempt(
             binding,
             &facts,
@@ -4256,6 +4328,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             &consumed_frontiers,
             &correlation,
             false,
+            &recovery_scope,
         )?;
         let final_attempt = if first.continuation_pending {
             let followup_correlation = format!("{correlation}:maintenance:1");
@@ -4266,6 +4339,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 &consumed_frontiers,
                 &followup_correlation,
                 true,
+                &recovery_scope,
             )?;
             if followup.window_status != RecoveryWindowStatus::Active {
                 return Err(ProviderFailure::new(
@@ -4358,7 +4432,14 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         )?;
         let reply = self.exchange(&frame)?;
         let value = decode_bridge_event_reply(&reply, &frame)?;
-        decode_reconciliation_outcome(binding, &facts, &value, Vec::new(), Some(request))
+        decode_reconciliation_outcome(
+            binding,
+            &facts,
+            &value,
+            Vec::new(),
+            None,
+            Some(request),
+        )
     }
 
     /// Jointly commits the transport half of one validated reconciliation
