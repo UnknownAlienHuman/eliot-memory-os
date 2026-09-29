@@ -5249,9 +5249,11 @@ impl KernelStoreGateway {
             )) => Ok((
                 wake,
                 UserAutomationExecutionPhase::UnknownOutcome {
-                    reason: format!("occurrence {occurrence_id} did not return a settled Durable \
+                    reason: format!(
+                        "occurrence {occurrence_id} did not return a settled Durable \
                                      Job disposition and must be reconciled under this occurrence \
-                                     identity: {error}"),
+                                     identity: {error}"
+                    ),
                 },
             )),
             Err(UserAutomationExecutionError::Runtime(
