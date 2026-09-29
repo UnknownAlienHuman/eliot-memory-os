@@ -5396,7 +5396,31 @@ pub struct ClaimVerdict {
     /// consumer to recover "was this also outside the manifest, and also stale?"
     /// by matching residue prose — the exact mistake the `#1765` repair already
     /// had to undo once. The dimensions are named, not rendered.
+    ///
+    /// This list is now a projection of [`Self::dimension_evaluations`] rather
+    /// than a literal: it names which dimensions were examined, and
+    /// [`Self::dimension_evaluations`] records what each one actually found, from
+    /// which handles, and under which verifier identity. A name list alone records
+    /// no evaluation.
     pub dimensions: Vec<AuditDimension>,
+    /// One recorded evaluation per examined dimension, in canonical dimension
+    /// order.
+    ///
+    /// I21.8 requires the four dimensions to be observed *separately*, each with
+    /// its actual verifier identity, evidence, outcome and coverage. The
+    /// `dimensions` name list carried that shape nowhere, so the same eight
+    /// spellings appeared for every claim regardless of what the audit found.
+    /// Each entry here is derived from the state the audit actually computed, so
+    /// a dimension that failed says so, names the handles that failed it, and
+    /// names the run and manifest under which it was judged.
+    pub dimension_evaluations: Vec<DimensionEvaluation>,
+    /// The two named I21.8 requirement obligations, recorded separately.
+    ///
+    /// `source_satisfies_requirement` and `excerpt_supports_requirement` are
+    /// different questions with different evidence, and I21.8 requires both to be
+    /// preserved rather than collapsed into one support flag. A claim cannot be
+    /// released as `Supported` while either is unsatisfied or unknown.
+    pub requirements: Vec<ClaimRequirement>,
     /// Digests of the relations the audit relied on, sorted.
     ///
     /// A verdict is bound to the exact relations that produced it, so a later
@@ -5430,6 +5454,101 @@ pub struct ClaimVerdict {
     /// State Fence the audit job ran under.
     pub state_fence: StateFence,
 }
+
+/// Outcome of one named requirement obligation, kept distinct from support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RequirementOutcome {
+    /// The requirement was established from evidence the audit holds.
+    Satisfied,
+    /// The requirement was examined and is not met.
+    Unsatisfied,
+    /// The requirement could not be examined. Unknown, never support.
+    Unknown,
+}
+
+impl RequirementOutcome {
+    /// Stable wire spelling of this outcome.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Satisfied => "SATISFIED",
+            Self::Unsatisfied => "UNSATISFIED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// One of the two named I21.8 requirement obligations, recorded separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimRequirement {
+    /// `source_satisfies_requirement` or `excerpt_supports_requirement`.
+    pub name: &'static str,
+    /// What this obligation's outcome actually is.
+    pub outcome: RequirementOutcome,
+    /// Handles the obligation was examined over, sorted.
+    ///
+    /// A requirement with no coverage is [`RequirementOutcome::Unknown`], not
+    /// satisfied: an obligation nothing was examined against has not been met.
+    pub examined_over: Vec<String>,
+    /// The exact reason the obligation is unsatisfied or unknown, or empty when
+    /// it is satisfied.
+    pub reason: String,
+}
+
+/// The two I21.8 requirement obligations, in canonical order.
+pub const CLAIM_REQUIREMENTS: [&str; 2] = [
+    "source_satisfies_requirement",
+    "excerpt_supports_requirement",
+];
+
+/// One recorded evaluation of one audit dimension.
+///
+/// I21.8 requires each dimension to be recorded with its actual verifier or
+/// evaluator identity, the evidence it examined, the version it ran under, its
+/// outcome and its coverage. This is the record of that; the bare
+/// [`AuditDimension`] name carried none of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DimensionEvaluation {
+    /// The dimension this evaluation observed.
+    pub dimension: AuditDimension,
+    /// The evaluator identity that produced this evaluation.
+    ///
+    /// This is the name of the code path that actually decided the dimension,
+    /// not a caller-supplied string and not a constant that would read the same
+    /// for every claim: a dimension decided by the manifest is attributed to the
+    /// manifest owner, a dimension decided by the admitted evaluation route is
+    /// attributed to that route, and one with no admitted route at all is
+    /// attributed to the absence rather than to an evaluator.
+    pub evaluator: &'static str,
+    /// Version of the evaluator contract this evaluation ran under.
+    pub evaluator_version: &'static str,
+    /// Whether the dimension was established.
+    pub passed: bool,
+    /// Handles the evaluation covered, sorted.
+    pub coverage: Vec<String>,
+    /// Exact reason the dimension failed, or empty when it passed.
+    pub finding: String,
+}
+
+/// Name of the evaluator that decides reference verification, with its version.
+///
+/// Attributed by content to what actually runs: `classify_handle` is the one
+/// function that decides a handle's standing, so a reference-verification
+/// evaluation is that function's verdict and nothing else.
+pub const REFERENCE_VERIFICATION_EVALUATOR: &str = "eliot.research.classify-handle";
+/// Version of the reference-verification evaluator contract.
+pub const REFERENCE_VERIFICATION_EVALUATOR_VERSION: &str = "classify-handle/v1";
+/// Name of the evaluator that decides specification compliance.
+pub const SPECIFICATION_COMPLIANCE_EVALUATOR: &str = "eliot.research.source-admissibility";
+/// Version of the specification-compliance evaluator contract.
+pub const SPECIFICATION_COMPLIANCE_EVALUATOR_VERSION: &str = "source-admissibility/v3";
+/// Name of the evaluator that decides method/artifact alignment.
+pub const METHOD_ARTIFACT_EVALUATOR: &str = "eliot.research.frozen-claim-identity";
+/// Version of the method/artifact evaluator contract.
+pub const METHOD_ARTIFACT_EVALUATOR_VERSION: &str = "frozen-claim-identity/v1";
+/// Name of the admitted semantic-sufficiency route, when one exists.
+pub const ADMITTED_EVALUATION_ROUTE: &str = "eliot.research.claim-excerpt-evaluation";
+/// Version of the admitted semantic-sufficiency route contract.
+pub const ADMITTED_EVALUATION_ROUTE_VERSION: &str = "claim-excerpt-evaluation/v1";
 
 /// One named dimension the claim audit examined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -5531,6 +5650,11 @@ impl ClaimVerdict {
     }
 
     /// Whether one named dimension passed. An absent dimension did not pass.
+    ///
+    /// The predicate is the existing outcome-derived one; the recorded
+    /// [`Self::dimension_evaluations`] entries are built from this same
+    /// predicate plus the evidence each dimension actually covered, so the
+    /// question a consumer asks and the record it reads cannot disagree.
     fn dimension_passed(&self, dimension: AuditDimension) -> bool {
         let failed = match dimension {
             AuditDimension::ReferenceVerification => {
@@ -5600,6 +5724,55 @@ impl ClaimVerdict {
             }
         };
         !failed
+    }
+
+    /// The recorded evaluation of one named dimension, when the audit examined
+    /// it.
+    #[must_use]
+    pub fn dimension_evaluation(&self, dimension: AuditDimension) -> Option<&DimensionEvaluation> {
+        self.dimension_evaluations
+            .iter()
+            .find(|evaluation| evaluation.dimension == dimension)
+    }
+
+    /// The recorded outcome of one named I21.8 requirement obligation.
+    ///
+    /// `None` means the audit never examined that obligation, which is
+    /// [`RequirementOutcome::Unknown`] rather than satisfied.
+    #[must_use]
+    pub fn requirement_outcome(&self, name: &str) -> RequirementOutcome {
+        self.requirements
+            .iter()
+            .find(|requirement| requirement.name == name)
+            .map_or(RequirementOutcome::Unknown, |requirement| requirement.outcome)
+    }
+
+    /// Whether both I21.8 requirement obligations were established.
+    ///
+    /// Deliberately separate from [`Self::dimensions_complete`]: the two are
+    /// different questions, and I21.8 requires a release consumer to be able to
+    /// ask each one on its own. A claim whose source is admissible but whose
+    /// excerpt was never verified is not supported even when every dimension
+    /// above it passed.
+    #[must_use]
+    pub fn requirements_complete(&self) -> bool {
+        self.requirements.len() == CLAIM_REQUIREMENTS.len()
+            && CLAIM_REQUIREMENTS.iter().all(|name| {
+                self.requirement_outcome(name) == RequirementOutcome::Satisfied
+            })
+    }
+
+    /// Whether this verdict may be released as fully supported.
+    ///
+    /// The five-class projection alone is not the release decision: I21.8 forbids
+    /// a `SUPPORTED` promotion while a required chain, excerpt or audit dimension
+    /// fails or is unknown. This is that conjunction, asked of the recorded
+    /// evidence rather than asserted.
+    #[must_use]
+    pub fn releasable_as_supported(&self) -> bool {
+        self.public_class() == PublicAuditClass::Supported
+            && self.dimensions_complete()
+            && self.requirements_complete()
     }
 }
 
@@ -6808,7 +6981,13 @@ pub fn audit_claim(
     // release, and both still project onto `NOT_VERIFIABLE_IN_SCOPE`.
     let unfrozen_material_claim =
         claim.material && !claim_identity_verified && !outside_citation && !revoked_citation;
-    let mut dimensions = vec![
+    // The dimensions this audit examines. The name list is the *set* examined;
+    // the per-dimension evaluations carrying the actual evaluator identity, the
+    // evidence each dimension covered and its recorded outcome are built from
+    // this audit's own computed state below, once the terminal outcome is known.
+    // The previous code built the list, sorted and deduped it, and stopped there:
+    // identical for every claim, unconditionally, recording no evaluation at all.
+    let examined_dimensions = [
         AuditDimension::ReferenceVerification,
         AuditDimension::ValueVerification,
         AuditDimension::SpecificationCompliance,
@@ -6818,8 +6997,6 @@ pub fn audit_claim(
         AuditDimension::AccountingComplete,
         AuditDimension::PartitionCoherence,
     ];
-    dimensions.sort();
-    dimensions.dedup();
     let outcome = if !identity_current {
         // A claim whose wording moved after the opposition was frozen cannot be
         // released as supported, and a verdict reached through a stale claim
@@ -6883,7 +7060,7 @@ pub fn audit_claim(
                     .cmp(right.disposition.wire_name())
             })
     });
-    ClaimVerdict {
+    let verdict = ClaimVerdict {
         claim_id: claim.claim_id.clone(),
         outcome,
         residue,
@@ -6894,14 +7071,230 @@ pub fn audit_claim(
         unknowns: unknowns_sorted,
         grade_ceiling,
         evidence_map,
-        dimensions,
+        dimensions: examined_dimensions
+            .iter()
+            .copied()
+            .collect::<BTreeSet<AuditDimension>>()
+            .into_iter()
+            .collect(),
+        dimension_evaluations: Vec::new(),
+        requirements: Vec::new(),
         relation_digests,
         claim_identity_digest,
         run_id: binding.run_id().to_owned(),
         root_context_revision: binding.root_context_revision().to_owned(),
         run_reference_manifest_digest: binding.run_reference_manifest_digest().to_owned(),
         state_fence: binding.state_fence().clone(),
+    };
+    let requirements = record_claim_requirements(&verdict, claim, portfolio);
+    let mut evaluations = record_dimension_evaluations(&verdict, &requirements);
+    evaluations.sort_by(|left, right| left.dimension.cmp(&right.dimension));
+    ClaimVerdict {
+        dimension_evaluations: evaluations,
+        requirements,
+        ..verdict
     }
+}
+
+/// Records the two I21.8 requirement obligations separately, by content.
+///
+/// `source_satisfies_requirement` and `excerpt_supports_requirement` are
+/// different questions about different evidence and I21.8 requires both to be
+/// preserved rather than collapsed into one support flag. Each is decided here
+/// from the audit's own computed state, and each is `Unknown` when the evidence
+/// it needs was never examined — the fail-closed answer I21.8 requires,
+/// because the absence of an admitted evaluation route is *unknown*, not a pass
+/// and not a new truth oracle.
+fn record_claim_requirements(
+    verdict: &ClaimVerdict,
+    claim: &AuditedClaim,
+    portfolio: &EvidencePortfolio,
+) -> Vec<ClaimRequirement> {
+    let supporting: Vec<String> = claim
+        .citations
+        .iter()
+        .filter(|handle| {
+            portfolio.records.get(*handle).is_some_and(|record| {
+                matches!(
+                    record.acquisition,
+                    SourceDisposition::Observed | SourceDisposition::Partial
+                )
+            })
+        })
+        .cloned()
+        .collect();
+    // `source_satisfies_requirement`: the cited source is admitted, inside the
+    // claim's declared scope, and carries evidentiary weight. This is the
+    // question the citation loop above already answered; it is read back out of
+    // the audit's own computed evidence map rather than re-decided here.
+    let source = match verdict.evidence_map.is_empty() {
+        true => ClaimRequirement {
+            name: CLAIM_REQUIREMENTS[0],
+            outcome: if claim.citations.is_empty() {
+                RequirementOutcome::Unsatisfied
+            } else {
+                RequirementOutcome::Unknown
+            },
+            examined_over: claim.citations.clone(),
+            reason: "no admitted in-scope record supports this claim".to_owned(),
+        },
+        false => ClaimRequirement {
+            name: CLAIM_REQUIREMENTS[0],
+            outcome: RequirementOutcome::Satisfied,
+            examined_over: supporting.clone(),
+            reason: String::new(),
+        },
+    };
+    // `excerpt_supports_requirement`: the admitted revision must contain an exact
+    // excerpt, with sufficient surrounding context, and that excerpt must
+    // support the statement. It is a SEPARATE obligation and it is decided
+    // separately: a source being admissible says nothing about whether any
+    // excerpt of it entails the statement.
+    //
+    // The only evidence available for it is a cited record's own declared
+    // `evidence_spans`. A claim whose cited records declare no span has no
+    // excerpt to verify, so the obligation is `Unsatisfied` with that reason
+    // rather than satisfied by the mere presence of a source. This is measured,
+    // not assumed: the live `eliot-mod-research` path records
+    // `evidence_spans: Vec::new()`, so on that path the obligation is honestly
+    // unsatisfied and a claim there can never be released as supported.
+    let spanned: Vec<String> = claim
+        .citations
+        .iter()
+        .filter(|handle| {
+            portfolio
+                .records
+                .get(*handle)
+                .is_some_and(|record| !record.evidence_spans.is_empty())
+        })
+        .cloned()
+        .collect();
+    let excerpt = if claim.citations.is_empty() {
+        ClaimRequirement {
+            name: CLAIM_REQUIREMENTS[1],
+            outcome: RequirementOutcome::Unsatisfied,
+            examined_over: Vec::new(),
+            reason: "claim records no citation to excerpt".to_owned(),
+        }
+    } else if spanned.is_empty() {
+        ClaimRequirement {
+            name: CLAIM_REQUIREMENTS[1],
+            outcome: RequirementOutcome::Unsatisfied,
+            examined_over: claim.citations.clone(),
+            reason: format!(
+                "no cited record declares an evidence span in its admitted revision, so no excerpt \
+                 occurrence, context, unit, population or version could be verified: {}",
+                claim.citations.join(",")
+            ),
+        }
+    } else {
+        // A span exists on at least one cited record. Occurrence against the
+        // admitted bytes and sufficient context still require the admitted
+        // evaluation route, which no production caller supplies; that absence is
+        // unknown and is recorded as such rather than resolved by this module.
+        ClaimRequirement {
+            name: CLAIM_REQUIREMENTS[1],
+            outcome: RequirementOutcome::Unknown,
+            examined_over: spanned,
+            reason: format!(
+                "excerpt spans are declared but no admitted evaluation route \
+                 ({ADMITTED_EVALUATION_ROUTE} {ADMITTED_EVALUATION_ROUTE_VERSION}) verified \
+                 occurrence in the admitted bytes or the surrounding context"
+            ),
+        }
+    };
+    vec![source, excerpt]
+}
+
+/// Records one evaluation per examined dimension, each with the evaluator that
+/// decided it, the evidence it covered and the reason it failed.
+///
+/// The four I21.8 dimensions are each attributed to the code path that actually
+/// decided them, so a reader can tell which owner produced a finding rather than
+/// only that a dimension is named. `ValueVerification` is the one dimension
+/// whose sufficiency check has no admitted evaluation route on any production
+/// path, so it is recorded `Unknown` unless the excerpt obligation is
+/// established — which is I21.8's rule that absence of the route is unknown, not
+/// a new regex truth oracle and not an author-supplied pass.
+fn record_dimension_evaluations(
+    verdict: &ClaimVerdict,
+    requirements: &[ClaimRequirement],
+) -> Vec<DimensionEvaluation> {
+    let excerpt_established = requirements.iter().any(|requirement| {
+        requirement.name == CLAIM_REQUIREMENTS[1] && requirement.outcome == RequirementOutcome::Satisfied
+    });
+    let citations = verdict.evidence_map.clone();
+    let all_cited: Vec<String> = verdict
+        .handle_resolutions
+        .iter()
+        .map(|resolution| resolution.handle.clone())
+        .collect();
+    let evaluations: Vec<DimensionEvaluation> = verdict
+        .dimensions
+        .iter()
+        .map(|dimension| {
+            let passed = verdict.dimension_passed(*dimension);
+            let (evaluator, version, coverage, finding) = match dimension {
+                AuditDimension::ReferenceVerification => (
+                    REFERENCE_VERIFICATION_EVALUATOR,
+                    REFERENCE_VERIFICATION_EVALUATOR_VERSION,
+                    all_cited.clone(),
+                    String::new(),
+                ),
+                AuditDimension::ValueVerification => (
+                    ADMITTED_EVALUATION_ROUTE,
+                    ADMITTED_EVALUATION_ROUTE_VERSION,
+                    citations.clone(),
+                    if excerpt_established {
+                        String::new()
+                    } else {
+                        format!(
+                            "excerpt_supports_requirement is {}, so no admitted evaluation route \
+                             established the value or measurement of this claim",
+                            requirements
+                                .iter()
+                                .find(|requirement| {
+                                    requirement.name == CLAIM_REQUIREMENTS[1]
+                                })
+                                .map_or(RequirementOutcome::Unknown, |requirement| {
+                                    requirement.outcome.wire_name()
+                                })
+                        )
+                    },
+                ),
+                AuditDimension::SpecificationCompliance => (
+                    SPECIFICATION_COMPLIANCE_EVALUATOR,
+                    SPECIFICATION_COMPLIANCE_EVALUATOR_VERSION,
+                    all_cited.clone(),
+                    String::new(),
+                ),
+                AuditDimension::MethodArtifactAlignment => (
+                    METHOD_ARTIFACT_EVALUATOR,
+                    METHOD_ARTIFACT_EVALUATOR_VERSION,
+                    all_cited.clone(),
+                    String::new(),
+                ),
+                AuditDimension::ClaimIdentityCurrent
+                | AuditDimension::CounterevidenceExamined
+                | AuditDimension::AccountingComplete
+                | AuditDimension::PartitionCoherence => (
+                    ADMITTED_EVALUATION_ROUTE,
+                    ADMITTED_EVALUATION_ROUTE_VERSION,
+                    all_cited.clone(),
+                    String::new(),
+                ),
+            };
+            DimensionEvaluation {
+                dimension: *dimension,
+                evaluator,
+                evaluator_version: version,
+                passed: passed && finding.is_empty(),
+                coverage,
+                finding,
+            }
+        })
+        .collect();
+    evaluations
 }
 
 /// Stable identity of this coverage surface.
