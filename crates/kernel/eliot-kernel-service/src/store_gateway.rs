@@ -3306,29 +3306,6 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + ?Sized,
     {
-        let runtime_error = |error: UserAutomationExecutionError| match error {
-            UserAutomationExecutionError::Runtime(runtime) => runtime,
-            // The declared occurrence denominator is unproven, so the answer is
-            // unknown and the durable query handle inside the obligation stays
-            // the caller's route to finish enumerating it. Reporting it as a
-            // refusal would claim the owner decided something it did not.
-            UserAutomationExecutionError::OccurrenceDenominatorIncomplete(obligation) => {
-                UserAutomationRuntimeError::UnknownOutcome(format!(
-                    "occurrence {} has no owner-proven complete occurrence denominator: \
-                     operation_ref={} cause={:?} read_revision={} \
-                     denominator_query_ref={}",
-                    obligation.occurrence_id,
-                    obligation.operation_ref,
-                    obligation.cause,
-                    obligation.read_revision,
-                    obligation
-                        .denominator_query_ref
-                        .as_deref()
-                        .unwrap_or("<none>"),
-                ))
-            }
-            decided => UserAutomationRuntimeError::Rejected(decided.to_string()),
-        };
         let state_fence = &request.context.state_fence;
         let owner = self
             .read_user_automation_owner(&UserAutomationOwnerLookup {
@@ -3354,7 +3331,9 @@ impl KernelStoreGateway {
         // this read only has to prove it still reads the same admitted state.
         // Anything else is a refusal re-derived by the preflight below, not
         // asserted here.
-        let config_snapshot = self.read_user_automation_policy_snapshot(state_fence).await?;
+        let config_snapshot = self
+            .read_user_automation_policy_snapshot(state_fence)
+            .await?;
         let service_request = UserAutomationServiceRequest {
             context: request.context.clone(),
             authenticated_principal: request.authenticated_principal.clone(),
@@ -3384,28 +3363,8 @@ impl KernelStoreGateway {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         let normalization_receipts = self
-            .read_run_now_normalization_receipts(
-                state_fence,
-                &owner.revision.schedule.normalization_receipt,
-            )
-            .await
-            .map_err(|assembly| match assembly {
-                RunNowPreflightAssembly::Unknown(reason) => {
-                    UserAutomationRuntimeError::UnknownOutcome(reason)
-                }
-                RunNowPreflightAssembly::Unavailable(reason) => {
-                    UserAutomationRuntimeError::Unavailable(reason)
-                }
-            })?;
-        if normalization_receipts.is_empty() {
-            return Err(UserAutomationRuntimeError::Unavailable(
-                "no owner-issued schedule normalization receipt envelope is retained under this \
-                 State Fence for the receipt identity the immutable revision names, so the \
-                 compiled occurrence set stays self-asserted and the due occurrence is not \
-                 admitted"
-                    .to_owned(),
-            ));
-        }
+            .read_due_wake_normalization_receipts(state_fence, &owner.revision)
+            .await?;
         // The same live evidence the run-now assembly reads. A due wake issues
         // no provider call before preflight either, so the only honest provider
         // observation here is none — which deterministic mode requires
@@ -3421,18 +3380,19 @@ impl KernelStoreGateway {
             failure: None,
         };
         let source_receipt = &request.preflight.source_receipt;
-        let projection = UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
-            revision: &owner.revision,
-            configuration_state: owner.current_configuration_state,
-            config_snapshot: &config_snapshot,
-            source_receipt,
-            normalization_receipts: &normalization_receipts,
-            execution: &execution,
-            invocation: &resolution.invocation,
-            request_metadata: &request.context,
-            evidence: &evidence,
-        })
-        .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let projection =
+            UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
+                revision: &owner.revision,
+                configuration_state: owner.current_configuration_state,
+                config_snapshot: &config_snapshot,
+                source_receipt,
+                normalization_receipts: &normalization_receipts,
+                execution: &execution,
+                invocation: &resolution.invocation,
+                request_metadata: &request.context,
+                evidence: &evidence,
+            })
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         UserAutomationService::new(&store)
             .execute_occurrence(
@@ -3447,7 +3407,72 @@ impl KernelStoreGateway {
                 runtime,
             )
             .await
-            .map_err(runtime_error)
+            .map_err(Self::due_wake_runtime_error)
+    }
+    /// Reads the retained schedule-normalization envelopes a due occurrence must
+    /// satisfy before its preflight can assemble.
+    ///
+    /// The occurrence is not admitted on a digest: the same owner-issued
+    /// envelopes the run-now leg reads are read here, and an owner that retained
+    /// none leaves this due occurrence unadmitted by name rather than admitted
+    /// on a self-asserted receipt id.
+    async fn read_due_wake_normalization_receipts(
+        &self,
+        state_fence: &StateFence,
+        revision: &UserAutomationRevision,
+    ) -> Result<Vec<eliot_receipts::ReceiptEnvelope>, UserAutomationRuntimeError> {
+        let receipts = self
+            .read_run_now_normalization_receipts(
+                state_fence,
+                &revision.schedule.normalization_receipt,
+            )
+            .await
+            .map_err(|assembly| match assembly {
+                RunNowPreflightAssembly::Unknown(reason) => {
+                    UserAutomationRuntimeError::UnknownOutcome(reason)
+                }
+                RunNowPreflightAssembly::Unavailable(reason) => {
+                    UserAutomationRuntimeError::Unavailable(reason)
+                }
+            })?;
+        if receipts.is_empty() {
+            return Err(UserAutomationRuntimeError::Unavailable(
+                "no owner-issued schedule normalization receipt envelope is retained under this \
+                 State Fence for the receipt identity the immutable revision names, so the \
+                 compiled occurrence set stays self-asserted and the due occurrence is not \
+                 admitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(receipts)
+    }
+
+    /// Maps one due-wake execution failure onto the runtime's typed phases.
+    ///
+    /// The declared occurrence denominator is unproven, so that answer is
+    /// unknown and the durable query handle inside the obligation stays the
+    /// caller's route to finish enumerating it. Reporting it as a refusal would
+    /// claim the owner decided something it did not.
+    fn due_wake_runtime_error(error: UserAutomationExecutionError) -> UserAutomationRuntimeError {
+        match error {
+            UserAutomationExecutionError::Runtime(runtime) => runtime,
+            UserAutomationExecutionError::OccurrenceDenominatorIncomplete(obligation) => {
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "occurrence {} has no owner-proven complete occurrence denominator: \
+                     operation_ref={} cause={:?} read_revision={} \
+                     denominator_query_ref={}",
+                    obligation.occurrence_id,
+                    obligation.operation_ref,
+                    obligation.cause,
+                    obligation.read_revision,
+                    obligation
+                        .denominator_query_ref
+                        .as_deref()
+                        .unwrap_or("<none>"),
+                ))
+            }
+            decided => UserAutomationRuntimeError::Rejected(decided.to_string()),
+        }
     }
 
     /// Requires the live evidence an active **agent** revision still lacks.

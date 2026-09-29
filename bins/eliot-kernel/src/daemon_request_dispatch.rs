@@ -5139,77 +5139,30 @@ impl KernelComposition {
         // overlap policy, an undeclared closure, or a provider policy that does
         // not admit the observed set would have reached the Durable Job owner
         // unchecked. That is the blind rerun I11.12:59 and I14.21 forbid.
-        let execution =
-            match Self::user_automation_due_wake_join(self, client, &request, &resolution, &readback)
-                .await
-            {
-                Ok(outcome) => match outcome {
-                    eliot_kernel_service::UserAutomationExecutionOutcome::Admitted {
-                        execution, ..
-                    } => execution,
-                    // The deterministic preflight decided this occurrence is not
-                    // admitted now, before any owner effect. That is a decided
-                    // disposition about this occurrence, exactly as a Durable Job
-                    // refusal is, so it reaches the same owner-acknowledged arm
-                    // below and is never reported as an admission. The owner's own
-                    // closed reason travels beside it, so a deferral is not
-                    // re-reported as a rejection.
-                    eliot_kernel_service::UserAutomationExecutionOutcome::Deferred {
-                        reason, ..
-                    } => {
-                        return Self::user_automation_due_wake_decided_response(
-                            session,
-                            &resolution,
-                            &occurrence_id,
-                            &request,
-                            &readback,
-                            client,
-                            "deferred",
-                            format!(
-                                "the deterministic preflight deferred occurrence \
-                                 {occurrence_id} with reason {reason:?}, before any model or \
-                                 provider call"
-                            ),
-                        )
-                        .await;
-                    }
-                    eliot_kernel_service::UserAutomationExecutionOutcome::BlockedConfig {
-                        failure, ..
-                    } => {
-                        return Self::user_automation_due_wake_decided_response(
-                            session,
-                            &resolution,
-                            &occurrence_id,
-                            &request,
-                            &readback,
-                            client,
-                            "blocked_config",
-                            format!(
-                                "occurrence {occurrence_id} entered blocked_config under failure \
-                                 fingerprint {} before any model call",
-                                failure.failure_fingerprint
-                            ),
-                        )
-                        .await;
-                    }
-                },
-                // Item 6, terminal leg. A refusal the Durable Job owner answered
-                // before any owner effect is a decided disposition about this
-                // occurrence, exactly as an admission is: the occurrence will not be
-                // admitted now, so leaving the recurring horizon pinned to it would
-                // wedge every later occurrence of the revision behind one
-                // permanently-refused wake. It advances through the same
-                // owner-acknowledged path the admitted branch uses, and it is
-                // reported as its own disposition rather than as a success.
-                //
-                // `Unavailable`, `NotRetained`, `UnknownOutcome` and
-                // `OutcomeSettled` deliberately do not reach this arm: none of them
-                // is an owner-acknowledged disposition about this occurrence. They
-                // respectively mean the owner could not answer, it answered about
-                // another record, it cannot say whether the effect landed, and the
-                // effect provably landed. Those keep the pre-existing fail-closed
-                // projection and do not advance.
-                Err(UserAutomationRuntimeError::Rejected(reason)) => {
+        let execution = match Self::user_automation_due_wake_join(
+            self,
+            client,
+            &request,
+            &resolution,
+            &readback,
+        )
+        .await
+        {
+            Ok(outcome) => match outcome {
+                eliot_kernel_service::UserAutomationExecutionOutcome::Admitted {
+                    execution,
+                    ..
+                } => execution,
+                // The deterministic preflight decided this occurrence is not
+                // admitted now, before any owner effect. That is a decided
+                // disposition about this occurrence, exactly as a Durable Job
+                // refusal is, so it reaches the same owner-acknowledged arm
+                // below and is never reported as an admission. The owner's own
+                // closed reason travels beside it, so a deferral is not
+                // re-reported as a rejection.
+                eliot_kernel_service::UserAutomationExecutionOutcome::Deferred {
+                    reason, ..
+                } => {
                     return Self::user_automation_due_wake_decided_response(
                         session,
                         &resolution,
@@ -5217,18 +5170,72 @@ impl KernelComposition {
                         &request,
                         &readback,
                         client,
-                        "rejected",
-                        reason,
+                        "deferred",
+                        format!(
+                            "the deterministic preflight deferred occurrence \
+                                 {occurrence_id} with reason {reason:?}, before any model or \
+                                 provider call"
+                        ),
                     )
                     .await;
                 }
-                Err(error) => {
-                    // No owner acknowledged a disposition, so the recurring horizon
-                    // does not advance: this wake is still unconsumed and a later
-                    // owner-issued submission can admit it.
-                    return Ok(Self::user_automation_runtime_error_response(error));
+                eliot_kernel_service::UserAutomationExecutionOutcome::BlockedConfig {
+                    failure,
+                    ..
+                } => {
+                    return Self::user_automation_due_wake_decided_response(
+                        session,
+                        &resolution,
+                        &occurrence_id,
+                        &request,
+                        &readback,
+                        client,
+                        "blocked_config",
+                        format!(
+                            "occurrence {occurrence_id} entered blocked_config under failure \
+                                 fingerprint {} before any model call",
+                            failure.failure_fingerprint
+                        ),
+                    )
+                    .await;
                 }
-            };
+            },
+            // Item 6, terminal leg. A refusal the Durable Job owner answered
+            // before any owner effect is a decided disposition about this
+            // occurrence, exactly as an admission is: the occurrence will not be
+            // admitted now, so leaving the recurring horizon pinned to it would
+            // wedge every later occurrence of the revision behind one
+            // permanently-refused wake. It advances through the same
+            // owner-acknowledged path the admitted branch uses, and it is
+            // reported as its own disposition rather than as a success.
+            //
+            // `Unavailable`, `NotRetained`, `UnknownOutcome` and
+            // `OutcomeSettled` deliberately do not reach this arm: none of them
+            // is an owner-acknowledged disposition about this occurrence. They
+            // respectively mean the owner could not answer, it answered about
+            // another record, it cannot say whether the effect landed, and the
+            // effect provably landed. Those keep the pre-existing fail-closed
+            // projection and do not advance.
+            Err(UserAutomationRuntimeError::Rejected(reason)) => {
+                return Self::user_automation_due_wake_decided_response(
+                    session,
+                    &resolution,
+                    &occurrence_id,
+                    &request,
+                    &readback,
+                    client,
+                    "rejected",
+                    reason,
+                )
+                .await;
+            }
+            Err(error) => {
+                // No owner acknowledged a disposition, so the recurring horizon
+                // does not advance: this wake is still unconsumed and a later
+                // owner-issued submission can admit it.
+                return Ok(Self::user_automation_runtime_error_response(error));
+            }
+        };
         if let Err(error) = execution.validate() {
             return Ok(Self::user_automation_runtime_error_response(
                 UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -5323,10 +5330,8 @@ impl KernelComposition {
         request: &UserAutomationRuntimeAdmission,
         resolution: &UserAutomationDueWakeResolution,
         readback: &UserAutomationWakeReadback,
-    ) -> Result<
-        eliot_kernel_service::UserAutomationExecutionOutcome,
-        UserAutomationRuntimeError,
-    > {
+    ) -> Result<eliot_kernel_service::UserAutomationExecutionOutcome, UserAutomationRuntimeError>
+    {
         let gateway = self.retained_store_gateway().map_err(|_| {
             UserAutomationRuntimeError::Unavailable(
                 "canonical UserAutomation Store owner is unavailable".to_owned(),
