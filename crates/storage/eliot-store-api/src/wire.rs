@@ -80,6 +80,7 @@ pub const CAPABILITY_DREAMER_JOB_REQUEST_CANCEL: &str = "store.dreamer_job.reque
 pub const CAPABILITY_DREAMER_JOB_RECONCILE: &str = "store.dreamer_job.reconcile";
 pub const CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY: &str =
     "store.dreamer_job.record_applicability";
+pub const CAPABILITY_DREAMER_JOB_RECORD_ADMISSION: &str = "store.dreamer_job.record_admission";
 
 /// Capabilities advertised by the canonical store process.
 pub const CAPABILITIES: &[&str] = &[
@@ -106,6 +107,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
     CAPABILITY_DREAMER_JOB_RECONCILE,
     CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
+    CAPABILITY_DREAMER_JOB_RECORD_ADMISSION,
     CAPABILITY_STORE_BACKUP,
 ];
 
@@ -131,6 +133,7 @@ pub fn dreamer_job_capability(
         Op::RequestCancel { .. } => CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
         Op::Reconcile { .. } => CAPABILITY_DREAMER_JOB_RECONCILE,
         Op::RecordApplicability { .. } => CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
+        Op::RecordAdmission { .. } => CAPABILITY_DREAMER_JOB_RECORD_ADMISSION,
     }
 }
 

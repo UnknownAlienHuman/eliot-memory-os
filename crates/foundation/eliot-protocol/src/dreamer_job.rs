@@ -22,7 +22,7 @@ use thiserror::Error;
 /// Stable identity of the `DurableJob` control family.
 pub const DURABLE_JOB_CONTRACT_NAME: &str = "eliot.foundation.protocol.durable-job";
 /// Current semantic revision of the `DurableJob` control family.
-pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
+pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 2, 0);
 /// Versioned namespace used when hashing a mutation request.
 pub const DURABLE_JOB_CANONICAL_ENCODING: &str = "eliot.durable-job.canonical.v1";
 /// Maximum bounded text field size in bytes.
@@ -113,6 +113,8 @@ pub enum JobOperationKind {
     Reconcile,
     #[serde(rename = "RECORD_APPLICABILITY")]
     RecordApplicability,
+    #[serde(rename = "RECORD_ADMISSION")]
+    RecordAdmission,
 }
 
 impl JobOperationKind {
@@ -132,6 +134,7 @@ impl JobOperationKind {
             Self::RequestCancel => "REQUEST_CANCEL",
             Self::Reconcile => "RECONCILE_MUTATION",
             Self::RecordApplicability => "RECORD_APPLICABILITY",
+            Self::RecordAdmission => "RECORD_ADMISSION",
         }
     }
 }
@@ -167,6 +170,7 @@ pub enum JobCapability {
     RequestCancel,
     Reconcile,
     RecordApplicability,
+    RecordAdmission,
 }
 
 impl JobRole {
@@ -180,6 +184,7 @@ impl JobRole {
                 JobCapability::RequestCancel,
                 JobCapability::Reconcile,
                 JobCapability::RecordApplicability,
+                JobCapability::RecordAdmission,
             ],
             Self::Worker => &[
                 JobCapability::Lease,
@@ -215,6 +220,7 @@ impl JobRole {
             JobOperationKind::RequestCancel => JobCapability::RequestCancel,
             JobOperationKind::Reconcile => JobCapability::Reconcile,
             JobOperationKind::RecordApplicability => JobCapability::RecordApplicability,
+            JobOperationKind::RecordAdmission => JobCapability::RecordAdmission,
         };
         self.capabilities().contains(&capability)
     }
@@ -387,6 +393,9 @@ fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
         }
         JobOperation::RecordApplicability { update } => {
             serde_json::json!({ "operation": "RECORD_APPLICABILITY", "update": update })
+        }
+        JobOperation::RecordAdmission { update } => {
+            serde_json::json!({ "operation": "RECORD_ADMISSION", "update": update })
         }
     }
 }
@@ -1007,6 +1016,317 @@ impl JobOutputApplicabilityRevision {
     }
 }
 
+/// Canonical I14.20 work-admission state.  This axis is deliberately a
+/// different type from [`JobState`]: an execution attempt never becomes
+/// `DEFERRED_CAPACITY`, because no `RunAttempt` exists before admission.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkAdmissionState {
+    BlockedDependency,
+    Ready,
+    Admitted,
+    DeferredCapacity,
+    Cancelled,
+    Stale,
+}
+
+impl WorkAdmissionState {
+    /// Returns whether this admission state is a closed projection.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Cancelled | Self::Stale)
+    }
+
+    /// Checks one legal I14.20 admission edge.  Replaying the same state is
+    /// valid; `ADMITTED` returns to `READY`/`DEFERRED_CAPACITY` only through a
+    /// new admission revision that references the closed attempt outcome.
+    #[must_use]
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::BlockedDependency => matches!(next, Self::Ready),
+            Self::Ready | Self::Admitted | Self::DeferredCapacity => matches!(
+                next,
+                Self::Ready | Self::Admitted | Self::DeferredCapacity | Self::Cancelled | Self::Stale
+            ),
+            Self::Cancelled | Self::Stale => false,
+        }
+    }
+}
+
+/// Which observed resource, route or quota is unavailable before admission.
+/// This names the capacity axis only; it never recomputes #1679's accounting.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CapacityDeficitAxis {
+    Resource,
+    Route,
+    Quota,
+}
+
+/// The exact #1679 capacity observation that keeps work out of admission:
+/// the unavailable axis, the exact reason, the reset horizon, the source of
+/// that reset, and the alternatives the owner may still take.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityDeferral {
+    pub axis: CapacityDeficitAxis,
+    pub reason: String,
+    pub observed_at_unix_ms: u64,
+    pub not_before_unix_ms: u64,
+    pub reset_source: String,
+    pub alternatives: Vec<String>,
+    pub evidence: Vec<ArtifactBinding>,
+}
+
+impl CapacityDeferral {
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        bounded_text(&self.reason, "deferral.reason")?;
+        bounded_text(&self.reset_source, "deferral.reset_source")?;
+        if self.observed_at_unix_ms == 0 || self.not_before_unix_ms < self.observed_at_unix_ms {
+            return Err(DurableJobError::InvalidField {
+                field: "deferral.not_before_unix_ms",
+                reason: "must be positive and not precede the observation",
+            });
+        }
+        validate_text_list(&self.alternatives, "deferral.alternatives")?;
+        if self.alternatives.is_empty() {
+            return Err(DurableJobError::InvalidField {
+                field: "deferral.alternatives",
+                reason: "a capacity deferral must name the owner's alternatives",
+            });
+        }
+        validate_artifacts(&self.evidence, "deferral.evidence")?;
+        if self.evidence.is_empty() {
+            return Err(DurableJobError::InvalidField {
+                field: "deferral.evidence",
+                reason: "a capacity deferral requires the observed capacity evidence",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated request to move the admission axis of existing durable work.
+///
+/// A `DEFERRED_CAPACITY` revision is pre-admission and therefore carries no
+/// attempt.  A revision that supersedes a closed attempt names that attempt's
+/// canonical outcome digest; the Store compares it against the immutable
+/// outcome it already holds and never rewrites that outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobAdmissionUpdate {
+    pub job_id: TaskId,
+    pub attempt_id: ArtifactId,
+    pub expected_admission_revision: u64,
+    pub current_state_fence: StateFence,
+    pub admission_state: WorkAdmissionState,
+    pub deferral: Option<CapacityDeferral>,
+    pub superseded_attempt_outcome_digest: Option<String>,
+}
+
+impl JobAdmissionUpdate {
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        if self.expected_admission_revision > DURABLE_JOB_MAX_REFERENCES as u64 {
+            return Err(DurableJobError::LimitExceeded(
+                "admission.expected_admission_revision",
+            ));
+        }
+        self.current_state_fence
+            .validate()
+            .map_err(DurableJobError::Foundation)?;
+        match (&self.deferral, self.admission_state) {
+            (Some(deferral), WorkAdmissionState::DeferredCapacity) => deferral.validate()?,
+            (None, WorkAdmissionState::DeferredCapacity) => {
+                return Err(DurableJobError::InvalidField {
+                    field: "admission.deferral",
+                    reason: "DEFERRED_CAPACITY requires the observed capacity deficit",
+                });
+            }
+            (Some(_), _) => {
+                return Err(DurableJobError::InvalidField {
+                    field: "admission.deferral",
+                    reason: "a capacity deficit belongs only to DEFERRED_CAPACITY",
+                });
+            }
+            (None, _) => {}
+        }
+        if let Some(digest) = &self.superseded_attempt_outcome_digest {
+            lowercase_digest(digest, "admission.superseded_attempt_outcome_digest")?;
+        }
+        if self.superseded_attempt_outcome_digest.is_some()
+            && self.admission_state == WorkAdmissionState::Admitted
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "admission.admission_state",
+                reason: "replacement work needs its own later admission revision",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Immutable admission revision.  It moves only the admission axis: execution
+/// state, revision and outcome stay exactly as the durable record holds them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobAdmissionRevision {
+    pub job_id: TaskId,
+    pub attempt_id: ArtifactId,
+    pub revision: u64,
+    pub prior_admission_state: WorkAdmissionState,
+    pub admission_state: WorkAdmissionState,
+    pub current_state_fence: StateFence,
+    pub deferral: Option<CapacityDeferral>,
+    pub superseded_attempt_outcome_digest: Option<String>,
+}
+
+impl JobAdmissionRevision {
+    /// Builds one admission revision from the durable record it must describe.
+    /// `prior` is the last recorded revision, or `None` for the first one:
+    /// the durable submission already carries its owner's admission receipt,
+    /// so an empty history continues from `ADMITTED` rather than inventing a
+    /// pending state.
+    pub fn from_update(
+        update: &JobAdmissionUpdate,
+        record: &DurableJobRecord,
+        prior: Option<&Self>,
+        revision: u64,
+    ) -> Result<Self, DurableJobError> {
+        update.validate()?;
+        record.validate()?;
+        if record.submission.job_id != update.job_id
+            || record.submission.attempt_id != update.attempt_id
+            || update.expected_admission_revision.checked_add(1) != Some(revision)
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        if update.current_state_fence != record.submission.work_scope.state_fence {
+            return Err(DurableJobError::FenceMismatch);
+        }
+        let prior_admission_state = match prior {
+            None => WorkAdmissionState::Admitted,
+            Some(previous) => {
+                if previous.revision.checked_add(1) != Some(revision) {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                previous.admission_state
+            }
+        };
+        let admission = Self {
+            job_id: update.job_id.clone(),
+            attempt_id: update.attempt_id.clone(),
+            revision,
+            prior_admission_state,
+            admission_state: update.admission_state,
+            current_state_fence: update.current_state_fence.clone(),
+            deferral: update.deferral.clone(),
+            superseded_attempt_outcome_digest: update.superseded_attempt_outcome_digest.clone(),
+        };
+        admission.validate_against_record(record)?;
+        Ok(admission)
+    }
+
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        if self.revision == 0 || self.revision > DURABLE_JOB_MAX_REFERENCES as u64 {
+            return Err(DurableJobError::InvalidField {
+                field: "admission.revision",
+                reason: "must be positive and bounded",
+            });
+        }
+        self.current_state_fence
+            .validate()
+            .map_err(DurableJobError::Foundation)?;
+        match (&self.deferral, self.admission_state) {
+            (Some(deferral), WorkAdmissionState::DeferredCapacity) => deferral.validate()?,
+            (None, WorkAdmissionState::DeferredCapacity) => {
+                return Err(DurableJobError::InvalidField {
+                    field: "admission.deferral",
+                    reason: "DEFERRED_CAPACITY requires the observed capacity deficit",
+                });
+            }
+            (Some(_), _) => {
+                return Err(DurableJobError::InvalidField {
+                    field: "admission.deferral",
+                    reason: "a capacity deficit belongs only to DEFERRED_CAPACITY",
+                });
+            }
+            (None, _) => {}
+        }
+        if !self.prior_admission_state.can_transition_to(self.admission_state) {
+            return Err(DurableJobError::InvalidField {
+                field: "admission.admission_state",
+                reason: "illegal admission transition",
+            });
+        }
+        if let Some(digest) = &self.superseded_attempt_outcome_digest {
+            lowercase_digest(digest, "admission.superseded_attempt_outcome_digest")?;
+        }
+        if self.superseded_attempt_outcome_digest.is_some()
+            && self.admission_state == WorkAdmissionState::Admitted
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "admission.admission_state",
+                reason: "replacement work needs its own later admission revision",
+            });
+        }
+        Ok(())
+    }
+
+    /// Verifies that this revision is bound to the durable work it describes
+    /// and to the immutable execution history it does not rewrite.
+    pub fn validate_against_record(
+        &self,
+        record: &DurableJobRecord,
+    ) -> Result<(), DurableJobError> {
+        record.validate()?;
+        self.validate()?;
+        if self.job_id != record.submission.job_id
+            || self.attempt_id != record.submission.attempt_id
+            || self.current_state_fence != record.submission.work_scope.state_fence
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        let outcome = record.outcome.as_ref();
+        if let Some(digest) = &self.superseded_attempt_outcome_digest {
+            let Some(outcome) = outcome else {
+                return Err(DurableJobError::InvalidOutcome);
+            };
+            if *digest != outcome.canonical_digest()? {
+                return Err(DurableJobError::OperationMismatch);
+            }
+            // An unresolved provisioning outcome cannot be replaced: the work
+            // stays supervised and never re-enters a launchable projection.
+            if outcome.state == JobState::UnknownOutcome
+                && matches!(
+                    self.admission_state,
+                    WorkAdmissionState::Ready | WorkAdmissionState::Admitted
+                )
+            {
+                return Err(DurableJobError::InvalidOutcome);
+            }
+        } else {
+            if outcome.is_some() {
+                return Err(DurableJobError::OperationMismatch);
+            }
+            // Capacity deferral happens before admission, so no external
+            // attempt may exist for the deferred work.
+            if self.admission_state == WorkAdmissionState::DeferredCapacity
+                && (record.lease.is_some()
+                    || !matches!(record.state, JobState::NotStarted | JobState::Queued))
+            {
+                return Err(DurableJobError::InvalidField {
+                    field: "admission.admission_state",
+                    reason: "DEFERRED_CAPACITY precedes admission and owns no attempt",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Store/transport mutation outcome.  It is deliberately separate from the
 /// semantic `UNKNOWN_OUTCOME` execution state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1177,6 +1497,10 @@ pub enum JobOperation {
     RecordApplicability {
         update: Box<JobOutputApplicabilityUpdate>,
     },
+    #[serde(rename = "RECORD_ADMISSION")]
+    RecordAdmission {
+        update: Box<JobAdmissionUpdate>,
+    },
 }
 
 impl JobOperation {
@@ -1196,6 +1520,7 @@ impl JobOperation {
             Self::RequestCancel { .. } => JobOperationKind::RequestCancel,
             Self::Reconcile { .. } => JobOperationKind::Reconcile,
             Self::RecordApplicability { .. } => JobOperationKind::RecordApplicability,
+            Self::RecordAdmission { .. } => JobOperationKind::RecordAdmission,
         }
     }
 
@@ -1258,6 +1583,10 @@ impl JobOperation {
                 job_ledger: Some((job_id, attempt_id)),
             },
             Self::RecordApplicability { update } => DreamerOrderingScopes {
+                work_scope: None,
+                job_ledger: Some((&update.job_id, &update.attempt_id)),
+            },
+            Self::RecordAdmission { update } => DreamerOrderingScopes {
                 work_scope: None,
                 job_ledger: Some((&update.job_id, &update.attempt_id)),
             },
@@ -1349,6 +1678,7 @@ impl JobOperation {
             }
             Self::Reconcile { mutation } => mutation.validate(),
             Self::RecordApplicability { update } => update.validate(),
+            Self::RecordAdmission { update } => update.validate(),
         }
     }
 }
@@ -1590,6 +1920,10 @@ pub struct DurableJobResponse {
     /// applicability is unknown, never implicitly current.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applicability_history: Vec<JobOutputApplicabilityRevision>,
+    /// Append-only admission history. Missing/empty history is a legacy record
+    /// whose admission proof was never written, never an active admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admission_history: Vec<JobAdmissionRevision>,
     /// Bounded candidate coverage for `LeaseNext` selection.
     pub selection_coverage: Vec<String>,
     /// Opaque frontier cursor for `LeaseNext` selection.
@@ -1692,6 +2026,7 @@ impl DurableJobResponse {
             return Err(DurableJobError::InvalidOutcome);
         }
         self.validate_applicability_history()?;
+        self.validate_admission_history()?;
         if self.disposition == Some(MutationDisposition::Committed) && self.receipt_id.is_none() {
             return Err(DurableJobError::InvalidField {
                 field: "receipt_id",
@@ -1722,6 +2057,24 @@ impl DurableJobResponse {
                 return Err(DurableJobError::OperationMismatch);
             }
             applicability.validate_against_outcome(outcome, &self.scope.state_fence)?;
+        }
+        Ok(())
+    }
+
+    /// Validates the admission axis carried by this response. The durable
+    /// record binding is owned by the Store bundle, which holds the record.
+    fn validate_admission_history(&self) -> Result<(), DurableJobError> {
+        if self.admission_history.len() > DURABLE_JOB_MAX_REFERENCES {
+            return Err(DurableJobError::LimitExceeded("admission.history"));
+        }
+        for (index, admission) in self.admission_history.iter().enumerate() {
+            admission.validate()?;
+            if admission.job_id != self.job_id
+                || admission.attempt_id != self.attempt_id
+                || admission.revision != index as u64 + 1
+            {
+                return Err(DurableJobError::OperationMismatch);
+            }
         }
         Ok(())
     }
@@ -1860,6 +2213,7 @@ impl DurableJobResponse {
             JobOperation::RecordApplicability { update } => {
                 self.validate_response_applicability(update)
             }
+            JobOperation::RecordAdmission { update } => self.validate_response_admission(update),
         }
     }
 
@@ -1880,6 +2234,31 @@ impl DurableJobResponse {
             || latest.changed_axes != update.changed_axes
             || latest.evidence != update.evidence
             || latest.next_action != update.next_action
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        Ok(())
+    }
+
+    /// Binds an admission response to exactly one appended admission revision.
+    /// The `prior_admission_state` stays Store-derived and is not compared
+    /// here because the request never supplies it.
+    fn validate_response_admission(
+        &self,
+        update: &JobAdmissionUpdate,
+    ) -> Result<(), DurableJobError> {
+        if self.job_id != update.job_id || self.attempt_id != update.attempt_id {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        let latest = self
+            .admission_history
+            .last()
+            .ok_or(DurableJobError::OperationMismatch)?;
+        if latest.revision != update.expected_admission_revision.saturating_add(1)
+            || latest.admission_state != update.admission_state
+            || latest.deferral != update.deferral
+            || latest.superseded_attempt_outcome_digest != update.superseded_attempt_outcome_digest
+            || latest.current_state_fence != update.current_state_fence
         {
             return Err(DurableJobError::OperationMismatch);
         }
@@ -2024,6 +2403,7 @@ fn validate_operation_fence(
         JobOperation::Status { expected_fence, .. }
         | JobOperation::RequestCancel { expected_fence, .. } => Some(expected_fence),
         JobOperation::RecordApplicability { update } => Some(&update.current_state_fence),
+        JobOperation::RecordAdmission { update } => Some(&update.current_state_fence),
         JobOperation::Reconcile { mutation } => Some(&mutation.operation.state_fence),
     };
     if target_fence.is_some_and(|target| target != fence) {
@@ -2053,7 +2433,7 @@ pub fn durable_job_contract_identity() -> Result<ContractIdentity, DurableJobErr
         "version": DURABLE_JOB_CONTRACT_VERSION,
         "encoding": DURABLE_JOB_CANONICAL_ENCODING,
         "states": ["NOT_STARTED", "QUEUED", "LEASED", "RUNNING", "CHECKPOINTED", "VERIFYING", "COMPLETED", "PARTIAL", "FAILED", "CANCELLED", "UNKNOWN_OUTCOME"],
-        "operations": ["SUBMIT_JOB", "LEASE_NEXT", "LEASE_EXACT", "RENEW_LEASE", "START_JOB", "CHECKPOINT_JOB", "RESUME_JOB", "BEGIN_VERIFICATION", "PUBLISH_OUTCOME", "STATUS", "REQUEST_CANCEL", "RECONCILE_MUTATION", "RECORD_APPLICABILITY"],
+        "operations": ["SUBMIT_JOB", "LEASE_NEXT", "LEASE_EXACT", "RENEW_LEASE", "START_JOB", "CHECKPOINT_JOB", "RESUME_JOB", "BEGIN_VERIFICATION", "PUBLISH_OUTCOME", "STATUS", "REQUEST_CANCEL", "RECONCILE_MUTATION", "RECORD_APPLICABILITY", "RECORD_ADMISSION"],
     });
     eliot_contracts::contract_identity(
         DURABLE_JOB_CONTRACT_NAME,

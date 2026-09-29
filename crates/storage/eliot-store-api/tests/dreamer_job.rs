@@ -185,6 +185,7 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
         selection_coverage: Vec::new(),
         selection_frontier: None,
         applicability_history: Vec::new(),
+        admission_history: Vec::new(),
     }
 }
 
@@ -220,6 +221,7 @@ fn ledger_record_for(
         active_lease: response.lease.clone(),
         lease_history: Vec::new(),
         applicability_history: Vec::new(),
+        admission_history: Vec::new(),
         result_under_verification: response.result_under_verification.clone(),
         last_mutation: mutation_identity(request),
         last_receipt_id: response.receipt_id.clone(),
@@ -340,6 +342,7 @@ fn status_bundle() -> (
         active_lease: Some(lease()),
         lease_history: Vec::new(),
         applicability_history: Vec::new(),
+        admission_history: Vec::new(),
         result_under_verification: None,
         last_mutation: mutation_identity(&request),
         last_receipt_id: Some(ReceiptId::new("lease-receipt").expect("receipt")),
