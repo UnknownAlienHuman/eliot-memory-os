@@ -3,16 +3,24 @@
 use std::path::{Component, Path, PathBuf};
 
 use eliot_contracts::{ResourceGeneration, sha256_hex};
+use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::{
-    Ed25519SupervisionLeaseSigner, ProvisionedSupervisionAuthority,
+    Ed25519SupervisionLeaseSigner, PORTABLE_DEV_SUPERVISION_KEY_PREFIX,
+    PortableDevSupervisionKeyReference, ProvisionedSupervisionAuthority,
     SUPERVISION_AUTHORITY_HOST_SERVICE, SupervisionLeaseError, SupervisionSealedKeyFileIdentity,
-    SupervisionSealedKeyReference, SupervisionTrustAnchor,
+    SupervisionSealedKeyReference, SupervisionTrustAnchor, UserModeSupervisionKeyReference,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::secret_store::{
+    CurrentUserSupervisionCredentialObservation, CurrentUserSupervisionCredentialProvisionOutcome,
+    CurrentUserSupervisionCredentialWriteReceipt, WindowsCurrentUserSupervisionCredentialProvider,
+};
 use crate::{
-    CredentialSecret, InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveSpec,
+    CredentialSecret, FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
+    InstallerRootPrimitiveSpec, ProtectedPathError, UserOwnedPathLease, UserOwnedRootLease,
     WindowsAdapterError, WindowsInstallerRootPrimitive, fill_system_random, resolve_service_sid,
     valid_service_sid_text,
 };
@@ -47,6 +55,995 @@ impl std::error::Error for SupervisionAuthorityKeyError {}
 pub struct SealedSupervisionAuthorityKey {
     pub sealed_blob: Vec<u8>,
     pub trust_anchor: SupervisionTrustAnchor,
+}
+
+/// Secret-free request for a UserMode Credential Manager authority key.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeSupervisionAuthorityCredentialRequest {
+    /// Durable transaction identity.
+    pub transaction_id: String,
+    /// Exact planned authority effect identity.
+    pub effect_id: String,
+    /// Installation identity pinned into the trust anchor.
+    pub installation_id: String,
+    /// Candidate generation owning the key.
+    pub candidate_generation: String,
+    /// Lifecycle generation owning the key.
+    pub authority_generation: ResourceGeneration,
+    /// Supervision lease scope selected by the candidate.
+    pub supervision_lease_scope_id: String,
+    /// Kernel signer identity.
+    pub signer_id: String,
+    /// Generation-specific public key identity.
+    pub key_id: String,
+    /// Exact current-user SID that owns Credential Manager access.
+    pub owner_sid: String,
+}
+
+impl UserModeSupervisionAuthorityCredentialRequest {
+    fn validate(&self) -> Result<(), SupervisionAuthorityKeyError> {
+        if [
+            self.transaction_id.as_str(),
+            self.effect_id.as_str(),
+            self.installation_id.as_str(),
+            self.candidate_generation.as_str(),
+            self.supervision_lease_scope_id.as_str(),
+            self.signer_id.as_str(),
+            self.key_id.as_str(),
+        ]
+        .iter()
+        .any(|value| {
+            value.is_empty() || *value != value.trim() || value.chars().any(char::is_control)
+        }) || self.authority_generation.value() == 0
+            || !self.owner_sid.starts_with("S-")
+            || self.owner_sid.trim() != self.owner_sid
+        {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Public, secret-free receipt for a transaction-owned UserMode authority key.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModeSupervisionAuthorityCredentialReceipt {
+    /// Breaking receipt discriminator.
+    pub wire: String,
+    /// Original immutable request and owner binding.
+    pub request: UserModeSupervisionAuthorityCredentialRequest,
+    /// Exact purpose-bound Credential Manager target.
+    pub target: PlatformHandle,
+    /// Installation-pinned public Ed25519 trust anchor.
+    pub trust_anchor: SupervisionTrustAnchor,
+}
+
+/// Secret-free transaction request for one disposable PortableDev key file.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDevSupervisionAuthorityKeyRequest {
+    /// Durable transaction identity.
+    pub transaction_id: String,
+    /// Exact planned authority effect identity.
+    pub effect_id: String,
+    /// Installation identity pinned into the trust anchor.
+    pub installation_id: String,
+    /// Candidate generation owning the key.
+    pub candidate_generation: String,
+    /// Lifecycle generation owning the key.
+    pub authority_generation: ResourceGeneration,
+    /// Supervision lease scope selected by the candidate.
+    pub supervision_lease_scope_id: String,
+    /// Kernel signer identity.
+    pub signer_id: String,
+    /// Generation-specific public key identity.
+    pub key_id: String,
+    /// Exact repository root selected by the PortableDev descriptor.
+    pub repository_root: PathBuf,
+    /// Repository-root file-object identity retained before key materialization.
+    pub repository_root_identity: FileIdentity,
+    /// Canonical descriptor-relative path under `.eliot-dev/state`.
+    pub relative_path: String,
+}
+
+impl PortableDevSupervisionAuthorityKeyRequest {
+    fn validate(&self) -> Result<(), SupervisionAuthorityKeyError> {
+        if [
+            self.transaction_id.as_str(),
+            self.effect_id.as_str(),
+            self.installation_id.as_str(),
+            self.candidate_generation.as_str(),
+            self.supervision_lease_scope_id.as_str(),
+            self.signer_id.as_str(),
+            self.key_id.as_str(),
+        ]
+        .iter()
+        .any(|value| {
+            value.is_empty() || *value != value.trim() || value.chars().any(char::is_control)
+        }) || self.authority_generation.value() == 0
+            || !self.repository_root.is_absolute()
+            || self
+                .repository_root
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            || self.repository_root_identity.volume_serial_number == 0
+            || self.repository_root_identity.file_index == 0
+        {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        PortableDevSupervisionKeyReference::new(self.relative_path.clone())
+            .map_err(map_contract_error)?;
+        Ok(())
+    }
+}
+
+/// Public, secret-free receipt for one transaction-owned PortableDev key.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableDevSupervisionAuthorityKeyReceipt {
+    /// Breaking receipt discriminator.
+    pub wire: String,
+    /// Original immutable request and root binding.
+    pub request: PortableDevSupervisionAuthorityKeyRequest,
+    /// Installation-pinned public Ed25519 trust anchor.
+    pub trust_anchor: SupervisionTrustAnchor,
+}
+
+impl PortableDevSupervisionAuthorityKeyReceipt {
+    fn new(
+        request: PortableDevSupervisionAuthorityKeyRequest,
+        trust_anchor: SupervisionTrustAnchor,
+    ) -> Result<Self, SupervisionAuthorityKeyError> {
+        let value = Self {
+            wire: "eliot.portable-dev-supervision-authority.v1".to_owned(),
+            request,
+            trust_anchor,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates the original transaction, repository-root identity, relative
+    /// key path and public signer anchor.
+    pub fn validate(&self) -> Result<(), SupervisionAuthorityKeyError> {
+        self.request.validate()?;
+        if self.wire != "eliot.portable-dev-supervision-authority.v1"
+            || self.trust_anchor.installation_id != self.request.installation_id
+            || self.trust_anchor.signer_id != self.request.signer_id
+            || self.trust_anchor.key_id != self.request.key_id
+            || self.trust_anchor.validate().is_err()
+        {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Read-only observation of the exact repository-local PortableDev key path
+/// before its seed has been prepared.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum PortableDevSupervisionAuthorityKeyTargetObservation {
+    /// The exact path was absent beneath the selected repository-root object.
+    Absent {
+        /// File-object identity of the retained repository root.
+        repository_root_identity: FileIdentity,
+        /// Exact descriptor-relative key path.
+        relative_path: String,
+    },
+    /// An object already occupies the create-only transaction path.
+    Present {
+        /// File-object identity of the retained repository root.
+        repository_root_identity: FileIdentity,
+        /// Exact descriptor-relative key path.
+        relative_path: String,
+    },
+}
+
+/// Exact post-attempt inspection against the original PortableDev key receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum PortableDevSupervisionAuthorityKeyObservation {
+    /// No file exists at the original descriptor-relative path.
+    Absent {
+        /// Original transaction receipt used for inspection.
+        receipt: PortableDevSupervisionAuthorityKeyReceipt,
+    },
+    /// The existing seed derives the original trust anchor.
+    Matching {
+        /// Original transaction receipt, never reconstructed from observed bytes.
+        receipt: PortableDevSupervisionAuthorityKeyReceipt,
+    },
+    /// A present file differs from the original key or root binding.
+    Mismatch {
+        /// Exact descriptor-relative path requiring recovery.
+        relative_path: String,
+    },
+}
+
+/// Prepared PortableDev key kept in memory until the caller durably records
+/// [`PortableDevSupervisionAuthorityKeyReceipt`].
+pub struct PreparedPortableDevSupervisionAuthorityKey {
+    receipt: PortableDevSupervisionAuthorityKeyReceipt,
+    secret: CredentialSecret,
+}
+
+impl PreparedPortableDevSupervisionAuthorityKey {
+    /// Returns the secret-free receipt that must be persisted before writing.
+    #[must_use]
+    pub const fn receipt(&self) -> &PortableDevSupervisionAuthorityKeyReceipt {
+        &self.receipt
+    }
+}
+
+/// Outcome of one create-only PortableDev key-file write attempt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum PortableDevSupervisionAuthorityKeyWriteOutcome {
+    /// Exact retained-file write, durable flush and public-key readback succeeded.
+    Created {
+        /// Original pre-write receipt.
+        receipt: PortableDevSupervisionAuthorityKeyReceipt,
+    },
+    /// A write was attempted but positive readback was unavailable.
+    Unknown {
+        /// Original pre-write receipt used for exact restart inspection.
+        receipt: PortableDevSupervisionAuthorityKeyReceipt,
+    },
+}
+
+impl UserModeSupervisionAuthorityCredentialReceipt {
+    fn new(
+        request: UserModeSupervisionAuthorityCredentialRequest,
+        target: PlatformHandle,
+        trust_anchor: SupervisionTrustAnchor,
+    ) -> Result<Self, SupervisionAuthorityKeyError> {
+        let value = Self {
+            wire: "eliot.user-mode-supervision-authority.v1".to_owned(),
+            request,
+            target,
+            trust_anchor,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates the original request, transaction target, and public anchor.
+    pub fn validate(&self) -> Result<(), SupervisionAuthorityKeyError> {
+        self.request.validate()?;
+        if self.wire != "eliot.user-mode-supervision-authority.v1"
+            || !valid_user_mode_authority_target(self.target.as_str())
+            || self.target.as_str() != user_mode_authority_target(&self.request)?
+            || self.trust_anchor.installation_id != self.request.installation_id
+            || self.trust_anchor.signer_id != self.request.signer_id
+            || self.trust_anchor.key_id != self.request.key_id
+            || self.trust_anchor.validate().is_err()
+        {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Exact observation of the UserMode authority target against its original
+/// transaction receipt and public trust anchor.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum UserModeSupervisionAuthorityCredentialObservation {
+    /// The planned target is absent under the current owner SID.
+    Absent {
+        /// Current-user SID performing the read.
+        owner_sid: PlatformHandle,
+        /// Exact target derived from transaction/effect identity.
+        target: PlatformHandle,
+    },
+    /// The current value derives the key pinned by the persisted public anchor.
+    Matching {
+        /// Original transaction receipt, never reconstructed from observed bytes.
+        receipt: UserModeSupervisionAuthorityCredentialReceipt,
+    },
+    /// A present target differs from the original public key or owner binding.
+    Mismatch {
+        /// Current-user SID performing the read.
+        owner_sid: PlatformHandle,
+        /// Exact target requiring recovery.
+        target: PlatformHandle,
+    },
+}
+
+/// Read-only observation of the deterministic current-user authority target
+/// before its seed commitment has been prepared.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum UserModeSupervisionAuthorityCredentialTargetObservation {
+    /// No credential exists at the exact target under the admitted SID.
+    Absent {
+        /// Current-user SID performing the read.
+        owner_sid: PlatformHandle,
+        /// Exact target derived from the immutable transaction/effect identity.
+        target: PlatformHandle,
+    },
+    /// A credential already occupies this create-only transaction target.
+    Present {
+        /// Current-user SID performing the read.
+        owner_sid: PlatformHandle,
+        /// Exact target derived from the immutable transaction/effect identity.
+        target: PlatformHandle,
+    },
+}
+
+/// Outcome of one UserMode authority-key write attempt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum UserModeSupervisionAuthorityCredentialWriteOutcome {
+    /// Exact provider write and immediate readback succeeded.
+    Created {
+        /// Original pre-write receipt.
+        receipt: UserModeSupervisionAuthorityCredentialReceipt,
+    },
+    /// A write was attempted but positive readback was unavailable.
+    Unknown {
+        /// Original pre-write receipt used for exact restart inspection.
+        receipt: UserModeSupervisionAuthorityCredentialReceipt,
+    },
+}
+
+/// Prepared authority seed kept only in memory until durable intent is saved.
+pub struct PreparedUserModeSupervisionAuthorityCredential {
+    receipt: UserModeSupervisionAuthorityCredentialReceipt,
+    secret: CredentialSecret,
+}
+
+impl PreparedUserModeSupervisionAuthorityCredential {
+    /// Returns the secret-free request receipt that must be persisted before
+    /// [`WindowsUserModeSupervisionAuthorityCredentialProvider::write_prepared`].
+    #[must_use]
+    pub const fn receipt(&self) -> &UserModeSupervisionAuthorityCredentialReceipt {
+        &self.receipt
+    }
+}
+
+/// Current-token Credential Manager provider for UserMode supervision keys.
+///
+/// This owner uses a purpose-specific target and exact current-user SID. It
+/// does not access SCM, ProgramData, LocalService, or installer-root HMAC keys.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsUserModeSupervisionAuthorityCredentialProvider {
+    primitive: WindowsCurrentUserSupervisionCredentialProvider,
+}
+
+impl WindowsUserModeSupervisionAuthorityCredentialProvider {
+    /// Creates a provider without opening or changing Credential Manager.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            primitive: WindowsCurrentUserSupervisionCredentialProvider::new(),
+        }
+    }
+
+    /// Observes the deterministic create-only target before preparing a key.
+    /// A present value is returned as a conflict candidate; callers must not
+    /// adopt it without the original pre-write receipt.
+    pub fn inspect_target(
+        &self,
+        request: &UserModeSupervisionAuthorityCredentialRequest,
+    ) -> Result<UserModeSupervisionAuthorityCredentialTargetObservation, SupervisionAuthorityKeyError>
+    {
+        request.validate()?;
+        let owner_sid = self
+            .primitive
+            .principal_sid()
+            .map_err(map_current_user_credential_error)?;
+        if owner_sid.as_str() != request.owner_sid {
+            return Err(SupervisionAuthorityKeyError::AccessDenied);
+        }
+        let target = self
+            .primitive
+            .target_for_effect(
+                &request.installation_id,
+                &request.transaction_id,
+                &request.effect_id,
+                &owner_sid,
+            )
+            .map_err(map_current_user_credential_error)?;
+        match self
+            .primitive
+            .inspect(&target, &owner_sid)
+            .map_err(map_current_user_credential_error)?
+        {
+            CurrentUserSupervisionCredentialObservation::Absent { owner_sid, target } => Ok(
+                UserModeSupervisionAuthorityCredentialTargetObservation::Absent {
+                    owner_sid,
+                    target,
+                },
+            ),
+            CurrentUserSupervisionCredentialObservation::Present { owner_sid, target } => Ok(
+                UserModeSupervisionAuthorityCredentialTargetObservation::Present {
+                    owner_sid,
+                    target,
+                },
+            ),
+        }
+    }
+
+    /// Generates a seed and public trust anchor before the caller commits its
+    /// effect intent. The caller must retain `prepared.receipt()` durably
+    /// before calling [`Self::write_prepared`].
+    pub fn prepare(
+        &self,
+        request: UserModeSupervisionAuthorityCredentialRequest,
+    ) -> Result<PreparedUserModeSupervisionAuthorityCredential, SupervisionAuthorityKeyError> {
+        request.validate()?;
+        let owner_sid = PlatformHandle::new(request.owner_sid.clone())
+            .map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
+        let target = self
+            .primitive
+            .target_for_effect(
+                &request.installation_id,
+                &request.transaction_id,
+                &request.effect_id,
+                &owner_sid,
+            )
+            .map_err(map_current_user_credential_error)?;
+        let mut seed = [0_u8; 32];
+        if fill_system_random(&mut seed).is_err() || seed.iter().all(|byte| *byte == 0) {
+            seed.fill(0);
+            return Err(SupervisionAuthorityKeyError::RandomUnavailable);
+        }
+        let secret_result = CredentialSecret::from_bytes(seed.to_vec());
+        seed.fill(0);
+        let secret =
+            secret_result.map_err(|_| SupervisionAuthorityKeyError::ProviderUnavailable)?;
+        let mut signer_seed = [0_u8; 32];
+        signer_seed.copy_from_slice(secret.expose());
+        let signer_result = Ed25519SupervisionLeaseSigner::from_secret_key(
+            request.signer_id.clone(),
+            request.key_id.clone(),
+            signer_seed,
+        );
+        signer_seed.fill(0);
+        let signer = signer_result.map_err(map_contract_error)?;
+        let trust_anchor = SupervisionTrustAnchor::new(
+            request.installation_id.clone(),
+            request.signer_id.clone(),
+            request.key_id.clone(),
+            signer.public_key().to_vec(),
+        )
+        .map_err(map_contract_error)?;
+        let receipt =
+            UserModeSupervisionAuthorityCredentialReceipt::new(request, target, trust_anchor)?;
+        Ok(PreparedUserModeSupervisionAuthorityCredential { receipt, secret })
+    }
+
+    /// Writes only the already-prepared seed and returns the original
+    /// transaction receipt on both positive and ambiguous outcomes.
+    pub fn write_prepared(
+        &self,
+        prepared: PreparedUserModeSupervisionAuthorityCredential,
+    ) -> Result<UserModeSupervisionAuthorityCredentialWriteOutcome, SupervisionAuthorityKeyError>
+    {
+        prepared.receipt.validate()?;
+        let owner_sid = PlatformHandle::new(prepared.receipt.request.owner_sid.clone())
+            .map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
+        let outcome = match self.primitive.write_exact_if_absent(
+            &prepared.receipt.target,
+            &owner_sid,
+            prepared.secret,
+        ) {
+            Ok(outcome) => outcome,
+            // The target became present after the committed Absent observation.
+            // Keep the original receipt for an exact readback; never adopt
+            // the object from its name or presence alone.
+            Err(WindowsAdapterError::AlreadyExists) => {
+                return Ok(
+                    UserModeSupervisionAuthorityCredentialWriteOutcome::Unknown {
+                        receipt: prepared.receipt,
+                    },
+                );
+            }
+            Err(error) => return Err(map_current_user_credential_error(error)),
+        };
+        match outcome {
+            CurrentUserSupervisionCredentialProvisionOutcome::Created(provider_receipt)
+                if provider_receipt_matches(&provider_receipt, &prepared.receipt) =>
+            {
+                Ok(
+                    UserModeSupervisionAuthorityCredentialWriteOutcome::Created {
+                        receipt: prepared.receipt,
+                    },
+                )
+            }
+            CurrentUserSupervisionCredentialProvisionOutcome::Unknown {
+                owner_sid: observed_sid,
+                target,
+            } if observed_sid == owner_sid && target == prepared.receipt.target => Ok(
+                UserModeSupervisionAuthorityCredentialWriteOutcome::Unknown {
+                    receipt: prepared.receipt,
+                },
+            ),
+            _ => Err(SupervisionAuthorityKeyError::InvalidBinding),
+        }
+    }
+
+    /// Inspects only against the original pre-write receipt.
+    pub fn inspect(
+        &self,
+        receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+    ) -> Result<UserModeSupervisionAuthorityCredentialObservation, SupervisionAuthorityKeyError>
+    {
+        receipt.validate()?;
+        let owner_sid = PlatformHandle::new(receipt.request.owner_sid.clone())
+            .map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
+        match self
+            .primitive
+            .inspect(&receipt.target, &owner_sid)
+            .map_err(map_current_user_credential_error)?
+        {
+            CurrentUserSupervisionCredentialObservation::Absent { owner_sid, target } => {
+                Ok(UserModeSupervisionAuthorityCredentialObservation::Absent { owner_sid, target })
+            }
+            CurrentUserSupervisionCredentialObservation::Present {
+                owner_sid: observed_sid,
+                target: observed_target,
+            } if observed_sid == owner_sid && observed_target == receipt.target => {
+                match self.load_signer(receipt) {
+                    Ok(_) => Ok(
+                        UserModeSupervisionAuthorityCredentialObservation::Matching {
+                            receipt: receipt.clone(),
+                        },
+                    ),
+                    Err(SupervisionAuthorityKeyError::InvalidBinding)
+                    | Err(SupervisionAuthorityKeyError::KeyInvalid) => Ok(
+                        UserModeSupervisionAuthorityCredentialObservation::Mismatch {
+                            owner_sid,
+                            target: receipt.target.clone(),
+                        },
+                    ),
+                    Err(error) => Err(error),
+                }
+            }
+            CurrentUserSupervisionCredentialObservation::Present { .. } => Ok(
+                UserModeSupervisionAuthorityCredentialObservation::Mismatch {
+                    owner_sid,
+                    target: receipt.target.clone(),
+                },
+            ),
+        }
+    }
+
+    /// Deletes only the target named by a validated positive receipt, after
+    /// the provider rechecks exact bytes and proves absence after deletion.
+    pub fn delete_if_matching(
+        &self,
+        receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+    ) -> Result<(), SupervisionAuthorityKeyError> {
+        receipt.validate()?;
+        let owner_sid = PlatformHandle::new(receipt.request.owner_sid.clone())
+            .map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
+        self.primitive
+            .delete_if_signing_key_matches(
+                &receipt.target,
+                &owner_sid,
+                &receipt.request.signer_id,
+                &receipt.request.key_id,
+                &receipt.trust_anchor.public_key,
+            )
+            .map_err(map_current_user_credential_error)
+    }
+
+    /// Loads a signer only when its derived public key matches the original
+    /// transaction receipt's trust anchor.
+    pub fn load_signer(
+        &self,
+        receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+    ) -> Result<Ed25519SupervisionLeaseSigner, SupervisionAuthorityKeyError> {
+        receipt.validate()?;
+        let owner_sid = PlatformHandle::new(receipt.request.owner_sid.clone())
+            .map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
+        let observed = self
+            .primitive
+            .inspect(&receipt.target, &owner_sid)
+            .map_err(map_current_user_credential_error)?;
+        if !matches!(
+            observed,
+            CurrentUserSupervisionCredentialObservation::Present {
+                owner_sid: observed_sid,
+                target: observed_target,
+            } if observed_sid == owner_sid && observed_target == receipt.target
+        ) {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        let secret = self
+            .primitive
+            .read(&receipt.target, &owner_sid)
+            .map_err(map_current_user_credential_error)?;
+        if secret.expose().len() != 32 {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(secret.expose());
+        let signer_result = Ed25519SupervisionLeaseSigner::from_secret_key(
+            receipt.request.signer_id.clone(),
+            receipt.request.key_id.clone(),
+            seed,
+        );
+        seed.fill(0);
+        let signer = signer_result.map_err(map_contract_error)?;
+        if signer.public_key().as_slice() != receipt.trust_anchor.public_key.as_slice() {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        Ok(signer)
+    }
+
+    /// Loads a Kernel signer from the exact current-user reference retained in
+    /// the launch descriptor and verifies it against the original public
+    /// trust anchor.
+    pub fn load_signer_for_kernel(
+        &self,
+        reference: &UserModeSupervisionKeyReference,
+        trust_anchor: &SupervisionTrustAnchor,
+    ) -> Result<Ed25519SupervisionLeaseSigner, SupervisionAuthorityKeyError> {
+        reference.validate().map_err(map_contract_error)?;
+        trust_anchor.validate().map_err(map_contract_error)?;
+        let owner_sid = self
+            .primitive
+            .principal_sid()
+            .map_err(map_current_user_credential_error)?;
+        if owner_sid.as_str() != reference.owner_sid_receipt.owner_sid {
+            return Err(SupervisionAuthorityKeyError::AccessDenied);
+        }
+        let target = PlatformHandle::new(reference.credential_target.clone())
+            .map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
+        let secret = self
+            .primitive
+            .read(&target, &owner_sid)
+            .map_err(map_current_user_credential_error)?;
+        signer_for_anchor(secret, trust_anchor)
+    }
+}
+
+/// Explicitly disposable repository-local key provider for PortableDev.
+///
+/// Key bytes exist only in the retained current-user file below the selected
+/// repository root. This provider has no service, ProgramData, Credential
+/// Manager, or production fallback path.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsPortableDevSupervisionAuthorityKeyProvider;
+
+impl WindowsPortableDevSupervisionAuthorityKeyProvider {
+    /// Creates a provider without opening or changing the repository.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Observes the exact create-only key path before a key is prepared.
+    pub fn inspect_target(
+        &self,
+        request: &PortableDevSupervisionAuthorityKeyRequest,
+    ) -> Result<PortableDevSupervisionAuthorityKeyTargetObservation, SupervisionAuthorityKeyError>
+    {
+        request.validate()?;
+        let root =
+            open_portable_dev_root(&request.repository_root, request.repository_root_identity)?;
+        let path = portable_dev_key_path(&root, &request.relative_path)?;
+        let parent = open_portable_dev_parent(&root, &path, false)?;
+        let state = match std::fs::symlink_metadata(&path) {
+            Ok(_) => PortableDevSupervisionAuthorityKeyTargetObservation::Present {
+                repository_root_identity: root.identity(),
+                relative_path: request.relative_path.clone(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PortableDevSupervisionAuthorityKeyTargetObservation::Absent {
+                    repository_root_identity: root.identity(),
+                    relative_path: request.relative_path.clone(),
+                }
+            }
+            Err(_) => return Err(SupervisionAuthorityKeyError::ProviderUnavailable),
+        };
+        if let Some(parent) = &parent {
+            parent
+                .verify_stable_identity()
+                .and_then(|()| parent.verify_path_identity())
+                .map_err(map_user_owned_path_error)?;
+        }
+        root.verify_stable_identity()
+            .and_then(|()| root.verify_path_identity())
+            .map_err(map_user_owned_path_error)?;
+        Ok(state)
+    }
+
+    /// Generates a key and public anchor before the caller commits the
+    /// returned secret-free receipt as durable effect intent.
+    pub fn prepare(
+        &self,
+        request: PortableDevSupervisionAuthorityKeyRequest,
+    ) -> Result<PreparedPortableDevSupervisionAuthorityKey, SupervisionAuthorityKeyError> {
+        request.validate()?;
+        let mut seed = [0_u8; 32];
+        if fill_system_random(&mut seed).is_err() || seed.iter().all(|byte| *byte == 0) {
+            seed.fill(0);
+            return Err(SupervisionAuthorityKeyError::RandomUnavailable);
+        }
+        let secret_result = CredentialSecret::from_bytes(seed.to_vec());
+        seed.fill(0);
+        let secret = secret_result.map_err(|_| SupervisionAuthorityKeyError::KeyInvalid)?;
+        let mut signer_seed = [0_u8; 32];
+        signer_seed.copy_from_slice(secret.expose());
+        let signer_result = Ed25519SupervisionLeaseSigner::from_secret_key(
+            request.signer_id.clone(),
+            request.key_id.clone(),
+            signer_seed,
+        );
+        signer_seed.fill(0);
+        let signer = signer_result.map_err(map_contract_error)?;
+        let trust_anchor = SupervisionTrustAnchor::new(
+            request.installation_id.clone(),
+            request.signer_id.clone(),
+            request.key_id.clone(),
+            signer.public_key().to_vec(),
+        )
+        .map_err(map_contract_error)?;
+        let receipt = PortableDevSupervisionAuthorityKeyReceipt::new(request, trust_anchor)?;
+        Ok(PreparedPortableDevSupervisionAuthorityKey { receipt, secret })
+    }
+
+    /// Writes only a prepared seed with create-new semantics. If a target
+    /// already exists or any post-create readback is uncertain, the original
+    /// receipt is returned as Unknown for read-only restart reconciliation.
+    pub fn write_prepared(
+        &self,
+        prepared: PreparedPortableDevSupervisionAuthorityKey,
+    ) -> Result<PortableDevSupervisionAuthorityKeyWriteOutcome, SupervisionAuthorityKeyError> {
+        let PreparedPortableDevSupervisionAuthorityKey { receipt, secret } = prepared;
+        receipt.validate()?;
+        let root = open_portable_dev_root(
+            &receipt.request.repository_root,
+            receipt.request.repository_root_identity,
+        )?;
+        let path = portable_dev_key_path(&root, &receipt.request.relative_path)?;
+        let parent = open_portable_dev_parent(&root, &path, true)?
+            .ok_or(SupervisionAuthorityKeyError::ProviderUnavailable)?;
+        let mut file = match UserOwnedPathLease::create_new(&parent, &path) {
+            Ok(file) => file,
+            Err(error) => {
+                return match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt })
+                    }
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Err(map_user_owned_path_error(error))
+                    }
+                    Err(_) => {
+                        Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt })
+                    }
+                };
+            }
+        };
+        let write_result = file.write_new_bytes(secret.expose());
+        let durable_root = parent
+            .verify_stable_identity()
+            .and_then(|()| parent.verify_path_identity())
+            .and_then(|()| root.verify_stable_identity())
+            .and_then(|()| root.verify_path_identity());
+        if write_result.is_err() || durable_root.is_err() {
+            return Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt });
+        }
+        match self.inspect(&receipt) {
+            Ok(PortableDevSupervisionAuthorityKeyObservation::Matching { .. }) => {
+                Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Created { receipt })
+            }
+            Ok(PortableDevSupervisionAuthorityKeyObservation::Absent { .. })
+            | Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch { .. })
+            | Err(_) => Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt }),
+        }
+    }
+
+    /// Inspects only against the original durable receipt and trust anchor.
+    pub fn inspect(
+        &self,
+        receipt: &PortableDevSupervisionAuthorityKeyReceipt,
+    ) -> Result<PortableDevSupervisionAuthorityKeyObservation, SupervisionAuthorityKeyError> {
+        receipt.validate()?;
+        let request = &receipt.request;
+        let root =
+            open_portable_dev_root(&request.repository_root, request.repository_root_identity)?;
+        let path = portable_dev_key_path(&root, &request.relative_path)?;
+        let parent = open_portable_dev_parent(&root, &path, false)?;
+        let Some(parent) = parent else {
+            root.verify_stable_identity()
+                .and_then(|()| root.verify_path_identity())
+                .map_err(map_user_owned_path_error)?;
+            return Ok(PortableDevSupervisionAuthorityKeyObservation::Absent {
+                receipt: receipt.clone(),
+            });
+        };
+        if let Err(error) = std::fs::symlink_metadata(&path) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                parent
+                    .verify_stable_identity()
+                    .and_then(|()| parent.verify_path_identity())
+                    .and_then(|()| root.verify_stable_identity())
+                    .and_then(|()| root.verify_path_identity())
+                    .map_err(map_user_owned_path_error)?;
+                return Ok(PortableDevSupervisionAuthorityKeyObservation::Absent {
+                    receipt: receipt.clone(),
+                });
+            }
+            return Err(SupervisionAuthorityKeyError::ProviderUnavailable);
+        }
+        let file =
+            UserOwnedPathLease::open_existing(&parent, &path).map_err(map_user_owned_path_error)?;
+        let bytes = match file.read_bounded(33) {
+            Ok(bytes) => bytes,
+            Err(crate::ProtectedPathError::SizeExceeded) => {
+                file.verify_stable_identity()
+                    .and_then(|()| file.verify_path_identity())
+                    .and_then(|()| parent.verify_stable_identity())
+                    .and_then(|()| parent.verify_path_identity())
+                    .and_then(|()| root.verify_stable_identity())
+                    .and_then(|()| root.verify_path_identity())
+                    .map_err(map_user_owned_path_error)?;
+                return Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch {
+                    relative_path: request.relative_path.clone(),
+                });
+            }
+            Err(error) => return Err(map_user_owned_path_error(error)),
+        };
+        file.verify_stable_identity()
+            .and_then(|()| file.verify_path_identity())
+            .and_then(|()| parent.verify_stable_identity())
+            .and_then(|()| parent.verify_path_identity())
+            .and_then(|()| root.verify_stable_identity())
+            .and_then(|()| root.verify_path_identity())
+            .map_err(map_user_owned_path_error)?;
+        if bytes.len() != 32 {
+            return Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch {
+                relative_path: request.relative_path.clone(),
+            });
+        }
+        let secret = CredentialSecret::from_bytes(bytes)
+            .map_err(|_| SupervisionAuthorityKeyError::KeyInvalid)?;
+        match signer_for_anchor(secret, &receipt.trust_anchor) {
+            Ok(_) => Ok(PortableDevSupervisionAuthorityKeyObservation::Matching {
+                receipt: receipt.clone(),
+            }),
+            Err(SupervisionAuthorityKeyError::KeyInvalid)
+            | Err(SupervisionAuthorityKeyError::InvalidBinding) => {
+                Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch {
+                    relative_path: request.relative_path.clone(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Deletes only a file whose retained bytes still derive the exact
+    /// transaction receipt's public key, then confirms the exact path is
+    /// absent beneath the same repository-root object.
+    pub fn delete_if_matching(
+        &self,
+        receipt: &PortableDevSupervisionAuthorityKeyReceipt,
+    ) -> Result<(), SupervisionAuthorityKeyError> {
+        match self.inspect(receipt)? {
+            PortableDevSupervisionAuthorityKeyObservation::Matching { .. } => {}
+            PortableDevSupervisionAuthorityKeyObservation::Absent { .. }
+            | PortableDevSupervisionAuthorityKeyObservation::Mismatch { .. } => {
+                return Err(SupervisionAuthorityKeyError::InvalidBinding);
+            }
+        }
+        let request = &receipt.request;
+        let root =
+            open_portable_dev_root(&request.repository_root, request.repository_root_identity)?;
+        let path = portable_dev_key_path(&root, &request.relative_path)?;
+        let parent = open_portable_dev_parent(&root, &path, false)?
+            .ok_or(SupervisionAuthorityKeyError::InvalidBinding)?;
+        let path_lease =
+            UserOwnedPathLease::open_existing(&parent, &path).map_err(map_user_owned_path_error)?;
+        let expected_identity = path_lease.identity();
+        let bytes = path_lease
+            .read_bounded(33)
+            .map_err(map_user_owned_path_error)?;
+        if bytes.len() != 32 {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        signer_for_anchor(
+            CredentialSecret::from_bytes(bytes)
+                .map_err(|_| SupervisionAuthorityKeyError::KeyInvalid)?,
+            &receipt.trust_anchor,
+        )?;
+        path_lease
+            .verify_stable_identity()
+            .and_then(|()| path_lease.verify_path_identity())
+            .and_then(|()| parent.verify_stable_identity())
+            .and_then(|()| parent.verify_path_identity())
+            .and_then(|()| root.verify_stable_identity())
+            .and_then(|()| root.verify_path_identity())
+            .map_err(map_user_owned_path_error)?;
+        drop(path_lease);
+        let (identity, file) =
+            crate::open_no_follow_file_for_delete(&path).map_err(map_user_owned_path_error)?;
+        if identity != expected_identity {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        crate::delete_owned_file_handle(file, identity).map_err(map_user_owned_path_error)?;
+        parent
+            .verify_stable_identity()
+            .and_then(|()| parent.verify_path_identity())
+            .and_then(|()| root.verify_stable_identity())
+            .and_then(|()| root.verify_path_identity())
+            .map_err(map_user_owned_path_error)?;
+        match self.inspect(receipt)? {
+            PortableDevSupervisionAuthorityKeyObservation::Absent { .. } => Ok(()),
+            PortableDevSupervisionAuthorityKeyObservation::Matching { .. }
+            | PortableDevSupervisionAuthorityKeyObservation::Mismatch { .. } => {
+                Err(SupervisionAuthorityKeyError::InvalidBinding)
+            }
+        }
+    }
+
+    /// Loads a signer only from the reference below the retained PortableDev
+    /// repository-root identity and compares the derived public key to the
+    /// original descriptor trust anchor.
+    pub fn load_signer_for_kernel(
+        &self,
+        reference: &PortableDevSupervisionKeyReference,
+        repository_root: &Path,
+        expected_repository_root_identity: FileIdentity,
+        trust_anchor: &SupervisionTrustAnchor,
+    ) -> Result<Ed25519SupervisionLeaseSigner, SupervisionAuthorityKeyError> {
+        reference.validate().map_err(map_contract_error)?;
+        trust_anchor.validate().map_err(map_contract_error)?;
+        let root = open_portable_dev_root(repository_root, expected_repository_root_identity)?;
+        let path = portable_dev_key_path(&root, &reference.relative_path)?;
+        let parent = open_portable_dev_parent(&root, &path, false)?
+            .ok_or(SupervisionAuthorityKeyError::ProviderUnavailable)?;
+        let file =
+            UserOwnedPathLease::open_existing(&parent, &path).map_err(map_user_owned_path_error)?;
+        let bytes = file.read_bounded(33).map_err(map_user_owned_path_error)?;
+        file.verify_stable_identity()
+            .and_then(|()| file.verify_path_identity())
+            .and_then(|()| parent.verify_stable_identity())
+            .and_then(|()| parent.verify_path_identity())
+            .and_then(|()| root.verify_stable_identity())
+            .and_then(|()| root.verify_path_identity())
+            .map_err(map_user_owned_path_error)?;
+        if bytes.len() != 32 {
+            return Err(SupervisionAuthorityKeyError::KeyInvalid);
+        }
+        signer_for_anchor(
+            CredentialSecret::from_bytes(bytes)
+                .map_err(|_| SupervisionAuthorityKeyError::KeyInvalid)?,
+            trust_anchor,
+        )
+    }
 }
 
 /// Stateless DPAPI-NG service-SID key provider.
@@ -194,6 +1191,9 @@ impl SealedKeyEnvelope {
     ) -> Result<(), SupervisionAuthorityKeyError> {
         request.validate()?;
         self.authority.validate().map_err(map_contract_error)?;
+        let Some(key_reference) = self.authority.key_reference.as_system_service() else {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        };
         if self.wire != SEALED_KEY_ENVELOPE_WIRE
             || self.transaction_id != request.transaction_id
             || self.effect_id != request.effect_id
@@ -204,10 +1204,10 @@ impl SealedKeyEnvelope {
             || self.authority.trust_anchor.installation_id != request.installation_id
             || self.authority.trust_anchor.signer_id != request.signer_id
             || self.authority.trust_anchor.key_id != request.key_id
-            || self.authority.key_reference.relative_path != request.relative_path
-            || self.authority.key_reference.host_service_sid != request.expected_host_service_sid
-            || self.authority.key_reference.file_identity != file_identity(object)
-            || self.authority.key_reference.sealed_blob_sha256 != sha256_hex(&self.sealed_blob)
+            || key_reference.relative_path != request.relative_path
+            || key_reference.host_service_sid != request.expected_host_service_sid
+            || key_reference.file_identity != file_identity(object)
+            || key_reference.sealed_blob_sha256 != sha256_hex(&self.sealed_blob)
             || !constant_time_eq(
                 self.ownership_mac.as_bytes(),
                 hmac_sha256_hex(ownership_key, &self.mac_payload()?).as_bytes(),
@@ -354,12 +1354,13 @@ impl WindowsSupervisionAuthorityKeyStore {
         authority: &ProvisionedSupervisionAuthority,
     ) -> Result<CredentialSecret, SupervisionAuthorityKeyError> {
         authority.validate().map_err(map_contract_error)?;
-        if !kernel_root.is_absolute()
-            || !single_relative_component(&authority.key_reference.relative_path)
-        {
+        let Some(key_reference) = authority.key_reference.as_system_service() else {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        };
+        if !kernel_root.is_absolute() || !single_relative_component(&key_reference.relative_path) {
             return Err(SupervisionAuthorityKeyError::InvalidBinding);
         }
-        let path = kernel_root.join(&authority.key_reference.relative_path);
+        let path = kernel_root.join(&key_reference.relative_path);
         let readback = self
             .primitive
             .read_protected_file(spec, &path, SEALED_KEY_FILE_LIMIT)
@@ -367,17 +1368,16 @@ impl WindowsSupervisionAuthorityKeyStore {
         let envelope: SealedKeyEnvelope = serde_json::from_slice(&readback.bytes)
             .map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
         if envelope.authority != *authority
-            || authority.key_reference.file_identity != file_identity(&readback.object)
-            || authority.key_reference.sealed_blob_sha256 != sha256_hex(&envelope.sealed_blob)
+            || key_reference.file_identity != file_identity(&readback.object)
+            || key_reference.sealed_blob_sha256 != sha256_hex(&envelope.sealed_blob)
             || resolve_service_sid(SUPERVISION_AUTHORITY_HOST_SERVICE)?
-                != authority.key_reference.host_service_sid
+                != key_reference.host_service_sid
         {
             return Err(SupervisionAuthorityKeyError::InvalidBinding);
         }
-        let secret = self.provider.unseal(
-            &authority.key_reference.host_service_sid,
-            &envelope.sealed_blob,
-        )?;
+        let secret = self
+            .provider
+            .unseal(&key_reference.host_service_sid, &envelope.sealed_blob)?;
         let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
             authority.trust_anchor.signer_id.clone(),
             authority.trust_anchor.key_id.clone(),
@@ -413,6 +1413,242 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_user_mode_authority_target(value: &str) -> bool {
+    value
+        .strip_prefix("eliot/supervision-authority/user-mode/v1/")
+        .is_some_and(|suffix| {
+            suffix.len() == 64
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn user_mode_authority_target(
+    request: &UserModeSupervisionAuthorityCredentialRequest,
+) -> Result<String, SupervisionAuthorityKeyError> {
+    let mut digest = Sha256::new();
+    digest.update(b"eliot-user-mode-supervision-credential-target-v1\0");
+    for value in [
+        request.installation_id.as_str(),
+        request.transaction_id.as_str(),
+        request.effect_id.as_str(),
+        request.owner_sid.as_str(),
+    ] {
+        let length =
+            u64::try_from(value.len()).map_err(|_| SupervisionAuthorityKeyError::InvalidBinding)?;
+        digest.update(length.to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    Ok(format!(
+        "eliot/supervision-authority/user-mode/v1/{:x}",
+        digest.finalize()
+    ))
+}
+
+fn open_portable_dev_root(
+    repository_root: &Path,
+    expected_identity: FileIdentity,
+) -> Result<UserOwnedRootLease, SupervisionAuthorityKeyError> {
+    if !repository_root.is_absolute()
+        || expected_identity.volume_serial_number == 0
+        || expected_identity.file_index == 0
+    {
+        return Err(SupervisionAuthorityKeyError::InvalidBinding);
+    }
+    crate::reject_reparse_chain(repository_root, true).map_err(map_user_owned_path_error)?;
+    let root =
+        UserOwnedRootLease::open_existing(repository_root).map_err(map_user_owned_path_error)?;
+    let canonical = root.canonical_path().map_err(map_user_owned_path_error)?;
+    if root.identity() != expected_identity
+        || !crate::windows_paths_equal(&canonical, repository_root)
+    {
+        return Err(SupervisionAuthorityKeyError::InvalidBinding);
+    }
+    root.verify_stable_identity()
+        .and_then(|()| root.verify_path_identity())
+        .map_err(map_user_owned_path_error)?;
+    Ok(root)
+}
+
+fn portable_dev_key_path(
+    root: &UserOwnedRootLease,
+    relative_path: &str,
+) -> Result<PathBuf, SupervisionAuthorityKeyError> {
+    PortableDevSupervisionKeyReference::new(relative_path.to_owned())
+        .map_err(map_contract_error)?;
+    let file_name = relative_path
+        .strip_prefix(PORTABLE_DEV_SUPERVISION_KEY_PREFIX)
+        .filter(|name| single_relative_component(name) && !name.contains('\\'))
+        .ok_or(SupervisionAuthorityKeyError::InvalidBinding)?;
+    let path = root.path().join(relative_path);
+    if path.file_name().and_then(|value| value.to_str()) != Some(file_name)
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(SupervisionAuthorityKeyError::InvalidBinding);
+    }
+    Ok(path)
+}
+
+fn open_portable_dev_parent(
+    root: &UserOwnedRootLease,
+    key_path: &Path,
+    create_supervision_directory: bool,
+) -> Result<Option<UserOwnedRootLease>, SupervisionAuthorityKeyError> {
+    let repository_root = root.path();
+    let state_path = repository_root.join(".eliot-dev").join("state");
+    let supervision_path = state_path.join("supervision");
+    let expected_key_path = supervision_path.join(
+        key_path
+            .file_name()
+            .ok_or(SupervisionAuthorityKeyError::InvalidBinding)?,
+    );
+    if !crate::windows_paths_equal(key_path, &expected_key_path) {
+        return Err(SupervisionAuthorityKeyError::InvalidBinding);
+    }
+    crate::reject_reparse_chain(key_path, false).map_err(map_user_owned_path_error)?;
+    root.verify_stable_identity()
+        .and_then(|()| root.verify_path_identity())
+        .map_err(map_user_owned_path_error)?;
+
+    let mut missing_ancestor = false;
+    for directory in [repository_root.join(".eliot-dev"), state_path.clone()] {
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(SupervisionAuthorityKeyError::InvalidBinding),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_ancestor = true;
+                break;
+            }
+            Err(error) => return Err(map_io_error(error)),
+        }
+    }
+    if missing_ancestor {
+        if create_supervision_directory {
+            return Err(SupervisionAuthorityKeyError::ProviderUnavailable);
+        }
+        root.verify_stable_identity()
+            .and_then(|()| root.verify_path_identity())
+            .map_err(map_user_owned_path_error)?;
+        return Ok(None);
+    }
+
+    let state_root =
+        UserOwnedRootLease::open_existing(&state_path).map_err(map_user_owned_path_error)?;
+    let parent = match std::fs::symlink_metadata(&supervision_path) {
+        Ok(metadata) if metadata.is_dir() => Some(
+            UserOwnedRootLease::open_existing(&supervision_path)
+                .map_err(map_user_owned_path_error)?,
+        ),
+        Ok(_) => return Err(SupervisionAuthorityKeyError::InvalidBinding),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if create_supervision_directory {
+                Some(
+                    state_root
+                        .open_or_create_child_directory("supervision")
+                        .map_err(map_user_owned_path_error)?,
+                )
+            } else {
+                None
+            }
+        }
+        Err(error) => return Err(map_io_error(error)),
+    };
+    if let Some(parent) = &parent {
+        let canonical = parent.canonical_path().map_err(map_user_owned_path_error)?;
+        if !crate::windows_paths_equal(&canonical, &supervision_path) {
+            return Err(SupervisionAuthorityKeyError::InvalidBinding);
+        }
+        parent
+            .verify_stable_identity()
+            .and_then(|()| parent.verify_path_identity())
+            .map_err(map_user_owned_path_error)?;
+    }
+    state_root
+        .verify_stable_identity()
+        .and_then(|()| state_root.verify_path_identity())
+        .and_then(|()| root.verify_stable_identity())
+        .and_then(|()| root.verify_path_identity())
+        .map_err(map_user_owned_path_error)?;
+    Ok(parent)
+}
+
+fn signer_for_anchor(
+    secret: CredentialSecret,
+    trust_anchor: &SupervisionTrustAnchor,
+) -> Result<Ed25519SupervisionLeaseSigner, SupervisionAuthorityKeyError> {
+    trust_anchor.validate().map_err(map_contract_error)?;
+    if secret.expose().len() != 32 {
+        return Err(SupervisionAuthorityKeyError::KeyInvalid);
+    }
+    let mut seed = [0_u8; 32];
+    seed.copy_from_slice(secret.expose());
+    let signer_result = Ed25519SupervisionLeaseSigner::from_secret_key(
+        trust_anchor.signer_id.clone(),
+        trust_anchor.key_id.clone(),
+        seed,
+    );
+    seed.fill(0);
+    let signer = signer_result.map_err(map_contract_error)?;
+    if signer.public_key().as_slice() != trust_anchor.public_key.as_slice() {
+        return Err(SupervisionAuthorityKeyError::InvalidBinding);
+    }
+    Ok(signer)
+}
+
+fn map_user_owned_path_error(error: ProtectedPathError) -> SupervisionAuthorityKeyError {
+    match error {
+        ProtectedPathError::AclMismatch => SupervisionAuthorityKeyError::AccessDenied,
+        ProtectedPathError::InvalidRoot
+        | ProtectedPathError::InvalidPath
+        | ProtectedPathError::ReparsePoint
+        | ProtectedPathError::IdentityMismatch => SupervisionAuthorityKeyError::InvalidBinding,
+        ProtectedPathError::Win32 { code: 5, .. } => SupervisionAuthorityKeyError::AccessDenied,
+        ProtectedPathError::Io
+        | ProtectedPathError::Win32 { .. }
+        | ProtectedPathError::SizeExceeded
+        | ProtectedPathError::UnsupportedPlatform => {
+            SupervisionAuthorityKeyError::ProviderUnavailable
+        }
+    }
+}
+
+fn map_io_error(error: std::io::Error) -> SupervisionAuthorityKeyError {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => SupervisionAuthorityKeyError::AccessDenied,
+        std::io::ErrorKind::NotFound => SupervisionAuthorityKeyError::InvalidBinding,
+        _ => SupervisionAuthorityKeyError::ProviderUnavailable,
+    }
+}
+
+fn provider_receipt_matches(
+    provider: &CurrentUserSupervisionCredentialWriteReceipt,
+    receipt: &UserModeSupervisionAuthorityCredentialReceipt,
+) -> bool {
+    provider.owner_sid.as_str() == receipt.request.owner_sid && provider.target == receipt.target
+}
+
+fn map_current_user_credential_error(error: WindowsAdapterError) -> SupervisionAuthorityKeyError {
+    match error {
+        WindowsAdapterError::PermissionDenied | WindowsAdapterError::AclMismatch => {
+            SupervisionAuthorityKeyError::AccessDenied
+        }
+        WindowsAdapterError::InvalidInput
+        | WindowsAdapterError::IdentityMismatch
+        | WindowsAdapterError::AlreadyExists => SupervisionAuthorityKeyError::InvalidBinding,
+        WindowsAdapterError::NotFound
+        | WindowsAdapterError::Unavailable
+        | WindowsAdapterError::Timeout
+        | WindowsAdapterError::Failed
+        | WindowsAdapterError::RevertToSelf { .. } => {
+            SupervisionAuthorityKeyError::ProviderUnavailable
+        }
+    }
 }
 
 fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {

@@ -65,6 +65,8 @@ impl CurrentUserLocalAppDataRootLease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UserModeProfileTaskSpec {
     pub(crate) task_name: String,
+    pub(crate) transaction_id: String,
+    pub(crate) effect_id: String,
     pub(crate) installation_id: String,
     pub(crate) installation_key: String,
     pub(crate) component: String,
@@ -107,6 +109,8 @@ impl From<WindowsAdapterError> for UserModeProfileTaskRegistrationError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UserModeProfileTaskReceipt {
     pub(crate) task_name: String,
+    pub(crate) transaction_id: String,
+    pub(crate) effect_id: String,
     pub(crate) installation_id: String,
     pub(crate) installation_key: String,
     pub(crate) component: String,
@@ -1209,6 +1213,8 @@ fn validate_user_mode_profile_task_spec(
     );
     let leaf = spec.task_name.rsplit('\\').next().unwrap_or_default();
     if spec.task_name != expected_name
+        || !valid_task_creation_marker(&spec.transaction_id)
+        || !valid_task_creation_marker(&spec.effect_id)
         || !valid_security_identity(&spec.installation_id)
         || !valid_security_identity(&spec.installation_key)
         || !valid_security_identity(&spec.component)
@@ -1249,6 +1255,8 @@ fn validate_user_mode_profile_task_receipt(
 ) -> Result<(), WindowsAdapterError> {
     validate_user_mode_profile_task_spec(&UserModeProfileTaskSpec {
         task_name: receipt.task_name.clone(),
+        transaction_id: receipt.transaction_id.clone(),
+        effect_id: receipt.effect_id.clone(),
         installation_id: receipt.installation_id.clone(),
         installation_key: receipt.installation_key.clone(),
         component: receipt.component.clone(),
@@ -1284,6 +1292,10 @@ fn valid_security_identity(value: &str) -> bool {
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
         })
+}
+
+fn valid_task_creation_marker(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_control)
 }
 
 #[cfg(windows)]
@@ -1405,6 +1417,8 @@ fn register_user_mode_profile_task_windows(
         };
         Ok(UserModeProfileTaskReceipt {
             task_name: spec.task_name.clone(),
+            transaction_id: spec.transaction_id.clone(),
+            effect_id: spec.effect_id.clone(),
             installation_id: spec.installation_id.clone(),
             installation_key: spec.installation_key.clone(),
             component: spec.component.clone(),
@@ -1621,6 +1635,8 @@ fn inspect_user_mode_profile_task_windows(
 fn receipt_as_spec(receipt: &UserModeProfileTaskReceipt) -> UserModeProfileTaskSpec {
     UserModeProfileTaskSpec {
         task_name: receipt.task_name.clone(),
+        transaction_id: receipt.transaction_id.clone(),
+        effect_id: receipt.effect_id.clone(),
         installation_id: receipt.installation_id.clone(),
         installation_key: receipt.installation_key.clone(),
         component: receipt.component.clone(),
@@ -1789,7 +1805,9 @@ fn user_mode_profile_task_readback_matches(
 
 fn user_mode_profile_task_description(spec: &UserModeProfileTaskSpec) -> String {
     format!(
-        "Eliot Host UserMode current-user supervisor; installation={}; key={}; component={}; version={}; generation={}; roots_sha256={}; artifact_sha256={}",
+        "Eliot Host UserMode current-user supervisor; transaction={}; effect={}; installation={}; key={}; component={}; version={}; generation={}; roots_sha256={}; artifact_sha256={}",
+        spec.transaction_id,
+        spec.effect_id,
         spec.installation_id,
         spec.installation_key,
         spec.component,
@@ -1908,10 +1926,7 @@ fn open_user_mode_task_folder_and_leaf(
 
 #[cfg(windows)]
 fn task_scheduler_object_missing(error: &windows::core::Error) -> bool {
-    matches!(
-        error.code().0 as u32,
-        0x8007_0002 | 0x8007_0003
-    )
+    matches!(error.code().0 as u32, 0x8007_0002 | 0x8007_0003)
 }
 
 fn xml_escape(value: &str) -> String {
