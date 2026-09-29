@@ -786,9 +786,27 @@ impl BoundedRevocationContinuationToken {
 /// only grows and no further round can reduce it. A caller that needs the
 /// whole set must raise the bound; the engine never hands back a result
 /// wider than the bound it was given and calls it complete.
+///
+/// `request_id`, `request_digest`, `bounds_digest`, `reason`,
+/// `completeness` and `state_fence` are the operation this receipt answers.
+/// They are the same identities the continuation already froze, carried here
+/// so a COMPLETE outcome is as self-describing as an incomplete one: before
+/// this change a complete outcome carried only `root_ref`, so its affected
+/// set, frontier and omissions were not attributable to any request, fence or
+/// bound. Every one of them is a value the traversal already computed, not a
+/// new one. [`verify_binding`](BoundedRevocationOutcome::verify_binding)
+/// recomputes them from the request and bounds a consumer holds and compares
+/// by content; it never infers the binding from the presence or absence of a
+/// continuation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 pub struct BoundedRevocationOutcome {
     pub root_ref: String,
+    pub request_id: String,
+    pub request_digest: String,
+    pub bounds_digest: String,
+    pub reason: RevocationReason,
+    pub completeness: ClosureCompleteness,
+    pub state_fence: StateFence,
     pub affected_refs: Vec<String>,
     pub frontier: Vec<String>,
     pub omissions: Vec<RevocationOmission>,
@@ -803,6 +821,52 @@ impl BoundedRevocationOutcome {
     /// Return the live continuation capability emitted with this outcome.
     pub fn continuation_token(&self) -> Option<&BoundedRevocationContinuationToken> {
         self.continuation_token.as_ref()
+    }
+
+    /// Prove this receipt answers exactly this request under exactly these
+    /// bounds.
+    ///
+    /// The request digest, the qualified-edge graph digest, and the bounds
+    /// digest are RECOMPUTED here from the request and bounds the caller
+    /// holds and then compared with the ones this outcome carries, so the
+    /// receipt is bound by content to the operation rather than by the
+    /// spelling of a root reference. `state_fence`, `reason` and
+    /// `completeness` are compared directly against the request. A receipt
+    /// that answers a different operation, a different graph snapshot, a
+    /// different bound set, a different reason or a different fence refuses.
+    ///
+    /// This is the guard a durable consumer runs before it uses
+    /// `affected_refs`, `frontier` or `omissions` as the dependent closure of
+    /// a revocation: an outcome read back from storage, or presented by
+    /// another owner, is only usable once it has been re-bound to the exact
+    /// request that is being served now.
+    pub fn verify_binding(
+        &self,
+        request: &BoundedRevocationRequest,
+        bounds: &RevocationBounds,
+    ) -> Result<(), InfluenceError> {
+        if self.request_digest != request.digest()?
+            || self.bounds_digest != bounds.digest()?
+            || self.request_id != request.request_id
+            || self.root_ref != request.root_ref
+            || self.reason != request.reason
+            || self.completeness != request.completeness
+            || self.state_fence != request.state_fence
+        {
+            return Err(InfluenceError::OutcomeBindingMismatch(
+                "outcome.request_identity",
+            ));
+        }
+        if let Some(continuation) = &self.continuation
+            && (continuation.request_digest != self.request_digest
+                || continuation.graph_snapshot_digest != request.graph_snapshot_digest()?
+                || continuation.bounds_digest != self.bounds_digest)
+        {
+            return Err(InfluenceError::OutcomeBindingMismatch(
+                "outcome.continuation_identity",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -825,6 +889,12 @@ impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
                 A: MapAccess<'de>,
             {
                 let mut root_ref = None;
+                let mut request_id = None;
+                let mut request_digest = None;
+                let mut bounds_digest = None;
+                let mut reason = None;
+                let mut completeness = None;
+                let mut state_fence = None;
                 let mut affected_refs = None;
                 let mut frontier = None;
                 let mut omissions = None;
@@ -834,6 +904,22 @@ impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "root_ref" => set_field(&mut root_ref, "root_ref", map.next_value()?)?,
+                        "request_id" => {
+                            set_field(&mut request_id, "request_id", map.next_value()?)?;
+                        }
+                        "request_digest" => {
+                            set_field(&mut request_digest, "request_digest", map.next_value()?)?;
+                        }
+                        "bounds_digest" => {
+                            set_field(&mut bounds_digest, "bounds_digest", map.next_value()?)?;
+                        }
+                        "reason" => set_field(&mut reason, "reason", map.next_value()?)?,
+                        "completeness" => {
+                            set_field(&mut completeness, "completeness", map.next_value()?)?;
+                        }
+                        "state_fence" => {
+                            set_field(&mut state_fence, "state_fence", map.next_value()?)?;
+                        }
                         "affected_refs" => {
                             set_field(&mut affected_refs, "affected_refs", map.next_value()?)?;
                         }
@@ -851,6 +937,12 @@ impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
                 }
                 Ok(BoundedRevocationOutcome {
                     root_ref: required(root_ref, "root_ref")?,
+                    request_id: required(request_id, "request_id")?,
+                    request_digest: required(request_digest, "request_digest")?,
+                    bounds_digest: required(bounds_digest, "bounds_digest")?,
+                    reason: required(reason, "reason")?,
+                    completeness: required(completeness, "completeness")?,
+                    state_fence: required(state_fence, "state_fence")?,
                     affected_refs: required(affected_refs, "affected_refs")?,
                     frontier: required(frontier, "frontier")?,
                     omissions: required(omissions, "omissions")?,
@@ -1585,14 +1677,14 @@ impl BoundedTraversal {
         let continuation = if self.exhausted || has_pending || self.unresolved_bound {
             let mut continuation = BoundedRevocationContinuation {
                 schema_version: BOUNDED_REVOCATION_CONTINUATION_SCHEMA.to_owned(),
-                request_id: self.request_id,
+                request_id: self.request_id.clone(),
                 root_ref: request.root_ref.clone(),
                 reason: self.reason,
                 completeness: self.completeness,
-                request_digest: self.request_digest,
+                request_digest: self.request_digest.clone(),
                 graph_snapshot_digest: self.graph_snapshot_digest,
                 state_fence: request.state_fence.clone(),
-                bounds_digest: self.bounds_digest,
+                bounds_digest: self.bounds_digest.clone(),
                 admitted_refs: affected_refs.clone(),
                 admitted_nodes,
                 expanded_refs: expanded_refs.clone(),
@@ -1620,6 +1712,12 @@ impl BoundedTraversal {
                 });
         Ok(BoundedRevocationOutcome {
             root_ref: request.root_ref.clone(),
+            request_id: self.request_id.clone(),
+            request_digest: self.request_digest.clone(),
+            bounds_digest: self.bounds_digest.clone(),
+            reason: self.reason,
+            completeness: self.completeness,
+            state_fence: request.state_fence.clone(),
             affected_refs,
             frontier,
             omissions: self.omissions,
@@ -1702,6 +1800,12 @@ impl BoundedTraversal {
         }
         Some(BoundedRevocationOutcome {
             root_ref: request.root_ref.clone(),
+            request_id: self.request_id.clone(),
+            request_digest: self.request_digest.clone(),
+            bounds_digest: self.bounds_digest.clone(),
+            reason: self.reason,
+            completeness: self.completeness,
+            state_fence: request.state_fence.clone(),
             affected_refs: emitted,
             frontier: self.frontier.iter().cloned().collect(),
             omissions: self.omissions.clone(),
@@ -3316,6 +3420,25 @@ pub enum InfluenceError {
     /// field coordinate.
     #[error("revocation state does not reconcile at {0}")]
     ReconciliationMismatch(&'static str),
+    /// Carries the `binding` cause: a bounded revocation receipt does not
+    /// answer the request and bounds it is being presented against.
+    ///
+    /// Produced by `BoundedRevocationOutcome::verify_binding`, the check a
+    /// consumer runs before it uses a receipt's `affected_refs`, `frontier`
+    /// or `omissions` as a dependent closure. The request digest, the
+    /// qualified-edge graph digest and the bounds digest are RECOMPUTED from
+    /// the request and bounds the consumer holds and compared with the ones
+    /// the receipt carries, and the request id, root, reason, completeness
+    /// and state fence are compared directly, so a receipt from another
+    /// operation, graph snapshot, bound set, reason or fence refuses instead
+    /// of being read as this operation's closure.
+    ///
+    /// The refusal set is new: nothing previously rejected a receipt on
+    /// those grounds, because a complete outcome carried only `root_ref` and
+    /// was not attributable to any request at all. The payload is a bounded,
+    /// redacted static field coordinate.
+    #[error("revocation receipt does not bind to this operation at {0}")]
+    OutcomeBindingMismatch(&'static str),
 }
 
 #[cfg(test)]

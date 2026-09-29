@@ -2277,6 +2277,15 @@ impl GrantGraph {
         };
         let mut outcome = eliot_influence::revoke_bounded_page(&request, bounds, page_limits)
             .map_err(map_bounded_revocation_error)?;
+        // The receipt is bound to THIS request and THESE bounds by content
+        // before any of its affected set is reconciled against the structural
+        // walk below. `revoke_bounded_page` returns a complete outcome that
+        // carries no continuation, so without this check the affected set,
+        // frontier and omissions of a complete page were attributable to no
+        // operation at all: only the root reference named anything.
+        outcome
+            .verify_binding(&request, bounds)
+            .map_err(map_bounded_revocation_error)?;
         while !outcome.complete {
             if outcome.omissions.iter().any(|omission| {
                 matches!(
@@ -2308,6 +2317,13 @@ impl GrantGraph {
                 page_limits,
             )
             .map_err(map_bounded_revocation_error)?;
+            // Every page is re-bound to the same operation before the loop
+            // reads its completeness: a resumed page that answered a
+            // different request, graph snapshot, bound set, reason or fence
+            // refuses here rather than extending the closure.
+            outcome
+                .verify_binding(&request, bounds)
+                .map_err(map_bounded_revocation_error)?;
             if !outcome.complete
                 && outcome.work_spent == previous_work
                 && !outcome.omissions.iter().any(|omission| {
