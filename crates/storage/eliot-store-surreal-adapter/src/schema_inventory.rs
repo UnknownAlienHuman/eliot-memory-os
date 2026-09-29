@@ -254,7 +254,7 @@ pub(crate) static NON_EXECUTABLE_MIGRATION_ROOTS: [NonExecutableRoot; 3] = [
         path: "crates/eliot-store/migrations",
         identity: "eliot.surql.legacy-root.migrations",
         disposition: RootDisposition::LegacyRoot,
-        rationale: "pre-split canonical schema root still owned by the legacy core; selected by the legacy store.migrations_dir config default and by legacy app/engine code, and retired by the legacy core retirement issue #1189 — the current owner records the disposition and never executes it",
+        rationale: "pre-split canonical schema root still owned by the legacy core; no current configuration key selects it (the legacy store.migrations_dir key is deleted under issue #1221 work item W4) and only legacy app/engine code still resolves it, and it is retired by the legacy core retirement issue #1189 — the current owner records the disposition and never executes it",
         removal_condition: "removed from current config, launch, packaging and restore only after the complete table-by-table mapping closes under issue #1221 wave D and the legacy core retirement issue #1189",
     },
     NonExecutableRoot {

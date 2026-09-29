@@ -447,13 +447,9 @@ pub fn run_daemon_init_default(
         .context("source config must be inside a project runtime root")?
         .to_path_buf();
     let source_surql = resolve_source_resource(&source_project_root, &config.store.surql_dir);
-    let source_migrations =
-        resolve_source_resource(&source_project_root, &config.store.migrations_dir);
     let resources = eliot_home.join("resources");
     let destination_surql = resources.join("surql");
-    let destination_migrations = resources.join("migrations");
     copy_resource_tree(&source_surql, &destination_surql)?;
-    copy_resource_tree(&source_migrations, &destination_migrations)?;
 
     "EliotGovernor".clone_into(&mut config.service.service_name);
     "default".clone_into(&mut config.service.instance_id);
@@ -466,7 +462,6 @@ pub fn run_daemon_init_default(
     config.control_wal.path = config_path_text(&eliot_home.join("control").join("control.redb"));
     config.blob_store.root = config_path_text(&eliot_home.join("blobs"));
     config.store.surql_dir = config_path_text(&destination_surql);
-    config.store.migrations_dir = config_path_text(&destination_migrations);
     config.validate()?;
     let encoded = toml::to_string_pretty(&config)?;
     atomic_write_bytes(destination_config, encoded.as_bytes())?;

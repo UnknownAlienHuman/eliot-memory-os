@@ -2175,7 +2175,6 @@ fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResul
     let blobs = slash(&runtime.join("blobs"));
     let repo = repository_root()?;
     let surql = slash(&repo.join("crates/eliot-store/src/surql"));
-    let migrations = slash(&repo.join("crates/eliot-store/migrations"));
     let config = format!(
         r#"schema_version = "1"
 
@@ -2219,7 +2218,6 @@ root = "{blobs}"
 
 [store]
 surql_dir = "{surql}"
-migrations_dir = "{migrations}"
 "#
     );
     fs::write(config_path, config)?;

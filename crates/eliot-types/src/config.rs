@@ -196,11 +196,20 @@ pub struct BlobStoreConfig {
 
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
 /// and duplicate member keys are already refused by the derived `MapAccess`.
+///
+/// `migrations_dir` is deleted (issue #1221, work item W4). It was the only
+/// current configuration key that named a legacy migration root: its default
+/// was `crates/eliot-store/migrations`, and `eliot-governor daemon
+/// init-default` resolved it and staged that root into the installed runtime
+/// resources. The current Store schema-generation owner
+/// (`eliot-store-surreal-adapter`) embeds its own migration graph and resolves
+/// nothing from the filesystem, so current configuration can no longer select a
+/// root or legacy migration root. `deny_unknown_fields` keeps a document that
+/// still carries `migrations_dir` a refusal rather than a silent default.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreConfig {
     pub surql_dir: String,
-    pub migrations_dir: String,
 }
 
 impl GovernorConfig {
@@ -265,7 +274,6 @@ impl GovernorConfig {
                 field: "supervision.watchdog_interval_ms",
             });
         }
-        require_non_empty("store.migrations_dir", &self.store.migrations_dir)?;
 
         let bind = self.db.surreal.bind.to_ascii_lowercase();
         if !bind.starts_with("127.0.0.1:") {
@@ -399,7 +407,6 @@ impl Default for GovernorConfig {
             },
             store: StoreConfig {
                 surql_dir: "crates/eliot-store/src/surql".to_owned(),
-                migrations_dir: "crates/eliot-store/migrations".to_owned(),
             },
             supervision: RuntimeSupervisionConfig::default(),
             delegation_calibration: DelegationCalibrationConfig::default(),
