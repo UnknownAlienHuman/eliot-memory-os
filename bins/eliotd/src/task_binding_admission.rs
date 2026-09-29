@@ -55,9 +55,11 @@
 //!
 //! - [`bind_current_task_selection`] — the applicability recheck admission
 //!   needs (issue #1746, W4). It refuses a current task until the readiness
-//!   receipt carries owner-proven selection source/evidence. Once that owner
-//!   producer exists, the activation snapshot and receipt can be compared at
-//!   the live fence. Structural validation of request-supplied
+//!   receipt carries owner-proven selection source/evidence. The owner
+//!   producer is `GovernorComposition::current_task_selection` and the
+//!   composition caller is `DaemonComposition::resolve_current_task_selection`
+//!   (itself STITCH-called: no live dispatch ingress supplies the lease key
+//!   terms yet). Structural validation of request-supplied
 //!   `TaskSelectionEvidence` is never sufficient.
 //!
 //! No entry creates a second write path, re-derives a downstream layer's
@@ -1818,8 +1820,9 @@ pub fn seal_dispatched_binding(
 /// live owners (issue #1746, W6/A5).
 ///
 /// The live task/scope, principal/session, task revision, acceptance digest,
-/// bootstrap receipt revision, governance profile reference, and fence come
-/// from the live owners at the existing queued-claim/launch/effect gate —
+/// bootstrap receipt revision, governance profile reference, projection
+/// generation, and fence come from the live owners at the existing
+/// queued-claim/launch/effect gate —
 /// never from the request. An intervening rebind, task revision, acceptance
 /// change, logout, or generation change fails closed with
 /// `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind: the old operation is not
@@ -1833,7 +1836,8 @@ pub fn seal_dispatched_binding(
 /// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
 /// and the scope-sensitive trigger, passing the live Governor task/scope,
 /// principal/session, task revision, acceptance digest, receipt revision,
-/// governance profile reference, and kernel-snapshot fence.
+/// governance profile reference, projection generation (the live receipt's own
+/// `projection_generation`, alongside its revision), and kernel-snapshot fence.
 #[allow(
     clippy::too_many_arguments,
     reason = "revalidation joins the sealed identity against every live owner value that can invalidate it in one fail-closed edge"
@@ -1848,6 +1852,7 @@ pub fn revalidate_dispatched_binding(
     live_acceptance_digest: &str,
     live_receipt_revision: u64,
     live_governance_profile_ref: &str,
+    live_projection_generation: u64,
     live_fence: &StateFence,
 ) -> Result<(), TaskBindingError> {
     let Some(live_task_ref) = live_task_ref else {
@@ -1897,6 +1902,16 @@ pub fn revalidate_dispatched_binding(
     {
         return Err(TaskBindingError::scope_incompatible(
             "admitted bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
+        ));
+    }
+    // The admitted projection generation is sealed alongside the receipt
+    // revision at admission (`seal_dispatched_binding`) and rechecked here
+    // against the live receipt's own generation: a re-projected bootstrap
+    // under the same receipt revision still conflicts for rebind, it is never
+    // silently adopted under the old operation identity.
+    if live_projection_generation != binding.projection_generation {
+        return Err(TaskBindingError::scope_incompatible(
+            "admitted projection generation moved before effect; rebind at the live projection, no silent rebind",
         ));
     }
     revalidate_task_bound_for_effect(
