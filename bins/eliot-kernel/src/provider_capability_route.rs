@@ -2,16 +2,19 @@
 //!
 //! Daemon-side composition only: builds a [`ProviderCapabilityContext`] from
 //! the authenticated Kernel client (session + service guard + ORS handle)
-//! and verifies one presented provider proof against the durable Kernel/ORS
-//! records bound to the exact attempt and operation, plus the presented
+//! and checks one presented tuple against the durable admitted claim binding
+//! for its exact attempt and operation, plus the presented
 //! route/capacity revision checked against the separately presented
 //! Governor-observed currentness (`governor_route_revision` /
 //! `governor_capacity_revision`, resolved by the daemon from its live
-//! Governor view), the claiming-worker generation, and the fence digest
+//! Governor view), the executable binding, claiming-worker generation, and
+//! fence digest
 //! (wire contour `eliot-kernel-provider-capability/v2`). No signing, no
 //! tokens, no cached `Verified` marker, no user authentication: every call
 //! re-queries ORS and the live authority epoch, so restore always observes
-//! fresh owner evidence.
+//! fresh owner evidence. The claim row contains no per-operation provider
+//! receipt payload, so this route establishes claim-binding coherence only;
+//! it does not authenticate the content of the seven provider proof kinds.
 //!
 //! The capability wire contract itself ([`ProviderProofKind`],
 //! [`ProviderCapabilityRequest`], [`ProviderCapabilityExpectation`],
@@ -57,8 +60,9 @@ use std::sync::{Arc, Mutex};
 // Wire operation.
 // ---------------------------------------------------------------------------
 
-/// Verifies one presented provider proof against the durable Kernel/ORS
-/// records bound to its exact attempt and operation.
+/// Checks one presented tuple against the durable admitted claim binding for
+/// its exact attempt and operation. It does not verify an operation-specific
+/// provider receipt payload.
 pub(crate) const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str =
     "native_worker.provider_capability.verify";
 
@@ -95,6 +99,8 @@ pub enum ProviderCapabilityRouteError {
     UnknownClaim(String),
     /// The presented attempt/operation disagrees with the durable row.
     BindingMismatch(String),
+    /// The claim is only a staged intent and has no admission receipt yet.
+    UnadmittedClaim,
 }
 
 impl std::fmt::Display for ProviderCapabilityRouteError {
@@ -103,7 +109,10 @@ impl std::fmt::Display for ProviderCapabilityRouteError {
             Self::Session(reason) => write!(f, "provider capability session rejected: {reason}"),
             Self::Store(reason) => write!(f, "provider capability store unavailable: {reason}"),
             Self::Capability(_) => {
-                write!(f, "provider capability proof rejected by the kernel owner")
+                write!(
+                    f,
+                    "provider capability binding rejected by the kernel owner"
+                )
             }
             Self::UnknownClaim(identity) => {
                 write!(f, "provider capability claim is unknown: {identity}")
@@ -112,6 +121,9 @@ impl std::fmt::Display for ProviderCapabilityRouteError {
                 f,
                 "provider capability attempt/operation mismatches claim: {identity}"
             ),
+            Self::UnadmittedClaim => {
+                write!(f, "provider capability claim has no admission receipt")
+            }
         }
     }
 }
@@ -129,7 +141,7 @@ impl ProviderCapabilityRouteError {
     pub(crate) fn into_transport(self) -> TransportError {
         match self {
             Self::UnknownClaim(_) => TransportError::UnknownRequest,
-            Self::BindingMismatch(_) => TransportError::IdentityConflict,
+            Self::BindingMismatch(_) | Self::UnadmittedClaim => TransportError::IdentityConflict,
             Self::Session(_) | Self::Store(_) | Self::Capability(_) => {
                 TransportError::SessionFenced
             }
@@ -140,6 +152,14 @@ impl ProviderCapabilityRouteError {
 /// Truncates one identity to a bounded, secret-free error fragment.
 fn bounded_identity(value: &str) -> String {
     value.chars().take(MAX_ERROR_TEXT_CHARS).collect()
+}
+
+/// Returns whether one string is exactly a lowercase SHA-256 digest.
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -173,14 +193,17 @@ impl ProviderCapabilityContext {
         &self.live_authority_epoch
     }
 
-    /// Verifies one presented provider proof of the given kind.
+    /// Checks one presented provider tuple against its durable claim binding.
     ///
     /// Loads the durable claim row by exact claim identity, requires the
     /// presented attempt and operation to equal the row binding, then
     /// delegates to the capability owner with the presented proof, the
-    /// loaded row, and a freshly re-queried live-epoch expectation. A
-    /// terminal row revokes capability authority (same rule as the replay
-    /// route); a row carrying no valid generation never verifies. Every call
+    /// loaded row, and a freshly re-queried live-epoch expectation. The ORS
+    /// row's executable digest is independent owner-observed material; it is
+    /// returned only after the presented digest matches that row value. A
+    /// missing or malformed row digest fails closed. A terminal row revokes
+    /// capability authority (same rule as the replay route); an unadmitted
+    /// row or one carrying no valid generation never verifies. Every call
     /// re-queries ORS and the live epoch; nothing is cached, so restore
     /// always observes fresh owner evidence.
     ///
@@ -197,10 +220,14 @@ impl ProviderCapabilityContext {
     /// the presented-versus-row binding for those two fields is established
     /// by [`ProviderCapabilityContext::verify_claim_binding`], which the
     /// dispatch path runs first on the wire-v2 presented values. Direct
-    /// callers of this method present row-coherent material by construction.
+    /// callers still require exact row and live-owner agreement. Success
+    /// returns the executable digest loaded from the claim row after that
+    /// independent value matches the presentation. The row contains no
+    /// operation-specific provider receipt payload, so this method proves
+    /// claim-binding coherence only, not the content of the selected proof.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the presented proof is one flat wire tuple plus the separately sourced Governor-observed currentness; grouping either would invent a second contract beside the owner request"
+        reason = "the presented tuple is flat wire material plus separately sourced Governor-observed currentness; grouping either would invent a second contract beside the owner request"
     )]
     pub fn verify(
         &self,
@@ -216,7 +243,7 @@ impl ProviderCapabilityContext {
         capacity_rev: &str,
         expected_route_revision: &str,
         expected_capacity_revision: &str,
-    ) -> Result<(), ProviderCapabilityRouteError> {
+    ) -> Result<String, ProviderCapabilityRouteError> {
         let claim_identity = OperationIdentity::new(claim_id).map_err(|_| {
             ProviderCapabilityRouteError::Session("claim identity is malformed".to_owned())
         })?;
@@ -231,10 +258,19 @@ impl ProviderCapabilityContext {
             .ok_or_else(|| {
                 ProviderCapabilityRouteError::UnknownClaim(bounded_identity(claim_id))
             })?;
+        row.validate().map_err(|_| {
+            ProviderCapabilityRouteError::Store("durable claim record is incoherent".to_owned())
+        })?;
         if row.attempt_id.as_str() != attempt_id || row.operation_id.as_str() != operation_id {
             return Err(ProviderCapabilityRouteError::BindingMismatch(
                 bounded_identity(claim_id),
             ));
+        }
+        if row.state == eliot_ors::NativeWorkerClaimState::Requested
+            || row.receipt_digest.is_none()
+            || row.admitted_at_unix_ms.is_none()
+        {
+            return Err(ProviderCapabilityRouteError::UnadmittedClaim);
         }
         // Fresh live epoch on every call: never the construction-time copy.
         let live_epoch = self
@@ -264,6 +300,18 @@ impl ProviderCapabilityContext {
                 ProviderCapabilityError::StaleGeneration,
             ));
         }
+        if row.state.is_terminal() {
+            return Err(ProviderCapabilityRouteError::Capability(
+                ProviderCapabilityError::Revoked,
+            ));
+        }
+        let loaded_executable_digest = row
+            .executable_binding_digest
+            .as_deref()
+            .filter(|digest| is_lowercase_sha256(digest))
+            .ok_or(ProviderCapabilityRouteError::Capability(
+                ProviderCapabilityError::DigestMismatch,
+            ))?;
         let request = ProviderCapabilityRequest {
             claim_id: row.claim_id.as_str().to_owned(),
             attempt_id: row.attempt_id.as_str().to_owned(),
@@ -292,26 +340,23 @@ impl ProviderCapabilityContext {
         };
         // W-A owner signature is the 9-parameter pure verifier
         // (request, expectation, loaded attempt/operation/binding/executable/
-        // generation/fence, live epoch). The ORS claim row carries no
-        // executable-binding column by design in this slice (no write
-        // migration; see the owner module residual), so the presented
-        // executable digest rides per call: the owner shape-checks it as
-        // lowercase SHA-256 and the durable equality gate in this slice is
-        // the binding digest from the exact row above. The durable
-        // attempt/operation/binding/generation/fence come from the row and
-        // the epoch is the freshly re-queried live authority epoch.
+        // generation/fence, live epoch). Every loaded value comes from the
+        // exact ORS claim row or a fresh owner query; the executable digest is
+        // never sourced from the presented request. This proves claim-binding
+        // coherence only: the row does not retain the operation-specific
+        // provider receipt payload needed to authenticate each proof kind.
         verify_provider_capability(
             &request,
             &expectation,
             row.attempt_id.as_str(),
             row.operation_id.as_str(),
             row.binding_digest.as_str(),
-            executable_digest,
+            loaded_executable_digest,
             row.worker_generation,
             row.fence_digest.as_str(),
             &live_epoch,
         )?;
-        Ok(())
+        Ok(loaded_executable_digest.to_owned())
     }
 
     /// Binds wire-v2 presented claiming-worker generation and fence digest
@@ -325,7 +370,7 @@ impl ProviderCapabilityContext {
     /// a different fence fails closed here even when every digest still
     /// matches; a row carrying no valid generation is incoherent and never
     /// binds. Terminal revocation itself is enforced by `verify` through
-    /// the owner expectation.
+    /// its current-row revocation gate.
     pub fn verify_claim_binding(
         &self,
         claim_id: &str,
@@ -346,6 +391,9 @@ impl ProviderCapabilityContext {
             .ok_or_else(|| {
                 ProviderCapabilityRouteError::UnknownClaim(bounded_identity(claim_id))
             })?;
+        row.validate().map_err(|_| {
+            ProviderCapabilityRouteError::Store("durable claim record is incoherent".to_owned())
+        })?;
         if row.worker_generation == 0 || presented_generation != row.worker_generation {
             return Err(ProviderCapabilityRouteError::Capability(
                 ProviderCapabilityError::StaleGeneration,
@@ -494,7 +542,9 @@ impl KernelComposition {
         Ok(KernelFrameAction::Reply(frame))
     }
 
-    /// Verifies one presented provider proof and seals the success receipt.
+    /// Checks one presented tuple against its current claim binding and seals
+    /// a claim-coherence receipt. Operation-specific provider proof content is
+    /// not present in the Kernel/ORS claim row and is not attested here.
     fn handle_provider_capability_verify(
         &self,
         session: &Session,
@@ -552,7 +602,7 @@ impl KernelComposition {
         let fence_digest = require_capability_digest(payload, "fence_digest")?;
         let context = self.provider_capability_for_session(session)?;
         context.verify_claim_binding(&claim_id, worker_generation, &fence_digest)?;
-        context.verify(
+        let owner_executable_digest = context.verify(
             proof_kind,
             &attempt_id,
             &operation_id,
@@ -567,19 +617,25 @@ impl KernelComposition {
             &governor_capacity_rev,
         )?;
         let body = serde_json::json!({
-            "kind": "native_worker_provider_capability",
+            "kind": "native_worker_claim_binding_coherence",
+            "verification_scope": "claim_binding_coherence_only",
             "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "operation": PROVIDER_CAPABILITY_VERIFY_OPERATION,
             "claim_id": claim_id,
             "attempt_id": attempt_id,
             "operation_id": operation_id,
             "proof_kind": proof_kind_value,
+            "canonical_payload_sha256": canonical_payload_sha256,
+            "binding_digest": binding_digest,
+            "executable_binding_digest": executable_digest,
+            "governor_executable_binding_digest": owner_executable_digest,
             "route_revision": route_rev,
             "capacity_revision": capacity_rev,
             "governor_route_revision": governor_route_rev,
             "governor_capacity_revision": governor_capacity_rev,
             "worker_generation": worker_generation,
             "fence_digest": fence_digest,
-            "verified_at_unix_ms": unix_ms(),
+            "checked_at_unix_ms": unix_ms(),
         });
         seal_capability_receipt(body)
     }
@@ -627,12 +683,7 @@ fn require_capability_digest(
     let value = payload
         .get(field)
         .and_then(serde_json::Value::as_str)
-        .filter(|value| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        })
+        .filter(|value| is_lowercase_sha256(value))
         .ok_or_else(|| ProviderCapabilityRouteError::Session(field.to_owned()))?;
     Ok(value.to_owned())
 }
