@@ -3792,11 +3792,7 @@ mod store_currentness_production_tests {
             profile_component: h("eliot"),
             profile_version: h("test-version"),
             profile_installation_key: None,
-            profile_governed_roots: fixture_profile_roots(
-                Path::new(portable),
-                "gen-1",
-                roots,
-            ),
+            profile_governed_roots: fixture_profile_roots(Path::new(portable), "gen-1", roots),
             portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
             installation_epoch: eliot_installation::InstallationEpoch {
                 installation: h("install-1"),

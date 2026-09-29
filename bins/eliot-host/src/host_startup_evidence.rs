@@ -486,11 +486,7 @@ mod tests {
             profile_component: handle("eliot"),
             profile_version: handle("test-version"),
             profile_installation_key: None,
-            profile_governed_roots: test_profile_roots(
-                dir,
-                generation.as_str(),
-                roots,
-            ),
+            profile_governed_roots: test_profile_roots(dir, generation.as_str(), roots),
             portable_root: Some(roots.installation_root.clone()),
             installation_epoch,
             generation,

@@ -250,10 +250,8 @@ impl ProtectedSupervisionLeaseSigner {
                 InstallationProfile::PortableDev,
                 SupervisionAuthorityKeyReference::PortableDev(reference),
             ) => {
-                let (repository_root, repository_root_identity) = self
-                    .portable_dev_repository_root
-                    .as_ref()
-                    .ok_or_else(|| {
+                let (repository_root, repository_root_identity) =
+                    self.portable_dev_repository_root.as_ref().ok_or_else(|| {
                         SupervisionLeaseError::Signing(
                             "PortableDev repository root is unavailable".to_owned(),
                         )

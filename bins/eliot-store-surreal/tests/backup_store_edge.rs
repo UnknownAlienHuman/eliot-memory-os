@@ -35,8 +35,8 @@ use eliot_contracts::{
     ProductId, RequestId, ResourceGeneration, SourceId, StateFence,
 };
 use eliot_installation::{
-    InstallationEpoch, InstallationProfile, InstallationRoots, RuntimeLaunchDescriptor,
-    RuntimeStateRoots, SupervisionAuthorityBinding, INSTALLATION_ROOT_BINDING_VERSION,
+    INSTALLATION_ROOT_BINDING_VERSION, InstallationEpoch, InstallationProfile, InstallationRoots,
+    RuntimeLaunchDescriptor, RuntimeStateRoots, SupervisionAuthorityBinding,
 };
 use eliot_ipc::{DeliveryOutcome, TransportLimits};
 use eliot_kernel_service::{
@@ -437,7 +437,13 @@ fn runtime_launch() -> RuntimeLaunchDescriptor {
         profile_component: handle("eliot"),
         profile_version: handle("test-version"),
         profile_installation_key: Some(handle(
-            roots.installation_root.as_str().rsplit('\\').next().unwrap().to_owned(),
+            roots
+                .installation_root
+                .as_str()
+                .rsplit('\\')
+                .next()
+                .unwrap()
+                .to_owned(),
         )),
         profile_governed_roots: system_profile_roots(&roots),
         portable_root: None,

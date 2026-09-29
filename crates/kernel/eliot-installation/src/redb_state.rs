@@ -28,10 +28,9 @@ use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROL
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
     InstallationError, InstallationRoots, InstallationStage, InstallationStepOutcome,
-    InstallationTransaction,
-    InstallationTransactionStore, InstallerEffectPlan, PackageArtifactDigest, SetupBinding,
-    SetupMilestone, SetupStatus, decode_installation_transaction_json_from_store, handle,
-    runtime_sha256_handle,
+    InstallationTransaction, InstallationTransactionStore, InstallerEffectPlan,
+    PackageArtifactDigest, SetupBinding, SetupMilestone, SetupStatus,
+    decode_installation_transaction_json_from_store, handle, runtime_sha256_handle,
     transaction_store_private::{self, TransactionVersion},
 };
 use eliot_config::initial_snapshot::SignedInitialConfigSnapshot;
@@ -2612,12 +2611,9 @@ fn validate_publication_journal(
             reason: "invalid publication journal identity or path".to_owned(),
         });
     }
-    journal.profile_governed_roots.validate(
-        journal
-            .profile_governed_roots
-            .runtime_state_roots
-            .profile,
-    )?;
+    journal
+        .profile_governed_roots
+        .validate(journal.profile_governed_roots.runtime_state_roots.profile)?;
     for (value, field) in [
         (&journal.operation_id, "publication.operation_id"),
         (&journal.transaction_id, "publication.transaction_id"),
@@ -3496,8 +3492,8 @@ mod tests {
     }
 
     fn publication_profile_binding() -> InstallationRoots {
-        let profile_root = PlatformHandle::new(r"C:\eliot-publication-fixture")
-            .expect("fixture profile root");
+        let profile_root =
+            PlatformHandle::new(r"C:\eliot-publication-fixture").expect("fixture profile root");
         let runtime_state_roots = RuntimeStateRoots::derived(
             InstallationProfile::PortableDev,
             profile_root.clone(),
