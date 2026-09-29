@@ -439,6 +439,76 @@ impl CutoverReadback {
     }
 }
 
+/// Bounded correlation handles carried by one cutover phase record
+/// (F-LOG-HOST-8, #983 W2).
+///
+/// W2 admits exactly one class of correlation for a phase observation: existing
+/// references the owners have ALREADY validated for this operation. This value
+/// holds that class and nothing else — the cutover operation identity triple
+/// plus the approved target generation, each a `PlatformHandle` the admitting
+/// envelope and the retained content-checked body already agreed on. It is built
+/// from a [`CutoverReadback`], which the EXECUTE contour takes from the sealed
+/// request (the seal proved the presented body equals the retained one, so the
+/// same identity survives) and the status contour already takes from the admitted
+/// body.
+///
+/// Every slot is an `Option`, exactly as
+/// `host_diagnostics::HostRequestProjection` renders its identity slots: a phase
+/// observed BEFORE that validation carries `None` and emits `<slot>_missing`,
+/// which is a positive statement that this boundary does not hold the fact. A
+/// pre-admission record therefore correlates by its static category alone — an
+/// unvalidated caller string is never a stand-in (I5.27).
+///
+/// Cost: copies of handles already in hand. No owner read, no registry or
+/// journal access, no archive hashing (in particular NOT
+/// `ValidatedCutover::sealed_operation`, whose `operation_request_digest()`
+/// would compute a digest that exists only for this log line), no resource
+/// acquisition, no retry and no mutation.
+struct CutoverPhaseCorrelation {
+    operation_id: Option<crate::host_diagnostics::BoundedField>,
+    request_digest: Option<crate::host_diagnostics::BoundedField>,
+    installation: Option<crate::host_diagnostics::BoundedField>,
+    target_generation: Option<crate::host_diagnostics::BoundedField>,
+}
+
+impl CutoverPhaseCorrelation {
+    /// The explicitly EMPTY correlation for a phase observed before this
+    /// operation's identity and target have been validated. Every slot renders
+    /// `missing`, so the record cannot be read as carrying an identity it does
+    /// not have.
+    fn unvalidated() -> Self {
+        Self {
+            operation_id: None,
+            request_digest: None,
+            installation: None,
+            target_generation: None,
+        }
+    }
+
+    /// The correlation for a phase observed AFTER the owners validated this
+    /// operation's identity and approved target. Each value is the
+    /// corresponding `PlatformHandle` text the readback already holds, bounded
+    /// by the facade's own helper; the handles themselves are not re-derived,
+    /// re-proved or re-hashed here.
+    fn for_readback(readback: &CutoverReadback) -> Self {
+        let operation = readback.operation();
+        Self {
+            operation_id: Some(crate::host_diagnostics::bound_field(
+                operation.operation_id.as_str(),
+            )),
+            request_digest: Some(crate::host_diagnostics::bound_field(
+                operation.request_digest.as_str(),
+            )),
+            installation: Some(crate::host_diagnostics::bound_field(
+                operation.installation.as_str(),
+            )),
+            target_generation: Some(crate::host_diagnostics::bound_field(
+                readback.target_generation().as_str(),
+            )),
+        }
+    }
+}
+
 /// Current recovery evidence consumed from the actual owners (#960 shape).
 ///
 /// Every denominator is complete-current: partial/unknown ORS/spool/effect
@@ -1112,33 +1182,63 @@ pub enum CutoverError {
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static tokens, owner disposition tokens,
-// or counts; never operation/installation/archive/build/fence strings,
-// digests, reasons, receipts, or arbitrary error `Debug`/`Display` (a canary
-// stays absent even inside an alleged identity string). Truncation bounds
-// size, never sensitivity. Macro arguments are precomputed pure values; sink
-// outcome never alters call counts, order, results, receipts, rollback, or
-// cleanup, and stdout framing is untouched (facade stderr subscriber). No
-// owner reads, effects, hashing, retries, or mutation are added for logging.
-// Requested/validated/prepared/committed/reconciled/retirement-pending/
-// failed/unknown stay exactly the owner-observed dispositions: rehearsal
-// never emits success, ambiguity stays unknown, and retirement-pending never
-// implies erasure.
+// or counts. The ONE exception is the bounded correlation W2 admits on a phase
+// record: [`CutoverPhaseCorrelation`] carries the cutover operation identity
+// triple and the approved target generation, and only ever as handles the owners
+// ALREADY validated for this operation (the sealed admitted body, or the
+// readback the status model was built from). A phase observed before that
+// validation passes `CutoverPhaseCorrelation::unvalidated()` and renders every
+// slot `<slot>_missing`, so it correlates by a static category alone and never by
+// an unvalidated caller string. Nothing else is ever carried: no archive digest
+// or class, no build or config digest, no activation fence, no reason, no
+// receipt, no path, and no arbitrary error `Debug`/`Display` (a canary stays
+// absent even inside an alleged identity string). Truncation bounds size, never
+// sensitivity. Macro arguments are precomputed pure values; the correlation is
+// built from values already in hand, so no owner read, registry or journal
+// access, digest computation, resource acquisition, retry or mutation is added
+// for logging. Sink outcome never alters call counts, order, results, receipts,
+// rollback, or cleanup, and stdout framing is untouched (facade stderr
+// subscriber). Requested/validated/prepared/committed/reconciled/
+// retirement-pending/failed/unknown stay exactly the owner-observed
+// dispositions: rehearsal never emits success, ambiguity stays unknown, and
+// retirement-pending never implies erasure.
 //
 // Terminal ownership (W4, applied): the leaf emits nonterminal phase/refusal
 // evidence only, with no dedup cache and no terminal record of its own, and
 // hands the error back UNCHANGED so no leaf frame can become the terminal
-// emitter. The single terminal record per failed cutover operation is owned by
+// emitter. The single terminal record per failed backup operation is owned by
 // the outer caller boundary through the crate's own `HostTerminalGuard` in
-// lib.rs: `HostComposition::backup_dispatch_cutover`,
-// `HostComposition::backup_dispatch_cutover_disposition` and
-// `HostComposition::backup_dispatch_cutover_retire` each arm one guard, armed
-// on entry, so an `Err` reaching any arm emits exactly one terminal record for
-// that operation. The three frozen codes are
-// `host-backup-cutover-failed` / `host-backup-cutover-disposition-failed` /
-// `host-backup-cutover-retire-failed`, so the three operations stay
-// distinguishable from each other and each stays distinct from a separate
-// process shutdown failure (`host-stop-failed`, `host-open-failed`). Nothing
-// here is deduplicated away: there is no global dedup cache, so a second
+// lib.rs, and each boundary names exactly one operation:
+//
+//   - `HostComposition::dispatch_backup_owner_operation` owns the LIVE
+//     registered-owner operation (`host-backup-dispatch-failed`). It is the one
+//     boundary the production contour actually reaches: it is what
+//     `HostComposition::process_backup_dispatch_requests` runs for every
+//     admitted backup request, and it is the only place a failed
+//     `PrepareIsolatedRestore` / `AdmitCutover` / `RestoreStatus` /
+//     `ReconcileRestore` produced by the closed dispatch table is decided. It
+//     calls only `HostComposition::backup_dispatch_reconcile`, which arms no
+//     guard of its own, so at most one guard is ever armed for one operation.
+//   - `HostComposition::backup_dispatch_cutover`,
+//     `HostComposition::backup_dispatch_cutover_disposition`,
+//     `HostComposition::backup_dispatch_cutover_retire` and
+//     `HostComposition::backup_dispatch_prepare` each own the single operation
+//     they themselves run (`host-backup-cutover-failed` /
+//     `host-backup-cutover-disposition-failed` /
+//     `host-backup-cutover-retire-failed` / `host-backup-prepare-failed`). None
+//     of them is reachable from the dispatch-owner boundary, so their guards
+//     never nest inside it.
+//
+// `HostBackupDispatchOwner::dispatch_backup_operation` (host `lib.rs`), the pipe
+// ingress that hands a request to that owner boundary, deliberately arms NO
+// guard: it does not run the operation. A refusal it returns is either a
+// closed-table routing miss the nonterminal `observe_live_cutover_dispatch`
+// record already names by static category, or the owner boundary's own refusal
+// propagated back verbatim through `HostBackupDispatchQueue::submit` — and
+// re-reporting that second kind there is exactly the duplicate terminal report
+// W4 forbids. Every frozen code above stays distinct from the others and from a
+// separate process shutdown failure (`host-stop-failed`, `host-open-failed`).
+// Nothing here is deduplicated away: there is no global dedup cache, so a second
 // failed operation still reports its own terminal.
 //
 // An operation can fail BY DISPOSITION rather than by `Err`, and a
@@ -1387,22 +1487,75 @@ pub fn observe_live_cutover_dispatch(
             Some(crate::BackupDispatchTarget::Prepare | crate::BackupDispatchTarget::Reconcile),
         ) => "admission_not_required",
     };
-    observe_cutover_progress(LIVE_CUTOVER_OP, outcome, "none", 0);
+    // #983 W2: this decision precedes every owner gate, so nothing about the
+    // operation is validated yet. The record therefore correlates by its static
+    // category alone and every identity slot renders `missing`; a presented
+    // operation id would be an unvalidated caller string and is never carried.
+    observe_cutover_progress(
+        LIVE_CUTOVER_OP,
+        outcome,
+        "none",
+        &CutoverPhaseCorrelation::unvalidated(),
+        0,
+    );
+}
+
+/// The [`CutoverPhaseCorrelation`] for a phase on any contour that holds a
+/// SEALED cutover.
+///
+/// Derived from the sealed request rather than from presented text:
+/// [`ValidatedCutover::seal`] already ran the authoritative admitted-payload
+/// check, so the retained content-checked body equals the admitted one and the
+/// presented operation triple equals the body-derived one —
+/// [`ValidatedCutover::sealed_operation`] says so explicitly, and
+/// [`CutoverReadback::from_request`] is then a pure field copy over the six
+/// bindings the status read model consumes. So this costs no owner read, no
+/// registry or journal access, no digest computation and no re-proof: it is the
+/// correlation the owners already established, reproduced for the record.
+///
+/// It is contour-neutral by design and used by the `validate`, `execute` and
+/// `retire_authorize` contours alike, because all three seal before they
+/// observe. A contour that has NOT sealed must not call this: it passes
+/// [`CutoverPhaseCorrelation::unvalidated`] instead.
+fn sealed_cutover_phase_correlation(validated: &ValidatedCutover) -> CutoverPhaseCorrelation {
+    CutoverPhaseCorrelation::for_readback(&CutoverReadback::from_request(validated.request()))
 }
 
 /// Observes one nonterminal cutover phase outcome after the decision exists.
 /// `disposition` repeats the owner-observed disposition (or `"none"` when the
 /// step produces none); `evidence_count` counts refs without naming them.
+///
+/// `correlation` carries the already-validated references W2 permits and nothing
+/// else. The pre-admission dispatch decision passes
+/// [`CutoverPhaseCorrelation::unvalidated`], which renders every slot `missing`,
+/// so a record filed before the owners validated this operation correlates by its
+/// static category alone. Every contour that has already sealed or read the
+/// admitted body passes the real correlation — the `validate`, `execute` and
+/// `retire_authorize` contours through
+/// [`sealed_cutover_phase_correlation`], the status and projection contours
+/// through [`CutoverPhaseCorrelation::for_readback`] — so the same stream ties a
+/// phase to the exact operation identity it belongs to. The record stays
+/// nonterminal: terminal ownership is the outer caller's, named beside the guard
+/// wiring.
 fn observe_cutover_progress(
     op: &'static str,
     outcome: &'static str,
     disposition: &'static str,
+    correlation: &CutoverPhaseCorrelation,
     evidence_count: u64,
 ) {
+    use crate::host_diagnostics::BoundedField;
     backup_cutover_note_event_log_unavailable();
     let op = crate::host_diagnostics::bound_field(op);
     let outcome = crate::host_diagnostics::bound_field(outcome);
     let disposition = crate::host_diagnostics::bound_field(disposition);
+    // A `None` slot renders empty WITH its `*_missing` flag true, so a reader
+    // checks the flag before the value and an absent correlation can never be
+    // mistaken for an identity this boundary did not hold.
+    let operation_id = correlation.operation_id.as_ref();
+    let request_digest = correlation.request_digest.as_ref();
+    let installation = correlation.installation.as_ref();
+    let target_generation = correlation.target_generation.as_ref();
     crate::host_diagnostics::info!(
         target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
         event = "host.backup.cutover_phase",
@@ -1410,6 +1563,14 @@ fn observe_cutover_progress(
         outcome = outcome.text(),
         disposition = disposition.text(),
         evidence_count = evidence_count,
+        operation_id = operation_id.map_or("", BoundedField::text),
+        operation_id_missing = operation_id.is_none(),
+        request_digest = request_digest.map_or("", BoundedField::text),
+        request_digest_missing = request_digest.is_none(),
+        installation = installation.map_or("", BoundedField::text),
+        installation_missing = installation.is_none(),
+        target_generation = target_generation.map_or("", BoundedField::text),
+        target_generation_missing = target_generation.is_none(),
         "host backup cutover phase observed"
     );
 }
@@ -1892,8 +2053,12 @@ pub fn plan_cutover_attempt(
 /// the expected predecessor.
 ///
 /// The outcome is observed once: success repeats the validated disposition,
-/// and each refusal carries its exact typed category. No request, evidence,
-/// or receipt string is logged.
+/// and each refusal carries its exact typed category. The success record is
+/// emitted only after the seal exists, so it may correlate with the operation
+/// identity and approved target the seal just proved
+/// ([`CutoverPhaseCorrelation`]); the refusal records precede the seal and
+/// carry their static category alone. No request, evidence, or receipt string is
+/// logged on either path.
 pub fn validate_cutover_request(
     request: &CutoverRequest,
     evidence: &IsolatedRecoveryEvidence,
@@ -1906,6 +2071,7 @@ pub fn validate_cutover_request(
                 "validate",
                 "validated",
                 "validated",
+                &sealed_cutover_phase_correlation(&validated),
                 backup_cutover_count(validated.evidence().fenced_introductions.len()),
             );
             Ok(validated)
@@ -2333,6 +2499,7 @@ fn execute_cutover_inner(
         "execute",
         "activation_settled",
         cutover_disposition_token(committed_outcome.disposition),
+        &sealed_cutover_phase_correlation(validated),
         backup_cutover_count(committed_outcome.evidence_refs.len()),
     );
     Ok((committed_outcome, barrier))
@@ -2370,6 +2537,7 @@ fn recover_retained_cutover(
                 "execute",
                 "replay_observed",
                 "committed",
+                &sealed_cutover_phase_correlation(validated),
                 backup_cutover_count(evidence_refs.len()),
             );
             CutoverOutcome {
@@ -2393,6 +2561,7 @@ fn recover_retained_cutover(
                 "execute",
                 "recovered_commit",
                 "committed",
+                &sealed_cutover_phase_correlation(validated),
                 backup_cutover_count(outcome.evidence_refs.len()),
             );
             outcome
@@ -2411,6 +2580,7 @@ fn recover_retained_cutover(
                 "execute",
                 "retained_unknown",
                 "unknown",
+                &sealed_cutover_phase_correlation(validated),
                 backup_cutover_count(outcome.evidence_refs.len()),
             );
             outcome
@@ -2783,6 +2953,7 @@ fn activate_cutover_contour(
         "execute",
         "activation_unestablished",
         cutover_disposition_token(outcome.disposition),
+        &sealed_cutover_phase_correlation(validated),
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     // The contour's own refusal is observed through the module's existing
@@ -2903,6 +3074,7 @@ pub fn read_cutover_disposition(
             READ_DISPOSITION_OP,
             "recheck",
             "owner_moved",
+            &CutoverPhaseCorrelation::for_readback(readback),
             backup_cutover_count(usize::from(attempt)),
         );
         if attempt >= CUTOVER_DISPOSITION_READ_ATTEMPTS {
@@ -3676,7 +3848,31 @@ pub fn retire_authorized_generation(
     let PredecessorRelationResolution::Bound(relation) =
         resolve_predecessor_retirement_relation(host, request, &operation, &journal)
     else {
-        observe_cutover_progress("retire_authorize", "relation_unavailable", "unknown", 0);
+        // #983 W2: the real correlation, not the empty one. By this point
+        // `retire_authorized_generation` has SEALED the body
+        // (`ValidatedCutover::seal` at the top of this function ran the
+        // authoritative admitted-payload check), the durable intent above was
+        // matched against the SEALED body's own operation identity, and the
+        // barrier's activation id, activation generation and state fence were
+        // all proved equal to the admitted body's. So the operation identity
+        // triple and the target generation this record reports on are
+        // owner-validated references, which is exactly the class W2 admits.
+        //
+        // The alternative — `CutoverPhaseCorrelation::unvalidated()` — would be
+        // false here rather than merely cautious: it would claim this boundary
+        // holds no operation identity while `operation` sits in scope as the
+        // sealed derivation, and it would make this `Unknown` record the one
+        // retirement record in the module that cannot be attributed to the
+        // operation it is about (I5.27). The neighbouring `note_cutover_error`
+        // refusals on this contour stay on their static `category`, because a
+        // refusal is filed before its decision exists and carries no result.
+        observe_cutover_progress(
+            "retire_authorize",
+            "relation_unavailable",
+            "unknown",
+            &sealed_cutover_phase_correlation(&validated),
+            0,
+        );
         return Ok(CutoverOutcome {
             disposition: CutoverDisposition::Unknown,
             residual: CutoverResidual::PredecessorEpochUnknown,
@@ -3981,6 +4177,7 @@ fn retire_prior_generation(
         "retire",
         "reconciled",
         "reconciled",
+        &sealed_cutover_phase_correlation(validated),
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     Ok(outcome)
@@ -4329,10 +4526,19 @@ pub fn reconcile_cutover_outcome(
     // The projected disposition repeats the owner observations verbatim:
     // ambiguity stays unknown with the original operation identity, and no
     // rollback request or archive hash can surface as a commit here.
+    //
+    // #983 W2: this is the record that most needs the operation identity, and it
+    // is the one place that holds it in VALIDATED form — `readback` was built
+    // from the admitted cutover body through `CutoverReadback::from_request`, so
+    // every slot below is an owner-proved reference for exactly the operation
+    // this projection is about. An observed replay, an unknown, a superseded
+    // retirement and a proven commit therefore stay separately attributable
+    // instead of being four anonymous `cutover_phase` lines (I5.27).
     observe_cutover_progress(
         "reconcile",
         "projected",
         cutover_disposition_token(outcome.disposition),
+        &CutoverPhaseCorrelation::for_readback(readback),
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     outcome

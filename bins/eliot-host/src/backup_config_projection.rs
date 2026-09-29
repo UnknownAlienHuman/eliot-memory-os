@@ -208,6 +208,13 @@ pub enum ProjectionError {
 // counts; never identity/digest/nonce/config/archive/user strings (a canary
 // stays absent even inside an alleged identity string), never
 // `describe_audit_fence()` text, never arbitrary error `Debug`/`Display`.
+// #983 W2 correlation: the only non-static facts any of these records carries are
+// the owner-validated NUMBERS already produced by the projection or the binding
+// (`generation`, `purge_ledger_revision`, `authority_generation`,
+// `artifact_count`/`build_count`, `audit_present`) — the same class the module
+// always used. No handle, digest, fence, receipt or caller string was added as
+// correlation, and a refusal observed before its decision exists keeps its
+// static `category` + `field` alone rather than reaching for a presented value.
 // Truncation bounds size, never sensitivity. Macro arguments are precomputed
 // pure values; sink outcome never alters results/order/receipts/rollback/
 // cleanup, and stdout framing is untouched (facade stderr subscriber).
@@ -296,7 +303,22 @@ fn observe_config_progress(
 }
 
 /// Observes one owner-build binding outcome after the decision exists.
-fn observe_bind_progress(outcome: &'static str, artifact_count: u64) {
+///
+/// # Correlation (F-LOG-HOST-8, #983 W2)
+///
+/// `authority_generation` is the W2 class this boundary may correlate with: the
+/// owner-validated numeric generation the approved record's own commit fence and
+/// manifest join just proved, copied from the binding in hand. It is a NUMBER
+/// from an owner-issued record, in the same class as the `generation` and
+/// `purge_revision` numerics [`observe_config_progress`] already carries, so the
+/// module's no-identity-string contract is unchanged: the generation HANDLE, the
+/// config digest and every artifact digest stay uncorrelated text and are still
+/// observed only as `artifact_count`. The refusals on this same contour fire
+/// before the binding exists and keep their static `category` + `field` alone.
+///
+/// Costs nothing but a copy: no owner query, no registry open, no hashing, no
+/// retry and no mutation is added for this record.
+fn observe_bind_progress(outcome: &'static str, authority_generation: u64, artifact_count: u64) {
     backup_config_note_event_log_unavailable();
     let outcome = crate::host_diagnostics::bound_field(outcome);
     crate::host_diagnostics::info!(
@@ -304,6 +326,7 @@ fn observe_bind_progress(outcome: &'static str, artifact_count: u64) {
         event = "host.backup.config_phase",
         op = "bind_build",
         outcome = outcome.text(),
+        authority_generation = authority_generation,
         artifact_count = artifact_count,
         "host backup owner-build binding observed"
     );
@@ -1213,7 +1236,14 @@ pub fn bind_approved_build(
         approved_profile,
     };
     // Owner-issued facts only; the count observes the binding, never values.
-    observe_bind_progress("bound", backup_config_count(binding.artifact_digests.len()));
+    // #983 W2: the binding now exists, so the owner-validated numeric generation
+    // it proved is available as correlation; the generation handle and every
+    // digest stay uncorrelated text and are observed only as `artifact_count`.
+    observe_bind_progress(
+        "bound",
+        binding.authority_generation.value(),
+        backup_config_count(binding.artifact_digests.len()),
+    );
     Ok(binding)
 }
 
