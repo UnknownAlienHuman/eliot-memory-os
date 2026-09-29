@@ -287,9 +287,9 @@ pub use user_automation_orchestration::{
 pub use user_automation_runtime_handoff::{
     USER_AUTOMATION_TRANSITION_WIRE_ID, USER_AUTOMATION_TRANSITION_WIRE_VERSION,
     UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
-    UserAutomationHorizonPhase, UserAutomationOperatorRuntime, UserAutomationOperatorTransition,
-    UserAutomationRecoveryPhase, UserAutomationWakePhase, committed_configuration_state,
-    run_now_wake_read_request,
+    UserAutomationHorizonPhase, UserAutomationOperatorResultEnvelope,
+    UserAutomationOperatorRuntime, UserAutomationOperatorTransition, UserAutomationRecoveryPhase,
+    UserAutomationWakePhase, committed_configuration_state, run_now_wake_read_request,
 };
 pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,

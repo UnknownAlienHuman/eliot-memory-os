@@ -598,7 +598,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 var read = await _client.UserAutomationAsync(
                     readRequest,
                     _requestCancellation?.Token ?? CancellationToken.None);
-                ShowUserAutomationResult(action, read, readRequest.IdempotencyKey);
+                ShowUserAutomationResult(action, read, readRequest);
             }
             catch (Exception error)
             {
@@ -668,7 +668,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var answer = await _client.UserAutomationAsync(
                 request,
                 _requestCancellation?.Token ?? CancellationToken.None);
-            ShowUserAutomationResult(action, answer, request.IdempotencyKey);
+            ShowUserAutomationResult(action, answer, request);
             // A typed attempt refusal can prove that this attempt stopped before
             // Store, but it does not settle an earlier attempt of the same
             // retained identity. Preserve an already-unknown phase; a first
@@ -769,10 +769,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private void ShowUserAutomationResult(
         string action,
         JsonElement answer,
-        string expectedIdempotencyKey)
+        UserAutomationOperatorRequest request)
     {
         ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(answer) ?? string.Empty;
-        var outcome = UserAutomationOutcomeClassifier.Read(action, answer, expectedIdempotencyKey);
+        var validationContext = UserAutomationResultValidationContext.FromRequest(request);
+        var outcome = UserAutomationOutcomeClassifier.Read(action, answer, validationContext);
         ResultSummary = outcome.Detail;
         SetBanner(
             outcome.Title,
