@@ -33,9 +33,8 @@ impl UserBrokerHeartbeat {
         Ok(Self(record))
     }
 
-    /// Returns the exact opaque operational record.
-    pub fn record(&self) -> &OperationalRecordInput {
-        &self.0
+    pub(crate) fn into_record(self) -> OperationalRecordInput {
+        self.0
     }
 }
 
