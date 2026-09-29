@@ -53,6 +53,7 @@ pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
+pub mod cell_declaration_registry;
 /// Issue #2857 W1/W2/W4: the live `eliot.query` `ContextReconstruction`
 /// route. This is the one production edge that resolves the closed selector set
 /// from the admitted envelope plus the authenticated Task Controller owner and
@@ -402,6 +403,15 @@ pub enum DaemonError {
     /// Governor commit, so neither the task nor the store is touched.
     #[error(transparent)]
     TaskBinding(#[from] crate::task_binding_admission::TaskBindingError),
+    /// Executable capability-cell registry refused composition (issue #18
+    /// AUD-5848557601-1, I2.23).
+    ///
+    /// The baked manifest declaration and the baked contract block disagree,
+    /// the compiled table drifts from the manifest, or one owner is claimed
+    /// twice. The typed defect travels unchanged so the refusal names the
+    /// exact divergent content instead of collapsing into a lifecycle string.
+    #[error(transparent)]
+    CellRegistry(#[from] cell_declaration_registry::CellRegistryError),
 }
 
 /// Typed revision-fence match failure for the daemon cache gate (issue #18
@@ -929,6 +939,10 @@ impl DaemonComposition {
         kernel: Arc<dyn KernelGenerationPort>,
         authority_activation: Option<Arc<dyn eliot_authority::P07AuthorityPort>>,
     ) -> Result<Self, DaemonError> {
+        // Issue #18 AUD-5848557601-1: prove the executable registry before
+        // composing anything. A diverged declaration/contract tree refuses
+        // to start here instead of running on a stale cell registry.
+        cell_declaration_registry::enforce_declared_cells()?;
         let config_lease = config.config_lease.take().ok_or_else(|| {
             DaemonError::Lifecycle(
                 "production start requires the retained Host-approved config lease".to_owned(),
