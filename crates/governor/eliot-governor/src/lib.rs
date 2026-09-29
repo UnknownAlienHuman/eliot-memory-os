@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 mod activation_outcome;
+mod bridge_event_privacy_owner;
 mod campaign_source_publishers;
 mod campaign_task_sources;
 mod canonical_projections;
@@ -111,6 +112,13 @@ mod task_lifecycle;
 mod wasm_resolution;
 
 pub use activation_outcome::*;
+pub use bridge_event_privacy_owner::{
+    BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION, BridgeEventDisclosureClosureOwner,
+    BridgeEventDisclosureDomainRule, BridgeEventPrivacyDecision, BridgeEventPrivacyError,
+    BridgeEventPrivacyOwnerSnapshot, BridgeEventPrivacyRecipient,
+    BridgeEventRetentionDisposition, BridgeEventRetentionPolicy, BridgeEventRetentionRule,
+    BridgeEventSourcePrivacyClass, decide_bridge_event_disclosure,
+};
 pub use campaign_source_publishers::{
     CampaignOwnerSourceInput, CampaignOwnerSourceRegistration, CampaignSourcePublicationBundle,
     CampaignSourcePublisherError, assemble_campaign_owner_matrix, assemble_task_owner_matrix,
