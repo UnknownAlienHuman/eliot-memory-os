@@ -51,6 +51,20 @@
 //! current under a stale denominator. Absence of the object is `unknown`,
 //! never unrestricted/complete (I5.16).
 //!
+//! Retained automation-owned normalization envelope (issue #1779). The
+//! revision legs carry the VERBATIM `ReceiptEnvelope` the automation leg
+//! minted over that revision's compiled occurrence set, and the closed
+//! `normalization` read returns those retained bytes selected by the
+//! envelope's own content-derived `identity.receipt_id` under the request's
+//! exact State Fence. I05.19:96 makes the envelope the property of the
+//! subsystem that performed the transition, so the envelope lives on the
+//! automation revision row that subsystem already writes: there is no second
+//! receipt store, no second writer, and no change to the generic Store receipt
+//! artifacts, which cannot express this transition. Nothing here re-derives a
+//! digest; the envelope's own `validate()` is the only validator, and the
+//! binding between the retained envelope and the revision's occurrence set is
+//! closed by the Kernel-owned preflight assembly.
+//!
 //! Paged continuation (issue #2859). A `TRUNCATED` completeness block carries
 //! an owner-issued V2 reference containing only its closed version and opaque
 //! identifier. The Store owner retains the exact request, snapshot, fence,
@@ -83,6 +97,8 @@ pub const USER_AUTOMATION_SCOPE: &str = "user-automation";
 pub const MAX_AUTOMATION_ID_BYTES: usize = 256;
 /// Maximum accepted `revision` identity length in bytes.
 pub const MAX_AUTOMATION_REVISION_ID_BYTES: usize = 128;
+/// Maximum accepted content-derived receipt identity length in bytes.
+pub const MAX_AUTOMATION_RECEIPT_ID_BYTES: usize = 128;
 /// Maximum accepted revision/invocation document length in bytes.
 ///
 /// Revisions are bounded operator documents (full config, schedule,
@@ -118,6 +134,18 @@ pub const AUTOMATION_PARAM_AUTOMATION_ID: &str = "automation_id";
 pub const AUTOMATION_PARAM_REVISION: &str = "revision";
 /// Opaque canonical revision document (revision legs).
 pub const AUTOMATION_PARAM_REVISION_JSON: &str = "revision_json";
+/// Verbatim normalization receipt envelope the automation leg minted for this
+/// revision's compiled occurrence set (revision legs: create and edit).
+///
+/// I05.19:96 makes every durable receipt a typed payload inside ONE versioned
+/// envelope owned by the subsystem that performed the transition, and forbids a
+/// second receipt store, writer, or lifecycle root. The subsystem that performed
+/// the schedule normalization transition is the automation Store leg, so the
+/// envelope belongs on the automation revision row that leg already writes, and
+/// the generic Store receipt history is NOT an owner of it. This parameter
+/// carries those ORIGINAL bytes verbatim; nothing here re-derives an identity to
+/// make a later comparison succeed.
+pub const AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON: &str = "normalization_envelope_json";
 /// Superseded revision identity (edit leg only).
 pub const AUTOMATION_PARAM_PREVIOUS_REVISION: &str = "previous_revision";
 /// Closed admission state (revision legs; stored on the current pointer).
@@ -144,6 +172,12 @@ pub const AUTOMATION_PARAM_MAX_RECORDS: &str = "max_records";
 /// bound the owner minted it with. It is never an offset, so a moving set can
 /// neither lose nor repeat a row.
 pub const AUTOMATION_PARAM_CURSOR: &str = "cursor";
+/// Exact content-derived receipt identity selector (normalization read only).
+///
+/// This is the `identity.receipt_id` the immutable revision names. The owner
+/// selects retained envelopes by comparing their OWN parsed identity to it, so
+/// a caller cannot reach an envelope by predicting a row name.
+pub const AUTOMATION_PARAM_RECEIPT_ID: &str = "receipt_id";
 
 /// Mutation leg discriminator values (mirror the domain operation
 /// `snake_case` kinds).
@@ -173,6 +207,17 @@ pub const AUTOMATION_QUERY_INVOCATIONS: &str = "invocations";
 /// Read query discriminator values (the failure writer leg records the
 /// last failure row; absence stays explicit, never fabricated).
 pub const AUTOMATION_QUERY_FAILURE: &str = "failure";
+/// Read query discriminator: the schedule normalization receipt envelopes the
+/// automation subsystem retained on its own revision rows under this fence.
+///
+/// I05.19:96 binds a durable receipt's envelope to the subsystem that performed
+/// the transition. The automation Store leg performed the normalization, so its
+/// envelope is retained there and read back there; this query is a read of that
+/// one owner, not a second receipt store. Selection is by the envelope's own
+/// content-derived `identity.receipt_id` — the read requests the exact receipt
+/// identity the immutable revision names and returns only envelopes carrying
+/// exactly that identity, never a name-derived lookup.
+pub const AUTOMATION_QUERY_NORMALIZATION: &str = "normalization";
 
 /// Closed admission-state wire values (mirror the domain
 /// `SCREAMING_SNAKE_CASE` states).
@@ -194,6 +239,11 @@ pub const AUTOMATION_PAGE_REVISIONS: &str = "revisions";
 pub const AUTOMATION_PAGE_INVOCATIONS: &str = "invocations";
 /// Read payload field: failure row or null (failure).
 pub const AUTOMATION_PAGE_FAILURE: &str = "failure";
+/// Read payload field: retained normalization receipt envelope array
+/// (normalization), each entry carrying the verbatim `envelope_json` and the
+/// envelope's own `receipt_id` so selection never depends on a predictable
+/// row name.
+pub const AUTOMATION_PAGE_NORMALIZATION_ENVELOPES: &str = "normalization_envelopes";
 /// Read payload field: owner revision read at (max current revision).
 pub const AUTOMATION_PAGE_REVISION: &str = "revision";
 /// Read payload field: projection fence.
@@ -254,6 +304,10 @@ pub enum DecodedAutomationMutation {
         revision: String,
         /// Verbatim canonical revision document.
         revision_json: String,
+        /// Verbatim normalization receipt envelope the automation leg minted
+        /// for this revision's compiled occurrence set. It is retained with the
+        /// row so the readback returns the same bytes, never a re-derived value.
+        normalization_envelope_json: String,
         /// Closed admission state for the current pointer.
         configuration_state: String,
     },
@@ -267,6 +321,9 @@ pub enum DecodedAutomationMutation {
         revision: String,
         /// Verbatim canonical revision document.
         revision_json: String,
+        /// Verbatim normalization receipt envelope the automation leg minted
+        /// for the NEW revision's compiled occurrence set.
+        normalization_envelope_json: String,
         /// Closed admission state for the current pointer.
         configuration_state: String,
     },
@@ -320,6 +377,10 @@ pub struct DecodedAutomationRead {
     pub requested_revision: Option<String>,
     /// Optional exact occurrence selector for invocation-owner reads.
     pub requested_occurrence_id: Option<String>,
+    /// Optional exact content-derived receipt identity for the retained
+    /// normalization-envelope read. It is an identity, not a row name: the
+    /// owner returns only envelopes whose own `identity.receipt_id` equals it.
+    pub requested_receipt_id: Option<String>,
     /// Retired-row inclusion (list only).
     pub include_retired: bool,
     /// Page-size bound (list/history/invocations only).
@@ -729,11 +790,17 @@ pub fn automation_mutation_request(params: BTreeMap<String, Value>) -> NamedMuta
 }
 
 /// Builds a create-leg parameter map.
+///
+/// `normalization_envelope_json` is the VERBATIM envelope the automation leg
+/// minted for this revision's compiled occurrence set. The Store retains those
+/// bytes on the revision row; it never re-derives them, and it never learns
+/// which automation semantics the envelope covers.
 pub fn automation_create_params(
     automation_id: String,
     revision: String,
     configuration_state: String,
     revision_json: String,
+    normalization_envelope_json: String,
 ) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
@@ -756,19 +823,33 @@ pub fn automation_create_params(
             AUTOMATION_PARAM_REVISION_JSON.to_owned(),
             Value::String(revision_json),
         ),
+        (
+            AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON.to_owned(),
+            Value::String(normalization_envelope_json),
+        ),
     ])
 }
 
 /// Builds an edit-leg parameter map.
+///
+/// The retained envelope is the one minted for the NEW revision, because an
+/// edit creates a new immutable revision whose occurrence set was compiled
+/// separately (I11.12:31).
 pub fn automation_edit_params(
     automation_id: String,
     previous_revision: String,
     revision: String,
     configuration_state: String,
     revision_json: String,
+    normalization_envelope_json: String,
 ) -> BTreeMap<String, Value> {
-    let mut params =
-        automation_create_params(automation_id, revision, configuration_state, revision_json);
+    let mut params = automation_create_params(
+        automation_id,
+        revision,
+        configuration_state,
+        revision_json,
+        normalization_envelope_json,
+    );
     params.insert(
         AUTOMATION_PARAM_OPERATION.to_owned(),
         Value::String(AUTOMATION_OPERATION_EDIT.to_owned()),
@@ -958,6 +1039,39 @@ pub fn automation_invocation_read_request(
     Ok(request)
 }
 
+/// Builds the exact retained normalization-envelope read for one immutable
+/// revision under the request's own State Fence.
+///
+/// The selector is accepted only by the closed `normalization` read contract.
+/// The owner returns retained envelopes whose OWN parsed `identity.receipt_id`
+/// equals `receipt_id`, so a caller cannot reach an envelope by predicting a
+/// row name; the fence is the same one the preflight request is bound to, so
+/// an envelope retained under a different admission era is not answerable
+/// here.
+pub fn automation_normalization_read_request(
+    automation_id: String,
+    revision: String,
+    receipt_id: String,
+    state_fence: StateFence,
+) -> Result<NamedReadRequest, StoreError> {
+    let mut request = automation_read_request(
+        AUTOMATION_QUERY_NORMALIZATION.to_owned(),
+        Some(automation_id),
+        false,
+        1,
+        state_fence,
+    )?;
+    request
+        .parameters
+        .insert(AUTOMATION_PARAM_REVISION.to_owned(), Value::String(revision));
+    request.parameters.insert(
+        AUTOMATION_PARAM_RECEIPT_ID.to_owned(),
+        Value::String(receipt_id),
+    );
+    request.validate()?;
+    Ok(request)
+}
+
 /// Validates closed mutation parameters for one automation operation.
 ///
 /// The operation identity is the discriminator: each leg declares exactly
@@ -985,6 +1099,7 @@ pub fn validate_automation_mutation_params(
                 text_param(parameters, AUTOMATION_PARAM_REVISION_JSON)?,
                 AUTOMATION_PARAM_REVISION_JSON,
             )?;
+            validate_normalization_envelope_param(parameters)?;
             Ok(())
         }
         AUTOMATION_OPERATION_EDIT => {
@@ -998,6 +1113,7 @@ pub fn validate_automation_mutation_params(
                 text_param(parameters, AUTOMATION_PARAM_REVISION_JSON)?,
                 AUTOMATION_PARAM_REVISION_JSON,
             )?;
+            validate_normalization_envelope_param(parameters)?;
             Ok(())
         }
         AUTOMATION_OPERATION_PAUSE | AUTOMATION_OPERATION_RESUME | AUTOMATION_OPERATION_REMOVE => {
@@ -1052,6 +1168,7 @@ pub fn decode_automation_mutation(
             automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
             revision: text_of(AUTOMATION_PARAM_REVISION)?,
             revision_json: text_of(AUTOMATION_PARAM_REVISION_JSON)?,
+            normalization_envelope_json: text_of(AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON)?,
             configuration_state: text_of(AUTOMATION_PARAM_CONFIGURATION_STATE)?,
         }),
         AUTOMATION_OPERATION_EDIT => Ok(DecodedAutomationMutation::Edit {
@@ -1059,6 +1176,7 @@ pub fn decode_automation_mutation(
             previous_revision: text_of(AUTOMATION_PARAM_PREVIOUS_REVISION)?,
             revision: text_of(AUTOMATION_PARAM_REVISION)?,
             revision_json: text_of(AUTOMATION_PARAM_REVISION_JSON)?,
+            normalization_envelope_json: text_of(AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON)?,
             configuration_state: text_of(AUTOMATION_PARAM_CONFIGURATION_STATE)?,
         }),
         AUTOMATION_OPERATION_PAUSE | AUTOMATION_OPERATION_RESUME | AUTOMATION_OPERATION_REMOVE => {
@@ -1119,6 +1237,13 @@ pub fn validate_automation_read_params(
     if let Some(occurrence_id) = requested_occurrence_id.as_deref() {
         validate_occurrence_id(occurrence_id)?;
     }
+    let requested_receipt_id = parameters
+        .get(AUTOMATION_PARAM_RECEIPT_ID)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(receipt_id) = requested_receipt_id.as_deref() {
+        validate_receipt_id(receipt_id)?;
+    }
     let include_retired = parameters
         .get(AUTOMATION_PARAM_INCLUDE_RETIRED)
         .and_then(Value::as_str)
@@ -1175,6 +1300,12 @@ pub fn validate_automation_read_params(
                     reason: "selector is not valid for list reads",
                 });
             }
+            if requested_receipt_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_RECEIPT_ID,
+                    reason: "receipt selector is only valid for normalization reads",
+                });
+            }
             if cursor_text.is_some() {
                 return Err(StoreError::InvalidField {
                     field: AUTOMATION_PARAM_CURSOR,
@@ -1186,6 +1317,7 @@ pub fn validate_automation_read_params(
                 automation_id: None,
                 requested_revision: None,
                 requested_occurrence_id: None,
+                requested_receipt_id: None,
                 include_retired,
                 max_records,
                 cursor: None,
@@ -1196,6 +1328,12 @@ pub fn validate_automation_read_params(
                 return Err(StoreError::InvalidField {
                     field: AUTOMATION_PARAM_OCCURRENCE_ID,
                     reason: "occurrence selector is only valid for invocations reads",
+                });
+            }
+            if requested_receipt_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_RECEIPT_ID,
+                    reason: "receipt selector is only valid for normalization reads",
                 });
             }
             let automation_id = automation_id.ok_or(StoreError::InvalidField {
@@ -1221,6 +1359,7 @@ pub fn validate_automation_read_params(
                 automation_id: Some(automation_id),
                 requested_revision,
                 requested_occurrence_id: None,
+                requested_receipt_id: None,
                 include_retired,
                 max_records,
                 cursor,
@@ -1231,6 +1370,12 @@ pub fn validate_automation_read_params(
                 return Err(StoreError::InvalidField {
                     field: AUTOMATION_PARAM_REVISION,
                     reason: "revision selector is only valid for current/history reads",
+                });
+            }
+            if requested_receipt_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_RECEIPT_ID,
+                    reason: "receipt selector is only valid for normalization reads",
                 });
             }
             let automation_id = automation_id.ok_or(StoreError::InvalidField {
@@ -1256,6 +1401,7 @@ pub fn validate_automation_read_params(
                 automation_id: Some(automation_id),
                 requested_revision: None,
                 requested_occurrence_id,
+                requested_receipt_id: None,
                 include_retired,
                 max_records,
                 cursor,
@@ -1270,6 +1416,12 @@ pub fn validate_automation_read_params(
                         AUTOMATION_PARAM_OCCURRENCE_ID
                     },
                     reason: "selector is not valid for failure reads",
+                });
+            }
+            if requested_receipt_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_RECEIPT_ID,
+                    reason: "receipt selector is only valid for normalization reads",
                 });
             }
             if cursor_text.is_some() {
@@ -1287,6 +1439,50 @@ pub fn validate_automation_read_params(
                 automation_id: Some(automation_id),
                 requested_revision: None,
                 requested_occurrence_id: None,
+                requested_receipt_id: None,
+                include_retired,
+                max_records,
+                cursor: None,
+            })
+        }
+        AUTOMATION_QUERY_NORMALIZATION => {
+            // The normalization read addresses ONE retained envelope by the
+            // immutable revision that owns it and by the envelope's own
+            // content-derived identity. It has no denominator, so a page bound
+            // and a continuation are not part of this leg.
+            if cursor_text.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_CURSOR,
+                    reason: "continuation is not valid for normalization reads",
+                });
+            }
+            if requested_occurrence_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_OCCURRENCE_ID,
+                    reason: "occurrence selector is not valid for normalization reads",
+                });
+            }
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+            // Both selectors are required together: the revision names the row
+            // and the receipt identity names the envelope, and neither half
+            // alone is an ownership proof.
+            let revision = requested_revision.ok_or(StoreError::InvalidField {
+                field: AUTOMATION_PARAM_REVISION,
+                reason: "exact immutable revision selector is required",
+            })?;
+            let receipt_id = requested_receipt_id.ok_or(StoreError::InvalidField {
+                field: AUTOMATION_PARAM_RECEIPT_ID,
+                reason: "exact receipt identity selector is required",
+            })?;
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: Some(automation_id),
+                requested_revision: Some(revision),
+                requested_occurrence_id: None,
+                requested_receipt_id: Some(receipt_id),
                 include_retired,
                 max_records,
                 cursor: None,
@@ -1325,6 +1521,26 @@ fn validate_automation_id(automation_id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Requires the owner-issued normalization receipt envelope on one revision leg.
+///
+/// The value is validated by the envelope's OWN existing
+/// [`eliot_receipts::ReceiptEnvelope::validate`], which re-derives the
+/// content-derived identity from the canonical core bytes. This wire module
+/// writes no second validator and learns no `UserAutomation` semantics: it
+/// proves only that the retained value is one well-formed receipt envelope
+/// whose identity the later readback can select by. The binding between that
+/// identity and the revision's compiled occurrence set is closed by
+/// `UserAutomationPreflightProjection::assemble`, not here.
+fn validate_normalization_envelope_param(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<(), StoreError> {
+    let retained = text_param(parameters, AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON)?;
+    validate_automation_doc(retained, AUTOMATION_PARAM_NORMALIZATION_ENVELOPE_JSON)?;
+    let envelope: eliot_receipts::ReceiptEnvelope = serde_json::from_str(retained)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    envelope.validate().map_err(StoreError::Receipt)
+}
+
 fn validate_revision_id(revision: &str) -> Result<(), StoreError> {
     if revision.trim().is_empty() || revision.chars().any(char::is_control) {
         return Err(StoreError::InvalidField {
@@ -1352,6 +1568,24 @@ fn validate_occurrence_id(occurrence_id: &str) -> Result<(), StoreError> {
         return Err(StoreError::InvalidField {
             field: "automation.occurrence_id",
             reason: "occurrence identity exceeds the length bound",
+        });
+    }
+    Ok(())
+}
+
+/// Validates one content-derived receipt identity selector.
+///
+/// The identity is a receipt envelope's own value, so this bounds its shape
+/// only. Whether any retained envelope actually carries it is the owner's
+/// answer at read time, never this boundary's assumption.
+fn validate_receipt_id(receipt_id: &str) -> Result<(), StoreError> {
+    if receipt_id.trim().is_empty()
+        || receipt_id.len() > MAX_AUTOMATION_RECEIPT_ID_BYTES
+        || receipt_id.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidField {
+            field: AUTOMATION_PARAM_RECEIPT_ID,
+            reason: "receipt identity must be bounded non-blank text",
         });
     }
     Ok(())
