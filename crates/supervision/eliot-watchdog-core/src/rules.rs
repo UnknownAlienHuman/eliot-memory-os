@@ -293,7 +293,13 @@ fn append_optional_identity(fields: &mut Vec<String>, value: Option<&str>) {
     }
 }
 
-fn encode_identity(fields: &[String]) -> String {
+/// Length-prefixes each field into one unambiguous identity string.
+///
+/// A separator alone would be ambiguous: two different field splits can
+/// produce the same joined text. Prefixing every field with its own length
+/// makes the encoding injective, so an identity derived from these fields
+/// cannot collide with an identity derived from a different field list.
+pub(crate) fn encode_identity(fields: &[String]) -> String {
     let mut encoded = String::new();
     for field in fields {
         encoded.push_str(&field.len().to_string());
