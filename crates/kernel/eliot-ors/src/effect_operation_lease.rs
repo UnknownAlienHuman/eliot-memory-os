@@ -510,6 +510,11 @@ impl EffectReplayDecision {
 /// * no delivery gap is open, on the lease or in the current view;
 /// * the lease is active and is not expired at `request.observed_at_ms`.
 ///
+/// The request side of each comparison is the caller's own observation, never a
+/// copy of the lease's fields. A caller that presents a well-formed lease for a
+/// *different* operation, module, generation or manifest therefore fails the
+/// matching content check instead of confirming the lease against itself.
+///
 /// An operation with no lease — that is, any new operation — is denied, which
 /// is what stops an effect-capable generation from resuming a new operation
 /// after catalog/policy freshness is lost.

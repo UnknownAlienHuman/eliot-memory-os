@@ -23550,6 +23550,56 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Resolves the effect operation lease that authorizes one exact replayed
+    /// operation (issue #1885; I1.9).
+    ///
+    /// Unlike [`Self::load_effect_operation_lease`], which is keyed by lease
+    /// identity, this resolves the lease by its **own recorded
+    /// [`crate::EffectOperationLease::operation_id`]**. That is what makes the
+    /// replay gate unreachable by guessing a key: a caller naming a lease
+    /// identity it does not own gets no row here, and a well-formed lease for a
+    /// different operation is never selected, so it cannot satisfy this
+    /// operation's replay.
+    ///
+    /// Exactly one lease may authorize one operation, so a second row claiming
+    /// the same `operation_id` is a durable ambiguity and fails closed as
+    /// corruption rather than letting the first row win. Each row's own lease
+    /// identity is checked against its key, exactly as in the keyed loader; the
+    /// selected lease is fully validated by the replay verifier before any
+    /// admission. Returns `Ok(None)` when no lease names the operation, which
+    /// the effect replay gate denies as `EffectLeaseAbsent`.
+    pub fn load_effect_operation_lease_for_operation(
+        &self,
+        operation_id: &OperationIdentity,
+    ) -> Result<Option<crate::EffectOperationLease>, OrsError> {
+        crate::model::validate_text(operation_id.as_str(), "effect_operation_lease_operation_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let leases = read.open_table(EFFECT_OPERATION_LEASES).map_err(storage)?;
+        let mut found: Option<crate::EffectOperationLease> = None;
+        for entry in leases.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let lease: crate::EffectOperationLease = decode(value.value())?;
+            if lease.lease_id.as_str() != key.value() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "effect_operation_lease",
+                    reason: "effect operation lease key does not match lease identity".to_owned(),
+                });
+            }
+            if &lease.operation_id != operation_id {
+                continue;
+            }
+            if found.is_some() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "effect_operation_lease",
+                    reason: "more than one effect operation lease authorizes the same operation"
+                        .to_owned(),
+                });
+            }
+            found = Some(lease);
+        }
+        Ok(found)
+    }
+
     /// Loads the recorded execution manifest for one generation (issue #1885;
     /// I1.9).
     ///
@@ -23637,21 +23687,26 @@ impl RedbRecoveryStore {
     ///
     /// This is the one store-backed query an effect-capable dispatch or replay
     /// path consults before it dispatches an external effect. The caller passes
-    /// only what its spawn seam actually holds: the effect operation lease
-    /// identity it is acting for, the module identity and generation the spawn
-    /// is bound to, its live Authority Epoch and the observation time of the
-    /// decision. Everything else is read from the durable rows, so the gate can
-    /// neither invent an effect receipt nor widen a recorded scope.
+    /// only what its spawn seam actually holds: the **exact operation identity
+    /// it is replaying**, the module identity and generation the spawn is bound
+    /// to, its live Authority Epoch and the observation time of the decision.
+    /// It passes no lease key: the lease is resolved here by its own recorded
+    /// `operation_id`, so naming a row cannot reach an effect. Everything else
+    /// is read from the durable rows, so the gate can neither invent an effect
+    /// receipt nor widen a recorded scope.
     ///
-    /// A recorded lease **is** the exact already-authorized effect, so the
-    /// request's `operation_id`, `effect_receipt_sha256`, `allowed_scope` and
-    /// `bound_manifest_sha256` are the lease's own recorded values and the
-    /// manifest is the lease's own recorded execution manifest. Every liveness
-    /// and currency check in [`crate::authorize_effect_replay`] still runs
-    /// against them, so this is a real gate and not a tautology: the lease must
-    /// still be active, unexpired at `observed_at_ms`, un-revoked, gap-free,
-    /// issued under the caller's current Authority Epoch, bound to the caller's
-    /// module/generation, and issued against a Governor-admitted manifest.
+    /// The request is built from what the caller independently observes — the
+    /// replayed `operation_id`, the owner's `module_id`/`generation`, and the
+    /// `bound_manifest_sha256` of the manifest durably recorded for that
+    /// generation — while the lease supplies the *expected* side of every
+    /// comparison. A well-formed lease that authorizes a **different** operation,
+    /// a different module or generation, or a different manifest digest is
+    /// therefore refused as a content mismatch, not admitted because its key
+    /// resolved. The caller cannot reach an effect by naming a key: it must hold
+    /// a lease that authorizes this exact operation, still active, unexpired at
+    /// `observed_at_ms`, un-revoked, gap-free, issued under the caller's current
+    /// Authority Epoch, bound to the caller's module/generation, and issued
+    /// against a Governor-admitted effect-capable manifest.
     /// `catalog_revision` and `policy_revision` are the **loaded manifest's**
     /// admitting revisions — the exact revisions the lease was issued against.
     ///
@@ -23689,13 +23744,14 @@ impl RedbRecoveryStore {
     /// canonical write admission.
     pub fn authorize_effect_replay_for_operation(
         &self,
-        lease_id: &OperationIdentity,
+        replayed_operation_id: &OperationIdentity,
         module_id: &str,
         generation: u64,
         current_authority_epoch: AuthorityEpoch,
         observed_at_ms: i64,
     ) -> Result<crate::EffectReplayDecision, OrsError> {
-        let Some(lease) = self.load_effect_operation_lease(lease_id)? else {
+        let Some(lease) = self.load_effect_operation_lease_for_operation(replayed_operation_id)?
+        else {
             // No recorded lease covers this operation, so there is no
             // already-authorized effect to replay and the caller holds no
             // effect receipt, route scope or manifest digest to name one. The
@@ -23703,7 +23759,7 @@ impl RedbRecoveryStore {
             // reconciliation intent is still produced below, naming the exact
             // operation that was refused.
             return self.deny_effect_replay_without_lease(
-                lease_id,
+                replayed_operation_id,
                 module_id,
                 generation,
                 observed_at_ms,
@@ -23733,10 +23789,35 @@ impl RedbRecoveryStore {
             _ => crate::CatalogPolicyView::Unavailable,
         };
         let request = crate::EffectReplayRequest {
-            operation_id: lease.operation_id.clone(),
-            manifest_module_id: lease.manifest_module_id.clone(),
-            manifest_generation: lease.manifest_generation,
-            bound_manifest_sha256: lease.bound_manifest_sha256.clone(),
+            // The operation actually being replayed, as the caller states it —
+            // never a copy of the lease's own field, so
+            // `EffectOperationIdentityMismatch` compares two independent
+            // values and a lease that authorizes a different operation is
+            // refused instead of self-confirming.
+            operation_id: replayed_operation_id.clone(),
+            // The caller's own authenticated owner binding, not the lease's
+            // recorded one, so `EffectManifestMismatch` cannot be satisfied by
+            // a lease that simply agrees with itself.
+            manifest_module_id: module_id.to_owned(),
+            manifest_generation: eliot_contracts::ResourceGeneration::new(generation).map_err(
+                |_error| OrsError::InvalidField {
+                    field: "effect_replay_manifest_generation",
+                    reason: "must be greater than zero",
+                },
+            )?,
+            // The digest of the manifest durably recorded for the caller's own
+            // module and generation. A lease bound to a different manifest hash
+            // therefore fails the content check. When no manifest is recorded
+            // there is no digest to name, and `ManifestAbsent` denies before
+            // this value is compared, so the lease's own digest is carried only
+            // to keep the request shape-valid.
+            bound_manifest_sha256: manifest.as_ref().map_or_else(
+                || lease.bound_manifest_sha256.clone(),
+                |recorded| recorded.manifest_sha256.clone(),
+            ),
+            // The caller holds no effect receipt and no route scope of its own:
+            // these two remain the lease's recorded values, which is exactly
+            // what the receipt and scope bindings are for.
             effect_receipt_sha256: lease.effect_receipt_sha256.clone(),
             allowed_scope: lease.allowed_scope.clone(),
             current: crate::EffectAuthorizationView {
@@ -23772,9 +23853,14 @@ impl RedbRecoveryStore {
     /// built. The shadow/no-effect authority and its durable reconciliation item
     /// come from [`crate::deny_unleased_effect_replay`], the one place the
     /// absence is asserted, so no request is fabricated here.
+    ///
+    /// The reconciliation intent names `operation_id` — the operation the
+    /// caller is actually replaying — and never the lease key it looked up. A
+    /// key that happens to resolve to no row must not become the recorded
+    /// identity of the refused attempt.
     fn deny_effect_replay_without_lease(
         &self,
-        lease_id: &OperationIdentity,
+        operation_id: &OperationIdentity,
         module_id: &str,
         generation: u64,
         observed_at_ms: i64,
@@ -23784,7 +23870,7 @@ impl RedbRecoveryStore {
         // rather than an absence marker.
         let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
         let decision = crate::deny_unleased_effect_replay(
-            lease_id,
+            operation_id,
             module_id,
             eliot_contracts::ResourceGeneration::new(generation).map_err(|_error| {
                 OrsError::InvalidField {
