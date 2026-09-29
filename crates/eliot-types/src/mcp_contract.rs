@@ -188,6 +188,36 @@ pub struct AgentCandidateSubmitInput {
     pub write_id: String,
     pub topic: String,
     pub statement: String,
+    /// Field-specific, caller-evidenced retention (#708).
+    ///
+    /// These six defaulted fields are retained deliberately and are NOT counted
+    /// as fixed. Exact current caller evidence that each is a genuine optional
+    /// agent choice on this specific wire, not a general exemption:
+    ///
+    /// - `where_applicable` / `where_not_applicable` / `negative_constraints`:
+    ///   the scope delimiters of a candidate statement. An omitted key here is a
+    ///   deliberate "this candidate states no boundary", which is a coherent
+    ///   answer; the current producer
+    ///   (`crates/eliot-app/tests/ul_cue_candidate.rs:31`) writes them
+    ///   explicitly, and `crates/eliot-types/tests/ul_cue_normalize.rs::t03_candidate_schema_roundtrip`
+    ///   round-trips the exact declared shape.
+    /// - `cue_bindings`: retained capture-first optionality. The published
+    ///   `agent_candidate_input_schema` deliberately keeps `cue_bindings` OUT of
+    ///   `required` and only force-inserts `expected_reuse_note` into the nested
+    ///   `CueBinding` definition (`agent_candidate_input_schema`, :262-289); the
+    ///   existing test asserts exactly that (`t03` asserts
+    ///   `!required.contains("cue_bindings")`). Removing the default would move
+    ///   that published required set — a wire change owned outside this file.
+    /// - `auto_bind` / `curation`: genuinely optional enrichment requests whose
+    ///   absence means "do not auto-bind" and "no curation attached".
+    ///
+    /// These are per-field exemptions, invalidated by any producer or schema
+    /// change, and none of them crosses or influences a protected boundary by
+    /// omission: the retained keys cannot create a grant, a scope, an effect or
+    /// a receipt. They are also NOT part of W2: none of the six is
+    /// authority-, scope-, effect- or receipt-bearing in the retained direction.
+    /// `deny_unknown_fields` remains, and the typed error owner remains serde's
+    /// `missing_field` for every non-retained key.
     #[serde(default)]
     pub where_applicable: Vec<String>,
     #[serde(default)]
@@ -205,6 +235,44 @@ pub struct AgentCandidateSubmitInput {
     pub curation: Option<AgentCandidateCurationInput>,
 }
 
+/// Field-specific retention, one row per field (#708).
+///
+/// `AgentCandidateCurationInput` is the only curation payload on the legacy
+/// candidate-submit wire, and it is `Option`-wrapped at the submission level,
+/// so its *whole* presence is already explicit. The remaining question for each
+/// field is whether an omitted key may be read as "not stated" or as a stated
+/// value. For every field in this struct the retained reading is the safe one,
+/// with exact caller evidence:
+///
+/// - `duplicate_of` / `semantic_duplicate_of` / `superseded_by` /
+///   `stale_reason_ref`: relation/provenance references. `None` means "no such
+///   relation was asserted", and asserting one is the only way to change it, so
+///   omission cannot manufacture a retention or erasure effect.
+/// - `semantic_equivalence_verified` / `protected` / `current_truth` /
+///   `audit_required` / `unsafe_instruction`: boolean curation judgements whose
+///   retained default is `false`. These are *fail-closed* on the two that
+///   matter for safety: an omitted `protected` is not "protected" and an
+///   omitted `unsafe_instruction` is not "flagged unsafe", so no omission can
+///   grant protection or suppress a safety flag. (The inverse defect —
+///   defaulting an unsafe/protected flag to `true` — would be an escalation and
+///   is not what this code does.)
+/// - `scope_match` / `evidence_sufficient` / `reopen_condition_met`: tri-state
+///   judgements where `None` (unknown) is materially different from either
+///   boolean. Retaining `default` here is therefore the W3-correct choice, not a
+///   tolerance: the three-way absent / present-empty / value distinction is
+///   preserved by the `Option`, and the `#[serde(default)]` only supplies `None`
+///   for a key the producer never wrote.
+/// - `wrong_scope_for` / `repeated_with` / `unsafe_evidence_refs` /
+///   `evidence_refs` / `counterevidence_refs`: evidence vectors, where an
+///   explicitly empty set is a real answer ("no counterevidence was recorded")
+///   and must not be banned generically.
+/// - `utility_score` / `utility_delta` / `repeat_count` / `role` / `lifecycle` /
+///   `authority`: advisory metadata, `None` = not stated.
+///
+/// Field-specific and invalidated by any producer/caller change; never
+/// package-wide or file-wide. `deny_unknown_fields` remains, so an unknown key
+/// is refused rather than defaulted. No alias, `untagged` or default helper
+/// re-accepts any removed layout (W4).
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
@@ -328,6 +396,27 @@ pub struct ObserveInput {
     pub text_or_structured_payload: Value,
     /// Optional first-pass classification hint. Classification never grants
     /// promotion or task authority.
+    ///
+    /// W4 DEFECT, unchanged in this increment and recorded here so it is not
+    /// mistaken for an intentional compatibility alias. `alias = "kind"` makes
+    /// the *current* decoder trial-accept the same closed control variant under
+    /// two names, and APPENDIX-P requires the current decoder to fail closed on
+    /// a closed control variant while admitting aliases only at a
+    /// migration/compatibility boundary. The two spellings are also not
+    /// semantically identical here: this is an agent-supplied classification
+    /// hint on an observation, while `kind` is the Cue-kind wire name owned by
+    /// `ul/cue.rs` (#706/#831) and already retired through a named legacy
+    /// boundary. So a payload can be accepted under a name that means something
+    /// else in the sibling contract.
+    ///
+    /// Why it is not corrected here: removing the alias breaks any producer
+    /// still sending `kind`, and #708 forbids compensating with a second alias,
+    /// `untagged`, or a default helper. Required owner is `eliot-mcp`'s
+    /// request-validation surface —
+    /// `crates/surfaces/eliot-mcp/src/core.rs::decode_protected_request_bytes` —
+    /// outside this issue's exclusive mutable scope, and it needs an
+    /// integration turn with a named compatibility boundary. Proof ceiling for
+    /// the recorded defect: source-attested only, no executed test in this lane.
     #[serde(default, alias = "kind")]
     pub hint: ObserveHint,
     /// Optional task selector. An absent task keeps the capture cold.
@@ -347,6 +436,39 @@ pub struct ObserveInput {
     #[serde(default)]
     pub write_id: Option<String>,
     /// Explicit schema revision for callers that pin the wire shape.
+    ///
+    /// BLOCKED-BY, unchanged in this increment and recorded here so the field is
+    /// not mistaken for a retained internal default. `schema_version` is
+    /// contract-required, and `dispatch_observe`
+    /// (`crates/eliot-app/src/mcp_stdio/verification.rs::dispatch_observe`, :26)
+    /// already pins `OBSERVE_INPUT_SCHEMA_VERSION` and rejects every other
+    /// value, so the wire version is enforced — just later than a required key
+    /// would be. The `default = "default_observe_schema_version"` helper is what
+    /// this issue's field inventory calls the *helper* default form, and it is
+    /// the one genuine remaining trial-accept path here: an omitted key is
+    /// silently promoted to the current version.
+    ///
+    /// Why it cannot be corrected in this issue's file scope: the JSON Schema
+    /// for `eliot.observe` is generated from this type
+    /// (`crates/eliot-app/src/mcp_stdio/protocol_support.rs::observe_schema` →
+    /// `eliot_types::observe_input_schema`, :112). Making a previously
+    /// omittable key required moves the published schema and therefore the
+    /// `schema_sha256` and `required` set that every connected agent sees
+    /// through `tools/list` (`crates/surfaces/eliot-mcp/src/schema.rs:60`
+    /// `descriptor::<ObserveInput>("eliot.observe", ..)` → `canonical_tool_schemas`
+    /// → `published_mcp_tool_surface` → `tools/list`). Under APPENDIX-P that is
+    /// a major incompatibility and it is owned by `eliot-mcp`, outside this
+    /// issue's exclusive mutable scope, and it needs an integration turn.
+    ///
+    /// W4 disposition: NOT a compatible requiredness correction, and NOT an
+    /// isolated old-version representation either. No `schema_version` field is
+    /// invented, and no alias/`untagged`/helper-default compensation is added;
+    /// the version field already exists on this wire and the current version is
+    /// already rejected by `dispatch_observe`. Required owner:
+    /// `crates/surfaces/eliot-mcp` (`src/schema.rs::descriptor`, `src/core.rs`
+    /// request validation) plus the `eliot.observe` catalogue bump. Base SHA of
+    /// this branch's merge-base with `origin/main` is recorded in the #708
+    /// report.
     #[serde(default = "default_observe_schema_version")]
     pub schema_version: String,
 }

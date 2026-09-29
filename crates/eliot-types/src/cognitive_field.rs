@@ -432,7 +432,9 @@ pub struct CognitiveFieldProviderCallPlan {
 /// correction: it invalidates a sealed artifact, and #708 forbids re-sealing it
 /// under an invented version or a trial-accept alias. The record's own
 /// `schema_version` is the only named boundary, and its owner already rejects
-/// every other value, so no older accepted layout exists to migrate (W4).
+/// every other value (`validate_provider_plan_hash` in
+/// `crates/eliot-app/src/cognitive_field_runner.rs`, :8354), so no older
+/// accepted layout exists to migrate (W4).
 /// Tracked as BLOCKED-BY in the #708 field table: it needs a migration decision
 /// from the `plan_hash` owner, which lives outside this issue's file scope.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

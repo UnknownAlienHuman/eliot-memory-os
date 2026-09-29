@@ -168,16 +168,65 @@ pub struct MaterialPacketFrame {
     pub stop_condition: String,
     pub tool_schema_bytes_visible: usize,
     pub instruction_hotset_size: usize,
-    /// Optional prediction/invariant data: a missing field decodes as empty and
-    /// carries no verified invariant, stored prediction, or coverage claim.
+    /// BREAKING CANDIDATE, deliberately NOT corrected in this increment (#708).
+    ///
+    /// `#[serde(default)]` is RETAINED on the five prediction/invariant fields
+    /// because removing it is *not* a compatible requiredness correction on this
+    /// wire. These five fields are agent-supplied input on the published
+    /// `eliot.packet` tool, and this type derives `JsonSchema`, so the published
+    /// `required` set is generated from the `serde` attributes:
+    /// `mcp_contract.rs::compile_packet_input_schema` (`:150`) serializes
+    /// `schemars::schema_for!(CompilePacketToolInput)`, whose `material_frame`
+    /// subschema is generated from this struct. `schemars` excludes
+    /// `#[serde(default)]` fields from `required`; removing `default` therefore
+    /// *adds* five names to the published `required` set, which changes
+    /// `tools/list` output for every connected agent.
+    ///
+    /// Two independent in-tree facts confirm the required set does NOT already
+    /// contain them, and that a same-file edit here would break its own owner:
+    ///
+    /// 1. `crates/eliot-types/tests/ul_contract_schema.rs::t01_schema_required_set_is_exact`
+    ///    pins the exact `material_frame` required set as 16 names, and these five
+    ///    are not among them.
+    /// 2. `mcp_contract.rs::compile_packet_minimal_example` (`:155`) — the
+    ///    `minimal_valid_example` this crate's own owner returns to agents on
+    ///    invalid tool input (`crates/eliot-app/src/mcp_stdio/input_validation.rs:28`
+    ///    and `:43`, `crates/eliot-app/src/mcp_stdio/task_handlers.rs:206`) —
+    ///    omits all five keys, and
+    ///    `crates/eliot-types/tests/ul_contract_schema.rs::t95`-path decode
+    ///    (`serde_json::from_value::<CompilePacketToolInput>(minimal)`, `:95`)
+    ///    requires that example to keep decoding. Making these fields required
+    ///    would make the owner ship an example its own decoder rejects.
+    ///
+    /// W4 disposition: this is NOT an invented version field and NOT a
+    /// trial-accept compensation. The named/versioned boundary for this wire
+    /// is the `eliot.packet` tool contract revision owned by `eliot-mcp`
+    /// (`crates/surfaces/eliot-mcp/src/schema.rs::descriptor` ->
+    /// `canonical_tool_schemas` -> `published_mcp_tool_surface` -> `tools/list`),
+    /// which is outside this issue's exclusive mutable scope and needs its own
+    /// integration turn. Required owner: `crates/surfaces/eliot-mcp` plus the
+    /// `eliot.packet` catalogue bump; the exact consumer change needed is a
+    /// `material_frame` `required` bump in the published schema together with a
+    /// `compile_packet_minimal_example` that carries the five keys. Base SHA is
+    /// recorded in the #708 report.
+    ///
+    /// Proof ceiling: source-attested only. No test was executed in this lane.
     #[serde(default)]
     pub invariant_refs: Vec<String>,
+    /// See `invariant_refs` above: one breaking-candidate decision covers all
+    /// five prediction/invariant fields on this record (#708).
     #[serde(default)]
     pub waived_invariants: Vec<WaivedInvariant>,
+    /// See `invariant_refs` above: one breaking-candidate decision covers all
+    /// five prediction/invariant fields on this record (#708).
     #[serde(default)]
     pub prediction_confidence: Option<PredictionConfidence>,
+    /// See `invariant_refs` above: one breaking-candidate decision covers all
+    /// five prediction/invariant fields on this record (#708).
     #[serde(default)]
     pub predicted_changed_paths: Vec<String>,
+    /// See `invariant_refs` above: one breaking-candidate decision covers all
+    /// five prediction/invariant fields on this record (#708).
     #[serde(default)]
     pub predicted_failing_verifiers: Vec<String>,
 }
@@ -312,9 +361,22 @@ pub struct CausalCandidate {
     pub transfer_boundary: String,
     pub edge_status: CausalEdgeStatus,
     pub calibration: String,
-    #[serde(default)]
+    /// Explicit presence for the assigned check and the intervention history
+    /// (#708).
+    ///
+    /// `assigned_check` is the verifier-or-bounded-inquiry binding a critical
+    /// action depends on: `validate_for_critical_action` already treats `None`
+    /// as "no check assigned" and refuses, so absence is meaningful and must be
+    /// stated. Defaulting it let an omitted key decode as an unassigned check
+    /// on a candidate that never declared one. `intervention_outcomes` is the
+    /// append-only history `record_intervention_outcome` appends to; an absent
+    /// key decoded as "no outcome was ever recorded", which `validate_intervention_history`
+    /// then reads as a first-generation candidate. Both are now required keys;
+    /// absence is a typed missing-field error rather than a manufactured fact.
+    /// `CausalCandidate` has exactly one in-tree construction surface and no
+    /// published schema, so this is a compatible requiredness correction with
+    /// unchanged accepted and emitted bytes.
     pub assigned_check: Option<CausalCheckAssignment>,
-    #[serde(default)]
     pub intervention_outcomes: Vec<CausalInterventionOutcomeRecord>,
 }
 
@@ -864,13 +926,33 @@ pub struct TaskCognitionView {
     pub current_truth: Vec<ClaimSummary>,
     pub epistemic_state: EpistemicPacketState,
     pub causal_bridge: Vec<CausalBridgeHop>,
-    #[serde(default)]
+    /// Explicit presence for the four optional cognition sections (#708).
+    ///
+    /// `TaskCognitionView` is the read-back half of `OperatorSnapshot`, and the
+    /// operator snapshot is a *projection*: an absent `experience_priors` /
+    /// `negative_memory` / `procedural_skills` key must not be able to read back
+    /// as "this task has no experience priors, no negative memory, no
+    /// procedural skills". Those are different claims from "the producer did not
+    /// populate this section", and the three sections decide what an agent is
+    /// told about prior failures.
+    ///
+    /// Compatibility: `OperatorSnapshot` is produced by exactly one function,
+    /// `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_snapshot`
+    /// (the full `OperatorSnapshot` literal at :679 and both view literals at
+    /// :385 and :438 set every field explicitly, including when the packet is
+    /// absent — those paths then use the explicit empty/`default` value, which
+    /// `Serialize` still writes), and read back by
+    /// `operator.rs::dispatch_operator_query` (:773) and
+    /// `crates/eliot-app/src/mcp_stdio/memory_grant.rs::merge_memory_grant_input`.
+    /// It is projected over the pipe, not persisted, so no durable
+    /// already-omitted payload exists. `Serialize` is untouched, so emitted
+    /// bytes are unchanged; this is a compatible requiredness correction whose
+    /// only effect is that a truncated or foreign snapshot fails with a typed
+    /// missing-field error instead of silently shrinking a view.
     pub experience_priors: Vec<ExperienceBrief>,
-    #[serde(default)]
     pub negative_memory: Vec<ClaimCard>,
     pub selected_memory: Vec<MemoryDecisionReceipt>,
     pub suppressed_memory: Vec<MemoryDecisionReceipt>,
-    #[serde(default)]
     pub procedural_skills: ProceduralSkillPacketView,
     pub packet_quality: Option<PacketQualityReport>,
     pub understanding_outcomes: Vec<UnderstandingOutcomeRecord>,
@@ -888,19 +970,28 @@ pub struct MemoryInspectorView {
     pub decisions: Vec<MemoryDecisionReceipt>,
     pub influence: Vec<MemoryInfluenceTrace>,
     pub cargo: Vec<ContextCargoReceipt>,
-    #[serde(default)]
+    /// Explicit presence for the seven optional memory-analysis sections (#708).
+    ///
+    /// The same reason as `TaskCognitionView` above, with a sharper edge here:
+    /// this is the *memory inspector* projection, and a defaulted
+    /// `applicability_decisions` / `negative_transfer` / `cognitive_lab_results`
+    /// reads back as "this project has no applicability decisions, no negative
+    /// transfer and no lab results" — a completeness claim about a canonical
+    /// store that the projection never actually made. `lifecycle` is the
+    /// lifecycle view; an omitted key decoded as "every memory is in its default
+    /// lifecycle state".
+    ///
+    /// Compatibility: one producer, `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_snapshot`
+    /// (`MemoryInspectorView` literal at :438 sets all eleven fields), read back
+    /// in the same snapshot consumer. Projected, never persisted, so no durable
+    /// omitted payload exists; `Serialize` is untouched. Compatible requiredness
+    /// correction, unchanged accepted and emitted bytes.
     pub lifecycle: MemoryLifecyclePacketView,
-    #[serde(default)]
     pub experience_cases: Vec<ExperienceCase>,
-    #[serde(default)]
     pub experience_patterns: Vec<ExperiencePattern>,
-    #[serde(default)]
     pub applicability_decisions: Vec<MemoryApplicabilityDecision>,
-    #[serde(default)]
     pub negative_transfer: Vec<NegativeTransferRecord>,
-    #[serde(default)]
     pub cognitive_lab_results: Vec<CognitiveTransferLabReport>,
-    #[serde(default)]
     pub failure_localization: Vec<CognitiveFailureLocalizationReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corpus_profile: Option<MemoryCorpusProfile>,
@@ -914,25 +1005,33 @@ pub struct AgentRoutingView {
     pub work_or_action_lease_refs: Vec<String>,
     pub route_policies: Vec<ContourRoutePolicy>,
     pub route_decisions: Vec<ContourRouteDecision>,
-    #[serde(default)]
+    /// Explicit presence for the nine delegation/lease/result sections (#708).
+    ///
+    /// This is the routing half of `OperatorSnapshot`, and its defaulted fields
+    /// are exactly the authority-bearing ones: `task_role_leases`,
+    /// `work_leases`, `worktree_leases`, `controller_leases` and
+    /// `agent_result_dispositions` decide which authority and which write scope
+    /// the operator surface shows. An omitted key decoded as "no live worktree
+    /// lease", "no controller lease" or "no result disposition" — a
+    /// no-authority claim about a governance surface, which is the strongest
+    /// form of the defect this issue exists to remove (A0.3: hidden creation or
+    /// expansion of authority; a stale read must not read as a revoked one).
+    ///
+    /// Compatibility: one producer,
+    /// `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_snapshot`
+    /// (`AgentRoutingView` literal at :693 sets all fifteen fields). The
+    /// snapshot is projected over the operator pipe, not persisted, so no
+    /// durable already-omitted payload exists. `Serialize` is untouched, so
+    /// emitted bytes are unchanged. Compatible requiredness correction.
     pub host_sessions: Vec<AgentSessionHostBinding>,
-    #[serde(default)]
     pub task_role_leases: Vec<TaskRoleLease>,
-    #[serde(default)]
     pub controller_leases: Vec<ControllerLease>,
-    #[serde(default)]
     pub operation_jobs: Vec<OperationJob>,
-    #[serde(default)]
     pub agent_results: Vec<AgentResultEnvelope>,
-    #[serde(default)]
     pub agent_result_dispositions: Vec<AgentResultDisposition>,
-    #[serde(default)]
     pub work_items: Vec<WorkItem>,
-    #[serde(default)]
     pub work_leases: Vec<WorkLease>,
-    #[serde(default)]
     pub worktree_leases: Vec<WorktreeLease>,
-    #[serde(default)]
     pub work_conflicts: Vec<WorkConflict>,
 }
 
@@ -943,21 +1042,36 @@ pub struct AutonomyRunView {
     pub work_item_refs: Vec<String>,
     pub assignment_refs: Vec<String>,
     pub verifier_result_refs: Vec<String>,
-    #[serde(default)]
+    /// Explicit presence for the run ledger and completion sections (#708).
+    ///
+    /// `model_invocations_used`, `tool_calls_used` and `wall_time_used_seconds`
+    /// are the budget denominators for an autonomy run, and `cost_or_tokens_used`
+    /// is the cost-authority record (A14.7). An omitted key decoded as
+    /// `0` / absent, i.e. "this run spent no model invocations, no tokens and no
+    /// time" — a measured-zero claim for a run whose actual consumption was
+    /// never recorded. `completion_proof` is the proof-bearing field: an absent
+    /// key decoded as "no completion proof", which is a *weaker* claim than the
+    /// honest one but is still a proof-status claim manufactured by omission.
+    /// `route_decision_refs` / `recovery_event_refs` /
+    /// `pause_resume_reassignment_refs` are the ordering and recovery
+    /// trajectory.
+    ///
+    /// Compatibility: one producer,
+    /// `crates/eliot-app/src/mcp_stdio/autonomy.rs::operator_run_view` (the
+    /// `AutonomyRunView` literal at :246 sets all eleven fields, including
+    /// `cost_or_tokens_used: Some(...)`). `eliot-store`'s
+    /// `CanonicalAutonomyRunView` is a *separate* read-only projection type in
+    /// `crates/eliot-store/src/canonical_projection_views.rs` and does not
+    /// decode this struct, so this change does not move the canonical store
+    /// read-back path. `Serialize` is untouched, so emitted bytes are
+    /// unchanged. Compatible requiredness correction.
     pub route_decision_refs: Vec<String>,
-    #[serde(default)]
     pub recovery_event_refs: Vec<String>,
-    #[serde(default)]
     pub model_invocations_used: u32,
-    #[serde(default)]
     pub tool_calls_used: u32,
-    #[serde(default)]
     pub wall_time_used_seconds: u64,
-    #[serde(default)]
     pub cost_or_tokens_used: Option<String>,
-    #[serde(default)]
     pub pause_resume_reassignment_refs: Vec<String>,
-    #[serde(default)]
     pub completion_proof: Option<CompletionProof>,
     pub finish_status: String,
 }
@@ -1034,13 +1148,31 @@ pub struct OperatorSnapshot {
     pub runs: Vec<AutonomyRunView>,
     pub approvals: Vec<ApprovalView>,
     pub timeline: TraceTimelineView,
-    #[serde(default)]
+    /// Explicit presence for the four operator-surface extensions (#708).
+    ///
+    /// `incidents` and `log_handles` are the operator's incident and log
+    /// evidence surface, and `backup_inventory` is the recovery/backup
+    /// visibility surface. An omitted key decoded as "no open incidents", "no
+    /// log handles" and "no backups exist" — three claims about *absence of
+    /// adverse evidence and of recoverability*, which is precisely the
+    /// untraceable-effect direction A0.3 fails closed on. `project_refs` is the
+    /// snapshot's project scope; a defaulted empty list made a truncated
+    /// snapshot indistinguishable from a genuinely empty one.
+    ///
+    /// Compatibility: one producer,
+    /// `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_snapshot`
+    /// (the `OperatorSnapshot` literal at :679 sets all four, at :718-721).
+    /// The snapshot travels over the operator pipe and is decoded by
+    /// `operator.rs::dispatch_operator_query` (:773); it is not persisted to
+    /// the canonical store, so no durable already-omitted payload exists.
+    /// `Serialize` is untouched, so emitted bytes are unchanged and the
+    /// hash-pinned contract manifest `schema/operator-contract-v1.json`
+    /// (`OPERATOR_CONTRACT_MANIFEST` → `operator_contract_hash`) is not a
+    /// struct-shape digest and does not move. Compatible requiredness
+    /// correction.
     pub project_refs: Vec<String>,
-    #[serde(default)]
     pub backup_inventory: Vec<BackupInventoryEntry>,
-    #[serde(default)]
     pub incidents: Vec<IncidentRecord>,
-    #[serde(default)]
     pub log_handles: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,

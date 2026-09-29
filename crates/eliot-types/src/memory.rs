@@ -216,7 +216,19 @@ pub struct TaskAcceptanceItem {
     pub satisfied: bool,
     pub observation_id: Option<String>,
     pub verification_id: Option<VerificationId>,
-    #[serde(default)]
+    /// Explicit presence for the verification scope binding (#708).
+    ///
+    /// `verification_scope_hash` is the binding from an acceptance item to the
+    /// exact verifier scope that satisfied it, so a defaulted absent key decoded
+    /// as "this item records no verifier scope" on an item that may in fact be
+    /// satisfied by a scoped verification. Every producer already writes the key
+    /// explicitly, including `None`:
+    /// `crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::acceptance_item`
+    /// (:421) for the declared-but-unsatisfied case and
+    /// `crates/eliot-app/src/mcp_stdio/protocol_tests.rs` (:1055) for the
+    /// satisfied case. The struct is `deny_unknown_fields` and has no published
+    /// schema or named legacy layout, so this is a compatible requiredness
+    /// correction with unchanged accepted and emitted bytes.
     pub verification_scope_hash: Option<String>,
 }
 
@@ -229,7 +241,17 @@ pub struct ActionSourceScope {
     pub branch: Option<String>,
     pub baseline_commit: Option<String>,
     pub baseline_dirty_state_hash: Option<String>,
-    #[serde(default)]
+    /// Explicit presence for the source artifact scope (#708).
+    ///
+    /// `artifact_paths` is the resource scope this provenance set was resolved
+    /// against; an omitted key decoded as "no artifacts", i.e. an
+    /// unscoped-provenance claim on a record whose other four scope fields are
+    /// all required. Every producer writes it explicitly, including the empty
+    /// no-authority set: `crates/eliot-app/src/mcp_stdio/runtime_handlers.rs::action_source_scope`
+    /// (:941 read-only scope, :966 git-worktree scope) and
+    /// `crates/eliot-app/src/mcp_stdio/memory_grant.rs` (:477).
+    /// `deny_unknown_fields`, no published schema, no named legacy layout:
+    /// compatible requiredness correction, unchanged bytes.
     pub artifact_paths: Vec<PathRef>,
 }
 
@@ -412,15 +434,46 @@ pub struct TaskContractInput {
     pub expected_revision: Option<MemoryRevision>,
     pub action_lease_id: Option<ActionLeaseId>,
     pub understanding_proof_hash: Option<String>,
-    #[serde(default)]
+    /// Explicit presence for the provenance, verification-scope and
+    /// completion-proof bindings on `TaskContractInput` (#708).
+    ///
+    /// All three are decision-material on a task contract:
+    /// `action_provenance` is the resolved source/evidence binding for the
+    /// contract write, `verification_scopes` is the exact verifier scope behind
+    /// the contract's `verification_ids`, and `completion_proof` is the
+    /// proof-bearing completion payload. A defaulted absent key read back as
+    /// "this contract carries no provenance / recorded no verifier scope / has
+    /// no completion proof" — three manufactured negative claims on a canonical
+    /// record whose sibling identity, status and revision fields are all
+    /// required.
+    ///
+    /// `memory_grant_redemptions` is deliberately NOT in this group and keeps
+    /// its `default, skip_serializing_if = "Vec::is_empty"` pair: on this wire
+    /// the type's own serialization omits the key when no opaque memory offer
+    /// was consumed, so absence and explicitly-empty are one declared fact
+    /// rather than two. Dropping the default there would make the type unable
+    /// to read back its own bytes — a canonical byte change, not a requiredness
+    /// correction. This is a field-specific, caller-evidenced exemption, not a
+    /// type- or file-wide one: it is invalidated if a producer ever starts
+    /// serializing a non-empty redemption list only sometimes.
+    ///
+    /// Compatibility: `TaskContractInput` is the write-side input of
+    /// `TaskContractWriteCommand`; `TaskContract` below carries the
+    /// identically-defaulted fields and shares this decision. The grant
+    /// redemption schema is versioned by name
+    /// (`ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION`) and every redemption
+    /// record always carries `schema_version`, so an older payload that omitted
+    /// these optional bindings on the *contract* is not a distinct accepted
+    /// wire layout to migrate: it is a record that never recorded the binding,
+    /// and it now fails loudly instead of claiming it did not exist. W4: no
+    /// alias, `untagged` or helper default is introduced to re-accept it.
+    /// `Serialize` is untouched, so emitted bytes are unchanged.
     pub action_provenance: Option<ActionProvenanceSet>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_grant_redemptions: Vec<ActionMemoryGrantRedemption>,
     pub observation_ids: Vec<String>,
     pub verification_ids: Vec<VerificationId>,
-    #[serde(default)]
     pub verification_scopes: Vec<VerifierArtifactScope>,
-    #[serde(default)]
     pub completion_proof: Option<CompletionProof>,
     pub completion_write_id: Option<WriteId>,
 }
@@ -436,6 +489,13 @@ pub struct TaskContractWriteCommand {
 }
 
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
+///
+/// The four `TaskContractInput` bindings above are required here too, for the
+/// same reason and with the same producer evidence
+/// (`crates/eliot-app/src/mcp_stdio/task.rs` builds the provenance set and the
+/// grant redemption; `crates/eliot-app/src/mcp_stdio/protocol_tests.rs` (:993)
+/// builds the full literal). `TaskContract` is the canonical stored form, so
+/// the same four silent-negative defects applied to the durable record itself.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskContract {
@@ -446,15 +506,15 @@ pub struct TaskContract {
     pub acceptance_items: Vec<TaskAcceptanceItem>,
     pub action_lease_id: Option<ActionLeaseId>,
     pub understanding_proof_hash: Option<String>,
-    #[serde(default)]
     pub action_provenance: Option<ActionProvenanceSet>,
+    /// Same field-specific exemption as `TaskContractInput` above: the paired
+    /// `skip_serializing_if` means "no opaque memory offer was consumed" is
+    /// declared by the key's absence on this wire.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_grant_redemptions: Vec<ActionMemoryGrantRedemption>,
     pub observation_ids: Vec<String>,
     pub verification_ids: Vec<VerificationId>,
-    #[serde(default)]
     pub verification_scopes: Vec<VerifierArtifactScope>,
-    #[serde(default)]
     pub completion_proof: Option<CompletionProof>,
     pub completion_write_id: Option<WriteId>,
     pub memory_revision: MemoryRevision,
@@ -867,15 +927,34 @@ pub struct RecallL0Request {
     pub query: String,
     pub consistency: ReadConsistencyMode,
     pub at_least_revision: Option<MemoryRevision>,
-    #[serde(default)]
+    /// Explicit presence for the five recall-scope/narrowing fields (#708).
+    ///
+    /// `lifecycle_audit` is a *retention/erasure* control: it is the flag that
+    /// makes recall return suppressed and archived memory instead of only live
+    /// memory. Defaulting it to `false` meant an omitted key silently narrowed
+    /// the recall to live memory — a privacy/retention-relevant scope
+    /// reduction created by omission, on the surface a caller uses to ask for
+    /// everything. `scope_refs` and `concept_refs` are the retrieval scope
+    /// denominators; a defaulted empty list read as "this query spans no scope
+    /// and no concepts", i.e. an unscoped recall. `task_id` and
+    /// `task_class_cues` are the task-scope narrowing.
+    ///
+    /// Compatibility: `RecallL0Request` is the *only* request shape of
+    /// `CanonicalStore::recall_l0`, and every construction site already writes
+    /// all seven fields explicitly, including `lifecycle_audit: false`:
+    /// `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_query` (:876,
+    /// which itself applies `.unwrap_or(false)` to the caller's parameter and
+    /// therefore already treats "absent" as a caller-level default it owns),
+    /// `crates/eliot-store/src/canonical_store.rs` (:4606, :4833) and the test
+    /// fixtures. `Serialize` is untouched. Compatible requiredness correction;
+    /// the caller-side `.unwrap_or(false)` is deliberately left in place
+    /// because it is a *caller* decision on a free-form parameter bag, not a
+    /// decoder default.
     pub lifecycle_audit: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
-    #[serde(default)]
     pub task_class_cues: Vec<String>,
-    #[serde(default)]
     pub scope_refs: Vec<String>,
-    #[serde(default)]
     pub concept_refs: Vec<String>,
 }
 
@@ -1813,17 +1892,38 @@ pub struct ClaimCard {
 #[serde(deny_unknown_fields)]
 pub struct VerificationRun {
     pub verification_id: VerificationId,
-    #[serde(default)]
+    /// Explicit presence for the whole subject/scope binding block (#708).
+    ///
+    /// These six fields are the verification run's subject and scope: which
+    /// claim, project, task, write and memory revision were verified, and by
+    /// which verifier. They are the *evidence* identity a proof claim rests on.
+    /// Defaulting all six let an omitted key decode as `None` / `""`, i.e. a
+    /// verification run that binds to no claim, no write and no revision and
+    /// names no verifier — a free-standing pass. `verifier: String` defaulting to
+    /// `""` is the sharpest of the six: an empty verifier name is not a
+    /// verifier, and `VerificationResult::Passed` next to it reads as a
+    /// `VERIFIED_COMPLETE` claim (A0.3: a false proof claim) manufactured by an
+    /// omitted key.
+    ///
+    /// Compatibility: `VerificationRun` is the stored canonical verification
+    /// record read back by
+    /// `crates/eliot-store/src/canonical_store.rs::verification_run_by_id` (:4012,
+    /// `decode_value(NamedSurqlOp::VerificationRunById, ..)`), and it is built by
+    /// `crates/eliot-engine/src/cognitive_disposition.rs::canonical_disposition_chain`
+    /// from a resolved canonical receipt, and asserted in
+    /// `crates/eliot-app/src/mcp_stdio/protocol_tests.rs` (:502) which sets every
+    /// field including `claim_id: None` and `verification_id: Some(..)`. The
+    /// sibling `VerificationRunInput` (write-side, :738) has the same shape with
+    /// no `default` at all, so the current producer contract already requires
+    /// the key to be stated. Compatible requiredness correction for current
+    /// writes; an existing stored record that never carried the binding now
+    /// fails to decode instead of reading as an unbound pass, and no alias,
+    /// `untagged` or default helper re-accepts it (W4).
     pub claim_id: Option<ClaimId>,
-    #[serde(default)]
     pub project_id: Option<ProjectId>,
-    #[serde(default)]
     pub task_id: Option<TaskId>,
-    #[serde(default)]
     pub write_id: Option<WriteId>,
-    #[serde(default)]
     pub memory_revision: Option<MemoryRevision>,
-    #[serde(default)]
     pub verifier: String,
     pub result: VerificationResult,
     pub summary: String,
@@ -2082,40 +2182,69 @@ pub struct UnderstandingProof {
     pub task_id: String,
     pub project_id: ProjectId,
     pub goal: String,
-    #[serde(default)]
+    /// Explicit presence for the whole agent-declared block (#708).
+    ///
+    /// `UnderstandingProof` is the agent's own claim about what it believes it
+    /// understood, and the fields defaulted here are the parts the
+    /// `CognitiveGate` then reasons over. `blast_radius_acknowledged` is the
+    /// sharpest: it is the agent's acknowledgement that it has accepted the
+    /// blast radius of its planned change, and defaulting it to `false` let an
+    /// omitted key decode as "the agent did not acknowledge the blast radius"
+    /// — a *fail-closed* direction, so not an escalation, but still a gate input
+    /// decided by omission rather than by a declared agent statement.
+    /// `code_task` is the task-classification input the gate branches on,
+    /// `causal_bridge_from_goal_to_code` is the causal-mechanism claim, and the
+    /// `files_to_change` / `files_to_inspect` / `codecortex_report_refs` /
+    /// `skill_*` vectors are the write-set and skill-grounding evidence the
+    /// gate checks. An empty list there must be an explicit "I inspected
+    /// nothing / I will change nothing", not an unstated omission.
+    ///
+    /// Compatibility: this type is agent-supplied input on the
+    /// `eliot_submit_understanding_proof` path, and every current producer
+    /// already writes the whole literal —
+    /// `crates/eliot-app/src/action_plan.rs` (:288-310, the agent-facing
+    /// default-proof builder) is the production path, and the gate-side
+    /// projection in `crates/eliot-engine/src/context.rs` (:2183) reads the
+    /// declared values. `crates/eliot-app/src/mcp_stdio/protocol_support.rs::understanding_proof_schema`
+    /// publishes the wire schema from this type, and it is a
+    /// `deny_unknown_fields` closed shape with no named legacy layout, so an
+    /// older payload that omitted these keys is not a supported wire version to
+    /// migrate (W4: previously buggy permissiveness is not promised
+    /// compatibility, and no alias/`untagged`/default helper re-accepts it).
+    /// `Serialize` is untouched, so emitted bytes are unchanged. Compatible
+    /// requiredness correction on the decode side.
     pub code_task: bool,
     pub current_truth_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
-    #[serde(default)]
     pub codecortex_report_refs: Vec<String>,
-    #[serde(default)]
     pub files_to_change: Vec<String>,
-    #[serde(default)]
     pub files_to_inspect: Vec<String>,
     pub causal_bridge: String,
-    #[serde(default)]
     pub causal_bridge_from_goal_to_code: String,
     pub invariants: Vec<String>,
     pub negative_memory_checked: bool,
     pub unknowns: Vec<String>,
     pub planned_action: String,
     pub expected_verifiers: Vec<String>,
-    #[serde(default)]
     pub blast_radius_acknowledged: bool,
-    #[serde(default)]
     pub skill_refs: Vec<SkillId>,
-    #[serde(default)]
     pub skill_application_rationales: Vec<String>,
-    #[serde(default)]
     pub skill_anti_scope_acknowledgements: Vec<String>,
-    #[serde(default)]
     pub skill_required_inputs: Vec<String>,
-    #[serde(default)]
     pub skill_verifier_plan_refs: Vec<String>,
     pub risk_level: String,
 }
 
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
+///
+/// The gate decision receipt mirrors `UnderstandingProof`'s four classification
+/// and write-set fields and they are now required for the same reason (#708):
+/// `UnderstandingProofReceipt` is what the gate *decided on*, so a defaulted
+/// `code_task` / `codecortex_report_refs` / `files_to_change` /
+/// `files_to_inspect` would let a receipt describe a decision taken on inputs
+/// the receipt itself does not state. Producer:
+/// `crates/eliot-engine/src/context.rs` (:2183) projects the declared values
+/// into the receipt.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnderstandingProofReceipt {
@@ -2124,13 +2253,9 @@ pub struct UnderstandingProofReceipt {
     pub accepted: bool,
     pub validation_errors: Vec<CognitiveGateReason>,
     pub checked_refs: Vec<String>,
-    #[serde(default)]
     pub code_task: bool,
-    #[serde(default)]
     pub codecortex_report_refs: Vec<String>,
-    #[serde(default)]
     pub files_to_change: Vec<String>,
-    #[serde(default)]
     pub files_to_inspect: Vec<String>,
 }
 
