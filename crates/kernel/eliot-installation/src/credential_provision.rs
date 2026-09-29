@@ -765,7 +765,10 @@ impl StoreCredentialProvisionPlan {
             });
         }
         if let Some(provider_bootstrap_target) = &self.provider_bootstrap_target {
-            handle(provider_bootstrap_target, "credential.provider_bootstrap_target")?;
+            handle(
+                provider_bootstrap_target,
+                "credential.provider_bootstrap_target",
+            )?;
             if let Err(reason) =
                 validate_provider_bootstrap_credential_target(provider_bootstrap_target.as_str())
             {
