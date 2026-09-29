@@ -2349,7 +2349,8 @@ mod tests {
             &config.runtime_launch.authority_state_fence,
             eliot_store_surreal_adapter::PINNED_SURREALDB_MAJOR,
             "test-provider-artifact-digest",
-        );
+        )
+        .expect("derived migration operation identity");
         let receipt = binding
             .receipt(&provider_receipt)
             .expect("typed authoritative receipt");
