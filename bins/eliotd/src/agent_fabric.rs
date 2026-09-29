@@ -569,6 +569,25 @@ fn digest_json<T: Serialize>(value: &T) -> Result<String, FabricError> {
     Ok(eliot_contracts::sha256_hex(&bytes))
 }
 
+/// Computes the frozen definition digest for one Task Controller-authored
+/// staffing plan request (issue #2567).
+///
+/// Crate-internal: the solo driver binds its adapters to the exact frozen
+/// bytes before fabric construction through this helper, so the fabric's own
+/// `define_and_plan` records the identical digest for the identical request.
+/// No second digest algorithm exists; this is the same canonical-JSON
+/// SHA-256 the fabric uses.
+///
+/// # Errors
+///
+/// Returns [`FabricError::Contract`] when the request cannot be canonically
+/// encoded.
+pub(crate) fn frozen_definition_digest(
+    request: &StaffingPlanRequest,
+) -> Result<String, FabricError> {
+    digest_json(request)
+}
+
 /// Deterministic daemon coordinator configuration for this composition.
 ///
 /// # Errors
