@@ -1111,7 +1111,7 @@ impl<'a> AutomationDispatch<'a> {
                 configuration_state,
             } => self.edit_leg(
                 automation_id,
-                previous_revision,
+                &previous_revision,
                 revision,
                 revision_json,
                 normalization_envelope_json,
@@ -1128,7 +1128,7 @@ impl<'a> AutomationDispatch<'a> {
                 revision,
                 occurrence_id,
                 invocation_json,
-            } => self.run_now_leg(automation_id, revision, occurrence_id, invocation_json),
+            } => self.run_now_leg(&automation_id, &revision, occurrence_id, &invocation_json),
             DecodedAutomationMutation::Failure {
                 automation_id,
                 revision,
@@ -1137,10 +1137,10 @@ impl<'a> AutomationDispatch<'a> {
                 failure_json,
             } => self.failure_leg(
                 automation_id,
-                revision,
-                occurrence_id,
+                &revision,
+                &occurrence_id,
                 failure.fingerprint,
-                failure_json,
+                &failure_json,
             ),
         }
     }
@@ -1246,10 +1246,17 @@ impl<'a> AutomationDispatch<'a> {
     /// The documents are retained and projected exactly as the create leg does
     /// it, by the same call, so neither leg owns a second copy of a document
     /// whose only destination is the immutable row.
+    ///
+    /// `previous_revision` is BORROWED because the leg only ever reads it: it
+    /// is the lineage base the edit is asserted against, compared against the
+    /// observed pointer and then dropped on every path. Nothing in this leg
+    /// stores it, so taking it by value would buy a heap copy the leg has no
+    /// use for. Every other parameter here is MOVED into a row this leg
+    /// writes, and stays owned.
     fn edit_leg(
         &mut self,
         automation_id: String,
-        previous_revision: String,
+        previous_revision: &str,
         revision: String,
         revision_json: String,
         normalization_envelope_json: String,
@@ -1291,6 +1298,13 @@ impl<'a> AutomationDispatch<'a> {
 
     /// Pause/resume/remove leg: pointer move only. The immutable revision row
     /// must exist and is read, never rewritten.
+    ///
+    /// All three parameters stay OWNED: each is read first — to build the
+    /// revision key, to compare the observed pointer, to project the row — and
+    /// then MOVED into the `AutomationCurrentRow` this leg writes. A leg whose
+    /// every parameter is consumed by the row it retains must take those
+    /// parameters by value; borrowing one would only turn the row's own
+    /// allocation into a `to_owned()` of a view the caller still holds.
     fn state_transition_leg(
         &mut self,
         automation_id: String,
@@ -1335,14 +1349,26 @@ impl<'a> AutomationDispatch<'a> {
     }
 
     /// Run-now leg: invocation row only, create-only by occurrence identity.
+    ///
+    /// `automation_id` and `revision` are BORROWED: this leg only reads them,
+    /// to build the revision key and to bind the row's identity. The row keeps
+    /// its OWN copy of each (`automation_id.to_owned()`), because the row
+    /// outlives this call and cannot borrow the decoding leg's locals; the
+    /// decoding leg, in turn, must not be forced to own a `String` whose only
+    /// use here is a read. `invocation_json` is the same case: it is read to
+    /// compare the stored bytes on replay and to project the row, and the row
+    /// takes its own `to_owned()` copy.
+    ///
+    /// `occurrence_id` stays OWNED and is MOVED into the row, because the
+    /// same value is the map key and the row's own identity field.
     fn run_now_leg(
         &mut self,
-        automation_id: String,
-        revision: String,
+        automation_id: &str,
+        revision: &str,
         occurrence_id: String,
-        invocation_json: String,
+        invocation_json: &str,
     ) -> Result<Value, StoreError> {
-        let key = automation_revision_key(&automation_id, &revision);
+        let key = automation_revision_key(automation_id, revision);
         if !self.state.automation_revisions.contains_key(&key) {
             return Err(StoreError::InvalidField {
                 field: "automation.revision",
@@ -1359,8 +1385,8 @@ impl<'a> AutomationDispatch<'a> {
                     occurrence_id.clone(),
                     AutomationInvocationRow {
                         occurrence_id,
-                        automation_id: automation_id.clone(),
-                        invocation_json: invocation_json.clone(),
+                        automation_id: automation_id.to_owned(),
+                        invocation_json: invocation_json.to_owned(),
                         state_fence: self.state_fence.clone(),
                         scope_id: self.scope_id.clone(),
                         task_id: self.task_id.clone(),
@@ -1368,21 +1394,32 @@ impl<'a> AutomationDispatch<'a> {
                 );
             }
         }
-        serde_json::to_value(&invocation_json)
+        serde_json::to_value(invocation_json)
             .map_err(|error| StoreError::Serialization(error.to_string()))
     }
 
     /// Failure leg: immutable revision-bound failure row plus the last-failure
     /// pointer move. Repeats of one failure class converge on the existing row.
+    ///
+    /// `revision`, `occurrence_id` and `failure_json` are BORROWED: this leg
+    /// only reads them — to build the failure key, to compare the stored
+    /// document on a repeat, and to project the row — and the failure row
+    /// takes its own `to_owned()` copy of each, because that row is immutable
+    /// and must not borrow the decoding leg's locals.
+    ///
+    /// `automation_id` stays OWNED: it is read for the key and copied into the
+    /// failure row, but it is finally MOVED into the last-failure pointer map,
+    /// so this leg does consume it. `fingerprint` stays OWNED and is MOVED
+    /// into the row it names.
     fn failure_leg(
         &mut self,
         automation_id: String,
-        revision: String,
-        occurrence_id: String,
+        revision: &str,
+        occurrence_id: &str,
         fingerprint: String,
-        failure_json: String,
+        failure_json: &str,
     ) -> Result<Value, StoreError> {
-        let key = automation_revision_key(&automation_id, &revision);
+        let key = automation_revision_key(&automation_id, revision);
         if !self.state.automation_revisions.contains_key(&key) {
             return Err(StoreError::InvalidField {
                 field: "automation.revision",
@@ -1390,7 +1427,7 @@ impl<'a> AutomationDispatch<'a> {
             });
         }
         let failure_key =
-            eliot_store_api::automation_failure_key(&automation_id, &revision, &fingerprint);
+            eliot_store_api::automation_failure_key(&automation_id, revision, &fingerprint);
         match self.state.automation_failures.get(&failure_key) {
             Some(existing) if existing.failure_json != failure_json => {
                 return Err(StoreError::IdentityConflict);
@@ -1401,10 +1438,10 @@ impl<'a> AutomationDispatch<'a> {
                     failure_key.clone(),
                     AutomationFailureRow {
                         automation_id: automation_id.clone(),
-                        revision: revision.clone(),
-                        occurrence_id: occurrence_id.clone(),
+                        revision: revision.to_owned(),
+                        occurrence_id: occurrence_id.to_owned(),
                         fingerprint,
-                        failure_json: failure_json.clone(),
+                        failure_json: failure_json.to_owned(),
                         source_operation_id: self.source_operation_id.clone(),
                         state_fence: self.state_fence.clone(),
                         scope_id: self.scope_id.clone(),
@@ -1416,7 +1453,7 @@ impl<'a> AutomationDispatch<'a> {
         self.state
             .automation_last_failure
             .insert(automation_id, failure_key);
-        serde_json::to_value(&failure_json)
+        serde_json::to_value(failure_json)
             .map_err(|error| StoreError::Serialization(error.to_string()))
     }
 }
