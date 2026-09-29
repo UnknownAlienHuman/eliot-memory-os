@@ -44,10 +44,12 @@
 //! - `DuplicateIdentity` and `ModelControl` failures are preserved verbatim as
 //!   [`ControlBoardError::Provider`] contract failures.
 //!
-//! Expected policy revision/digest equality is enforced by the owning
-//! coordinator compiler against the exact replacement policy (the single
-//! owner of that check); this edge enforces capability, exact view pinning,
-//! and visible-attempt existence, then forwards and maps. The command identity
+//! Expected predecessor revision/digest equality is enforced by the owning
+//! coordinator compiler against the exact current policy read from the
+//! already validated envelope (missing preferences refuse closed as a stale
+//! view, never as a caller-supplied substitute); this edge enforces
+//! capability, exact view pinning, and visible-attempt existence, then
+//! forwards and maps. The command identity
 //! is derived deterministically from the exact view revision plus the action
 //! bytes, so an identical submission replays to the identical candidate while
 //! changed bytes always produce a different identity and digest.
@@ -197,9 +199,9 @@ impl ControlBoard {
     /// action fails closed as [`ControlBoardError::InvalidField`]. The caller
     /// capability is enforced with `ResolvedAccess::can` before the projection
     /// is read, the envelope is pinned at the exact `(revision, fence)` pair,
-    /// cancel targets must exist in the visible attempt rows, and expected
-    /// policy revision/digest equality is enforced by the owning compiler.
-    /// Every refusal returns before any compiler call with zero effecting
+    /// cancel targets must exist in the visible attempt rows, and the
+    /// expected predecessor policy revision/digest is checked by the owning
+    /// compiler against the current envelope policy. Every refusal returns
     /// calls; success returns a candidate-only value with no effect authority.
     pub fn swarm_command_candidate(
         &mut self,
@@ -281,9 +283,19 @@ impl ControlBoard {
                 expected_policy_revision,
                 expected_policy_digest,
             } => {
+                // The CAS predecessor is the current policy in the already
+                // validated envelope, never a caller-supplied substitute:
+                // missing preferences refuse closed as a stale view before
+                // any compiler call.
+                let current = envelope
+                    .projection
+                    .preferences
+                    .clone()
+                    .ok_or(ControlBoardError::StaleView)?;
                 let candidate = compile_replace_policy_candidate(&ReplacePreferencePolicyRequest {
                     binding: binding.clone(),
                     account_scope,
+                    current_policy: current,
                     policy: policy.clone(),
                     expected_policy_revision: expected_policy_revision.clone(),
                     expected_policy_digest: expected_policy_digest.clone(),
