@@ -2569,12 +2569,41 @@ impl KernelComposition {
         }
     }
 
+    /// Refuses a materially repeated expensive call on unchanged inputs
+    /// without new owner-observed evidence (I7.24 step 5). The retained
+    /// per-route stage is the kernel-owned attempt history; the repeat is
+    /// refused with the existing identity-conflict signal so it is never
+    /// staged as progress. The class derives from the accepted admission
+    /// and a reworded expected delta alone is not progress.
+    fn refuse_staged_local_read_repeat(
+        index: &std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        admission: &LocalReadAdmission,
+    ) -> Result<(), TransportError> {
+        if let Some(current) =
+            super::tool_exposure::build_tool_call_request(envelope, tool, admission)
+        {
+            let retained = index.values().flatten().filter_map(|candidate| {
+                Some((
+                    candidate.local_read_envelope.as_ref()?,
+                    candidate.local_read_tool.as_ref()?,
+                ))
+            });
+            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_local_read_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
-        match check_local_read_admission(envelope, tool)? {
+        let admission = check_local_read_admission(envelope, tool)?;
+        match admission {
             LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {}
             LocalReadAdmission::CampaignPacket { .. } => {
                 return Err(TransportError::SessionFenced);
@@ -2597,22 +2626,9 @@ impl KernelComposition {
             LocalReadReplay::AlreadyStaged => return Ok(()),
             LocalReadReplay::Fresh => {}
         }
-        // I7.24 W3/A2: a materially repeated expensive call on unchanged
-        // inputs without a new expected delta is a loop/no-progress signal,
-        // not a fresh dispatch. The retained per-route stage above is the
-        // kernel-owned store; the repeat is refused with the existing
-        // identity-conflict signal so it is never staged as progress.
-        if let Some(current) = super::tool_exposure::build_tool_call_request(envelope, tool) {
-            let retained = index.values().flatten().filter_map(|candidate| {
-                Some((
-                    candidate.local_read_envelope.as_ref()?,
-                    candidate.local_read_tool.as_ref()?,
-                ))
-            });
-            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
-                return Err(TransportError::IdentityConflict);
-            }
-        }
+        // I7.24 step 5: refuse materially repeated calls with no new
+        // owner-observed evidence before staging them as progress.
+        Self::refuse_staged_local_read_repeat(&index, envelope, tool, &admission)?;
         let queued = index
             .values()
             .flatten()
@@ -7832,13 +7848,8 @@ pub(crate) fn local_read_admission_from_tool(
         .and_then(serde_json::Value::as_str)
         .ok_or(TransportError::SessionFenced)?;
     // I7.24: expensive-class calls require a valid intent before dispatch.
-    if super::tool_exposure::requires_intent(name) {
-        let request = super::tool_exposure::build_tool_call_request(envelope, tool)
-            .ok_or(TransportError::SessionFenced)?;
-        super::tool_exposure::authorize_pre_dispatch(&request)
-            .map_err(|_| TransportError::SessionFenced)?;
-    }
-    match name {
+    // The call class derives from the accepted admission, never the tool name.
+    let admission = match name {
         "eliot.packet" => campaign_packet_admission(envelope, tool),
         "eliot.query" => local_read_selectors_from_tool(envelope, tool)
             .map_err(|_| TransportError::SessionFenced)?
@@ -7848,7 +7859,14 @@ pub(crate) fn local_read_admission_from_tool(
             Ok(LocalReadAdmission::Skill)
         }
         _ => Err(TransportError::SessionFenced),
+    }?;
+    if super::tool_exposure::requires_intent(&admission) {
+        let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
+            .ok_or(TransportError::SessionFenced)?;
+        super::tool_exposure::authorize_pre_dispatch(&request)
+            .map_err(|_| TransportError::SessionFenced)?;
     }
+    Ok(admission)
 }
 
 /// Validates one local-read admission before any store read (no IO).
