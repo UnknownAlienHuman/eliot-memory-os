@@ -497,6 +497,13 @@ impl KernelExecutionManifest {
                 reason: "must be non-zero",
             });
         }
+        // I1.9: the accepted Module Catalog revision travels with its
+        // lifecycle/admission receipt. A receipt-less projection is not an
+        // admission, so it validates as unusable rather than issuable.
+        text(
+            self.accepted_catalog_receipt.as_str(),
+            "execution.accepted_catalog_receipt",
+        )?;
         digest(&self.artifact_digest, "execution.artifact_digest")?;
         digest(&self.config_digest, "execution.config_digest")?;
         digest(&self.protocol_digest, "execution.protocol_digest")?;
@@ -524,6 +531,10 @@ impl GenerationAdmission {
     pub fn validate(&self) -> Result<(), ModuleError> {
         self.candidate.validate()?;
         self.execution.validate()?;
+        // I1.9: the Governor issues the lifecycle/admission receipt with the
+        // revision. An admission without one cannot authorize a Kernel
+        // manifest, so it is rejected at issuance, not downstream.
+        text(self.admission_receipt.as_str(), "admission_receipt")?;
         self.state_fence
             .validate()
             .map_err(|error| ModuleError::Contract(error.to_string()))?;
