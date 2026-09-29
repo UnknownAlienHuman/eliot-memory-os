@@ -1143,6 +1143,25 @@ pub struct ImprovementPipelineInputs<'a> {
     pub policy: &'a ImprovementAdmissionPolicy,
 }
 
+/// One identity component of a record that this crate does not recognize.
+///
+/// A checked record carries the SAME domain, encoding revision, and algorithm
+/// constants the producer stamps. A consumer that accepts a record carrying any
+/// other identity accepts content the producer never vouched for, so the
+/// mismatch is a typed refusal rather than a tolerated value: no digest is
+/// substituted, no legacy or empty value is filled in, and the record is not
+/// compared at all.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("checked identity mismatch on {component}: record carries {found}, this build checks {expected}")]
+pub struct UncheckedRecordIdentity {
+    /// Which identity component of the record disagreed.
+    pub component: &'static str,
+    /// The identity the record carries.
+    pub found: String,
+    /// The identity this build checks.
+    pub expected: &'static str,
+}
+
 /// Typed pipeline failures. Malformed or unbound input never decides.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PipelineError {
@@ -1210,8 +1229,19 @@ pub enum PipelineError {
     #[error("improvement input profile exceeds its ceiling: {0}")]
     InputProfileCeiling(&'static str),
     /// The versioned proposal commitment could not be produced.
-    #[error("improvement proposal commitment failed: {0}")]
-    CommitmentFailed(&'static str),
+    ///
+    /// `detail` carries the serializer's OWN failure text, so a serialization
+    /// refusal crosses every layer boundary as itself and is never flattened
+    /// into a placeholder reason, an empty value, or a substitute digest.
+    #[error("improvement proposal commitment failed: {detail}")]
+    CommitmentFailed {
+        /// The canonical serializer's own failure text.
+        detail: String,
+    },
+    /// A record presented for comparison does not carry this crate's checked
+    /// identity, so its digest is not a current commitment.
+    #[error("improvement record identity is not the checked version: {0}")]
+    UncheckedRecordIdentity(#[from] UncheckedRecordIdentity),
     /// Governor admission refused the candidate with a typed failure.
     ///
     /// The admission error is carried whole, so an identity conflict stays an
@@ -1269,6 +1299,70 @@ fn current_proposal_of(
         material_equality: material_equality_of(normalized, experiment),
         experiment_plan: experiment.clone(),
     })
+}
+
+/// Refuses a record that does not carry this build's checked identity.
+///
+/// Every consumer of a [`ImprovementCurrentProposal`] calls this before the
+/// record is compared, propagated, or named in an obligation. The comparison is
+/// against the SAME constants the producer stamps in `commitment_of`, so a
+/// record written under another domain, encoding revision, or algorithm is a
+/// typed refusal rather than a tolerated value: nothing is substituted for it,
+/// no legacy digest is reinterpreted, and no assessment is derived from a
+/// record this build cannot read.
+///
+/// The refusal names the disagreeing component and both identities, so a caller
+/// cannot repair the record by guessing.
+pub fn check_checked_record_identity(
+    current: &ImprovementCurrentProposal,
+) -> Result<(), UncheckedRecordIdentity> {
+    let identities: [(&'static str, &str, &'static str); 7] = [
+        (
+            "commitment.domain",
+            &current.commitment.domain,
+            IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN,
+        ),
+        (
+            "commitment.encoding_version",
+            &current.commitment.encoding_version,
+            IMPROVEMENT_PROPOSAL_ENCODING_VERSION,
+        ),
+        (
+            "commitment.algorithm",
+            &current.commitment.algorithm,
+            IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
+        ),
+        (
+            "discriminator.domain",
+            &current.discriminator.domain,
+            IMPROVEMENT_DISCRIMINATOR_DOMAIN,
+        ),
+        (
+            "discriminator.encoding_version",
+            &current.discriminator.encoding_version,
+            IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION,
+        ),
+        (
+            "material_equality.domain",
+            &current.material_equality.domain,
+            IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN,
+        ),
+        (
+            "material_equality.encoding_version",
+            &current.material_equality.encoding_version,
+            IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION,
+        ),
+    ];
+    for (component, found, expected) in identities {
+        if found != expected {
+            return Err(UncheckedRecordIdentity {
+                component,
+                found: found.to_owned(),
+                expected,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Derives the discriminator projection of one normalized proposal.
@@ -1338,10 +1432,11 @@ pub fn assess_improvement_replay(
     proposal: &ImprovementProposal,
     experiment: &ExperimentPlan,
 ) -> Result<ImprovementReplayAssessment, PipelineError> {
-    Ok(compare_improvement_commitments(
+    compare_improvement_commitments(
         retained,
         &current_proposal_of(&canonical_proposal(proposal)?, experiment)?,
-    ))
+    )
+    .map_err(PipelineError::from)
 }
 
 /// Assesses the current record against the retained prior record, if any.
@@ -1352,12 +1447,15 @@ pub fn assess_improvement_replay(
 pub(crate) fn assess_improvement_progress(
     retained: Option<&RetainedImprovementProposal>,
     current: &ImprovementCurrentProposal,
-) -> ImprovementReplayAssessment {
+) -> Result<ImprovementReplayAssessment, UncheckedRecordIdentity> {
     match retained {
         Some(retained) => compare_improvement_commitments(retained, current),
-        None => ImprovementReplayAssessment::NoRetainedPrior {
-            commitment: current.commitment.clone(),
-        },
+        None => {
+            check_checked_record_identity(current)?;
+            Ok(ImprovementReplayAssessment::NoRetainedPrior {
+                commitment: current.commitment.clone(),
+            })
+        }
     }
 }
 
@@ -1383,20 +1481,33 @@ pub(crate) fn assess_improvement_progress(
 /// that is an ordinary new candidate, never a progress claim. Without a
 /// retained record nothing is established at all. None of these clears an
 /// unknown external effect; effect retry stays with its own owner.
+///
+/// # The current record must be this build's checked version
+///
+/// Every assessment this function returns is derived only after
+/// [`check_checked_record_identity`] confirms that `current` carries the SAME
+/// domain, encoding revision, and algorithm the producer stamps. Comparing a
+/// record against another record is not enough: two records that agree with each
+/// other but not with this build agree about content no version of this
+/// pipeline committed, and a consumer that tolerates that reads a foreign
+/// digest as a replay, a conflict, or an established discriminator. The refusal
+/// is therefore returned as [`UncheckedRecordIdentity`] rather than resolved
+/// into an assessment, and no substitute digest, legacy value, or recomputation
+/// over local state stands in for the record.
 pub fn compare_improvement_commitments(
     retained: &RetainedImprovementProposal,
     current: &ImprovementCurrentProposal,
-) -> ImprovementReplayAssessment {
-    if let Some(assessment) = same_operation_replay(retained, current) {
-        return assessment;
-    }
-    if let Some(assessment) = unestablished_projection(retained, current) {
-        return assessment;
-    }
-    if let Some(assessment) = material_repeat(retained, current) {
-        return assessment;
-    }
-    changed_discriminator(retained, current)
+) -> Result<ImprovementReplayAssessment, UncheckedRecordIdentity> {
+    check_checked_record_identity(current)?;
+    Ok(if let Some(assessment) = same_operation_replay(retained, current) {
+        assessment
+    } else if let Some(assessment) = unestablished_projection(retained, current) {
+        assessment
+    } else if let Some(assessment) = material_repeat(retained, current) {
+        assessment
+    } else {
+        changed_discriminator(retained, current)
+    })
 }
 
 /// Decides the outcomes that belong to the retained record's own operation.
@@ -1669,8 +1780,9 @@ pub fn reconcile_unknown_activation(
     prior: &ImprovementAdmissionDecision,
     current: &ImprovementCurrentProposal,
     rollback: &RollbackContract,
-) -> ImprovementTerminalDisposition {
-    match prior {
+) -> Result<ImprovementTerminalDisposition, PipelineError> {
+    check_checked_record_identity(current)?;
+    Ok(match prior {
         ImprovementAdmissionDecision::RequiresReconciliation { owner_id, .. } => {
             ImprovementTerminalDisposition::UnknownRequiresReconciliation {
                 obligation: Box::new(unknown_effect_of(current, rollback, owner_id)),
@@ -1708,7 +1820,7 @@ pub fn reconcile_unknown_activation(
             ),
             owner_id: rollback_owner_id.clone(),
         },
-    }
+    })
 }
 
 /// Builds the unresolved external-effect obligation from checked records only.
@@ -2655,8 +2767,9 @@ fn commitment_of(normalized: &ImprovementProposal) -> Result<ProposalCommitment,
         algorithm: IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM.to_string(),
         proposal: normalized.clone(),
     };
-    let bytes = canonical_json_bytes(&envelope)
-        .map_err(|_| PipelineError::CommitmentFailed("canonical-json-bytes-unavailable"))?;
+    let bytes = canonical_json_bytes(&envelope).map_err(|error| PipelineError::CommitmentFailed {
+        detail: error.to_string(),
+    })?;
     if bytes.len() > IMPROVEMENT_MAX_COMMITMENT_BYTES {
         return Err(PipelineError::InputProfileCeiling(
             "proposal-commitment-bytes",
