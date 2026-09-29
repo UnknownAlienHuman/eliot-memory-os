@@ -1515,6 +1515,11 @@ impl WakeCancellationBatchEntry {
 pub struct WakeCancellationBatchRecord {
     pub fence: RecordFence,
     pub operation: IdempotencyIdentity,
+    /// Canonical commitment of the exact typed UserAutomation cancellation
+    /// request received by the Host. Legacy batches omit it and cannot satisfy
+    /// exact cancellation readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_commitment_sha256: Option<String>,
     pub entries: Vec<WakeCancellationBatchEntry>,
 }
 
@@ -1522,6 +1527,9 @@ impl WakeCancellationBatchRecord {
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
+        if let Some(commitment) = &self.request_commitment_sha256 {
+            record_checksum_digest(commitment, "wake_cancellation.request_commitment_sha256")?;
+        }
         if self.entries.is_empty() {
             return Err(JournalError::Invalid(
                 "wake cancellation batch must not be empty".into(),

@@ -3588,13 +3588,49 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Atomically records a daemon attempt before returning the executable
-    /// claim. A different owner closes the row as `Unknown` while retaining
-    /// the prior attempt for reconciliation.
+    /// claim. A competing v1 caller observes the durable winner unchanged;
+    /// legacy ownership conflicts retain their conservative `Unknown` fence.
     fn claim_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
         attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Expires an active v1 claim under its exact retained identity. Expiry
+    /// moves possible-effect work to `Unknown`; it never grants another send.
+    fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Durably fences the exact claim before any transport write is attempted.
+    /// A restart that finds this phase must reconcile; it is never no-effect
+    /// evidence.
+    fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists one authenticated transport-custody observation under the
+    /// exact active claim.
+    fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Retains a separate authenticated owner readback under the exact send
+    /// claim. This channel is independent from the original transport channel.
+    fn record_host_request_owner_readback(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Records a no-effect deferral for the exact active daemon attempt.
     fn defer_host_request_attempt(
@@ -3635,6 +3671,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         result_response: &serde_json::Value,
         result_evidence: Option<&crate::HostRequestEffectEvidence>,
         result_lineage: Option<&crate::HostRequestRetainedLineage>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Atomically stores an exact owner result and terminalizes the same
+    /// claimed attempt that durably recorded `ResponseReceived`.
+    fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Loads one host-request operation by exact operation/request identity.
     fn load_host_request(
@@ -8490,6 +8537,16 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
+        if existing.send_claim_protocol_version
+            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            && !(target == crate::HostRequestState::Admitted
+                && matches!(
+                    existing.state,
+                    crate::HostRequestState::Requested | crate::HostRequestState::Admitted
+                ))
+        {
+            return Err(OrsError::InvalidTransition);
+        }
         if existing.state == target {
             let replay_matches = match (&existing.result_digest, result_digest) {
                 (Some(current), Some(replayed)) => current.as_str() == replayed,
@@ -8592,10 +8649,18 @@ impl RedbRecoveryStore {
             | crate::HostRequestState::PossiblyEffected => crate::HostRequestState::Unknown,
             crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
                 match parent.attempt.as_ref().map(|attempt| attempt.phase) {
-                    None | Some(crate::HostRequestAttemptPhase::DeferredNoEffect) => {
+                    None
+                    | Some(crate::HostRequestAttemptPhase::DeferredNoEffect)
+                    | Some(crate::HostRequestAttemptPhase::DefinitelyNotSent) => {
                         crate::HostRequestState::Cancelled
                     }
-                    Some(crate::HostRequestAttemptPhase::Claimed) => {
+                    Some(
+                        crate::HostRequestAttemptPhase::Claimed
+                        | crate::HostRequestAttemptPhase::DispatchStarted
+                        | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                        | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                        | crate::HostRequestAttemptPhase::ResponseReceived,
+                    ) => {
                         crate::HostRequestState::Unknown
                     }
                 }
@@ -8670,6 +8735,11 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
+        if existing.send_claim_protocol_version
+            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
 
         let mut cancellation: crate::HostRequestRecord = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
@@ -8732,9 +8802,10 @@ impl RedbRecoveryStore {
     }
 
     /// Persists the daemon attempt and `Routed` phase before exposing a claim.
-    /// Exact same-owner polls recover the original attempt. A different owner
-    /// fences the operation as `Unknown` and leaves the original attempt in
-    /// place so a replacement cannot silently acquire writer ownership.
+    /// Exact same-owner polls recover the original attempt. A competing v1
+    /// caller observes that durable winner without changing its state, so the
+    /// winner can persist the transport boundary; legacy ownership conflicts
+    /// keep their conservative `Unknown` fence.
     pub fn claim_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -8765,60 +8836,200 @@ impl RedbRecoveryStore {
             });
         }
         attempt.validate(&existing.fence_digest)?;
-        let next = match existing.attempt.as_ref() {
-            None if matches!(
-                existing.state,
-                crate::HostRequestState::Admitted | crate::HostRequestState::Routed
-            ) && existing.result_digest.is_none()
-                && existing.result_response.is_none() =>
+        if existing.send_claim_protocol_version
+            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            && attempt.channel_binding_sha256.as_deref()
+                != existing.transport_channel_binding_sha256.as_deref()
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if existing.send_claim_protocol_version
+            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            let now_unix_ms = current_unix_ms_u64()?;
+            let Some(claim_expires_at_unix_ms) = attempt.claim_expires_at_unix_ms else {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "versioned claims require an explicit expiry",
+                });
+            };
+            let latest_allowed_expiry = now_unix_ms
+                .checked_add(crate::HOST_REQUEST_SEND_CLAIM_LEASE_MS)
+                .ok_or(OrsError::InvalidTransition)?;
+            if claim_expires_at_unix_ms <= now_unix_ms
+                || claim_expires_at_unix_ms > latest_allowed_expiry
             {
-                let mut next = existing.clone();
-                next.state = crate::HostRequestState::Routed;
-                next.attempt = Some(attempt.clone());
-                next
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "claim expiry must be in the future and within the bounded lease",
+                });
             }
-            Some(current) if current.phase == crate::HostRequestAttemptPhase::DeferredNoEffect => {
-                let next_generation = current
-                    .generation
-                    .checked_add(1)
-                    .ok_or(OrsError::InvalidTransition)?;
-                if existing.state != crate::HostRequestState::Routed
-                    || attempt.generation != next_generation
-                    || existing.result_digest.is_some()
-                    || existing.result_response.is_some()
+        }
+        if existing.send_claim_protocol_version == 0
+            && existing.connection_ref.as_str() == "USER_AUTOMATION_RUNTIME_OPERATION"
+            && matches!(
+                existing.state,
+                crate::HostRequestState::Admitted
+                    | crate::HostRequestState::Routed
+                    | crate::HostRequestState::Submitted
+                    | crate::HostRequestState::PossiblyEffected
+                    | crate::HostRequestState::Unknown
+                    | crate::HostRequestState::Reconciling
+            )
+        {
+            let mut fenced = existing.clone();
+            if !matches!(
+                fenced.state,
+                crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+            ) {
+                fenced.state = fenced.state.transition_to(crate::HostRequestState::Unknown)?;
+            }
+            if fenced == existing {
+                write.commit().map_err(storage)?;
+                return Ok(Some(existing));
+            }
+            fenced.validate()?;
+            let payload = encode(&fenced)?;
+            {
+                let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+            return Ok(Some(fenced));
+        }
+        let next = if existing.send_claim_protocol_version == 0 {
+            // Preserve the pre-#2970 claim contract for generic HostRequest
+            // routes. Only the UserAutomation runtime channel opts into the
+            // new durable transport-custody protocol.
+            match existing.attempt.as_ref() {
+                None if matches!(
+                    existing.state,
+                    crate::HostRequestState::Admitted | crate::HostRequestState::Routed
+                ) && existing.result_digest.is_none()
+                    && existing.result_response.is_none() =>
+                {
+                    let mut next = existing.clone();
+                    next.state = crate::HostRequestState::Routed;
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.phase == crate::HostRequestAttemptPhase::DeferredNoEffect =>
+                {
+                    let next_generation = current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(OrsError::InvalidTransition)?;
+                    if existing.state != crate::HostRequestState::Routed
+                        || attempt.generation != next_generation
+                        || existing.result_digest.is_some()
+                        || existing.result_response.is_some()
+                    {
+                        return Err(OrsError::InvalidTransition);
+                    }
+                    let mut next = existing.clone();
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.owner_connection_ref == attempt.owner_connection_ref
+                        && current.owner_launch_nonce == attempt.owner_launch_nonce
+                        && current.owner_session_epoch == attempt.owner_session_epoch
+                        && current.fence_digest == attempt.fence_digest
+                        && current.phase == crate::HostRequestAttemptPhase::Claimed =>
+                {
+                    write.commit().map_err(storage)?;
+                    return Ok(Some(existing));
+                }
+                Some(_)
+                    if matches!(
+                        existing.state,
+                        crate::HostRequestState::Admitted
+                            | crate::HostRequestState::Routed
+                            | crate::HostRequestState::Submitted
+                            | crate::HostRequestState::PossiblyEffected
+                    ) =>
+                {
+                    let mut next = existing.clone();
+                    next.state = crate::HostRequestState::Unknown;
+                    next
+                }
+                _ => {
+                    write.commit().map_err(storage)?;
+                    return Ok(Some(existing));
+                }
+            }
+        } else {
+            match existing.attempt.as_ref() {
+                None if existing.state == crate::HostRequestState::Admitted
+                    && existing.attempt_history.is_empty()
+                    && attempt.generation == 1
+                    && existing.result_digest.is_none()
+                    && existing.result_response.is_none() =>
+                {
+                    let mut next = existing.clone();
+                    next.state = crate::HostRequestState::Routed;
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.phase == crate::HostRequestAttemptPhase::DefinitelyNotSent
+                        && existing.state == crate::HostRequestState::Routed
+                        && existing.attempt_history.is_empty() =>
+                {
+                    let next_generation = current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(OrsError::InvalidTransition)?;
+                    if attempt.generation != next_generation
+                        || existing.result_digest.is_some()
+                        || existing.result_response.is_some()
+                    {
+                        return Err(OrsError::InvalidTransition);
+                    }
+                    let mut next = existing.clone();
+                    next.attempt_history.push(current.clone());
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.phase == crate::HostRequestAttemptPhase::DefinitelyNotSent
+                        && existing.state == crate::HostRequestState::Routed
+                        && !existing.attempt_history.is_empty() =>
+                {
+                    let mut next = existing.clone();
+                    next.state = next.state.transition_to(crate::HostRequestState::Unknown)?;
+                    next.validate()?;
+                    let payload = encode(&next)?;
+                    {
+                        let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                        table
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
+                    }
+                    write.commit().map_err(storage)?;
+                    return Err(OrsError::HostRequestAttemptLimitExceeded);
+                }
+                Some(current)
+                    if current.same_claim(attempt)
+                        && current.phase == crate::HostRequestAttemptPhase::Claimed =>
                 {
                     return Err(OrsError::InvalidTransition);
                 }
-                let mut next = existing.clone();
-                next.attempt = Some(attempt.clone());
-                next
-            }
-            Some(current)
-                if current.owner_connection_ref == attempt.owner_connection_ref
-                    && current.owner_launch_nonce == attempt.owner_launch_nonce
-                    && current.owner_session_epoch == attempt.owner_session_epoch
-                    && current.fence_digest == attempt.fence_digest
-                    && current.phase == crate::HostRequestAttemptPhase::Claimed =>
-            {
-                write.commit().map_err(storage)?;
-                return Ok(Some(existing));
-            }
-            Some(_)
-                if matches!(
-                    existing.state,
-                    crate::HostRequestState::Admitted
-                        | crate::HostRequestState::Routed
-                        | crate::HostRequestState::Submitted
-                        | crate::HostRequestState::PossiblyEffected
-                ) =>
-            {
-                let mut next = existing.clone();
-                next.state = crate::HostRequestState::Unknown;
-                next
-            }
-            _ => {
-                write.commit().map_err(storage)?;
-                return Ok(Some(existing));
+                // The durable v1 attempt is the winner. A competing caller
+                // only observes that claim; it must not rewrite the winner's
+                // Routed/Submitted state before the owner can persist its
+                // transport boundary. The gateway compares the returned
+                // attempt with the caller's attempt and refuses the loser.
+                _ => {
+                    write.commit().map_err(storage)?;
+                    return Ok(Some(existing));
+                }
             }
         };
         next.validate()?;
@@ -8831,6 +9042,434 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Moves one expired v1 send claim to reconciliation while retaining the
+    /// exact attempt and its owner identity. Expiry is never evidence that the
+    /// owner received no bytes and never makes the operation claimable again.
+    pub fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(mut record) = ({
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        }) else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version
+            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(current) = record.attempt.as_ref() else {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        let Some(claim_expires_at_unix_ms) = current.claim_expires_at_unix_ms else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_attempt_claim_expiry",
+                reason: "versioned claims require an explicit expiry",
+            });
+        };
+        if claim_expires_at_unix_ms > current_unix_ms_u64()?
+            || matches!(
+                current.phase,
+                crate::HostRequestAttemptPhase::DefinitelyNotSent
+                    | crate::HostRequestAttemptPhase::DeferredNoEffect
+            )
+            || matches!(
+                record.state,
+                crate::HostRequestState::ResultReceived
+                    | crate::HostRequestState::Cancelled
+                    | crate::HostRequestState::Expired
+                    | crate::HostRequestState::Conflicted
+                    | crate::HostRequestState::Terminal
+            )
+        {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        if matches!(
+            record.state,
+            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+        ) {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        if matches!(
+            record.state,
+            crate::HostRequestState::Routed
+                | crate::HostRequestState::Submitted
+                | crate::HostRequestState::PossiblyEffected
+        ) {
+            record.state = record
+                .state
+                .transition_to(crate::HostRequestState::Unknown)?;
+            record.validate()?;
+            let payload = encode(&record)?;
+            {
+                let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Commits the dispatch fence under the exact current claim before the
+    /// authenticated transport is entered. This is intentionally not
+    /// idempotent: a repeated claim cannot reopen a send after a crash.
+    pub fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(mut record) = ({
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        }) else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version
+            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            return Err(OrsError::InvalidTransition);
+        }
+        let claim_expiry = current
+            .claim_expires_at_unix_ms
+            .ok_or(OrsError::InvalidTransition)?;
+        if claim_expiry <= current_unix_ms_u64()? {
+            if matches!(
+                record.state,
+                crate::HostRequestState::Routed
+                    | crate::HostRequestState::Submitted
+                    | crate::HostRequestState::PossiblyEffected
+            ) {
+                record.state = record
+                    .state
+                    .transition_to(crate::HostRequestState::Unknown)?;
+                record.validate()?;
+                let payload = encode(&record)?;
+                {
+                    let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+            }
+            write.commit().map_err(storage)?;
+            return Err(OrsError::HostRequestAttemptExpired);
+        }
+        if current.phase != crate::HostRequestAttemptPhase::Claimed
+            || !current.transport_observations.is_empty()
+            || record.state != crate::HostRequestState::Routed
+            || observation.boundary != crate::HostRequestTransportBoundary::DispatchStarted
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        observation.validate_for(&record, &current)?;
+        current.transport_observations.push(observation.clone());
+        current.phase = crate::HostRequestAttemptPhase::DispatchStarted;
+        record.attempt = Some(current);
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Appends one monotonic typed transport observation to the exact active
+    /// claim. The observation is validated and retained in the same redb
+    /// transaction as its phase/state projection.
+    pub fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(mut record) = ({
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        }) else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version
+            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            return Err(OrsError::InvalidTransition);
+        }
+        observation.validate_for(&record, &current)?;
+        if current.transport_observations.last() == Some(observation) {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        let next_phase = match observation.boundary {
+            crate::HostRequestTransportBoundary::DispatchStarted => {
+                return Err(OrsError::InvalidTransition);
+            }
+            crate::HostRequestTransportBoundary::DefinitelyNotSent => {
+                let proof_matches_phase = match current.phase {
+                    crate::HostRequestAttemptPhase::Claimed => {
+                        observation.no_send_proof
+                            == Some(crate::HostRequestNoSendProof::RequestRejectedBeforeWrite)
+                    }
+                    crate::HostRequestAttemptPhase::DispatchStarted => {
+                        observation.no_send_proof
+                            == Some(
+                                crate::HostRequestNoSendProof::AuthenticatedTransportPreflightRejected,
+                            )
+                    }
+                    _ => false,
+                };
+                if !proof_matches_phase {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::DefinitelyNotSent
+            }
+            crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown => {
+                if current.phase != crate::HostRequestAttemptPhase::DispatchStarted {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+            }
+            crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost => {
+                if current.phase != crate::HostRequestAttemptPhase::DispatchStarted {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+            }
+            crate::HostRequestTransportBoundary::ResponseReceived => {
+                if !matches!(
+                    current.phase,
+                    crate::HostRequestAttemptPhase::DispatchStarted
+                        | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                        | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                ) {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::ResponseReceived
+            }
+        };
+        if current.transport_observations.len() >= 3 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        current.transport_observations.push(observation.clone());
+        current.phase = next_phase;
+        match observation.boundary {
+            crate::HostRequestTransportBoundary::DefinitelyNotSent => {}
+            crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+            | crate::HostRequestTransportBoundary::ResponseReceived => {
+                if !matches!(
+                    record.state,
+                    crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+                ) {
+                    record.state = record.state.transition_to(crate::HostRequestState::Unknown)?;
+                }
+            }
+            crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost => {
+                if record.state == crate::HostRequestState::Routed {
+                    record.state = record.state.transition_to(crate::HostRequestState::Submitted)?;
+                }
+            }
+            crate::HostRequestTransportBoundary::DispatchStarted => {
+                return Err(OrsError::InvalidTransition);
+            }
+        }
+        record.attempt = Some(current);
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Retains one exact authenticated owner readback without changing the
+    /// original transport channel observations. The readback can resolve only
+    /// the active claim whose request and payload commitments it repeats.
+    pub fn record_host_request_owner_readback(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(mut record) = ({
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        }) else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version
+            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            return Err(OrsError::InvalidTransition);
+        }
+        evidence.validate_for(&record, &current)?;
+        if let Some(existing) = &current.owner_readback {
+            if existing == evidence {
+                write.commit().map_err(storage)?;
+                return Ok(Some(record));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        let response_was_already_observed = current.phase
+            == crate::HostRequestAttemptPhase::ResponseReceived
+            && current
+                .transport_observations
+                .last()
+                .is_some_and(|observation| {
+                    observation.boundary
+                        == crate::HostRequestTransportBoundary::ResponseReceived
+                        && observation.response_commitment_sha256.as_deref()
+                            == Some(evidence.result_commitment_sha256.as_str())
+                });
+        let unresolved_transport_claim = matches!(
+            current.phase,
+            crate::HostRequestAttemptPhase::DispatchStarted
+                | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+        ) && current
+            .transport_observations
+            .last()
+            .is_some_and(|observation| {
+                matches!(
+                    observation.boundary,
+                    crate::HostRequestTransportBoundary::DispatchStarted
+                        | crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                )
+            });
+        if current.transport_observations.is_empty()
+            || (!response_was_already_observed && !unresolved_transport_claim)
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        current.owner_readback = Some(evidence.clone());
+        current.phase = crate::HostRequestAttemptPhase::ResponseReceived;
+        if !matches!(
+            record.state,
+            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+        ) {
+            record.state = record.state.transition_to(crate::HostRequestState::Unknown)?;
+        }
+        record.attempt = Some(current);
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
     }
 
     /// Records the daemon owner's explicit no-effect deferral for the exact
@@ -8856,6 +9495,11 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        if record.send_claim_protocol_version
+            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
         let Some(mut current) = record.attempt.clone() else {
             return Err(OrsError::InvalidTransition);
         };
@@ -8879,6 +9523,169 @@ impl RedbRecoveryStore {
         current.phase = crate::HostRequestAttemptPhase::DeferredNoEffect;
         record.attempt = Some(current);
         record.state = crate::HostRequestState::Routed;
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Atomically terminalizes one exact send claim with the result whose
+    /// commitment was durably observed through the authenticated transport or
+    /// exact owner readback. When `owner_readback` is present, both that
+    /// evidence and the terminal response are retained in this same redb
+    /// transaction.
+    pub fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        crate::model::validate_digest(result_digest, "host_request_result_digest")?;
+        validate_result_response(result_response)?;
+        let result_body_bytes = canonical_json_bytes(result_response)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let result_body_digest = crate::model::sha256_hex(&result_body_bytes);
+        if result_body_digest != result_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(mut record) = ({
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        }) else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version
+            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt)
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        if let Some(evidence) = owner_readback {
+            if record.send_claim_protocol_version
+                != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            {
+                return Err(OrsError::InvalidTransition);
+            }
+            evidence.validate_for(&record, &current)?;
+            let unresolved_transport_claim = matches!(
+                current.phase,
+                crate::HostRequestAttemptPhase::DispatchStarted
+                    | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                    | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                    | crate::HostRequestAttemptPhase::ResponseReceived
+            ) && current.transport_observations.last().is_some_and(|observation| {
+                matches!(
+                    observation.boundary,
+                    crate::HostRequestTransportBoundary::DispatchStarted
+                        | crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                        | crate::HostRequestTransportBoundary::ResponseReceived
+                )
+            });
+            if current.transport_observations.is_empty() || !unresolved_transport_claim {
+                return Err(OrsError::InvalidTransition);
+            }
+            if let Some(existing) = &current.owner_readback {
+                if existing != evidence {
+                    return Err(OrsError::HostRequestIdentityConflict {
+                        operation_id: operation_id.as_str().to_owned(),
+                        request_digest: request_digest.to_owned(),
+                    });
+                }
+            } else {
+                current.owner_readback = Some(evidence.clone());
+            }
+            current.phase = crate::HostRequestAttemptPhase::ResponseReceived;
+        }
+        if current.phase != crate::HostRequestAttemptPhase::ResponseReceived {
+            return Err(OrsError::InvalidTransition);
+        }
+        let observed_result_digest = current
+            .owner_readback
+            .as_ref()
+            .map(|readback| readback.result_commitment_sha256.as_str())
+            .or_else(|| {
+                current
+                    .transport_observations
+                    .last()
+                    .filter(|observation| {
+                        observation.boundary
+                            == crate::HostRequestTransportBoundary::ResponseReceived
+                    })
+                    .and_then(|observation| observation.response_commitment_sha256.as_deref())
+            });
+        if observed_result_digest != Some(result_digest)
+            || observed_result_digest != Some(result_body_digest.as_str())
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.state == crate::HostRequestState::ResultReceived {
+            if record.result_digest.as_deref() == Some(result_digest)
+                && record.result_response.as_ref() == Some(result_response)
+            {
+                write.commit().map_err(storage)?;
+                return Ok(Some(record));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if !matches!(
+            record.state,
+            crate::HostRequestState::Submitted
+                | crate::HostRequestState::PossiblyEffected
+                | crate::HostRequestState::Unknown
+                | crate::HostRequestState::Reconciling
+        ) {
+            return Err(OrsError::InvalidTransition);
+        }
+        record.attempt = Some(current);
+        record.state = record
+            .state
+            .transition_to(crate::HostRequestState::ResultReceived)?;
+        record.result_digest = Some(result_digest.to_owned());
+        record.result_response = Some(result_response.clone());
+        if record.commit_order == 0 {
+            record.commit_order = Self::next_operational_order(&write)?;
+        }
         record.validate()?;
         let payload = encode(&record)?;
         {
@@ -8933,6 +9740,11 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
+        if existing.send_claim_protocol_version
+            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        {
+            return Err(OrsError::InvalidTransition);
+        }
         if existing.state == crate::HostRequestState::ResultReceived {
             let same_digest = existing.result_digest.as_deref() == Some(result_digest);
             let same_body = existing.result_response.as_ref() == Some(result_response);
@@ -23413,16 +24225,17 @@ impl RedbRecoveryStore {
     /// Converts a host request whose claimed owner vanished with the process
     /// into the durable unknown-outcome state (issue #1853, I14.21, I1.4).
     ///
-    /// A non-terminal row holding a `Claimed` attempt is a daemon that was
-    /// killed after it claimed writer ownership and may have issued effects. The
-    /// restart path must not leave it looking live, must not free the retained
-    /// attempt so a replacement can silently acquire ownership, and must not
-    /// retry: it advances the row to `Unknown` through the existing
+    /// A non-terminal row holding any active transport phase may have issued
+    /// effects. Legacy `Admitted`/`Routed` rows with no attempt are also
+    /// uncertain because earlier send code could cross the transport before
+    /// persisting the new claim marker. Restart must not leave these rows
+    /// looking live, free their retained attempt, or retry: it advances them to
+    /// `Unknown` through the existing
     /// [`crate::HostRequestState::transition_to`] edge, so exactly one result or
     /// `UNKNOWN_OUTCOME` can still be bound later from reconciliation evidence.
     /// The attempt is retained in place and its generation is untouched.
     ///
-    /// A `Reconciling` row keeps its retained `Claimed` attempt and still has a
+    /// A `Reconciling` row keeps its retained attempt and still has a
     /// legal edge to `Unknown`, so it is a candidate too: the interrupted
     /// reconciliation cannot be resumed across a restart, and the owning route
     /// re-advances the row to `Reconciling` when the next reconciliation
@@ -23433,7 +24246,9 @@ impl RedbRecoveryStore {
     /// over data the sweep itself holds would let recovery invent authority.
     /// Identity-index rows share `HOST_REQUESTS` and are told apart by the
     /// same `request_digest` marker the reuse check uses, so only real
-    /// operation rows are candidates.
+    /// operation rows are candidates. The legacy no-claim Admitted/Routed
+    /// fallback is restricted to the UserAutomation runtime channel: generic
+    /// protocol-v0 HostRequest rows retain their pre-protocol restart behavior.
     fn recover_interrupted_host_requests(&self) -> Result<(), OrsError> {
         loop {
             let write = self.database.begin_write().map_err(storage)?;
@@ -23457,14 +24272,31 @@ impl RedbRecoveryStore {
                     if record.state.is_terminal() {
                         continue;
                     }
-                    let claimed = record.attempt.as_ref().is_some_and(|attempt| {
-                        attempt.phase == crate::HostRequestAttemptPhase::Claimed
+                    let active_attempt = record.attempt.as_ref().is_some_and(|attempt| {
+                        matches!(
+                            attempt.phase,
+                            crate::HostRequestAttemptPhase::Claimed
+                                | crate::HostRequestAttemptPhase::DispatchStarted
+                                | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                                | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                                | crate::HostRequestAttemptPhase::ResponseReceived
+                        )
                     });
-                    if !claimed {
+                    let legacy_admitted_without_claim =
+                        record.send_claim_protocol_version == 0
+                            && record.connection_ref.as_str()
+                                == "USER_AUTOMATION_RUNTIME_OPERATION"
+                            && record.attempt.is_none()
+                            && matches!(
+                                record.state,
+                                crate::HostRequestState::Admitted
+                                    | crate::HostRequestState::Routed
+                            );
+                    if !active_attempt && !legacy_admitted_without_claim {
                         continue;
                     }
                     // A row already advanced to `Unknown`/`Reconciling` keeps
-                    // its retained `Claimed` attempt, so it still looks like a
+                    // its retained active attempt, so it still looks like a
                     // candidate. The owner's own transition table decides
                     // whether the row can still move forward; re-using it here
                     // keeps the sweep idempotent across its own pages without
@@ -29917,6 +30749,68 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::claim_host_request_attempt(self, operation_id, request_digest, attempt)
     }
 
+    fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::reconcile_expired_host_request_claim(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+        )
+    }
+
+    fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::begin_host_request_transport_dispatch(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::observe_host_request_transport_custody(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    fn record_host_request_owner_readback(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::record_host_request_owner_readback(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            evidence,
+        )
+    }
+
     fn defer_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -29943,6 +30837,26 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             result_response,
             result_evidence,
             result_lineage,
+        )
+    }
+
+    fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::persist_claimed_host_request_result(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            result_digest,
+            result_response,
+            owner_readback,
         )
     }
 
@@ -30497,6 +31411,67 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
             .claim_host_request_attempt(operation_id, request_digest, attempt)
     }
 
+    /// Reconciles an expired active send claim under its retained identity.
+    pub fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .reconcile_expired_host_request_claim(operation_id, request_digest, attempt)
+    }
+
+    /// Durably fences the exact claim before entering the authenticated
+    /// transport.
+    pub fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.begin_host_request_transport_dispatch(
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    /// Persists one typed custody observation for the exact active claim.
+    pub fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.observe_host_request_transport_custody(
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    /// Retains an authenticated cross-restart owner readback independently
+    /// from the original transport channel observations.
+    pub fn record_host_request_owner_readback(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.record_host_request_owner_readback(
+            operation_id,
+            request_digest,
+            attempt,
+            evidence,
+        )
+    }
+
     /// Records the exact current attempt's no-effect deferral.
     pub fn defer_host_request_attempt(
         &self,
@@ -30525,6 +31500,27 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
             result_response,
             result_evidence,
             result_lineage,
+        )
+    }
+
+    /// Atomically persists the exact response for the claim whose retained
+    /// custody evidence already contains the same response commitment.
+    pub fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.persist_claimed_host_request_result(
+            operation_id,
+            request_digest,
+            attempt,
+            result_digest,
+            result_response,
+            owner_readback,
         )
     }
 
@@ -31427,6 +32423,8 @@ mod host_request_result_tests {
         let label = |value: &str| OpaqueLabel::new(value.to_owned()).expect("valid test label");
         crate::HostRequestRecord {
             contract_version: crate::CONTRACT_VERSION,
+            send_claim_protocol_version: 0,
+            transport_channel_binding_sha256: None,
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
@@ -31447,6 +32445,7 @@ mod host_request_result_tests {
             deadline_unix_ms: 9_999_999,
             state: HostRequestState::Requested,
             attempt: None,
+            attempt_history: Vec::new(),
             cancellation_target: None,
             result_digest: None,
             result_response: None,

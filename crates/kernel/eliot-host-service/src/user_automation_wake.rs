@@ -17,14 +17,16 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_host_state::{
     AppendDisposition, BackendError, HostState, HostStateJournalService, HostStateRecord,
     IdempotencyIdentity, JournalBackend, JournalError, WakeCancellationBatchEntry,
-    WakeCancellationBatchRecord, host_owner_epoch_digest, record_checksum,
+    WakeCancellationBatchQuery, WakeCancellationBatchQueryError, WakeCancellationBatchRecord,
+    host_owner_epoch_digest, record_checksum,
 };
 use eliot_kernel_service::{
     USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION, UserAutomationRuntimeError,
     UserAutomationWakeCancellation, UserAutomationWakeEnumerationCoverage,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
     UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOwnerEvidence,
-    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeCancellationReadback, UserAutomationWakePort,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::WakeIntentState;
@@ -121,10 +123,22 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
             .first()
             .map(|entry| entry.wake.fence.clone())
             .ok_or_else(|| rejected("wake cancellation batch is empty"))?;
-        let operation = cancellation_batch_identity(&request, &entries)?;
+        let (operation_id, idempotency_key) = request
+            .host_batch_operation_identity()
+            .map_err(|error| rejected(format!("wake cancellation batch identity: {error}")))?;
+        let operation = IdempotencyIdentity {
+            operation_id: PlatformHandle::new(operation_id)
+                .map_err(|_| rejected("wake cancellation batch operation identity is invalid"))?,
+            idempotency_key: PlatformHandle::new(idempotency_key)
+                .map_err(|_| rejected("wake cancellation batch idempotency identity is invalid"))?,
+        };
+        let request_commitment_sha256 = request
+            .request_commitment_sha256()
+            .map_err(|error| rejected(format!("wake cancellation request commitment: {error}")))?;
         let record = HostStateRecord::WakeCancellationBatch(WakeCancellationBatchRecord {
             fence,
             operation,
+            request_commitment_sha256: Some(request_commitment_sha256),
             entries,
         });
         match self
@@ -136,6 +150,74 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
             AppendDisposition::Applied | AppendDisposition::Replayed => {}
         }
         Ok(cancelled)
+    }
+
+    async fn read_cancellation_batch_authenticated(
+        &self,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
+        authenticated_channel_binding_sha256: String,
+    ) -> Result<UserAutomationWakeCancellationReadback, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeCancellation> = request.into();
+        request
+            .validate()
+            .map_err(|error| rejected(format!("wake cancellation readback: {error}")))?;
+        validate_sha256(&authenticated_channel_binding_sha256)?;
+        let (operation_id, idempotency_key) = request
+            .host_batch_operation_identity()
+            .map_err(|error| rejected(format!("wake cancellation batch identity: {error}")))?;
+        let operation = IdempotencyIdentity {
+            operation_id: PlatformHandle::new(operation_id)
+                .map_err(|_| rejected("wake cancellation batch operation identity is invalid"))?,
+            idempotency_key: PlatformHandle::new(idempotency_key)
+                .map_err(|_| rejected("wake cancellation batch idempotency identity is invalid"))?,
+        };
+        let request_commitment_sha256 = request
+            .request_commitment_sha256()
+            .map_err(|error| rejected(format!("wake cancellation request commitment: {error}")))?;
+        let observation = self
+            .journal
+            .query_wake_cancellation_batch(&WakeCancellationBatchQuery {
+                operation: operation.clone(),
+                request_commitment_sha256: request_commitment_sha256.clone(),
+            })
+            .map_err(map_cancellation_query_error)?;
+        let record = observation.record();
+        if record.operation != operation
+            || record.request_commitment_sha256.as_deref()
+                != Some(request_commitment_sha256.as_str())
+            || record.entries.len() != request.targets.len()
+            || record
+                .entries
+                .iter()
+                .zip(&request.targets)
+                .any(|(entry, target)| {
+                    entry.wake.wake_id.as_str() != target.wake_id
+                        || entry.wake.operation.operation_id.as_str() != target.operation_id
+                        || entry.wake.operation.idempotency_key.as_str() != target.idempotency_key
+                        || entry.expected_record_checksum.as_str() != target.record_checksum
+                        || entry.wake.intent.state_fence != target.state_fence
+                        || entry.wake.intent.state != WakeIntentState::Cancelled
+                })
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let readback = UserAutomationWakeCancellationReadback {
+            batch_operation_id: operation.operation_id.as_str().to_owned(),
+            batch_idempotency_key: operation.idempotency_key.as_str().to_owned(),
+            request_commitment_sha256,
+            record_checksum: observation.record_checksum().to_owned(),
+            journal_sequence: observation.receipt().sequence(),
+            journal_transaction_id: observation.receipt().transaction_id().as_str().to_owned(),
+            cancelled_wake_ids: record
+                .entries
+                .iter()
+                .map(|entry| entry.wake.wake_id.as_str().to_owned())
+                .collect(),
+        };
+        readback
+            .validate_for(&request)
+            .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+        Ok(readback)
     }
 
     async fn enumerate_pending_wakes_authenticated(
@@ -443,37 +525,6 @@ fn validate_sha256(value: &str) -> Result<(), UserAutomationRuntimeError> {
     Ok(())
 }
 
-fn cancellation_batch_identity(
-    request: &UserAutomationWakeCancellation,
-    entries: &[WakeCancellationBatchEntry],
-) -> Result<IdempotencyIdentity, UserAutomationRuntimeError> {
-    let members: Vec<(&str, &str)> = entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.wake.wake_id.as_str(),
-                entry.expected_record_checksum.as_str(),
-            )
-        })
-        .collect();
-    let bytes = serde_json::to_vec(&(
-        "eliot.user_automation.wake-cancellation-batch.v1",
-        request.identity.operation_id.as_str(),
-        request.identity.idempotency_key.as_str(),
-        members,
-    ))
-    .map_err(|error| rejected(format!("wake cancellation batch identity: {error}")))?;
-    let digest = sha256_hex(&bytes);
-    let operation_id = PlatformHandle::new(format!("ua-wake-cancel-batch:{digest}"))
-        .map_err(|_| rejected("wake cancellation batch operation identity is invalid"))?;
-    let idempotency_key = PlatformHandle::new(format!("ua-wake-cancel-batch-key:{digest}"))
-        .map_err(|_| rejected("wake cancellation batch idempotency identity is invalid"))?;
-    Ok(IdempotencyIdentity {
-        operation_id,
-        idempotency_key,
-    })
-}
-
 fn map_journal_error(error: JournalError) -> UserAutomationRuntimeError {
     match error {
         JournalError::OutcomeUnknown { transaction_id } => {
@@ -484,6 +535,25 @@ fn map_journal_error(error: JournalError) -> UserAutomationRuntimeError {
             BackendError::Unavailable | BackendError::PlanGap { .. } | BackendError::Unknown(_),
         ) => UserAutomationRuntimeError::Unavailable(error.to_string()),
         _ => UserAutomationRuntimeError::Rejected(error.to_string()),
+    }
+}
+
+fn map_cancellation_query_error(
+    error: WakeCancellationBatchQueryError,
+) -> UserAutomationRuntimeError {
+    match error {
+        WakeCancellationBatchQueryError::NotFound
+        | WakeCancellationBatchQueryError::LegacyUnbound
+        | WakeCancellationBatchQueryError::RequestCommitmentMismatch
+        | WakeCancellationBatchQueryError::Contradictory
+        | WakeCancellationBatchQueryError::MissingReceipt
+        | WakeCancellationBatchQueryError::Invalid(_)
+        | WakeCancellationBatchQueryError::Journal(_) => {
+            UserAutomationRuntimeError::UnknownOutcome(
+                "the exact Host cancellation batch is absent, conflicting, or unreadable; the original operation remains reconciling"
+                    .to_owned(),
+            )
+        }
     }
 }
 

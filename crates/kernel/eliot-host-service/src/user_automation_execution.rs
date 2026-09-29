@@ -107,6 +107,11 @@ where
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
+            // The exact cancellation readback is a restart reconciliation
+            // proof and must use a server-authenticated session.
+            UserAutomationHostExecutionOperation::ReadCancellationBatch { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
+            }
         }
     }
 
@@ -173,6 +178,19 @@ where
                     request_sha256,
                     state_fence,
                     receipt: Box::new(receipt),
+                })
+            }
+            UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+                let channel_binding_sha256 = session.authenticated_channel_binding_digest()?;
+                let readback = self
+                    .wake
+                    .read_cancellation_batch_authenticated(request, channel_binding_sha256.clone())
+                    .await?;
+                Ok(UserAutomationHostExecutionResponse::WakeCancellationBatchReadback {
+                    request_sha256,
+                    state_fence,
+                    authenticated_channel_binding_sha256: channel_binding_sha256,
+                    readback: Box::new(readback),
                 })
             }
         }

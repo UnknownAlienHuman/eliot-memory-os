@@ -969,6 +969,8 @@ fn requested_host_request_record(
     let optional_label = |value: Option<&String>| value.map(|identity| label(identity)).transpose();
     Ok(HostRequestRecord {
         contract_version: ORS_CONTRACT_VERSION,
+        send_claim_protocol_version: 0,
+        transport_channel_binding_sha256: None,
         operation_id: ors_operation_id(envelope)?,
         kind: match envelope.kind {
             HostRequestKind::Activation => OrsHostRequestKind::Activation,
@@ -999,6 +1001,7 @@ fn requested_host_request_record(
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        attempt_history: Vec::new(),
         cancellation_target: None,
         result_digest: None,
         result_response: None,
@@ -1617,6 +1620,8 @@ mod local_read_result_tests {
         let label = |value: &str| OpaqueLabel::new(value.to_owned()).expect("valid test label");
         let mut record = HostRequestRecord {
             contract_version: ORS_CONTRACT_VERSION,
+            send_claim_protocol_version: 0,
+            transport_channel_binding_sha256: None,
             operation_id: ors_operation_id_for_test(),
             kind: OrsHostRequestKind::Invocation,
             request_id: label("req-1"),
@@ -1637,6 +1642,7 @@ mod local_read_result_tests {
             deadline_unix_ms: 2_000_000,
             state: HostRequestState::Admitted,
             attempt: None,
+            attempt_history: Vec::new(),
             cancellation_target: None,
             result_digest: None,
             result_response: None,

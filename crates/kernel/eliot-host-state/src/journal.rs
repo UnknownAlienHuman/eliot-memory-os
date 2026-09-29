@@ -72,6 +72,72 @@ pub struct EpochRetirementQuery {
     pub operation: IdempotencyIdentity,
 }
 
+/// Exact Host journal selector for one UserAutomation wake-cancellation batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeCancellationBatchQuery {
+    /// Canonical Host batch operation identity computed from the original
+    /// typed cancellation request.
+    pub operation: IdempotencyIdentity,
+    /// Canonical SHA-256 commitment of the exact typed request bytes.
+    pub request_commitment_sha256: String,
+}
+
+/// Journal-owned observation of one committed wake-cancellation batch.
+///
+/// The record is selected from and revalidated against the retained Host
+/// journal frame; the receipt is reconstructed from that frame's exact
+/// operation, checksum, sequence, and durable committed receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeCancellationBatchObservation {
+    record: crate::WakeCancellationBatchRecord,
+    receipt: AppendReceipt,
+    record_checksum: String,
+}
+
+impl WakeCancellationBatchObservation {
+    /// Exact cancellation batch record applied by the Host journal.
+    pub const fn record(&self) -> &crate::WakeCancellationBatchRecord {
+        &self.record
+    }
+
+    /// Exact durable journal append receipt reconstructed by the journal owner.
+    pub const fn receipt(&self) -> &AppendReceipt {
+        &self.receipt
+    }
+
+    /// Checksum of the exact retained Host record.
+    pub fn record_checksum(&self) -> &str {
+        &self.record_checksum
+    }
+}
+
+/// Typed outcomes of an exact Host cancellation-batch query.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum WakeCancellationBatchQueryError {
+    /// The Host journal or backend could not provide a verified read.
+    #[error("host cancellation journal: {0}")]
+    Journal(#[from] JournalError),
+    /// The operation or request commitment was malformed.
+    #[error("wake cancellation query is invalid: {0}")]
+    Invalid(String),
+    /// No durable cancellation batch exists for the exact Host operation.
+    #[error("wake cancellation batch was not found for the named operation")]
+    NotFound,
+    /// A legacy batch exists but did not retain its original typed request
+    /// commitment, so it cannot prove the exact cancellation request.
+    #[error("wake cancellation batch predates request-commitment retention")]
+    LegacyUnbound,
+    /// The operation exists but is bound to different typed request bytes.
+    #[error("wake cancellation batch request commitment conflicts")]
+    RequestCommitmentMismatch,
+    /// More than one durable record or receipt matched the operation.
+    #[error("wake cancellation batch journal evidence is contradictory")]
+    Contradictory,
+    /// The journal frame did not have its exact durable commit receipt.
+    #[error("wake cancellation batch has no durable commit receipt")]
+    MissingReceipt,
+}
+
 /// Retirement resolved by the journal owner under one exact operation
 /// identity.
 ///
@@ -1415,6 +1481,134 @@ impl<B: JournalBackend> HostStateJournal<B> {
         Ok(EpochRetirementObservation {
             record: retirement,
             transaction_id,
+        })
+    }
+
+    /// Reads one exact committed wake-cancellation batch by both its original
+    /// Host operation identity and canonical typed-request commitment.
+    ///
+    /// This scans the verified durable frame and checks its reducer projection
+    /// plus backend commit receipt. Current wake rows are not used as a proxy:
+    /// their absence or later lifecycle state cannot settle an earlier batch.
+    pub fn query_wake_cancellation_batch(
+        &self,
+        query: &WakeCancellationBatchQuery,
+    ) -> Result<WakeCancellationBatchObservation, WakeCancellationBatchQueryError> {
+        query
+            .operation
+            .validate()
+            .map_err(|error| WakeCancellationBatchQueryError::Invalid(error.to_string()))?;
+        if query.request_commitment_sha256.len() != 64
+            || !query
+                .request_commitment_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(WakeCancellationBatchQueryError::Invalid(
+                "request commitment must be lowercase sha256".to_owned(),
+            ));
+        }
+
+        // `append_inner` uses this same lock order. Holding both locks while
+        // loading the image prevents a concurrent append from splitting the
+        // projected sequence from the durable frame/receipt we return.
+        let mut current = self
+            .state
+            .lock()
+            .map_err(|_| WakeCancellationBatchQueryError::Journal(JournalError::Synchronization))?;
+        let mut backend = self
+            .backend
+            .lock()
+            .map_err(|_| WakeCancellationBatchQueryError::Journal(JournalError::Synchronization))?;
+        let image = backend
+            .load()
+            .map_err(map_backend_error)
+            .map_err(WakeCancellationBatchQueryError::Journal)?;
+        let verified = state_for_host(&image, &current.host)
+            .map_err(WakeCancellationBatchQueryError::Journal)?;
+        if verified.sequence != current.sequence || verified.last_checksum != current.last_checksum
+        {
+            *current = verified.clone();
+        }
+        let epoch = image
+            .epochs
+            .iter()
+            .find(|epoch| epoch.host == verified.host)
+            .ok_or(WakeCancellationBatchQueryError::NotFound)?;
+        let frames = scan_frames(&epoch.bytes).map_err(WakeCancellationBatchQueryError::Journal)?;
+        let mut matching_records = frames.into_iter().filter_map(|frame| {
+            let HostStateRecord::WakeCancellationBatch(record) = frame.record else {
+                return None;
+            };
+            (record.operation == query.operation).then_some((record, frame.header))
+        });
+        let Some((record, header)) = matching_records.next() else {
+            return Err(WakeCancellationBatchQueryError::NotFound);
+        };
+        if matching_records.next().is_some() {
+            return Err(WakeCancellationBatchQueryError::Contradictory);
+        }
+        match record.request_commitment_sha256.as_deref() {
+            None => return Err(WakeCancellationBatchQueryError::LegacyUnbound),
+            Some(commitment) if commitment != query.request_commitment_sha256 => {
+                return Err(WakeCancellationBatchQueryError::RequestCommitmentMismatch);
+            }
+            Some(_) => {}
+        }
+
+        let host_record = HostStateRecord::WakeCancellationBatch(record.clone());
+        let record_checksum = record_checksum(&host_record)
+            .map_err(WakeCancellationBatchQueryError::Journal)?;
+        if header.checksum != record_checksum {
+            return Err(WakeCancellationBatchQueryError::Journal(
+                JournalError::IdempotencyConflict,
+            ));
+        }
+        let applied = verified
+            .applied_operations
+            .iter()
+            .filter(|item| item.identity == query.operation)
+            .collect::<Vec<_>>();
+        let [applied] = applied.as_slice() else {
+            return Err(WakeCancellationBatchQueryError::Contradictory);
+        };
+        if applied.checksum != record_checksum || applied.sequence != header.sequence {
+            return Err(WakeCancellationBatchQueryError::Journal(
+                JournalError::IdempotencyConflict,
+            ));
+        }
+        let receipts = image
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.host == verified.host && receipt.operation == query.operation)
+            .collect::<Vec<_>>();
+        let [receipt] = receipts.as_slice() else {
+            return if receipts.is_empty() {
+                Err(WakeCancellationBatchQueryError::MissingReceipt)
+            } else {
+                Err(WakeCancellationBatchQueryError::Contradictory)
+            };
+        };
+        let receipt_sequence = validate_committed_append(receipt, &verified)
+            .map_err(WakeCancellationBatchQueryError::Journal)?;
+        let transaction_id = journal_transaction_id(&host_record, &record_checksum)
+            .map_err(WakeCancellationBatchQueryError::Journal)?;
+        if receipt_sequence != header.sequence
+            || receipt.record_checksum != record_checksum
+            || receipt.transaction_id != transaction_id
+        {
+            return Err(WakeCancellationBatchQueryError::Journal(
+                JournalError::IdempotencyConflict,
+            ));
+        }
+        Ok(WakeCancellationBatchObservation {
+            record,
+            receipt: AppendReceipt {
+                sequence: receipt_sequence,
+                disposition: AppendDisposition::Replayed,
+                transaction_id,
+            },
+            record_checksum,
         })
     }
 
