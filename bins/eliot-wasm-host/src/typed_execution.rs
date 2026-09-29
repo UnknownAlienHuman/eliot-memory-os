@@ -603,7 +603,8 @@ pub fn execute_describe_experimental(
     let (output_digest, output_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
             .map_err(|error| staged(TypedStage::Output, error))?;
-    validate_descriptor_abi_digest(&descriptor).map_err(|error| staged(TypedStage::Output, error))?;
+    validate_descriptor_abi_digest(&descriptor)
+        .map_err(|error| staged(TypedStage::Output, error))?;
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let input_digest = Sha256Digest::of_bytes(&[]);
