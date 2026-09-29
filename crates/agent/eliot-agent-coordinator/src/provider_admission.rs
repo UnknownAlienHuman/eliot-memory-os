@@ -1,30 +1,29 @@
-//! Closed production provider verifier (T9-05, issue #1108).
+//! Provider claim context and verifier boundary (T9-05, issue #1108).
 //!
-//! Composes the sealed [`ProviderVerifier`](crate::core::ProviderVerifier) on
-//! the T9-04 Kernel-supplied capability (`eliot-kernel-service`
-//! `protocol::provider_capability`, wire contour
-//! `eliot-kernel-provider-capability/v2`): the daemon resolves the presented
-//! claim material from the operation at hand plus the owner currentness it
-//! observed over its authenticated Kernel session (live fence/epoch, Governor
-//! expectation, session binding), hands both halves here as plain validated
-//! data, and every `verify` call re-runs the pure T9-04 owner verifier. The
-//! coordinator performs no I/O, launches nothing, mints no authority, and
-//! never accepts a serialized `Verified` label: restore rebuilds the verifier
-//! from freshly supplied capability data and replays every event through it,
-//! so stale, revoked, foreign, or conflicting evidence fails closed.
+//! This module composes the sealed
+//! [`ProviderVerifier`](crate::core::ProviderVerifier) with plain data
+//! supplied by daemon composition: ingress-presented claim material plus
+//! session-observed currentness from an authenticated Kernel session. The
+//! current coordinator value does not carry an authenticated,
+//! operation-specific owner receipt or an original proof record. Its local
+//! pure tuple check therefore cannot establish effect authority. Every
+//! effecting `verify` call remains a typed failure until the daemon supplies
+//! and this boundary validates such an owner receipt. The plan-only
+//! constructor continues to use its typed `PLAN_GAP` verifier.
 //!
-//! Presented versus owner, enforced at construction: the capability carries
-//! the ingress-presented claim material ([`PresentedClaimMaterial`]) apart
-//! from the session-observed owner currentness ([`OwnerCurrentness`]).
-//! [`AdmittedProviderCapability::new`] fails closed unless the presented
-//! route/capacity revisions equal the Governor-observed expectation, the
-//! presented and expected authority epochs agree with the live session fence
-//! epoch, the presented and live resource generations agree, and the pure
-//! verifier accepts the whole tuple. Digest equality between the presented
-//! binding digests and the durable ORS row is enforced Kernel-side per
-//! effecting operation through the authenticated capability wire operation;
-//! the coordinator never mistakes its stored presented values for loaded
-//! owner evidence.
+//! [`AdmittedProviderCapability::new`] validates shape and compares presented
+//! route/capacity revisions, authority epoch and resource generation with the
+//! supplied Governor/session observations. The construction-time pure check
+//! reuses presented tuple values as both request and expected values; it is a
+//! coherence check only, not an authenticated ORS-row read or proof of an
+//! operation payload. Restoring a snapshot rebuilds this context from fresh
+//! daemon-supplied data, but does not make historical or new effecting proofs
+//! verifiable without the missing operation-specific owner receipt path.
+//!
+//! The coordinator performs no I/O, launches nothing and mints no authority.
+//! A serialized `Verified` identity label is not authority; all effecting
+//! operations fail closed through [`KernelProviderVerifier::verify`] while
+//! owner receipt verification is unavailable.
 //!
 //! Catalogue, quota, and liveness observations (issue #265) ride only as
 //! [`ProviderSelectionHealth`]: selection/health input, never admission. The
@@ -45,15 +44,18 @@ use eliot_kernel_service::{
 };
 
 use crate::core::{ProviderProofKind, ProviderVerifier};
-use crate::model::{CoordinatorError, ProviderBindingSnapshot, ProviderIdentity, validate_text};
+use crate::model::{
+    CoordinatorError, PlanGap, ProviderBindingSnapshot, ProviderIdentity, validate_text,
+};
 
 /// Ingress-presented claim material for one provider admission (T9-05
 /// presented half, issue #1108).
 ///
 /// Values as claimed by the operation at hand (admission receipt refs, lane
-/// claim presentation): validated for shape here, bound to owner currentness
-/// by [`AdmittedProviderCapability::new`], and bound to the durable ORS row
-/// Kernel-side per effecting operation. Nothing here is trusted by value.
+/// claim presentation): validated for shape here and checked against the
+/// supplied session currentness by [`AdmittedProviderCapability::new`]. They
+/// remain presentation data; this type does not load an ORS row or authorize
+/// any effecting proof by itself.
 #[derive(Clone, Debug)]
 pub struct PresentedClaimMaterial {
     claim_id: String,
@@ -117,11 +119,10 @@ impl PresentedClaimMaterial {
         })
     }
 
-    /// Recomputes the canonical fence digest over the presented fence bytes.
+    /// Computes the canonical fence digest over the presented fence bytes.
     ///
-    /// Same recipe the Kernel owner uses for the durable `fence_digest`
-    /// (canonical JSON plus SHA-256 hex), so the presented fence travels to
-    /// the owner as a digest it can compare against the durable row.
+    /// The digest is request input only; the local coordinator does not load
+    /// or authenticate the owner row that contains its expected value.
     fn fence_digest(&self) -> Result<String, CoordinatorError> {
         let bytes = canonical_json_bytes(&self.presented_fence)
             .map_err(|error| CoordinatorError::Serialization(error.to_string()))?;
@@ -245,21 +246,21 @@ impl ProviderSelectionHealth {
     }
 }
 
-/// Daemon-supplied Kernel admission for one provider claim (T9-05 closed
-/// production verifier input, issue #1108).
+/// Daemon-supplied provider claim context (T9-05, issue #1108).
 ///
 /// Plain validated data only: the ingress-presented claim material plus the
 /// session-observed owner currentness. Construction fails closed unless the
-/// presented half agrees with the owner half (route/capacity revisions,
-/// authority epoch, resource generation) and the pure T9-04 verifier accepts
-/// the tuple. The coordinator performs no I/O and launches nothing; every
-/// proof re-runs the same coherence check plus the pure verifier, and
-/// restore requires a freshly supplied value, so a replayed snapshot without
-/// live durable backing still fails closed.
+/// presented half agrees with the supplied currentness observations
+/// (route/capacity revisions, authority epoch, resource generation). Its
+/// construction-time pure tuple check is not an authenticated owner receipt.
+/// The coordinator performs no I/O and launches nothing; until an
+/// operation-specific owner receipt is supplied and verified, every effecting
+/// proof returns a typed failure. Restore requires a freshly supplied value,
+/// but freshness of this context does not prove historical operation payloads.
 ///
 /// Never serialized: possessing a `Verified` snapshot label grants nothing;
-/// only this in-memory value, rebuilt per construction and per restore from
-/// exact owner records, admits effects.
+/// this in-memory value records a claim identity/currentness context only and
+/// does not itself admit effects.
 #[derive(Clone, Debug)]
 pub struct AdmittedProviderCapability {
     identity: ProviderIdentity,
@@ -308,7 +309,7 @@ impl AdmittedProviderCapability {
             minimum_event_sequence,
         };
         capability.check_currentness()?;
-        capability.check_owner_tuple()?;
+        capability.check_presented_tuple()?;
         Ok(capability)
     }
 
@@ -356,18 +357,13 @@ impl AdmittedProviderCapability {
         Ok(())
     }
 
-    /// Runs the pure T9-04 owner verifier over the presented tuple.
+    /// Checks the presented tuple's local shape and currentness coherence.
     ///
-    /// This is a construction-time coherence probe, not a provider proof:
-    /// the presenter is the daemon session itself (its session binding rides
-    /// as the presenter reference) binding the presented fence digest. The
-    /// presented digests travel as both request and loaded evidence here:
-    /// digest equality against the durable ORS row is enforced Kernel-side
-    /// per effecting operation through the authenticated capability wire
-    /// operation, which loads the row itself. This check enforces shape,
-    /// revocation, revision agreement, epoch currency, generation form, and
-    /// fence-digest form before any effect.
-    fn check_owner_tuple(&self) -> Result<(), CoordinatorError> {
+    /// This local pure check is not an owner receipt: presented values are
+    /// supplied as both request and expected evidence, and no durable ORS row
+    /// or operation-specific proof record is loaded here. It can reject
+    /// malformed or incoherent input, but it never authorizes an effect.
+    fn check_presented_tuple(&self) -> Result<(), CoordinatorError> {
         let fence_digest = self.presented.fence_digest()?;
         let request = ProviderCapabilityRequest {
             claim_id: self.presented.claim_id.clone(),
@@ -398,9 +394,11 @@ impl AdmittedProviderCapability {
     }
 }
 
-/// Kernel-backed [`ProviderVerifier`]: joins every presented proof with the
-/// daemon-supplied admitted capability and re-runs the T9-04 pure verifier.
-/// Constructed only through
+/// Kernel-backed [`ProviderVerifier`] context. It checks identity, input
+/// shape and supplied currentness, but has no authenticated
+/// operation-specific owner receipt to verify. Every effecting proof kind
+/// therefore fails closed until that receipt verifier is wired. Constructed
+/// only through
 /// [`AgentCoordinator::new_with_admitted_provider`](crate::core::AgentCoordinator::new_with_admitted_provider)
 /// and
 /// [`AgentCoordinator::restore_with_admitted_provider`](crate::core::AgentCoordinator::restore_with_admitted_provider);
@@ -417,13 +415,10 @@ impl KernelProviderVerifier {
 
 impl ProviderVerifier for KernelProviderVerifier {
     fn binding(&self) -> ProviderBindingSnapshot {
-        // Conditional by construction: this value exists only because
-        // `AdmittedProviderCapability::new` proved presented-versus-owner
-        // coherence through the pure verifier. A serialized `Verified`
-        // label alone still grants nothing: restore rebuilds this verifier
-        // from freshly supplied capability data and replays every event.
-        ProviderBindingSnapshot::Verified {
-            identity: self.capability.identity.clone(),
+        // No operation-specific owner receipt is available, so expose an
+        // explicit typed gap instead of a misleading Verified label.
+        ProviderBindingSnapshot::Gap {
+            gap: operation_owner_receipt_gap(),
         }
     }
 
@@ -437,7 +432,7 @@ impl ProviderVerifier for KernelProviderVerifier {
 
     fn verify(
         &self,
-        kind: ProviderProofKind,
+        _kind: ProviderProofKind,
         identity: &ProviderIdentity,
         proof_ref: &str,
         canonical_payload: &str,
@@ -450,57 +445,20 @@ impl ProviderVerifier for KernelProviderVerifier {
         if canonical_payload.is_empty() {
             return Err(CoordinatorError::InvalidField("canonical_payload"));
         }
-        // The receipt at hand is bound to the admitted provider identity
-        // above; its attempt/operation correlation travels in the canonical
-        // payload the coordinator itself hashes here, and digest equality
-        // against the durable row is enforced Kernel-side per effecting
-        // operation. This call re-proves currentness coherence plus the pure
-        // owner tuple, so a capability built under stale currentness cannot
-        // verify even before the Kernel is consulted.
+        // Recheck only the currentness values supplied at construction. This
+        // detects stale local observations but does not query Kernel or load
+        // the original ORS proof record. No proof kind can authorize an
+        // effect until its authenticated, operation-specific owner receipt
+        // is available here.
         self.capability.check_currentness()?;
-        let presented = &self.capability.presented;
-        let currentness = &self.capability.currentness;
-        let fence_digest = presented.fence_digest()?;
-        let request = ProviderCapabilityRequest {
-            claim_id: presented.claim_id.clone(),
-            attempt_id: presented.attempt_id.clone(),
-            operation_id: presented.operation_id.clone(),
-            proof_kind: map_proof_kind(kind),
-            proof_ref: proof_ref.to_owned(),
-            canonical_payload_sha256: sha256_hex(canonical_payload.as_bytes()),
-            binding_digest: presented.binding_digest.clone(),
-            executable_binding_digest: presented.executable_digest.clone(),
-            route_revision: presented.route_revision.clone(),
-            capacity_revision: presented.capacity_revision.clone(),
-            worker_generation: presented.worker_generation,
-            fence_digest,
-        };
-        verify_provider_capability(
-            &request,
-            &currentness.expectation,
-            &presented.attempt_id,
-            &presented.operation_id,
-            &presented.binding_digest,
-            &presented.executable_digest,
-            presented.worker_generation,
-            &request.fence_digest,
-            &currentness.live_epoch(),
-        )
-        .map_err(map_capability_error)
+        Err(operation_owner_receipt_gap().into())
     }
 }
 
-/// Maps the sealed coordinator proof slot onto the Kernel-owned proof kind.
-/// All seven slots verify; there is no plan-only or always-verified kind.
-fn map_proof_kind(kind: ProviderProofKind) -> KernelProofKind {
-    match kind {
-        ProviderProofKind::Admission => KernelProofKind::Admission,
-        ProviderProofKind::Cancellation => KernelProofKind::Cancellation,
-        ProviderProofKind::WorkerFence => KernelProofKind::WorkerFence,
-        ProviderProofKind::Reassignment => KernelProofKind::Reassignment,
-        ProviderProofKind::Result => KernelProofKind::Result,
-        ProviderProofKind::UnknownOutcome => KernelProofKind::UnknownOutcome,
-        ProviderProofKind::Binding => KernelProofKind::Binding,
+fn operation_owner_receipt_gap() -> PlanGap {
+    PlanGap::G11Unavailable {
+        reason: "operation-specific authenticated provider owner receipt verifier is not wired"
+            .to_owned(),
     }
 }
 
