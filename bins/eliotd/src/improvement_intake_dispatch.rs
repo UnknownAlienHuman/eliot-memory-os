@@ -1,13 +1,11 @@
 //! Production improvement-intake dispatch for `eliotd` (issue #1867 W1,
 //! I12.24).
 //!
-//! This is the production caller that closes the gap the cross-check refuted:
-//! before this module, [`crate::improvement_intake::route_evidence_refs_to_backlog`]
-//! and [`crate::improvement_intake::route_self_quality_handoff_to_backlog`]
-//! were defined but reached from no production entry point, so the
-//! `eliot-improvement` candidate/brief path was unreachable in production.
-//! The daemon run loop now reaches it through
-//! [`crate::daemon_runtime`]'s retained `ImprovementIntakeFlight`.
+//! This is the production caller for the advisory candidate/brief intake. The
+//! daemon run loop reaches it through [`crate::daemon_runtime`]'s retained
+//! `ImprovementIntakeFlight`, starting from a live Governor maintenance
+//! observation. This intake remains distinct from the full
+//! `ImprovementRouteRequest` pipeline, which has no production request source.
 //!
 //! # The evidence is a real observation this daemon already made
 //!
