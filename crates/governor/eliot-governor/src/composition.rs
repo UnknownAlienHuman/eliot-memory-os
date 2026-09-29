@@ -19,6 +19,7 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
+use crate::migration_inventory::PRODUCT_PROOF_PLAN;
 use crate::negative_memory_gate::{
     self, NegativeMemoryGateDecision, NegativeMemoryGateInput, evaluate_negative_memory_gate,
 };
@@ -995,27 +996,107 @@ fn product_proof_execution(action: FinishLifecycleAction) -> ExecutionStatus {
     }
 }
 
+/// The exact required proof this composition's installed-route stage names.
+///
+/// The acceptance owner builds the parked stage in `eliot-finish`, and this
+/// constant is the identical text the revision here uses, so the parked record
+/// and its later revision name the same missing proof rather than drifting into
+/// two requirements an operator would read as two different gaps.
+const INSTALLED_ROUTE_REQUIRED_PROOF: &str =
+    "installed Windows route pulse executed end to end on the target generation";
+
+/// The observed installed-route stage a real finish receipt justifies.
+///
+/// A terminal succeeded position alone is NOT an installed-route observation.
+/// The acceptance owner requires an installed-route receipt, so this reads the
+/// Product Proof plan's own concrete receipt identity out of the decision's
+/// *independently derived* artifact/verifier bindings — the set
+/// `eliot-canonical` assembles from rehydrated evidence, not from this
+/// product-proof path — and compares it against the plan's expected receipt
+/// name. The decision's own digest and its own lifecycle action are the same
+/// operation being measured, so neither can stand in for the independent
+/// expected set. A finish decision that closed successfully while carrying no
+/// installed-route receipt therefore yields no observed stage at all.
+fn observed_installed_route_stage(
+    receipt: &FinishDecisionReceipt,
+) -> Option<eliot_reports::product_proof::ProductProofStageReceipt> {
+    let expected = PRODUCT_PROOF_PLAN.installed_route_receipt;
+    receipt
+        .decision
+        .proof
+        .artifact_and_verifier_bindings
+        .iter()
+        .find_map(|binding| installed_route_receipt_id(binding, expected))
+}
+
+/// Extracts the installed-route receipt identity a binding handle names.
+///
+/// The handle is compared by content, not by shape: a binding cites the
+/// concrete receipt name the plan requires, optionally qualified by the
+/// generation or decision that produced it. Only an exact `ProductPulseReceipt`
+/// name, on its own or as a trailing segment, counts — a binding that merely
+/// contains the word is not an installed-route receipt.
+fn installed_route_receipt_id<'a>(
+    binding: &'a str,
+    expected: &str,
+) -> Option<&'a str> {
+    let trimmed = binding.trim();
+    if trimmed == expected {
+        return Some(trimmed);
+    }
+    trimmed
+        .rsplit([':', '/', '@', '#'])
+        .find(|segment| segment.trim() == expected)
+}
+
 /// The installed-route stage receipt a real finish receipt justifies.
 ///
-/// An attempt that actually succeeded cites the receipt's own digest; every
-/// other position records the stage as explicitly missing, naming what the
-/// absent execution would have proven. A non-successful attempt therefore can
-/// never mark the installed route observed.
+/// The stage cites the installed-route receipt the decision actually carried —
+/// never the finish decision's own digest — so the record names the evidence
+/// that proves the stage. Every other case, including a successfully closed
+/// decision that carried no installed-route receipt, records the stage as
+/// explicitly missing and names what the absent execution would have proven. A
+/// simulated or absent launch receipt can never mark the installed route
+/// observed, and the `PASS` refusal above it is untouched.
 fn installed_route_stage(
     receipt: &FinishDecisionReceipt,
-    observed: bool,
 ) -> eliot_reports::product_proof::ProductProofStageReceipt {
-    if observed {
-        eliot_reports::product_proof::ProductProofStageReceipt::Observed {
-            receipt_id: receipt.receipt_digest.clone(),
-        }
-    } else {
-        eliot_reports::product_proof::ProductProofStageReceipt::Missing {
-            required_proof:
-                "installed Windows route pulse executed end to end on the target generation"
-                    .to_owned(),
-        }
+    match observed_installed_route_stage(receipt) {
+        Some(observed) => observed,
+        None => eliot_reports::product_proof::ProductProofStageReceipt::Missing {
+            required_proof: INSTALLED_ROUTE_REQUIRED_PROOF.to_owned(),
+        },
     }
+}
+
+/// Re-derives the evidence an unobserved product proof is still missing.
+///
+/// This is computed from the record's own retained stage and the plan's
+/// concrete installed-route requirement rather than carried forward from a
+/// prior revision's list, so a requirement can never be cleared by repeating
+/// the same caller list. The installed-route proof text is read back off the
+/// record's own `Missing` stage, so the two always name the same thing, and
+/// the plan's receipt requirement is added independently so an operator sees
+/// the concrete receipt that was never produced. The result is sorted, which
+/// `ProductProofStatus::validate()` independently requires.
+fn product_proof_missing_evidence(
+    previous: &eliot_reports::product_proof::ProductProofStatus,
+) -> Vec<String> {
+    let mut missing: BTreeSet<String> = previous
+        .missing_evidence
+        .iter()
+        .filter(|requirement| **requirement != INSTALLED_ROUTE_REQUIRED_PROOF)
+        .cloned()
+        .collect();
+    if !previous.retained.installed_route_observed() {
+        missing.insert(INSTALLED_ROUTE_REQUIRED_PROOF.to_owned());
+        missing.insert(format!(
+            "{} receipt bound to the installed route (expected by the Product Proof plan {})",
+            PRODUCT_PROOF_PLAN.installed_route_receipt,
+            PRODUCT_PROOF_PLAN.plan_path
+        ));
+    }
+    missing.into_iter().collect()
 }
 
 /// Errors raised before daemon readiness.
@@ -5027,7 +5108,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         CompositionError,
     > {
         let execution = product_proof_execution(receipt.lifecycle_action);
-        let observed = execution == ExecutionStatus::Succeeded;
+        // The installed-route stage is observed only when the decision actually
+        // carries the plan's installed-route receipt, NOT merely because it
+        // closed as completed. A succeeded position without that receipt leaves
+        // the stage missing, so a simulated absent launch receipt can never be
+        // rolled up as `PASS`.
+        let installed_route = installed_route_stage(receipt);
+        let observed = installed_route.is_observed();
         let outcome = eliot_finish::product_proof::outcome_of_decision(&receipt.decision);
         let attempt = match eliot_finish::product_proof::failure_class_of_execution(execution) {
             Some(failure_class) => {
@@ -5059,22 +5146,42 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             executable: previous.retained.executable.clone(),
             environment: previous.retained.environment.clone(),
             stage_receipts: eliot_reports::product_proof::ProductProofStageReceipts {
-                installed_route: installed_route_stage(receipt, observed),
+                installed_route,
             },
         };
+        // The still-missing evidence is recomputed from this record's own state
+        // and the plan's concrete requirement, not copied from the prior
+        // revision's list. Copying the same caller list forward would let an
+        // attempt "clear" the requirement without ever satisfying it; here an
+        // unobserved installed route always re-derives the exact proof that is
+        // still absent. A record whose installed route is observed clears the
+        // list only because this same call established that observation.
         let missing_evidence = if observed {
             Vec::new()
         } else {
-            previous.missing_evidence.clone()
+            product_proof_missing_evidence(previous)
         };
         let live_evidence = if observed {
+            // The live evidence cites the *installed-route* receipt identity the
+            // decision carried, not the finish decision's own digest, so the
+            // evidence bound to the product property is the one that actually
+            // proves it. The revision still binds to the exact retained finish
+            // bytes, so the digest is computed from content, never supplied.
+            let receipt_id = match &installed_route {
+                eliot_reports::product_proof::ProductProofStageReceipt::Observed {
+                    receipt_id,
+                } => receipt_id.clone(),
+                eliot_reports::product_proof::ProductProofStageReceipt::Missing { .. } => {
+                    return Err(product_proof_error("product proof stage receipt disappeared"));
+                }
+            };
             vec![
                 eliot_reports::product_proof::ProductProofEvidence::new(
                     eliot_reports::product_proof::ProductProofEvidenceDomain::Runtime,
-                    format!("installed-route-receipt:{}", receipt.receipt_digest),
+                    format!("installed-route-receipt:{receipt_id}"),
                     format!(
-                        "installed route attempt {} produced finish receipt {}",
-                        receipt.decision_id, receipt.decision_id
+                        "installed route attempt {} produced the installed-route receipt {receipt_id}",
+                        receipt.decision_id
                     ),
                     eliot_reports::projection::ReportInputRevision::new(
                         eliot_reports::projection::ReportInputSource::ProductSupport,
