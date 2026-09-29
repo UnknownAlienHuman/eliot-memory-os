@@ -71,6 +71,20 @@
 //! owner-issued new-epoch and operational-readiness evidence, refusing a
 //! rehearsal outright from the posture its own destination pinned.
 //!
+//! Non-revival of invalid state (A13.7 ARCH-RES-03, #1141 A7) is enforced at
+//! two boundaries and never by guessing. Revoked influence is refused by
+//! [`gate_revocation_ledger`] before the purge ledger is staged; purged-payload
+//! suppression, old Session authority, and retention/permission expiry each
+//! refuse with a NAMED missing capability where the accepted contract carries
+//! no proof — see [`PurgeOwnerClient::suppress_purged_member`],
+//! [`require_cutover_obligations`], and
+//! [`require_unexpired_retention_obligations`]. The refusal is the honest
+//! answer in every one of those cases: an absent-evidence refusal is recorded
+//! as such, never read as proof, and no vector is left silently uncovered by
+//! another slot's refusal. Stale epoch is refused by the accepted
+//! [`RestoredFence`](eliot_backup::RestoredFence) lineage rules this adapter
+//! re-proves at qualification with no caller arithmetic on epochs.
+//!
 //! Capability cell: Kernel restore ownership (isolated import execution).
 //! Forbidden authority: no ORS row reinterpretation, no epoch minting, no
 //! cutover, no activation/retirement of any installation, no second phase
@@ -152,6 +166,12 @@ mod owners {
     /// a ledger `subject_ref` to archive member identities, so per-member
     /// suppression cannot be computed here. Backlog to M2.
     pub const PURGE_MEMBER_SUPPRESSION: &str = "purge-member-suppression";
+    /// Missing accepted retention/permission-validity carrier: the archive
+    /// carries retention and erasure DOMAIN identities but no expiry, no
+    /// validity window, and no permission that could be shown to still be in
+    /// force, so a qualification cannot prove a carried obligation is
+    /// unexpired. Refused as absent evidence rather than read as unexpired.
+    pub const RETENTION_EXPIRY: &str = "retention-permission-expiry";
 }
 
 /// Purge owner client: validates the purge ledger through the owner's
@@ -266,6 +286,61 @@ fn gate_revocation_ledger(bundle: &BackupBundle) -> Result<(), BackupError> {
         ));
     }
     Ok(())
+}
+
+/// Retention/permission expiry gate for cutover qualification (issue #1141
+/// A7: "restore cannot revive … expired retention permissions").
+///
+/// ## What the accepted contract actually carries
+///
+/// Nothing time-bounded. The archive carries retention and erasure as
+/// OPAQUE, OWNER-SCOPED DOMAIN IDENTITIES and nothing else:
+///
+/// - `BackupBundle` ([`eliot_backup::BackupBundle`]) has no expiry, deadline,
+///   validity-window, or retention-permission field of any kind;
+/// - [`BackupBlob`]'s `locator.residency` is the blob contract's
+///   `ObjectResidencyKey`, whose `retention_domain_id` and `erasure_domain_id`
+///   are documented as values for which "no value registry is implied" — a
+///   domain name, not a permission with an end;
+/// - the ECXF manifest projects the same two identities
+///   ([`eliot_backup::BackupBlob`]);
+/// - `RestoreEvidence` and `RestoreObligations` have no retention or expiry
+///   slot at all — the thirteen obligation slots are all producer/reference/
+///   blob/ORS/reconciliation/watchdog/external-source/invalidation, and none
+///   of them is a retention-permission slot;
+/// - [`PurgeLedgerEntry`] carries a `state_fence` and a monotonic `revision`,
+///   which are fencing and ordering facts, not expiries.
+///
+/// The nearest non-backup concept, the blob contract's
+/// `BlobPolicyBinding::retention_class`, is a policy-owner interpretation
+/// label and is not part of the archive contract at all.
+///
+/// ## Consequence
+///
+/// A qualification therefore has NOTHING to compare an expiry against. The
+/// honest answer is an absent-evidence refusal, not a pass: restore must not
+/// certify that the retention and erasure obligations it is about to make
+/// current are still in force, because the archive carries no evidence that
+/// any of them has an end at all — let alone that the end is in the future.
+///
+/// Refusing is a strengthening, not a regression: cutover qualification is
+/// already refused unconditionally by the other absent channels, so this adds
+/// a NAMED, attributable refusal for this vector instead of leaving it
+/// silently uncovered by another slot's refusal. An archive with no
+/// retention-obligated payload carries no such obligation and is untouched.
+///
+/// Unblocking needs an accepted owner-issued retention/erasure ADMISSION
+/// carrying the obligation's validity window, bound to this exact bundle and
+/// compared against the authority the restore runs under. Inventing such a
+/// field here, or comparing a domain name against a permission by spelling,
+/// would be a second scheme weaker than the obligation it claims to prove.
+fn require_unexpired_retention_obligations(bundle: &BackupBundle) -> Result<(), BackupError> {
+    if bundle.blobs.is_empty() {
+        return Ok(());
+    }
+    Err(BackupError::RestoreCapabilityUnsupported {
+        capability: owners::RETENTION_EXPIRY,
+    })
 }
 
 /// Kernel ceiling on the number of files one restore execution may stage into
@@ -1030,6 +1105,13 @@ impl KernelBackupRestore {
             .map_err(KernelRestoreError::TargetFailed)?;
         require_cutover_obligations(&evidence.obligations, bundle)
             .map_err(KernelRestoreError::TargetFailed)?;
+        // Retention/permission expiry (A7). After the obligation denominator
+        // so the pre-existing refusals keep their exact reasons, and never
+        // inside the staging path: an isolated root stages bytes under a new
+        // lineage and revives nothing, so the barrier belongs at the boundary
+        // where the restored root would become current.
+        require_unexpired_retention_obligations(bundle)
+            .map_err(KernelRestoreError::TargetFailed)?;
         let owner_epoch = require_qualified_owner_epoch(evidence)?;
         require_operational_validation(evidence)?;
         if destination.label() != plan.target.target_id
@@ -1199,6 +1281,23 @@ fn suspended_entries(
 /// unresolved work passes only through a satisfied reconciliation
 /// obligation backed by its complete current denominator, which only the
 /// exact reconciliation owner can issue.
+///
+/// ## Obligation issuer binding (issue #1141 A7: "old Session authority")
+///
+/// An obligation is a claim that ONE named owner discharged it. Reading
+/// `Satisfied` without comparing the issuer therefore accepts a claim
+/// against the very slot whose whole purpose is to name the owner: the five
+/// live-authority invalidation slots (runtime/session/lease/route/broker)
+/// exist precisely so a stale Session cannot be papered over, and a
+/// `session_invalidation` carrying any other `owner_id` is not a
+/// session-owner proof of anything.
+///
+/// `RestoreOwnerObligation` is a closed wire type, so the comparison is an
+/// exact string identity against the owner vocabulary this file already uses
+/// for `phase_owner` and for the missing-capability refusals — one owner
+/// vocabulary, not a second one. `RestoreObligations::validate` only checks
+/// that both strings are non-blank, so this binding is genuinely new and is
+/// enforced here.
 fn require_cutover_obligations(
     obligations: &RestoreObligations,
     bundle: &BackupBundle,
